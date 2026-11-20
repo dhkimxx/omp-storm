@@ -14,7 +14,7 @@ Storm gives three role agents the models the user approved and enforces them whe
 | `storm-reviewer` | Independent read-only review of a change |
 
 - Spawn these roles by agent name. Do not pass `model` for them; Storm replaces it with the approved models.
-- If Storm blocks a spawn, stop and tell the user the reason and the command it names (`/storm` or `/storm review`). Do not retry with another agent to get around the block.
+- If Storm blocks a spawn, stop and tell the user the reason and to type `/storm`. Do not retry with another agent to get around the block.
 - Reuse finished subagents: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent with `write agent://<id>` (or the eval handle's `.send()`) instead of a new spawn. When unsure whether its cache is still warm or its context too big, call the `storm` tool's `agents` action first.
 - Never edit `.omp/storm/` or Storm's approval records. Team changes go through the `storm` tool or `/storm` and need the user's approval.
 
@@ -34,6 +34,7 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 | A spending limit per run | `budget` |
 | Which subagents to reuse, start fresh or let go | `agents` |
 | Work done (implement, analyze, fix…) | `run` with the request as `task` |
+| Set the team up again, roll back to an earlier approval, or reset Storm | No action: tell the user to type `/storm` and pick it from the menu |
 
 - Write actions only propose. The user approves in a dialog; report the tool's outcome as is and never claim a change was applied unless the tool said so.
 - After `run`, end your reply at once without doing the work: Storm starts the run with the team contract right after your turn.

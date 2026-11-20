@@ -25,7 +25,7 @@ import {
 } from "../proposals/build.ts";
 import { presentProposal } from "../proposals/present.ts";
 import { renderModelCheck } from "../report/models.ts";
-import { adviseRows, agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "../report/agents.ts";
+import { adviseRows, agentsReport } from "../report/agents.ts";
 import { parseModelEntry } from "../selector.ts";
 import type { ProjectState } from "../state.ts";
 import type {
@@ -169,7 +169,7 @@ async function propose(
 	if (answer === "cancelled") return { outcome: "cancelled", text: "바꾸지 않았습니다." };
 	if (answer === "deferred") {
 		await host.proposals.save(proposal);
-		return { outcome: "deferred", text: `${built.summary}\n보류했습니다. /storm review 에서 승인할 수 있습니다.` };
+		return { outcome: "deferred", text: `${built.summary}\n보류했습니다. /storm 메뉴에서 승인할 수 있습니다.` };
 	}
 	const fresh = await host.loadState();
 	if (fresh.config.status !== "ok" || fresh.config.hash !== cur.hash || !sameShadows(fresh.shadows, cur.state.shadows)) {
@@ -213,15 +213,15 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 			return { outcome: "ok", text: renderStatus(view, host.now()) };
 		}
 		case "agents": {
-			const entries = host.runtime.agents();
 			const [settings, state] = await Promise.all([host.lifecycleSettings(), host.loadState()]);
-			const providers = state.config.status === "ok" ? teamProviders(state.config.config) : agentProviders(entries);
-			const warnings = lifecycleWarnings(settings, providers);
-			const body = entries.length
-				? renderAgents(agentRows(host, entries, settings), host.now())
-				: "이 세션에서 아직 실행된 서브에이전트가 없습니다.";
-			const notes = warnings.length ? `\n\n### 수명 관리\n${warnings.map((w) => `- ${w}`).join("\n")}` : "";
-			return { outcome: "ok", text: body + notes };
+			const config = state.config.status === "ok" ? state.config.config : undefined;
+			const text = agentsReport(host.runtime.agents(), {
+				now: host.now(),
+				settings,
+				cost: (m) => host.modelCost(m),
+				...(config ? { config } : {}),
+			});
+			return { outcome: "ok", text };
 		}
 		case "models": {
 			const state = await host.loadState();

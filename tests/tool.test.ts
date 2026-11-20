@@ -403,7 +403,7 @@ describe("approval gate", () => {
 			const f = fakeHost({ answers: [answer] });
 			const r = await run(f, { action: "workers", role: "implementer", workers: 2 });
 			expect(r.outcome).toBe("deferred");
-			expect(r.text).toContain("보류했습니다. /storm review 에서 승인할 수 있습니다.");
+			expect(r.text).toContain("보류했습니다. /storm 메뉴에서 승인할 수 있습니다.");
 			expect(f.saved).toEqual([]);
 			expect(f.config()).toEqual(base);
 			expect(f.proposals).toHaveLength(1);

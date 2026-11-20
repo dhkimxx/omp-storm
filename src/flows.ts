@@ -16,7 +16,7 @@ import { deriveScope, runSetupInterview } from "./interview/setup.ts";
 import { newProposalId } from "./proposals/build.ts";
 import { presentProposal } from "./proposals/present.ts";
 import { createProposalStore } from "./proposals/store.ts";
-import { adviseRows } from "./report/agents.ts";
+import { adviseRows, agentsReport } from "./report/agents.ts";
 import { renderModelCheck } from "./report/models.ts";
 import { ROLES } from "./roles.ts";
 import { activeLedgerRun } from "./runtime/ledger.ts";
@@ -223,7 +223,7 @@ async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState
 	}
 }
 
-/** Shows a proposal and applies it only on the exact approval label; a deferral is kept for /storm review. */
+/** Shows a proposal and applies it only on the exact approval label; a deferral is kept for the /storm menu. */
 async function decideProposal(env: FlowEnv, ui: UiPort, state: ProjectState, current: StormConfig, proposal: Proposal): Promise<void> {
 	const store = proposalStore(state);
 	const decision = await presentProposal(ui, proposal, current);
@@ -235,7 +235,7 @@ async function decideProposal(env: FlowEnv, ui: UiPort, state: ProjectState, cur
 	}
 	if (decision === "deferred") {
 		await store.save(proposal);
-		ui.notify("보류했습니다. /storm review 에서 승인할 수 있습니다.");
+		ui.notify("보류했습니다. /storm 메뉴에서 승인할 수 있습니다.");
 		return;
 	}
 	await store.remove(proposal.id);
@@ -255,7 +255,7 @@ export async function reviewFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	}
 	if (state.config.status === "invalid") {
 		ui.report("Storm 설정 오류", state.config.errors.map(error => `- ${error}`).join("\n"));
-		ui.notify("설정 파일을 고치거나 /storm setup 으로 다시 만드세요.", "warning");
+		ui.notify("설정 파일을 고치거나 /storm 으로 다시 만드세요.", "warning");
 		return;
 	}
 	if (state.approval && !unapprovedShadows(state)) {
@@ -294,8 +294,8 @@ export async function reviewFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	ui.notify(`승인했습니다(${shortHash(hash)}).`);
 }
 
-export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
-	const state = await loadProjectState(env);
+/** Earlier approved configs that still have a snapshot, newest first, without the current one. */
+async function rollbackOptions(state: ProjectState): Promise<RollbackOption[]> {
 	const currentHash = state.config.status === "ok" ? state.config.hash : null;
 	const options: RollbackOption[] = [];
 	for (const record of await state.store.list()) {
@@ -303,6 +303,13 @@ export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		const config = await state.store.snapshot(record.configHash);
 		if (config) options.push({ hash: record.configHash, approvedAt: record.approvedAt, config });
 	}
+	return options;
+}
+
+export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+	const state = await loadProjectState(env);
+	const currentHash = state.config.status === "ok" ? state.config.hash : null;
+	const options = await rollbackOptions(state);
 	if (options.length === 0) {
 		ui.notify("되돌릴 이전 승인 기록이 없습니다.");
 		return;
@@ -317,6 +324,66 @@ export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	if (written.hash !== result.option.hash) throw new Error("되돌린 설정의 해시가 승인 기록과 다릅니다");
 	await state.store.recordRollback(result.option.hash, currentHash);
 	ui.notify(`${relative(state.repo.root, written.path)}를 ${shortHash(result.option.hash)}로 되돌렸습니다.`);
+}
+
+/** Subagents of this session with reuse advice, plus lifecycle warnings for the team's providers. */
+async function agentsFlow(env: FlowEnv, ui: UiPort, state: ProjectState): Promise<void> {
+	const settings = (await env.lifecycleSettings?.()) ?? {};
+	const config = state.config.status === "ok" ? state.config.config : undefined;
+	ui.report(
+		"서브에이전트 재사용 권장",
+		agentsReport(env.agents?.() ?? [], {
+			now: env.now(),
+			settings,
+			...(env.modelCost ? { cost: env.modelCost } : {}),
+			...(config ? { config } : {}),
+		}),
+	);
+}
+
+const MENU = {
+	pending: "보류 제안 승인",
+	setup: "팀 다시 설정",
+	models: "모델 점검",
+	agents: "서브에이전트 재사용 권장",
+	rollback: "이전 설정으로 되돌리기",
+	reset: "초기화",
+	close: "닫기",
+} as const;
+
+/**
+ * Bare `/storm`: sets up a project without a valid config, asks for approval while something is unapproved,
+ * and otherwise shows the status and a menu of everything else. Returns true when the user reset Storm.
+ */
+export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
+	const before = await loadProjectState(env);
+	if (before.config.status !== "ok") {
+		await setupFlow(env, ui);
+		return false;
+	}
+	if (!before.approval || unapprovedShadows(before)) {
+		await reviewFlow(env, ui);
+		return false;
+	}
+	await statusFlow(env, ui);
+	// A trial decision in the status flow may have changed the config.
+	const state = await loadProjectState(env);
+	const [pending, rollbacks] = await Promise.all([proposalStore(state).list(), rollbackOptions(state)]);
+	const pendingLabel = `${MENU.pending} (${pending.length}건)`;
+	const options: string[] = [];
+	if (pending.length) options.push(pendingLabel);
+	options.push(MENU.setup, MENU.models);
+	if ((env.agents?.() ?? []).length) options.push(MENU.agents);
+	if (rollbacks.length) options.push(MENU.rollback);
+	options.push(MENU.reset, MENU.close);
+	const choice = await ui.select("Storm 메뉴", options);
+	if (choice === pendingLabel) await reviewFlow(env, ui);
+	else if (choice === MENU.setup) await setupFlow(env, ui);
+	else if (choice === MENU.models) await modelsFlow(env, ui);
+	else if (choice === MENU.agents) await agentsFlow(env, ui, state);
+	else if (choice === MENU.rollback) await rollbackFlow(env, ui);
+	else if (choice === MENU.reset) return resetFlow(env, ui);
+	return false;
 }
 
 async function pathExists(file: string): Promise<boolean> {
@@ -407,7 +474,7 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const removed = hasApprovals ? await state.store.clear() : 0;
 	ui.notify(
 		[
-			`Storm 설정과 기록을 지웠습니다(승인 ${removed}건 포함). 다시 쓰려면 /storm setup 으로 팀을 설정하세요.`,
+			`Storm 설정과 기록을 지웠습니다(승인 ${removed}건 포함). 다시 쓰려면 /storm 으로 팀을 설정하세요.`,
 			tracked.length ? "git에서 지워진 파일은 직접 커밋하세요." : "",
 		]
 			.filter(Boolean)

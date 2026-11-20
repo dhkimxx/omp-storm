@@ -363,12 +363,12 @@ export function renderShadows(shadows: StatusView["shadows"]): string {
 export function renderStatus(view: StatusView, now: number): string {
 	const out = [`- Storm ${STORM_VERSION}`, "", "### 저장소", `- repoId: ${view.repo.repoId}`, `- 루트: ${view.repo.root}`, "", "### 설정"];
 	const c = view.config;
-	if (c.status === "missing") out.push(`- 없음 (${c.path}) — /storm setup으로 만드세요`);
+	if (c.status === "missing") out.push(`- 없음 (${c.path}) — /storm 으로 만드세요`);
 	else if (c.status === "invalid") out.push(`- 오류 (${c.path})`, ...c.errors.map((e) => `  - ${e}`));
 	else out.push(`- 정상 · ${c.hash.replace(/^jcs-sha256:/, "").slice(0, 12)}`);
 	out.push("", "### 승인");
 	if (view.approval) out.push(`- 승인됨 · ${view.approval.approvalId} · ${view.approval.approvedAt}`);
-	else if (c.status === "ok") out.push("- 미승인 — /storm review로 승인하세요");
+	else if (c.status === "ok") out.push("- 미승인 — /storm 으로 승인하세요");
 	else out.push("- 미승인");
 	if (c.status === "ok") {
 		out.push("", "### 역할별 모델");
@@ -396,7 +396,7 @@ export function renderStatus(view: StatusView, now: number): string {
 	if (view.pending?.length) {
 		out.push("", `### 승인 대기 제안 (${view.pending.length}건)`);
 		for (const p of view.pending) out.push(`- ${p.summary}`);
-		out.push("- /storm review 로 승인하세요");
+		out.push("- /storm 메뉴에서 승인하세요");
 	}
 	if (view.agents) out.push("", "### 서브에이전트", renderAgents(view.agents, now));
 	if (view.lifecycle) {

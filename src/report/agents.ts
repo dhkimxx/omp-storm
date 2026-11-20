@@ -206,3 +206,10 @@ export function lifecycleWarnings(settings: LifecycleSettings, providers: readon
 	}
 	return out;
 }
+
+/** The advice table (or a note that none ran yet) plus lifecycle warnings for the team's providers (the agents' without a team). */
+export function agentsReport(entries: AgentEntry[], input: AdviceInput & { config?: StormConfig }): string {
+	const body = entries.length ? renderAgents(adviseRows(entries, input), input.now) : "이 세션에서 아직 실행된 서브에이전트가 없습니다.";
+	const warnings = lifecycleWarnings(input.settings, input.config ? teamProviders(input.config) : agentProviders(entries));
+	return warnings.length ? `${body}\n\n### 수명 관리\n${warnings.map((w) => `- ${w}`).join("\n")}` : body;
+}

@@ -62,7 +62,7 @@ function gate(state: SpawnState): Gate {
 	// An approval for another hash must never authorize the current file.
 	if (!approval || approval.status !== "active" || approval.configHash !== load.hash) {
 		const short = load.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
-		return { ok: false, reason: `승인되지 않은 Storm 설정입니다(${short}). /storm review 로 승인하세요.` };
+		return { ok: false, reason: `승인되지 않은 Storm 설정입니다(${short}). /storm 으로 승인하세요.` };
 	}
 	return { ok: true, config: load.config, approved: approval };
 }
@@ -138,7 +138,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	for (const shadow of state.shadows) {
 		if (shadow.agent !== event.agent) continue;
 		if (approvedShadows.some(a => a.agent === shadow.agent && a.sha256 === shadow.sha256)) continue;
-		return block(`승인되지 않은 역할 정의가 있습니다: ${shadow.path}. /storm review 로 확인하세요.`, { role: roleKey });
+		return block(`승인되지 않은 역할 정의가 있습니다: ${shadow.path}. /storm 으로 확인하세요.`, { role: roleKey });
 	}
 
 	if (role.models.length === 0) return block(`Storm 설정의 ${event.agent} 역할에 모델이 없습니다.`, { role: roleKey });

@@ -742,7 +742,7 @@ describe("render", () => {
 		);
 		expect(md).toContain("abcdef012345");
 		expect(md).not.toContain("abcdef0123456");
-		expect(md).toContain("/storm review");
+		expect(md).toContain("미승인 — /storm 으로 승인하세요");
 		expect(md).toContain("omp --max-cost 3");
 		expect(md).toContain("사용 —");
 		expect(md).toContain(shadow.path);
@@ -873,7 +873,7 @@ describe("render", () => {
 		expect(md).toContain("| 요청당 비용 | $0.0100 | — |");
 		expect(md).toMatch(/- t2 \(리뷰 · c\/cand\): 시작 전 · 배정 0\/10 · 지출 \$0\.0000 \/ \$5 · 종료 예정 /);
 		expect(md).toMatch(/### 쿼터 소진 표시\n- openai: .*까지 다른 provider 우선/);
-		expect(md).toContain("### 승인 대기 제안 (2건)\n- 워커 수 변경: 구현 1 → 3\n- 우선순위 변경: 균형 → 비용 우선\n- /storm review 로 승인하세요");
+		expect(md).toContain("### 승인 대기 제안 (2건)\n- 워커 수 변경: 구현 1 → 3\n- 우선순위 변경: 균형 → 비용 우선\n- /storm 메뉴에서 승인하세요");
 	});
 
 	test("config diff shows workers, other-agent handling and trial add/remove/change", () => {

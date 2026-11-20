@@ -1,5 +1,5 @@
 /**
- * Storm run lifecycle for one main session: a `/storm run` or a run the storm tool queued becomes a
+ * Storm run lifecycle for one main session: a run the storm tool queued (from a `/storm <request>`) becomes a
  * keyword handoff; the run ends when the session settles. Spawn decisions arrive from any session in
  * the process (children included), so they are collected per run in module scope.
  */
@@ -42,7 +42,7 @@ export function buildStormRequest(text: string): string {
 		text,
 		"</storm-request>",
 		"",
-		"위는 /storm 요청입니다. storm 도구로 처리하세요. 상태·쿼터·모델 점검은 조회 동작을, 설정 변경(우선순위·워커 수·모델 재선정·쿼터 대응·시험 사용·예산)은 해당 동작을 쓰고, 변경은 사용자가 승인 창에서 확정한다고 알리세요. 작업 요청이면 action \"run\"으로 실행을 예약하고 이 턴에서는 작업하지 말고 바로 응답을 끝내세요.",
+		"위는 /storm 요청입니다. storm 도구로 처리하세요. 상태·쿼터·모델 점검·서브에이전트는 조회 동작을, 설정 변경(우선순위·워커 수·모델 재선정·쿼터 대응·시험 사용·예산)은 해당 동작을 쓰고, 변경은 사용자가 승인 창에서 확정한다고 알리세요. 팀 다시 설정·되돌리기·초기화는 도구로 할 수 없으니 /storm 을 입력해 메뉴에서 고르라고 안내하세요. 작업 요청이면 action \"run\"으로 실행을 예약하고 이 턴에서는 작업하지 말고 바로 응답을 끝내세요.",
 	].join("\n");
 }
 
@@ -116,10 +116,10 @@ export class RunController {
 		if (load.status === "invalid") return { ok: false, reason: `Storm 설정 오류: ${load.errors[0] ?? "알 수 없는 오류"}` };
 		if (!state.approval || state.approval.configHash !== load.hash) {
 			const short = load.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
-			return { ok: false, reason: `승인되지 않은 Storm 설정입니다(${short}). /storm review 로 승인하세요.` };
+			return { ok: false, reason: `승인되지 않은 Storm 설정입니다(${short}). /storm 으로 승인하세요.` };
 		}
 		const shadow = unapprovedShadowPath(state);
-		if (shadow) return { ok: false, reason: `승인되지 않은 역할 정의가 있습니다: ${shadow}. /storm review 로 확인하세요.` };
+		if (shadow) return { ok: false, reason: `승인되지 않은 역할 정의가 있습니다: ${shadow}. /storm 으로 확인하세요.` };
 		if (activeLedgerRun(state.repo.repoId)) return { ok: false, reason: "이 프로젝트에서 다른 Storm 실행이 진행 중입니다." };
 
 		const config = load.config;

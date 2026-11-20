@@ -88,7 +88,7 @@ describe("decideSpawn (v0.1 cases)", () => {
 	});
 
 	test("blocks without an active approval for this exact hash", () => {
-		const expected = "승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm review 로 승인하세요.";
+		const expected = "승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.";
 		expect(reason(decide(ev("storm-reviewer"), state({ approval: undefined })))).toBe(expected);
 		expect(reason(decide(ev("storm-reviewer"), state({ approval: approval({ status: "revoked" }) })))).toBe(expected);
 		const other = approval({ configHash: `jcs-sha256:${"f".repeat(64)}` });
@@ -100,7 +100,7 @@ describe("decideSpawn (v0.1 cases)", () => {
 	});
 
 	test("blocks unapproved shadow definitions of the spawned role only", () => {
-		const blocked = "승인되지 않은 역할 정의가 있습니다: /r/.omp/agents/rev.md. /storm review 로 확인하세요.";
+		const blocked = "승인되지 않은 역할 정의가 있습니다: /r/.omp/agents/rev.md. /storm 으로 확인하세요.";
 		expect(reason(decide(ev("storm-reviewer"), state({ shadows: [shadow] })))).toBe(blocked);
 		// Same agent approved with different content is still unapproved.
 		const stale = approval({}, [{ ...shadow, sha256: "2".repeat(64) }]);
@@ -199,7 +199,7 @@ describe("decideSpawn (v0.2 storm agents)", () => {
 	test("blocked storm spawns carry the reason in the record", () => {
 		const out = decideSpawn(ev("storm-reviewer"), state({ approval: undefined }), runtime());
 		expect(out.record?.outcome).toBe("blocked");
-		expect(out.record?.reason).toBe("승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm review 로 승인하세요.");
+		expect(out.record?.reason).toBe("승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.");
 	});
 
 	test("blocks new storm spawns once the run budget is spent", () => {
@@ -318,7 +318,7 @@ describe("decideSpawn (v0.2 non-Storm agents)", () => {
 
 	test("blocks during a run when the config is not approved", () => {
 		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state({ approval: undefined }), inRun()))).toBe(
-			"승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm review 로 승인하세요.",
+			"승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.",
 		);
 		expect(reason(decide(ev("task"), state({ config: { status: "missing", path: "x" } }), inRun()))).toBe(
 			"Storm 설정이 없습니다. /storm 으로 팀을 설정하세요.",

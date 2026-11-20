@@ -551,7 +551,7 @@ export type InterviewResult =
 	| { status: "cancelled"; at: string }
 	| { status: "no-ui" };
 
-/** Everything `/storm status` shows. v0.2 runtime fields are optional; absent ones render as nothing. */
+/** Everything the Storm status report shows. v0.2 runtime fields are optional; absent ones render as nothing. */
 export interface StatusView {
 	repo: RepoIdentity;
 	config: ConfigLoad;
@@ -575,7 +575,7 @@ export interface StatusView {
 	lifecycle?: LifecycleSettings;
 }
 
-/** A previously approved config offered by `/storm rollback`. */
+/** A previously approved config offered by rollback. */
 export interface RollbackOption {
 	hash: string;
 	approvedAt: string;

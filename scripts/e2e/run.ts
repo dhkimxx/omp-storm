@@ -176,6 +176,12 @@ async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>, flavor
 
 const textOf = (frame: Frame): string => JSON.stringify(frame);
 const noAnswer: Answer = () => undefined;
+const choose =
+	(label: string): Answer =>
+	request =>
+		((request.options as string[] | undefined) ?? []).includes(label) ? label : undefined;
+const uiTitled = (frames: Frame[], title: string): boolean =>
+	frames.some(frame => frame.type === "extension_ui_request" && String(frame.title).startsWith(title));
 
 /** Runs a slash command and returns its frames once it has completed and the session is quiet. */
 async function command(line: string, answer: Answer): Promise<Frame[]> {
@@ -304,7 +310,7 @@ async function main(): Promise<void> {
 			`main=${run.main.length}`,
 		);
 
-		let frames = await command("/storm setup", setupAnswers);
+		let frames = await command("/storm", setupAnswers);
 		const config = existsSync(CONFIG) ? (JSON.parse(readFileSync(CONFIG, "utf8")) as { roles: Record<string, { models: string[]; effort?: string }> }) : undefined;
 		check("setup: 설정 저장", config !== undefined);
 		check("setup: 승인 기록", approvalFiles().length === 1, `approvals=${approvalFiles().length}`);
@@ -330,7 +336,8 @@ async function main(): Promise<void> {
 		writeFileSync(CONFIG, `${JSON.stringify(edited, null, 2)}\n`);
 		run = await spawn(["storm-implementer"]);
 		check("직접 편집: 승인 전 차단", run.results.includes("승인되지 않은 Storm 설정") && run.children.length === 0);
-		await command("/storm review", approveAnswers);
+		frames = await command("/storm", approveAnswers);
+		check("허브: 미승인이면 승인 화면", uiTitled(frames, "이 설정을 승인할까요?") && !uiTitled(frames, "Storm 메뉴"));
 		run = await spawn(["storm-implementer"]);
 		check("리뷰 승인 후: 다시 허용", run.children.length === 1 && run.children[0]?.model === expectedModel);
 
@@ -338,18 +345,20 @@ async function main(): Promise<void> {
 		writeFileSync(SHADOW, "---\nname: storm-implementer\ndescription: shadow\n---\nSTORM-ROLE shadow. Reply with OK.\n");
 		run = await spawn(["storm-implementer"]);
 		check("역할 가림: 승인 전 차단", run.results.includes("승인되지 않은 역할 정의") && run.children.length === 0);
+		// The old subcommand word still opens its flow directly (hidden shortcut).
 		await command("/storm review", approveAnswers);
 		run = await spawn(["storm-implementer"]);
 		check("역할 가림: 승인 후 가림 정의로 실행", run.children[0]?.roles.includes("shadow") === true);
 		rmSync(join(PROJECT, ".omp", "agents"), { recursive: true, force: true });
 
 		const beforeRollback = configHashOnDisk();
-		await command("/storm rollback", request => {
+		frames = await command("/storm", request => {
 			const options = (request.options as string[] | undefined) ?? [];
+			if (request.title === "Storm 메뉴") return "이전 설정으로 되돌리기";
 			if (options.includes("승인 후 되돌리기")) return "승인 후 되돌리기";
 			return options.find(option => option !== "취소");
 		});
-		check("롤백: 설정 파일 변경", configHashOnDisk() !== beforeRollback);
+		check("롤백: 메뉴에서 설정 파일 변경", uiTitled(frames, "Storm 메뉴") && configHashOnDisk() !== beforeRollback);
 		run = await spawn(["storm-implementer"]);
 		check("롤백 후: 승인된 설정으로 허용", run.children.length === 1);
 
@@ -358,17 +367,24 @@ async function main(): Promise<void> {
 		const llmBefore = readLlm().length;
 		const print = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm setup"], { cwd: PROJECT, timeout: 120_000 });
 		const printReset = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm reset"], { cwd: PROJECT, timeout: 120_000 });
+		const printHub = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm"], { cwd: PROJECT, timeout: 120_000 });
 		check(
-			"print 모드: setup·reset 모두 변경 없음",
+			"print 모드: /storm·setup·reset 모두 변경 없음",
 			configHashOnDisk() === hashBefore && approvalFiles().length === approvalsBefore,
-			`exit=${print.exitCode},${printReset.exitCode}`,
+			`exit=${print.exitCode},${printReset.exitCode},${printHub.exitCode}`,
 		);
 		check("print 모드: 모델 호출 없음", readLlm().length === llmBefore);
 
-		frames = await command("/storm status", noAnswer);
-		check("status: 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
-		check("status: Storm 버전", frames.some(frame => textOf(frame).includes(`- Storm ${STORM_VERSION}`)));
-		check("status: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
+		frames = await command("/storm", noAnswer);
+		check("허브: 현황 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
+		check("허브: Storm 버전", frames.some(frame => textOf(frame).includes(`- Storm ${STORM_VERSION}`)));
+		check("허브: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
+		const menu = frames.find(frame => frame.type === "extension_ui_request" && frame.title === "Storm 메뉴")?.options as string[] | undefined;
+		check(
+			"허브: 현황 뒤 메뉴(있는 것만)",
+			JSON.stringify(menu) === JSON.stringify(["팀 다시 설정", "모델 점검", "이전 설정으로 되돌리기", "초기화", "닫기"]),
+			JSON.stringify(menu),
+		);
 
 		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
 		type StoredRole = { models: string[]; effort?: string; workers?: number };
@@ -398,12 +414,6 @@ async function main(): Promise<void> {
 			const dir = join(stateDir, "proposals");
 			return existsSync(dir) ? readdirSync(dir).filter(file => file.endsWith(".json")) : [];
 		};
-		const choose =
-			(label: string): Answer =>
-			request =>
-				((request.options as string[] | undefined) ?? []).includes(label) ? label : undefined;
-		const uiTitled = (frames: Frame[], title: string): boolean =>
-			frames.some(frame => frame.type === "extension_ui_request" && String(frame.title).startsWith(title));
 		/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
 		const OUTSIDER = "fake/premium-c";
 
@@ -413,7 +423,7 @@ async function main(): Promise<void> {
 			"v0.2 전제: 대체 확인용 모델은 승인 밖",
 			!Object.values(team.roles).some(role => role.models.some(model => bare(model) === OUTSIDER)),
 		);
-		let talk = await converse("/storm run SPIKE-TASK storm-implementer task", noAnswer, { model: OUTSIDER });
+		let talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK storm-implementer task"}', noAnswer, { model: OUTSIDER });
 		// The hidden notice is delivered with the handoff, so the logged (truncated) user text may not show the contract itself.
 		const noticed = talk.llm.some(entry => !entry.child && entry.notices.workflowz.length > 0);
 		check("실행: 인계에 workflowz 계약", noticed && runFiles().at(-1)?.contract === "workflowz", `contract=${runFiles().at(-1)?.contract} noticed=${noticed}`);
@@ -445,6 +455,23 @@ async function main(): Promise<void> {
 		talk = await converse(["SPIKE-TASK storm-implementer", '/storm STORM-TOOL {"action":"agents"}'], noAnswer);
 		const agentsReply = talk.frames.map(textOf).find(text => text.includes("(implementer)") && text.includes("| 권장 |"));
 		check("agents: 끝난 에이전트 재사용 권장", agentsReply?.includes("재사용") === true && agentsReply.includes("agent://"), agentsReply?.slice(0, 300) ?? "no table");
+		const hubAgents = await session(
+			request => (request.title === "Storm 메뉴" ? "서브에이전트 재사용 권장" : undefined),
+			async rpc => {
+				const first = rpc.frames.length;
+				rpc.send({ type: "prompt", message: "SPIKE-TASK storm-implementer" });
+				await settleQuietly(rpc, first, "spawn before /storm");
+				const from = rpc.frames.length;
+				const id = rpc.send({ type: "prompt", message: "/storm" });
+				await until(() => rpc.find(frame => frame.type === "prompt_result" && frame.id === id, from), 120_000, "/storm");
+				await Bun.sleep(300);
+				return rpc.frames.slice(from);
+			},
+		);
+		check(
+			"허브: 서브에이전트가 있으면 재사용 권장 메뉴",
+			hubAgents.some(frame => textOf(frame).includes("### 서브에이전트 재사용 권장") && textOf(frame).includes("| 권장 |")),
+		);
 		run = await spawn(["task"], { model: OUTSIDER });
 		check("실행 밖: 일반 에이전트는 그대로", run.children[0]?.model === idOf(OUTSIDER), `child=${run.children[0]?.model}`);
 
@@ -466,13 +493,14 @@ async function main(): Promise<void> {
 			configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 1,
 			`proposals=${proposalFiles().length}`,
 		);
-		await command("/storm review", request => {
+		await command("/storm", request => {
 			const options = (request.options as string[] | undefined) ?? [];
+			if (request.title === "Storm 메뉴") return options.find(option => option.startsWith("보류 제안 승인"));
 			if (String(request.title).startsWith("보류 중인 변경 제안")) return options[0];
 			return options.includes("승인") ? "승인" : undefined;
 		});
 		team = readConfig();
-		check("리뷰: 보류 제안 승인", team.roles.reviewer?.workers === 3 && proposalFiles().length === 0, `workers=${team.roles.reviewer?.workers}`);
+		check("메뉴: 보류 제안 승인", team.roles.reviewer?.workers === 3 && proposalFiles().length === 0, `workers=${team.roles.reviewer?.workers}`);
 
 		const implementerModels = team.roles.implementer?.models ?? [];
 		const fallback = implementerModels.find(model => providerOf(model) !== providerOf(implementerModels[0]));
@@ -500,13 +528,13 @@ async function main(): Promise<void> {
 			routedTo.join(",") === [idOf(primary), idOf(candidate), idOf(primary)].join(","),
 			`${routedTo.join(",")} expected=${idOf(primary)},${idOf(candidate)},${idOf(primary)}`,
 		);
-		frames = await command("/storm status", request => (String(request.title).startsWith("시험 사용이 끝났습니다") ? "나중에" : undefined));
+		frames = await command("/storm", request => (String(request.title).startsWith("시험 사용이 끝났습니다") ? "나중에" : undefined));
 		check("시험 사용: 끝나면 교체 여부 질문", uiTitled(frames, "시험 사용이 끝났습니다"));
 
 		await converse('/storm STORM-TOOL {"action":"budget","budgetUsd":0.0005}', choose("승인"));
 		team = readConfig();
 		check("예산: 승인 후 설정", team.budget?.perRunUsd === 0.0005, JSON.stringify(team.budget));
-		talk = await converse("/storm run SPIKE-TASK storm-implementer", noAnswer, { model: OUTSIDER });
+		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK storm-implementer"}', noAnswer, { model: OUTSIDER });
 		const budgetRun = runFiles().at(-1);
 		check(
 			"예산: 넘으면 새 스폰 차단",
@@ -516,11 +544,12 @@ async function main(): Promise<void> {
 		check("예산: 실행 기록", budgetRun?.status === "budget-exceeded", `status=${budgetRun?.status}`);
 
 		const approvalsBeforeReset = approvalFiles().length;
-		frames = await command("/storm reset", choose("취소"));
+		frames = await command("/storm", request => (request.title === "Storm 메뉴" ? "초기화" : choose("취소")(request)));
 		check(
-			"초기화: 확인 한 번, 취소하면 그대로",
+			"초기화: 메뉴에서 확인 한 번, 취소하면 그대로",
 			uiTitled(frames, "Storm 설정과 기록을 모두 지울까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
 		);
+		// The hidden shortcut opens the same confirmation directly.
 		frames = await command("/storm reset", choose("초기화"));
 		check(
 			"초기화: 설정과 승인 기록을 한 번에 삭제",

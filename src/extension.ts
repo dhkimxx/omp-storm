@@ -13,6 +13,7 @@ import { readExplicitSettings } from "./discovery/settings.ts";
 import {
 	approveAndSave,
 	type FlowEnv,
+	hubFlow,
 	modelsFlow,
 	resetFlow,
 	reviewFlow,
@@ -38,9 +39,11 @@ import type { ConfigLoad, ExplicitSettings, LifecycleSettings, ModelInfo, RepoId
 import { createUiPort } from "./ui.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
-/** Handled without the LLM when the argument is exactly one of these. */
-const EXACT = ["status", "models", "setup", "review", "rollback", "reset"] as const;
-const COMPLETIONS = [...EXACT, "run"] as const;
+/**
+ * The old subcommand words: exactly one of them opens that flow without the LLM, so muscle memory never turns
+ * into a request. Not advertised; `/storm` and its menu cover them.
+ */
+const SHORTCUTS = ["status", "models", "setup", "review", "rollback", "reset"] as const;
 const CONFIG_TTL_MS = 5_000;
 
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
@@ -353,21 +356,28 @@ export default function storm(pi: ExtensionAPI): void {
 		try {
 			await syncSession(ctx);
 		} catch {
-			// The status line and the tool are conveniences; /storm status reports the actual error.
+			// The status line and the tool are conveniences; /storm reports the actual error.
 		}
 	});
 
 	pi.registerTool(tool);
 
 	pi.registerCommand("storm", {
-		description: "Storm 멀티에이전트 팀 (/storm [status|models|setup|review|rollback|reset|run <작업>|<자연어 요청>])",
-		getArgumentCompletions: prefix =>
-			COMPLETIONS.filter(name => name.startsWith(prefix)).map(name => ({ value: name, label: name })),
+		description: "Storm 멀티에이전트 팀 (/storm: 현황과 메뉴 · /storm <요청>: 작업 맡기기, 팀 변경, 질문)",
 		handler: async (args, ctx) => {
 			const ui = createUiPort(pi, ctx);
 			const env = flowEnv(ctx);
 			const input = args.trim();
 			try {
+				if (input !== "" && !(SHORTCUTS as readonly string[]).includes(input)) {
+					// A request: the main LLM starts a run for work or answers through the storm tool; changes still need the approval dialog.
+					await ctx.waitForIdle();
+					await activateTool();
+					pi.sendUserMessage(buildStormRequest(input)).catch((error: unknown) => {
+						ui.notify(`요청을 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
+					});
+					return;
+				}
 				if (input === "status") {
 					await statusFlow(env, ui);
 					return;
@@ -376,42 +386,19 @@ export default function storm(pi: ExtensionAPI): void {
 					await modelsFlow(env, ui);
 					return;
 				}
-				if (input === "run" || input.startsWith("run ")) {
-					const task = input.slice(3).trim();
-					if (!task) {
-						ui.notify("/storm run <작업> 형식으로 쓰세요.", "warning");
-						return;
-					}
-					await ctx.waitForIdle();
-					const result = await runs.start(ctx, task);
-					if (!result.ok) ui.notify(result.reason, "warning");
-					return;
-				}
-				if (input !== "" && !(EXACT as readonly string[]).includes(input)) {
-					// Natural language: the main LLM answers through the storm tool; changes still need the approval dialog.
-					await ctx.waitForIdle();
-					await activateTool();
-					pi.sendUserMessage(buildStormRequest(input)).catch((error: unknown) => {
-						ui.notify(`요청을 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
-					});
-					return;
-				}
 				if (!ctx.hasUI) {
-					ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm status 는 쓸 수 있습니다.", "warning");
+					// Nothing can be approved without dialogs; plain /storm still shows the status.
+					if (input === "") await statusFlow(env, ui);
+					else ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm 으로 현황은 볼 수 있습니다.", "warning");
 					return;
 				}
+				let reset = false;
 				if (input === "setup") await setupFlow(env, ui);
 				else if (input === "review") await reviewFlow(env, ui);
 				else if (input === "rollback") await rollbackFlow(env, ui);
-				else if (input === "reset") {
-					if (await resetFlow(env, ui)) await deactivateTool();
-				}
-				else {
-					const state = await loadProjectState(env);
-					if (state.config.status === "missing" || state.config.status === "invalid") await setupFlow(env, ui);
-					else if (!state.approval) await reviewFlow(env, ui);
-					else await statusFlow(env, ui);
-				}
+				else if (input === "reset") reset = await resetFlow(env, ui);
+				else reset = await hubFlow(env, ui);
+				if (reset) await deactivateTool();
 			} catch (error) {
 				ui.notify(`Storm 오류: ${error instanceof Error ? error.message : String(error)}`, "error");
 			} finally {
