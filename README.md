@@ -66,7 +66,7 @@ One command. Intelligent agents. Any runtime.
 ## 설치
 
 ```bash
-omp plugin install github:dhkimxx/omp-storm   # 저장소 접근 권한 필요(비공개)
+omp plugin install github:dhkimxx/omp-storm
 omp plugin link /path/to/omp-storm            # 로컬 체크아웃으로 개발할 때
 ```
 

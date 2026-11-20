@@ -319,7 +319,8 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 	for (const id of ids) {
 		const a = prev?.roles[id];
 		const b = next.roles[id];
-		line(`${id} 모델`, a && a.models.join(" → "), b ? b.models.join(" → ") : "(삭제)");
+		// Comma-joined here: in a diff "→" already means old → new, so it cannot also mean attempt order.
+		line(`${id} 모델`, a && a.models.join(", "), b ? b.models.join(", ") : "(삭제)");
 		line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
 		line(`${id} 워커`, a ? String(a.workers ?? 1) : undefined, b ? String(b.workers ?? 1) : DASH);
 	}

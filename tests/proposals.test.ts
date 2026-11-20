@@ -114,7 +114,7 @@ describe("presentProposal", () => {
 	test("renders summary, diff and evidence of changed roles only", () => {
 		const md = renderProposal(p, base);
 		expect(md).toContain("**구현 모델 교체**");
-		expect(md).toContain("implementer 모델: a/i → c/j → a/i");
+		expect(md).toContain("implementer 모델: a/i → c/j, a/i");
 		expect(md).toContain("- 구현: 선택 c/j");
 		expect(md).toContain("J (c/j) · 지능 60 · — tok/s · $0.0100");
 		expect(md).toContain("근거: 많이 씀");
