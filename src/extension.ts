@@ -40,8 +40,8 @@ import { createUiPort } from "./ui.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /**
- * The old subcommand words: exactly one of them opens that flow without the LLM, so muscle memory never turns
- * into a request. Not advertised; `/storm` and its menu cover them.
+ * Shortcuts (the old subcommand words): exactly one of them opens that flow without the LLM, so muscle memory
+ * never turns into a request. The README lists them; completions do not, since `/storm` and its menu cover them.
  */
 const SHORTCUTS = ["status", "models", "setup", "review", "rollback", "reset"] as const;
 const CONFIG_TTL_MS = 5_000;
