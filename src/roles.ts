@@ -1,6 +1,6 @@
 import type { RoleId, RoleSpec } from "./types.ts";
 
-export const STORM_VERSION = "0.7.0";
+export const STORM_VERSION = "0.7.1";
 
 /** Roles Storm ships. Each maps to an agent definition in agents/. */
 export const ROLES: readonly RoleSpec[] = [

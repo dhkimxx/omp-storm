@@ -49,9 +49,9 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 
 `/storm` sends this when the user sets the team up or sets it up again. The section holds the facts (providers, candidates per role with price, speed, scores and usage, the current config) and Storm's own team in `<storm-recommended-config>`.
 
-1. Interview the user with the `ask` tool. Mark the recommended option by ending its label with ` (추천)`; never use the ask tool's `recommended` field.
-2. The first question offers exactly `Storm 추천안 그대로 (추천)`, `역할별로 고르기` and `취소`.
-   - `역할별로 고르기`: ask per role for the primary model, the fallback and the effort, then the run settings (parallelism, workers per role, contract, budget). Build options from the facts and mark Storm's pick with `(추천)`.
+1. Interview the user with the `ask` tool, one form per step with all of that step's questions (a fieldset each), not one call per question. Mark the recommended option by ending its label with ` (추천)` and preselect it with `checked`; never use the ask tool's `recommended` field.
+2. The first form shows Storm's team as a table and asks one question offering exactly `Storm 추천안 그대로 (추천)`, `역할별로 고르기` and `취소`.
+   - `역할별로 고르기`: two more forms. The models form asks every role's primary model and fallback (`폴백 없음` allowed), with the candidates' price, speed and scores in a table. Every role but implementer ends its primary-model options with `사용 안 함`, which leaves the role out of `roles`, lists it in `disabledRoles` and skips it later. The settings form asks the effort of each kept role (only levels its chosen model supports), then parallelism, workers per role, contract and budget. Build options from the facts and mark Storm's pick with `(추천)`.
    - `취소` or no answer: call nothing and say briefly that nothing changed.
 3. Search the web only when the user asks about a model missing from the facts, and cite sources.
 4. Finish with the `storm` tool: `action: "propose"`, the whole team as `config` (same shape as `<storm-recommended-config>`, model entries as `provider/id:effort`) and a Korean `rationale`. If the tool returns config errors, fix them and propose again.

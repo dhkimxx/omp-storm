@@ -182,10 +182,11 @@ describe("buildSetupRequest", () => {
 		expect(facts).toContain("<warnings>\n- 사전 지식 경고\n- 설정 파일 오류\n- 분석 경고\n</warnings>");
 	});
 
-	test("instructions: ask with (추천) labels, never the recommended field, first question, then propose", () => {
+	test("instructions: one ask form per step with (추천) labels, never the recommended field, first question, then propose", () => {
 		const text = buildSetupRequest(input());
 		const after = text.slice(text.indexOf("</storm-setup>"));
 		expect(after).toContain("`ask` 도구");
+		expect(after).toContain("단계마다 ask 한 번(form 하나)에 그 단계의 질문을 모두");
 		expect(after).toContain('" (추천)"');
 		expect(after).toContain("`recommended` 필드는 쓰지 마세요");
 		expect(after).toContain('"Storm 추천안 그대로 (추천)", "역할별로 고르기", "취소"');
