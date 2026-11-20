@@ -38,9 +38,6 @@ const config: StormConfig = {
 	runtime: "omp",
 };
 
-const LOCAL = "설정만 초기화";
-const ALL = "승인 기록까지 모두 초기화";
-
 let tmp: string;
 let project: string;
 let env: FlowEnv;
@@ -108,42 +105,37 @@ function scriptedUi(answers: Array<string | undefined>) {
 }
 
 describe("/storm reset", () => {
-	test("config only: deletes .omp/storm, keeps approvals for rollback and other .omp files", async () => {
-		await seed();
-		const f = scriptedUi([LOCAL, "초기화"]);
-		expect(await resetFlow(env, f.ui)).toBe(true);
-		expect(existsSync(stormDir())).toBe(false);
-		expect(existsSync(path.join(project, ".omp", "other.txt"))).toBe(true);
-		expect(await approvals()).toBe(1);
-		expect(f.notes.at(-1)).toContain("/storm rollback");
-
-		// Only what is left is offered next time.
-		const again = scriptedUi(["취소"]);
-		expect(await resetFlow(env, again.ui)).toBe(false);
-		expect(again.selects[0]?.options).toEqual([ALL, "취소"]);
-	});
-
-	test("everything: also deletes this repo's approval records, not other repos'", async () => {
+	test("one confirmation deletes .omp/storm and this repo's approvals; other repos and other .omp files stay", async () => {
 		const dir = await seed();
 		const other = path.join(path.dirname(dir), "git-other-000000000000000000000000");
 		await mkdir(other, { recursive: true });
 		await writeFile(path.join(other, "log.jsonl"), "");
-		const f = scriptedUi([ALL, "초기화"]);
+		const f = scriptedUi(["초기화"]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(f.selects.map(s => s.options)).toEqual([["초기화", "취소"]]);
 		expect(existsSync(stormDir())).toBe(false);
 		expect(existsSync(dir)).toBe(false);
 		expect(existsSync(path.join(other, "log.jsonl"))).toBe(true);
+		expect(existsSync(path.join(project, ".omp", "other.txt"))).toBe(true);
 		expect(f.notes.at(-1)).toContain("승인 1건");
 	});
 
-	test("nothing is deleted without the scope choice and the exact confirmation label", async () => {
+	test("nothing is deleted unless 초기화 is chosen", async () => {
 		await seed();
-		for (const answers of [[undefined], ["취소"], [LOCAL, "취소"], [LOCAL, undefined], [ALL, "네"]]) {
-			const f = scriptedUi(answers);
+		for (const answer of [undefined, "취소", "네"]) {
+			const f = scriptedUi([answer]);
 			expect(await resetFlow(env, f.ui)).toBe(false);
 			expect(existsSync(path.join(stormDir(), "config.json"))).toBe(true);
 			expect(await approvals()).toBe(1);
 		}
+	});
+
+	test("approval records left after .omp/storm was deleted by hand are still cleared", async () => {
+		const dir = await seed();
+		await rm(stormDir(), { recursive: true });
+		const f = scriptedUi(["초기화"]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(existsSync(dir)).toBe(false);
 	});
 
 	test("refuses while a run is active, before asking anything", async () => {
@@ -161,25 +153,27 @@ describe("/storm reset", () => {
 			costByModel: {},
 			spawns: [],
 		};
-		const f = scriptedUi([ALL, "초기화"]);
+		const f = scriptedUi(["초기화"]);
 		expect(await resetFlow({ ...env, activeRun: () => run }, f.ui)).toBe(false);
 		expect(f.selects).toEqual([]);
 		expect(f.notes[0]).toContain("run-x");
 		expect(existsSync(stormDir())).toBe(true);
 	});
 
-	test("a committed config is called out: deleting it leaves a git change to commit", async () => {
+	test("calls out a committed config and other worktrees that share the approvals", async () => {
 		await seed();
 		await git(project, "add", ".omp/storm/config.json");
 		await git(project, "commit", "-qm", "storm");
-		const f = scriptedUi([LOCAL, "초기화"]);
+		await git(project, "worktree", "add", path.join(tmp, "wt"));
+		const f = scriptedUi(["초기화"]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
 		expect(f.reports[0]).toContain("git에 커밋된 파일 1개(.omp/storm/config.json)");
+		expect(f.reports[0]).toContain("다른 worktree 1개");
 		expect(f.notes.at(-1)).toContain("직접 커밋");
 	});
 
 	test("nothing to reset: says so without asking", async () => {
-		const f = scriptedUi([ALL, "초기화"]);
+		const f = scriptedUi(["초기화"]);
 		expect(await resetFlow(env, f.ui)).toBe(false);
 		expect(f.selects).toEqual([]);
 		expect(f.notes).toEqual(["초기화할 Storm 설정이나 기록이 없습니다."]);

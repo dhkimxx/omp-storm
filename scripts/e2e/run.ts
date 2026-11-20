@@ -518,27 +518,22 @@ async function main(): Promise<void> {
 		const approvalsBeforeReset = approvalFiles().length;
 		frames = await command("/storm reset", choose("취소"));
 		check(
-			"초기화: 범위 질문, 취소하면 그대로",
-			uiTitled(frames, "어디까지 초기화할까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
+			"초기화: 확인 한 번, 취소하면 그대로",
+			uiTitled(frames, "Storm 설정과 기록을 모두 지울까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
 		);
-		const pick =
-			(scope: string): Answer =>
-			request => {
-				const options = (request.options as string[] | undefined) ?? [];
-				return options.includes(scope) ? scope : options.includes("초기화") ? "초기화" : undefined;
-			};
-		await command("/storm reset", pick("설정만 초기화"));
+		frames = await command("/storm reset", choose("초기화"));
 		check(
-			"초기화: 설정만 지우고 승인 기록은 남김",
-			!existsSync(join(PROJECT, ".omp", "storm")) && approvalFiles().length === approvalsBeforeReset,
+			"초기화: 설정과 승인 기록을 한 번에 삭제",
+			frames.filter(frame => frame.type === "extension_ui_request" && frame.method === "select").length === 1 &&
+				!existsSync(join(PROJECT, ".omp", "storm")) &&
+				approvalsBeforeReset > 0 &&
+				approvalFiles().length === 0,
 			`approvals=${approvalFiles().length}/${approvalsBeforeReset}`,
 		);
 		run = await spawn(["storm-implementer", "task"]);
 		check("초기화 후: storm 역할 차단", run.results.includes("Storm 설정이 없습니다"));
 		check("초기화 후: 일반 에이전트 정상", run.children.length === 1);
 		check("초기화 후: storm 도구 없음", run.main.length > 0 && run.main.every(entry => !entry.tools.includes("storm")));
-		await command("/storm reset", pick("승인 기록까지 모두 초기화"));
-		check("초기화: 승인 기록까지 삭제", approvalFiles().length === 0, `approvals=${approvalFiles().length}`);
 	} finally {
 		server.kill();
 		await server.exited;

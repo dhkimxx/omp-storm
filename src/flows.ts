@@ -38,7 +38,6 @@ import type {
 	StormConfig,
 	TrialView,
 	UiPort,
-	UiSelectItem,
 } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
@@ -320,9 +319,6 @@ export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	ui.notify(`${relative(state.repo.root, written.path)}를 ${shortHash(result.option.hash)}로 되돌렸습니다.`);
 }
 
-const RESET_LOCAL = "설정만 초기화";
-const RESET_ALL = "승인 기록까지 모두 초기화";
-
 async function pathExists(file: string): Promise<boolean> {
 	try {
 		await stat(file);
@@ -347,10 +343,16 @@ async function trackedFiles(env: FlowEnv, root: string, dir: string): Promise<st
 	return result?.code === 0 ? result.stdout.split("\n").filter(Boolean) : [];
 }
 
+/** Other worktrees of this repo; they share its approval records. */
+async function otherWorktrees(env: FlowEnv, root: string): Promise<number> {
+	const result = await env.exec("git", ["-C", root, "worktree", "list", "--porcelain"]).catch(() => undefined);
+	if (result?.code !== 0) return 0;
+	return Math.max(0, result.stdout.split("\n").filter(line => line.startsWith("worktree ")).length - 1);
+}
+
 /**
- * `/storm reset`: deletes the project's `.omp/storm/` and, when chosen, this repo's approval records outside the
- * project. Refuses while a run is active; deletes only after the scope choice and the exact "초기화" label.
- * Returns true when something was deleted.
+ * `/storm reset`: deletes the project's `.omp/storm/` and this repo's approval records in one go, after one
+ * exact "초기화". Refuses while a run is active. Returns true when something was deleted.
  */
 export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const state = await loadProjectState(env);
@@ -366,10 +368,12 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		ui.notify("초기화할 Storm 설정이나 기록이 없습니다.");
 		return false;
 	}
-	const [runs, proposals, tracked, approvals, log, last] = await Promise.all([
+	const git = state.repo.kind === "git-common-dir";
+	const [runs, proposals, tracked, worktrees, approvals, log, last] = await Promise.all([
 		countJson(runsDir(root)),
 		countJson(join(stateDir(root), "proposals")),
-		hasLocal && state.repo.kind === "git-common-dir" ? trackedFiles(env, root, local) : Promise.resolve([]),
+		hasLocal && git ? trackedFiles(env, root, local) : Promise.resolve([]),
+		hasApprovals && git ? otherWorktrees(env, root) : Promise.resolve(0),
 		state.store.list(),
 		state.store.log(),
 		lastRun(root),
@@ -377,50 +381,33 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const c = state.config;
 	const configLine =
 		c.status === "ok"
-			? `정상 · ${shortHash(c.hash)}${state.approval ? " (승인됨)" : " (미승인)"}`
+			? `설정 ${shortHash(c.hash)}(${state.approval ? "승인됨" : "미승인"})`
 			: c.status === "invalid"
-				? "오류"
-				: "없음";
-	const lines = [`### 프로젝트 안: \`${relative(root, local)}/\``];
+				? "설정(오류)"
+				: "설정 없음";
+	const lines = ["### 지울 것"];
 	if (hasLocal) {
-		lines.push(`- 설정: ${configLine}`, `- 실행 기록 ${runs}개 · 보류 제안 ${proposals}개 · 시험 카운터와 쿼터 표시`);
-		if (tracked.length) {
-			lines.push(`- 주의: git에 커밋된 파일 ${tracked.length}개(${tracked.join(", ")})는 지우면 변경 사항으로 남습니다. 커밋은 직접 하세요.`);
-		}
-		if (last?.status === "running") {
-			lines.push(`- 주의: 마지막 실행(${last.runId})이 진행 중으로 남아 있습니다. 다른 터미널에서 실행 중이면 끝난 뒤 초기화하세요.`);
-		}
-	} else lines.push("- 없음");
-	lines.push("", `### 프로젝트 밖: 승인 기록 (\`${state.store.dir}\`)`);
-	if (hasApprovals) {
-		lines.push(`- 유효한 승인 ${approvals.length}건 · 기록 ${log.length}줄 · 스냅숏과 근거`);
-		if (state.repo.kind === "git-common-dir") lines.push("- 이 저장소의 모든 워크트리가 함께 씁니다.");
-		lines.push(`- "${RESET_LOCAL}"을 고르면 남기므로, /storm rollback 으로 승인했던 설정을 되살릴 수 있습니다.`);
-	} else lines.push("- 없음");
-	lines.push("", "### 그대로 두는 것", "- `.omp/` 안의 다른 파일, 여러 프로젝트가 함께 쓰는 사용 기록 보관본, omp 설정");
-	ui.report("Storm 초기화 대상", lines.join("\n"));
-
-	const options: UiSelectItem[] = [];
-	if (hasLocal) options.push({ label: RESET_LOCAL, description: `${relative(root, local)}/ 삭제, 승인 기록은 남김` });
-	if (hasApprovals) options.push({ label: RESET_ALL, description: "프로젝트 밖 승인·스냅숏·근거·기록도 삭제" });
-	options.push("취소");
-	const scope = await ui.select("어디까지 초기화할까요?", options);
-	if (scope !== RESET_LOCAL && scope !== RESET_ALL) {
-		ui.notify("초기화하지 않았습니다.");
-		return false;
+		lines.push(`- \`${relative(root, local)}/\`: ${configLine}, 실행 기록 ${runs}개, 보류 제안 ${proposals}개, 시험 카운터·쿼터 표시`);
 	}
-	const confirmed = await ui.select(`${scope}: 지운 파일은 되돌릴 수 없습니다. 계속할까요?`, ["초기화", "취소"]);
-	if (confirmed !== "초기화") {
+	if (hasApprovals) lines.push(`- 승인 기록 \`${state.store.dir}\`: 유효한 승인 ${approvals.length}건, 기록 ${log.length}줄, 스냅숏·근거`);
+	if (tracked.length) {
+		lines.push(`- 주의: git에 커밋된 파일 ${tracked.length}개(${tracked.join(", ")})는 지우면 변경 사항으로 남습니다. 커밋은 직접 하세요.`);
+	}
+	if (worktrees > 0) lines.push(`- 주의: 이 저장소의 다른 worktree ${worktrees}개도 이 승인 기록을 씁니다. 그쪽 설정은 다시 승인해야 합니다.`);
+	if (last?.status === "running") {
+		lines.push(`- 주의: 마지막 실행(${last.runId})이 진행 중으로 남아 있습니다. 다른 터미널에서 실행 중이면 끝난 뒤 초기화하세요.`);
+	}
+	lines.push("", "### 그대로 두는 것", "- `.omp/`의 다른 파일, 여러 프로젝트가 함께 쓰는 사용 기록 보관본, omp 설정");
+	ui.report("Storm 초기화", lines.join("\n"));
+	if ((await ui.select("Storm 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.", ["초기화", "취소"])) !== "초기화") {
 		ui.notify("초기화하지 않았습니다.");
 		return false;
 	}
 	await rm(local, { recursive: true, force: true });
-	const removed = scope === RESET_ALL ? await state.store.clear() : 0;
-	const kept = scope === RESET_LOCAL && approvals.length > 0;
+	const removed = hasApprovals ? await state.store.clear() : 0;
 	ui.notify(
 		[
-			scope === RESET_ALL ? `Storm 설정과 승인 기록(승인 ${removed}건)을 지웠습니다.` : `${relative(root, local)}/ 를 지웠습니다.`,
-			kept ? `승인 기록 ${approvals.length}건은 남아 /storm rollback 으로 되살릴 수 있습니다.` : "다시 쓰려면 /storm setup 으로 팀을 설정하세요.",
+			`Storm 설정과 기록을 지웠습니다(승인 ${removed}건 포함). 다시 쓰려면 /storm setup 으로 팀을 설정하세요.`,
 			tracked.length ? "git에서 지워진 파일은 직접 커밋하세요." : "",
 		]
 			.filter(Boolean)
