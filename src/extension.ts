@@ -1,17 +1,71 @@
 /**
- * OMP Storm extension: the /storm command and spawn-time enforcement of the approved team.
+ * OMP Storm extension: /storm, the storm tool, spawn-time enforcement of the approved team, and Storm
+ * runs (keyword handoff, run-scoped policy, budget, telemetry). Module-level state is shared by every
+ * session in the process, because subagent sessions reuse this module.
  */
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type FlowEnv, reviewFlow, rollbackFlow, setupFlow, statusFlow } from "./flows.ts";
+import { resolveRepo } from "./approval/repo.ts";
+import { loadConfig } from "./config/store.ts";
+import { prepareAnalysis } from "./context.ts";
+import { readExplicitSettings } from "./discovery/settings.ts";
+import { approveAndSave, type FlowEnv, modelsFlow, reviewFlow, rollbackFlow, setupFlow, statusFlow } from "./flows.ts";
 import { execPort, ompBinary } from "./omp.ts";
-import { decideSpawn } from "./policy/spawn.ts";
+import { decideSpawn, stripEffort } from "./policy/spawn.ts";
+import { createProposalStore } from "./proposals/store.ts";
 import { ROLE_AGENT_PREFIX } from "./roles.ts";
+import { buildStormRequest, noteRunSpawn, RunController } from "./runtime/controller.ts";
+import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
+import { lastRun } from "./runtime/run.ts";
+import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
+import { trialPhase } from "./runtime/trials.ts";
+import { trialViews } from "./runtime/views.ts";
 import { createStateCache, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
+import type { StormToolHost } from "./tool/host.ts";
+import { createStormTool } from "./tool/storm-tool.ts";
+import type { ConfigLoad, ExplicitSettings, RepoIdentity, TrialConfig } from "./types.ts";
 import { createUiPort } from "./ui.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
-const SUBCOMMANDS = ["status", "setup", "review", "rollback"] as const;
+/** Handled without the LLM when the argument is exactly one of these. */
+const EXACT = ["status", "models", "setup", "review", "rollback"] as const;
+const COMPLETIONS = [...EXACT, "run"] as const;
+const CONFIG_TTL_MS = 5_000;
+
+const repoByCwd = new Map<string, Promise<RepoIdentity>>();
+const configByRoot = new Map<string, { at: number; load: Promise<ConfigLoad> }>();
+const spawnQueues = new Map<string, Promise<unknown>>();
+
+/** Spawn decisions of one project run one at a time, so parallel spawns never read the same trial counters. */
+function serialize<T>(key: string, task: () => Promise<T>): Promise<T> {
+	const next = (spawnQueues.get(key) ?? Promise.resolve()).then(task, task);
+	spawnQueues.set(
+		key,
+		next.catch(() => undefined),
+	);
+	return next;
+}
+
+function cachedConfig(root: string): Promise<ConfigLoad> {
+	const hit = configByRoot.get(root);
+	if (hit && Date.now() - hit.at < CONFIG_TTL_MS) return hit.load;
+	const load = loadConfig(root);
+	configByRoot.set(root, { at: Date.now(), load });
+	return load;
+}
+
+/** List-price spend of a finished assistant message, if any. */
+function assistantSpend(message: unknown): { selector: string; usd: number } | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	if (!("role" in message) || message.role !== "assistant") return undefined;
+	if (!("provider" in message) || !("model" in message) || !("usage" in message)) return undefined;
+	const { provider, model, usage } = message;
+	if (typeof provider !== "string" || typeof model !== "string" || !usage || typeof usage !== "object") return undefined;
+	const cost = "cost" in usage ? usage.cost : undefined;
+	const usd = cost && typeof cost === "object" && "total" in cost ? cost.total : undefined;
+	if (typeof usd !== "number" || !Number.isFinite(usd) || usd <= 0) return undefined;
+	return { selector: `${provider}/${model}`, usd };
+}
 
 function statusLabel(state: ProjectState): string | undefined {
 	if (state.config.status === "missing") return undefined;
@@ -28,6 +82,38 @@ export default function storm(pi: ExtensionAPI): void {
 		agentDir: pi.pi.getAgentDir(),
 		pluginAgentsDir: PLUGIN_AGENTS_DIR,
 	});
+	const repoFor = (ctx: ExtensionContext): Promise<RepoIdentity> => {
+		const hit = repoByCwd.get(ctx.cwd);
+		if (hit) return hit;
+		const repo = resolveRepo(ctx.cwd, exec);
+		repoByCwd.set(ctx.cwd, repo);
+		repo.catch(() => repoByCwd.delete(ctx.cwd));
+		return repo;
+	};
+
+	let keywordSettings: Promise<ExplicitSettings["magicKeywords"]> | undefined;
+	const usableKeywords = async (): Promise<{ workflowz: boolean; orchestrate: boolean }> => {
+		keywordSettings ??= readExplicitSettings(exec, ompBinary()).then(
+			settings => settings.magicKeywords,
+			() => undefined,
+		);
+		// omp enables both keywords by default; unreadable settings keep that default.
+		const keywords = (await keywordSettings) ?? { enabled: true, workflowz: true, orchestrate: true };
+		const tools = pi.getActiveTools();
+		return {
+			workflowz: tools.includes("task") && tools.includes("eval") && keywords.enabled && keywords.workflowz,
+			orchestrate: tools.includes("task") && keywords.enabled && keywords.orchestrate,
+		};
+	};
+
+	const runs = new RunController({
+		pi,
+		ui: ctx => createUiPort(pi, ctx),
+		loadState: ctx => loadProjectState(projectEnv(ctx)),
+		usableKeywords: () => usableKeywords(),
+		now: Date.now,
+	});
+
 	const flowEnv = (ctx: ExtensionContext): FlowEnv => ({
 		...projectEnv(ctx),
 		ompBin: ompBinary(),
@@ -36,12 +122,109 @@ export default function storm(pi: ExtensionAPI): void {
 		registry: ctx.modelRegistry,
 		activeTools: pi.getActiveTools(),
 		now: Date.now,
+		activeRun: () => runs.active(),
 	});
 
+	const toolHost = (ctx: ExtensionContext): StormToolHost => {
+		const ui = createUiPort(pi, ctx);
+		const root = async () => (await repoFor(ctx)).root;
+		const proposals = async () => {
+			const dir = await root();
+			return createProposalStore(dir, async () => {
+				const load = await loadConfig(dir);
+				return load.status === "ok" ? load.hash : null;
+			});
+		};
+		return {
+			ui,
+			now: Date.now,
+			loadState: () => loadProjectState(projectEnv(ctx)),
+			prepare: () => prepareAnalysis(flowEnv(ctx), ui),
+			approveAndSave: async (state, config, scope, evidence) => {
+				try {
+					return await approveAndSave(flowEnv(ctx), state, config, scope, evidence);
+				} finally {
+					stateCache.clear();
+					configByRoot.clear();
+				}
+			},
+			runtime: {
+				activeRun: () => runs.active(),
+				lastRun: async () => lastRun(await root()),
+				trials: async () => {
+					const dir = await root();
+					const load = await loadConfig(dir);
+					return load.status === "ok" ? trialViews(dir, load.config, Date.now()) : [];
+				},
+				quotaMarks: async () => readQuotaMarks(await root(), Date.now()),
+				addQuotaMark: async mark => addQuotaMark(await root(), mark),
+				requestRun: task => runs.request(task),
+			},
+			proposals: {
+				list: async () => (await proposals()).list(),
+				save: async proposal => (await proposals()).save(proposal),
+				remove: async id => (await proposals()).remove(id),
+			},
+		};
+	};
+
 	pi.on("before_subagent_spawn", async (event, ctx) => {
-		if (!event.agent.startsWith(ROLE_AGENT_PREFIX)) return undefined;
+		// Outside a Storm run only storm-* agents are Storm's business (v0.1 behavior).
+		if (!event.agent.startsWith(ROLE_AGENT_PREFIX) && !activeLedgerRun((await repoFor(ctx)).repoId)) return undefined;
 		const state = await stateCache.get(projectEnv(ctx));
-		return decideSpawn(event, { config: state.config, approval: state.approval, shadows: state.shadows });
+		const root = state.repo.root;
+		return serialize(root, async () => {
+			const now = Date.now();
+			const run = activeLedgerRun(state.repo.repoId);
+			const [quotaMarks, trials] = await Promise.all([readQuotaMarks(root, now), readTrialStates(root)]);
+			const outcome = decideSpawn(
+				event,
+				{ config: state.config, approval: state.approval, shadows: state.shadows },
+				{
+					now,
+					quotaMarks,
+					trials,
+					...(run ? { run: { runId: run.runId, costUsd: run.costUsd, ...(run.budget ? { budget: run.budget } : {}) } } : {}),
+				},
+			);
+			const record = outcome.record;
+			if (record?.trialId) {
+				const routed = record.outcome === "trial" ? 1 : 0;
+				await updateTrialState(root, record.trialId, current => ({ ...current, seen: current.seen + 1, routed: current.routed + routed }));
+			}
+			if (record && run) noteRunSpawn(run.runId, record);
+			return outcome.decision;
+		});
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		const spend = assistantSpend(event.message);
+		if (!spend) return;
+		const repo = await repoFor(ctx);
+		recordCost(repo.repoId, spend.selector, spend.usd);
+		// A trial's budget caps the candidate's spend while the trial runs (all of it, not only trial spawns: the safe side).
+		const load = await cachedConfig(repo.root);
+		const candidates: TrialConfig[] =
+			load.status === "ok" ? (load.config.trials ?? []).filter(trial => stripEffort(trial.model) === spend.selector) : [];
+		if (candidates.length === 0) return;
+		const states = await readTrialStates(repo.root);
+		const now = Date.now();
+		for (const trial of candidates) {
+			if (trialPhase(trial, states[trial.id], now).phase !== "active") continue;
+			await updateTrialState(repo.root, trial.id, current => ({ ...current, costUsd: current.costUsd + spend.usd }));
+		}
+	});
+
+	pi.on("agent_start", () => {
+		runs.onAgentStart();
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		await runs.onAgentEnd(event, ctx);
+	});
+
+	pi.on("session_shutdown", async () => {
+		await runs.finish("stopped");
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -53,30 +236,51 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 	});
 
+	pi.registerTool(createStormTool(pi.zod, ctx => toolHost(ctx)));
+
 	pi.registerCommand("storm", {
-		description: "Storm 멀티에이전트 팀 설정·현황·승인 (/storm [status|setup|review|rollback])",
+		description: "Storm 멀티에이전트 팀 (/storm [status|models|setup|review|rollback|run <작업>|<자연어 요청>])",
 		getArgumentCompletions: prefix =>
-			SUBCOMMANDS.filter(name => name.startsWith(prefix)).map(name => ({ value: name, label: name })),
+			COMPLETIONS.filter(name => name.startsWith(prefix)).map(name => ({ value: name, label: name })),
 		handler: async (args, ctx) => {
 			const ui = createUiPort(pi, ctx);
 			const env = flowEnv(ctx);
-			const sub = args.trim();
+			const input = args.trim();
 			try {
-				if (sub === "status") {
+				if (input === "status") {
 					await statusFlow(env, ui);
 					return;
 				}
-				if (!(SUBCOMMANDS as readonly string[]).includes(sub) && sub !== "") {
-					ui.notify("자연어 요청은 v0.2에서 지원합니다. 지금은 /storm, /storm status·setup·review·rollback 을 쓰세요.", "warning");
+				if (input === "models") {
+					await modelsFlow(env, ui);
+					return;
+				}
+				if (input === "run" || input.startsWith("run ")) {
+					const task = input.slice(3).trim();
+					if (!task) {
+						ui.notify("/storm run <작업> 형식으로 쓰세요.", "warning");
+						return;
+					}
+					await ctx.waitForIdle();
+					const result = await runs.start(ctx, task);
+					if (!result.ok) ui.notify(result.reason, "warning");
+					return;
+				}
+				if (input !== "" && !(EXACT as readonly string[]).includes(input)) {
+					// Natural language: the main LLM answers through the storm tool; changes still need the approval dialog.
+					await ctx.waitForIdle();
+					pi.sendUserMessage(buildStormRequest(input)).catch((error: unknown) => {
+						ui.notify(`요청을 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
+					});
 					return;
 				}
 				if (!ctx.hasUI) {
 					ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm status 는 쓸 수 있습니다.", "warning");
 					return;
 				}
-				if (sub === "setup") await setupFlow(env, ui);
-				else if (sub === "review") await reviewFlow(env, ui);
-				else if (sub === "rollback") await rollbackFlow(env, ui);
+				if (input === "setup") await setupFlow(env, ui);
+				else if (input === "review") await reviewFlow(env, ui);
+				else if (input === "rollback") await rollbackFlow(env, ui);
 				else {
 					const state = await loadProjectState(env);
 					if (state.config.status === "missing" || state.config.status === "invalid") await setupFlow(env, ui);
@@ -87,6 +291,7 @@ export default function storm(pi: ExtensionAPI): void {
 				ui.notify(`Storm 오류: ${error instanceof Error ? error.message : String(error)}`, "error");
 			} finally {
 				stateCache.clear();
+				configByRoot.clear();
 				if (ctx.hasUI) {
 					try {
 						ctx.ui.setStatus("storm", statusLabel(await loadProjectState(projectEnv(ctx))));

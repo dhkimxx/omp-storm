@@ -144,7 +144,7 @@ flowchart LR
 |---|---|
 | `/storm` (승인된 설정 없음) | 최초 설정 인터뷰 |
 | `/storm` (승인된 설정 있음) | 팀 현황(역할·모델·쿼터·비용·진행 중 작업)과 다음 행동 선택 |
-| `/storm status`, `setup`, `review`, `rollback` | 정확히 일치하면 LLM 호출 없이 처리. `rollback`도 승인 UI를 거친다 |
+| `/storm status`, `models`, `setup`, `review`, `rollback`, `run <작업>` | 정확히 일치하면 LLM 호출 없이 처리. `rollback`도 승인 UI를 거친다. `run`은 분류 없이 바로 실행을 인계한다 |
 | `/storm <그 외 자연어>` | 팀 계약과 함께 메인 세션에 인계. LLM이 작업 실행인지 관리 요청인지 판단 |
 
 ### 자연어 관리 연산 (`storm` 도구)
@@ -443,7 +443,7 @@ interface OrchestrationRuntimeAdapter {
 |---|---|---|
 | P0 스파이크 | 아래 질문 9개 | 완료(2026-11-20). 결과와 결정: [p0-results.md](p0-results.md) |
 | v0.1 최초 설정 | `/storm`: 탐지 → 사용 기록 분석(선호 모델, 실측 속도, 새 버전·가성비 후보) → 추천 → 인터뷰 → 승인 → `config.json` 저장, 역할 에이전트, 스폰 강제, 팀 현황, `rollback` | 완료(2026-11-20). [v0.1 결과](#v01-결과). 승인 없이 저장·강제 0건, 취소 시 무변경, 승인 밖 모델 스폰 차단, 해시 불일치 시 재승인 요구, 결측 지표를 추측으로 채우지 않음, Storm 설정 삭제 후 omp 동작이 원래와 같음 |
-| v0.2 자연어 인터페이스 | `/storm <자연어>`: 작업 실행 인계, 관리 연산(우선순위, 워커 추가, 모델 재선정, 모델 점검, 쿼터 대응), 시험 사용, 미인증 Provider·웹 조사 제안, 텔레메트리 | 승인 전 `config.json` 불변, 작업 실행 시 승인된 모델만 사용, 시험 사용은 승인된 비율·기간·예산 이내, 예산 준수, 결과와 선정 근거 역추적 가능 |
+| v0.2 자연어 인터페이스 | `/storm <자연어>`: 작업 실행 인계, 관리 연산(우선순위, 워커 추가, 모델 재선정, 모델 점검, 쿼터 대응), 시험 사용, 미인증 Provider·웹 조사 제안, 텔레메트리 | 완료(2026-11-20). [v0.2 결과](#v02-결과). 승인 전 `config.json` 불변, 작업 실행 시 승인된 모델만 사용, 시험 사용은 승인된 비율·기간·예산 이내, 예산 준수, 결과와 선정 근거 역추적 가능 |
 | v0.3 Orca 어댑터 | capability 탐지, run·task·worker·gate 매핑, 런타임 변경 연산 | 계약 테스트 통과, 이중 스케줄러 없음, 런타임 전환은 승인 필요 |
 | 이후 | Herdr, 원격 호스트, 외부 하네스, 벤치마크 수집, omp 설정 내보내기 | 어댑터 추가만으로 발견·인터뷰·실행 확장 |
 
@@ -463,6 +463,33 @@ interface OrchestrationRuntimeAdapter {
 - 사유를 확인하지 못한 '쓰다 멈춘 계열'은 표시만 하고 인터뷰에서 묻지 않는다.
 - `/storm`은 취소해도 사용 기록 일 단위 보관본(`<omp 에이전트 디렉터리>/storm/usage/`)을 남긴다. 설정과 승인은 바뀌지 않는다.
 - Orca 채팅 폼 지원과 `/agents` 화면 표시는 확인하지 않았다.
+
+### v0.2 결과
+
+완료 조건은 아래 검증으로 확인했다.
+
+- 단위 테스트 259개(`npm run verify`): v0.1 분량에 더해 비용 장부 임계값, 실행 기록, 인계 메시지(실제 키워드 매처로 검사), 시험 카운터 동시 갱신, 스폰 결정 v2(예산·시험·쿼터 순서·실행 중 다른 에이전트), 새 설정 필드 검증, 근거 저장, `storm` 도구의 모든 동작(정확히 "승인"일 때만 저장, UI 없으면 보류), 제안 저장소, 모델 점검·시험 비교 보고.
+- E2E 39개(`npm run e2e`, omp 19.0.1, 가짜 LLM). v0.1 19개는 그대로 통과했다. v0.2 20개는 다음을 확인했다.
+  - 인계에 workflowz 안내가 붙는다.
+  - 실행 중 승인 밖 모델 요청은 대체 역할 모델로 바뀌고, 실행 밖 일반 에이전트는 그대로다.
+  - 실행 기록이 남는다.
+  - 자연어 변경은 취소하면 그대로이고 승인하면 적용된다.
+  - UI가 없으면 제안만 보류되고, `/storm review`에서 승인하면 적용된다.
+  - 쿼터 대응은 승인 없이 다른 Provider 폴백으로 넘어간다.
+  - 시험 사용은 비율 0.5·최대 1회대로 현재 → 후보 → 현재로 라우팅되고, 끝나면 교체 여부를 묻는다.
+  - 예산을 넘으면 스폰이 막히고 실행 기록이 `budget-exceeded`로 남는다.
+- 실제 프로필(모델 호출 없음, 임시 프로젝트): `/storm models` 1.6초, `/storm status` 1.0초. 리뷰 역할에 새 버전 GPT-6.2-Sol, 탐색 역할에 Claude Haiku 5.5(비용 ×1.21)를 대안으로 보여 줬다.
+
+알려진 한계:
+
+- 비용은 메시지의 정가 환산 비용이라 구독형 Provider는 실제 청구와 다르거나 0으로 잡힌다.
+- 진행 중 요청과 병렬 워커만큼 예산을 넘을 수 있다.
+- 누계는 omp 프로세스 단위라 같은 프로젝트의 다른 omp 프로세스와는 합쳐지지 않는다.
+- 시험 예산은 시험 기간 중 후보 모델의 모든 요청을 센다(시험 스폰만 따로 셀 방법이 없다). 넘치게 세는 쪽이라 일찍 끝날 수는 있어도 넘지는 않는다.
+- 시험 비교의 TTFT p50은 행별 중앙값의 요청 가중 평균이다.
+- 쿼터 대응 표시는 사용자 요청으로만 생긴다. `omp usage`로 자동 감지하지 않는다.
+- `onExceed: "stop"`은 메인 턴을 중단한다. 이미 돌고 있는 자식이 함께 멈추는지는 확인하지 않았다.
+- 웹 조사는 사용자가 요청할 때 메인 LLM이 한다. Storm이 직접 하지 않는다.
 
 ### P0 질문
 
@@ -504,15 +531,26 @@ interface OrchestrationRuntimeAdapter {
 ```text
 omp-storm/
 ├── package.json             # name: omp-storm, omp.extensions: ["./src/extension.ts"]
-├── src/extension.ts         # /storm 명령, storm 도구, 스폰 훅
-├── src/discovery/           # omp CLI JSON, 런타임 탐지
+├── src/extension.ts         # /storm 명령, storm 도구 등록, 스폰 훅, 실행 이벤트 연결
+├── src/flows.ts             # setup·status·models·review·rollback 흐름
+├── src/context.ts           # 카탈로그·쿼터·사용 기록을 한 번 읽어 분석 (설정과 도구가 공유)
+├── src/discovery/           # omp CLI JSON(쿼터·설정), 모델 레지스트리
+├── src/history/             # stats.db 읽기 전용 집계, 일 단위 보관
+├── src/lineage/             # 계열 키, 가격 계층, 지표 대체, priors
 ├── src/analysis/            # 사용 기록 분석: 선호 모델, 실측 속도, 대안 후보
-├── src/recommend/           # 제약 필터, 점수, 설명
-├── src/interview/           # 검토 화면 상태 머신
-├── src/config/              # .omp/storm/config.json 스키마, 승인 해시
+├── src/recommend/           # 제약 필터, 순위, 설명
+├── src/interview/           # 설정 인터뷰, 현황·diff 화면
+├── src/config/              # .omp/storm/config.json 스키마, 정규화 해시
+├── src/approval/            # repo-id, 승인·근거 저장, 가림 감지
+├── src/policy/              # 스폰 결정(역할 교체, 실행 중 다른 에이전트, 예산, 시험, 쿼터 순서)
+├── src/runtime/             # 비용 장부, 실행 수명 주기·기록, 인계 메시지, 시험·쿼터 상태 파일
+├── src/tool/                # storm 도구와 호스트 계약
+├── src/proposals/           # 변경 제안 생성, 승인 창, 보류 저장
+├── src/report/              # 모델 점검, 시험 비교
 ├── agents/storm-*.md        # 역할 에이전트 정의
-├── skills/storm/SKILL.md    # LLM용 /storm 사용 계약
-├── priors/priors.yml        # 역할별 사전값
+├── skills/storm/SKILL.md    # LLM용 /storm·storm 도구·실행 계약
+├── priors/priors.yml        # 이름 어휘, 등급 순서, 계층 경계, alias
+├── scripts/e2e/             # 가짜 LLM으로 실제 omp에서 도는 E2E (패키지에 포함하지 않음)
 └── tests/
 
 spikes/p0/                    # P0 스파이크 하네스: 가짜 LLM 서버, 스파이크 플러그인, 시나리오 드라이버 (패키지에 포함하지 않음)

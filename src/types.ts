@@ -376,6 +376,28 @@ export interface RoleConfig {
 	/** Attempt order, "provider/id". */
 	models: string[];
 	effort?: Effort;
+	/** Workers of this role one Storm run may keep busy at once (default 1); stated in the run contract. */
+	workers?: number;
+}
+
+/** A bounded trial of a candidate model for one role (plan 9.3). Part of the hashed config, so approving the config approves the trial. */
+export interface TrialConfig {
+	/** Unique within the config, e.g. "implementer-gpt-6-2-sol-20261120". */
+	id: string;
+	/** Key into `roles`. */
+	role: string;
+	/** Candidate "provider/id". */
+	model: string;
+	effort?: Effort;
+	/** Fraction of the role's spawns routed to the candidate, 0 < share ≤ 1. */
+	share: number;
+	/** At most this many spawns go to the candidate (integer ≥ 1). */
+	maxSpawns: number;
+	/** ISO 8601; nothing is routed outside [startsAt, endsAt). */
+	startsAt: string;
+	endsAt: string;
+	/** List-price spend cap for the candidate's requests during the trial (USD > 0). */
+	budgetUsd: number;
 }
 
 export interface BudgetConfig {
@@ -394,6 +416,9 @@ export interface StormConfig {
 	contract: "workflowz" | "orchestrate";
 	runtime: "omp";
 	budget?: BudgetConfig;
+	/** Key into `roles`. During a Storm run, a non-Storm agent asking for an unapproved model gets this role's models; absent → blocked. */
+	fallbackRole?: string;
+	trials?: TrialConfig[];
 }
 
 export type ConfigLoad =
@@ -438,6 +463,8 @@ export interface ApprovalScope {
 	runtime: "omp";
 	/** Shadowing definitions the user saw and approved. */
 	shadowedAgents: ShadowInfo[];
+	fallbackRole?: string;
+	trials?: TrialConfig[];
 }
 
 export interface ApprovalRecord {
@@ -519,7 +546,7 @@ export type InterviewResult =
 	| { status: "cancelled"; at: string }
 	| { status: "no-ui" };
 
-/** Everything `/storm status` shows. */
+/** Everything `/storm status` shows. v0.2 runtime fields are optional; absent ones render as nothing. */
 export interface StatusView {
 	repo: RepoIdentity;
 	config: ConfigLoad;
@@ -528,6 +555,15 @@ export interface StatusView {
 	shadows: ShadowInfo[];
 	quota: QuotaStatus[];
 	dataAsOf: number | null;
+	/** The Storm run active in this process for this project. */
+	run?: RunRecord;
+	/** The most recent finished run. */
+	lastRun?: RunRecord;
+	trials?: TrialView[];
+	/** Active quota marks only. */
+	quotaMarks?: QuotaMark[];
+	/** Proposals still waiting for approval (built on the current config). */
+	pending?: Proposal[];
 }
 
 /** A previously approved config offered by `/storm rollback`. */
@@ -535,4 +571,225 @@ export interface RollbackOption {
 	hash: string;
 	approvedAt: string;
 	config: StormConfig;
+}
+
+// ── Runtime: runs, cost ledger, quota marks, trials (implemented in src/runtime) ──────────────
+
+export type RunStatus = "running" | "done" | "budget-exceeded" | "stopped";
+
+/** One spawn Storm decided: every storm-* spawn, and non-Storm spawns during a run. */
+export interface SpawnRecord {
+	/** ISO 8601. */
+	ts: string;
+	agent: string;
+	invocationKind: "task" | "eval";
+	/** Patterns core would have used, as received. */
+	requested: string[];
+	/**
+	 * routed: storm-* agent got its approved models · trial: routed to a trial candidate ·
+	 * allowed: non-Storm agent kept its (approved) model · substituted: non-Storm agent got `fallbackRole`'s models ·
+	 * blocked: spawn refused (`reason`).
+	 */
+	outcome: "routed" | "trial" | "allowed" | "substituted" | "blocked";
+	/** Models returned to omp, in attempt order (with effort suffix). */
+	models?: string[];
+	reason?: string;
+	/** Role key (storm-* agents and substitutions). */
+	role?: string;
+	/** Set when a trial was active for the role, whether or not this spawn was routed to it. */
+	trialId?: string;
+}
+
+/** `<root>/.omp/storm/state/runs/<runId>.json`: what one Storm run did and under which approval. */
+export interface RunRecord {
+	schema: "storm.run/v1";
+	runId: string;
+	configHash: string;
+	approvalId: string;
+	/** ISO 8601. */
+	startedAt: string;
+	endedAt?: string;
+	status: RunStatus;
+	/** Keyword the handoff carried; "none" when neither keyword was usable. */
+	contract: StormConfig["contract"] | "none";
+	/** The request, truncated to 200 characters. */
+	task: string;
+	/** List-price spend of every assistant message in this process while the run was active. */
+	costUsd: number;
+	/** Spend by "provider/model". */
+	costByModel: Record<string, number>;
+	budget?: BudgetConfig;
+	warnedAt?: string;
+	exceededAt?: string;
+	spawns: SpawnRecord[];
+}
+
+/** A provider reported out of quota; approved fallbacks on other providers go first until `until`. */
+export interface QuotaMark {
+	provider: string;
+	source: "user" | "usage";
+	/** ISO 8601. */
+	markedAt: string;
+	until: string;
+}
+
+/** Counters of one trial, kept in `<root>/.omp/storm/state/trials.json` by trial id. */
+export interface TrialState {
+	id: string;
+	/** Spawns of the trial's role decided while the trial was active. */
+	seen: number;
+	/** Of those, routed to the candidate. */
+	routed: number;
+	/** Candidate's list-price spend while the trial was active. */
+	costUsd: number;
+	/** ISO 8601, set once the trial stops routing. */
+	endedAt?: string;
+	endReason?: "time" | "spawns" | "budget";
+}
+
+/** Measured comparison of a trial candidate with the role's primary model since the trial started (stats DB, subagent seat). */
+export interface TrialSide {
+	selector: string;
+	requests: number;
+	errorRate: number | null;
+	ompTps: number | null;
+	decodeTps: number | null;
+	ttftP50: number | null;
+	costPerRequest: number | null;
+}
+
+export interface TrialComparison {
+	candidate: TrialSide;
+	current: TrialSide;
+	dataAsOf: number | null;
+}
+
+export interface TrialView {
+	trial: TrialConfig;
+	state: TrialState | undefined;
+	/** "pending" before startsAt, "active" while it may still route, "ended" once time, spawns or budget ran out. */
+	phase: "pending" | "active" | "ended";
+	comparison?: TrialComparison;
+}
+
+/** Spawn-time runtime facts beyond the v0.1 SpawnState. */
+export interface SpawnRuntime {
+	now: number;
+	/** The run active in this process for this project, if any. */
+	run?: { runId: string; costUsd: number; budget?: BudgetConfig };
+	/** Active marks only. */
+	quotaMarks: QuotaMark[];
+	/** Trial counters by trial id. */
+	trials: Record<string, TrialState>;
+}
+
+export interface SpawnOutcome {
+	decision: SpawnDecision;
+	/** Undefined when Storm stays out (non-Storm agent outside a run). */
+	record?: SpawnRecord;
+}
+
+// ── Proposals and evidence (implemented in src/proposals) ─────────────────────────────────────
+
+export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget";
+
+/** Why the approved models were chosen, stored per config hash next to the approval. */
+export interface EvidenceRecord {
+	schema: "storm.evidence/v1";
+	/** ISO 8601. */
+	createdAt: string;
+	source: "setup" | ProposalKind;
+	priority: Priority;
+	dataAsOf: number | null;
+	roles: Record<
+		string,
+		{
+			chosen: string | null;
+			candidates: Array<{
+				selector: string;
+				label: string;
+				validated: boolean;
+				int: number | null;
+				speed: number | null;
+				referenceUsd: number | null;
+				why: string[];
+				whyNot: string[];
+			}>;
+		}
+	>;
+}
+
+/** A config change the storm tool proposed; nothing changes until the user approves it. */
+export interface Proposal {
+	schema: "storm.proposal/v1";
+	id: string;
+	kind: ProposalKind;
+	/** ISO 8601. */
+	createdAt: string;
+	/** One line for lists. */
+	summary: string;
+	/** Hash of the config the proposal was built on; stale once the config moves on. */
+	baseHash: string;
+	config: StormConfig;
+	evidence?: EvidenceRecord;
+}
+
+// ── Shared analysis context (implemented in src/context.ts) ──────────────────────────────────
+
+/** Catalog, quota, usage and analysis read once; recommendations re-rank without re-reading. */
+export interface AnalysisContext {
+	now: number;
+	catalog: ModelInfo[];
+	available: ModelInfo[];
+	quota: QuotaStatus[];
+	explicit: ExplicitSettings;
+	usage: UsageSnapshot;
+	analysis: Analysis;
+	lineage: LineageFn;
+	/** Keyed by modelKey. */
+	tiers: Map<string, PriceTierInfo>;
+	/** Priors and data warnings. */
+	warnings: string[];
+	recommend(priority: Priority): RoleRecommendation[];
+	checkModel: InterviewInput["checkModel"];
+	detection(activeTools: string[], extraWarnings?: string[]): DetectionSummary;
+}
+
+// ── storm tool (implemented in src/tool) ────────────────────────────────────────────────────
+
+export type StormToolAction =
+	| "status"
+	| "models"
+	| "priority"
+	| "workers"
+	| "reselect"
+	| "quota"
+	| "trial"
+	| "budget"
+	| "run";
+
+/** Arguments the LLM passes; each action reads only its own fields. */
+export interface StormToolParams {
+	action: StormToolAction;
+	/** priority */
+	priority?: Priority;
+	/** workers, reselect, trial */
+	role?: RoleId;
+	/** workers: absolute count for the role */
+	workers?: number;
+	/** reselect: the model the user named; trial: the candidate */
+	model?: string;
+	/** quota */
+	provider?: string;
+	/** trial */
+	share?: number;
+	maxSpawns?: number;
+	days?: number;
+	/** trial budget, or budget.perRunUsd */
+	budgetUsd?: number;
+	/** budget */
+	warnAtUsd?: number;
+	onExceed?: BudgetConfig["onExceed"];
+	/** run */
+	task?: string;
 }

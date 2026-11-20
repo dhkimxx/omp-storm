@@ -136,6 +136,9 @@ function decide(request: ChatRequest): Decision {
 		.filter(message => message.role === "user")
 		.map(message => textOf(message.content))
 		.join("\n");
+	// Checked first: a storm-tool argument (e.g. a run's task) may itself carry a SPIKE directive.
+	const stormTool = fresh.match(/STORM-TOOL[ \t]+(\{.*\})/);
+	if (stormTool?.[1]) return { kind: "tool", name: "storm", args: JSON.parse(stormTool[1]) as Record<string, unknown> };
 	const spawn = fresh.match(/SPIKE-(TASK|EVAL)((?:[ \t]+[\w.-]+)+)/);
 	if (spawn) {
 		const agents = spawn[2].trim().split(/\s+/);

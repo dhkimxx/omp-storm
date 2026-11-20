@@ -9,6 +9,7 @@ import type {
 	RoleRecommendation,
 	ShadowInfo,
 	StormConfig,
+	TrialConfig,
 	UiPort,
 } from "../types.ts";
 import {
@@ -36,6 +37,9 @@ const BACK = "뒤로";
 const CANCEL = "취소";
 const CUSTOM = "직접 입력";
 export const APPROVE_SAVE = "승인 후 저장";
+const WORKERS = "워커 수";
+const OTHER_AGENTS = "다른 에이전트 처리";
+const BLOCK = "차단";
 
 type Step = "summary" | "priority" | "review" | "edit" | "evidence" | "final";
 
@@ -49,6 +53,12 @@ export function buildConfig(
 		contract: StormConfig["contract"];
 		budget?: BudgetConfig;
 		efforts?: Record<string, Effort | null>;
+		/** Workers per role id; roles not listed get `defaultWorkers`. */
+		workers?: Record<string, number>;
+		/** undefined → implementer when present; null → non-Storm agents are blocked during a run. */
+		fallbackRole?: string | null;
+		/** Kept for roles that still exist. */
+		trials?: TrialConfig[];
 	},
 ): StormConfig {
 	const roles: Record<string, RoleConfig> = {};
@@ -62,6 +72,7 @@ export function buildConfig(
 			opts.efforts && rec.role.id in opts.efforts ? opts.efforts[rec.role.id] : (c?.effort ?? null);
 		const role: RoleConfig = { agent: rec.role.agent, models: fb ? [selector, fb.selector] : [selector] };
 		if (effort) role.effort = effort;
+		role.workers = opts.workers?.[rec.role.id] ?? defaultWorkers(rec.role.id);
 		roles[rec.role.id] = role;
 	}
 	const config: StormConfig = {
@@ -74,6 +85,10 @@ export function buildConfig(
 		runtime: "omp",
 	};
 	if (opts.budget) config.budget = opts.budget;
+	const fallback = opts.fallbackRole === undefined ? "implementer" : opts.fallbackRole;
+	if (fallback !== null && Object.hasOwn(roles, fallback)) config.fallbackRole = fallback;
+	const trials = opts.trials?.filter((t) => Object.hasOwn(roles, t.role));
+	if (trials?.length) config.trials = structuredClone(trials);
 	return config;
 }
 
@@ -92,7 +107,21 @@ export function deriveScope(config: StormConfig, shadows: ShadowInfo[]): Approva
 		shadowedAgents: [...shadows],
 	};
 	if (config.budget) scope.budget = { ...config.budget };
+	if (config.fallbackRole !== undefined) scope.fallbackRole = config.fallbackRole;
+	if (config.trials) scope.trials = structuredClone(config.trials);
 	return scope;
+}
+
+/** Explorers fan out over independent reads; other roles default to one worker. */
+export function defaultWorkers(roleId: string): number {
+	return roleId === "explorer" ? 2 : 1;
+}
+
+/** Interview start values from the current config. A v0.2 config (roles carry workers) without fallbackRole was blocked on purpose. */
+function initialFallback(current: StormConfig | undefined): string | null | undefined {
+	if (!current) return undefined;
+	if (current.fallbackRole !== undefined) return current.fallbackRole;
+	return Object.values(current.roles).some((r) => r.workers !== undefined) ? null : undefined;
 }
 
 function initialPicks(recs: RoleRecommendation[]): Record<string, number | string> {
@@ -117,6 +146,10 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 	const isolation = input.defaults.isolation;
 	let contract = input.defaults.contract;
 	let budget: BudgetConfig | undefined = input.current?.config.budget;
+	const workers: Record<string, number> = {};
+	for (const [id, r] of Object.entries(input.current?.config.roles ?? {})) if (r.workers !== undefined) workers[id] = r.workers;
+	let fallbackRole = initialFallback(input.current?.config);
+	const trials = input.current?.config.trials;
 	const cancelled = (at: Step): InterviewResult => ({ status: "cancelled", at });
 	const config = () =>
 		buildConfig(recs, picks, {
@@ -125,7 +158,10 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 			isolation,
 			contract,
 			efforts,
+			workers,
+			...(fallbackRole !== undefined ? { fallbackRole } : {}),
 			...(budget ? { budget } : {}),
+			...(trials ? { trials } : {}),
 		});
 
 	for (;;) {
@@ -158,9 +194,20 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 				break;
 			}
 			case "review": {
+				const draft = config();
+				const resolvedWorkers: Record<string, number> = {};
+				for (const rec of recs) resolvedWorkers[rec.role.id] = workers[rec.role.id] ?? defaultWorkers(rec.role.id);
 				ui.report(
 					"추천 팀 구성",
-					renderTeam(recs, picks, { parallelism, isolation, contract, ...(budget ? { budget } : {}) }),
+					renderTeam(recs, picks, {
+						parallelism,
+						isolation,
+						contract,
+						workers: resolvedWorkers,
+						...(budget ? { budget } : {}),
+						...(draft.fallbackRole !== undefined ? { fallbackRole: draft.fallbackRole } : {}),
+						...(draft.trials ? { trials: draft.trials } : {}),
+					}),
 				);
 				const a = await ui.select("추천 구성을 어떻게 할까요?", ["전체 수락", "항목 수정", "근거 보기", BACK, CANCEL]);
 				if (a === "전체 수락") {
@@ -183,7 +230,15 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 			}
 			case "edit": {
 				const roleItems = recs.map((r) => `역할: ${r.role.title}`);
-				const a = await ui.select("수정할 항목", [...roleItems, "병렬도", "실행 계약", "예산", BACK]);
+				const a = await ui.select("수정할 항목", [
+					...roleItems,
+					"병렬도",
+					"실행 계약",
+					"예산",
+					WORKERS,
+					OTHER_AGENTS,
+					BACK,
+				]);
 				if (a === BACK) {
 					step = "review";
 					break;
@@ -212,6 +267,14 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 					const b = await askBudget(ui, budget);
 					if (b === undefined) return cancelled(step);
 					budget = b === null ? undefined : b;
+				} else if (a === WORKERS) {
+					const r = await editWorkers(ui, recs, (id) => workers[id] ?? defaultWorkers(id));
+					if (r === undefined) return cancelled(step);
+					if (r !== BACK) workers[r.role] = r.workers;
+				} else if (a === OTHER_AGENTS) {
+					const r = await editFallback(ui, recs, config().fallbackRole);
+					if (r === undefined) return cancelled(step);
+					if (r !== BACK) fallbackRole = r;
 				} else return cancelled(step);
 				break;
 			}
@@ -228,6 +291,44 @@ export async function runSetupInterview(ui: UiPort, input: InterviewInput): Prom
 			}
 		}
 	}
+}
+
+async function editWorkers(
+	ui: UiPort,
+	recs: RoleRecommendation[],
+	current: (roleId: string) => number,
+): Promise<{ role: string; workers: number } | typeof BACK | undefined> {
+	const titles = recs.map((r) => r.role.title);
+	const a = await ui.select("워커 수를 바꿀 역할", [...titles, BACK]);
+	if (a === BACK) return BACK;
+	const rec = a === undefined ? undefined : recs[titles.indexOf(a)];
+	if (!rec) return undefined;
+	const now = current(rec.role.id);
+	const n = await ui.select(`${rec.role.title} 워커 수 (현재: ${now})`, ["1", "2", "3", "4", CUSTOM, BACK]);
+	if (n === BACK) return BACK;
+	if (n === CUSTOM) {
+		const v = await askNumber(ui, `${rec.role.title} 워커 수 (1-16)`, String(now), (v) =>
+			Number.isInteger(v) && v >= 1 && v <= 16 ? undefined : "1에서 16 사이 정수를 입력하세요.",
+		);
+		return v === undefined ? undefined : { role: rec.role.id, workers: v };
+	}
+	const v = Number(n);
+	return n !== undefined && Number.isInteger(v) && v >= 1 && v <= 4 ? { role: rec.role.id, workers: v } : undefined;
+}
+
+/** Role id to substitute, null to block, BACK, or undefined when cancelled. */
+async function editFallback(
+	ui: UiPort,
+	recs: RoleRecommendation[],
+	current: string | undefined,
+): Promise<string | null | typeof BACK | undefined> {
+	const labels = recs.map((r) => `${r.role.title} 역할 모델로 바꾸기`);
+	const now = current === undefined ? BLOCK : `${recs.find((r) => r.role.id === current)?.role.title ?? current} 역할 모델`;
+	const a = await ui.select(`실행 중 다른 에이전트 처리 (현재: ${now})`, [...labels, BLOCK, BACK]);
+	if (a === BACK) return BACK;
+	if (a === BLOCK) return null;
+	const i = a === undefined ? -1 : labels.indexOf(a);
+	return recs[i]?.role.id;
 }
 
 type RolePick = { pick: number | string; effort: Effort | null | undefined };

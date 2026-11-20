@@ -1,3 +1,4 @@
+import { ROLES } from "../roles.ts";
 import type {
 	Analysis,
 	BudgetConfig,
@@ -6,10 +7,16 @@ import type {
 	MetricValue,
 	QuotaState,
 	RoleRecommendation,
+	RunRecord,
+	RunStatus,
 	Seat,
+	SpawnRecord,
 	StatusView,
 	StormConfig,
 	Tier,
+	TrialConfig,
+	TrialSide,
+	TrialView,
 } from "../types.ts";
 
 const DASH = "—";
@@ -195,21 +202,34 @@ export function pickedCandidate(rec: RoleRecommendation, pick: number | string |
 export function renderTeam(
 	recs: RoleRecommendation[],
 	picks: Record<string, number | string>,
-	extra: { parallelism: number; isolation: string; contract: string; budget?: BudgetConfig },
+	extra: {
+		parallelism: number;
+		isolation: string;
+		contract: string;
+		budget?: BudgetConfig;
+		/** Workers per role id; missing roles show the contract default of 1. */
+		workers?: Record<string, number>;
+		/** Role id whose models non-Storm agents get during a run; absent → blocked. */
+		fallbackRole?: string;
+		trials?: TrialConfig[];
+	},
 ): string {
-	const out = ["| 역할 | 모델 | effort | 계층 | 근거 | 폴백 |", "|---|---|---|---|---|---|"];
+	const out = ["| 역할 | 모델 | effort | 계층 | 근거 | 폴백 | 워커 |", "|---|---|---|---|---|---|---|"];
 	for (const rec of recs) {
 		const pick = picks[rec.role.id];
 		const c = pickedCandidate(rec, pick);
 		const fb = fallbackOf(rec, typeof pick === "string" ? pick : c?.selector);
+		const workers = extra.workers?.[rec.role.id] ?? 1;
 		if (typeof pick === "string") {
-			out.push(`| ${rec.role.title} | ${cell(pick)} (직접 입력) | ${DASH} | ${DASH} | 사용자 지정 | ${fb?.selector ?? DASH} |`);
+			out.push(
+				`| ${rec.role.title} | ${cell(pick)} (직접 입력) | ${DASH} | ${DASH} | 사용자 지정 | ${fb?.selector ?? DASH} | ${workers} |`,
+			);
 		} else if (c) {
 			out.push(
-				`| ${rec.role.title} | ${cell(c.label)} (${cell(c.selector)}) | ${c.effort ?? DASH} | ${tierLabel(c.tier)} | ${cell(c.why[0] ?? DASH)} | ${fb?.selector ?? DASH} |`,
+				`| ${rec.role.title} | ${cell(c.label)} (${cell(c.selector)}) | ${c.effort ?? DASH} | ${tierLabel(c.tier)} | ${cell(c.why[0] ?? DASH)} | ${fb?.selector ?? DASH} | ${workers} |`,
 			);
 		} else {
-			out.push(`| ${rec.role.title} | 후보 없음 | ${DASH} | ${DASH} | ${DASH} | ${DASH} |`);
+			out.push(`| ${rec.role.title} | 후보 없음 | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${workers} |`);
 		}
 	}
 	out.push(
@@ -218,8 +238,32 @@ export function renderTeam(
 		`- 격리: ${extra.isolation}`,
 		`- 실행 계약: ${extra.contract}`,
 		`- 예산: ${extra.budget ? budgetText(extra.budget) : "없음"}`,
+		`- 실행 중 다른 에이전트: ${fallbackText(extra.fallbackRole)}`,
 	);
+	if (extra.trials?.length) {
+		out.push("- 시험:");
+		for (const t of extra.trials) out.push(`  - ${trialText(t)}`);
+	}
 	return out.join("\n");
+}
+
+export function roleTitle(id: string): string {
+	return ROLES.find((r) => r.id === id)?.title ?? id;
+}
+
+function fallbackText(role: string | undefined): string {
+	return role === undefined ? "차단" : `${roleTitle(role)} 역할 모델로 대체`;
+}
+
+/** Local "YYYY-MM-DD HH:mm" for ISO strings; unparsable text is shown as is. */
+function isoText(s: string): string {
+	const t = Date.parse(s);
+	return Number.isFinite(t) ? time(t) : s;
+}
+
+/** One line describing a trial: role, candidate, share, spawn cap, period and budget. */
+export function trialText(t: TrialConfig): string {
+	return `${roleTitle(t.role)} · ${t.model}${t.effort ? `:${t.effort}` : ""} · 비율 ${pct(t.share)} · 최대 ${t.maxSpawns}회 · ${isoText(t.startsAt)} ~ ${isoText(t.endsAt)} · 예산 $${t.budgetUsd}`;
 }
 
 function budgetText(b: BudgetConfig): string {
@@ -277,11 +321,24 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 		const b = next.roles[id];
 		line(`${id} 모델`, a && a.models.join(" → "), b ? b.models.join(" → ") : "(삭제)");
 		line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
+		line(`${id} 워커`, a ? String(a.workers ?? 1) : undefined, b ? String(b.workers ?? 1) : DASH);
 	}
 	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));
 	line("격리", prev?.isolation, next.isolation);
 	line("실행 계약", prev?.contract, next.contract);
 	line("예산", prev && (prev.budget ? budgetText(prev.budget) : "없음"), next.budget ? budgetText(next.budget) : "없음");
+	line("실행 중 다른 에이전트", prev && fallbackText(prev.fallbackRole), fallbackText(next.fallbackRole));
+	const prevTrials = new Map((prev?.trials ?? []).map((t) => [t.id, t]));
+	const nextTrials = new Map((next.trials ?? []).map((t) => [t.id, t]));
+	for (const id of new Set([...prevTrials.keys(), ...nextTrials.keys()])) {
+		const a = prevTrials.get(id);
+		const b = nextTrials.get(id);
+		if (prev === undefined) {
+			if (b) rows.push(`- 시험 ${id}: ${trialText(b)}`);
+		} else if (!a && b) rows.push(`- 시험 ${id}: 추가 · ${trialText(b)}`);
+		else if (a && !b) rows.push(`- 시험 ${id}: 삭제`);
+		else if (a && b && trialText(a) !== trialText(b)) rows.push(`- 시험 ${id}: ${trialText(a)} → ${trialText(b)}`);
+	}
 	if (!rows.length) return "변경 없음";
 	return (prev === undefined ? "새 설정\n" : "") + rows.join("\n");
 }
@@ -306,8 +363,30 @@ export function renderStatus(view: StatusView, now: number): string {
 	if (c.status === "ok") {
 		out.push("", "### 역할별 모델");
 		for (const [id, r] of Object.entries(c.config.roles)) {
-			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}`);
+			const workers = r.workers !== undefined ? ` · 워커 ${r.workers}` : "";
+			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}${workers}`);
 		}
+		if (c.config.fallbackRole !== undefined) {
+			out.push(`- 실행 중 다른 에이전트: ${fallbackText(c.config.fallbackRole)}`);
+		}
+	}
+	if (view.run) {
+		const r = view.run;
+		out.push("", "### 실행 중", `- ${r.runId} · 시작 ${isoText(r.startedAt)} · ${spendText(r.costUsd, r.budget)}`);
+	}
+	if (view.lastRun) out.push("", "### 마지막 실행", ...lastRunLines(view.lastRun));
+	if (view.trials?.length) {
+		out.push("", "### 시험");
+		for (const t of view.trials) out.push(...trialViewLines(t));
+	}
+	if (view.quotaMarks?.length) {
+		out.push("", "### 쿼터 소진 표시");
+		for (const m of view.quotaMarks) out.push(`- ${m.provider}: ${isoText(m.until)}까지 다른 provider 우선`);
+	}
+	if (view.pending?.length) {
+		out.push("", `### 승인 대기 제안 (${view.pending.length}건)`);
+		for (const p of view.pending) out.push(`- ${p.summary}`);
+		out.push("- /storm review 로 승인하세요");
 	}
 	out.push("", "### 쿼터");
 	if (!view.quota.length) out.push(`- ${DASH}`);
@@ -326,4 +405,74 @@ export function renderStatus(view: StatusView, now: number): string {
 			: "- 하드 상한은 `omp --max-cost <USD>` 또는 `session.maxCost`로 거세요.",
 	);
 	return out.join("\n") + renderShadows(view.shadows);
+}
+
+const RUN_STATUS: Record<RunStatus, string> = {
+	running: "진행 중",
+	done: "완료",
+	"budget-exceeded": "예산 초과",
+	stopped: "중단",
+};
+const OUTCOME: Record<SpawnRecord["outcome"], string> = {
+	routed: "배정",
+	trial: "시험",
+	allowed: "허용",
+	substituted: "대체",
+	blocked: "차단",
+};
+const PHASE: Record<TrialView["phase"], string> = { pending: "시작 전", active: "진행 중", ended: "종료" };
+const END_REASON: Record<NonNullable<NonNullable<TrialView["state"]>["endReason"]>, string> = {
+	time: "기간 만료",
+	spawns: "횟수 소진",
+	budget: "예산 소진",
+};
+
+function spendText(cost: number, budget: BudgetConfig | undefined): string {
+	return `지출 ${usd(cost)}${budget ? ` / 예산 $${budget.perRunUsd}` : ""}`;
+}
+
+function lastRunLines(run: RunRecord): string[] {
+	const counts = new Map<SpawnRecord["outcome"], number>();
+	for (const s of run.spawns) counts.set(s.outcome, (counts.get(s.outcome) ?? 0) + 1);
+	const spawns = counts.size
+		? (Object.keys(OUTCOME) as Array<SpawnRecord["outcome"]>)
+				.filter((o) => counts.has(o))
+				.map((o) => `${OUTCOME[o]} ${counts.get(o)}`)
+				.join(", ")
+		: "없음";
+	const out = [`- ${run.runId} · ${RUN_STATUS[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
+	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
+	if (blocked?.reason) out.push(`- 첫 차단: ${blocked.agent} · ${blocked.reason}`);
+	return out;
+}
+
+function trialViewLines(v: TrialView): string[] {
+	const t = v.trial;
+	const s = v.state;
+	const end = s?.endedAt
+		? `종료 ${isoText(s.endedAt)}${s.endReason ? ` (${END_REASON[s.endReason]})` : ""}`
+		: `종료 예정 ${isoText(t.endsAt)}`;
+	const out = [
+		`- ${t.id} (${roleTitle(t.role)} · ${t.model}): ${PHASE[v.phase]} · 배정 ${s?.routed ?? 0}/${t.maxSpawns} · 지출 ${usd(s?.costUsd ?? 0)} / $${t.budgetUsd} · ${end}`,
+	];
+	const cmp = v.comparison;
+	if (cmp) {
+		const row = (label: string, f: (x: TrialSide) => string) =>
+			`| ${label} | ${cell(f(cmp.candidate))} | ${cell(f(cmp.current))} |`;
+		out.push(
+			"",
+			"| 항목 | 후보 | 현재 |",
+			"|---|---|---|",
+			row("모델", (x) => x.selector),
+			row("요청", (x) => String(x.requests)),
+			row("오류율", (x) => pct(x.errorRate)),
+			row("omp tok/s", (x) => int(x.ompTps)),
+			row("생성 tok/s", (x) => int(x.decodeTps)),
+			row("TTFT p50", (x) => ms(x.ttftP50)),
+			row("요청당 비용", (x) => usd(x.costPerRequest)),
+			`- 측정 기준: ${time(cmp.dataAsOf)}`,
+			"",
+		);
+	}
+	return out;
 }

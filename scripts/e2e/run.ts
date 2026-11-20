@@ -19,6 +19,8 @@ interface LlmEntry {
 	roles: string[];
 	spike: string[];
 	child: boolean;
+	notices: { workflowz: string[]; orchestrate: string[] };
+	users: string[];
 }
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -33,8 +35,29 @@ const PROFILE_ROOT = join(homedir(), ".omp", "profiles", PROFILE);
 const AGENT_DIR = join(PROFILE_ROOT, "agent");
 const CONFIG = join(PROJECT, ".omp", "storm", "config.json");
 const SHADOW = join(PROJECT, ".omp", "agents", "storm-implementer.md");
-const MODEL_ARGS = ["--model", "fake/general-b", "--smol", "fake/cheap-a", "--slow", "fake/general-b", "--plan", "fake/general-b"];
-const BASE_ARGS = ["--profile", PROFILE, "--no-session", "--no-title", "--auto-approve", ...MODEL_ARGS, "-e", ROOT];
+const MAIN_MODEL = "fake/general-b";
+const baseArgs = (model = MAIN_MODEL): string[] => [
+	"--profile",
+	PROFILE,
+	"--no-session",
+	"--no-title",
+	"--auto-approve",
+	"--model",
+	model,
+	"--smol",
+	"fake/cheap-a",
+	"--slow",
+	"fake/general-b",
+	"--plan",
+	"fake/general-b",
+	"-e",
+	ROOT,
+];
+/** Session flavor: the main model (one outside the approved team makes non-Storm agents ask for it) and extra flags. */
+interface Flavor {
+	model?: string;
+	flags?: string[];
+}
 
 const MODELS = {
 	fake: [
@@ -80,8 +103,16 @@ class Rpc {
 	readonly #proc: Subprocess<"pipe", "pipe", "pipe">;
 	#seq = 0;
 
-	constructor(readonly answer: Answer) {
-		this.#proc = Bun.spawn([OMP, "--mode", "rpc", ...BASE_ARGS], { cwd: PROJECT, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+	constructor(
+		readonly answer: Answer,
+		flavor: Flavor = {},
+	) {
+		this.#proc = Bun.spawn([OMP, "--mode", "rpc", ...baseArgs(flavor.model), ...(flavor.flags ?? [])], {
+			cwd: PROJECT,
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		void this.#pump();
 	}
 
@@ -131,8 +162,8 @@ class Rpc {
 	}
 }
 
-async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>): Promise<T> {
-	const rpc = new Rpc(answer);
+async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>, flavor: Flavor = {}): Promise<T> {
+	const rpc = new Rpc(answer, flavor);
 	try {
 		await until(() => rpc.find(frame => frame.type === "ready"), 30_000, "rpc ready");
 		return await body(rpc);
@@ -156,7 +187,7 @@ async function command(line: string, answer: Answer): Promise<Frame[]> {
 }
 
 /** Asks the fake model to spawn the agents; returns child requests and async results. */
-async function spawn(agents: string[]): Promise<{ children: LlmEntry[]; results: string }> {
+async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children: LlmEntry[]; results: string }> {
 	const before = readLlm().length;
 	return session(noAnswer, async rpc => {
 		const from = rpc.frames.length;
@@ -173,7 +204,35 @@ async function spawn(agents: string[]): Promise<{ children: LlmEntry[]; results:
 			.map(textOf)
 			.join("\n");
 		return { children: readLlm().slice(before).filter(entry => entry.child && entry.tools.length > 0), results };
-	});
+	}, flavor);
+}
+
+/** Sends a prompt and returns every frame until the session has settled and stayed quiet (handoffs start follow-up turns). */
+async function converse(message: string, answer: Answer, flavor: Flavor = {}): Promise<{ frames: Frame[]; llm: LlmEntry[] }> {
+	const before = readLlm().length;
+	return session(
+		answer,
+		async rpc => {
+			const from = rpc.frames.length;
+			rpc.send({ type: "prompt", message });
+			const deadline = Date.now() + 120_000;
+			let seen = rpc.frames.length;
+			let quietSince = Date.now();
+			for (;;) {
+				await Bun.sleep(200);
+				if (rpc.frames.length !== seen) {
+					seen = rpc.frames.length;
+					quietSince = Date.now();
+					continue;
+				}
+				const settled = rpc.find(frame => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true), from);
+				if (settled && Date.now() - quietSince >= 3_000) break;
+				if (Date.now() > deadline) throw new Error(`timeout waiting for quiet: ${message}`);
+			}
+			return { frames: rpc.frames.slice(from), llm: readLlm().slice(before) };
+		},
+		flavor,
+	);
 }
 
 const failures: string[] = [];
@@ -274,12 +333,131 @@ async function main(): Promise<void> {
 		const hashBefore = configHashOnDisk();
 		const approvalsBefore = approvalFiles().length;
 		const llmBefore = readLlm().length;
-		const print = Bun.spawnSync([OMP, "-p", ...BASE_ARGS, "/storm setup"], { cwd: PROJECT, timeout: 120_000 });
+		const print = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm setup"], { cwd: PROJECT, timeout: 120_000 });
 		check("print 모드: 변경 없음", configHashOnDisk() === hashBefore && approvalFiles().length === approvalsBefore, `exit=${print.exitCode}`);
 		check("print 모드: 모델 호출 없음", readLlm().length === llmBefore);
 
 		frames = await command("/storm status", noAnswer);
 		check("status: 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
+
+		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
+		type StoredRole = { models: string[]; effort?: string; workers?: number };
+		type StoredConfig = { priority: string; roles: Record<string, StoredRole>; trials?: unknown[]; budget?: { perRunUsd: number } };
+		type StoredRun = { status: string; contract: string; spawns: Array<{ outcome: string; agent: string }> };
+		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
+		const idOf = (selector: string | undefined): string | undefined => selector?.split("/").slice(1).join("/");
+		const providerOf = (selector: string | undefined): string | undefined => selector?.split("/")[0];
+		const stateDir = join(PROJECT, ".omp", "storm", "state");
+		const runFiles = (): StoredRun[] => {
+			const dir = join(stateDir, "runs");
+			if (!existsSync(dir)) return [];
+			return readdirSync(dir)
+				.filter(file => file.endsWith(".json"))
+				.sort()
+				.map(file => JSON.parse(readFileSync(join(dir, file), "utf8")) as StoredRun);
+		};
+		const proposalFiles = (): string[] => {
+			const dir = join(stateDir, "proposals");
+			return existsSync(dir) ? readdirSync(dir).filter(file => file.endsWith(".json")) : [];
+		};
+		const choose =
+			(label: string): Answer =>
+			request =>
+				((request.options as string[] | undefined) ?? []).includes(label) ? label : undefined;
+		const uiTitled = (frames: Frame[], title: string): boolean =>
+			frames.some(frame => frame.type === "extension_ui_request" && String(frame.title).startsWith(title));
+		/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
+		const OUTSIDER = "fake/premium-c";
+
+		let team = readConfig();
+		let primary = team.roles.implementer?.models[0];
+		check("v0.2 전제: 대체 확인용 모델은 승인 밖", !Object.values(team.roles).some(role => role.models.includes(OUTSIDER)));
+		let talk = await converse("/storm run SPIKE-TASK storm-implementer task", noAnswer, { model: OUTSIDER });
+		// The hidden notice is delivered with the handoff, so the logged (truncated) user text may not show the contract itself.
+		const noticed = talk.llm.some(entry => !entry.child && entry.notices.workflowz.length > 0);
+		check("실행: 인계에 workflowz 계약", noticed && runFiles().at(-1)?.contract === "workflowz", `contract=${runFiles().at(-1)?.contract} noticed=${noticed}`);
+		const runChildren = talk.llm.filter(entry => entry.child && entry.tools.length > 0);
+		check(
+			"실행: storm 역할·승인 밖 요청 모두 승인 모델로",
+			runChildren.length === 2 && runChildren.every(entry => entry.model === idOf(primary)),
+			`children=${runChildren.map(entry => entry.model).join(",")} expected=${idOf(primary)}`,
+		);
+		const firstRun = runFiles().at(-1);
+		check(
+			"실행: 기록(완료, 교체·대체)",
+			firstRun?.status === "done" && firstRun.spawns.some(s => s.outcome === "routed") && firstRun.spawns.some(s => s.outcome === "substituted"),
+			`${firstRun?.status} ${firstRun?.spawns.map(s => s.outcome).join(",")}`,
+		);
+		check("실행: 결과 보고", talk.frames.some(frame => textOf(frame).includes("Storm 실행 결과")));
+		run = await spawn(["task"], { model: OUTSIDER });
+		check("실행 밖: 일반 에이전트는 그대로", run.children[0]?.model === idOf(OUTSIDER), `child=${run.children[0]?.model}`);
+
+		let hash = configHashOnDisk();
+		let approvals = approvalFiles().length;
+		const priorityRequest = '/storm STORM-TOOL {"action":"priority","priority":"cost"}';
+		talk = await converse(priorityRequest, choose("취소"));
+		check("자연어 변경: 승인 창 표시", uiTitled(talk.frames, "이 변경을 승인할까요"));
+		check("자연어 변경: 취소하면 그대로", configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 0);
+		await converse(priorityRequest, choose("승인"));
+		team = readConfig();
+		check("자연어 변경: 승인하면 적용", team.priority === "cost" && approvalFiles().length === approvals + 1, `priority=${team.priority}`);
+
+		hash = configHashOnDisk();
+		approvals = approvalFiles().length;
+		await converse('/storm STORM-TOOL {"action":"workers","role":"reviewer","workers":3}', noAnswer, { flags: ["--no-ui"] });
+		check(
+			"UI 없음: 제안만 보류",
+			configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 1,
+			`proposals=${proposalFiles().length}`,
+		);
+		await command("/storm review", request => {
+			const options = (request.options as string[] | undefined) ?? [];
+			if (String(request.title).startsWith("보류 중인 변경 제안")) return options[0];
+			return options.includes("승인") ? "승인" : undefined;
+		});
+		team = readConfig();
+		check("리뷰: 보류 제안 승인", team.roles.reviewer?.workers === 3 && proposalFiles().length === 0, `workers=${team.roles.reviewer?.workers}`);
+
+		const implementerModels = team.roles.implementer?.models ?? [];
+		const fallback = implementerModels.find(model => providerOf(model) !== providerOf(implementerModels[0]));
+		if (fallback) {
+			hash = configHashOnDisk();
+			await converse(`/storm STORM-TOOL {"action":"quota","provider":"${providerOf(implementerModels[0])}"}`, noAnswer);
+			check("쿼터 대응: 승인 없이 표시만", configHashOnDisk() === hash && existsSync(join(stateDir, "quota-marks.json")));
+			run = await spawn(["storm-implementer"]);
+			check("쿼터 대응: 다른 Provider 폴백으로", run.children[0]?.model === idOf(fallback), `child=${run.children[0]?.model} expected=${idOf(fallback)}`);
+			rmSync(join(stateDir, "quota-marks.json"), { force: true });
+		} else console.log(`SKIP 쿼터 대응: 구현 역할의 폴백이 다른 Provider에 없음 (${implementerModels.join(", ")})`);
+
+		primary = team.roles.implementer?.models[0];
+		const candidate = ["fake/general-b", "fake2/general-e", "fake/cheap-a"].find(model => model !== primary) ?? "fake/general-b";
+		await converse(
+			`/storm STORM-TOOL {"action":"trial","role":"implementer","model":"${candidate}","share":0.5,"maxSpawns":1,"days":1,"budgetUsd":1}`,
+			choose("승인"),
+		);
+		team = readConfig();
+		check("시험 사용: 승인 후 설정에 추가", (team.trials?.length ?? 0) === 1);
+		const routedTo: Array<string | undefined> = [];
+		for (let i = 0; i < 3; i++) routedTo.push((await spawn(["storm-implementer"])).children[0]?.model);
+		check(
+			"시험 사용: 비율·횟수대로 라우팅",
+			routedTo.join(",") === [idOf(primary), idOf(candidate), idOf(primary)].join(","),
+			`${routedTo.join(",")} expected=${idOf(primary)},${idOf(candidate)},${idOf(primary)}`,
+		);
+		frames = await command("/storm status", request => (String(request.title).startsWith("시험 사용이 끝났습니다") ? "나중에" : undefined));
+		check("시험 사용: 끝나면 교체 여부 질문", uiTitled(frames, "시험 사용이 끝났습니다"));
+
+		await converse('/storm STORM-TOOL {"action":"budget","budgetUsd":0.0005}', choose("승인"));
+		team = readConfig();
+		check("예산: 승인 후 설정", team.budget?.perRunUsd === 0.0005, JSON.stringify(team.budget));
+		talk = await converse("/storm run SPIKE-TASK storm-implementer", noAnswer, { model: OUTSIDER });
+		const budgetRun = runFiles().at(-1);
+		check(
+			"예산: 넘으면 새 스폰 차단",
+			talk.frames.some(frame => textOf(frame).includes("Storm 실행 예산")) && !talk.llm.some(entry => entry.child),
+			`children=${talk.llm.filter(entry => entry.child).length}`,
+		);
+		check("예산: 실행 기록", budgetRun?.status === "budget-exceeded", `status=${budgetRun?.status}`);
 
 		rmSync(join(PROJECT, ".omp", "storm"), { recursive: true, force: true });
 		run = await spawn(["storm-implementer", "task"]);

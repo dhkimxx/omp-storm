@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { canonicalJson, configHash, parseStrictJson } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, loadConfig, serializeConfig, writeConfig } from "../src/config/store.ts";
-import type { StormConfig } from "../src/types.ts";
+import type { StormConfig, TrialConfig } from "../src/types.ts";
 
 const base: StormConfig = {
 	version: 1,
@@ -23,6 +23,21 @@ const base: StormConfig = {
 
 function clone(): Record<string, any> {
 	return structuredClone(base) as Record<string, any>;
+}
+
+const trial: TrialConfig = {
+	id: "reviewer-c-20261120",
+	role: "reviewer",
+	model: "openai/gpt-6",
+	share: 0.25,
+	maxSpawns: 10,
+	startsAt: "2026-11-20T00:00:00.000Z",
+	endsAt: "2026-11-27T00:00:00.000Z",
+	budgetUsd: 5,
+};
+
+function withTrial(c: Record<string, any>, over: Record<string, unknown>): void {
+	c.trials = [{ ...trial, ...over }];
 }
 
 function parsed(text: string): unknown {
@@ -130,6 +145,31 @@ describe("validateConfig", () => {
 		["warn above limit", c => (c.budget.warnAtUsd = 3), "budget.warnAtUsd:"],
 		["warn zero", c => (c.budget.warnAtUsd = 0), "budget.warnAtUsd:"],
 		["onExceed", c => (c.budget.onExceed = "ignore"), "budget.onExceed:"],
+		["workers zero", c => (c.roles.reviewer.workers = 0), "roles.reviewer.workers: 1~16 사이 정수여야 합니다"],
+		["workers 17", c => (c.roles.reviewer.workers = 17), "roles.reviewer.workers:"],
+		["workers fraction", c => (c.roles.reviewer.workers = 1.5), "roles.reviewer.workers:"],
+		["workers string", c => (c.roles.reviewer.workers = "2"), "roles.reviewer.workers:"],
+		["fallbackRole unknown", c => (c.fallbackRole = "implementer"), "fallbackRole: roles에 있는 역할이어야 합니다"],
+		["fallbackRole non-string", c => (c.fallbackRole = 1), "fallbackRole:"],
+		["fallbackRole prototype key", c => (c.fallbackRole = "toString"), "fallbackRole:"],
+		["trials object", c => (c.trials = {}), "trials: 배열이어야 합니다"],
+		["trial item", c => (c.trials = [1]), "trials[0]: 객체여야 합니다"],
+		["trial empty id", c => withTrial(c, { id: " " }), "trials[0].id:"],
+		["trial duplicate id", c => (c.trials = [trial, { ...trial }]), "trials[1].id: 중복된 id입니다"],
+		["trial role", c => withTrial(c, { role: "implementer" }), "trials[0].role:"],
+		["trial model", c => withTrial(c, { model: "gpt-6" }), "trials[0].model: provider/id 형식이 아닙니다"],
+		["trial effort", c => withTrial(c, { effort: "huge" }), "trials[0].effort:"],
+		["trial share zero", c => withTrial(c, { share: 0 }), "trials[0].share:"],
+		["trial share above one", c => withTrial(c, { share: 1.2 }), "trials[0].share:"],
+		["trial maxSpawns zero", c => withTrial(c, { maxSpawns: 0 }), "trials[0].maxSpawns:"],
+		["trial maxSpawns 1001", c => withTrial(c, { maxSpawns: 1001 }), "trials[0].maxSpawns:"],
+		["trial maxSpawns fraction", c => withTrial(c, { maxSpawns: 2.5 }), "trials[0].maxSpawns:"],
+		["trial startsAt garbage", c => withTrial(c, { startsAt: "tomorrow" }), "trials[0].startsAt:"],
+		["trial startsAt without zone", c => withTrial(c, { startsAt: "2026-11-20T00:00:00" }), "trials[0].startsAt:"],
+		["trial endsAt invalid date", c => withTrial(c, { endsAt: "2026-13-45T00:00:00Z" }), "trials[0].endsAt:"],
+		["trial endsAt not after", c => withTrial(c, { endsAt: trial.startsAt }), "trials[0].endsAt: startsAt보다 뒤여야 합니다"],
+		["trial budget zero", c => withTrial(c, { budgetUsd: 0 }), "trials[0].budgetUsd:"],
+		["trial budget missing", c => withTrial(c, { budgetUsd: undefined }), "trials[0].budgetUsd:"],
 	];
 	for (const [name, mutate, expected] of cases) {
 		test(`rejects ${name}`, () => {
@@ -146,6 +186,18 @@ describe("validateConfig", () => {
 		delete c.budget;
 		delete c.roles.reviewer.effort;
 		expect(validateConfig(c).errors).toEqual([]);
+	});
+
+	test("accepts workers, fallbackRole and trials, and warns on unknown trial fields", () => {
+		const c = clone();
+		c.roles.reviewer.workers = 16;
+		c.roles.explorer.workers = 1;
+		c.fallbackRole = "reviewer";
+		c.trials = [trial, { ...trial, id: "t2", effort: "high", share: 1, maxSpawns: 1000, endsAt: "2026-11-27T09:00:00.5+09:00", note: 1 }];
+		const r = validateConfig(c);
+		expect(r.errors).toEqual([]);
+		expect(r.config?.trials).toHaveLength(2);
+		expect(r.warnings).toEqual(["trials[1].note: 알 수 없는 필드입니다"]);
 	});
 });
 

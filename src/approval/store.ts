@@ -2,7 +2,14 @@ import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "nod
 import * as path from "node:path";
 import { serializeConfig } from "../config/store.ts";
 import { STORM_VERSION } from "../roles.ts";
-import type { ApprovalLogEntry, ApprovalRecord, ApprovalScope, RepoIdentity, StormConfig } from "../types.ts";
+import type {
+	ApprovalLogEntry,
+	ApprovalRecord,
+	ApprovalScope,
+	EvidenceRecord,
+	RepoIdentity,
+	StormConfig,
+} from "../types.ts";
 
 const HASH_PREFIX = "jcs-sha256:";
 const LOCK_STALE_MS = 30_000;
@@ -116,6 +123,10 @@ export class ApprovalStore {
 		return path.join(this.dir, "snapshots", `${hex}.json`);
 	}
 
+	private evidencePath(hex: string): string {
+		return path.join(this.dir, "evidence", `${hex}.json`);
+	}
+
 	private async withLock<T>(fn: () => Promise<T>): Promise<T> {
 		await mkdir(this.dir, { recursive: true });
 		const lockPath = path.join(this.dir, ".lock");
@@ -192,6 +203,8 @@ export class ApprovalStore {
 		via: string;
 		ompVersion: string;
 		supersedes: string | null;
+		/** Why these models were chosen; stored per hash before the approval record. */
+		evidence?: EvidenceRecord;
 	}): Promise<ApprovalRecord> {
 		const hex = hexOf(input.configHash);
 		return this.withLock(async () => {
@@ -211,6 +224,7 @@ export class ApprovalStore {
 				expiresAt: null,
 			};
 			await writeAtomic(this.snapshotPath(hex), serializeConfig(input.config));
+			if (input.evidence) await writeAtomic(this.evidencePath(hex), toJson(input.evidence));
 			await writeAtomic(this.approvedPath(hex), toJson(record));
 			await this.appendLog({
 				ts: approvedAt,
@@ -263,6 +277,14 @@ export class ApprovalStore {
 	async snapshot(configHash: string): Promise<StormConfig | undefined> {
 		const value = parseJson(await readText(this.snapshotPath(hexOf(configHash))));
 		return typeof value === "object" && value !== null ? (value as StormConfig) : undefined;
+	}
+
+	async evidence(configHash: string): Promise<EvidenceRecord | undefined> {
+		const value = parseJson(await readText(this.evidencePath(hexOf(configHash))));
+		// Written only by approve; the schema check filters foreign or torn files.
+		return typeof value === "object" && value !== null && "schema" in value && value.schema === "storm.evidence/v1"
+			? (value as EvidenceRecord)
+			: undefined;
 	}
 
 	async log(): Promise<ApprovalLogEntry[]> {

@@ -2,36 +2,35 @@
  * /storm flows: setup (detect → analyze → recommend → interview → approve → save), status, review, rollback.
  * Nothing is written unless an interview step returned an explicit approval.
  */
-import { join, relative } from "node:path";
-import { analyze } from "./analysis/analyze.ts";
+import { relative } from "node:path";
 import { configHash, sha256Hex } from "./config/canonical.ts";
 import { serializeConfig, writeConfig } from "./config/store.ts";
-import { collectModels } from "./discovery/models.ts";
+import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
-import { readExplicitSettings } from "./discovery/settings.ts";
-import { archiveDays, readUsageWithArchive } from "./history/archive.ts";
+import { buildEvidence } from "./evidence.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
 import { renderStatus } from "./interview/render.ts";
 import { runReview, runRollback } from "./interview/review.ts";
 import { deriveScope, runSetupInterview } from "./interview/setup.ts";
-import { createLineage, displayLabel } from "./lineage/key.ts";
-import { fillInt, fillTps } from "./lineage/metrics.ts";
-import { loadPriors } from "./lineage/priors.ts";
-import { assignTiers } from "./lineage/price.ts";
-import { recommend } from "./recommend/recommend.ts";
+import { newProposalId } from "./proposals/build.ts";
+import { presentProposal } from "./proposals/present.ts";
+import { createProposalStore } from "./proposals/store.ts";
+import { renderModelCheck } from "./report/models.ts";
 import { ROLES } from "./roles.ts";
-import { loadProjectState, type ProjectEnv, type ProjectState, stormDir } from "./state.ts";
+import { lastRun } from "./runtime/run.ts";
+import { readQuotaMarks } from "./runtime/state-files.ts";
+import { trialViews } from "./runtime/views.ts";
+import { loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type {
-	DetectionSummary,
-	ExplicitSettings,
+	EvidenceRecord,
 	InterviewInput,
-	ModelInfo,
 	Priority,
-	QuotaStatus,
+	Proposal,
 	RollbackOption,
+	RunRecord,
 	StormConfig,
+	TrialView,
 	UiPort,
-	UsageSnapshot,
 } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
@@ -42,75 +41,23 @@ export interface FlowEnv extends ProjectEnv {
 	registry: { getAll(kind?: string): unknown[]; getAvailable(kind?: string): unknown[] };
 	activeTools: string[];
 	now: () => number;
+	/** The Storm run active in this session, for status. */
+	activeRun?: () => RunRecord | undefined;
 }
 
-const WINDOW_DAYS = 30;
-const STALE_MS = 6 * 3_600_000;
-const STATS_REFRESH_TIMEOUT_MS = 120_000;
 const DEFAULTS: InterviewInput["defaults"] = { parallelism: 4, isolation: "shared", contract: "workflowz" };
 
 function shortHash(hash: string): string {
 	return hash.replace(/^jcs-sha256:/, "").slice(0, 12);
 }
 
-/** Usage over the window; refreshes omp's stats DB first when it lags (it only syncs when `omp stats` runs). */
-async function loadUsage(env: FlowEnv, ui: UiPort): Promise<UsageSnapshot> {
-	const dbPath = statsDbPath();
-	const dir = join(stormDir(env.agentDir), "usage");
-	const read = () => readUsageWithArchive({ dbPath, dir, windowDays: WINDOW_DAYS, now: env.now() });
-	let usage = read();
-	if (usage.status === "ok" && usage.dataAsOf !== null && env.now() - usage.dataAsOf > STALE_MS) {
-		ui.notify("사용 기록이 오래돼 omp stats로 갱신합니다…");
-		const result = await env.exec(env.ompBin, ["stats", "--summary"], { timeout: STATS_REFRESH_TIMEOUT_MS });
-		if (result.code === 0) usage = read();
-		else ui.notify("사용 기록 갱신에 실패해 기존 기록으로 분석합니다.", "warning");
-	}
-	if (usage.status === "ok") archiveDays({ dbPath, dir, now: env.now() });
-	return usage;
-}
-
-function detectionSummary(input: {
-	available: ModelInfo[];
-	quota: QuotaStatus[];
-	activeTools: string[];
-	explicit: ExplicitSettings;
-	usage: UsageSnapshot;
-	now: number;
-	warnings: string[];
-}): DetectionSummary {
-	const counts = new Map<string, number>();
-	for (const model of input.available) counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
-	const task = input.activeTools.includes("task");
-	const evalTool = input.activeTools.includes("eval");
-	// omp enables both keywords by default; unreadable settings keep that default.
-	const keywords = input.explicit.magicKeywords ?? { enabled: true, workflowz: true, orchestrate: true };
-	const stale = input.usage.dataAsOf !== null && input.now - input.usage.dataAsOf > STALE_MS;
-	return {
-		providers: [...counts]
-			.sort(([a], [b]) => a.localeCompare(b))
-			.map(([provider, models]) => ({
-				provider,
-				models,
-				quota: input.quota.find(entry => entry.provider === provider)?.state ?? "unknown",
-			})),
-		tools: { task, eval: evalTool },
-		keywords: {
-			workflowz: task && evalTool && keywords.enabled && keywords.workflowz,
-			orchestrate: task && keywords.enabled && keywords.orchestrate,
-		},
-		explicit: input.explicit,
-		dataAsOf: input.usage.dataAsOf,
-		stale,
-		warnings: input.warnings,
-	};
-}
-
-/** Writes the approval first, then the file, so the config never exists unapproved after a successful setup. */
-async function approveAndSave(
+/** Writes the approval (and the evidence behind it) first, then the file, so the config never exists unapproved after a successful save. */
+export async function approveAndSave(
 	env: FlowEnv,
 	state: ProjectState,
 	config: StormConfig,
 	scope: Parameters<ProjectState["store"]["approve"]>[0]["scope"],
+	evidence?: EvidenceRecord,
 ): Promise<string> {
 	const hash = configHash(config);
 	await state.store.approve({
@@ -121,59 +68,36 @@ async function approveAndSave(
 		via: env.mode,
 		ompVersion: env.ompVersion,
 		supersedes: state.approval?.approvalId ?? null,
+		...(evidence ? { evidence } : {}),
 	});
 	const written = await writeConfig(state.repo.root, config);
 	if (written.hash !== hash) throw new Error(`저장한 설정의 해시가 승인한 해시와 다릅니다(${shortHash(written.hash)})`);
 	return hash;
 }
 
+function proposalStore(state: ProjectState) {
+	const hash = state.config.status === "ok" ? state.config.hash : null;
+	return createProposalStore(state.repo.root, async () => hash);
+}
+
 export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
-	const now = env.now();
-	const { catalog, available } = collectModels(env.registry);
-	const [quota, explicit, usage] = await Promise.all([
-		readQuota(env.exec, env.ompBin, now),
-		readExplicitSettings(env.exec, env.ompBin),
-		loadUsage(env, ui),
-	]);
-	const { priors, warnings } = loadPriors({ userPath: join(stormDir(env.agentDir), "priors.yml"), now });
-	const lineage = createLineage(catalog, priors);
-	const tiers = assignTiers(catalog, lineage, priors);
-	const variantOf = (model: ModelInfo) => lineage(model.provider, model.id, model.identity).variant;
-	const deps = {
-		lineage,
-		tiers,
-		fillInt: (route: ModelInfo, siblings: ModelInfo[], key: string) => fillInt(route, siblings, priors, key),
-		fillTps: (
-			route: ModelInfo,
-			measured: { decodeTps: number | null; samples: number } | undefined,
-			siblings: ModelInfo[],
-		) => fillTps(route, measured, siblings, variantOf(route), new Map(siblings.map(s => [s.selector, variantOf(s)]))),
-		label: displayLabel,
-	};
-	const analysis = analyze({ usage, catalog, quota, ...deps, now });
+	const ctx = await prepareAnalysis(env, ui);
 	const current =
 		state.config.status === "ok"
 			? { config: state.config.config, hash: state.config.hash, approved: state.approval !== undefined }
 			: undefined;
 	const priority: Priority = current?.config.priority ?? "balanced";
-	const rerecommend = (next: Priority) =>
-		recommend({ analysis, catalog, quota, usage, ...deps, priority: next, roles: ROLES });
-	const detectionWarnings = [...warnings];
+	const detectionWarnings: string[] = [];
 	if (state.config.status === "invalid") detectionWarnings.push(`지금 설정 파일에 오류가 있어 새로 만듭니다: ${state.config.errors[0] ?? ""}`);
 	const result = await runSetupInterview(ui, {
-		detection: detectionSummary({ available, quota, activeTools: env.activeTools, explicit, usage, now, warnings: detectionWarnings }),
-		analysis,
-		recommendations: rerecommend(priority),
+		detection: ctx.detection(env.activeTools, detectionWarnings),
+		analysis: ctx.analysis,
+		recommendations: ctx.recommend(priority),
 		...(current ? { current } : {}),
 		shadows: state.shadows,
-		rerecommend,
-		checkModel: selector => {
-			const model = available.find(entry => entry.selector === selector.trim());
-			if (!model) return { ok: false, reason: `${selector.trim()}: 지금 쓸 수 있는 모델이 아닙니다` };
-			if (!model.supportsTools) return { ok: false, reason: `${model.selector}: 도구 호출을 지원하지 않습니다` };
-			return { ok: true, label: model.name, efforts: model.efforts };
-		},
+		rerecommend: ctx.recommend,
+		checkModel: ctx.checkModel,
 		defaults: current
 			? { parallelism: current.config.parallelism, isolation: current.config.isolation, contract: current.config.contract }
 			: DEFAULTS,
@@ -183,7 +107,15 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		ui.notify("저장하지 않았습니다. 바뀐 것은 없습니다.");
 		return;
 	}
-	const hash = await approveAndSave(env, state, result.config, result.scope);
+	const evidence = buildEvidence({
+		source: "setup",
+		priority: result.config.priority,
+		dataAsOf: ctx.usage.dataAsOf,
+		recommendations: ctx.recommend(result.config.priority),
+		config: result.config,
+		now: env.now(),
+	});
+	const hash = await approveAndSave(env, state, result.config, result.scope, evidence);
 	ui.notify(`Storm 팀을 승인하고 저장했습니다(${shortHash(hash)}).`);
 	await statusFlow(env, ui);
 }
@@ -191,15 +123,101 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
 	const now = env.now();
-	const quota = await readQuota(env.exec, env.ompBin, now);
+	const root = state.repo.root;
+	const config = state.config.status === "ok" ? state.config.config : undefined;
+	const [quota, quotaMarks, last, trials, pending] = await Promise.all([
+		readQuota(env.exec, env.ompBin, now),
+		readQuotaMarks(root, now),
+		lastRun(root),
+		config ? trialViews(root, config, now) : Promise.resolve([]),
+		config ? proposalStore(state).list() : Promise.resolve([]),
+	]);
 	const usage = readUsage({ dbPath: statsDbPath(), windowDays: 1, now });
+	const run = env.activeRun?.();
 	ui.report(
 		"Storm 현황",
 		renderStatus(
-			{ repo: state.repo, config: state.config, approval: state.approval, shadows: state.shadows, quota, dataAsOf: usage.dataAsOf },
+			{
+				repo: state.repo,
+				config: state.config,
+				approval: state.approval,
+				shadows: state.shadows,
+				quota,
+				dataAsOf: usage.dataAsOf,
+				...(run ? { run } : {}),
+				...(last ? { lastRun: last } : {}),
+				...(trials.length ? { trials } : {}),
+				...(quotaMarks.length ? { quotaMarks } : {}),
+				...(pending.length ? { pending } : {}),
+			},
 			now,
 		),
 	);
+	if (config && state.approval) await offerTrialDecisions(env, ui, state, config, trials);
+}
+
+/** Read-only model check without the LLM: newer, better or cheaper models than the team's current ones. */
+export async function modelsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+	const state = await loadProjectState(env);
+	const ctx = await prepareAnalysis(env, ui);
+	ui.report("Storm 모델 점검", renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined));
+}
+
+/** Ended trials: show is done by the status report; here the user decides to adopt the candidate or keep the current model. */
+async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState, config: StormConfig, trials: TrialView[]): Promise<void> {
+	for (const view of trials) {
+		if (view.phase !== "ended") continue;
+		const { trial } = view;
+		const role = config.roles[trial.role];
+		if (!role) continue;
+		const title = ROLES.find(spec => spec.id === trial.role)?.title ?? trial.role;
+		const choice = await ui.select(`시험 사용이 끝났습니다: ${title} 역할의 ${trial.model}`, ["후보로 바꾸기", "지금 모델 유지", "나중에"]);
+		if (choice !== "후보로 바꾸기" && choice !== "지금 모델 유지") return;
+		const adopt = choice === "후보로 바꾸기";
+		const effort = trial.effort ?? role.effort;
+		const next: StormConfig = {
+			...config,
+			roles: {
+				...config.roles,
+				...(adopt
+					? { [trial.role]: { ...role, models: [trial.model, ...role.models.filter(model => model !== trial.model)], ...(effort ? { effort } : {}) } }
+					: {}),
+			},
+		};
+		const remaining = (config.trials ?? []).filter(other => other.id !== trial.id);
+		if (remaining.length) next.trials = remaining;
+		else delete next.trials;
+		const proposal: Proposal = {
+			schema: "storm.proposal/v1",
+			id: newProposalId(env.now()),
+			kind: adopt ? "reselect" : "trial",
+			createdAt: new Date(env.now()).toISOString(),
+			summary: adopt ? `${title} 역할을 ${trial.model}로 바꾸고 시험 사용 종료` : `${title} 역할 유지, 시험 사용 종료`,
+			baseHash: state.config.status === "ok" ? state.config.hash : "",
+			config: next,
+		};
+		await decideProposal(env, ui, state, config, proposal);
+		return;
+	}
+}
+
+/** Shows a proposal and applies it only on the exact approval label; a deferral is kept for /storm review. */
+async function decideProposal(env: FlowEnv, ui: UiPort, state: ProjectState, current: StormConfig, proposal: Proposal): Promise<void> {
+	const store = proposalStore(state);
+	const decision = await presentProposal(ui, proposal, current);
+	if (decision === "approved") {
+		const hash = await approveAndSave(env, state, proposal.config, deriveScope(proposal.config, state.shadows), proposal.evidence);
+		await store.remove(proposal.id);
+		ui.notify(`승인했습니다(${shortHash(hash)}).`);
+		return;
+	}
+	if (decision === "deferred") {
+		await store.save(proposal);
+		ui.notify("보류했습니다. /storm review 에서 승인할 수 있습니다.");
+		return;
+	}
+	await store.remove(proposal.id);
+	ui.notify("바꾸지 않았습니다.");
 }
 
 function unapprovedShadows(state: ProjectState): boolean {
@@ -219,7 +237,19 @@ export async function reviewFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		return;
 	}
 	if (state.approval && !unapprovedShadows(state)) {
-		ui.notify("이미 승인된 설정입니다.");
+		const pending = await proposalStore(state).list();
+		if (pending.length === 0) {
+			ui.notify("이미 승인된 설정입니다.");
+			return;
+		}
+		const options = pending.map(proposal => `${proposal.summary} (${proposal.id})`);
+		const picked = await ui.select("보류 중인 변경 제안", [...options, "취소"]);
+		const proposal = pending[options.indexOf(picked ?? "")];
+		if (!proposal) {
+			ui.notify("바꾸지 않았습니다.");
+			return;
+		}
+		await decideProposal(env, ui, state, state.config.config, proposal);
 		return;
 	}
 	const latest = (await state.store.list())[0];

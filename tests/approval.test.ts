@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { normalizeRemote, resolveRepo } from "../src/approval/repo.ts";
 import { findShadows } from "../src/approval/shadow.ts";
 import { ApprovalStore } from "../src/approval/store.ts";
-import type { ApprovalScope, Exec, RepoIdentity, StormConfig } from "../src/types.ts";
+import type { ApprovalScope, EvidenceRecord, Exec, RepoIdentity, StormConfig } from "../src/types.ts";
 
 const exec: Exec = async (command, args, options) => {
 	const p = Bun.spawn([command, ...args], {
@@ -218,6 +218,46 @@ describe("ApprovalStore", () => {
 		await store.recordRollback(HASH_A, HASH_B);
 		const last = (await store.log()).at(-1);
 		expect(last).toMatchObject({ event: "rolled_back", approvalId: rec.approvalId, configHash: HASH_A, prevHash: HASH_B });
+	});
+
+	test("evidence is written per hash before the approval and read back", async () => {
+		const store = new ApprovalStore(tmp, repo);
+		const evidence = (chosen: string): EvidenceRecord => ({
+			schema: "storm.evidence/v1",
+			createdAt: "2026-11-20T00:00:00.000Z",
+			source: "setup",
+			priority: "balanced",
+			dataAsOf: null,
+			roles: {
+				reviewer: {
+					chosen,
+					candidates: [{ selector: chosen, label: "B", validated: true, int: null, speed: 40, referenceUsd: null, why: ["좋음"], whyNot: [] }],
+				},
+			},
+		});
+		await store.approve({ ...approveInput(HASH_A), evidence: evidence("a/b") });
+		await store.approve({ ...approveInput(HASH_B), evidence: evidence("a/c") });
+		expect(await store.evidence(HASH_A)).toEqual(evidence("a/b"));
+		expect(await store.evidence(HASH_B)).toEqual(evidence("a/c"));
+		expect((await readdir(path.join(repoDir(), "evidence"))).sort()).toEqual([`${"a".repeat(64)}.json`, `${"b".repeat(64)}.json`]);
+
+		const HASH_C = `jcs-sha256:${"c".repeat(64)}`;
+		await store.approve(approveInput(HASH_C));
+		expect(await store.evidence(HASH_C)).toBeUndefined();
+		await writeFile(path.join(repoDir(), "evidence", `${"c".repeat(64)}.json`), '{"schema":"other"}');
+		expect(await store.evidence(HASH_C)).toBeUndefined();
+		await expect(store.evidence("jcs-sha256:../x")).rejects.toThrow();
+	});
+
+	test("a failed evidence write leaves no approval", async () => {
+		const store = new ApprovalStore(tmp, repo);
+		// A file where the evidence directory should be makes the evidence write fail.
+		await mkdir(repoDir(), { recursive: true });
+		await writeFile(path.join(repoDir(), "evidence"), "");
+		const evidence: EvidenceRecord = { schema: "storm.evidence/v1", createdAt: "x", source: "setup", priority: "balanced", dataAsOf: null, roles: {} };
+		await expect(store.approve({ ...approveInput(HASH_A), evidence })).rejects.toThrow();
+		expect(await store.active(HASH_A)).toBeUndefined();
+		expect(await store.snapshot(HASH_A)).toEqual(config);
 	});
 });
 
