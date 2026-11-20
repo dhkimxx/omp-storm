@@ -1,0 +1,63 @@
+# OMP Storm priors: name rules, tier order, price-tier bounds, aliases (p0-results Q9-6).
+# Users may override any key in ~/.omp/storm/priors.yml; arrays replace, maps merge.
+schema: 1
+updated: 2026-11-20 # Storm warns when this is more than 90 days old
+
+lineage:
+  # Route/billing/quantization/region words: same model, kept as variant.route.
+  route_tokens: [fast, ultrafast, highspeed, economy, flex, speed, latest, preview, original,
+                 free, contributor, discounted, tee, wm, cloud, nitro, exacto, optimized, customtools,
+                 nvfp4, fp8, fp4, bf16, int8, int4, peft, eu, us, global]
+  # Leading vendor words removed from ids (allow-list; unknown prefixes stay in the key).
+  vendor_prefixes: [zai, e2ee, umans, hf, tee, openai, google, meta, mistralai, moonshotai,
+                    xai, anthropic, amazon, microsoft, nvidia, global, us, eu, deepseek-ai,
+                    qwen-ai, minimaxai, z-ai]
+  # Brand words per class dropped from the tier (product-line names like llama/codex stay).
+  generic_brand:
+    openai: [gpt, openai, chatgpt]
+    anthropic: [claude]
+    glm: [glm, zai]
+    deepseek: [deepseek]
+    minimax: [minimax]
+    kimi: [kimi, moonshotai, moonshot]
+    xai: [grok, xai]
+    gpt-oss: [gpt, oss]
+    qwen: [qwen]
+    gemini: [gemini, google]
+    gemma: [gemma, google]
+    meta: [meta]
+    mistral: [mistral, mistralai]
+    mimo: [mimo, xiaomi]
+    bytedance: [bytedance]
+    stepfun: [step, stepfun]
+    amazon: [amazon]
+    baidu: [baidu, ernie]
+    cohere: [cohere]
+    ai21: [ai21, jamba]
+  # Only what the catalog cannot resolve; source and expiry required.
+  aliases:
+    - match: {provider: "*", id: "deepseek-flash"}
+      key: deepseek/flash@4.1.0
+      source: "catalog override deepseek.kdl:20 (deepseek, opencode-go only)"
+      expires: 2027-02-01
+
+# Tier order inside a class, low to high; used for newer/higher-tier detection.
+tiers:
+  openai: [luna, terra, sol, astra] # "-pro" suffix is the same tier plus a pro variant
+  anthropic: [haiku, sonnet, opus, fable, mythos] # fable and mythos are peers
+  deepseek: [flash, pro]
+  minimax: [m-flash, m]
+  glm: [flash, "-"]
+  tier_aliases: {} # renamed tiers across generations; confirmed ones only
+
+price_tier:
+  # Reference request in tokens (user's 30-day mean, rounded); fixed so tiers stay stable.
+  reference_mix: {input: 4000, output: 1000, cache_read: 160000, cache_write: 1000}
+  # Median cacheRead/input ratio over catalog chat rows; used when cacheRead is 0.
+  cache_read_fallback_ratio: 0.1
+  # cheap < cheap_below <= general < premium_from <= premium (USD per reference request).
+  bounds_usd_per_request: {cheap_below: 0.01, premium_from: 0.06}
+
+# Optional external benchmark values only; never adjusts catalog int.
+# Item: {key, metric, value, source, url, date, harness}
+quality_priors: []
