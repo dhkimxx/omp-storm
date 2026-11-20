@@ -3,10 +3,10 @@
 > **OMP STORM** — Adaptive Multi-Agent Orchestration
 > One command. Intelligent agents. Any runtime.
 
-- 상태: 초안. P0 스파이크 완료(2026-11-20, [p0-results.md](p0-results.md))
+- 상태: v0.2까지 구현(2026-11-20). P0 결과: [p0-results.md](p0-results.md)
 - 작성일: 2026-11-20
-- 검증 기준: omp 19.0.1(CLI), `@oh-my-pi/pi-coding-agent` 19.0.0 소스, Orca CLI 1.4.261
-- 제품 형태: omp 플러그인(Extension + Skill + 역할 에이전트 정의). 외부 런타임 어댑터는 이후 단계
+- 검증 기준: omp 19.0.1(CLI), `@oh-my-pi/pi-coding-agent` 19.0.0 소스
+- 제품 형태: omp 플러그인(Extension + Skill + 역할 에이전트 정의)
 - 원칙: **AI는 후보를 조사·평가·추천하지만, 설정과 중요한 변경은 사용자의 명시적 선택과 승인 이후에만 확정한다.**
 
 ## 1. 공식 네이밍
@@ -32,7 +32,7 @@
 
 1. **최초 `/storm`:** 환경 탐지 → 역할별 후보 추천 → 인터뷰 → 승인 → `.omp/storm/config.json` 저장
 2. **`/storm <자연어>`:** 작업 실행, 상태 확인, 설정 변경(우선순위, 워커 추가, 모델 재선정), 쿼터 대응을 한 인터페이스에서 처리
-3. **실행:** 사용자가 고른 런타임(기본 OMP, 이후 Orca·Herdr)에서 승인된 모델·effort·병렬화 정책으로 수행
+3. **실행:** OMP 기본 기능(`task`·eval, `workflowz`·`orchestrate`)으로 승인된 모델·effort·병렬화 정책에 따라 수행
 4. **강제:** 승인 밖의 모델·Provider 사용은 스폰 단계에서 막는다
 5. **모델 점검:** 사용 기록으로 역할별 선호 모델과 실측 속도를 파악하고, 더 새롭거나 더 좋거나 더 가성비 좋은 모델을 근거와 함께 찾는다(9장)
 
@@ -109,16 +109,14 @@ flowchart LR
   M -.->|before_subagent_spawn| X
   X -.->|승인된 모델 목록·차단| W
   W --> H[Agent Hub]
-  X -.->|v0.3| O[Orca 어댑터]
 ```
 
 - **`/storm` 명령:** 입력을 나눈다. 인자가 없으면 최초 설정 또는 팀 현황, 정확히 일치하는 짧은 키워드는 LLM 없이 처리, 그 외 자연어는 팀 계약과 함께 메인 세션에 인계한다.
 - **`storm` 도구:** LLM이 호출하는 관리 연산이다. 조회는 바로 답하고, 변경은 제안(diff)을 만들어 승인 UI를 띄운다.
 - **정책·강제:** 스폰 훅, 예산·쿼터 감시, 텔레메트리
 - **실행(OMP 기본):** 메인 세션 LLM이 `workflowz`·`orchestrate` 계약에 따라 `storm-<역할>` 에이전트를 `task`·eval로 실행
-- **외부 런타임 어댑터(v0.3 이후):** Orca(`orca orchestration`), Herdr
 
-스케줄링 소유권은 실행 주체가 가진다. OMP로 실행하면 메인 세션(task·eval)이, Orca로 실행하면 Orca(run·task·gate)가 소유한다. Storm은 별도 스케줄러를 만들지 않고, 승인 범위를 넘는 스폰만 막는다.
+스케줄링은 메인 세션(task·eval)이 소유한다. Storm은 별도 스케줄러를 만들지 않고, 승인 범위를 넘는 스폰만 막는다.
 
 ### 확장 API 사실 (P0 실측, omp 19.0.1, [p0-results.md](p0-results.md))
 
@@ -158,7 +156,6 @@ flowchart LR
 | 모델 점검 | "지금 모델보다 싸고 좋은 거 있어?", "더 최신 모델 나왔어?" | 불필요(조회). 교체는 모델 재선정과 같음 |
 | 시험 사용 | "리뷰 워커에 새 모델 일주일만 써 보자" (v0.2) | 필요. 비율·기간·예산 상한 포함 |
 | 쿼터 대응 | "Anthropic 쿼터 다 썼어" | 승인된 폴백 범위 안이면 정책대로, 밖이면 필요 |
-| 런타임 변경 | "Orca로 돌려줘" (v0.3) | 필요 |
 
 - 도구는 설정을 직접 쓰지 않는다. 제안(diff)을 만들고 승인 UI를 띄운다. 사용자가 승인해야 `.omp/storm/config.json`과 승인 기록이 바뀐다.
 - 승인 UI가 응답하지 않는 환경(print, `--no-ui`, 폼 미지원 ACP)에서는 제안만 남기고 적용하지 않는다. `hasUI`로는 판단하지 않는다.
@@ -222,9 +219,8 @@ flowchart LR
 - CLI 결과는 `pi.exec`로, 카탈로그는 공개 확장 API(`ctx.models`, `ctx.modelRegistry`)로 읽는다. 그 밖의 omp 내부 API(`authStorage.usage.reports()` 등)와 내부 DB는 자동 업데이트로 조용히 깨질 수 있어 쓰지 않는다. 예외는 `stats.db` 읽기 전용 조회 하나이며, 스키마 검사로 보호한다(9.1).
 - `pi.getActiveTools()`로 `task`·`eval` 활성 여부를 확인하고, 매직 키워드 설정이 켜져 있는지 확인해 `workflowz`·`orchestrate` 사용 가능성을 판정한다.
 
-### 8.2 외부 런타임 (v0.3 이후)
+### 8.2 외부 런타임 (이후)
 
-- **Orca:** `orca status --json`과 `orca agent-context`(기계 판독용 명령 스키마)로 capability를 판정한다. 명령 이름을 하드코딩하지 않는다. `coordinator-start/stop`처럼 이미 Retired된 명령이 있다.
 - **Herdr:** 실행 파일·세션을 확인한다. 현재 테스트 환경이 없다.
 - localhost와 원격 호스트는 서로 다른 실행 환경으로 기록한다. 원격은 v0.1에서 제외한다.
 
@@ -360,7 +356,7 @@ Storm은 사용자의 omp 사용 기록과 omp 카탈로그로 아래 네 가지
 4. `전체 수락` 또는 항목 선택 → 그 항목만 후보 2~5개 비교·선택(직접 입력, 근거 보기, 뒤로)
 5. 최종 diff(`.omp/storm/config.json`에 쓸 내용) → `승인 후 저장` / `취소`
 
-런타임·호스트·하네스 선택 단계는 외부 런타임 어댑터가 생긴 뒤(v0.3) 감지된 후보가 둘 이상일 때만 노출한다. 자연어 변경 요청의 승인 화면도 같은 검토 화면에서 바뀌는 항목만 보여 준다.
+런타임·호스트·하네스 선택 단계는 외부 런타임 어댑터가 생긴 뒤 감지된 후보가 둘 이상일 때만 노출한다. 자연어 변경 요청의 승인 화면도 같은 검토 화면에서 바뀌는 항목만 보여 준다.
 
 ### 화면 예시 (가상의 값)
 
@@ -398,30 +394,7 @@ storm-reviewer      provider-y/model-b / high     구현 워커와 다른 계열
 - **민감 정보:** 비밀키, 원시 토큰, 계정 식별자(`identityKey`, 이메일, `orgName`)는 파일과 프롬프트에 남기지 않는다.
 - **omp 설정 내보내기:** Storm 없이도 같은 모델을 쓰고 싶은 경우를 위해, 승인된 구성을 omp 설정으로 내보내는 연산은 이후 단계에서 검토한다.
 
-## 12. 외부 런타임 어댑터 (v0.3 이후)
-
-```ts
-interface OrchestrationRuntimeAdapter {
-  id: string;
-  detect(host: HostContext): Promise<RuntimeDiscovery>;
-  capabilities(host: HostContext): Promise<RuntimeCapabilities>;
-  createRun(plan: ApprovedPlan, idempotencyKey: string): Promise<RuntimeRunHandle>;
-  spawnTask(run: RuntimeRunHandle, task: ApprovedTask, idempotencyKey: string): Promise<TaskHandle>;
-  reattach(runId: string): Promise<RuntimeRunHandle | undefined>;
-  getStatus(handle: TaskHandle): Promise<TaskStatus>;
-  send?(handle: TaskHandle, text: string): Promise<void>;
-  cancel(handle: TaskHandle): Promise<void>;
-  collect(handle: TaskHandle): Promise<TaskArtifacts>;
-  cleanup(run: RuntimeRunHandle): Promise<void>;
-}
-```
-
-- 크래시 후 재연결(`reattach`)과 중복 실행 방지(멱등 키)를 계약에 포함한다.
-- 어댑터가 지원하지 않는 기능은 capability로 `false`를 반환하고, 필요한 경우 다른 런타임을 추천한다.
-- **Orca:** `orca orchestration`의 `run-create`, `task-create`, `worker-start`, `dispatch`, `gate-create`, `request-show`(변경 요청이 이미 반영됐는지 확인)를 쓴다. Orca로 실행할 때 스케줄링은 Orca가 소유한다.
-- **Herdr:** 테스트 환경을 확보한 뒤 진행한다. 선행 사례 `pi-herdr-agents`(Pi용)를 참고한다.
-
-## 13. 보안 및 안전
+## 12. 보안 및 안전
 
 1. 탐지는 읽기 전용이다. 비용이 발생하는 측정은 별도 동의를 받는다.
 2. 승인 기록은 저장소 밖에 둔다. 저장소의 `config.json`은 승인 해시와 일치할 때만 유효하다.
@@ -437,15 +410,14 @@ interface OrchestrationRuntimeAdapter {
 
 참고: omp는 프로젝트 로컬 입력(`.omp/extensions`, `.omp/config.yml`)을 신뢰 확인 없이 로드한다. 신뢰할 수 없는 저장소에서 omp를 여는 위험은 Storm이 막을 수 없다.
 
-## 14. 구현 단계
+## 13. 구현 단계
 
 | 단계 | 범위 | 완료 조건 |
 |---|---|---|
 | P0 스파이크 | 아래 질문 9개 | 완료(2026-11-20). 결과와 결정: [p0-results.md](p0-results.md) |
 | v0.1 최초 설정 | `/storm`: 탐지 → 사용 기록 분석(선호 모델, 실측 속도, 새 버전·가성비 후보) → 추천 → 인터뷰 → 승인 → `config.json` 저장, 역할 에이전트, 스폰 강제, 팀 현황, `rollback` | 완료(2026-11-20). [v0.1 결과](#v01-결과). 승인 없이 저장·강제 0건, 취소 시 무변경, 승인 밖 모델 스폰 차단, 해시 불일치 시 재승인 요구, 결측 지표를 추측으로 채우지 않음, Storm 설정 삭제 후 omp 동작이 원래와 같음 |
 | v0.2 자연어 인터페이스 | `/storm <자연어>`: 작업 실행 인계, 관리 연산(우선순위, 워커 추가, 모델 재선정, 모델 점검, 쿼터 대응), 시험 사용, 미인증 Provider·웹 조사 제안, 텔레메트리 | 완료(2026-11-20). [v0.2 결과](#v02-결과). 승인 전 `config.json` 불변, 작업 실행 시 승인된 모델만 사용, 시험 사용은 승인된 비율·기간·예산 이내, 예산 준수, 결과와 선정 근거 역추적 가능 |
-| v0.3 Orca 어댑터 | capability 탐지, run·task·worker·gate 매핑, 런타임 변경 연산 | 계약 테스트 통과, 이중 스케줄러 없음, 런타임 전환은 승인 필요 |
-| 이후 | Herdr, 원격 호스트, 외부 하네스, 벤치마크 수집, omp 설정 내보내기 | 어댑터 추가만으로 발견·인터뷰·실행 확장 |
+| 이후 | Herdr, 원격 호스트, 외부 하네스, 벤치마크 수집, omp 설정 내보내기 | 필요가 확인되면 단계로 올린다 |
 
 ### v0.1 결과
 
@@ -526,7 +498,7 @@ interface OrchestrationRuntimeAdapter {
 - print, `--no-ui`, 폼 미지원 ACP에서는 어떤 변경도 적용되지 않는다.
 - 브랜치마다 `config.json`이 다른 worktree 둘을 오가도 이미 승인한 해시는 다시 묻지 않는다.
 
-## 15. 플러그인 구성
+## 14. 플러그인 구성
 
 ```text
 omp-storm/
@@ -556,14 +528,14 @@ omp-storm/
 spikes/p0/                    # P0 스파이크 하네스: 가짜 LLM 서버, 스파이크 플러그인, 시나리오 드라이버 (패키지에 포함하지 않음)
 ```
 
-## 16. 선행 사례와 차별점
+## 15. 선행 사례와 차별점
 
 - **omp용:** `@yuechou/omp-agent`(다중 에이전트 관리), `@nledford/omp-coord`(세션 간 서브에이전트 한도·큐), `gsd-for-omp`(오케스트레이션 시스템 호스트), `@sencha930511/pi-model-sync`(서브에이전트 모델 라우팅)
 - **Pi용:** `pi-subagents`, `pi-herdr-agents`(Herdr + worktree), `pi-orchestrator-config`
 - **OMP 자체:** Swarm Extension(삭제됨), `workflowz`·`orchestrate` 키워드, Agent Hub
-- **Storm의 차별점:** (1) `/storm` 하나로 팀 구성·실행·변경·쿼터 대응을 관리하는 자연어 인터페이스, (2) 사용 기록과 카탈로그로 선호 모델·실측 속도·새 버전·가성비 대안을 찾는 모델 점검, (3) 근거 기반 역할별 모델·effort 추천과 승인 기록, (4) 승인 범위의 강제(스폰 훅)와 승인된 시험 사용, (5) 외부 런타임 선택. 실행 엔진 자체로는 경쟁하지 않는다.
+- **Storm의 차별점:** (1) `/storm` 하나로 팀 구성·실행·변경·쿼터 대응을 관리하는 자연어 인터페이스, (2) 사용 기록과 카탈로그로 선호 모델·실측 속도·새 버전·가성비 대안을 찾는 모델 점검, (3) 근거 기반 역할별 모델·effort 추천과 승인 기록, (4) 승인 범위의 강제(스폰 훅)와 승인된 시험 사용. 실행 엔진 자체로는 경쟁하지 않는다.
 
-## 17. 참고
+## 16. 참고
 
 - OMP: https://github.com/can1357/oh-my-pi
 - Extensions(`before_subagent_spawn`, `ctx.invokeTool`, UI 컨텍스트): https://github.com/can1357/oh-my-pi/blob/main/docs/extensions.md
@@ -574,7 +546,6 @@ spikes/p0/                    # P0 스파이크 하네스: 가짜 LLM 서버, �
 - Agent Hub: https://github.com/can1357/oh-my-pi/blob/main/docs/agent-hub.md
 - Settings: https://github.com/can1357/oh-my-pi/blob/main/docs/settings.md
 - Swarm Extension 삭제 커밋: https://github.com/can1357/oh-my-pi/commit/b0a94a8fc
-- Orca Orchestration: https://orca.dev/docs/cli/orchestration
 - Herdr: https://github.com/herdrdev/herdr, https://herdr.dev/tui/docs/cli-reference/
 - WorkflowArena: https://arxiv.org/abs/2611.12856
 - ClawArena-Team: https://arxiv.org/abs/2606.31174

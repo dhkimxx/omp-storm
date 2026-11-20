@@ -60,7 +60,7 @@ One command. Intelligent agents. Any runtime.
 - 시험 예산은 시험 기간 중 후보 모델의 모든 요청을 셉니다.
 - 예산 누계는 omp 프로세스 단위라, 같은 프로젝트에서 동시에 도는 다른 omp 프로세스와는 합쳐지지 않습니다.
 
-**아직 없는 것(v0.3 이후):** Orca·Herdr 런타임, `omp bench` 측정, 불만 신호, `omp usage` 기반 자동 쿼터 감지.
+**아직 없는 것:** `omp bench` 측정, 불만 신호, `omp usage` 기반 자동 쿼터 감지, Herdr 같은 외부 런타임.
 
 ## 설치
 
