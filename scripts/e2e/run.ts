@@ -395,6 +395,8 @@ async function main(): Promise<void> {
 			contract: string;
 			spawns: Array<{ outcome: string; agent: string; spawnKey?: string }>;
 			agents?: StoredAgent[];
+			mainCostUsd?: number;
+			blockedEdits?: number;
 		};
 		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
 		const idOf = (entry: string | undefined): string | undefined =>
@@ -474,6 +476,23 @@ async function main(): Promise<void> {
 		);
 		run = await spawn(["task"], { model: OUTSIDER });
 		check("실행 밖: 일반 에이전트는 그대로", run.children[0]?.model === idOf(OUTSIDER), `child=${run.children[0]?.model}`);
+
+		const directed = join(PROJECT, "director-check.txt");
+		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-WRITE director-check.txt"}', noAnswer);
+		const directorRun = runFiles().at(-1);
+		check(
+			"감독 모드: 실행 중 메인의 파일 쓰기는 막고 위임하라고 알림",
+			!existsSync(directed) && directorRun?.blockedEdits === 1 && talk.frames.some(frame => textOf(frame).includes("Storm 감독 모드")),
+			`exists=${existsSync(directed)} blocked=${directorRun?.blockedEdits}`,
+		);
+		check(
+			"감독 모드: 실행 기록에 메인 비용",
+			(directorRun?.mainCostUsd ?? 0) > 0 && talk.frames.some(frame => textOf(frame).includes("메인(감독) 비용")),
+			`main=${directorRun?.mainCostUsd}`,
+		);
+		await converse("SPIKE-WRITE director-check.txt", noAnswer);
+		check("감독 모드: 실행 밖에서는 메인이 그대로 씀", existsSync(directed));
+		rmSync(directed, { force: true });
 
 		let hash = configHashOnDisk();
 		let approvals = approvalFiles().length;

@@ -11,6 +11,7 @@
  *   SPIKE-EVAL <agent...>   call `eval` (python) that spawns each agent through agent()
  *   SPIKE-APPROVE           call the spike extension's `storm_spike_approve` tool
  *   SPIKE-SLOW              stream a ~4 s text reply so messages can be queued mid-stream
+ *   SPIKE-WRITE <path>      call `write` with that path (director mode blocks it inside a Storm run)
  * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered.
  *
  * Env: FAKE_LLM_PORT (default 18555), FAKE_LLM_LOG (default /tmp/storm-p0/llm.jsonl).
@@ -146,6 +147,8 @@ function decide(request: ChatRequest): Decision {
 	}
 	if (fresh.includes("SPIKE-APPROVE")) return { kind: "tool", name: "storm_spike_approve", args: {} };
 	if (fresh.includes("SPIKE-SLOW")) return { kind: "text", text: "slow reply ".repeat(8).trim(), slow: true };
+	const write = fresh.match(/SPIKE-WRITE[ \t]+(\S+)/);
+	if (write?.[1]) return { kind: "tool", name: "write", args: { path: write[1], content: "storm director check\n" } };
 	const yieldSchema = schemaOf(request.tools, "yield");
 	if (fresh.includes(CHILD_MARK) && yieldSchema) return { kind: "tool", name: "yield", args: requiredArgs(yieldSchema) };
 	return { kind: "text", text: "OK" };

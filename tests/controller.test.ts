@@ -143,6 +143,30 @@ describe("live run record", () => {
 	});
 });
 
+describe("director mode", () => {
+	test("directs only while its run is active; main spend and blocked edits land in the record and summary", async () => {
+		const h = harness([]);
+		h.controller.noteMainSpend(5);
+		h.controller.noteBlockedEdit();
+		expect(h.controller.directing()).toBe(false);
+
+		await startRun(h);
+		expect(h.controller.directing()).toBe(true);
+		h.controller.noteMainSpend(1.5);
+		h.controller.noteMainSpend(0.5);
+		h.controller.noteBlockedEdit();
+		recordCost(h.repo.repoId, "a/i", 4);
+		const record = await h.controller.finish("done");
+
+		expect(h.controller.directing()).toBe(false);
+		expect(record).toMatchObject({ mainCostUsd: 2, blockedEdits: 1, costUsd: 4 });
+		if (!record) throw new Error("no record");
+		const summary = summarizeRun(record);
+		expect(summary).toContain("- 메인(감독) 비용: $2.00 · 전체의 50%");
+		expect(summary).toContain("- 메인이 직접 고치려다 위임으로 돌린 수정: 1회");
+	});
+});
+
 describe("run summary", () => {
 	test("reports subagent reuse", () => {
 		const run: RunRecord = {

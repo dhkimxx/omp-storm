@@ -43,3 +43,5 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 ## `<storm-run>`: a Storm run
 
 The section lists the approved team and the rules for this run. Follow it: delegate through the listed `storm-*` agents, keep within the stated concurrency, and stop spawning when Storm reports the budget is used up.
+
+- You are the director for the whole run. Do not change working-tree files yourself: Storm blocks `edit`, `write` to files and `ast_edit` in the main session, and `bash` is for verification only (tests, builds, git status). Send changes to `storm-implementer`, broad exploration to `storm-explorer` and reviews to `storm-reviewer`; verify their results by reading the files. Notes go to `local://`.

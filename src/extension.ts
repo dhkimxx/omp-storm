@@ -20,6 +20,7 @@ import {
 	statusFlow,
 } from "./flows.ts";
 import { execPort, ompBinary } from "./omp.ts";
+import { DIRECTOR_BLOCK_REASON, directorBlocks } from "./policy/director.ts";
 import { decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
 import { ROLE_AGENT_PREFIX } from "./roles.ts";
@@ -287,6 +288,7 @@ export default function storm(pi: ExtensionAPI): void {
 			});
 		}
 		if (usage.usd <= 0) return;
+		if (ctx.agent.kind === "main") runs.noteMainSpend(usage.usd);
 		const repo = await repoFor(ctx);
 		const run = recordCost(repo.repoId, usage.selector, usage.usd);
 		if (run) touchRun(run.runId);
@@ -319,6 +321,14 @@ export default function storm(pi: ExtensionAPI): void {
 		});
 		if (runId) touchRun(runId);
 		return undefined;
+	});
+
+	// Director mode: while this session runs Storm, file changes go to storm-implementer. Blocking the call instead of
+	// swapping the tool list keeps the main session's prompt cache intact.
+	pi.on("tool_call", event => {
+		if (!runs.directing() || !directorBlocks(event.toolName, event.input)) return undefined;
+		runs.noteBlockedEdit();
+		return { block: true, reason: DIRECTOR_BLOCK_REASON };
 	});
 
 	pi.on("agent_start", () => {

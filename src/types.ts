@@ -635,6 +635,10 @@ export interface RunRecord {
 	spawns: SpawnRecord[];
 	/** Subagents seen during the run, from the agent ledger. */
 	agents?: AgentEntry[];
+	/** List-price spend of the main session (the director) while the run was active. */
+	mainCostUsd?: number;
+	/** File changes the main session tried itself and director mode sent back to delegation. */
+	blockedEdits?: number;
 	/** ISO 8601 of the last write while the run was active. */
 	updatedAt?: string;
 }

@@ -142,6 +142,8 @@ export function buildHandoff(input: {
 		return `- ${role.agent}: ${title}, 동시에 최대 ${role.workers ?? 1}개`;
 	});
 	const rules = [
+		"- 감독: 이 실행에서 당신은 감독입니다. 작업 트리 파일을 직접 고치지 않습니다(edit·write·ast_edit 는 막혀 있습니다). 수정은 storm-implementer, 넓은 탐색은 storm-explorer, 리뷰는 storm-reviewer 에 맡기고, 결과는 파일을 읽어 검증합니다.",
+		"- bash 는 테스트·빌드 확인·git 조회 같은 검증에만 쓰고, bash 로 파일을 바꾸지 않습니다. 메모는 local:// 에 씁니다.",
 		"- 서브에이전트는 위 storm-* 에이전트로만 띄웁니다(task 도구 또는 eval 의 agent()).",
 		"- model 을 넘기지 않습니다. 스폰할 때 Storm 이 승인된 모델을 고릅니다.",
 		`- 서브에이전트는 한 번에 최대 ${config.parallelism}개까지 띄웁니다.`,

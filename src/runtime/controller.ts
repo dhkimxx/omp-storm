@@ -164,6 +164,27 @@ export class RunController {
 		if (this.#own) this.#own.turnStarted = true;
 	}
 
+	/** True while this session runs Storm: the main session directs and does not change files itself. */
+	directing(): boolean {
+		return this.#own !== undefined;
+	}
+
+	/** Spend of this (main) session while its run is active: what directing costs. */
+	noteMainSpend(usd: number): void {
+		const own = this.#own;
+		if (!own) return;
+		own.record.mainCostUsd = (own.record.mainCostUsd ?? 0) + usd;
+		this.#scheduleFlush(own);
+	}
+
+	/** A file change the main session tried itself; director mode sent it back to delegation. */
+	noteBlockedEdit(): void {
+		const own = this.#own;
+		if (!own) return;
+		own.record.blockedEdits = (own.record.blockedEdits ?? 0) + 1;
+		this.#scheduleFlush(own);
+	}
+
 	async onAgentEnd(event: { willContinue?: boolean; awaitingAsyncWork?: boolean }, ctx: ExtensionContext): Promise<void> {
 		// Not settled yet: an automatic continuation or background work will resume the session.
 		if (event.willContinue || event.awaitingAsyncWork) return;
@@ -253,6 +274,10 @@ export function summarizeRun(run: RunRecord): string {
 	];
 	const blocked = run.spawns.find(spawn => spawn.outcome === "blocked");
 	if (blocked?.reason) lines.push(`- 차단 사유: ${blocked.reason}`);
+	if (run.mainCostUsd !== undefined && run.costUsd > 0) {
+		lines.push(`- 메인(감독) 비용: ${money(run.mainCostUsd)} · 전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%`);
+	}
+	if (run.blockedEdits) lines.push(`- 메인이 직접 고치려다 위임으로 돌린 수정: ${run.blockedEdits}회`);
 	const agents = run.agents ?? [];
 	if (agents.length) {
 		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);
