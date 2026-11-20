@@ -39,10 +39,17 @@ import { createUiPort, registerReportRenderer } from "./ui.ts";
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /**
  * Shortcuts kept from the old subcommands: exactly one of them opens that flow without the LLM, so muscle memory
- * never turns into a request. The README lists them; completions do not, since `/storm` and its menu cover them.
+ * never turns into a request. Offered as completions after `/storm ` (only after the space, so `/storm` + Enter
+ * still opens the hub); read-only `status` comes first in case Enter takes the top candidate.
  * Approval and rollback have none: `/storm` opens the approval screen by itself, and rollback is a menu item.
  */
-const SHORTCUTS = ["status", "models", "setup", "reset"] as const;
+const SHORTCUTS = [
+	{ value: "status", label: "status", description: "현황만 보기(메뉴 없음)" },
+	{ value: "models", label: "models", description: "모델 점검" },
+	{ value: "setup", label: "setup", description: "팀 다시 설정" },
+	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
+] as const;
+const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.value);
 const CONFIG_TTL_MS = 5_000;
 
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
@@ -364,12 +371,17 @@ export default function storm(pi: ExtensionAPI): void {
 
 	pi.registerCommand("storm", {
 		description: "Storm 멀티에이전트 팀 (/storm: 현황과 메뉴 · /storm <요청>: 작업 맡기기, 팀 변경, 질문)",
+		getArgumentCompletions: prefix => {
+			const typed = prefix.trim();
+			const matches = SHORTCUTS.filter(shortcut => shortcut.value.startsWith(typed));
+			return matches.length ? [...matches] : null;
+		},
 		handler: async (args, ctx) => {
 			const ui = createUiPort(pi, ctx);
 			const env = flowEnv(ctx);
 			const input = args.trim();
 			try {
-				if (input !== "" && !(SHORTCUTS as readonly string[]).includes(input)) {
+				if (input !== "" && !SHORTCUT_NAMES.includes(input)) {
 					// A request: the main LLM starts a run for work or answers through the storm tool; changes still need the approval dialog.
 					await ctx.waitForIdle();
 					await activateTool();
