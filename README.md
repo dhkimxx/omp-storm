@@ -12,7 +12,8 @@ One command. Intelligent agents. Any runtime.
 /storm 지금 모델보다 싸고 좋은 거 있어?
 ```
 
-현재 계획 단계이며 코드는 아직 없습니다.
+계획 단계이며 플러그인 코드는 아직 없습니다. P0 스파이크(확장 API 실측)는 끝났습니다.
 
 - 계획서: [docs/plan.md](docs/plan.md)
-- 다음 단계: P0 스파이크 ([계획서 14장](docs/plan.md#14-구현-단계))
+- P0 결과: [docs/p0-results.md](docs/p0-results.md), 하네스: [spikes/p0](spikes/p0/README.md)
+- 다음 단계: v0.1 최초 설정 ([계획서 14장](docs/plan.md#14-구현-단계))
