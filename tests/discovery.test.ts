@@ -182,6 +182,20 @@ describe("parseConfigList", () => {
 		expect(s).toEqual({ modelRoles: {}, agentModelOverrides: {} });
 	});
 
+	test("reads the subagent idle TTL and cache retention, ignoring wrong types", () => {
+		const s = parseConfigList(
+			JSON.stringify({ "task.agentIdleTtlMs": entry(420_000, "number"), "providers.cacheRetention": entry("long", "enum") }),
+		);
+		expect(s.agentIdleTtlMs).toBe(420_000);
+		expect(s.cacheRetention).toBe("long");
+		expect(parseConfigList(JSON.stringify({ "task.agentIdleTtlMs": entry(0, "number") })).agentIdleTtlMs).toBe(0);
+		const bad = parseConfigList(
+			JSON.stringify({ "task.agentIdleTtlMs": entry("7m", "number"), "providers.cacheRetention": entry(3, "enum") }),
+		);
+		expect(bad).toEqual({ modelRoles: {}, agentModelOverrides: {} });
+		expect(parseConfigList(JSON.stringify({ "task.agentIdleTtlMs": entry(undefined, "number") })).agentIdleTtlMs).toBeUndefined();
+	});
+
 	test("command failure gives empty defaults", async () => {
 		const failing: Exec = async () => ({ stdout: "", stderr: "", code: 2 });
 		expect(await readExplicitSettings(failing, "omp")).toEqual({ modelRoles: {}, agentModelOverrides: {} });

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { ROLES } from "../src/roles.ts";
+import { ROLES, STORM_VERSION } from "../src/roles.ts";
 import type {
+	AgentEntry,
 	Analysis,
 	Candidate,
 	Effort,
@@ -749,9 +750,54 @@ describe("render", () => {
 
 	test("v0.1 status view renders none of the v0.2 sections", () => {
 		const md = renderStatus(statusBase(), 0);
-		for (const h of ["### 실행 중", "### 마지막 실행", "### 시험", "### 쿼터 소진 표시", "### 승인 대기", "다른 에이전트", "워커"]) {
+		expect(md.split("\n")[0]).toBe(`- Storm ${STORM_VERSION}`);
+		for (const h of ["### 실행 중", "### 마지막 실행", "### 시험", "### 쿼터 소진 표시", "### 승인 대기", "다른 에이전트", "워커", "### 서브에이전트", "### 수명 관리"]) {
 			expect(md).not.toContain(h);
 		}
+	});
+
+	test("status renders subagents and lifecycle warnings, skipping the section when there are none", () => {
+		const entry: AgentEntry = {
+			id: "Imp1",
+			name: "storm-implementer",
+			role: "implementer",
+			model: "a/x",
+			state: "idle",
+			startedAt: 0,
+			lastActivityAt: 1_000,
+			contextTokens: 5_000,
+			requests: 2,
+			costUsd: 0.01,
+			followUps: 1,
+		};
+		const md = renderStatus(
+			{
+				...statusBase(),
+				agents: [{ entry, advice: { id: "Imp1", action: "reuse", reason: "캐시 남음", handle: "agent://Imp1" } }],
+				lifecycle: { agentIdleTtlMs: 420_000, cacheRetention: "auto" },
+			},
+			61_000,
+		);
+		expect(md).toContain("### 서브에이전트");
+		expect(md).toMatch(/\| Imp1 \(implementer\) \| a\/x \| 유휴 \| 1분 \| 5\.0k \| 1 \| 재사용 \| 캐시 남음 \|/);
+		expect(md).toContain("### 수명 관리\n- a: 유휴 TTL 7분");
+		const quiet = renderStatus(
+			{
+				...statusBase(),
+				config: {
+					status: "ok",
+					path: "/r/c",
+					config: { ...cfg("a/x"), roles: { explorer: { agent: "storm-explorer", models: ["anthropic/y"] } } },
+					hash: "jcs-sha256:abcdef0123456789",
+					rawSha256: "x",
+					warnings: [],
+				},
+				lifecycle: { agentIdleTtlMs: 3_600_000, cacheRetention: "long" },
+			},
+			0,
+		);
+		expect(quiet).not.toContain("### 수명 관리");
+		expect(quiet).not.toContain("### 서브에이전트");
 	});
 
 	test("status renders run, last run, trials with comparison, quota marks and pending proposals", () => {

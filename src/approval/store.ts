@@ -315,4 +315,13 @@ export class ApprovalStore {
 			});
 		});
 	}
+
+	/** Deletes this repo's approvals, snapshots, evidence and log (`/storm reset`); returns how many approvals there were. */
+	async clear(): Promise<number> {
+		return this.withLock(async () => {
+			const count = (await this.list()).length;
+			await rm(this.dir, { recursive: true, force: true });
+			return count;
+		});
+	}
 }

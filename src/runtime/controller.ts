@@ -6,17 +6,28 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
-import type { RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
+import type { AgentEntry, RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, startLedgerRun } from "./ledger.ts";
 import { buildHandoff, newRunId, pickKeyword, pruneRuns, writeRun } from "./run.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
+
+/** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
+const liveWriters = new Map<string, () => void>();
+/** How often an active run's record is rewritten at most, so other processes can follow it. */
+const LIVE_FLUSH_MS = 2_000;
+
+/** Asks the owning session to rewrite the run's record soon (spawns, spend, thresholds). */
+export function touchRun(runId: string): void {
+	liveWriters.get(runId)?.();
+}
 
 /** Called by the spawn hook of whichever session decided the spawn. */
 export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 	const list = spawnsByRun.get(runId);
 	if (list) list.push(record);
 	else spawnsByRun.set(runId, [record]);
+	touchRun(runId);
 }
 
 export function money(usd: number): string {
@@ -57,11 +68,18 @@ export interface RunControllerDeps {
 	/** Which magic keywords would attach their notice in this session. */
 	usableKeywords(ctx: ExtensionContext): Promise<{ workflowz: boolean; orchestrate: boolean }>;
 	now(): number;
+	/** Subagents that started during the run, from the agent ledger. */
+	agents?(runId: string): AgentEntry[];
+	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
+	flushMs?: number;
 }
 
 export class RunController {
 	#pending: { runId: string; task: string } | undefined;
 	#own: OwnRun | undefined;
+	#flushTimer: ReturnType<typeof setTimeout> | undefined;
+	/** The last live write; the final record waits for it so a late live write never lands on top. */
+	#liveWrite: Promise<unknown> = Promise.resolve();
 
 	constructor(private readonly deps: RunControllerDeps) {}
 
@@ -79,11 +97,13 @@ export class RunController {
 		const own = this.#own;
 		if (!own) return undefined;
 		const live = activeLedgerRun(own.repoId);
+		const agents = this.deps.agents?.(own.record.runId) ?? [];
 		return {
 			...own.record,
 			costUsd: live?.costUsd ?? own.record.costUsd,
 			costByModel: { ...(live?.costByModel ?? own.record.costByModel) },
 			spawns: [...(spawnsByRun.get(own.record.runId) ?? [])],
+			...(agents.length ? { agents } : {}),
 		};
 	}
 
@@ -129,6 +149,7 @@ export class RunController {
 		this.#own = own;
 		spawnsByRun.set(runId, []);
 		await writeRun(own.root, record);
+		liveWriters.set(runId, () => this.#scheduleFlush(own));
 		const ui = this.deps.ui(ctx);
 		if (!keyword) ui.notify("이 세션에서 workflowz·orchestrate 키워드를 쓸 수 없어 팀 계약만 보냅니다.", "warning");
 		ui.notify(`Storm 실행을 시작합니다(${runId}).`);
@@ -159,9 +180,13 @@ export class RunController {
 		const own = this.#own;
 		if (!own) return undefined;
 		this.#own = undefined;
+		clearTimeout(this.#flushTimer);
+		this.#flushTimer = undefined;
+		liveWriters.delete(own.record.runId);
 		const ledger = endLedgerRun(own.record.runId);
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
 		spawnsByRun.delete(own.record.runId);
+		const agents = this.deps.agents?.(own.record.runId) ?? [];
 		const record: RunRecord = {
 			...own.record,
 			endedAt: iso(this.deps.now()),
@@ -169,11 +194,25 @@ export class RunController {
 			costUsd: ledger?.costUsd ?? own.record.costUsd,
 			costByModel: { ...(ledger?.costByModel ?? own.record.costByModel) },
 			spawns,
+			...(agents.length ? { agents } : {}),
 		};
+		await this.#liveWrite;
 		await writeRun(own.root, record);
 		await pruneRuns(own.root);
 		if (ctx) this.deps.ui(ctx).report("Storm 실행 결과", summarizeRun(record));
 		return record;
+	}
+
+	#scheduleFlush(own: OwnRun): void {
+		if (this.#flushTimer) return;
+		this.#flushTimer = setTimeout(() => {
+			this.#flushTimer = undefined;
+			const live = this.active();
+			// A run that finished meanwhile has already written its final record.
+			if (!live || this.#own !== own) return;
+			this.#liveWrite = writeRun(own.root, { ...live, updatedAt: iso(this.deps.now()) }).catch(() => undefined);
+		}, this.deps.flushMs ?? LIVE_FLUSH_MS);
+		this.#flushTimer.unref?.();
 	}
 
 	#threshold(ctx: ExtensionContext, own: OwnRun, kind: "warn" | "limit", run: LedgerRun): void {
@@ -182,10 +221,12 @@ export class RunController {
 		const budget = run.budget;
 		if (kind === "warn") {
 			own.record.warnedAt = at;
+			this.#scheduleFlush(own);
 			ui.notify(`Storm 실행 비용이 경고선 ${money(budget?.warnAtUsd ?? 0)}에 닿았습니다(누계 ${money(run.costUsd)}).`, "warning");
 			return;
 		}
 		own.record.exceededAt = at;
+		this.#scheduleFlush(own);
 		ui.notify(`Storm 실행 예산 ${money(budget?.perRunUsd ?? 0)}을 넘었습니다(누계 ${money(run.costUsd)}). 새 스폰을 막습니다.`, "warning");
 		if (budget?.onExceed === "stop") ctx.abort();
 	}
@@ -212,5 +253,11 @@ export function summarizeRun(run: RunRecord): string {
 	];
 	const blocked = run.spawns.find(spawn => spawn.outcome === "blocked");
 	if (blocked?.reason) lines.push(`- 차단 사유: ${blocked.reason}`);
+	const agents = run.agents ?? [];
+	if (agents.length) {
+		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);
+		const reused = agents.filter(agent => agent.followUps > 0).length;
+		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)`);
+	}
 	return lines.join("\n");
 }

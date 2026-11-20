@@ -7,11 +7,13 @@ import type { ProjectState } from "../src/state.ts";
 import type { RunRequestResult, StormToolHost } from "../src/tool/host.ts";
 import { createStormTool, runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
 import type {
+	AgentEntry,
 	Analysis,
 	AnalysisContext,
 	ApprovalScope,
 	Candidate,
 	EvidenceRecord,
+	LifecycleSettings,
 	MetricValue,
 	ModelInfo,
 	Proposal,
@@ -164,7 +166,16 @@ interface Saved {
 	baseHash: string | null;
 }
 
-function fakeHost(opts: { config?: StormConfig | null; answers?: Answer[]; shadows?: ShadowInfo[]; run?: RunRequestResult } = {}) {
+function fakeHost(
+	opts: {
+		config?: StormConfig | null;
+		answers?: Answer[];
+		shadows?: ShadowInfo[];
+		run?: RunRequestResult;
+		agents?: AgentEntry[];
+		lifecycle?: LifecycleSettings;
+	} = {},
+) {
 	let config: StormConfig | null = opts.config === undefined ? structuredClone(base) : opts.config;
 	let shadows = opts.shadows ?? [];
 	const queue = [...(opts.answers ?? [])];
@@ -227,7 +238,10 @@ function fakeHost(opts: { config?: StormConfig | null; answers?: Answer[]; shado
 				runs.push(task);
 				return opts.run ?? { ok: true, runId: "run-1" };
 			},
+			agents: () => structuredClone(opts.agents ?? []),
 		},
+		lifecycleSettings: async () => opts.lifecycle ?? { agentIdleTtlMs: 420_000, cacheRetention: "auto" },
+		modelCost: (s) => (s === "a/i" ? { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } : undefined),
 		proposals: {
 			list: async () => proposals.filter((p) => config !== null && p.baseHash === configHash(config)),
 			save: async (p) => {
@@ -296,6 +310,77 @@ describe("read actions", () => {
 		expect(r.outcome).toBe("ok");
 		expect(r.text).toContain("웹에서 찾아볼 수 있습니다");
 		expect(f.prepares()).toBe(1);
+	});
+
+	test("status lists subagents with advice when there are any", async () => {
+		const r = await run(fakeHost({ agents: [agentEntry({ id: "Imp1", role: "implementer", state: "idle" })] }), { action: "status" });
+		expect(r.text).toContain("### 서브에이전트");
+		expect(r.text).toContain("Imp1 (implementer)");
+		expect(r.text).toContain("### 수명 관리");
+	});
+});
+
+function agentEntry(over: Partial<AgentEntry> = {}): AgentEntry {
+	return {
+		id: "A1",
+		name: "storm-implementer",
+		model: "a/i",
+		state: "idle",
+		startedAt: NOW - 600_000,
+		lastActivityAt: NOW - 60_000,
+		contextTokens: 30_000,
+		contextWindow: 200_000,
+		requests: 4,
+		costUsd: 0.1,
+		followUps: 0,
+		...over,
+	};
+}
+
+describe("agents", () => {
+	test("schema accepts the action and the description carries the reuse rule", () => {
+		const tool = createStormTool(zod, () => fakeHost().host);
+		expect(tool.parameters.safeParse({ action: "agents" }).success).toBe(true);
+		expect(tool.description).toContain("agent://<id>");
+	});
+
+	test("no subagents yet: says so, still warns about lifecycle, never asks or prepares", async () => {
+		const f = fakeHost();
+		const r = await run(f, { action: "agents" });
+		expect(r.outcome).toBe("ok");
+		expect(r.text).toContain("아직 실행된 서브에이전트가 없습니다");
+		// Team providers a and b are unknown → 5 min estimate, shorter than the 7 min idle TTL; same window, one line.
+		expect(r.text).toContain("### 수명 관리");
+		expect(r.text).toContain("a·b: 유휴 TTL 7분");
+		expect(f.prepares()).toBe(0);
+		expect(f.selects).toEqual([]);
+	});
+
+	test("advice table with reuse and fresh, priced from the host", async () => {
+		const f = fakeHost({
+			agents: [
+				agentEntry({ id: "Warm", lastActivityAt: NOW - 60_000 }),
+				agentEntry({ id: "Cold", lastActivityAt: NOW - 3_600_000 }),
+				agentEntry({ id: "Busy", state: "running" }),
+			],
+		});
+		const r = await run(f, { action: "agents" });
+		expect(r.text).toContain("| Warm (storm-implementer) |");
+		expect(r.text).toMatch(/\| Warm .*\| 재사용 \|/);
+		expect(r.text).toMatch(/\| Cold .*\| 새 에이전트 \|.*\$0\.1125/);
+		expect(r.text).toMatch(/\| Busy .*\| 작업 중 \|/);
+		expect(r.text).toContain("write agent://<id>");
+	});
+
+	test("without a config the agents' providers drive the warnings", async () => {
+		const f = fakeHost({
+			config: null,
+			agents: [agentEntry({ model: "openai/gpt" })],
+			lifecycle: { agentIdleTtlMs: 420_000, cacheRetention: "long" },
+		});
+		const r = await run(f, { action: "agents" });
+		expect(r.text).toContain("openai: 캐시 유지 12시간");
+		expect(r.text).not.toMatch(/^- [ab]: /m);
 	});
 });
 

@@ -1,4 +1,5 @@
-import { ROLES } from "../roles.ts";
+import { agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "../report/agents.ts";
+import { ROLES, STORM_VERSION } from "../roles.ts";
 import type {
 	Analysis,
 	BudgetConfig,
@@ -360,7 +361,7 @@ export function renderShadows(shadows: StatusView["shadows"]): string {
 }
 
 export function renderStatus(view: StatusView, now: number): string {
-	const out = ["### 저장소", `- repoId: ${view.repo.repoId}`, `- 루트: ${view.repo.root}`, "", "### 설정"];
+	const out = [`- Storm ${STORM_VERSION}`, "", "### 저장소", `- repoId: ${view.repo.repoId}`, `- 루트: ${view.repo.root}`, "", "### 설정"];
 	const c = view.config;
 	if (c.status === "missing") out.push(`- 없음 (${c.path}) — /storm setup으로 만드세요`);
 	else if (c.status === "invalid") out.push(`- 오류 (${c.path})`, ...c.errors.map((e) => `  - ${e}`));
@@ -396,6 +397,12 @@ export function renderStatus(view: StatusView, now: number): string {
 		out.push("", `### 승인 대기 제안 (${view.pending.length}건)`);
 		for (const p of view.pending) out.push(`- ${p.summary}`);
 		out.push("- /storm review 로 승인하세요");
+	}
+	if (view.agents) out.push("", "### 서브에이전트", renderAgents(view.agents, now));
+	if (view.lifecycle) {
+		const providers = c.status === "ok" ? teamProviders(c.config) : agentProviders((view.agents ?? []).map((a) => a.entry));
+		const ws = lifecycleWarnings(view.lifecycle, providers);
+		if (ws.length) out.push("", "### 수명 관리", ...ws.map((w) => `- ${w}`));
 	}
 	out.push("", "### 쿼터");
 	if (!view.quota.length) out.push(`- ${DASH}`);

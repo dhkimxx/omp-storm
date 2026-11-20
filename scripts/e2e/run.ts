@@ -9,6 +9,7 @@ import type { Subprocess } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { STORM_VERSION } from "../../src/roles.ts";
 import { parseModelEntry } from "../../src/selector.ts";
 
 type Frame = { type?: string; [key: string]: unknown };
@@ -209,27 +210,35 @@ async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children:
 	}, flavor);
 }
 
-/** Sends a prompt and returns every frame until the session has settled and stayed quiet (handoffs start follow-up turns). */
-async function converse(message: string, answer: Answer, flavor: Flavor = {}): Promise<{ frames: Frame[]; llm: LlmEntry[] }> {
+/** Waits until the session has settled and stayed quiet (handoffs start follow-up turns). */
+async function settleQuietly(rpc: Rpc, from: number, label: string): Promise<void> {
+	const deadline = Date.now() + 120_000;
+	let seen = rpc.frames.length;
+	let quietSince = Date.now();
+	for (;;) {
+		await Bun.sleep(200);
+		if (rpc.frames.length !== seen) {
+			seen = rpc.frames.length;
+			quietSince = Date.now();
+			continue;
+		}
+		const settled = rpc.find(frame => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true), from);
+		if (settled && Date.now() - quietSince >= 3_000) return;
+		if (Date.now() > deadline) throw new Error(`timeout waiting for quiet: ${label}`);
+	}
+}
+
+/** Sends the prompts one after another in one session; returns every frame once each has settled. */
+async function converse(messages: string | string[], answer: Answer, flavor: Flavor = {}): Promise<{ frames: Frame[]; llm: LlmEntry[] }> {
 	const before = readLlm().length;
 	return session(
 		answer,
 		async rpc => {
 			const from = rpc.frames.length;
-			rpc.send({ type: "prompt", message });
-			const deadline = Date.now() + 120_000;
-			let seen = rpc.frames.length;
-			let quietSince = Date.now();
-			for (;;) {
-				await Bun.sleep(200);
-				if (rpc.frames.length !== seen) {
-					seen = rpc.frames.length;
-					quietSince = Date.now();
-					continue;
-				}
-				const settled = rpc.find(frame => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true), from);
-				if (settled && Date.now() - quietSince >= 3_000) break;
-				if (Date.now() > deadline) throw new Error(`timeout waiting for quiet: ${message}`);
+			for (const message of [messages].flat()) {
+				const at = rpc.frames.length;
+				rpc.send({ type: "prompt", message });
+				await settleQuietly(rpc, at, message);
 			}
 			return { frames: rpc.frames.slice(from), llm: readLlm().slice(before) };
 		},
@@ -348,16 +357,29 @@ async function main(): Promise<void> {
 		const approvalsBefore = approvalFiles().length;
 		const llmBefore = readLlm().length;
 		const print = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm setup"], { cwd: PROJECT, timeout: 120_000 });
-		check("print 모드: 변경 없음", configHashOnDisk() === hashBefore && approvalFiles().length === approvalsBefore, `exit=${print.exitCode}`);
+		const printReset = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm reset"], { cwd: PROJECT, timeout: 120_000 });
+		check(
+			"print 모드: setup·reset 모두 변경 없음",
+			configHashOnDisk() === hashBefore && approvalFiles().length === approvalsBefore,
+			`exit=${print.exitCode},${printReset.exitCode}`,
+		);
 		check("print 모드: 모델 호출 없음", readLlm().length === llmBefore);
 
 		frames = await command("/storm status", noAnswer);
 		check("status: 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
+		check("status: Storm 버전", frames.some(frame => textOf(frame).includes(`- Storm ${STORM_VERSION}`)));
+		check("status: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
 
 		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
 		type StoredRole = { models: string[]; effort?: string; workers?: number };
 		type StoredConfig = { priority: string; roles: Record<string, StoredRole>; trials?: unknown[]; budget?: { perRunUsd: number } };
-		type StoredRun = { status: string; contract: string; spawns: Array<{ outcome: string; agent: string }> };
+		type StoredAgent = { id: string; role?: string; model?: string; contextTokens: number; state: string; followUps: number };
+		type StoredRun = {
+			status: string;
+			contract: string;
+			spawns: Array<{ outcome: string; agent: string; spawnKey?: string }>;
+			agents?: StoredAgent[];
+		};
 		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
 		const idOf = (entry: string | undefined): string | undefined =>
 			entry === undefined ? undefined : parseModelEntry(entry).selector.split("/").slice(1).join("/");
@@ -408,6 +430,21 @@ async function main(): Promise<void> {
 			`${firstRun?.status} ${firstRun?.spawns.map(s => s.outcome).join(",")}`,
 		);
 		check("실행: 결과 보고", talk.frames.some(frame => textOf(frame).includes("Storm 실행 결과")));
+		const ledger = firstRun?.agents ?? [];
+		check(
+			"실행: 서브에이전트 장부(역할·모델·컨텍스트)",
+			ledger.length === 2 && ledger.some(agent => agent.role === "implementer") && ledger.every(agent => agent.contextTokens > 0 && agent.model !== undefined),
+			JSON.stringify(ledger.map(agent => [agent.id, agent.role, agent.model, agent.contextTokens, agent.state])),
+		);
+		const spawnKeys = (firstRun?.spawns ?? []).map(spawn => spawn.spawnKey);
+		check(
+			"실행: 스폰 기록이 에이전트 id로 이어짐",
+			spawnKeys.length > 0 && spawnKeys.every(key => ledger.some(agent => agent.id === key)),
+			`spawnKeys=${spawnKeys.join(",")} agents=${ledger.map(agent => agent.id).join(",")}`,
+		);
+		talk = await converse(["SPIKE-TASK storm-implementer", '/storm STORM-TOOL {"action":"agents"}'], noAnswer);
+		const agentsReply = talk.frames.map(textOf).find(text => text.includes("(implementer)") && text.includes("| 권장 |"));
+		check("agents: 끝난 에이전트 재사용 권장", agentsReply?.includes("재사용") === true && agentsReply.includes("agent://"), agentsReply?.slice(0, 300) ?? "no table");
 		run = await spawn(["task"], { model: OUTSIDER });
 		check("실행 밖: 일반 에이전트는 그대로", run.children[0]?.model === idOf(OUTSIDER), `child=${run.children[0]?.model}`);
 
@@ -478,10 +515,30 @@ async function main(): Promise<void> {
 		);
 		check("예산: 실행 기록", budgetRun?.status === "budget-exceeded", `status=${budgetRun?.status}`);
 
-		rmSync(join(PROJECT, ".omp", "storm"), { recursive: true, force: true });
+		const approvalsBeforeReset = approvalFiles().length;
+		frames = await command("/storm reset", choose("취소"));
+		check(
+			"초기화: 범위 질문, 취소하면 그대로",
+			uiTitled(frames, "어디까지 초기화할까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
+		);
+		const pick =
+			(scope: string): Answer =>
+			request => {
+				const options = (request.options as string[] | undefined) ?? [];
+				return options.includes(scope) ? scope : options.includes("초기화") ? "초기화" : undefined;
+			};
+		await command("/storm reset", pick("설정만 초기화"));
+		check(
+			"초기화: 설정만 지우고 승인 기록은 남김",
+			!existsSync(join(PROJECT, ".omp", "storm")) && approvalFiles().length === approvalsBeforeReset,
+			`approvals=${approvalFiles().length}/${approvalsBeforeReset}`,
+		);
 		run = await spawn(["storm-implementer", "task"]);
-		check("설정 삭제: storm 역할 차단", run.results.includes("Storm 설정이 없습니다"));
-		check("설정 삭제: 일반 에이전트 정상", run.children.length === 1);
+		check("초기화 후: storm 역할 차단", run.results.includes("Storm 설정이 없습니다"));
+		check("초기화 후: 일반 에이전트 정상", run.children.length === 1);
+		check("초기화 후: storm 도구 없음", run.main.length > 0 && run.main.every(entry => !entry.tools.includes("storm")));
+		await command("/storm reset", pick("승인 기록까지 모두 초기화"));
+		check("초기화: 승인 기록까지 삭제", approvalFiles().length === 0, `approvals=${approvalFiles().length}`);
 	} finally {
 		server.kill();
 		await server.exited;

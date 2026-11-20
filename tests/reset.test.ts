@@ -1,0 +1,187 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { approveAndSave, type FlowEnv, resetFlow } from "../src/flows.ts";
+import { deriveScope } from "../src/interview/setup.ts";
+import { loadProjectState } from "../src/state.ts";
+import type { Exec, RunRecord, StormConfig, UiPort } from "../src/types.ts";
+
+const exec: Exec = async (command, args, options) => {
+	const p = Bun.spawn([command, ...args], {
+		...(options?.cwd !== undefined ? { cwd: options.cwd } : {}),
+		stdout: "pipe",
+		stderr: "pipe",
+		env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+	});
+	const [stdout, stderr, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+	return { stdout, stderr, code };
+};
+
+async function git(cwd: string, ...args: string[]): Promise<void> {
+	const res = await exec("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args]);
+	if (res.code !== 0) throw new Error(`git ${args.join(" ")}: ${res.stderr}`);
+}
+
+const config: StormConfig = {
+	version: 1,
+	priority: "balanced",
+	roles: {
+		explorer: { agent: "storm-explorer", models: ["a/x"] },
+		implementer: { agent: "storm-implementer", models: ["a/i"] },
+		reviewer: { agent: "storm-reviewer", models: ["a/r"] },
+	},
+	parallelism: 4,
+	isolation: "shared",
+	contract: "workflowz",
+	runtime: "omp",
+};
+
+const LOCAL = "설정만 초기화";
+const ALL = "승인 기록까지 모두 초기화";
+
+let tmp: string;
+let project: string;
+let env: FlowEnv;
+
+beforeEach(async () => {
+	tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-reset-")));
+	project = path.join(tmp, "project");
+	await mkdir(project);
+	await git(project, "init", "-q");
+	env = {
+		cwd: project,
+		exec,
+		agentDir: path.join(tmp, "agent"),
+		pluginAgentsDir: path.join(tmp, "plugin-agents"),
+		ompBin: "omp",
+		ompVersion: "19.0.1",
+		mode: "test",
+		registry: { getAll: () => [], getAvailable: () => [] },
+		activeTools: [],
+		now: Date.now,
+	};
+});
+
+afterEach(async () => {
+	await rm(tmp, { recursive: true, force: true });
+});
+
+const stormDir = () => path.join(project, ".omp", "storm");
+
+/** An approved team plus an unrelated file under .omp/; returns this repo's approval directory. */
+async function seed(): Promise<string> {
+	const state = await loadProjectState(env);
+	await approveAndSave(env, state, config, deriveScope(config, []));
+	await writeFile(path.join(project, ".omp", "other.txt"), "keep\n");
+	return state.store.dir;
+}
+
+async function approvals(): Promise<number> {
+	return (await (await loadProjectState(env)).store.list()).length;
+}
+
+function scriptedUi(answers: Array<string | undefined>) {
+	const selects: Array<{ title: string; options: string[] }> = [];
+	const notes: string[] = [];
+	const reports: string[] = [];
+	const ui: UiPort = {
+		async select(title, options) {
+			selects.push({ title, options: options.map(o => (typeof o === "string" ? o : o.label)) });
+			return answers.shift();
+		},
+		async confirm() {
+			return false;
+		},
+		async input() {
+			return undefined;
+		},
+		notify(message) {
+			notes.push(message);
+		},
+		report(_title, markdown) {
+			reports.push(markdown);
+		},
+	};
+	return { ui, selects, notes, reports };
+}
+
+describe("/storm reset", () => {
+	test("config only: deletes .omp/storm, keeps approvals for rollback and other .omp files", async () => {
+		await seed();
+		const f = scriptedUi([LOCAL, "초기화"]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(existsSync(stormDir())).toBe(false);
+		expect(existsSync(path.join(project, ".omp", "other.txt"))).toBe(true);
+		expect(await approvals()).toBe(1);
+		expect(f.notes.at(-1)).toContain("/storm rollback");
+
+		// Only what is left is offered next time.
+		const again = scriptedUi(["취소"]);
+		expect(await resetFlow(env, again.ui)).toBe(false);
+		expect(again.selects[0]?.options).toEqual([ALL, "취소"]);
+	});
+
+	test("everything: also deletes this repo's approval records, not other repos'", async () => {
+		const dir = await seed();
+		const other = path.join(path.dirname(dir), "git-other-000000000000000000000000");
+		await mkdir(other, { recursive: true });
+		await writeFile(path.join(other, "log.jsonl"), "");
+		const f = scriptedUi([ALL, "초기화"]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(existsSync(stormDir())).toBe(false);
+		expect(existsSync(dir)).toBe(false);
+		expect(existsSync(path.join(other, "log.jsonl"))).toBe(true);
+		expect(f.notes.at(-1)).toContain("승인 1건");
+	});
+
+	test("nothing is deleted without the scope choice and the exact confirmation label", async () => {
+		await seed();
+		for (const answers of [[undefined], ["취소"], [LOCAL, "취소"], [LOCAL, undefined], [ALL, "네"]]) {
+			const f = scriptedUi(answers);
+			expect(await resetFlow(env, f.ui)).toBe(false);
+			expect(existsSync(path.join(stormDir(), "config.json"))).toBe(true);
+			expect(await approvals()).toBe(1);
+		}
+	});
+
+	test("refuses while a run is active, before asking anything", async () => {
+		await seed();
+		const run: RunRecord = {
+			schema: "storm.run/v1",
+			runId: "run-x",
+			configHash: "h",
+			approvalId: "ap",
+			startedAt: "2026-11-20T09:00:00.000Z",
+			status: "running",
+			contract: "workflowz",
+			task: "t",
+			costUsd: 0,
+			costByModel: {},
+			spawns: [],
+		};
+		const f = scriptedUi([ALL, "초기화"]);
+		expect(await resetFlow({ ...env, activeRun: () => run }, f.ui)).toBe(false);
+		expect(f.selects).toEqual([]);
+		expect(f.notes[0]).toContain("run-x");
+		expect(existsSync(stormDir())).toBe(true);
+	});
+
+	test("a committed config is called out: deleting it leaves a git change to commit", async () => {
+		await seed();
+		await git(project, "add", ".omp/storm/config.json");
+		await git(project, "commit", "-qm", "storm");
+		const f = scriptedUi([LOCAL, "초기화"]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(f.reports[0]).toContain("git에 커밋된 파일 1개(.omp/storm/config.json)");
+		expect(f.notes.at(-1)).toContain("직접 커밋");
+	});
+
+	test("nothing to reset: says so without asking", async () => {
+		const f = scriptedUi([ALL, "초기화"]);
+		expect(await resetFlow(env, f.ui)).toBe(false);
+		expect(f.selects).toEqual([]);
+		expect(f.notes).toEqual(["초기화할 Storm 설정이나 기록이 없습니다."]);
+	});
+});

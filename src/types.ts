@@ -229,6 +229,10 @@ export interface ExplicitSettings {
 	agentModelOverrides: Record<string, string | string[]>;
 	/** `magicKeywords.*` toggles; undefined when the settings could not be read. */
 	magicKeywords?: { enabled: boolean; workflowz: boolean; orchestrate: boolean };
+	/** `task.agentIdleTtlMs`: how long a finished subagent stays live before omp parks it (0 = never); undefined when unreadable. */
+	agentIdleTtlMs?: number;
+	/** `providers.cacheRetention` (`auto|short|long|none`); undefined when unreadable. */
+	cacheRetention?: string;
 }
 
 // ── Analysis (implemented in src/analysis) ──────────────────────────────────────────────────
@@ -565,6 +569,10 @@ export interface StatusView {
 	quotaMarks?: QuotaMark[];
 	/** Proposals still waiting for approval (built on the current config). */
 	pending?: Proposal[];
+	/** Subagents of this session with lifecycle advice. */
+	agents?: Array<{ entry: AgentEntry; advice: AgentAdvice }>;
+	/** omp settings that decide what reusing a subagent costs; drives lifecycle warnings. */
+	lifecycle?: LifecycleSettings;
 }
 
 /** A previously approved config offered by `/storm rollback`. */
@@ -599,6 +607,8 @@ export interface SpawnRecord {
 	role?: string;
 	/** Set when a trial was active for the role, whether or not this spawn was routed to it. */
 	trialId?: string;
+	/** The caller's per-spawn key (task item name or eval label); omp names the subagent and its transcript after it. */
+	spawnKey?: string;
 }
 
 /** `<root>/.omp/storm/state/runs/<runId>.json`: what one Storm run did and under which approval. */
@@ -623,6 +633,10 @@ export interface RunRecord {
 	warnedAt?: string;
 	exceededAt?: string;
 	spawns: SpawnRecord[];
+	/** Subagents seen during the run, from the agent ledger. */
+	agents?: AgentEntry[];
+	/** ISO 8601 of the last write while the run was active. */
+	updatedAt?: string;
 }
 
 /** A provider reported out of quota; approved fallbacks on other providers go first until `until`. */
@@ -767,7 +781,8 @@ export type StormToolAction =
 	| "quota"
 	| "trial"
 	| "budget"
-	| "run";
+	| "run"
+	| "agents";
 
 /** Arguments the LLM passes; each action reads only its own fields. */
 export interface StormToolParams {
@@ -793,4 +808,52 @@ export interface StormToolParams {
 	onExceed?: BudgetConfig["onExceed"];
 	/** run */
 	task?: string;
+}
+
+// ── Agent ledger and lifecycle advice (implemented in src/runtime/agents.ts, src/report/agents.ts) ─
+
+export type AgentLiveState = "running" | "idle" | "parked";
+
+/** A subagent of this process as Storm observed it from inside the child session. */
+export interface AgentEntry {
+	/** omp agent id (`ctx.agent.id`); also its `agent://<id>` handle. */
+	id: string;
+	/** Agent definition name (`ctx.agent.name`), e.g. "storm-implementer". */
+	name: string;
+	parentId?: string;
+	/** Storm role key for storm-* agents. */
+	role?: string;
+	/** The Storm run active when the agent started. */
+	runId?: string;
+	/** "provider/model" of its last assistant message. */
+	model?: string;
+	state: AgentLiveState;
+	/** ms since epoch. */
+	startedAt: number;
+	lastActivityAt: number;
+	/** Prompt tokens of its last request (input + cache read + cache write): roughly what a follow-up carries. */
+	contextTokens: number;
+	contextWindow?: number;
+	requests: number;
+	/** List-price spend. */
+	costUsd: number;
+	/** Turns after its first one: follow-ups by message, wake or revive. */
+	followUps: number;
+	/** Cache-read share of the last request's prompt, 0..1. */
+	lastCacheReadShare?: number;
+}
+
+export interface AgentAdvice {
+	id: string;
+	/** reuse: send follow-ups to it · fresh: give new work to a new agent with a summary · cleanup: nothing left to gain from keeping it. */
+	action: "reuse" | "fresh" | "cleanup" | "busy";
+	reason: string;
+	/** "agent://<id>" when reuse is advised. */
+	handle?: string;
+}
+
+/** The omp settings that decide what reusing a subagent costs. Storm only reads them. */
+export interface LifecycleSettings {
+	agentIdleTtlMs?: number;
+	cacheRetention?: string;
 }

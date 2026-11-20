@@ -15,6 +15,7 @@ Storm gives three role agents the models the user approved and enforces them whe
 
 - Spawn these roles by agent name. Do not pass `model` for them; Storm replaces it with the approved models.
 - If Storm blocks a spawn, stop and tell the user the reason and the command it names (`/storm` or `/storm review`). Do not retry with another agent to get around the block.
+- Reuse finished subagents: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent with `write agent://<id>` (or the eval handle's `.send()`) instead of a new spawn. When unsure whether its cache is still warm or its context too big, call the `storm` tool's `agents` action first.
 - Never edit `.omp/storm/` or Storm's approval records. Team changes go through the `storm` tool or `/storm` and need the user's approval.
 
 ## `<storm-request>`: a `/storm` request in natural language
@@ -31,6 +32,7 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 | A provider ran out of quota | `quota` |
 | To try a model on part of a role's work | `trial` |
 | A spending limit per run | `budget` |
+| Which subagents to reuse, start fresh or let go | `agents` |
 | Work done (implement, analyze, fix…) | `run` with the request as `task` |
 
 - Write actions only propose. The user approves in a dialog; report the tool's outcome as is and never claim a change was applied unless the tool said so.

@@ -189,6 +189,13 @@ describe("decideSpawn (v0.2 storm agents)", () => {
 		});
 	});
 
+	test("the caller's spawn key is kept so the record points at the subagent (agent://<key>)", () => {
+		const out = decideSpawn({ ...ev("storm-implementer", ["pi/smol"]), spawnKey: "ResidencyImpl" }, state(), runtime());
+		expect(out.record?.spawnKey).toBe("ResidencyImpl");
+		const blocked = decideSpawn({ ...ev("storm-reviewer"), spawnKey: "Review" }, state({ approval: undefined }), runtime());
+		expect(blocked.record).toMatchObject({ outcome: "blocked", spawnKey: "Review" });
+	});
+
 	test("blocked storm spawns carry the reason in the record", () => {
 		const out = decideSpawn(ev("storm-reviewer"), state({ approval: undefined }), runtime());
 		expect(out.record?.outcome).toBe("blocked");

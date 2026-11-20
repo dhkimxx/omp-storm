@@ -8,13 +8,24 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { resolveRepo } from "./approval/repo.ts";
 import { loadConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
+import { toModelInfo } from "./discovery/models.ts";
 import { readExplicitSettings } from "./discovery/settings.ts";
-import { approveAndSave, type FlowEnv, modelsFlow, reviewFlow, rollbackFlow, setupFlow, statusFlow } from "./flows.ts";
+import {
+	approveAndSave,
+	type FlowEnv,
+	modelsFlow,
+	resetFlow,
+	reviewFlow,
+	rollbackFlow,
+	setupFlow,
+	statusFlow,
+} from "./flows.ts";
 import { execPort, ompBinary } from "./omp.ts";
 import { decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
 import { ROLE_AGENT_PREFIX } from "./roles.ts";
-import { buildStormRequest, noteRunSpawn, RunController } from "./runtime/controller.ts";
+import { listAgents, noteAgentEnd, noteAgentParked, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
+import { buildStormRequest, noteRunSpawn, RunController, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
 import { lastRun } from "./runtime/run.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
@@ -23,18 +34,20 @@ import { trialViews } from "./runtime/views.ts";
 import { createStateCache, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
-import type { ConfigLoad, ExplicitSettings, RepoIdentity, TrialConfig } from "./types.ts";
+import type { ConfigLoad, ExplicitSettings, LifecycleSettings, ModelInfo, RepoIdentity, TrialConfig } from "./types.ts";
 import { createUiPort } from "./ui.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /** Handled without the LLM when the argument is exactly one of these. */
-const EXACT = ["status", "models", "setup", "review", "rollback"] as const;
+const EXACT = ["status", "models", "setup", "review", "rollback", "reset"] as const;
 const COMPLETIONS = [...EXACT, "run"] as const;
 const CONFIG_TTL_MS = 5_000;
 
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
 const configByRoot = new Map<string, { at: number; load: Promise<ConfigLoad> }>();
 const spawnQueues = new Map<string, Promise<unknown>>();
+/** Catalog rows by "provider/id"; misses are not cached so a refreshed catalog is picked up. */
+const modelInfos = new Map<string, ModelInfo>();
 
 /** Spawn decisions of one project run one at a time, so parallel spawns never read the same trial counters. */
 function serialize<T>(key: string, task: () => Promise<T>): Promise<T> {
@@ -54,17 +67,44 @@ function cachedConfig(root: string): Promise<ConfigLoad> {
 	return load;
 }
 
-/** List-price spend of a finished assistant message, if any. */
-function assistantSpend(message: unknown): { selector: string; usd: number } | undefined {
+interface AssistantUsage {
+	selector: string;
+	/** List price; 0 when the model's prices are unknown. */
+	usd: number;
+	/** Input + cache read + cache write: what the request carried. */
+	promptTokens: number;
+	cacheReadTokens: number;
+}
+
+/** Spend and prompt size of a finished assistant message, if any. */
+function assistantUsage(message: unknown): AssistantUsage | undefined {
 	if (!message || typeof message !== "object") return undefined;
 	if (!("role" in message) || message.role !== "assistant") return undefined;
 	if (!("provider" in message) || !("model" in message) || !("usage" in message)) return undefined;
 	const { provider, model, usage } = message;
 	if (typeof provider !== "string" || typeof model !== "string" || !usage || typeof usage !== "object") return undefined;
+	const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
 	const cost = "cost" in usage ? usage.cost : undefined;
-	const usd = cost && typeof cost === "object" && "total" in cost ? cost.total : undefined;
-	if (typeof usd !== "number" || !Number.isFinite(usd) || usd <= 0) return undefined;
-	return { selector: `${provider}/${model}`, usd };
+	const cacheRead = count("cacheRead" in usage ? usage.cacheRead : undefined);
+	return {
+		selector: `${provider}/${model}`,
+		usd: count(cost && typeof cost === "object" && "total" in cost ? cost.total : undefined),
+		promptTokens: count("input" in usage ? usage.input : undefined) + cacheRead + count("cacheWrite" in usage ? usage.cacheWrite : undefined),
+		cacheReadTokens: cacheRead,
+	};
+}
+
+function lookupModel(ctx: ExtensionContext, selector: string): ModelInfo | undefined {
+	const wanted = stripEffort(selector);
+	const hit = modelInfos.get(wanted);
+	if (hit) return hit;
+	for (const model of ctx.modelRegistry.getAll()) {
+		const info = toModelInfo(model, true);
+		if (info?.selector !== wanted) continue;
+		modelInfos.set(wanted, info);
+		return info;
+	}
+	return undefined;
 }
 
 function statusLabel(state: ProjectState): string | undefined {
@@ -106,12 +146,31 @@ export default function storm(pi: ExtensionAPI): void {
 		};
 	};
 
+	/** Read on every use: these settings may change during a session, and only status and the agents action ask. */
+	const lifecycleSettings = async (): Promise<LifecycleSettings> => {
+		const settings = await readExplicitSettings(exec, ompBinary()).catch(() => undefined);
+		return {
+			...(settings?.agentIdleTtlMs !== undefined ? { agentIdleTtlMs: settings.agentIdleTtlMs } : {}),
+			...(settings?.cacheRetention !== undefined ? { cacheRetention: settings.cacheRetention } : {}),
+		};
+	};
+	const modelCost = (ctx: ExtensionContext, selector: string) => {
+		const info = lookupModel(ctx, selector);
+		return info?.pricingKnown ? info.cost : undefined;
+	};
+	/** Rewrites the project's active run record soon, so other terminals can follow it. */
+	const touchActiveRun = async (ctx: ExtensionContext): Promise<void> => {
+		const run = activeLedgerRun((await repoFor(ctx)).repoId);
+		if (run) touchRun(run.runId);
+	};
+
 	const runs = new RunController({
 		pi,
 		ui: ctx => createUiPort(pi, ctx),
 		loadState: ctx => loadProjectState(projectEnv(ctx)),
 		usableKeywords: () => usableKeywords(),
 		now: Date.now,
+		agents: runId => listAgents({ runId }),
 	});
 
 	const flowEnv = (ctx: ExtensionContext): FlowEnv => ({
@@ -123,6 +182,9 @@ export default function storm(pi: ExtensionAPI): void {
 		activeTools: pi.getActiveTools(),
 		now: Date.now,
 		activeRun: () => runs.active(),
+		agents: () => listAgents({ ancestorId: ctx.agent.id }),
+		lifecycleSettings,
+		modelCost: selector => modelCost(ctx, selector),
 	});
 
 	const toolHost = (ctx: ExtensionContext): StormToolHost => {
@@ -159,7 +221,10 @@ export default function storm(pi: ExtensionAPI): void {
 				quotaMarks: async () => readQuotaMarks(await root(), Date.now()),
 				addQuotaMark: async mark => addQuotaMark(await root(), mark),
 				requestRun: task => runs.request(task),
+				agents: () => listAgents({ ancestorId: ctx.agent.id }),
 			},
+			lifecycleSettings,
+			modelCost: selector => modelCost(ctx, selector),
 			proposals: {
 				list: async () => (await proposals()).list(),
 				save: async proposal => (await proposals()).save(proposal),
@@ -198,21 +263,53 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("message_end", async (event, ctx) => {
-		const spend = assistantSpend(event.message);
-		if (!spend) return;
+		const usage = assistantUsage(event.message);
+		if (!usage) return;
+		if (ctx.agent.kind === "sub" && usage.promptTokens > 0) {
+			const contextWindow = lookupModel(ctx, usage.selector)?.contextWindow;
+			noteAgentUsage({
+				id: ctx.agent.id,
+				model: usage.selector,
+				promptTokens: usage.promptTokens,
+				cacheReadTokens: usage.cacheReadTokens,
+				costUsd: usage.usd,
+				...(contextWindow ? { contextWindow } : {}),
+				now: Date.now(),
+			});
+		}
+		if (usage.usd <= 0) return;
 		const repo = await repoFor(ctx);
-		recordCost(repo.repoId, spend.selector, spend.usd);
+		const run = recordCost(repo.repoId, usage.selector, usage.usd);
+		if (run) touchRun(run.runId);
 		// A trial's budget caps the candidate's spend while the trial runs (all of it, not only trial spawns: the safe side).
 		const load = await cachedConfig(repo.root);
 		const candidates: TrialConfig[] =
-			load.status === "ok" ? (load.config.trials ?? []).filter(trial => stripEffort(trial.model) === spend.selector) : [];
+			load.status === "ok" ? (load.config.trials ?? []).filter(trial => stripEffort(trial.model) === usage.selector) : [];
 		if (candidates.length === 0) return;
 		const states = await readTrialStates(repo.root);
 		const now = Date.now();
 		for (const trial of candidates) {
 			if (trialPhase(trial, states[trial.id], now).phase !== "active") continue;
-			await updateTrialState(repo.root, trial.id, current => ({ ...current, costUsd: current.costUsd + spend.usd }));
+			await updateTrialState(repo.root, trial.id, current => ({ ...current, costUsd: current.costUsd + usage.usd }));
 		}
+	});
+
+	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
+	pi.on("before_agent_start", async (event, ctx) => {
+		if (ctx.agent.kind !== "sub") return undefined;
+		const { id, name, parentId } = ctx.agent;
+		const runId = activeLedgerRun((await repoFor(ctx)).repoId)?.runId;
+		noteAgentStart({
+			id,
+			name,
+			...(parentId ? { parentId } : {}),
+			...(name.startsWith(ROLE_AGENT_PREFIX) ? { role: name.slice(ROLE_AGENT_PREFIX.length) } : {}),
+			...(runId ? { runId } : {}),
+			now: Date.now(),
+			revive: event.reason === "revive",
+		});
+		if (runId) touchRun(runId);
+		return undefined;
 	});
 
 	pi.on("agent_start", () => {
@@ -220,10 +317,17 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		if (ctx.agent.kind === "sub") {
+			noteAgentEnd({ id: ctx.agent.id, now: Date.now(), settled: !(event.willContinue || event.awaitingAsyncWork) });
+			await touchActiveRun(ctx);
+			return;
+		}
 		await runs.onAgentEnd(event, ctx);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
+		if (ctx.agent.kind === "sub") noteAgentParked(ctx.agent.id);
 		await runs.finish("stopped");
 	});
 
@@ -231,6 +335,10 @@ export default function storm(pi: ExtensionAPI): void {
 	const activateTool = async (): Promise<void> => {
 		const active = pi.getActiveTools();
 		if (!active.includes(tool.name)) await pi.setActiveTools([...active, tool.name]);
+	};
+	const deactivateTool = async (): Promise<void> => {
+		const active = pi.getActiveTools();
+		if (active.includes(tool.name)) await pi.setActiveTools(active.filter(name => name !== tool.name));
 	};
 	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
 	const syncSession = async (ctx: ExtensionContext): Promise<void> => {
@@ -252,7 +360,7 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.registerTool(tool);
 
 	pi.registerCommand("storm", {
-		description: "Storm 멀티에이전트 팀 (/storm [status|models|setup|review|rollback|run <작업>|<자연어 요청>])",
+		description: "Storm 멀티에이전트 팀 (/storm [status|models|setup|review|rollback|reset|run <작업>|<자연어 요청>])",
 		getArgumentCompletions: prefix =>
 			COMPLETIONS.filter(name => name.startsWith(prefix)).map(name => ({ value: name, label: name })),
 		handler: async (args, ctx) => {
@@ -295,6 +403,9 @@ export default function storm(pi: ExtensionAPI): void {
 				if (input === "setup") await setupFlow(env, ui);
 				else if (input === "review") await reviewFlow(env, ui);
 				else if (input === "rollback") await rollbackFlow(env, ui);
+				else if (input === "reset") {
+					if (await resetFlow(env, ui)) await deactivateTool();
+				}
 				else {
 					const state = await loadProjectState(env);
 					if (state.config.status === "missing" || state.config.status === "invalid") await setupFlow(env, ui);

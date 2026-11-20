@@ -8,7 +8,7 @@ function isRec(value: unknown): value is Rec {
 
 /**
  * Parses `omp config list --json`: a flat map of dotted keys to `{ value?, type, description }`.
- * Only model preferences and magic-keyword toggles are read; other keys (auth.* included) are ignored.
+ * Only model preferences, magic-keyword toggles, the subagent idle TTL and cache retention are read; other keys (auth.* included) are ignored.
  */
 export function parseConfigList(text: string): ExplicitSettings {
 	const settings: ExplicitSettings = { modelRoles: {}, agentModelOverrides: {} };
@@ -50,6 +50,10 @@ export function parseConfigList(text: string): ExplicitSettings {
 	if (typeof enabled === "boolean" && typeof workflowz === "boolean" && typeof orchestrate === "boolean") {
 		settings.magicKeywords = { enabled, workflowz, orchestrate };
 	}
+	const idleTtl = valueOf("task.agentIdleTtlMs");
+	if (typeof idleTtl === "number" && Number.isFinite(idleTtl) && idleTtl >= 0) settings.agentIdleTtlMs = idleTtl;
+	const retention = valueOf("providers.cacheRetention");
+	if (typeof retention === "string" && retention) settings.cacheRetention = retention;
 	return settings;
 }
 

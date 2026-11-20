@@ -5,9 +5,12 @@
  */
 import type { ProjectState } from "../state.ts";
 import type {
+	AgentEntry,
 	AnalysisContext,
 	ApprovalScope,
 	EvidenceRecord,
+	LifecycleSettings,
+	ModelCost,
 	Proposal,
 	QuotaMark,
 	RunRecord,
@@ -38,7 +41,13 @@ export interface StormToolHost {
 		addQuotaMark(mark: QuotaMark): Promise<void>;
 		/** Queues a run that starts once the current agent turn settles. */
 		requestRun(task: string): RunRequestResult;
+		/** Subagents spawned under this session (any depth), from the agent ledger. */
+		agents(): AgentEntry[];
 	};
+	/** omp's idle-park TTL and cache retention as configured; fields are undefined when unreadable. */
+	lifecycleSettings(): Promise<LifecycleSettings>;
+	/** List prices of a "provider/id" (effort suffix allowed), when the model is known. */
+	modelCost(selector: string): ModelCost | undefined;
 	proposals: {
 		/** Pending proposals built on the current config hash (stale ones are dropped). */
 		list(): Promise<Proposal[]>;

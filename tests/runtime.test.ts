@@ -204,6 +204,8 @@ describe("handoff", () => {
 		expect(text).toContain("최대 3개");
 		expect(text).toContain("model 을 넘기지 않습니다");
 		expect(text).toContain("승인 밖 모델을 요청하면 스폰이 막힙니다.");
+		expect(text).toContain("끝난 storm-* 에이전트에 agent://<id> 로 보냅니다");
+		expect(text).toContain("storm 도구의 agents 동작");
 		expect(text).not.toContain("예산");
 		expect(text.endsWith(`</storm-run>\n\n${base.task}`)).toBe(true);
 		// Outside line 1 neither keyword appears anywhere.

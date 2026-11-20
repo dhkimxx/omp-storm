@@ -1,10 +1,11 @@
 /**
- * /storm flows: setup (detect → analyze → recommend → interview → approve → save), status, review, rollback.
- * Nothing is written unless an interview step returned an explicit approval.
+ * /storm flows: setup (detect → analyze → recommend → interview → approve → save), status, review, rollback, reset.
+ * Nothing is written unless an interview step returned an explicit approval; reset deletes only after two explicit choices.
  */
-import { relative } from "node:path";
+import { readdir, rm, stat } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { configHash, sha256Hex } from "./config/canonical.ts";
-import { serializeConfig, writeConfig } from "./config/store.ts";
+import { configPath, serializeConfig, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { buildEvidence } from "./evidence.ts";
@@ -15,16 +16,21 @@ import { deriveScope, runSetupInterview } from "./interview/setup.ts";
 import { newProposalId } from "./proposals/build.ts";
 import { presentProposal } from "./proposals/present.ts";
 import { createProposalStore } from "./proposals/store.ts";
+import { adviseRows } from "./report/agents.ts";
 import { renderModelCheck } from "./report/models.ts";
 import { ROLES } from "./roles.ts";
-import { lastRun } from "./runtime/run.ts";
+import { activeLedgerRun } from "./runtime/ledger.ts";
+import { lastRun, runsDir, stateDir } from "./runtime/run.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
 import { entryEffort, formatModelEntry, parseModelEntry } from "./selector.ts";
 import { loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type {
+	AgentEntry,
 	EvidenceRecord,
 	InterviewInput,
+	LifecycleSettings,
+	ModelCost,
 	Priority,
 	Proposal,
 	RollbackOption,
@@ -32,6 +38,7 @@ import type {
 	StormConfig,
 	TrialView,
 	UiPort,
+	UiSelectItem,
 } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
@@ -44,6 +51,11 @@ export interface FlowEnv extends ProjectEnv {
 	now: () => number;
 	/** The Storm run active in this session, for status. */
 	activeRun?: () => RunRecord | undefined;
+	/** Subagents under this session, for status. */
+	agents?: () => AgentEntry[];
+	/** omp's idle-park TTL and cache retention, for status. */
+	lifecycleSettings?: () => Promise<LifecycleSettings>;
+	modelCost?: (selector: string) => ModelCost | undefined;
 }
 
 const DEFAULTS: InterviewInput["defaults"] = { parallelism: 4, isolation: "shared", contract: "workflowz" };
@@ -126,15 +138,20 @@ export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const now = env.now();
 	const root = state.repo.root;
 	const config = state.config.status === "ok" ? state.config.config : undefined;
-	const [quota, quotaMarks, last, trials, pending] = await Promise.all([
+	const [quota, quotaMarks, last, trials, pending, lifecycle] = await Promise.all([
 		readQuota(env.exec, env.ompBin, now),
 		readQuotaMarks(root, now),
 		lastRun(root),
 		config ? trialViews(root, config, now) : Promise.resolve([]),
 		config ? proposalStore(state).list() : Promise.resolve([]),
+		env.lifecycleSettings?.(),
 	]);
 	const usage = readUsage({ dbPath: statsDbPath(), windowDays: 1, now });
 	const run = env.activeRun?.();
+	const entries = env.agents?.() ?? [];
+	const agents = entries.length
+		? adviseRows(entries, { now, settings: lifecycle ?? {}, ...(env.modelCost ? { cost: env.modelCost } : {}) })
+		: [];
 	ui.report(
 		"Storm 현황",
 		renderStatus(
@@ -150,6 +167,8 @@ export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 				...(trials.length ? { trials } : {}),
 				...(quotaMarks.length ? { quotaMarks } : {}),
 				...(pending.length ? { pending } : {}),
+				...(agents.length ? { agents } : {}),
+				...(lifecycle ? { lifecycle } : {}),
 			},
 			now,
 		),
@@ -299,4 +318,113 @@ export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	if (written.hash !== result.option.hash) throw new Error("되돌린 설정의 해시가 승인 기록과 다릅니다");
 	await state.store.recordRollback(result.option.hash, currentHash);
 	ui.notify(`${relative(state.repo.root, written.path)}를 ${shortHash(result.option.hash)}로 되돌렸습니다.`);
+}
+
+const RESET_LOCAL = "설정만 초기화";
+const RESET_ALL = "승인 기록까지 모두 초기화";
+
+async function pathExists(file: string): Promise<boolean> {
+	try {
+		await stat(file);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function countJson(dir: string): Promise<number> {
+	try {
+		return (await readdir(dir)).filter(name => name.endsWith(".json")).length;
+	} catch {
+		return 0;
+	}
+}
+
+/** Files under `dir` that git tracks; deleting them leaves a change in the work tree. */
+async function trackedFiles(env: FlowEnv, root: string, dir: string): Promise<string[]> {
+	const result = await env.exec("git", ["-C", root, "ls-files", "--", relative(root, dir)]).catch(() => undefined);
+	return result?.code === 0 ? result.stdout.split("\n").filter(Boolean) : [];
+}
+
+/**
+ * `/storm reset`: deletes the project's `.omp/storm/` and, when chosen, this repo's approval records outside the
+ * project. Refuses while a run is active; deletes only after the scope choice and the exact "초기화" label.
+ * Returns true when something was deleted.
+ */
+export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
+	const state = await loadProjectState(env);
+	const running = env.activeRun?.() ?? activeLedgerRun(state.repo.repoId);
+	if (running) {
+		ui.notify(`Storm 실행(${running.runId})이 진행 중이라 초기화하지 않습니다. 실행이 끝난 뒤 다시 하세요.`, "warning");
+		return false;
+	}
+	const root = state.repo.root;
+	const local = dirname(configPath(root));
+	const [hasLocal, hasApprovals] = await Promise.all([pathExists(local), pathExists(state.store.dir)]);
+	if (!hasLocal && !hasApprovals) {
+		ui.notify("초기화할 Storm 설정이나 기록이 없습니다.");
+		return false;
+	}
+	const [runs, proposals, tracked, approvals, log, last] = await Promise.all([
+		countJson(runsDir(root)),
+		countJson(join(stateDir(root), "proposals")),
+		hasLocal && state.repo.kind === "git-common-dir" ? trackedFiles(env, root, local) : Promise.resolve([]),
+		state.store.list(),
+		state.store.log(),
+		lastRun(root),
+	]);
+	const c = state.config;
+	const configLine =
+		c.status === "ok"
+			? `정상 · ${shortHash(c.hash)}${state.approval ? " (승인됨)" : " (미승인)"}`
+			: c.status === "invalid"
+				? "오류"
+				: "없음";
+	const lines = [`### 프로젝트 안: \`${relative(root, local)}/\``];
+	if (hasLocal) {
+		lines.push(`- 설정: ${configLine}`, `- 실행 기록 ${runs}개 · 보류 제안 ${proposals}개 · 시험 카운터와 쿼터 표시`);
+		if (tracked.length) {
+			lines.push(`- 주의: git에 커밋된 파일 ${tracked.length}개(${tracked.join(", ")})는 지우면 변경 사항으로 남습니다. 커밋은 직접 하세요.`);
+		}
+		if (last?.status === "running") {
+			lines.push(`- 주의: 마지막 실행(${last.runId})이 진행 중으로 남아 있습니다. 다른 터미널에서 실행 중이면 끝난 뒤 초기화하세요.`);
+		}
+	} else lines.push("- 없음");
+	lines.push("", `### 프로젝트 밖: 승인 기록 (\`${state.store.dir}\`)`);
+	if (hasApprovals) {
+		lines.push(`- 유효한 승인 ${approvals.length}건 · 기록 ${log.length}줄 · 스냅숏과 근거`);
+		if (state.repo.kind === "git-common-dir") lines.push("- 이 저장소의 모든 워크트리가 함께 씁니다.");
+		lines.push(`- "${RESET_LOCAL}"을 고르면 남기므로, /storm rollback 으로 승인했던 설정을 되살릴 수 있습니다.`);
+	} else lines.push("- 없음");
+	lines.push("", "### 그대로 두는 것", "- `.omp/` 안의 다른 파일, 여러 프로젝트가 함께 쓰는 사용 기록 보관본, omp 설정");
+	ui.report("Storm 초기화 대상", lines.join("\n"));
+
+	const options: UiSelectItem[] = [];
+	if (hasLocal) options.push({ label: RESET_LOCAL, description: `${relative(root, local)}/ 삭제, 승인 기록은 남김` });
+	if (hasApprovals) options.push({ label: RESET_ALL, description: "프로젝트 밖 승인·스냅숏·근거·기록도 삭제" });
+	options.push("취소");
+	const scope = await ui.select("어디까지 초기화할까요?", options);
+	if (scope !== RESET_LOCAL && scope !== RESET_ALL) {
+		ui.notify("초기화하지 않았습니다.");
+		return false;
+	}
+	const confirmed = await ui.select(`${scope}: 지운 파일은 되돌릴 수 없습니다. 계속할까요?`, ["초기화", "취소"]);
+	if (confirmed !== "초기화") {
+		ui.notify("초기화하지 않았습니다.");
+		return false;
+	}
+	await rm(local, { recursive: true, force: true });
+	const removed = scope === RESET_ALL ? await state.store.clear() : 0;
+	const kept = scope === RESET_LOCAL && approvals.length > 0;
+	ui.notify(
+		[
+			scope === RESET_ALL ? `Storm 설정과 승인 기록(승인 ${removed}건)을 지웠습니다.` : `${relative(root, local)}/ 를 지웠습니다.`,
+			kept ? `승인 기록 ${approvals.length}건은 남아 /storm rollback 으로 되살릴 수 있습니다.` : "다시 쓰려면 /storm setup 으로 팀을 설정하세요.",
+			tracked.length ? "git에서 지워진 파일은 직접 커밋하세요." : "",
+		]
+			.filter(Boolean)
+			.join(" "),
+	);
+	return true;
 }

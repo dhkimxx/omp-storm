@@ -156,6 +156,9 @@ export function buildHandoff(input: {
 			? `- 다른 에이전트(task, scout 등)는 승인된 모델로만 실행됩니다. 승인 밖 모델을 요청하면 ${fallback.agent} 역할의 모델로 바뀝니다.`
 			: "- 다른 에이전트(task, scout 등)는 승인된 모델로만 실행됩니다. 승인 밖 모델을 요청하면 스폰이 막힙니다.",
 	);
+	rules.push(
+		"- 같은 영역의 후속 작업(리뷰 지적 수정, 두 번째 패스)은 새로 띄우지 말고 끝난 storm-* 에이전트에 agent://<id> 로 보냅니다. 확실하지 않으면 먼저 storm 도구의 agents 동작으로 재사용할 에이전트를 확인합니다.",
+	);
 	const lines = [
 		...(input.keyword ? [input.keyword] : []),
 		`<storm-run id="${input.runId}" config="${short}">`,

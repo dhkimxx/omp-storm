@@ -25,10 +25,13 @@ import {
 } from "../proposals/build.ts";
 import { presentProposal } from "../proposals/present.ts";
 import { renderModelCheck } from "../report/models.ts";
+import { adviseRows, agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "../report/agents.ts";
 import { parseModelEntry } from "../selector.ts";
 import type { ProjectState } from "../state.ts";
 import type {
+	AgentEntry,
 	EvidenceRecord,
+	LifecycleSettings,
 	Proposal,
 	ProposalKind,
 	StatusView,
@@ -56,13 +59,13 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "agents"] as const satisfies readonly StormToolAction[];
 const QUOTA_MARK_MS = 5 * 3_600_000;
 const NO_CONFIG = "Storm 설정이 없습니다(또는 오류). /storm 으로 먼저 팀을 설정하세요.";
 
 const DESCRIPTION = `Manage this project's OMP Storm multi-agent team, or hand a task to a Storm run.
 Actions:
-- status: team, approval, active/last run, trials, quota marks, pending proposals.
+- status: team, approval, active/last run, trials, quota marks, pending proposals, subagents of this session.
 - models: check configured models for newer versions, better/cheaper/faster alternatives and upgrades that need another provider login. Slow (reads usage history).
 - priority {priority}: re-recommend every role's model for a new optimization priority.
 - workers {role, workers}: how many workers of a role one run may keep busy (1-16).
@@ -71,6 +74,7 @@ Actions:
 - trial {role, model, share?, maxSpawns?, days?, budgetUsd?}: route a bounded share of a role's spawns to a candidate model for a while (defaults 0.25, 20 spawns, 7 days, $2).
 - budget {budgetUsd, warnAtUsd?, onExceed?}: per-run spend limit; 0 removes it.
 - run {task}: the user wants work done by the Storm team. Call it, then end your reply at once; never do the task yourself in the same turn. Storm starts the run with the approved team contract right after.
+- agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Before giving new work to a subagent, check for a reusable one: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent via \`write agent://<id>\` (or the eval handle's .send()) instead of a new spawn.
 priority, workers, reselect, trial, budget (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned.`;
 
 function stormParams(z: Zod): StormToolSchema {
@@ -200,7 +204,24 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 			const run = host.runtime.activeRun();
 			if (run) view.run = run;
 			if (lastRun) view.lastRun = lastRun;
+			const entries = host.runtime.agents();
+			if (entries.length) {
+				const settings = await host.lifecycleSettings();
+				view.agents = agentRows(host, entries, settings);
+				view.lifecycle = settings;
+			}
 			return { outcome: "ok", text: renderStatus(view, host.now()) };
+		}
+		case "agents": {
+			const entries = host.runtime.agents();
+			const [settings, state] = await Promise.all([host.lifecycleSettings(), host.loadState()]);
+			const providers = state.config.status === "ok" ? teamProviders(state.config.config) : agentProviders(entries);
+			const warnings = lifecycleWarnings(settings, providers);
+			const body = entries.length
+				? renderAgents(agentRows(host, entries, settings), host.now())
+				: "이 세션에서 아직 실행된 서브에이전트가 없습니다.";
+			const notes = warnings.length ? `\n\n### 수명 관리\n${warnings.map((w) => `- ${w}`).join("\n")}` : "";
+			return { outcome: "ok", text: body + notes };
 		}
 		case "models": {
 			const state = await host.loadState();
@@ -222,6 +243,10 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 		default:
 			return write(host, params);
 	}
+}
+
+function agentRows(host: StormToolHost, entries: AgentEntry[], settings: LifecycleSettings): NonNullable<StatusView["agents"]> {
+	return adviseRows(entries, { now: host.now(), settings, cost: (m) => host.modelCost(m) });
 }
 
 async function write(host: StormToolHost, params: StormToolInput): Promise<StormToolReply> {

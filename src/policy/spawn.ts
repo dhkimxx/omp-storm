@@ -91,6 +91,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		invocationKind: event.invocationKind,
 		requested: [...event.patterns],
 		outcome: "blocked",
+		...(event.spawnKey ? { spawnKey: event.spawnKey } : {}),
 	};
 	const block = (reason: string, extra: Partial<SpawnRecord> = {}): SpawnOutcome => ({
 		decision: { block: true, reason },
