@@ -5,12 +5,12 @@
 import { fallbackOf, priorityLabel, roleTitle } from "../interview/render.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
 import { ROLES } from "../roles.ts";
+import { entryEffort, formatModelEntry, parseModelEntry } from "../selector.ts";
 import type {
 	BudgetConfig,
 	Effort,
 	ModelInfo,
 	Priority,
-	RoleConfig,
 	RoleRecommendation,
 	RoleSpec,
 	StormConfig,
@@ -38,21 +38,34 @@ function defaultEffort(role: string): Effort {
 	return spec ? ROLE_EFFORT[spec.id] : "medium";
 }
 
-/** Keeps the role's effort when the new model supports it, else the role default nearest the model's levels. */
+/** Keeps the given effort when the new model supports it, else the role default nearest the model's levels. */
 export function effortFor(role: string, current: Effort | undefined, efforts: readonly Effort[]): Effort | null {
 	if (current !== undefined && efforts.includes(current)) return current;
 	return pickEffort(defaultEffort(role), efforts);
 }
 
-function setEffort(role: RoleConfig, effort: Effort | null | undefined): void {
-	if (effort) role.effort = effort;
-	else delete role.effort;
+/** Supported efforts of a model; none when it does not check out. */
+export function effortsOf(check: (selector: string) => ModelCheck, selector: string): Effort[] {
+	const r = check(selector);
+	return r.ok ? r.efforts : [];
+}
+
+/** A models[] entry with its own effort suffix, or bare when the model has no effort control. */
+function entry(selector: string, effort: Effort | null | undefined): string {
+	return formatModelEntry(effort ? { selector, effort } : { selector });
+}
+
+function selectorOf(model: string): string {
+	return parseModelEntry(model).selector;
 }
 
 /** A trial for a role whose primary is now the candidate has been adopted; it would only route to itself. */
 function dropAdoptedTrials(config: StormConfig): void {
 	if (!config.trials) return;
-	const kept = config.trials.filter((t) => config.roles[t.role]?.models[0] !== t.model);
+	const kept = config.trials.filter((t) => {
+		const first = config.roles[t.role]?.models[0];
+		return first === undefined || selectorOf(first) !== selectorOf(t.model);
+	});
 	if (kept.length) config.trials = kept;
 	else delete config.trials;
 }
@@ -79,8 +92,16 @@ export function checkRoleModel(
 	return r;
 }
 
-/** Re-picks every configured role for the new priority the way setup does: chosen candidate, then a fallback on another provider. */
-export function buildPriority(current: StormConfig, priority: Priority, recs: RoleRecommendation[]): Built {
+/**
+ * Re-picks every configured role for the new priority the way setup does: chosen candidate, then a fallback on
+ * another provider. Each model carries its own effort; the role-level default is dropped.
+ */
+export function buildPriority(
+	current: StormConfig,
+	priority: Priority,
+	recs: RoleRecommendation[],
+	efforts: (selector: string) => readonly Effort[],
+): Built {
 	const next = structuredClone(current);
 	next.priority = priority;
 	const kept: string[] = [];
@@ -92,8 +113,9 @@ export function buildPriority(current: StormConfig, priority: Priority, recs: Ro
 			continue;
 		}
 		const fb = fallbackOf(rec, c.selector);
-		role.models = fb ? [c.selector, fb.selector] : [c.selector];
-		setEffort(role, c.effort);
+		const primary = entry(c.selector, c.effort);
+		role.models = fb ? [primary, entry(fb.selector, pickEffort(defaultEffort(id), efforts(fb.selector)))] : [primary];
+		delete role.effort;
 	}
 	dropAdoptedTrials(next);
 	const note = kept.length ? ` (후보 없어 유지: ${kept.join(", ")})` : "";
@@ -113,21 +135,25 @@ export function buildWorkers(current: StormConfig, role: string, workers: number
 	return { config: next, summary: `${roleTitle(role)} 워커를 ${workers}개로 바꿉니다` };
 }
 
-/** Puts `model` first and keeps the role's other models behind it as fallbacks. */
-export function buildReselect(
-	current: StormConfig,
-	role: string,
-	model: string,
-	effort: Effort | null,
-): Built {
+/**
+ * Puts `model` first and keeps the role's other models behind it as fallbacks. The new model keeps the old
+ * primary's effort when it supports it; the others keep the effort they ran with, now as their own suffix.
+ */
+export function buildReselect(current: StormConfig, role: string, model: string, efforts: readonly Effort[]): Built {
 	const prev = current.roles[role];
 	if (!prev) return { error: `${role}: 설정에 없는 역할입니다` };
 	const next = structuredClone(current);
 	const r = next.roles[role]!;
-	r.models = [model, ...prev.models.filter((m) => m !== model)];
-	setEffort(r, effort);
+	const selector = selectorOf(model);
+	const first = prev.models[0];
+	const effort = effortFor(role, first === undefined ? undefined : entryEffort(first, prev.effort), efforts);
+	const rest = prev.models
+		.filter((m) => selectorOf(m) !== selector)
+		.map((m) => entry(selectorOf(m), entryEffort(m, prev.effort)));
+	r.models = [entry(selector, effort), ...rest];
+	delete r.effort;
 	dropAdoptedTrials(next);
-	return { config: next, summary: `${roleTitle(role)} 역할 모델을 ${model}(으)로 바꿉니다` };
+	return { config: next, summary: `${roleTitle(role)} 역할 모델을 ${selector}(으)로 바꿉니다` };
 }
 
 export interface QuotaImpact {
@@ -143,8 +169,8 @@ export function quotaPlan(config: StormConfig, provider: string): QuotaImpact[] 
 	const out: QuotaImpact[] = [];
 	for (const [role, r] of Object.entries(config.roles)) {
 		const first = r.models[0];
-		if (first === undefined || providerOf(first) !== provider) continue;
-		out.push({ role, from: first, alternative: r.models.find((m) => providerOf(m) !== provider) ?? null });
+		if (first === undefined || providerOf(selectorOf(first)) !== provider) continue;
+		out.push({ role, from: first, alternative: r.models.find((m) => providerOf(selectorOf(m)) !== provider) ?? null });
 	}
 	return out;
 }
@@ -169,7 +195,7 @@ export function buildQuota(
 			missing.push(roleTitle(id));
 			continue;
 		}
-		r.models = [...r.models.filter((m) => m !== pick.selector), pick.selector];
+		r.models = [...r.models.filter((m) => selectorOf(m) !== pick.selector), entry(pick.selector, pick.effort)];
 		added.push(`${roleTitle(id)} → ${pick.selector}`);
 	}
 	if (!added.length) return { error: `${provider} 밖에서 쓸 후보가 없습니다: ${missing.join(", ")}` };
@@ -199,7 +225,9 @@ export function trialId(role: string, model: string, now: number): string {
 export function buildTrial(current: StormConfig, input: TrialInput): Built {
 	const prev = current.roles[input.role];
 	if (!prev) return { error: `${input.role}: 설정에 없는 역할입니다` };
-	if (prev.models[0] === input.model) return { error: `${input.model}: 이미 ${roleTitle(input.role)} 역할의 기본 모델입니다` };
+	if (prev.models[0] !== undefined && selectorOf(prev.models[0]) === selectorOf(input.model)) {
+		return { error: `${input.model}: 이미 ${roleTitle(input.role)} 역할의 기본 모델입니다` };
+	}
 	const share = input.share ?? TRIAL_DEFAULTS.share;
 	const maxSpawns = input.maxSpawns ?? TRIAL_DEFAULTS.maxSpawns;
 	const days = input.days ?? TRIAL_DEFAULTS.days;
@@ -220,7 +248,8 @@ export function buildTrial(current: StormConfig, input: TrialInput): Built {
 		endsAt: new Date(endsAt).toISOString(),
 		budgetUsd,
 	};
-	const effort = effortFor(input.role, prev.effort, input.efforts);
+	const first = prev.models[0];
+	const effort = effortFor(input.role, first === undefined ? prev.effort : entryEffort(first, prev.effort), input.efforts);
 	if (effort) trial.effort = effort;
 	const next = structuredClone(current);
 	next.trials = [...(current.trials ?? []).filter((t) => t.role !== input.role), trial];

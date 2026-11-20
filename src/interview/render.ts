@@ -4,6 +4,7 @@ import type {
 	BudgetConfig,
 	Candidate,
 	DetectionSummary,
+	Effort,
 	MetricValue,
 	QuotaState,
 	RoleRecommendation,
@@ -34,7 +35,7 @@ function ms(v: number | null | undefined): string {
 	return v == null || !Number.isFinite(v) ? DASH : `${Math.round(v)}ms`;
 }
 /** Anything not measured from the user's own runs is marked as an estimate. */
-function speedText(m: MetricValue): string {
+export function speedText(m: MetricValue): string {
 	return m.value === null ? `${DASH} tok/s` : `${m.source === "measured" ? "" : "≈"}${int(m.value)} tok/s`;
 }
 const REASON: Record<string, string> = {
@@ -195,13 +196,21 @@ export function renderAnalysis(a: Analysis, now: number): string {
 	return out.join("\n") + warnings(a.warnings);
 }
 
-export function pickedCandidate(rec: RoleRecommendation, pick: number | string | undefined): Candidate | undefined {
-	return typeof pick === "number" ? rec.candidates[pick] : undefined;
+/** A model the interview picked for a role, with its own effort (none when the model has no effort control). */
+export interface PickedModel {
+	selector: string;
+	label: string;
+	effort?: Effort;
+}
+
+export interface RolePick {
+	primary: PickedModel;
+	fallback?: PickedModel;
 }
 
 export function renderTeam(
 	recs: RoleRecommendation[],
-	picks: Record<string, number | string>,
+	picks: Record<string, RolePick>,
 	extra: {
 		parallelism: number;
 		isolation: string;
@@ -214,23 +223,21 @@ export function renderTeam(
 		trials?: TrialConfig[];
 	},
 ): string {
-	const out = ["| 역할 | 모델 | effort | 계층 | 근거 | 폴백 | 워커 |", "|---|---|---|---|---|---|---|"];
+	const out = ["| 역할 | 모델 | effort | 계층 | 근거 | 폴백 | 폴백 effort | 워커 |", "|---|---|---|---|---|---|---|---|"];
 	for (const rec of recs) {
 		const pick = picks[rec.role.id];
-		const c = pickedCandidate(rec, pick);
-		const fb = fallbackOf(rec, typeof pick === "string" ? pick : c?.selector);
 		const workers = extra.workers?.[rec.role.id] ?? 1;
-		if (typeof pick === "string") {
-			out.push(
-				`| ${rec.role.title} | ${cell(pick)} (직접 입력) | ${DASH} | ${DASH} | 사용자 지정 | ${fb?.selector ?? DASH} | ${workers} |`,
-			);
-		} else if (c) {
-			out.push(
-				`| ${rec.role.title} | ${cell(c.label)} (${cell(c.selector)}) | ${c.effort ?? DASH} | ${tierLabel(c.tier)} | ${cell(c.why[0] ?? DASH)} | ${fb?.selector ?? DASH} | ${workers} |`,
-			);
-		} else {
-			out.push(`| ${rec.role.title} | 후보 없음 | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${workers} |`);
+		if (!pick) {
+			out.push(`| ${rec.role.title} | 후보 없음 | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${workers} |`);
+			continue;
 		}
+		const c = rec.candidates.find((x) => x.selector === pick.primary.selector);
+		const model = c ? `${cell(c.label)} (${cell(c.selector)})` : `${cell(pick.primary.selector)} (직접 입력)`;
+		const basis = c ? `${tierLabel(c.tier)} | ${cell(c.why[0] ?? DASH)}` : `${DASH} | 사용자 지정`;
+		const fb = pick.fallback;
+		out.push(
+			`| ${rec.role.title} | ${model} | ${pick.primary.effort ?? DASH} | ${basis} | ${fb ? cell(fb.selector) : DASH} | ${fb?.effort ?? DASH} | ${workers} |`,
+		);
 	}
 	out.push(
 		"",
@@ -251,7 +258,7 @@ export function roleTitle(id: string): string {
 	return ROLES.find((r) => r.id === id)?.title ?? id;
 }
 
-function fallbackText(role: string | undefined): string {
+export function fallbackText(role: string | undefined): string {
 	return role === undefined ? "차단" : `${roleTitle(role)} 역할 모델로 대체`;
 }
 
@@ -266,7 +273,7 @@ export function trialText(t: TrialConfig): string {
 	return `${roleTitle(t.role)} · ${t.model}${t.effort ? `:${t.effort}` : ""} · 비율 ${pct(t.share)} · 최대 ${t.maxSpawns}회 · ${isoText(t.startsAt)} ~ ${isoText(t.endsAt)} · 예산 $${t.budgetUsd}`;
 }
 
-function budgetText(b: BudgetConfig): string {
+export function budgetText(b: BudgetConfig): string {
 	return `실행당 $${b.perRunUsd}${b.warnAtUsd != null ? ` (경고 $${b.warnAtUsd})` : ""}, 초과 시 ${b.onExceed}`;
 }
 
@@ -321,7 +328,8 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 		const b = next.roles[id];
 		// Comma-joined here: in a diff "→" already means old → new, so it cannot also mean attempt order.
 		line(`${id} 모델`, a && a.models.join(", "), b ? b.models.join(", ") : "(삭제)");
-		line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
+		// Role-level effort is only a default for entries without a suffix; the interview no longer writes it.
+		if (a?.effort !== undefined || b?.effort !== undefined) line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
 		line(`${id} 워커`, a ? String(a.workers ?? 1) : undefined, b ? String(b.workers ?? 1) : DASH);
 	}
 	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));

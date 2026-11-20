@@ -198,7 +198,8 @@ describe("handoff", () => {
 		const lines = text.split("\n");
 		expect(lines[0]).toBe("workflowz");
 		expect(lines[1]).toBe('<storm-run id="run-20261120-153012-a1b2" config="ab12ab12ab12">');
-		expect(text).toContain("- storm-explorer: 탐색, effort low, 동시에 최대 2개");
+		expect(text).toContain("- storm-explorer: 탐색, 동시에 최대 2개");
+		expect(text).not.toContain("effort");
 		expect(text).toContain("- storm-implementer: 구현, 동시에 최대 1개");
 		expect(text).toContain("최대 3개");
 		expect(text).toContain("model 을 넘기지 않습니다");

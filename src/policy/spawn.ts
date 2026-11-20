@@ -1,15 +1,15 @@
 import { ROLE_AGENT_PREFIX } from "../roles.ts";
 import { activeTrialFor, shouldRouteToTrial } from "../runtime/trials.ts";
-import {
-	EFFORTS,
-	type Effort,
-	type QuotaMark,
-	type SpawnEvent,
-	type SpawnOutcome,
-	type SpawnRecord,
-	type SpawnRuntime,
-	type SpawnState,
-	type StormConfig,
+import { formatModelEntry, parseModelEntry } from "../selector.ts";
+import type {
+	Effort,
+	QuotaMark,
+	SpawnEvent,
+	SpawnOutcome,
+	SpawnRecord,
+	SpawnRuntime,
+	SpawnState,
+	StormConfig,
 } from "../types.ts";
 
 /** "$12.34" at ≥ $1, "$0.0123" below. */
@@ -19,16 +19,13 @@ export function formatUsd(usd: number): string {
 
 /** Drops a trailing ":<effort>" only when it is a known effort, so ids like "x:thinking" stay intact. */
 export function stripEffort(pattern: string): string {
-	const colon = pattern.lastIndexOf(":");
-	if (colon < 0) return pattern;
-	const suffix = pattern.slice(colon + 1);
-	return (EFFORTS as readonly string[]).includes(suffix) ? pattern.slice(0, colon) : pattern;
+	return parseModelEntry(pattern).selector;
 }
 
-/** omp model patterns take thinking effort as a ":<level>" suffix on the id part; an existing suffix wins. */
+/** omp model patterns take thinking effort as a ":<level>" suffix on the id part; any existing suffix wins. */
 export function withEffort(selector: string, effort: Effort | undefined): string {
-	if (!effort) return selector;
-	return selector.slice(selector.lastIndexOf("/") + 1).includes(":") ? selector : `${selector}:${effort}`;
+	if (!effort || selector.slice(selector.lastIndexOf("/") + 1).includes(":")) return selector;
+	return formatModelEntry({ selector, effort });
 }
 
 /** Every model the approved config may run: all role models and all trial candidates, without effort. */

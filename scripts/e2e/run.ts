@@ -9,6 +9,7 @@ import type { Subprocess } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { parseModelEntry } from "../../src/selector.ts";
 
 type Frame = { type?: string; [key: string]: unknown };
 interface LlmEntry {
@@ -301,12 +302,14 @@ async function main(): Promise<void> {
 		check("setup: .gitignore", existsSync(join(PROJECT, ".omp", "storm", ".gitignore")));
 		check("setup: 현황 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
 		const implementer = config?.roles.implementer;
-		const expectedModel = implementer?.models[0]?.split("/").slice(1).join("/");
+		const primaryEntry = implementer?.models[0] === undefined ? undefined : parseModelEntry(implementer.models[0]);
+		const expectedModel = primaryEntry?.selector.split("/").slice(1).join("/");
+		const expectedEffort = primaryEntry?.effort ?? implementer?.effort;
 
 		run = await spawn(["storm-implementer"]);
 		const child = run.children[0];
 		check("승인 후: 승인 모델로 교체", child?.model === expectedModel, `child=${child?.model} expected=${expectedModel}`);
-		check("승인 후: effort 전달", implementer?.effort === undefined || child?.effort === implementer.effort, `effort=${child?.effort} expected=${implementer?.effort}`);
+		check("승인 후: effort 전달", expectedEffort === undefined || child?.effort === expectedEffort, `effort=${child?.effort} expected=${expectedEffort}`);
 		check(
 			"도구: 설정 있으면 메인 세션에만 storm 도구",
 			run.main.length > 0 && run.main.every(entry => entry.tools.includes("storm")) && run.children.every(entry => !entry.tools.includes("storm")),
@@ -356,7 +359,9 @@ async function main(): Promise<void> {
 		type StoredConfig = { priority: string; roles: Record<string, StoredRole>; trials?: unknown[]; budget?: { perRunUsd: number } };
 		type StoredRun = { status: string; contract: string; spawns: Array<{ outcome: string; agent: string }> };
 		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
-		const idOf = (selector: string | undefined): string | undefined => selector?.split("/").slice(1).join("/");
+		const idOf = (entry: string | undefined): string | undefined =>
+			entry === undefined ? undefined : parseModelEntry(entry).selector.split("/").slice(1).join("/");
+		const bare = (entry: string | undefined): string | undefined => (entry === undefined ? undefined : parseModelEntry(entry).selector);
 		const providerOf = (selector: string | undefined): string | undefined => selector?.split("/")[0];
 		const stateDir = join(PROJECT, ".omp", "storm", "state");
 		const runFiles = (): StoredRun[] => {
@@ -382,7 +387,10 @@ async function main(): Promise<void> {
 
 		let team = readConfig();
 		let primary = team.roles.implementer?.models[0];
-		check("v0.2 전제: 대체 확인용 모델은 승인 밖", !Object.values(team.roles).some(role => role.models.includes(OUTSIDER)));
+		check(
+			"v0.2 전제: 대체 확인용 모델은 승인 밖",
+			!Object.values(team.roles).some(role => role.models.some(model => bare(model) === OUTSIDER)),
+		);
 		let talk = await converse("/storm run SPIKE-TASK storm-implementer task", noAnswer, { model: OUTSIDER });
 		// The hidden notice is delivered with the handoff, so the logged (truncated) user text may not show the contract itself.
 		const noticed = talk.llm.some(entry => !entry.child && entry.notices.workflowz.length > 0);
@@ -441,7 +449,7 @@ async function main(): Promise<void> {
 		} else console.log(`SKIP 쿼터 대응: 구현 역할의 폴백이 다른 Provider에 없음 (${implementerModels.join(", ")})`);
 
 		primary = team.roles.implementer?.models[0];
-		const candidate = ["fake/general-b", "fake2/general-e", "fake/cheap-a"].find(model => model !== primary) ?? "fake/general-b";
+		const candidate = ["fake/general-b", "fake2/general-e", "fake/cheap-a"].find(model => model !== bare(primary)) ?? "fake/general-b";
 		await converse(
 			`/storm STORM-TOOL {"action":"trial","role":"implementer","model":"${candidate}","share":0.5,"maxSpawns":1,"days":1,"budgetUsd":1}`,
 			choose("승인"),

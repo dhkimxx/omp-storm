@@ -1,3 +1,4 @@
+import { parseModelEntry } from "./selector.ts";
 import type { EvidenceRecord, Priority, RoleRecommendation, StormConfig } from "./types.ts";
 
 /** Snapshot of the recommendation behind an approved config: what was chosen per role and why the rest lost. */
@@ -11,8 +12,9 @@ export function buildEvidence(input: {
 }): EvidenceRecord {
 	const roles: EvidenceRecord["roles"] = {};
 	for (const rec of input.recommendations) {
+		const first = input.config.roles[rec.role.id]?.models[0];
 		roles[rec.role.id] = {
-			chosen: input.config.roles[rec.role.id]?.models[0] ?? null,
+			chosen: first === undefined ? null : parseModelEntry(first).selector,
 			candidates: rec.candidates.map(c => ({
 				selector: c.selector,
 				label: c.label,

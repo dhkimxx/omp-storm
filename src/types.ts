@@ -373,8 +373,9 @@ export interface RoleRecommendation {
 
 export interface RoleConfig {
 	agent: string;
-	/** Attempt order, "provider/id". */
+	/** Attempt order. Each entry is "provider/id" with an optional ":<effort>" suffix (omp pattern syntax); see src/selector.ts. */
 	models: string[];
+	/** Default effort for entries without their own suffix. The interview writes a suffix per model and leaves this unset. */
 	effort?: Effort;
 	/** Workers of this role one Storm run may keep busy at once (default 1); stated in the run contract. */
 	workers?: number;

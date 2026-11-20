@@ -1,5 +1,6 @@
 import { readUsage, statsDbPath } from "../history/stats.ts";
 import { compareTrial } from "../report/trials.ts";
+import { parseModelEntry } from "../selector.ts";
 import type { StormConfig, TrialView } from "../types.ts";
 import { readTrialStates } from "./state-files.ts";
 import { trialPhase } from "./trials.ts";
@@ -22,8 +23,8 @@ export async function trialViews(root: string, config: StormConfig, now: number)
 	const usage = readUsage({ dbPath: statsDbPath(), windowDays: (now - Math.min(...starts)) / DAY_MS, now });
 	if (usage.status !== "ok") return views;
 	for (const view of ended) {
-		const primary = config.roles[view.trial.role]?.models[0];
-		if (primary) view.comparison = compareTrial(view.trial, primary, usage);
+		const first = config.roles[view.trial.role]?.models[0];
+		if (first !== undefined) view.comparison = compareTrial(view.trial, parseModelEntry(first).selector, usage);
 	}
 	return views;
 }

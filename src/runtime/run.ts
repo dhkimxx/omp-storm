@@ -136,11 +136,10 @@ export function buildHandoff(input: {
 }): string {
 	const { config } = input;
 	const short = input.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
+	// Effort is per model and chosen at spawn, so the team line names only the role and its worker cap.
 	const team = Object.entries(config.roles).map(([key, role]) => {
-		const parts = [ROLES.find(r => r.id === key)?.title ?? ROLES.find(r => r.agent === role.agent)?.title ?? key];
-		if (role.effort) parts.push(`effort ${role.effort}`);
-		parts.push(`동시에 최대 ${role.workers ?? 1}개`);
-		return `- ${role.agent}: ${parts.join(", ")}`;
+		const title = ROLES.find(r => r.id === key)?.title ?? ROLES.find(r => r.agent === role.agent)?.title ?? key;
+		return `- ${role.agent}: ${title}, 동시에 최대 ${role.workers ?? 1}개`;
 	});
 	const rules = [
 		"- 서브에이전트는 위 storm-* 에이전트로만 띄웁니다(task 도구 또는 eval 의 agent()).",

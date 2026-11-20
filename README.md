@@ -17,7 +17,7 @@ One command. Intelligent agents. Any runtime.
 | 명령 | 하는 일 |
 |---|---|
 | `/storm` | 설정이 없으면 설정 인터뷰, 승인되지 않은 설정이 있으면 리뷰, 승인됐으면 현황 |
-| `/storm setup` | 탐지 → 사용 기록 분석 → 역할별 추천 → 인터뷰 → 승인 → `.omp/storm/config.json` 저장 |
+| `/storm setup` | 탐지 → 사용 기록 분석 → 역할별 추천 → 단계별 선택(작업별 모델 · 폴백 모델 · 모델별 effort · 실행 설정, 단계마다 추천안 표시) 또는 전체 수락 → 승인 → `.omp/storm/config.json` 저장 |
 | `/storm status` | 설정·승인, 역할별 모델·워커, 진행 중·마지막 실행, 시험 사용, 쿼터, 보류된 제안 |
 | `/storm models` | 지금 팀 모델보다 새롭거나 좋거나 싼 모델 점검(LLM 호출 없음) |
 | `/storm review` | 승인되지 않은 설정(직접 편집, 팀원 커밋), 가림 정의, 보류된 변경 제안을 보여 주고 승인 |

@@ -398,9 +398,10 @@ describe("priority", () => {
 		expect(r.outcome).toBe("approved");
 		const s = f.saved[0]!;
 		expect(s.config.priority).toBe("quality");
-		expect(s.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x2", "b/z2"], effort: "low" });
-		expect(s.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["a/i2", "c/j2"], workers: 3 });
-		expect(s.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r2"], effort: "high" });
+		// Per-model effort: the primary keeps the candidate's effort, the fallback gets the role default it supports.
+		expect(s.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x2:low", "b/z2:low"] });
+		expect(s.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["a/i2", "c/j2:medium"], workers: 3 });
+		expect(s.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r2:high"] });
 		expect(s.evidence).toMatchObject({ source: "priority", priority: "quality", dataAsOf: NOW - 3_600_000 });
 		expect(s.evidence!.roles.implementer!.chosen).toBe("a/i2");
 		expect(f.reports.at(-1)!.md).toContain("근거");
@@ -424,20 +425,28 @@ describe("workers", () => {
 });
 
 describe("reselect", () => {
-	test("named model goes first; effort falls back to the role default when unsupported", async () => {
+	test("named model goes first with the old primary's effort, else the role default it supports", async () => {
 		const f = fakeHost({ answers: ["승인"] });
 		const r = await run(f, { action: "reselect", role: "implementer", model: "c/j" });
 		expect(r.outcome).toBe("approved");
-		expect(f.saved[0]!.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j", "a/i"], effort: "medium", workers: 3 });
+		expect(f.saved[0]!.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j:medium", "a/i"], workers: 3 });
 		expect(f.saved[0]!.evidence?.source).toBe("reselect");
 
 		const g = fakeHost({ answers: ["승인"] });
 		await run(g, { action: "reselect", role: "reviewer", model: "c/cand" });
-		expect(g.saved[0]!.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["c/cand", "b/r"], effort: "medium" });
+		expect(g.saved[0]!.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["c/cand:medium", "b/r:high"] });
 
+		// Kept models carry the role effort they ran with as their own suffix, so dropping the role default changes nothing for them.
 		const h = fakeHost({ answers: ["승인"] });
 		await run(h, { action: "reselect", role: "explorer", model: "e/noeffort" });
-		expect(h.saved[0]!.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["e/noeffort", "a/x", "b/z"] });
+		expect(h.saved[0]!.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["e/noeffort", "a/x:low", "b/z:low"] });
+
+		// The old primary's own suffix wins over the role default; the moved model is matched by selector.
+		const cfg = structuredClone(base);
+		cfg.roles.explorer = { agent: "storm-explorer", models: ["a/x:high", "b/z:max"], effort: "low" };
+		const k = fakeHost({ config: cfg, answers: ["승인"] });
+		await run(k, { action: "reselect", role: "explorer", model: "b/z" });
+		expect(k.saved[0]!.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["b/z:high", "a/x:high"] });
 	});
 
 	test("rejects unusable models and too-small context", async () => {
@@ -463,7 +472,13 @@ describe("reselect", () => {
 		const r = await run(f, { action: "reselect", role: "explorer" });
 		expect(f.selects[0]!.options).toEqual(["X (a/x) · 현재", "Y (a/y)", "Z (b/z)", "취소"]);
 		expect(r.outcome).toBe("approved");
-		expect(f.saved[0]!.config.roles.explorer!.models).toEqual(["b/z", "a/x"]);
+		expect(f.saved[0]!.config.roles.explorer!.models).toEqual(["b/z:low", "a/x:low"]);
+
+		const cfg = structuredClone(base);
+		cfg.roles.explorer!.models = ["a/x:max", "b/z"];
+		const g = fakeHost({ config: cfg, answers: ["취소"] });
+		await run(g, { action: "reselect", role: "explorer" });
+		expect(g.selects[0]!.options[0]).toBe("X (a/x) · 현재");
 	});
 
 	test("adopting a trial's model drops that trial", async () => {
@@ -508,7 +523,7 @@ describe("quota", () => {
 		const r = await run(f, { action: "quota", provider: "a" });
 		expect(r.outcome).toBe("approved");
 		expect(f.marks).toHaveLength(1);
-		expect(f.saved[0]!.config.roles.implementer!.models).toEqual(["a/i", "c/j"]);
+		expect(f.saved[0]!.config.roles.implementer!.models).toEqual(["a/i", "c/j:medium"]);
 		expect(f.saved[0]!.config.roles.explorer).toEqual(base.roles.explorer!);
 		expect(f.saved[0]!.evidence?.source).toBe("quota");
 

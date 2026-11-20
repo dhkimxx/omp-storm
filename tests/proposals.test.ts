@@ -6,7 +6,7 @@ import { buildBudget, buildQuota, buildTrial, buildWorkers, newProposalId, quota
 import { presentProposal, renderProposal } from "../src/proposals/present.ts";
 import { createProposalStore } from "../src/proposals/store.ts";
 import { ROLES } from "../src/roles.ts";
-import type { EvidenceRecord, Proposal, StormConfig, UiPort, UiSelectItem } from "../src/types.ts";
+import type { Candidate, Effort, EvidenceRecord, Proposal, StormConfig, UiPort, UiSelectItem } from "../src/types.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
 
@@ -161,6 +161,44 @@ describe("builders", () => {
 			{ role: ROLES[1]!, candidates: [], chosenIndex: -1, excluded: [] },
 		];
 		expect("error" in buildQuota(base, "a", ["implementer"], recs)).toBe(true);
+	});
+
+	test("per-model entries are matched by selector, not by their effort suffix", () => {
+		const suffixed: StormConfig = {
+			...base,
+			roles: {
+				explorer: { agent: "storm-explorer", models: ["a/x:max", "b/z:low"] },
+				reviewer: { agent: "storm-reviewer", models: ["c/j:high"], effort: "low" },
+			},
+		};
+		expect(quotaPlan(suffixed, "a")).toEqual([{ role: "explorer", from: "a/x:max", alternative: "b/z:low" }]);
+		const input = { role: "reviewer", model: "c/j", efforts: ["low", "high"] as Effort[], now: NOW };
+		expect(buildTrial(suffixed, input)).toHaveProperty("error");
+		// The trial starts from the primary's own effort, not the role default.
+		const trial = buildTrial({ ...suffixed, roles: { ...suffixed.roles, reviewer: { agent: "storm-reviewer", models: ["b/r:high"], effort: "low" } } }, input);
+		if ("error" in trial) throw new Error(trial.error);
+		expect(trial.config.trials![0]!.effort).toBe("high");
+		const metric = { value: 50, source: "catalog", confidence: "medium" } as const;
+		const z: Candidate = {
+			selector: "b/z",
+			modelKey: "b/z",
+			label: "z",
+			effort: "medium",
+			tier: "general",
+			int: metric,
+			speed: metric,
+			referenceUsd: null,
+			userMixUsd: null,
+			quota: "available",
+			confidence: "medium",
+			validated: false,
+			why: [],
+			whyNot: [],
+		};
+		const recs = [{ role: ROLES[0]!, candidates: [z], chosenIndex: 0, excluded: [] }];
+		const quota = buildQuota({ ...suffixed, roles: { explorer: { agent: "storm-explorer", models: ["a/x:max", "b/z:low"] } } }, "a", ["explorer"], recs);
+		if ("error" in quota) throw new Error(quota.error);
+		expect(quota.config.roles.explorer!.models).toEqual(["a/x:max", "b/z:medium"]);
 	});
 
 	test("workers bounds and default", () => {

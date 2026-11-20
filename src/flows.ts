@@ -20,6 +20,7 @@ import { ROLES } from "./roles.ts";
 import { lastRun } from "./runtime/run.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
+import { entryEffort, formatModelEntry, parseModelEntry } from "./selector.ts";
 import { loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type {
 	EvidenceRecord,
@@ -174,13 +175,16 @@ async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState
 		const choice = await ui.select(`시험 사용이 끝났습니다: ${title} 역할의 ${trial.model}`, ["후보로 바꾸기", "지금 모델 유지", "나중에"]);
 		if (choice !== "후보로 바꾸기" && choice !== "지금 모델 유지") return;
 		const adopt = choice === "후보로 바꾸기";
-		const effort = trial.effort ?? role.effort;
+		// The adopted model carries its own effort, so the role default and the other entries keep theirs.
+		const candidate = parseModelEntry(trial.model).selector;
+		const effort = trial.effort ?? entryEffort(role.models[0] ?? "", role.effort);
+		const adopted = formatModelEntry({ selector: candidate, ...(effort ? { effort } : {}) });
 		const next: StormConfig = {
 			...config,
 			roles: {
 				...config.roles,
 				...(adopt
-					? { [trial.role]: { ...role, models: [trial.model, ...role.models.filter(model => model !== trial.model)], ...(effort ? { effort } : {}) } }
+					? { [trial.role]: { ...role, models: [adopted, ...role.models.filter(model => parseModelEntry(model).selector !== candidate)] } }
 					: {}),
 			},
 		};

@@ -19,12 +19,13 @@ import {
 	buildTrial,
 	buildWorkers,
 	checkRoleModel,
-	effortFor,
+	effortsOf,
 	newProposalId,
 	quotaPlan,
 } from "../proposals/build.ts";
 import { presentProposal } from "../proposals/present.ts";
 import { renderModelCheck } from "../report/models.ts";
+import { parseModelEntry } from "../selector.ts";
 import type { ProjectState } from "../state.ts";
 import type {
 	EvidenceRecord,
@@ -235,7 +236,7 @@ async function write(host: StormToolHost, params: StormToolInput): Promise<Storm
 			if (!params.priority) return rejected("priority가 필요합니다.");
 			const ctx = await host.prepare();
 			const recs = ctx.recommend(params.priority).filter((r) => r.role.id in config.roles);
-			const built = buildPriority(config, params.priority, recs);
+			const built = buildPriority(config, params.priority, recs, (s) => effortsOf(ctx.checkModel, s));
 			if ("error" in built) return rejected(built.error);
 			const evidence = buildEvidence({
 				source: "priority",
@@ -260,15 +261,16 @@ async function write(host: StormToolHost, params: StormToolInput): Promise<Storm
 				const model = params.model.trim();
 				const check = checkRoleModel(role, model, ctx.checkModel, ctx.available);
 				if (!check.ok) return rejected(check.reason);
-				built = buildReselect(config, role, model, effortFor(role, config.roles[role]!.effort, check.efforts));
+				built = buildReselect(config, role, model, check.efforts);
 			} else {
 				if (!rec?.candidates.length) return rejected(`${roleTitle(role)} 역할에 추천할 후보가 없습니다. 모델을 직접 지정하세요.`);
 				const first = config.roles[role]!.models[0];
-				const labels = rec.candidates.map((c) => `${c.label} (${c.selector})${c.selector === first ? " · 현재" : ""}`);
+				const current = first === undefined ? undefined : parseModelEntry(first).selector;
+				const labels = rec.candidates.map((c) => `${c.label} (${c.selector})${c.selector === current ? " · 현재" : ""}`);
 				const answer = await host.ui.select(`${roleTitle(role)} 역할 모델 선택`, [...labels, "취소"]);
 				const picked = answer === undefined ? undefined : rec.candidates[labels.indexOf(answer)];
 				if (!picked) return { outcome: "cancelled", text: "바꾸지 않았습니다." };
-				built = buildReselect(config, role, picked.selector, picked.effort);
+				built = buildReselect(config, role, picked.selector, effortsOf(ctx.checkModel, picked.selector));
 			}
 			if ("error" in built) return rejected(built.error);
 			const evidence = rec

@@ -4,6 +4,7 @@
  */
 import { int, roleTitle } from "../interview/render.ts";
 import { compareRevision } from "../lineage/key.ts";
+import { parseModelEntry } from "../selector.ts";
 import type { AnalysisContext, Alternative, StormConfig } from "../types.ts";
 
 const KIND: Record<Alternative["kind"], string> = {
@@ -20,8 +21,9 @@ export function renderModelCheck(ctx: AnalysisContext, config: StormConfig | und
 	const availableSel = new Set(ctx.available.map((m) => m.selector));
 
 	for (const [roleId, role] of Object.entries(config?.roles ?? {})) {
-		const sel = role.models[0];
-		if (sel === undefined) continue;
+		const entry = role.models[0];
+		if (entry === undefined) continue;
+		const sel = parseModelEntry(entry).selector;
 		const model = ctx.catalog.find((m) => m.selector === sel);
 		const slash = sel.indexOf("/");
 		const lin = model
