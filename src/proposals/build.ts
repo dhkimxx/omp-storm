@@ -122,8 +122,16 @@ export function buildPriority(
 	return { config: next, summary: `우선순위를 ${priorityLabel(priority)}(으)로 바꾸고 역할 모델을 다시 추천합니다${note}` };
 }
 
+/** Why a role-targeted proposal cannot apply to a role that is not in `roles`. */
+function missingRole(config: StormConfig, role: string): string {
+	if (config.disabledRoles?.includes(role)) {
+		return `${roleTitle(role)}(${role}): 사용 안 함으로 설정된 역할입니다. 다시 쓰려면 /storm 에서 팀 다시 설정을 고르세요`;
+	}
+	return `${role}: 설정에 없는 역할입니다`;
+}
+
 export function buildWorkers(current: StormConfig, role: string, workers: number): Built {
-	if (!current.roles[role]) return { error: `${role}: 설정에 없는 역할입니다` };
+	if (!current.roles[role]) return { error: missingRole(current, role) };
 	if (!Number.isInteger(workers) || workers < 1 || workers > MAX_WORKERS) {
 		return { error: `workers: 1~${MAX_WORKERS} 사이 정수여야 합니다` };
 	}
@@ -141,7 +149,7 @@ export function buildWorkers(current: StormConfig, role: string, workers: number
  */
 export function buildReselect(current: StormConfig, role: string, model: string, efforts: readonly Effort[]): Built {
 	const prev = current.roles[role];
-	if (!prev) return { error: `${role}: 설정에 없는 역할입니다` };
+	if (!prev) return { error: missingRole(current, role) };
 	const next = structuredClone(current);
 	const r = next.roles[role]!;
 	const selector = selectorOf(model);
@@ -224,7 +232,7 @@ export function trialId(role: string, model: string, now: number): string {
 
 export function buildTrial(current: StormConfig, input: TrialInput): Built {
 	const prev = current.roles[input.role];
-	if (!prev) return { error: `${input.role}: 설정에 없는 역할입니다` };
+	if (!prev) return { error: missingRole(current, input.role) };
 	if (prev.models[0] !== undefined && selectorOf(prev.models[0]) === selectorOf(input.model)) {
 		return { error: `${input.model}: 이미 ${roleTitle(input.role)} 역할의 기본 모델입니다` };
 	}

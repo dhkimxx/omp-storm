@@ -36,12 +36,14 @@ export function buildConfig(
 		fallbackRole?: string | null;
 		/** Kept for roles that still exist. */
 		trials?: TrialConfig[];
+		/** Roles the user chose not to use; never built into roles. */
+		disabledRoles?: string[];
 	},
 ): StormConfig {
 	const roles: Record<string, RoleConfig> = {};
 	for (const rec of recs) {
 		const pick = picks[rec.role.id];
-		if (!pick) continue;
+		if (!pick || opts.disabledRoles?.includes(rec.role.id)) continue;
 		// Each model carries its own effort suffix, so the role-level default stays unset.
 		const models = [formatModelEntry(pick.primary)];
 		if (pick.fallback) models.push(formatModelEntry(pick.fallback));
@@ -61,6 +63,8 @@ export function buildConfig(
 		runtime: "omp",
 	};
 	if (opts.budget) config.budget = opts.budget;
+	const disabled = opts.disabledRoles?.filter((id) => !Object.hasOwn(roles, id));
+	if (disabled?.length) config.disabledRoles = [...disabled];
 	const fallback = opts.fallbackRole === undefined ? "implementer" : opts.fallbackRole;
 	if (fallback !== null && Object.hasOwn(roles, fallback)) config.fallbackRole = fallback;
 	const trials = opts.trials?.filter((t) => Object.hasOwn(roles, t.role));
@@ -80,7 +84,9 @@ export function recommendedConfig(
 	current?: StormConfig,
 ): StormConfig {
 	const picks: Record<string, RolePick> = {};
+	const disabled = current?.disabledRoles ?? [];
 	for (const rec of recs) {
+		if (disabled.includes(rec.role.id)) continue;
 		const c = rec.candidates[rec.chosenIndex];
 		if (!c) continue;
 		const pick = (selector: string, label: string): PickedModel => {
@@ -102,6 +108,7 @@ export function recommendedConfig(
 		...(fallbackRole !== undefined ? { fallbackRole } : {}),
 		...(current?.budget ? { budget: current.budget } : {}),
 		...(current?.trials ? { trials: current.trials } : {}),
+		...(disabled.length ? { disabledRoles: disabled } : {}),
 	});
 }
 
@@ -123,12 +130,13 @@ export function deriveScope(config: StormConfig, shadows: ShadowInfo[]): Approva
 	if (config.budget) scope.budget = { ...config.budget };
 	if (config.fallbackRole !== undefined) scope.fallbackRole = config.fallbackRole;
 	if (config.trials) scope.trials = structuredClone(config.trials);
+	if (config.disabledRoles) scope.disabledRoles = [...config.disabledRoles];
 	return scope;
 }
 
-/** Explorers fan out over independent reads; other roles default to one worker. */
+/** Explorers and quick workers fan out over independent small tasks; other roles default to one worker. */
 export function defaultWorkers(roleId: string): number {
-	return roleId === "explorer" ? 2 : 1;
+	return roleId === "explorer" || roleId === "quick" ? 2 : 1;
 }
 
 /** Fallback role carried over from the current config. A v0.2 config (roles carry workers) without fallbackRole was blocked on purpose. */

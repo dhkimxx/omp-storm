@@ -62,6 +62,13 @@ const NOTICES = {
 const STORM_AGENTS = ["storm-implementer", "storm-reviewer"];
 /** Model id that always fails with an out-of-quota 429. */
 const QUOTA_OUT = "quota-out";
+/** A reviewer's verdict for agents whose yield schema asks for one (storm-reviewer): one P1 finding, so the run record has something to count. */
+const REVIEW_VERDICT = {
+	overall_correctness: "incorrect",
+	explanation: "E2E verdict",
+	confidence: 0.8,
+	findings: [{ title: "E2E finding", body: "E2E", priority: 1, confidence: 0.8, file_path: "README.md", line_start: 1, line_end: 1 }],
+};
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -158,7 +165,12 @@ function decide(request: ChatRequest): Decision {
 	const write = fresh.match(/SPIKE-WRITE[ \t]+(\S+)/);
 	if (write?.[1]) return { kind: "tool", name: "write", args: { path: write[1], content: "storm director check\n" } };
 	const yieldSchema = schemaOf(request.tools, "yield");
-	if (fresh.includes(CHILD_MARK) && yieldSchema) return { kind: "tool", name: "yield", args: requiredArgs(yieldSchema) };
+	if (fresh.includes(CHILD_MARK) && yieldSchema) {
+		const args = requiredArgs(yieldSchema);
+		if (!JSON.stringify(yieldSchema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
+		// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
+		return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data: REVIEW_VERDICT } };
+	}
 	return { kind: "text", text: "OK" };
 }
 

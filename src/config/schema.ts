@@ -1,3 +1,4 @@
+import { REQUIRED_ROLES, ROLES } from "../roles.ts";
 import { EFFORTS, PRIORITIES } from "../types.ts";
 import type { StormConfig } from "../types.ts";
 
@@ -18,6 +19,7 @@ const TOP_KEYS = [
 	"budget",
 	"fallbackRole",
 	"trials",
+	"disabledRoles",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers"];
 const BUDGET_KEYS = ["perRunUsd", "warnAtUsd", "onExceed"];
@@ -88,6 +90,22 @@ function validateTrials(trials: unknown, roleKeys: string[] | undefined, errors:
 		else if (start !== undefined && end <= start) errors.push(`${path}.endsAt: startsAt보다 뒤여야 합니다`);
 		if (!isPositiveNumber(t.budgetUsd)) errors.push(`${path}.budgetUsd: 0보다 큰 숫자여야 합니다`);
 		warnUnknown(t, TRIAL_KEYS, path, warnings);
+	});
+}
+
+function validateDisabled(disabled: unknown, roleKeys: string[] | undefined, errors: string[]): void {
+	if (!Array.isArray(disabled)) {
+		errors.push("disabledRoles: 배열이어야 합니다");
+		return;
+	}
+	const seen = new Set<string>();
+	disabled.forEach((id: unknown, i) => {
+		const path = `disabledRoles[${i}]`;
+		if (typeof id !== "string" || !ROLES.some((r) => r.id === id)) errors.push(`${path}: Storm 역할 id여야 합니다`);
+		else if (seen.has(id)) errors.push(`${path}: 중복된 역할입니다 (${id})`);
+		else if ((REQUIRED_ROLES as readonly string[]).includes(id)) errors.push(`${path}: ${id} 역할은 끌 수 없습니다`);
+		else if (roleKeys?.includes(id)) errors.push(`${path}: roles에 있는 역할은 끌 수 없습니다 (${id})`);
+		if (typeof id === "string") seen.add(id);
 	});
 }
 
@@ -169,6 +187,7 @@ export function validateConfig(value: unknown): ConfigValidation {
 		}
 	}
 	if (value.trials !== undefined) validateTrials(value.trials, roleKeys, errors, warnings);
+	if (value.disabledRoles !== undefined) validateDisabled(value.disabledRoles, roleKeys, errors);
 
 	warnUnknown(value, TOP_KEYS, "", warnings);
 

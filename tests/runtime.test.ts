@@ -198,12 +198,12 @@ describe("handoff", () => {
 		const lines = text.split("\n");
 		expect(lines[0]).toBe("workflowz");
 		expect(lines[1]).toBe('<storm-run id="run-20261120-153012-a1b2" config="ab12ab12ab12">');
-		expect(text).toContain("- storm-explorer: 탐색, 동시에 최대 2개");
+		expect(text).toContain("- storm-explorer: 탐색(넓게 읽고 근거 모으기), 동시에 최대 2개");
 		expect(text).not.toContain("effort");
-		expect(text).toContain("- storm-implementer: 구현, 동시에 최대 1개");
+		expect(text).toContain("- storm-implementer: 구현(코드 수정), 동시에 최대 1개");
 		expect(text).toContain("최대 3개");
 		expect(text).toContain("model 을 넘기지 않습니다");
-		expect(text).toContain("승인 밖 모델을 요청하면 스폰이 막힙니다.");
+		expect(text).toContain("승인 밖 모델을 요청하면 scout → explorer, task → implementer 역할 모델로 바뀌고, 그 밖의 에이전트는 스폰이 막힙니다.");
 		expect(text).toContain("끝난 storm-* 에이전트에 agent://<id> 로 보냅니다");
 		expect(text).toContain("storm 도구의 agents 동작");
 		expect(text).not.toContain("예산");
@@ -227,6 +227,32 @@ describe("handoff", () => {
 		expect(text).toContain("격리 없음");
 		expect(text).not.toContain("isolated: true");
 		expect(text.startsWith("<storm-run ")).toBe(true);
+	});
+
+	test("role states shape the team list, the director rule and the lanes rule", () => {
+		const text = buildHandoff({
+			...base,
+			config: { ...config, disabledRoles: ["architect"], isolation: "shared" },
+			keyword: null,
+		});
+		const director = text.split("\n").find(l => l.startsWith("- 감독:")) ?? "";
+		expect(director).not.toContain("storm-architect");
+		expect(director).toContain("작고 기계적인 수정은 storm-quick");
+		expect(director).toContain("리뷰는 storm-reviewer");
+		expect(text).toContain("- 쓰지 않음: storm-architect(설계·자문). 띄우지 않습니다.");
+		expect(text).toContain("- storm-quick: 단순 작업(작고 기계적인 수정), 설정에 없어 implementer 역할 모델로 실행");
+		expect(text).toContain("- storm-reviewer: 리뷰(독립 검증), 설정에 없어 implementer 역할 모델로 실행");
+		expect(text).toContain("- 동시에 도는 작업 항목은 서로 다른 파일을 맡게 나눕니다. 같은 파일을 고쳐야 하는 일은 한 항목에 묶거나 순서대로 돌립니다.");
+		expect(text).not.toContain("같은 파일을 동시에 고치지 않도록");
+		// No reviewer configured: no verdict rule.
+		expect(text).not.toContain("P0~P3");
+		const reviewed = buildHandoff({
+			...base,
+			config: { ...config, roles: { ...config.roles, reviewer: { agent: "storm-reviewer", models: ["a/r"] } } },
+			keyword: null,
+		});
+		expect(reviewed).toContain("incorrect 판정이나 처리하지 않은 P0 를 남긴 채 실행을 끝내지 않습니다.");
+		expect(reviewed).toContain("reviewer → reviewer, security-reviewer → reviewer");
 	});
 
 	test("omp's matcher sees only the intended keyword", () => {

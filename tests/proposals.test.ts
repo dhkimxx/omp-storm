@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildBudget, buildQuota, buildTrial, buildWorkers, newProposalId, quotaPlan, trialId } from "../src/proposals/build.ts";
+import { buildBudget, buildQuota, buildReselect, buildTrial, buildWorkers, newProposalId, quotaPlan, trialId } from "../src/proposals/build.ts";
 import { presentProposal, renderProposal } from "../src/proposals/present.ts";
 import { createProposalStore } from "../src/proposals/store.ts";
 import { ROLES } from "../src/roles.ts";
@@ -280,5 +280,16 @@ describe("builders", () => {
 		const off = buildBudget(set.config, 0, undefined, undefined);
 		if ("error" in off) throw new Error(off.error);
 		expect(off.config.budget).toBeUndefined();
+	});
+});
+
+describe("role-targeted proposals for a role not in roles", () => {
+	const disabled: StormConfig = { ...base, disabledRoles: ["architect"] };
+	test("a disabled role points to team re-setup; a missing one says it is not configured", () => {
+		const off = "설계·자문(architect): 사용 안 함으로 설정된 역할입니다. 다시 쓰려면 /storm 에서 팀 다시 설정을 고르세요";
+		expect(buildWorkers(disabled, "architect", 2)).toEqual({ error: off });
+		expect(buildReselect(disabled, "architect", "a/new", ["high"])).toEqual({ error: off });
+		expect(buildTrial(disabled, { role: "architect", model: "a/new", efforts: ["high"], now: 0 })).toEqual({ error: off });
+		expect(buildWorkers(disabled, "quick", 2)).toEqual({ error: "quick: 설정에 없는 역할입니다" });
 	});
 });

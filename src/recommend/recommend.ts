@@ -38,7 +38,13 @@ const MAX_CANDIDATES = 5;
 /** Catalog scores come from different sources; gaps this small are noise, so the user's own preference decides instead. */
 const QUALITY_TOLERANCE = 1;
 /** Default effort per role; recommendations and proposals start from it. */
-export const ROLE_EFFORT: Record<RoleId, Effort> = { explorer: "low", implementer: "medium", reviewer: "high" };
+export const ROLE_EFFORT: Record<RoleId, Effort> = {
+	explorer: "low",
+	implementer: "medium",
+	reviewer: "high",
+	quick: "low",
+	architect: "xhigh",
+};
 const TIER_LABEL: Record<Tier, string> = { cheap: "저가", general: "범용", premium: "고성능" };
 const CONFIDENCE: readonly Confidence[] = ["high", "medium", "low"];
 

@@ -4,6 +4,7 @@
  * in the one map the parent reads.
  */
 import type { AgentEntry } from "../types.ts";
+import { reviewFromYield } from "./review.ts";
 
 /** Parked entries older than this are dropped when a new agent is added. */
 const PARKED_KEEP_MS = 24 * 3_600_000;
@@ -86,6 +87,14 @@ export function noteAgentEnd(input: { id: string; now: number; settled: boolean 
 export function noteAgentParked(id: string): void {
 	const e = agents.get(id);
 	if (e) e.state = "parked";
+}
+
+/** Folds a `yield` call's args into the agent's review verdict; input that is no review leaves it alone. */
+export function noteAgentReview(id: string, input: unknown): void {
+	const e = agents.get(id);
+	if (!e) return;
+	const review = reviewFromYield(e.review, input);
+	if (review) e.review = review;
 }
 
 function descends(e: AgentEntry, ancestorId: string): boolean {

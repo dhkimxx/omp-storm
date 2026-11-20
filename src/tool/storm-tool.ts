@@ -29,12 +29,14 @@ import { renderModelCheck } from "../report/models.ts";
 import { adviseRows, agentsReport } from "../report/agents.ts";
 import { parseModelEntry } from "../selector.ts";
 import type { ProjectState } from "../state.ts";
+import { ROLES } from "../roles.ts";
 import type {
 	AgentEntry,
 	EvidenceRecord,
 	LifecycleSettings,
 	Proposal,
 	ProposalKind,
+	RoleId,
 	StatusView,
 	StormConfig,
 	StormToolAction,
@@ -61,6 +63,7 @@ export type StormToolInput = { action: StormToolAction } & {
 };
 
 const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "agents", "propose"] as const satisfies readonly StormToolAction[];
+const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const QUOTA_MARK_MS = 5 * 3_600_000;
 const NO_CONFIG = "Storm 설정이 없습니다(또는 오류). /storm 으로 먼저 팀을 설정하세요.";
 
@@ -84,7 +87,7 @@ function stormParams(z: Zod): StormToolSchema {
 	return z.object({
 		action: z.enum(ACTIONS).describe("Operation to perform"),
 		priority: z.enum(["balanced", "quality", "cost", "speed", "quota"]).optional().describe("priority: new optimization priority"),
-		role: z.enum(["explorer", "implementer", "reviewer"]).optional().describe("workers, reselect, trial: target role"),
+		role: z.enum(ROLE_IDS).optional().describe("workers, reselect, trial: target role (must be configured, not disabled)"),
 		workers: z.number().optional().describe("workers: absolute worker count for the role (1-16)"),
 		model: z.string().optional().describe('reselect: model the user named; trial: candidate. "provider/id"'),
 		provider: z.string().optional().describe("quota: provider that ran out"),

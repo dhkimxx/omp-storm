@@ -332,3 +332,71 @@ describe("decideSpawn (v0.2 non-Storm agents)", () => {
 		expect(out.record?.outcome).toBe("blocked");
 	});
 });
+
+describe("decideSpawn (v0.7 role states)", () => {
+	const team: StormConfig = {
+		...config,
+		roles: {
+			implementer: { agent: "storm-implementer", models: ["openai/gpt-5.2"], effort: "medium" },
+			reviewer: config.roles.reviewer!,
+		},
+	};
+
+	test("a disabled role is blocked and points to its first configured stand-in", () => {
+		const out = decideSpawn(ev("storm-explorer"), withConfig({ ...team, disabledRoles: ["explorer"] }), runtime());
+		expect(reason(out.decision)).toBe(
+			"storm-explorer(탐색)는 이 팀에서 쓰지 않습니다(설정에서 사용 안 함). 대신 storm-implementer 를 쓰세요.",
+		);
+		const arch = decideSpawn(ev("storm-architect"), withConfig({ ...team, disabledRoles: ["architect"] }), runtime());
+		expect(reason(arch.decision)).toContain("대신 storm-reviewer 를 쓰세요.");
+	});
+
+	test("a missing role borrows the first configured stand-in, skipping unconfigured ones", () => {
+		// explorer → [quick, implementer]: quick is not configured, so implementer's models carry its effort.
+		const out = decideSpawn(ev("storm-explorer"), withConfig(team), runtime());
+		expect(models(out.decision)).toEqual(["openai/gpt-5.2:medium"]);
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "implementer", reason: "설정에 없는 역할 → implementer 역할 모델" });
+		// A disabled stand-in is skipped too.
+		const withQuick: StormConfig = { ...team, roles: { ...team.roles, quick: { agent: "storm-quick", models: ["google/flash"] } } };
+		expect(models(decide(ev("storm-explorer"), withConfig(withQuick)))).toEqual(["google/flash"]);
+		const quickOff = { ...team, disabledRoles: ["quick"] };
+		expect(models(decide(ev("storm-explorer"), withConfig(quickOff)))).toEqual(["openai/gpt-5.2:medium"]);
+	});
+
+	test("stand-in routing never goes to the stand-in's trial", () => {
+		const s = withConfig({ ...team, trials: [baseTrial] });
+		const counters: TrialState = { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0 };
+		const out = decideSpawn(ev("storm-architect"), s, runtime({ trials: { [baseTrial.id]: counters } }));
+		expect(out.record?.outcome).toBe("substituted");
+		expect(out.record?.trialId).toBeUndefined();
+		expect(models(out.decision)?.some(m => m.startsWith("zai/"))).toBe(false);
+	});
+
+	test("a missing role with no configured stand-in is blocked", () => {
+		const only: StormConfig = { ...config, roles: { reviewer: config.roles.reviewer! } };
+		expect(reason(decide(ev("storm-quick"), withConfig(only)))).toBe("Storm 설정에 storm-quick 역할이 없습니다.");
+	});
+
+	test("stand-in spawns still honor the budget gate", () => {
+		const out = decideSpawn(ev("storm-explorer"), withConfig(team), inRun({ run: { runId: "r", costUsd: 3, budget: { perRunUsd: 2, onExceed: "block-spawns" } } }));
+		expect(out.record?.outcome).toBe("blocked");
+	});
+
+	test("scout in a run gets explorer's models for an unapproved model; approved models pass", () => {
+		const s = withConfig({ ...config, fallbackRole: "reviewer" });
+		const out = decideSpawn(ev("scout", ["x/unknown"]), s, inRun());
+		expect(models(out.decision)).toEqual(["google/gemini-flash"]);
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
+		expect(decideSpawn(ev("scout", ["openai/gpt-5.2"]), s, inRun())).toMatchObject({
+			decision: undefined,
+			record: { outcome: "allowed" },
+		});
+	});
+
+	test("a built-in mapped to an unconfigured role falls back to fallbackRole", () => {
+		const out = decideSpawn(ev("task", ["x/unknown"]), withConfig({ ...config, fallbackRole: "explorer" }), inRun());
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
+		const blocked = decideSpawn(ev("task", ["x/unknown"]), withConfig(config), inRun());
+		expect(blocked.record?.outcome).toBe("blocked");
+	});
+});

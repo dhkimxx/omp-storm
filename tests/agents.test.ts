@@ -10,7 +10,7 @@ import {
 	renderAgents,
 	teamProviders,
 } from "../src/report/agents.ts";
-import { listAgents, noteAgentEnd, noteAgentParked, noteAgentStart, noteAgentUsage, resetAgents } from "../src/runtime/agents.ts";
+import { listAgents, noteAgentEnd, noteAgentParked, noteAgentReview, noteAgentStart, noteAgentUsage, resetAgents } from "../src/runtime/agents.ts";
 import type { AgentEntry, LifecycleSettings, ModelCost, StormConfig } from "../src/types.ts";
 
 const T0 = Date.parse("2026-11-20T09:00:00Z");
@@ -282,5 +282,23 @@ describe("lifecycleWarnings", () => {
 		expect(teamProviders(config)).toEqual(["openai", "anthropic"]);
 		const { model: _, ...noModel } = entry();
 		expect(agentProviders([entry(), entry({ model: "openai/x" }), noModel])).toEqual(["anthropic", "openai"]);
+	});
+});
+
+describe("noteAgentReview", () => {
+	beforeEach(() => resetAgents());
+
+	test("accumulates a reviewer's yields on its own entry and ignores non-review yields", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: 0, revive: false });
+		noteAgentStart({ id: "Impl", name: "storm-implementer", now: 0, revive: false });
+		noteAgentReview("Impl", { data: { done: true } });
+		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } });
+		noteAgentReview("Rev", { error: "x" });
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } });
+		noteAgentReview("Ghost", { data: { overall_correctness: "correct" } });
+		const [rev, impl] = listAgents();
+		expect(rev?.review).toEqual({ verdict: "incorrect", findings: [1, 0, 0, 0] });
+		expect(impl?.review).toBeUndefined();
+		expect(listAgents()).toHaveLength(2);
 	});
 });

@@ -5,15 +5,18 @@ description: OMP Storm team roles, the storm tool, and Storm run rules. Use when
 
 # OMP Storm
 
-Storm gives three role agents the models the user approved and enforces them when they are spawned.
+Storm gives its role agents the models the user approved and enforces them when they are spawned.
 
 | Agent | Use for |
 |---|---|
 | `storm-explorer` | Read-only research: scope files, call sites, and contracts |
 | `storm-implementer` | The code change itself, with verification |
 | `storm-reviewer` | Independent read-only review of a change |
+| `storm-quick` | Cheap mechanical edits: renames, version bumps, repeated edits, formatting, data collection |
+| `storm-architect` | Read-only planning into disjoint lanes, stuck debugging, and design calls (expensive) |
 
 - Spawn these roles by agent name. Do not pass `model` for them; Storm replaces it with the approved models.
+- Never spawn a role the user disabled ("사용 안 함"); the run contract lists those roles.
 - If Storm blocks a spawn, stop and tell the user the reason and to type `/storm`. Do not retry with another agent to get around the block.
 - Reuse finished subagents: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent with `write agent://<id>` (or the eval handle's `.send()`) instead of a new spawn. When unsure whether its cache is still warm or its context too big, call the `storm` tool's `agents` action first.
 - Never edit `.omp/storm/` or Storm's approval records. Team changes go through the `storm` tool or `/storm` and need the user's approval.
@@ -58,4 +61,4 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 
 The section lists the approved team and the rules for this run. Follow it: delegate through the listed `storm-*` agents, keep within the stated concurrency, and stop spawning when Storm reports the budget is used up.
 
-- You are the director for the whole run. Do not change working-tree files yourself: Storm blocks `edit`, `write` to files and `ast_edit` in the main session, and `bash` is for verification only (tests, builds, git status). Send changes to `storm-implementer`, broad exploration to `storm-explorer` and reviews to `storm-reviewer`; verify their results by reading the files. Notes go to `local://`.
+- You are the director for the whole run. Do not change working-tree files yourself: Storm blocks `edit`, `write` to files and `ast_edit` in the main session, and `bash` is for verification only (tests, builds, git status). Send small mechanical edits to `storm-quick`, other edits to `storm-implementer`, broad exploration to `storm-explorer` and reviews to `storm-reviewer`. Use `storm-architect` for decomposition, stuck debugging and design calls, sparingly because it is expensive. Verify results by reading the files. Notes go to `local://`.

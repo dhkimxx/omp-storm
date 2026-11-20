@@ -1,5 +1,6 @@
 import { agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "../report/agents.ts";
 import { ROLES, STORM_VERSION } from "../roles.ts";
+import { reviewLine } from "../runtime/review.ts";
 import type {
 	Analysis,
 	BudgetConfig,
@@ -333,6 +334,7 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 		if (a?.effort !== undefined || b?.effort !== undefined) line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
 		line(`${id} 워커`, a ? String(a.workers ?? 1) : undefined, b ? String(b.workers ?? 1) : DASH);
 	}
+	if (prev !== undefined || next.disabledRoles?.length) line("사용 안 함", prev && (disabledTitles(prev) || "없음"), disabledTitles(next) || "없음");
 	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));
 	line("격리", prev?.isolation, next.isolation);
 	line("실행 계약", prev?.contract, next.contract);
@@ -360,6 +362,11 @@ export function renderShadows(shadows: StatusView["shadows"]): string {
 		.join("\n")}`;
 }
 
+/** Titles of the roles the user chose not to use, comma-joined; "" when every role is in use. */
+function disabledTitles(config: StormConfig): string {
+	return (config.disabledRoles ?? []).map(roleTitle).join(", ");
+}
+
 export function renderStatus(view: StatusView, now: number): string {
 	const version = view.newerVersion
 		? `- Storm ${STORM_VERSION} · 새 버전 ${view.newerVersion} 설치됨 → /restart 로 적용`
@@ -382,6 +389,7 @@ export function renderStatus(view: StatusView, now: number): string {
 		if (c.config.fallbackRole !== undefined) {
 			out.push(`- 실행 중 다른 에이전트: ${fallbackText(c.config.fallbackRole)}`);
 		}
+		if (c.config.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(c.config)}`);
 	}
 	if (view.run) {
 		const r = view.run;
@@ -443,6 +451,7 @@ export function renderStatusBrief(view: StatusView, now: number): string {
 		for (const [id, r] of Object.entries(c.config.roles)) {
 			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}${r.workers !== undefined ? ` · 워커 ${r.workers}` : ""}`);
 		}
+		if (c.config.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(c.config)}`);
 	} else out.push(c.status === "missing" ? "- 설정 없음" : "- 설정 오류");
 	if (view.run) out.push(`- 실행 중: ${view.run.runId} · ${spendText(view.run.costUsd, view.run.budget)}`);
 	else if (view.lastRun) {
@@ -504,6 +513,7 @@ function lastRunLines(run: RunRecord): string[] {
 	const out = [`- ${run.runId} · ${RUN_STATUS[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
 	if (blocked?.reason) out.push(`- 첫 차단: ${blocked.agent} · ${blocked.reason}`);
+	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
 	return out;
 }
 

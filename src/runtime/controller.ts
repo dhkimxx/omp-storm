@@ -8,6 +8,7 @@ import type { ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
 import type { AgentEntry, RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, startLedgerRun } from "./ledger.ts";
+import { reviewLine } from "./review.ts";
 import { buildHandoff, newRunId, pickKeyword, pruneRuns, writeRun } from "./run.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
@@ -253,7 +254,7 @@ export class RunController {
 	}
 }
 
-/** The run's record in the transcript: at most four lines, the one Storm output that stays there. */
+/** The run's record in the transcript: at most five lines, the one Storm output that stays there. */
 export function summarizeRun(run: RunRecord): string {
 	const counts = new Map<string, number>();
 	for (const spawn of run.spawns) counts.set(spawn.outcome, (counts.get(spawn.outcome) ?? 0) + 1);
@@ -285,5 +286,6 @@ export function summarizeRun(run: RunRecord): string {
 		const reused = agents.filter(agent => agent.followUps > 0).length;
 		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)`);
 	}
+	if (run.spawns.length) lines.push(reviewLine(agents));
 	return lines.join("\n");
 }

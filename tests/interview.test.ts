@@ -539,3 +539,29 @@ describe("render per-model effort", () => {
 		expect(renderConfigDiff(undefined, roles(["a/x"], "low"))).toContain("- explorer effort: low");
 	});
 });
+
+describe("v0.7 roles", () => {
+	const all = (): RoleRecommendation[] => ROLES.map((role, i) => ({ role, candidates: [cand(`a/m${i}`), cand(`b/m${i}`)], chosenIndex: 0, excluded: [] }));
+	test("recommendedConfig builds every role, quick with 2 workers, and skips roles the current config disabled", () => {
+		const c = recommendedConfig(all(), efforts, "balanced");
+		expect(Object.keys(c.roles)).toEqual(ROLES.map((r) => r.id));
+		expect(c.roles.quick).toMatchObject({ agent: "storm-quick", workers: 2 });
+		expect(c.roles.architect).toMatchObject({ agent: "storm-architect", workers: 1 });
+		expect(c.disabledRoles).toBeUndefined();
+		const current: StormConfig = { ...c, disabledRoles: ["reviewer", "architect"] };
+		delete current.roles.reviewer;
+		delete current.roles.architect;
+		const again = recommendedConfig(all(), efforts, "balanced", current);
+		expect(Object.keys(again.roles)).toEqual(["explorer", "implementer", "quick"]);
+		expect(again.disabledRoles).toEqual(["reviewer", "architect"]);
+		expect(deriveScope(again, []).disabledRoles).toEqual(["reviewer", "architect"]);
+	});
+	test("config diff shows disabled roles by title, and changes to them", () => {
+		const prev = cfg("a/x");
+		const next: StormConfig = { ...prev, disabledRoles: ["reviewer", "architect"] };
+		expect(renderConfigDiff(undefined, next)).toContain("- 사용 안 함: 리뷰, 설계·자문");
+		expect(renderConfigDiff(prev, next)).toBe("- 사용 안 함: 없음 → 리뷰, 설계·자문");
+		expect(renderConfigDiff(next, { ...prev, disabledRoles: ["architect"] })).toBe("- 사용 안 함: 리뷰, 설계·자문 → 설계·자문");
+		expect(renderConfigDiff(undefined, prev)).not.toContain("사용 안 함");
+	});
+});

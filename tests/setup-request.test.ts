@@ -238,3 +238,13 @@ describe("buildSetupRequest", () => {
 		expect(config.fallbackRole).toBeUndefined();
 	});
 });
+
+describe("disabled roles in setup", () => {
+	test("instructions offer 사용 안 함 for every role but implementer and say where it goes", () => {
+		const text = buildSetupRequest(input());
+		const after = text.slice(text.indexOf("</storm-setup>"));
+		expect(after).toContain('implementer를 뺀 모든 역할의 주 모델 질문은 마지막 선택지로 "사용 안 함"');
+		expect(after).toContain("`disabledRoles`에 넣으세요");
+		expect(after).toContain('implementer는 필수 역할이라 "사용 안 함" 선택지가 없습니다');
+	});
+});

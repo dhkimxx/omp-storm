@@ -67,6 +67,9 @@ const MODELS = {
 		["cheap-a", { input: 0.1, output: 0.4, cacheRead: 0.01, cacheWrite: 0.1 }],
 		["general-b", { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }],
 		["premium-c", { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }],
+		// Below every role's minimum context, so no team ever approves it: the model outside the team. Priced like premium-c,
+		// so one main request of a run already passes the budget step's cap.
+		["outsider-z", { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, context: 60_000 }],
 	],
 	fake2: [
 		["cheap-d", { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0.2 }],
@@ -81,7 +84,7 @@ function modelsYml(withQuotaOut = false): string {
 	for (const [provider, models] of Object.entries(withQuotaOut ? { ...MODELS, ...QUOTA_OUT } : MODELS)) {
 		lines.push(`  ${provider}:`, `    baseUrl: http://127.0.0.1:${PORT}/v1`, "    apiKey: storm-e2e-dummy", "    api: openai-completions", "    models:");
 		for (const [id, cost] of models) {
-			lines.push(`      - id: ${id}`, "        contextWindow: 200000", "        maxTokens: 8192");
+			lines.push(`      - id: ${id}`, `        contextWindow: ${"context" in cost ? cost.context : 200_000}`, "        maxTokens: 8192");
 			lines.push(`        cost: { input: ${cost.input}, output: ${cost.output}, cacheRead: ${cost.cacheRead}, cacheWrite: ${cost.cacheWrite} }`);
 		}
 	}
@@ -321,6 +324,11 @@ async function main(): Promise<void> {
 		check("setup: 설정 저장", config !== undefined);
 		check("setup: 승인 기록", approvalFiles().length === 1, `approvals=${approvalFiles().length}`);
 		check("setup: .gitignore", existsSync(join(PROJECT, ".omp", "storm", ".gitignore")));
+		check(
+			"setup: 새 역할(단순 작업·설계·자문)도 추천안에",
+			config?.roles.quick !== undefined && config.roles.architect !== undefined,
+			Object.keys(config?.roles ?? {}).join(","),
+		);
 		const implementer = config?.roles.implementer;
 		const primaryEntry = implementer?.models[0] === undefined ? undefined : parseModelEntry(implementer.models[0]);
 		const expectedModel = primaryEntry?.selector.split("/").slice(1).join("/");
@@ -334,6 +342,16 @@ async function main(): Promise<void> {
 			"도구: 설정 있으면 메인 세션에만 storm 도구",
 			run.main.length > 0 && run.main.every(entry => entry.tools.includes("storm")) && run.children.every(entry => !entry.tools.includes("storm")),
 			`main=${run.main.map(entry => entry.tools.includes("storm")).join(",")} children=${run.children.map(entry => entry.tools.includes("storm")).join(",")}`,
+		);
+		run = await spawn(["storm-quick", "storm-architect"]);
+		const newRoleModels = ["quick", "architect"].map(id => {
+			const entry = config?.roles[id]?.models[0];
+			return entry === undefined ? undefined : parseModelEntry(entry).selector.split("/").slice(1).join("/");
+		});
+		check(
+			"새 역할: 단순 작업·설계·자문 스폰이 각자 승인 모델로",
+			run.children.length === 2 && newRoleModels.every(model => run.children.some(child => child.model === model)),
+			`children=${run.children.map(child => child.model).join(",")} expected=${newRoleModels.join(",")}`,
 		);
 
 		const edited = JSON.parse(readFileSync(CONFIG, "utf8")) as { parallelism: number };
@@ -400,12 +418,26 @@ async function main(): Promise<void> {
 
 		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
 		type StoredRole = { models: string[]; effort?: string; workers?: number };
-		type StoredConfig = { priority: string; roles: Record<string, StoredRole>; trials?: unknown[]; budget?: { perRunUsd: number } };
-		type StoredAgent = { id: string; role?: string; model?: string; contextTokens: number; state: string; followUps: number };
+		type StoredConfig = {
+			priority: string;
+			roles: Record<string, StoredRole>;
+			trials?: unknown[];
+			budget?: { perRunUsd: number };
+			disabledRoles?: string[];
+		};
+		type StoredAgent = {
+			id: string;
+			role?: string;
+			model?: string;
+			contextTokens: number;
+			state: string;
+			followUps: number;
+			review?: { verdict?: string; findings: number[] };
+		};
 		type StoredRun = {
 			status: string;
 			contract: string;
-			spawns: Array<{ outcome: string; agent: string; spawnKey?: string }>;
+			spawns: Array<{ outcome: string; agent: string; spawnKey?: string; role?: string }>;
 			agents?: StoredAgent[];
 			mainCostUsd?: number;
 			blockedEdits?: number;
@@ -429,7 +461,7 @@ async function main(): Promise<void> {
 			return existsSync(dir) ? readdirSync(dir).filter(file => file.endsWith(".json")) : [];
 		};
 		/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
-		const OUTSIDER = "fake/premium-c";
+		const OUTSIDER = "fake/outsider-z";
 
 		let team = readConfig();
 		let primary = team.roles.implementer?.models[0];
@@ -465,6 +497,26 @@ async function main(): Promise<void> {
 			"실행: 스폰 기록이 에이전트 id로 이어짐",
 			spawnKeys.length > 0 && spawnKeys.every(key => ledger.some(agent => agent.id === key)),
 			`spawnKeys=${spawnKeys.join(",")} agents=${ledger.map(agent => agent.id).join(",")}`,
+		);
+		// omp's built-in agents get their mapped role's models, and a reviewer's yielded verdict lands in the run record.
+		const explorerPrimary = team.roles.explorer?.models[0];
+		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK scout storm-reviewer"}', noAnswer, {
+			model: OUTSIDER,
+			flags: ["--smol", OUTSIDER],
+		});
+		const reviewRun = runFiles().at(-1);
+		const scoutSpawn = reviewRun?.spawns.find(spawn => spawn.agent === "scout");
+		check(
+			"기본 에이전트: 승인 밖 scout 는 탐색 역할 모델로",
+			scoutSpawn?.outcome === "substituted" && scoutSpawn.role === "explorer" && talk.llm.some(entry => entry.child && entry.model === idOf(explorerPrimary)),
+			`scout=${JSON.stringify(scoutSpawn)} expected=${idOf(explorerPrimary)}`,
+		);
+		const verdicts = (reviewRun?.agents ?? []).flatMap(agent => (agent.review ? [agent.review] : []));
+		check(
+			"리뷰 판정: 실행 기록과 결과 보고에 남음",
+			verdicts.some(review => review.verdict === "incorrect" && review.findings[1] === 1) &&
+				talk.frames.some(frame => textOf(frame).includes("수정 필요 1 (P1 1)")),
+			`verdicts=${JSON.stringify(verdicts)} agents=${JSON.stringify((reviewRun?.agents ?? []).map(agent => [agent.id, agent.role, agent.review]))} yields=${JSON.stringify(talk.llm.filter(entry => entry.child).map(entry => entry.decision))}`,
 		);
 		talk = await converse(["SPIKE-TASK storm-implementer", '/storm STORM-TOOL {"action":"agents"}'], noAnswer);
 		const agentsReply = talk.frames.map(textOf).find(text => text.includes("(implementer)") && text.includes("| 권장 |"));
@@ -593,6 +645,28 @@ async function main(): Promise<void> {
 			`children=${talk.llm.filter(entry => entry.child).length}`,
 		);
 		check("예산: 실행 기록", budgetRun?.status === "budget-exceeded", `status=${budgetRun?.status}`);
+
+		// A role set to "사용 안 함" is refused; a role missing from the config borrows its nearest stand-in's models.
+		const trimmed = readConfig();
+		const implementerPrimary = trimmed.roles.implementer?.models[0];
+		delete trimmed.roles.reviewer;
+		delete trimmed.roles.quick;
+		trimmed.disabledRoles = ["reviewer"];
+		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: trimmed, rationale: "E2E" })}`, choose("승인"));
+		team = readConfig();
+		check(
+			"사용 안 함: 승인 후 설정",
+			team.disabledRoles?.includes("reviewer") === true && team.roles.reviewer === undefined,
+			JSON.stringify(team.disabledRoles),
+		);
+		run = await spawn(["storm-reviewer"]);
+		check("사용 안 함: 그 역할 스폰은 막힘", run.results.includes("사용 안 함") && run.children.length === 0, run.results.slice(0, 200));
+		run = await spawn(["storm-quick"]);
+		check(
+			"설정에 없는 역할: 가까운 역할(구현) 모델로",
+			run.children[0]?.model === idOf(implementerPrimary),
+			`child=${run.children[0]?.model} expected=${idOf(implementerPrimary)}`,
+		);
 
 		const approvalsBeforeReset = approvalFiles().length;
 		frames = await command("/storm", request => (request.title === "Storm 메뉴" ? "초기화" : choose("취소")(request)));

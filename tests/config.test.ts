@@ -272,3 +272,25 @@ describe("config store", () => {
 		expect((await loadConfig(root)).status).toBe("invalid");
 	});
 });
+
+describe("disabledRoles", () => {
+	const check = (disabled: unknown) => {
+		const c = clone();
+		c.disabledRoles = disabled;
+		return validateConfig(c);
+	};
+	test("accepts unique known roles that are not configured and not required", () => {
+		const v = check(["quick", "architect"]);
+		expect(v.errors).toEqual([]);
+		expect(v.warnings).toEqual([]);
+		expect(v.config?.disabledRoles).toEqual(["quick", "architect"]);
+	});
+	test("rejects non-arrays, unknown ids, duplicates, implementer and configured roles", () => {
+		expect(check("quick").errors).toEqual(["disabledRoles: 배열이어야 합니다"]);
+		expect(check(["ghost"]).errors).toEqual(["disabledRoles[0]: Storm 역할 id여야 합니다"]);
+		expect(check([3]).errors).toEqual(["disabledRoles[0]: Storm 역할 id여야 합니다"]);
+		expect(check(["quick", "quick"]).errors).toEqual(["disabledRoles[1]: 중복된 역할입니다 (quick)"]);
+		expect(check(["implementer"]).errors).toEqual(["disabledRoles[0]: implementer 역할은 끌 수 없습니다"]);
+		expect(check(["reviewer"]).errors).toEqual(["disabledRoles[0]: roles에 있는 역할은 끌 수 없습니다 (reviewer)"]);
+	});
+});

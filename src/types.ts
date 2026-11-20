@@ -344,7 +344,7 @@ export interface Analysis {
 
 // ── Roles and recommendations (implemented in src/recommend) ────────────────────────────────
 
-export type RoleId = "explorer" | "implementer" | "reviewer";
+export type RoleId = "explorer" | "implementer" | "reviewer" | "quick" | "architect";
 
 export interface RoleSpec {
 	id: RoleId;
@@ -441,6 +441,12 @@ export interface StormConfig {
 	budget?: BudgetConfig;
 	/** Key into `roles`. During a Storm run, a non-Storm agent asking for an unapproved model gets this role's models; absent → blocked. */
 	fallbackRole?: string;
+	/**
+	 * Roles the user chose not to use ("사용 안 함" in setup): their storm-* spawns are refused and the run contract
+	 * leaves them out. Never "implementer" and never a key of `roles`. A role in neither list is missing: its spawns
+	 * borrow the nearest configured stand-in's models (`ROLE_STAND_INS`).
+	 */
+	disabledRoles?: string[];
 	trials?: TrialConfig[];
 }
 
@@ -487,6 +493,7 @@ export interface ApprovalScope {
 	/** Shadowing definitions the user saw and approved. */
 	shadowedAgents: ShadowInfo[];
 	fallbackRole?: string;
+	disabledRoles?: string[];
 	trials?: TrialConfig[];
 }
 
@@ -607,7 +614,8 @@ export interface SpawnRecord {
 	requested: string[];
 	/**
 	 * routed: storm-* agent got its approved models · trial: routed to a trial candidate ·
-	 * allowed: non-Storm agent kept its (approved) model · substituted: non-Storm agent got `fallbackRole`'s models ·
+	 * allowed: non-Storm agent kept its (approved) model · substituted: the agent got another role's models
+	 * (`fallbackRole`, the role an omp built-in agent maps to, or a missing role's stand-in; `role` names it) ·
 	 * blocked: spawn refused (`reason`).
 	 */
 	outcome: "routed" | "trial" | "allowed" | "substituted" | "blocked";
@@ -864,6 +872,18 @@ export interface AgentEntry {
 	followUps: number;
 	/** Cache-read share of the last request's prompt, 0..1. */
 	lastCacheReadShare?: number;
+	/** Structured verdict it yielded (omp reviewer output schema), when it reviewed. */
+	review?: ReviewVerdict;
+}
+
+/** A reviewer's verdict from its `yield`: overall correctness plus its findings counted by priority. */
+export interface ReviewVerdict {
+	/** Absent until the final payload arrives (findings can come first, one section at a time). */
+	verdict?: "correct" | "incorrect";
+	/** 0..1 */
+	confidence?: number;
+	/** Findings by priority: [P0, P1, P2, P3]. */
+	findings: [number, number, number, number];
 }
 
 export interface AgentAdvice {

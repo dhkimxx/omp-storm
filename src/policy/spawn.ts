@@ -1,4 +1,4 @@
-import { ROLE_AGENT_PREFIX } from "../roles.ts";
+import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES } from "../roles.ts";
 import { activeTrialFor, shouldRouteToTrial } from "../runtime/trials.ts";
 import { formatModelEntry, parseModelEntry } from "../selector.ts";
 import type {
@@ -83,6 +83,12 @@ function dedupeBySelector(models: readonly string[]): string[] {
 	});
 }
 
+/** A configured, enabled role with at least one model. */
+export function usableRole(config: StormConfig, id: string): StormConfig["roles"][string] | undefined {
+	const role = config.roles[id];
+	return role && role.models.length > 0 && !config.disabledRoles?.includes(id) ? role : undefined;
+}
+
 /** Decides how a spawn runs: `storm-*` agents always, other agents only while a Storm run is active. */
 export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: SpawnRuntime): SpawnOutcome {
 	const base: SpawnRecord = {
@@ -112,6 +118,16 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		if (approvedSelectors(checked.config).has(requested)) {
 			return { decision: undefined, record: { ...base, outcome: "allowed" } };
 		}
+		const builtinKey = BUILTIN_AGENT_ROLES[event.agent];
+		const builtin = builtinKey === undefined ? undefined : usableRole(checked.config, builtinKey);
+		if (builtinKey !== undefined && builtin) {
+			const models = orderByQuota(builtin.models, runtime.quotaMarks).map(m => withEffort(m, builtin.effort));
+			return route(models, {
+				outcome: "substituted",
+				role: builtinKey,
+				reason: `승인 밖 모델 ${requested || "없음"} → ${builtinKey} 역할 모델`,
+			});
+		}
 		const fallbackKey = checked.config.fallbackRole;
 		const fallback = fallbackKey === undefined ? undefined : checked.config.roles[fallbackKey];
 		if (fallbackKey !== undefined && fallback && fallback.models.length > 0) {
@@ -131,8 +147,26 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	if (!checked.ok) return block(checked.reason);
 	const config = checked.config;
 	const entry = Object.entries(config.roles).find(([, r]) => r.agent === event.agent);
-	if (!entry) return block(`Storm 설정에 ${event.agent} 역할이 없습니다.`);
-	const [roleKey, role] = entry;
+	let roleKey: string;
+	let role: StormConfig["roles"][string];
+	let standIn = false;
+	if (entry) [roleKey, role] = entry;
+	else {
+		const spec = ROLES.find(r => r.agent === event.agent);
+		if (!spec) return block(`Storm 설정에 ${event.agent} 역할이 없습니다.`);
+		const usable = ROLE_STAND_INS[spec.id].find(id => usableRole(config, id));
+		if (config.disabledRoles?.includes(spec.id)) {
+			const suggest = (usable === undefined ? undefined : config.roles[usable]?.agent) ?? "storm-implementer";
+			return block(`${event.agent}(${spec.title})는 이 팀에서 쓰지 않습니다(설정에서 사용 안 함). 대신 ${suggest} 를 쓰세요.`, {
+				role: spec.id,
+			});
+		}
+		const borrowed = usable === undefined ? undefined : usableRole(config, usable);
+		if (usable === undefined || !borrowed) return block(`Storm 설정에 ${event.agent} 역할이 없습니다.`);
+		roleKey = usable;
+		role = borrowed;
+		standIn = true;
+	}
 
 	const approvedShadows = checked.approved.scope.shadowedAgents;
 	for (const shadow of state.shadows) {
@@ -146,6 +180,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	if (overBudget) return block(overBudget, { role: roleKey });
 
 	const ordered = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));
+	if (standIn) return route(ordered, { outcome: "substituted", role: roleKey, reason: `설정에 없는 역할 → ${roleKey} 역할 모델` });
 	const trial = activeTrialFor(config, roleKey, runtime.trials, runtime.now);
 	const trialTag: Partial<SpawnRecord> = trial ? { trialId: trial.id } : {};
 	if (trial && shouldRouteToTrial(trial, runtime.trials[trial.id])) {

@@ -166,7 +166,9 @@ const INSTRUCTIONS = `사용자가 /storm 에서 Storm 팀 설정을 요청했�
 2. 첫 질문의 선택지는 정확히 "Storm 추천안 그대로 (추천)", "역할별로 고르기", "취소" 세 개입니다.
    - Storm 추천안 그대로: storm-recommended-config를 그대로 제안합니다.
    - 역할별로 고르기: 역할마다 주 모델, 폴백 모델, effort를 차례로 묻고, 마지막에 실행 설정(병렬도, 역할별 워커 수, 실행 계약, 실행당 예산)을 묻습니다. 선택지는 위 후보에서 만들고, storm-recommended-config에 있는 값에 (추천)을 붙이세요. effort는 그 모델이 지원하는 것만 보여 주세요.
+     - implementer를 뺀 모든 역할의 주 모델 질문은 마지막 선택지로 "사용 안 함"을 둡니다. 이를 고르면 그 역할의 폴백·effort 질문을 건너뛰고, 그 역할을 \`roles\`에서 빼고 id를 \`disabledRoles\`에 넣으세요.
+     - implementer는 필수 역할이라 "사용 안 함" 선택지가 없습니다.
    - 취소하거나 답이 없으면 아무것도 호출하지 말고, 바뀐 것이 없다고만 짧게 알리세요.
 3. 사용자가 위 사실에 없는 모델을 물을 때만 웹 검색을 하고, 출처를 밝히세요.
-4. 마지막으로 \`storm\` 도구를 action "propose"로 호출하세요. \`config\`에는 팀 전체 설정 객체(storm-recommended-config와 같은 형식, 모델 항목은 "provider/id:effort")를, \`rationale\`에는 왜 이 팀인지 한국어 2~4문장을 넣으세요. 도구가 설정 오류를 돌려주면 고쳐서 다시 호출하세요.
+4. 마지막으로 \`storm\` 도구를 action "propose"로 호출하세요. \`config\`에는 팀 전체 설정 객체(storm-recommended-config와 같은 형식, 모델 항목은 "provider/id:effort", 쓰지 않는 역할은 \`disabledRoles\` 배열)를, \`rationale\`에는 왜 이 팀인지 한국어 2~4문장을 넣으세요. 도구가 설정 오류를 돌려주면 고쳐서 다시 호출하세요.
 5. 저장은 사용자가 Storm 승인 창에서 "승인"을 골라야만 됩니다. 도구 결과를 그대로 전하고, 저장했다고 먼저 말하지 마세요.`;

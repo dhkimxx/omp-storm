@@ -25,7 +25,7 @@ import { DIRECTOR_BLOCK_REASON, directorBlocks } from "./policy/director.ts";
 import { decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
 import { ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
-import { listAgents, noteAgentEnd, noteAgentParked, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
+import { listAgents, noteAgentEnd, noteAgentParked, noteAgentReview, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
 import { buildStormRequest, noteRunSpawn, RunController, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
 import { lastRun } from "./runtime/run.ts";
@@ -349,6 +349,12 @@ export default function storm(pi: ExtensionAPI): void {
 		if (!runs.directing() || !directorBlocks(event.toolName, event.input)) return undefined;
 		runs.noteBlockedEdit();
 		return { block: true, reason: DIRECTOR_BLOCK_REASON };
+	});
+
+	// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
+	pi.on("tool_result", (event, ctx) => {
+		if (ctx.agent.kind === "sub" && event.toolName === "yield" && !event.isError) noteAgentReview(ctx.agent.id, event.input);
+		return undefined;
 	});
 
 	pi.on("agent_start", () => {

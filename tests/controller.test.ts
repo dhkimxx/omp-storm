@@ -164,7 +164,7 @@ describe("director mode", () => {
 		if (!record) throw new Error("no record");
 		const summary = summarizeRun(record);
 		expect(summary).toContain("- 메인(감독): 비용 $2.00(전체의 50%) · 직접 수정 1회를 위임으로 돌림");
-		expect(summary.split("\n").length).toBeLessThanOrEqual(4);
+		expect(summary.split("\n").length).toBeLessThanOrEqual(5);
 	});
 });
 
@@ -185,5 +185,28 @@ describe("run summary", () => {
 			agents: [agent({ followUps: 3 }), agent({ id: "Review", followUps: 1 }), agent({ id: "Scout" })],
 		};
 		expect(summarizeRun(run)).toContain("- 서브에이전트: 3개 · 재사용 2개(후속 지시 4회)");
+	});
+
+	test("adds the review line and stays within five lines when every line is present", () => {
+		const run: RunRecord = {
+			schema: "storm.run/v1",
+			runId: "run-1",
+			configHash: "h",
+			approvalId: "ap-1",
+			startedAt: "2026-11-20T09:00:00.000Z",
+			status: "done",
+			contract: "workflowz",
+			task: "t",
+			costUsd: 2,
+			mainCostUsd: 1,
+			blockedEdits: 1,
+			costByModel: {},
+			spawns: [spawn, { ...spawn, outcome: "blocked", reason: "x" }],
+			agents: [agent({ review: { verdict: "incorrect", findings: [1, 0, 0, 0] } })],
+		};
+		const lines = summarizeRun(run).split("\n");
+		expect(lines).toContain("- 리뷰: 통과 0 · 수정 필요 1 (P0 1)");
+		expect(lines.length).toBeLessThanOrEqual(5);
+		expect(summarizeRun({ ...run, spawns: [] })).not.toContain("리뷰");
 	});
 });
