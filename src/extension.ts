@@ -16,8 +16,6 @@ import {
 	hubFlow,
 	modelsFlow,
 	resetFlow,
-	reviewFlow,
-	rollbackFlow,
 	setupFlow,
 	statusFlow,
 } from "./flows.ts";
@@ -36,14 +34,15 @@ import { createStateCache, loadProjectState, type ProjectEnv, type ProjectState 
 import type { StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
 import type { ConfigLoad, ExplicitSettings, LifecycleSettings, ModelInfo, RepoIdentity, TrialConfig } from "./types.ts";
-import { createUiPort } from "./ui.ts";
+import { createUiPort, registerReportRenderer } from "./ui.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /**
- * Shortcuts (the old subcommand words): exactly one of them opens that flow without the LLM, so muscle memory
+ * Shortcuts kept from the old subcommands: exactly one of them opens that flow without the LLM, so muscle memory
  * never turns into a request. The README lists them; completions do not, since `/storm` and its menu cover them.
+ * Approval and rollback have none: `/storm` opens the approval screen by itself, and rollback is a menu item.
  */
-const SHORTCUTS = ["status", "models", "setup", "review", "rollback", "reset"] as const;
+const SHORTCUTS = ["status", "models", "setup", "reset"] as const;
 const CONFIG_TTL_MS = 5_000;
 
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
@@ -361,6 +360,7 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool(tool);
+	registerReportRenderer(pi);
 
 	pi.registerCommand("storm", {
 		description: "Storm 멀티에이전트 팀 (/storm: 현황과 메뉴 · /storm <요청>: 작업 맡기기, 팀 변경, 질문)",
@@ -394,8 +394,6 @@ export default function storm(pi: ExtensionAPI): void {
 				}
 				let reset = false;
 				if (input === "setup") await setupFlow(env, ui);
-				else if (input === "review") await reviewFlow(env, ui);
-				else if (input === "rollback") await rollbackFlow(env, ui);
 				else if (input === "reset") reset = await resetFlow(env, ui);
 				else reset = await hubFlow(env, ui);
 				if (reset) await deactivateTool();

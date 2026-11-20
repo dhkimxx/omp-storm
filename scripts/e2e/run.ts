@@ -345,8 +345,8 @@ async function main(): Promise<void> {
 		writeFileSync(SHADOW, "---\nname: storm-implementer\ndescription: shadow\n---\nSTORM-ROLE shadow. Reply with OK.\n");
 		run = await spawn(["storm-implementer"]);
 		check("역할 가림: 승인 전 차단", run.results.includes("승인되지 않은 역할 정의") && run.children.length === 0);
-		// The old subcommand word still opens its flow directly (hidden shortcut).
-		await command("/storm review", approveAnswers);
+		frames = await command("/storm", approveAnswers);
+		check("허브: 승인 안 된 가림 정의도 승인 화면", uiTitled(frames, "이 설정을 승인할까요?") && !uiTitled(frames, "Storm 메뉴"));
 		run = await spawn(["storm-implementer"]);
 		check("역할 가림: 승인 후 가림 정의로 실행", run.children[0]?.roles.includes("shadow") === true);
 		rmSync(join(PROJECT, ".omp", "agents"), { recursive: true, force: true });
@@ -549,7 +549,7 @@ async function main(): Promise<void> {
 			"초기화: 메뉴에서 확인 한 번, 취소하면 그대로",
 			uiTitled(frames, "Storm 설정과 기록을 모두 지울까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
 		);
-		// The hidden shortcut opens the same confirmation directly.
+		// The reset shortcut opens the same confirmation directly.
 		frames = await command("/storm reset", choose("초기화"));
 		check(
 			"초기화: 설정과 승인 기록을 한 번에 삭제",

@@ -34,7 +34,7 @@ Handle it with the `storm` tool, then answer briefly in the user's language.
 | A spending limit per run | `budget` |
 | Which subagents to reuse, start fresh or let go | `agents` |
 | Work done (implement, analyze, fix…) | `run` with the request as `task` |
-| Set the team up again, roll back to an earlier approval, or reset Storm | No action: tell the user to type `/storm` and pick it from the menu |
+| Set the team up again, roll back to an earlier approval, reset Storm, or approve a pending config or proposal (also a bare old command word such as `review` or `rollback`) | No action: tell the user to type `/storm`. It opens the approval screen when something awaits approval; the rest is in its menu |
 
 - Write actions only propose. The user approves in a dialog; report the tool's outcome as is and never claim a change was applied unless the tool said so.
 - After `run`, end your reply at once without doing the work: Storm starts the run with the team contract right after your turn.
