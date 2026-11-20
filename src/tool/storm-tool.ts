@@ -100,6 +100,8 @@ export function createStormTool(
 		description: DESCRIPTION,
 		parameters: stormParams(z),
 		loadMode: "essential",
+		// Off until a Storm project's main session (or a /storm request) turns it on, so other sessions never carry its schema.
+		defaultInactive: true,
 		approval: "write",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const reply = await runStormTool(hostFor(ctx), params);

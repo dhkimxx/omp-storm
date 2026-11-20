@@ -187,7 +187,7 @@ async function command(line: string, answer: Answer): Promise<Frame[]> {
 }
 
 /** Asks the fake model to spawn the agents; returns child requests and async results. */
-async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children: LlmEntry[]; results: string }> {
+async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children: LlmEntry[]; main: LlmEntry[]; results: string }> {
 	const before = readLlm().length;
 	return session(noAnswer, async rpc => {
 		const from = rpc.frames.length;
@@ -203,7 +203,8 @@ async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children:
 			.filter(frame => frame.type === "message_start" && textOf(frame).includes("async-result"))
 			.map(textOf)
 			.join("\n");
-		return { children: readLlm().slice(before).filter(entry => entry.child && entry.tools.length > 0), results };
+		const fresh = readLlm().slice(before).filter(entry => entry.tools.length > 0);
+		return { children: fresh.filter(entry => entry.child), main: fresh.filter(entry => !entry.child), results };
 	}, flavor);
 }
 
@@ -287,6 +288,11 @@ async function main(): Promise<void> {
 		let run = await spawn(["storm-implementer", "task"]);
 		check("설정 없음: storm 역할 차단", run.results.includes("Storm 설정이 없습니다") && run.children.every(c => !c.roles.length));
 		check("설정 없음: 일반 에이전트는 영향 없음", run.children.length === 1, `children=${run.children.length}`);
+		check(
+			"도구: 설정 없는 프로젝트엔 storm 도구 없음",
+			run.main.length > 0 && run.main.every(entry => !entry.tools.includes("storm")),
+			`main=${run.main.length}`,
+		);
 
 		let frames = await command("/storm setup", setupAnswers);
 		const config = existsSync(CONFIG) ? (JSON.parse(readFileSync(CONFIG, "utf8")) as { roles: Record<string, { models: string[]; effort?: string }> }) : undefined;
@@ -301,6 +307,11 @@ async function main(): Promise<void> {
 		const child = run.children[0];
 		check("승인 후: 승인 모델로 교체", child?.model === expectedModel, `child=${child?.model} expected=${expectedModel}`);
 		check("승인 후: effort 전달", implementer?.effort === undefined || child?.effort === implementer.effort, `effort=${child?.effort} expected=${implementer?.effort}`);
+		check(
+			"도구: 설정 있으면 메인 세션에만 storm 도구",
+			run.main.length > 0 && run.main.every(entry => entry.tools.includes("storm")) && run.children.every(entry => !entry.tools.includes("storm")),
+			`main=${run.main.map(entry => entry.tools.includes("storm")).join(",")} children=${run.children.map(entry => entry.tools.includes("storm")).join(",")}`,
+		);
 
 		const edited = JSON.parse(readFileSync(CONFIG, "utf8")) as { parallelism: number };
 		edited.parallelism = edited.parallelism === 3 ? 5 : 3;

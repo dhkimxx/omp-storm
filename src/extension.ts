@@ -227,16 +227,29 @@ export default function storm(pi: ExtensionAPI): void {
 		await runs.finish("stopped");
 	});
 
+	const tool = createStormTool(pi.zod, ctx => toolHost(ctx));
+	const activateTool = async (): Promise<void> => {
+		const active = pi.getActiveTools();
+		if (!active.includes(tool.name)) await pi.setActiveTools([...active, tool.name]);
+	};
+	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
+	const syncSession = async (ctx: ExtensionContext): Promise<void> => {
+		const state = await loadProjectState(projectEnv(ctx));
+		if (state.config.status !== "missing") await activateTool();
+		if (ctx.hasUI) ctx.ui.setStatus("storm", statusLabel(state));
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
-		if (!ctx.hasUI) return;
+		// Subagents never manage the team: no tool, no status line.
+		if (ctx.agent.kind !== "main") return;
 		try {
-			ctx.ui.setStatus("storm", statusLabel(await loadProjectState(projectEnv(ctx))));
+			await syncSession(ctx);
 		} catch {
-			// The status line is a hint; /storm status reports the actual error.
+			// The status line and the tool are conveniences; /storm status reports the actual error.
 		}
 	});
 
-	pi.registerTool(createStormTool(pi.zod, ctx => toolHost(ctx)));
+	pi.registerTool(tool);
 
 	pi.registerCommand("storm", {
 		description: "Storm 멀티에이전트 팀 (/storm [status|models|setup|review|rollback|run <작업>|<자연어 요청>])",
@@ -269,6 +282,7 @@ export default function storm(pi: ExtensionAPI): void {
 				if (input !== "" && !(EXACT as readonly string[]).includes(input)) {
 					// Natural language: the main LLM answers through the storm tool; changes still need the approval dialog.
 					await ctx.waitForIdle();
+					await activateTool();
 					pi.sendUserMessage(buildStormRequest(input)).catch((error: unknown) => {
 						ui.notify(`요청을 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
 					});
@@ -292,12 +306,10 @@ export default function storm(pi: ExtensionAPI): void {
 			} finally {
 				stateCache.clear();
 				configByRoot.clear();
-				if (ctx.hasUI) {
-					try {
-						ctx.ui.setStatus("storm", statusLabel(await loadProjectState(projectEnv(ctx))));
-					} catch {
-						// Status refresh is best-effort.
-					}
+				try {
+					await syncSession(ctx);
+				} catch {
+					// Status refresh is best-effort.
 				}
 			}
 		},
