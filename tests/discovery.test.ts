@@ -196,6 +196,44 @@ describe("parseConfigList", () => {
 		expect(parseConfigList(JSON.stringify({ "task.agentIdleTtlMs": entry(undefined, "number") })).agentIdleTtlMs).toBeUndefined();
 	});
 
+	test("reads isolation, concurrency, model badge and retry fallback settings", () => {
+		const s = parseConfigList(
+			JSON.stringify({
+				"task.isolation.enabled": entry(true, "boolean"),
+				"task.maxConcurrency": entry(4, "number"),
+				"task.showResolvedModelBadge": entry(false, "boolean"),
+				"retry.modelFallback": entry(true, "boolean"),
+				"retry.fallbackChains": entry({
+					"a/x": ["b/y", "c/z"],
+					default: [],
+					mixed: ["b/y", 3],
+					blank: [""],
+					single: "b/y",
+				}),
+			}),
+		);
+		expect(s.isolationEnabled).toBe(true);
+		expect(s.maxConcurrency).toBe(4);
+		expect(s.showResolvedModelBadge).toBe(false);
+		expect(s.modelFallback).toBe(true);
+		expect(s.fallbackChains).toEqual({ "a/x": ["b/y", "c/z"], default: [] });
+	});
+
+	test("new settings ignore wrong types and non-positive concurrency", () => {
+		const s = parseConfigList(
+			JSON.stringify({
+				"task.isolation.enabled": entry("true", "boolean"),
+				"task.maxConcurrency": entry(0, "number"),
+				"task.showResolvedModelBadge": entry(1, "boolean"),
+				"retry.modelFallback": entry(null, "boolean"),
+				"retry.fallbackChains": entry(["a/x"]),
+			}),
+		);
+		expect(s).toEqual({ modelRoles: {}, agentModelOverrides: {} });
+		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(-2, "number") })).maxConcurrency).toBeUndefined();
+		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(undefined, "number") })).maxConcurrency).toBeUndefined();
+	});
+
 	test("command failure gives empty defaults", async () => {
 		const failing: Exec = async () => ({ stdout: "", stderr: "", code: 2 });
 		expect(await readExplicitSettings(failing, "omp")).toEqual({ modelRoles: {}, agentModelOverrides: {} });

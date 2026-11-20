@@ -92,7 +92,8 @@ function harness(agents: AgentEntry[]) {
 		confirm: async () => false,
 		input: async () => undefined,
 		notify: () => undefined,
-		report: () => undefined,
+		report: async () => undefined,
+		record: () => undefined,
 	};
 	const controller = new RunController({
 		pi: { sendUserMessage: async () => undefined },
@@ -162,8 +163,8 @@ describe("director mode", () => {
 		expect(record).toMatchObject({ mainCostUsd: 2, blockedEdits: 1, costUsd: 4 });
 		if (!record) throw new Error("no record");
 		const summary = summarizeRun(record);
-		expect(summary).toContain("- 메인(감독) 비용: $2.00 · 전체의 50%");
-		expect(summary).toContain("- 메인이 직접 고치려다 위임으로 돌린 수정: 1회");
+		expect(summary).toContain("- 메인(감독): 비용 $2.00(전체의 50%) · 직접 수정 1회를 위임으로 돌림");
+		expect(summary.split("\n").length).toBeLessThanOrEqual(4);
 	});
 });
 

@@ -27,7 +27,7 @@ function isQuotaMark(value: unknown): value is QuotaMark {
 	const v = value as Record<string, unknown>;
 	return (
 		typeof v.provider === "string" &&
-		(v.source === "user" || v.source === "usage") &&
+		(v.source === "user" || v.source === "usage" || v.source === "fallback") &&
 		typeof v.markedAt === "string" &&
 		typeof v.until === "string" &&
 		Number.isFinite(Date.parse(v.until))

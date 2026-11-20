@@ -59,16 +59,24 @@ export type Exec = (
 
 export type UiSelectItem = string | { label: string; description?: string };
 
-/** The subset of omp's `ctx.ui` Storm uses, plus a transcript report channel. */
+/** Shown with a choice while it is open (TUI: a panel above the selector, gone once it closes); other hosts get a transcript message. */
+export interface UiContext {
+	title: string;
+	markdown: string;
+}
+
+/** The subset of omp's `ctx.ui` Storm uses, plus Storm's own views. */
 export interface UiPort {
 	/** Resolves to the chosen label, or undefined when cancelled or when no UI can answer. */
-	select(title: string, options: UiSelectItem[]): Promise<string | undefined>;
+	select(title: string, options: UiSelectItem[], context?: UiContext): Promise<string | undefined>;
 	/** Resolves to false when declined, cancelled, or when no UI can answer. */
 	confirm(title: string, message: string): Promise<boolean>;
 	input(title: string, placeholder?: string): Promise<string | undefined>;
 	notify(message: string, level?: "info" | "warning" | "error"): void;
-	/** Show multi-line markdown in the transcript without sending it to the model. */
-	report(title: string, markdown: string): void;
+	/** A view to read and close. TUI: a scrollable overlay that leaves nothing in the transcript; other hosts: a transcript message. Resolves once closed. */
+	report(title: string, markdown: string): Promise<void>;
+	/** Kept in the transcript, never sent to the model: run results and other records. Keep it to a few lines. */
+	record(title: string, markdown: string): void;
 }
 
 // ── Catalog ─────────────────────────────────────────────────────────────────────────────────
@@ -233,6 +241,16 @@ export interface ExplicitSettings {
 	agentIdleTtlMs?: number;
 	/** `providers.cacheRetention` (`auto|short|long|none`); undefined when unreadable. */
 	cacheRetention?: string;
+	/** `task.isolation.enabled`: whether the task tool accepts `isolated: true`. */
+	isolationEnabled?: boolean;
+	/** `task.maxConcurrency`: subagents omp runs at once. */
+	maxConcurrency?: number;
+	/** `task.showResolvedModelBadge`: the task widget shows each subagent's actual model. */
+	showResolvedModelBadge?: boolean;
+	/** `retry.modelFallback`: omp may switch to `retry.fallbackChains` models after provider errors. */
+	modelFallback?: boolean;
+	/** `retry.fallbackChains`: model role, selector or `provider/*` → ordered fallback selectors. */
+	fallbackChains?: Record<string, string[]>;
 }
 
 // ── Analysis (implemented in src/analysis) ──────────────────────────────────────────────────
@@ -517,7 +535,7 @@ export interface SpawnState {
 /** undefined = leave the spawn alone. */
 export type SpawnDecision = undefined | { block: true; reason: string } | { model: string[]; note: string };
 
-// ── Setup interview (implemented in src/interview) ──────────────────────────────────────────
+// ── Setup detection (implemented in src/context.ts) ─────────────────────────────────────────
 
 export interface DetectionSummary {
 	providers: Array<{ provider: string; models: number; quota: QuotaState }>;
@@ -530,26 +548,6 @@ export interface DetectionSummary {
 	stale: boolean;
 	warnings: string[];
 }
-
-export interface InterviewInput {
-	detection: DetectionSummary;
-	analysis: Analysis;
-	recommendations: RoleRecommendation[];
-	/** The current config and whether its hash is approved, when one exists. */
-	current?: { config: StormConfig; hash: string; approved: boolean };
-	shadows: ShadowInfo[];
-	/** Re-rank for another priority without re-reading data. */
-	rerecommend: (priority: Priority) => RoleRecommendation[];
-	/** Validates a selector the user typed against the available catalog. */
-	checkModel: (selector: string) => { ok: true; label: string; efforts: Effort[] } | { ok: false; reason: string };
-	defaults: { parallelism: number; isolation: StormConfig["isolation"]; contract: StormConfig["contract"] };
-	priority: Priority;
-}
-
-export type InterviewResult =
-	| { status: "approved"; config: StormConfig; scope: ApprovalScope }
-	| { status: "cancelled"; at: string }
-	| { status: "no-ui" };
 
 /** Everything the Storm status report shows. v0.2 runtime fields are optional; absent ones render as nothing. */
 export interface StatusView {
@@ -573,6 +571,19 @@ export interface StatusView {
 	agents?: Array<{ entry: AgentEntry; advice: AgentAdvice }>;
 	/** omp settings that decide what reusing a subagent costs; drives lifecycle warnings. */
 	lifecycle?: LifecycleSettings;
+	/** omp settings that do not fit the approved team; shown, never changed. */
+	ompAdvice?: OmpAdvice[];
+	/** A newer Storm installed on disk than the one this process runs (`/restart` loads it). */
+	newerVersion?: string;
+}
+
+/** An omp setting that does not fit the approved team. Storm shows it with a copy-ready command and never changes it. */
+export interface OmpAdvice {
+	/** Setting key, e.g. "task.maxConcurrency". */
+	key: string;
+	message: string;
+	/** `omp config set …` that fixes it, when one does. */
+	command?: string;
 }
 
 /** A previously approved config offered by rollback. */
@@ -646,7 +657,7 @@ export interface RunRecord {
 /** A provider reported out of quota; approved fallbacks on other providers go first until `until`. */
 export interface QuotaMark {
 	provider: string;
-	source: "user" | "usage";
+	source: "user" | "usage" | "fallback";
 	/** ISO 8601. */
 	markedAt: string;
 	until: string;
@@ -710,7 +721,7 @@ export interface SpawnOutcome {
 
 // ── Proposals and evidence (implemented in src/proposals) ─────────────────────────────────────
 
-export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget";
+export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "setup";
 
 /** Why the approved models were chosen, stored per config hash next to the approval. */
 export interface EvidenceRecord {
@@ -736,6 +747,8 @@ export interface EvidenceRecord {
 			}>;
 		}
 	>;
+	/** Why this team, as the session LLM explained it when it proposed a setup. */
+	rationale?: string;
 }
 
 /** A config change the storm tool proposed; nothing changes until the user approves it. */
@@ -770,7 +783,8 @@ export interface AnalysisContext {
 	/** Priors and data warnings. */
 	warnings: string[];
 	recommend(priority: Priority): RoleRecommendation[];
-	checkModel: InterviewInput["checkModel"];
+	/** Validates a selector the user named against the available catalog. */
+	checkModel: (selector: string) => { ok: true; label: string; efforts: Effort[] } | { ok: false; reason: string };
 	detection(activeTools: string[], extraWarnings?: string[]): DetectionSummary;
 }
 
@@ -786,7 +800,8 @@ export type StormToolAction =
 	| "trial"
 	| "budget"
 	| "run"
-	| "agents";
+	| "agents"
+	| "propose";
 
 /** Arguments the LLM passes; each action reads only its own fields. */
 export interface StormToolParams {
@@ -812,6 +827,10 @@ export interface StormToolParams {
 	onExceed?: BudgetConfig["onExceed"];
 	/** run */
 	task?: string;
+	/** propose: the whole team as a Storm config object (version, priority, roles, parallelism, isolation, contract, …). */
+	config?: unknown;
+	/** propose: why this team, in the user's language; stored with the evidence. */
+	rationale?: string;
 }
 
 // ── Agent ledger and lifecycle advice (implemented in src/runtime/agents.ts, src/report/agents.ts) ─

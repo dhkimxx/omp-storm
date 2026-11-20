@@ -361,7 +361,10 @@ export function renderShadows(shadows: StatusView["shadows"]): string {
 }
 
 export function renderStatus(view: StatusView, now: number): string {
-	const out = [`- Storm ${STORM_VERSION}`, "", "### 저장소", `- repoId: ${view.repo.repoId}`, `- 루트: ${view.repo.root}`, "", "### 설정"];
+	const version = view.newerVersion
+		? `- Storm ${STORM_VERSION} · 새 버전 ${view.newerVersion} 설치됨 → /restart 로 적용`
+		: `- Storm ${STORM_VERSION}`;
+	const out = [version, "", "### 저장소", `- repoId: ${view.repo.repoId}`, `- 루트: ${view.repo.root}`, "", "### 설정"];
 	const c = view.config;
 	if (c.status === "missing") out.push(`- 없음 (${c.path}) — /storm 으로 만드세요`);
 	else if (c.status === "invalid") out.push(`- 오류 (${c.path})`, ...c.errors.map((e) => `  - ${e}`));
@@ -404,6 +407,11 @@ export function renderStatus(view: StatusView, now: number): string {
 		const ws = lifecycleWarnings(view.lifecycle, providers);
 		if (ws.length) out.push("", "### 수명 관리", ...ws.map((w) => `- ${w}`));
 	}
+	if (view.ompAdvice?.length) {
+		out.push("", "### omp 설정 점검");
+		for (const a of view.ompAdvice) out.push(`- ${a.message}`, ...(a.command ? [`  - \`${a.command}\``] : []));
+		out.push("- Storm 은 omp 설정을 바꾸지 않습니다. 필요하면 위 명령을 직접 실행하세요.");
+	}
 	out.push("", "### 쿼터");
 	if (!view.quota.length) out.push(`- ${DASH}`);
 	for (const q of view.quota) {
@@ -421,6 +429,43 @@ export function renderStatus(view: StatusView, now: number): string {
 			: "- 하드 상한은 `omp --max-cost <USD>` 또는 `session.maxCost`로 거세요.",
 	);
 	return out.join("\n") + renderShadows(view.shadows);
+}
+
+/** The status in a few lines, for the panel above the /storm menu; `/storm status` shows all of it. */
+export function renderStatusBrief(view: StatusView, now: number): string {
+	const out = [
+		view.newerVersion ? `- Storm ${STORM_VERSION} · 새 버전 ${view.newerVersion} 설치됨 → /restart 로 적용` : `- Storm ${STORM_VERSION}`,
+	];
+	const c = view.config;
+	if (c.status === "ok") {
+		const hash = c.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
+		out.push(`- 설정 ${hash} · ${view.approval ? "승인됨" : "미승인"} · 우선순위 ${priorityLabel(c.config.priority)}`);
+		for (const [id, r] of Object.entries(c.config.roles)) {
+			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}${r.workers !== undefined ? ` · 워커 ${r.workers}` : ""}`);
+		}
+	} else out.push(c.status === "missing" ? "- 설정 없음" : "- 설정 오류");
+	if (view.run) out.push(`- 실행 중: ${view.run.runId} · ${spendText(view.run.costUsd, view.run.budget)}`);
+	else if (view.lastRun) {
+		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${RUN_STATUS[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
+	}
+	const notes: string[] = [];
+	if (view.trials?.length) notes.push(`시험 ${view.trials.length}건`);
+	if (view.quotaMarks?.length) notes.push(`쿼터 소진 표시 ${view.quotaMarks.map((m) => m.provider).join(", ")}`);
+	if (view.pending?.length) notes.push(`승인 대기 제안 ${view.pending.length}건`);
+	if (view.lifecycle) {
+		const providers = c.status === "ok" ? teamProviders(c.config) : agentProviders((view.agents ?? []).map((a) => a.entry));
+		const n = lifecycleWarnings(view.lifecycle, providers).length;
+		if (n) notes.push(`수명 관리 경고 ${n}건`);
+	}
+	if (view.ompAdvice?.length) notes.push(`omp 설정 점검 ${view.ompAdvice.length}건`);
+	if (notes.length) out.push(`- 확인할 것: ${notes.join(" · ")}`);
+	out.push(`- 사용 데이터 기준: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)}) · 전체 현황은 /storm status`);
+	return out.join("\n");
+}
+
+/** One trial with its measured comparison, for the decision that follows it. */
+export function renderTrial(view: TrialView): string {
+	return trialViewLines(view).join("\n");
 }
 
 const RUN_STATUS: Record<RunStatus, string> = {

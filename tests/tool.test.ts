@@ -23,6 +23,7 @@ import type {
 	ShadowInfo,
 	StormConfig,
 	TrialConfig,
+	UiContext,
 	UiPort,
 	UiSelectItem,
 } from "../src/types.ts";
@@ -180,15 +181,15 @@ function fakeHost(
 	let shadows = opts.shadows ?? [];
 	const queue = [...(opts.answers ?? [])];
 	const reports: Array<{ title: string; md: string }> = [];
-	const selects: Array<{ title: string; options: string[] }> = [];
+	const selects: Array<{ title: string; options: string[]; context?: UiContext }> = [];
 	const saved: Saved[] = [];
 	const proposals: Proposal[] = [];
 	const marks: QuotaMark[] = [];
 	const runs: string[] = [];
 	let prepares = 0;
 	const ui: UiPort = {
-		async select(title: string, options: UiSelectItem[]) {
-			selects.push({ title, options: options.map((o) => (typeof o === "string" ? o : o.label)) });
+		async select(title: string, options: UiSelectItem[], context?: UiContext) {
+			selects.push({ title, options: options.map((o) => (typeof o === "string" ? o : o.label)), ...(context ? { context } : {}) });
 			if (!queue.length) throw new Error(`no answer for select: ${title}`);
 			const a = queue.shift();
 			return typeof a === "function" ? a() : a;
@@ -200,7 +201,10 @@ function fakeHost(
 			return undefined;
 		},
 		notify() {},
-		report(title: string, md: string) {
+		async report(title: string, md: string) {
+			reports.push({ title, md });
+		},
+		record(title: string, md: string) {
 			reports.push({ title, md });
 		},
 	};
@@ -285,6 +289,10 @@ describe("tool definition", () => {
 			share: 0.5,
 		});
 		expect(tool.parameters.safeParse({ action: "delete-everything" }).success).toBe(false);
+		expect(tool.parameters.parse({ action: "propose", config: { version: 1 }, rationale: "왜" })).toMatchObject({ action: "propose", config: { version: 1 } });
+		expect(tool.parameters.safeParse({ action: "propose", config: "x" }).success).toBe(false);
+		expect(tool.description).toContain("<storm-setup>");
+		expect(tool.description).toContain("/storm");
 	});
 });
 
@@ -449,11 +457,13 @@ describe("approval gate", () => {
 		expect(g.saved).toEqual([]);
 	});
 
-	test("shadowing definitions are shown before asking, and a new one blocks the write", async () => {
+	test("shadowing definitions are shown in the approval dialog, and a new one blocks the write", async () => {
 		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.omp/agents/storm-reviewer.md", scope: "project", sha256: "ab" };
 		const f = fakeHost({ shadows: [shadow], answers: ["승인"] });
 		expect((await run(f, { action: "workers", role: "implementer", workers: 2 })).outcome).toBe("approved");
-		expect(f.reports.map((x) => x.title)).toEqual(["Storm 가림 정의", "Storm 변경 제안"]);
+		expect(f.reports).toEqual([]);
+		expect(f.selects[0]!.context).toMatchObject({ title: "Storm 변경 제안" });
+		expect(f.selects[0]!.context!.markdown).toContain(shadow.path);
 		expect(f.saved[0]!.scope.shadowedAgents).toEqual([shadow]);
 
 		const g = fakeHost({
@@ -489,7 +499,7 @@ describe("priority", () => {
 		expect(s.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r2:high"] });
 		expect(s.evidence).toMatchObject({ source: "priority", priority: "quality", dataAsOf: NOW - 3_600_000 });
 		expect(s.evidence!.roles.implementer!.chosen).toBe("a/i2");
-		expect(f.reports.at(-1)!.md).toContain("근거");
+		expect(f.selects.at(-1)!.context!.markdown).toContain("근거");
 	});
 
 	test("missing priority is rejected", async () => {
@@ -711,5 +721,92 @@ describe("run", () => {
 		expect(f.runs).toEqual([]);
 		const g = fakeHost({ run: { ok: false, reason: "승인된 설정이 없습니다" } });
 		expect(await run(g, { action: "run", task: "x" })).toEqual({ outcome: "rejected", text: "승인된 설정이 없습니다" });
+	});
+});
+
+describe("propose", () => {
+	const team = (): StormConfig => {
+		const c = structuredClone(base);
+		c.roles.explorer = { agent: "storm-explorer", models: ["b/z:low", "a/x:low"], workers: 2 };
+		c.fallbackRole = "implementer";
+		return c;
+	};
+	const params = (config: unknown = team()): StormToolInput => ({ action: "propose", config, rationale: "  탐색은 빠른 모델, 리뷰는 다른 Provider  " });
+
+	test("an invalid or missing config is rejected with the errors, asking nothing", async () => {
+		const f = fakeHost({ config: null });
+		const r = await run(f, params({ ...team(), version: 2, parallelism: 0 }));
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("version");
+		expect(r.text).toContain("parallelism");
+		expect((await run(f, { action: "propose" })).outcome).toBe("rejected");
+		expect(f.selects).toEqual([]);
+		expect(f.saved).toEqual([]);
+	});
+
+	test("only the exact label saves; anything else cancels without a pending proposal", async () => {
+		for (const answer of ["취소", undefined, "나중에", "승인 ", "승인 후 저장"]) {
+			const f = fakeHost({ answers: [answer] });
+			const r = await run(f, params());
+			expect(r).toEqual({ outcome: "cancelled", text: "저장하지 않았습니다. 바뀐 것은 없습니다." });
+			expect(f.selects[0]!.options).toEqual(["승인", "취소"]);
+			expect(f.saved).toEqual([]);
+			expect(f.proposals).toEqual([]);
+			expect(f.config()).toEqual(base);
+		}
+		const f = fakeHost({ answers: ["승인"] });
+		const r = await run(f, params());
+		expect(r.outcome).toBe("approved");
+		expect(r.text).toContain("Storm 팀 재설정 제안 (균형)");
+		expect(f.saved).toHaveLength(1);
+		const s = f.saved[0]!;
+		expect(s.config).toEqual(team());
+		expect(s.baseHash).toBe(configHash(base));
+		expect(s.scope.providers).toEqual(["a", "b"]);
+		expect(s.evidence).toMatchObject({ source: "setup", priority: "balanced", rationale: "탐색은 빠른 모델, 리뷰는 다른 Provider" });
+		expect(s.evidence!.roles.explorer!.chosen).toBe("b/z");
+		const md = f.selects[0]!.context!.markdown;
+		expect(md).toContain("explorer 모델: a/x, b/z → b/z:low, a/x:low");
+		expect(md).toContain("탐색은 빠른 모델");
+	});
+
+	test("a new project gets the whole team, shadows included, and saves on approval", async () => {
+		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.omp/agents/storm-reviewer.md", scope: "project", sha256: "ab" };
+		const f = fakeHost({ config: null, shadows: [shadow], answers: ["승인"] });
+		const r = await run(f, params());
+		expect(r.outcome).toBe("approved");
+		expect(r.text).toContain("Storm 팀 설정 제안");
+		expect(f.selects[0]!.context).toMatchObject({ title: "Storm 팀 제안" });
+		const md = f.selects[0]!.context!.markdown;
+		expect(md).toContain("### 팀 구성\n새 설정");
+		expect(md).toContain(shadow.path);
+		expect(f.saved[0]!.baseHash).toBeNull();
+		expect(f.saved[0]!.scope.shadowedAgents).toEqual([shadow]);
+		expect(f.config()).toEqual(team());
+	});
+
+	test("models missing from the available list are warned about in the dialog", async () => {
+		const c = team();
+		c.roles.reviewer!.models = ["zz/none:high", "b/r:high"];
+		const f = fakeHost({ answers: ["취소"] });
+		await run(f, params(c));
+		const md = f.selects[0]!.context!.markdown;
+		expect(md).toContain("### 경고");
+		expect(md).toContain("zz/none: 지금 쓸 수 있는 모델 목록에 없습니다");
+		expect(md).not.toContain("b/r: 지금");
+	});
+
+	test("a config written underneath during the dialog blocks the save", async () => {
+		const g = fakeHost({
+			config: null,
+			answers: [
+				() => {
+					g.setConfig(base);
+					return "승인";
+				},
+			],
+		});
+		expect((await run(g, params())).outcome).toBe("rejected");
+		expect(g.saved).toEqual([]);
 	});
 });

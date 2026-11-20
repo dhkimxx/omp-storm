@@ -8,7 +8,7 @@ function isRec(value: unknown): value is Rec {
 
 /**
  * Parses `omp config list --json`: a flat map of dotted keys to `{ value?, type, description }`.
- * Only model preferences, magic-keyword toggles, the subagent idle TTL and cache retention are read; other keys (auth.* included) are ignored.
+ * Only model preferences, magic-keyword toggles, subagent lifecycle/concurrency/isolation, retry fallback and cache retention are read; other keys (auth.* included) are ignored.
  */
 export function parseConfigList(text: string): ExplicitSettings {
 	const settings: ExplicitSettings = { modelRoles: {}, agentModelOverrides: {} };
@@ -54,6 +54,24 @@ export function parseConfigList(text: string): ExplicitSettings {
 	if (typeof idleTtl === "number" && Number.isFinite(idleTtl) && idleTtl >= 0) settings.agentIdleTtlMs = idleTtl;
 	const retention = valueOf("providers.cacheRetention");
 	if (typeof retention === "string" && retention) settings.cacheRetention = retention;
+	const isolation = valueOf("task.isolation.enabled");
+	if (typeof isolation === "boolean") settings.isolationEnabled = isolation;
+	const concurrency = valueOf("task.maxConcurrency");
+	if (typeof concurrency === "number" && Number.isFinite(concurrency) && concurrency > 0) settings.maxConcurrency = concurrency;
+	const badge = valueOf("task.showResolvedModelBadge");
+	if (typeof badge === "boolean") settings.showResolvedModelBadge = badge;
+	const modelFallback = valueOf("retry.modelFallback");
+	if (typeof modelFallback === "boolean") settings.modelFallback = modelFallback;
+	// An entry counts only when it is a list of non-empty selectors; others are dropped whole.
+	const chains = valueOf("retry.fallbackChains");
+	if (isRec(chains)) {
+		settings.fallbackChains = {};
+		for (const [key, chain] of Object.entries(chains)) {
+			if (!Array.isArray(chain)) continue;
+			const list = chain.filter((s): s is string => typeof s === "string" && s.length > 0);
+			if (list.length === chain.length) settings.fallbackChains[key] = list;
+		}
+	}
 	return settings;
 }
 

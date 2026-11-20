@@ -148,7 +148,7 @@ export function buildHandoff(input: {
 		"- model 을 넘기지 않습니다. 스폰할 때 Storm 이 승인된 모델을 고릅니다.",
 		`- 서브에이전트는 한 번에 최대 ${config.parallelism}개까지 띄웁니다.`,
 		config.isolation === "isolated"
-			? "- 격리: 서브에이전트를 isolated 로 띄워 각자 격리된 작업 공간에서 일하게 합니다."
+			? "- 격리: task 도구의 작업 항목마다 `isolated: true` 를 넣어 각자 격리된 작업 공간에서 일하게 합니다. omp 설정 `task.isolation.enabled` 가 켜져 있어야 적용됩니다."
 			: "- 격리 없음: 서브에이전트가 같은 작업 트리를 함께 씁니다. 같은 파일을 동시에 고치지 않도록 범위를 나눕니다.",
 	];
 	if (config.budget) rules.push(`- 이 실행 예산 ${formatUsd(config.budget.perRunUsd)}: 넘으면 새 스폰이 막힙니다.`);

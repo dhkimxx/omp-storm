@@ -1,14 +1,15 @@
 /**
  * The `storm` tool: what `/storm <natural language>` resolves to. Reads answer directly; every
  * config change is a proposal the user approves in a dialog (exact label "승인") or defers.
- * Config and approvals are written only through `host.approveAndSave`.
+ * `propose` answers a `<storm-setup>` request with a whole team. Config and approvals are written
+ * only through `host.approveAndSave`.
  */
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { configHash } from "../config/canonical.ts";
 import { validateConfig } from "../config/schema.ts";
 import { buildEvidence } from "../evidence.ts";
-import { renderShadows, renderStatus, roleTitle } from "../interview/render.ts";
+import { priorityLabel, renderStatus, roleTitle } from "../interview/render.ts";
 import { deriveScope } from "../interview/setup.ts";
 import {
 	type Built,
@@ -59,7 +60,7 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "agents"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "agents", "propose"] as const satisfies readonly StormToolAction[];
 const QUOTA_MARK_MS = 5 * 3_600_000;
 const NO_CONFIG = "Storm 설정이 없습니다(또는 오류). /storm 으로 먼저 팀을 설정하세요.";
 
@@ -75,7 +76,9 @@ Actions:
 - budget {budgetUsd, warnAtUsd?, onExceed?}: per-run spend limit; 0 removes it.
 - run {task}: the user wants work done by the Storm team. Call it, then end your reply at once; never do the task yourself in the same turn. Storm starts the run with the approved team contract right after.
 - agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Before giving new work to a subagent, check for a reusable one: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent via \`write agent://<id>\` (or the eval handle's .send()) instead of a new spawn.
-priority, workers, reselect, trial, budget (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned.`;
+- propose {config, rationale}: only to answer a <storm-setup> request, after interviewing the user with the ask tool. config is the whole team (same shape as <storm-recommended-config>), rationale explains it in Korean. The user approves or cancels it in Storm's dialog.
+priority, workers, reselect, trial, budget (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned and never claim a change was saved unless the result says so.
+Setting the team up (again), rolling back to an earlier approval and resetting Storm are not actions: tell the user to type /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
@@ -92,6 +95,8 @@ function stormParams(z: Zod): StormToolSchema {
 		warnAtUsd: z.number().optional().describe("budget: warn at this run spend (below budgetUsd)"),
 		onExceed: z.enum(["block-spawns", "stop"]).optional().describe("budget: what happens past the limit"),
 		task: z.string().optional().describe("run: the user's task request, verbatim"),
+		config: z.record(z.string(), z.unknown()).optional().describe("propose: the whole team as a Storm config object"),
+		rationale: z.string().optional().describe("propose: why this team, in Korean"),
 	});
 }
 
@@ -123,6 +128,13 @@ interface Current {
 	hash: string;
 }
 
+/** What a proposal is built on: the current config, or none for a first setup (or over an invalid file). */
+interface Base {
+	state: ProjectState;
+	config: StormConfig | undefined;
+	hash: string | null;
+}
+
 async function loadCurrent(host: StormToolHost): Promise<Current | StormToolReply> {
 	const state = await host.loadState();
 	if (state.config.status !== "ok") return rejected(NO_CONFIG);
@@ -141,16 +153,20 @@ function sameShadows(a: ProjectState["shadows"], b: ProjectState["shadows"]): bo
 /** Validates, shows and asks; writes only on the exact approval label and only if nothing moved underneath. */
 async function propose(
 	host: StormToolHost,
-	cur: Current,
+	cur: Base,
 	kind: ProposalKind,
 	built: Built,
 	evidence?: EvidenceRecord,
+	warnings: string[] = [],
 ): Promise<StormToolReply> {
 	if ("error" in built) return rejected(built.error);
 	const next = built.config;
 	const checked = validateConfig(next);
 	if (!checked.config) return rejected(`제안한 설정이 올바르지 않습니다: ${checked.errors.join("; ")}`);
-	if (configHash(next) === cur.hash) return { outcome: "ok", text: "이미 그 설정입니다. 바꿀 것이 없습니다." };
+	// A setup proposal of the current but unapproved config still needs the dialog: approving it is the change.
+	if (configHash(next) === cur.hash && (kind !== "setup" || cur.state.approval)) {
+		return { outcome: "ok", text: "이미 그 설정입니다. 바꿀 것이 없습니다." };
+	}
 	const now = host.now();
 	const proposal: Proposal = {
 		schema: "storm.proposal/v1",
@@ -158,25 +174,53 @@ async function propose(
 		kind,
 		createdAt: new Date(now).toISOString(),
 		summary: built.summary,
-		baseHash: cur.hash,
+		baseHash: cur.hash ?? "",
 		config: next,
 	};
 	if (evidence) proposal.evidence = evidence;
 
-	// Approval covers the shadowing definitions too, so the user has to see them first.
-	if (cur.state.shadows.length) host.ui.report("Storm 가림 정의", renderShadows(cur.state.shadows).trim());
-	const answer = await presentProposal(host.ui, proposal, cur.config);
+	const answer = await presentProposal(host.ui, proposal, cur.config, { shadows: cur.state.shadows, warnings: [...checked.warnings, ...warnings] });
 	if (answer === "cancelled") return { outcome: "cancelled", text: "바꾸지 않았습니다." };
 	if (answer === "deferred") {
 		await host.proposals.save(proposal);
 		return { outcome: "deferred", text: `${built.summary}\n보류했습니다. /storm 메뉴에서 승인할 수 있습니다.` };
 	}
 	const fresh = await host.loadState();
-	if (fresh.config.status !== "ok" || fresh.config.hash !== cur.hash || !sameShadows(fresh.shadows, cur.state.shadows)) {
+	const freshHash = fresh.config.status === "ok" ? fresh.config.hash : null;
+	if (freshHash !== cur.hash || !sameShadows(fresh.shadows, cur.state.shadows)) {
 		return rejected("승인하는 사이 설정이나 가림 정의가 바뀌어 적용하지 않았습니다. 다시 요청하세요.");
 	}
 	const hash = await host.approveAndSave(fresh, next, deriveScope(next, fresh.shadows), evidence);
 	return { outcome: "approved", text: `${built.summary}\n승인하고 저장했습니다(${shortHash(hash)}).` };
+}
+
+/** A whole team from a `<storm-setup>` interview; works without a current config. */
+async function proposeSetup(host: StormToolHost, params: StormToolInput): Promise<StormToolReply> {
+	if (params.config === undefined) return rejected("config가 필요합니다. <storm-setup> 요청에 답할 때만 propose를 쓰세요.");
+	const checked = validateConfig(params.config);
+	if (!checked.config) return rejected(`설정이 올바르지 않습니다. 고쳐서 다시 제안하세요: ${checked.errors.join("; ")}`);
+	const config = checked.config;
+	const state = await host.loadState();
+	const ok = state.config.status === "ok" ? state.config : undefined;
+	const ctx = await host.prepare();
+	const available = new Set(ctx.available.map((m) => m.selector));
+	const used = [...Object.values(config.roles).flatMap((r) => r.models), ...(config.trials ?? []).map((t) => t.model)];
+	const unknown = [...new Set(used.map((m) => parseModelEntry(m).selector))].filter((s) => !available.has(s));
+	const warnings = unknown.map((s) => `${s}: 지금 쓸 수 있는 모델 목록에 없습니다. 이 모델로는 실행되지 않을 수 있습니다.`);
+	const evidence = buildEvidence({
+		source: "setup",
+		priority: config.priority,
+		dataAsOf: ctx.usage.dataAsOf,
+		recommendations: ctx.recommend(config.priority),
+		config,
+		now: host.now(),
+	});
+	const rationale = params.rationale?.trim();
+	if (rationale) evidence.rationale = rationale;
+	const summary = `Storm 팀 ${ok ? "재설정" : "설정"} 제안 (${priorityLabel(config.priority)})`;
+	const reply = await propose(host, { state, config: ok?.config, hash: ok?.hash ?? null }, "setup", { config, summary }, evidence, warnings);
+	if (reply.outcome === "cancelled") return { outcome: "cancelled", text: "저장하지 않았습니다. 바뀐 것은 없습니다." };
+	return reply;
 }
 
 export async function runStormTool(host: StormToolHost, params: StormToolInput): Promise<StormToolReply> {
@@ -240,6 +284,8 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 					"응답이 끝나면 Storm이 승인된 팀 계약으로 실행을 시작합니다.",
 			};
 		}
+		case "propose":
+			return proposeSetup(host, params);
 		default:
 			return write(host, params);
 	}

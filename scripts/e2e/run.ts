@@ -23,6 +23,7 @@ interface LlmEntry {
 	child: boolean;
 	notices: { workflowz: string[]; orchestrate: string[] };
 	users: string[];
+	decision?: { tool?: string; args?: { action?: string } };
 }
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -72,10 +73,12 @@ const MODELS = {
 		["general-e", { input: 1.5, output: 8, cacheRead: 0.15, cacheWrite: 2 }],
 	],
 } as const;
+/** A provider whose only model always answers 429 (fake-llm.ts); added only for the fallback step, so it never enters the team. */
+const QUOTA_OUT = { fake3: [["quota-out", { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 }]] } as const;
 
-function modelsYml(): string {
+function modelsYml(withQuotaOut = false): string {
 	const lines = ["providers:"];
-	for (const [provider, models] of Object.entries(MODELS)) {
+	for (const [provider, models] of Object.entries(withQuotaOut ? { ...MODELS, ...QUOTA_OUT } : MODELS)) {
 		lines.push(`  ${provider}:`, `    baseUrl: http://127.0.0.1:${PORT}/v1`, "    apiKey: storm-e2e-dummy", "    api: openai-completions", "    models:");
 		for (const [id, cost] of models) {
 			lines.push(`      - id: ${id}`, "        contextWindow: 200000", "        maxTokens: 8192");
@@ -84,6 +87,10 @@ function modelsYml(): string {
 	}
 	return `${lines.join("\n")}\n`;
 }
+
+const PROFILE_CONFIG = "setupVersion: 3\n";
+/** No same-model retries, so omp walks the chain at once. */
+const FALLBACK_CONFIG = `${PROFILE_CONFIG}retry:\n  maxRetries: 0\n  modelFallback: true\n  fallbackOn: any\n  fallbackChains:\n    fake3/quota-out:\n      - fake/general-b\n`;
 
 const readLlm = (): LlmEntry[] =>
 	existsSync(LLM_LOG) ? readFileSync(LLM_LOG, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as LlmEntry) : [];
@@ -272,14 +279,6 @@ function approvalFiles(): string[] {
 	});
 }
 
-const setupAnswers: Answer = request => {
-	const options = (request.options as string[] | undefined) ?? [];
-	if (options.includes("계속")) return "계속";
-	if (String(request.title).startsWith("최적화 우선순위")) return "균형";
-	if (options.includes("전체 수락")) return "전체 수락";
-	if (options.includes("승인 후 저장")) return "승인 후 저장";
-	return undefined;
-};
 const approveAnswers: Answer = request => {
 	const options = (request.options as string[] | undefined) ?? [];
 	return options.includes("승인") ? "승인" : undefined;
@@ -291,7 +290,7 @@ async function main(): Promise<void> {
 	mkdirSync(PROJECT, { recursive: true });
 	mkdirSync(AGENT_DIR, { recursive: true });
 	writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml());
-	writeFileSync(join(AGENT_DIR, "config.yml"), "setupVersion: 3\n");
+	writeFileSync(join(AGENT_DIR, "config.yml"), PROFILE_CONFIG);
 	Bun.spawnSync(["git", "init", "-q", PROJECT]);
 	const server = Bun.spawn([BUN, join(import.meta.dir, "fake-llm.ts")], {
 		env: { ...process.env, FAKE_LLM_PORT: String(PORT), FAKE_LLM_LOG: LLM_LOG },
@@ -310,12 +309,18 @@ async function main(): Promise<void> {
 			`main=${run.main.length}`,
 		);
 
-		let frames = await command("/storm", setupAnswers);
+		// Setup is led by the session LLM: the fake model proposes Storm's recommendation, and only "승인" in Storm's dialog saves it.
+		const setup = await converse("/storm", approveAnswers);
+		let frames = setup.frames;
 		const config = existsSync(CONFIG) ? (JSON.parse(readFileSync(CONFIG, "utf8")) as { roles: Record<string, { models: string[]; effort?: string }> }) : undefined;
+		check(
+			"setup: 세션 LLM이 팀 제안(propose)",
+			setup.llm.some(entry => !entry.child && entry.decision?.tool === "storm" && entry.decision.args?.action === "propose"),
+		);
+		check("setup: 팀 제안 승인 창", uiTitled(frames, "이 변경을 승인할까요") && frames.some(frame => textOf(frame).includes("Storm 팀 제안")));
 		check("setup: 설정 저장", config !== undefined);
 		check("setup: 승인 기록", approvalFiles().length === 1, `approvals=${approvalFiles().length}`);
 		check("setup: .gitignore", existsSync(join(PROJECT, ".omp", "storm", ".gitignore")));
-		check("setup: 현황 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
 		const implementer = config?.roles.implementer;
 		const primaryEntry = implementer?.models[0] === undefined ? undefined : parseModelEntry(implementer.models[0]);
 		const expectedModel = primaryEntry?.selector.split("/").slice(1).join("/");
@@ -376,14 +381,21 @@ async function main(): Promise<void> {
 		check("print 모드: 모델 호출 없음", readLlm().length === llmBefore);
 
 		frames = await command("/storm", noAnswer);
-		check("허브: 현황 보고", frames.some(frame => textOf(frame).includes("Storm 현황")));
-		check("허브: Storm 버전", frames.some(frame => textOf(frame).includes(`- Storm ${STORM_VERSION}`)));
-		check("허브: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
+		check(
+			"허브: 메뉴와 함께 짧은 현황",
+			frames.some(frame => textOf(frame).includes("Storm 현황") && textOf(frame).includes(`- Storm ${STORM_VERSION}`) && textOf(frame).includes("/storm status")),
+		);
 		const menu = frames.find(frame => frame.type === "extension_ui_request" && frame.title === "Storm 메뉴")?.options as string[] | undefined;
 		check(
-			"허브: 현황 뒤 메뉴(있는 것만)",
+			"허브: 해당하는 메뉴만",
 			JSON.stringify(menu) === JSON.stringify(["팀 다시 설정", "모델 점검", "이전 설정으로 되돌리기", "초기화", "닫기"]),
 			JSON.stringify(menu),
+		);
+		frames = await command("/storm status", noAnswer);
+		check("현황: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
+		check(
+			"현황: omp 설정 점검(복사용 명령)",
+			frames.some(frame => textOf(frame).includes("### omp 설정 점검") && textOf(frame).includes("omp config set")),
 		);
 
 		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
@@ -487,7 +499,7 @@ async function main(): Promise<void> {
 		);
 		check(
 			"감독 모드: 실행 기록에 메인 비용",
-			(directorRun?.mainCostUsd ?? 0) > 0 && talk.frames.some(frame => textOf(frame).includes("메인(감독) 비용")),
+			(directorRun?.mainCostUsd ?? 0) > 0 && talk.frames.some(frame => textOf(frame).includes("메인(감독): 비용")),
 			`main=${directorRun?.mainCostUsd}`,
 		);
 		await converse("SPIKE-WRITE director-check.txt", noAnswer);
@@ -531,6 +543,26 @@ async function main(): Promise<void> {
 			check("쿼터 대응: 다른 Provider 폴백으로", run.children[0]?.model === idOf(fallback), `child=${run.children[0]?.model} expected=${idOf(fallback)}`);
 			rmSync(join(stateDir, "quota-marks.json"), { force: true });
 		} else console.log(`SKIP 쿼터 대응: 구현 역할의 폴백이 다른 Provider에 없음 (${implementerModels.join(", ")})`);
+
+		// omp itself leaves a model after provider errors: Storm marks that provider (source "fallback") and says so, with no approval.
+		hash = configHashOnDisk();
+		writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml(true));
+		writeFileSync(join(AGENT_DIR, "config.yml"), FALLBACK_CONFIG);
+		try {
+			talk = await converse("hello", noAnswer, { model: "fake3/quota-out" });
+		} finally {
+			writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml());
+			writeFileSync(join(AGENT_DIR, "config.yml"), PROFILE_CONFIG);
+		}
+		const marksFile = join(stateDir, "quota-marks.json");
+		const marks = existsSync(marksFile) ? (JSON.parse(readFileSync(marksFile, "utf8")) as { marks: Array<{ provider: string; source: string }> }).marks : [];
+		check(
+			"자동 쿼터 표시: omp 폴백이면 Provider 표시(승인 없이)",
+			marks.some(mark => mark.provider === "fake3" && mark.source === "fallback") && configHashOnDisk() === hash,
+			JSON.stringify(marks),
+		);
+		check("자동 쿼터 표시: 알림", talk.frames.some(frame => textOf(frame).includes("fake3 를 5시간 동안 쿼터 소진으로 표시")));
+		rmSync(marksFile, { force: true });
 
 		primary = team.roles.implementer?.models[0];
 		const candidate = ["fake/general-b", "fake2/general-e", "fake/cheap-a"].find(model => model !== bare(primary)) ?? "fake/general-b";

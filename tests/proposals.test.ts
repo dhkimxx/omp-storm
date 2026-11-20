@@ -6,7 +6,7 @@ import { buildBudget, buildQuota, buildTrial, buildWorkers, newProposalId, quota
 import { presentProposal, renderProposal } from "../src/proposals/present.ts";
 import { createProposalStore } from "../src/proposals/store.ts";
 import { ROLES } from "../src/roles.ts";
-import type { Candidate, Effort, EvidenceRecord, Proposal, StormConfig, UiPort, UiSelectItem } from "../src/types.ts";
+import type { Candidate, Effort, EvidenceRecord, Proposal, ShadowInfo, StormConfig, UiContext, UiPort, UiSelectItem } from "../src/types.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
 
@@ -30,10 +30,10 @@ function proposal(id: string, baseHash: string, createdAt: string, config: Storm
 
 function fakeUi(answer: string | undefined) {
 	const reports: Array<{ title: string; md: string }> = [];
-	const selects: Array<{ title: string; options: string[] }> = [];
+	const selects: Array<{ title: string; options: string[]; context?: UiContext }> = [];
 	const ui: UiPort = {
-		async select(title: string, options: UiSelectItem[]) {
-			selects.push({ title, options: options.map((o) => (typeof o === "string" ? o : o.label)) });
+		async select(title: string, options: UiSelectItem[], context?: UiContext) {
+			selects.push({ title, options: options.map((o) => (typeof o === "string" ? o : o.label)), ...(context ? { context } : {}) });
 			return answer;
 		},
 		async confirm() {
@@ -43,7 +43,10 @@ function fakeUi(answer: string | undefined) {
 			return undefined;
 		},
 		notify() {},
-		report(title: string, md: string) {
+		async report(title: string, md: string) {
+			reports.push({ title, md });
+		},
+		record(title: string, md: string) {
 			reports.push({ title, md });
 		},
 	};
@@ -122,7 +125,7 @@ describe("presentProposal", () => {
 		expect(md).not.toContain("리뷰 근거");
 	});
 
-	test("only the exact approval label approves", async () => {
+	test("only the exact approval label approves; the proposal is the select's context", async () => {
 		const cases: Array<[string | undefined, "approved" | "deferred" | "cancelled"]> = [
 			["승인", "approved"],
 			["취소", "cancelled"],
@@ -134,8 +137,35 @@ describe("presentProposal", () => {
 		for (const [answer, outcome] of cases) {
 			const f = fakeUi(answer);
 			expect(await presentProposal(f.ui, p, base)).toBe(outcome);
-			expect(f.reports[0]?.title).toBe("Storm 변경 제안");
-			expect(f.selects[0]).toEqual({ title: "이 변경을 승인할까요?", options: ["승인", "나중에", "취소"] });
+			expect(f.reports).toEqual([]);
+			expect(f.selects).toEqual([
+				{ title: "이 변경을 승인할까요?", options: ["승인", "나중에", "취소"], context: { title: "Storm 변경 제안", markdown: renderProposal(p, base) } },
+			]);
+		}
+	});
+
+	test("shadows and warnings join the context", async () => {
+		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.omp/agents/storm-reviewer.md", scope: "project", sha256: "ab" };
+		const f = fakeUi("승인");
+		await presentProposal(f.ui, p, base, { shadows: [shadow], warnings: ["z/z: 지금 쓸 수 있는 모델 목록에 없습니다"] });
+		const md = f.selects[0]!.context!.markdown;
+		expect(md).toContain("### 경고\n- z/z: 지금 쓸 수 있는 모델 목록에 없습니다");
+		expect(md).toContain("### 경고: 가림 정의");
+		expect(md).toContain(shadow.path);
+	});
+
+	test("a setup proposal shows the whole team and the rationale, and offers no deferral", async () => {
+		const setup: Proposal = { ...p, kind: "setup", summary: "Storm 팀 설정 제안", evidence: { ...evidence, source: "setup", rationale: "빠른 탐색, 꼼꼼한 리뷰" } };
+		const md = renderProposal(setup, undefined);
+		expect(md).toContain("### 팀 구성\n새 설정");
+		expect(md).toContain("- explorer 모델: a/x");
+		expect(md).toContain("### 근거\n빠른 탐색, 꼼꼼한 리뷰");
+		// Without a current config every role counts as changed.
+		expect(md).toContain("리뷰 근거");
+		for (const [answer, outcome] of [["승인", "approved"], ["나중에", "cancelled"], [undefined, "cancelled"]] as const) {
+			const f = fakeUi(answer);
+			expect(await presentProposal(f.ui, setup, undefined)).toBe(outcome);
+			expect(f.selects[0]).toMatchObject({ options: ["승인", "취소"], context: { title: "Storm 팀 제안" } });
 		}
 	});
 });

@@ -8,33 +8,34 @@ import { configHash, sha256Hex } from "./config/canonical.ts";
 import { configPath, serializeConfig, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
-import { buildEvidence } from "./evidence.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
-import { renderStatus } from "./interview/render.ts";
+import { renderStatus, renderStatusBrief, renderTrial } from "./interview/render.ts";
 import { runReview, runRollback } from "./interview/review.ts";
-import { deriveScope, runSetupInterview } from "./interview/setup.ts";
+import { deriveScope } from "./interview/setup.ts";
 import { newProposalId } from "./proposals/build.ts";
 import { presentProposal } from "./proposals/present.ts";
 import { createProposalStore } from "./proposals/store.ts";
 import { adviseRows, agentsReport } from "./report/agents.ts";
 import { renderModelCheck } from "./report/models.ts";
+import { ompSettingsAdvice } from "./report/omp-settings.ts";
 import { ROLES } from "./roles.ts";
 import { activeLedgerRun } from "./runtime/ledger.ts";
 import { lastRun, runsDir, stateDir } from "./runtime/run.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
+import { buildSetupRequest } from "./setup/request.ts";
 import { entryEffort, formatModelEntry, parseModelEntry } from "./selector.ts";
 import { loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type {
 	AgentEntry,
 	EvidenceRecord,
-	InterviewInput,
+	ExplicitSettings,
 	LifecycleSettings,
 	ModelCost,
-	Priority,
 	Proposal,
 	RollbackOption,
 	RunRecord,
+	StatusView,
 	StormConfig,
 	TrialView,
 	UiPort,
@@ -52,12 +53,21 @@ export interface FlowEnv extends ProjectEnv {
 	activeRun?: () => RunRecord | undefined;
 	/** Subagents under this session, for status. */
 	agents?: () => AgentEntry[];
-	/** omp's idle-park TTL and cache retention, for status. */
-	lifecycleSettings?: () => Promise<LifecycleSettings>;
+	/** omp settings as configured (subagent lifecycle, concurrency, fallbacks, isolation); fields are undefined when unreadable. */
+	ompSettings?: () => Promise<ExplicitSettings>;
 	modelCost?: (selector: string) => ModelCost | undefined;
+	/** A newer Storm installed on disk than the one this process runs. */
+	newerVersion?: () => string | undefined;
+	/** Hands a setup request to the session LLM, which interviews the user and proposes the team through the storm tool. */
+	requestSetup?: (message: string) => Promise<void>;
 }
 
-const DEFAULTS: InterviewInput["defaults"] = { parallelism: 4, isolation: "shared", contract: "workflowz" };
+function lifecycleOf(settings: ExplicitSettings): LifecycleSettings {
+	return {
+		...(settings.agentIdleTtlMs !== undefined ? { agentIdleTtlMs: settings.agentIdleTtlMs } : {}),
+		...(settings.cacheRetention !== undefined ? { cacheRetention: settings.cacheRetention } : {}),
+	};
+}
 
 function shortHash(hash: string): string {
 	return hash.replace(/^jcs-sha256:/, "").slice(0, 12);
@@ -92,97 +102,95 @@ function proposalStore(state: ProjectState) {
 	return createProposalStore(state.repo.root, async () => hash);
 }
 
+/**
+ * Setup and re-setup are led by the session LLM: Storm hands it the facts (catalog, usage, candidates and its own
+ * recommendation), the LLM interviews the user and proposes the team through the storm tool, and only the exact
+ * "승인" in Storm's approval dialog saves it.
+ */
 export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+	if (!env.requestSetup) {
+		ui.notify("이 세션에서는 팀 설정을 시작할 수 없습니다.", "warning");
+		return;
+	}
 	const state = await loadProjectState(env);
 	const ctx = await prepareAnalysis(env, ui);
 	const current =
 		state.config.status === "ok"
 			? { config: state.config.config, hash: state.config.hash, approved: state.approval !== undefined }
 			: undefined;
-	const priority: Priority = current?.config.priority ?? "balanced";
-	const detectionWarnings: string[] = [];
-	if (state.config.status === "invalid") detectionWarnings.push(`지금 설정 파일에 오류가 있어 새로 만듭니다: ${state.config.errors[0] ?? ""}`);
-	const result = await runSetupInterview(ui, {
-		detection: ctx.detection(env.activeTools, detectionWarnings),
-		analysis: ctx.analysis,
-		recommendations: ctx.recommend(priority),
-		...(current ? { current } : {}),
-		shadows: state.shadows,
-		rerecommend: ctx.recommend,
-		checkModel: ctx.checkModel,
-		defaults: current
-			? { parallelism: current.config.parallelism, isolation: current.config.isolation, contract: current.config.contract }
-			: DEFAULTS,
-		priority,
-	});
-	if (result.status !== "approved") {
-		ui.notify("저장하지 않았습니다. 바뀐 것은 없습니다.");
-		return;
-	}
-	const evidence = buildEvidence({
-		source: "setup",
-		priority: result.config.priority,
-		dataAsOf: ctx.usage.dataAsOf,
-		recommendations: ctx.recommend(result.config.priority),
-		config: result.config,
-		now: env.now(),
-	});
-	const hash = await approveAndSave(env, state, result.config, result.scope, evidence);
-	ui.notify(`Storm 팀을 승인하고 저장했습니다(${shortHash(hash)}).`);
-	await statusFlow(env, ui);
+	const warnings =
+		state.config.status === "invalid" ? [`지금 설정 파일에 오류가 있어 새로 만듭니다: ${state.config.errors[0] ?? ""}`] : [];
+	await env.requestSetup(
+		buildSetupRequest({
+			ctx,
+			priority: current?.config.priority ?? "balanced",
+			...(current ? { current } : {}),
+			shadows: state.shadows,
+			activeTools: env.activeTools,
+			warnings,
+		}),
+	);
+	ui.notify("세션 모델이 팀 구성을 인터뷰합니다. 마지막에 승인 창에서 확정해야 저장됩니다.");
 }
 
-export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+/** The status view: in full for `/storm status`, in brief for the panel above the menu. */
+async function buildStatus(env: FlowEnv): Promise<{ state: ProjectState; markdown: string; brief: string; trials: TrialView[] }> {
 	const state = await loadProjectState(env);
 	const now = env.now();
 	const root = state.repo.root;
 	const config = state.config.status === "ok" ? state.config.config : undefined;
-	const [quota, quotaMarks, last, trials, pending, lifecycle] = await Promise.all([
+	const [quota, quotaMarks, last, trials, pending, settings] = await Promise.all([
 		readQuota(env.exec, env.ompBin, now),
 		readQuotaMarks(root, now),
 		lastRun(root),
 		config ? trialViews(root, config, now) : Promise.resolve([]),
 		config ? proposalStore(state).list() : Promise.resolve([]),
-		env.lifecycleSettings?.(),
+		env.ompSettings?.(),
 	]);
 	const usage = readUsage({ dbPath: statsDbPath(), windowDays: 1, now });
 	const run = env.activeRun?.();
+	const lifecycle = settings ? lifecycleOf(settings) : undefined;
 	const entries = env.agents?.() ?? [];
 	const agents = entries.length
 		? adviseRows(entries, { now, settings: lifecycle ?? {}, ...(env.modelCost ? { cost: env.modelCost } : {}) })
 		: [];
-	ui.report(
-		"Storm 현황",
-		renderStatus(
-			{
-				repo: state.repo,
-				config: state.config,
-				approval: state.approval,
-				shadows: state.shadows,
-				quota,
-				dataAsOf: usage.dataAsOf,
-				...(run ? { run } : {}),
-				...(last ? { lastRun: last } : {}),
-				...(trials.length ? { trials } : {}),
-				...(quotaMarks.length ? { quotaMarks } : {}),
-				...(pending.length ? { pending } : {}),
-				...(agents.length ? { agents } : {}),
-				...(lifecycle ? { lifecycle } : {}),
-			},
-			now,
-		),
-	);
-	if (config && state.approval) await offerTrialDecisions(env, ui, state, config, trials);
+	const ompAdvice = config && settings ? ompSettingsAdvice(config, settings) : [];
+	const newerVersion = env.newerVersion?.();
+	const view: StatusView = {
+		repo: state.repo,
+		config: state.config,
+		approval: state.approval,
+		shadows: state.shadows,
+		quota,
+		dataAsOf: usage.dataAsOf,
+		...(run ? { run } : {}),
+		...(last ? { lastRun: last } : {}),
+		...(trials.length ? { trials } : {}),
+		...(quotaMarks.length ? { quotaMarks } : {}),
+		...(pending.length ? { pending } : {}),
+		...(agents.length ? { agents } : {}),
+		...(lifecycle ? { lifecycle } : {}),
+		...(ompAdvice.length ? { ompAdvice } : {}),
+		...(newerVersion ? { newerVersion } : {}),
+	};
+	return { state, markdown: renderStatus(view, now), brief: renderStatusBrief(view, now), trials };
+}
+
+/** `/storm status`: the status to read and close, then any ended trial to decide. */
+export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+	const { state, markdown, trials } = await buildStatus(env);
+	await ui.report("Storm 현황", markdown);
+	if (state.config.status === "ok" && state.approval) await offerTrialDecisions(env, ui, state, state.config.config, trials);
 }
 
 /** Read-only model check without the LLM: newer, better or cheaper models than the team's current ones. */
 export async function modelsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
 	const ctx = await prepareAnalysis(env, ui);
-	ui.report("Storm 모델 점검", renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined));
+	await ui.report("Storm 모델 점검", renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined));
 }
 
-/** Ended trials: show is done by the status report; here the user decides to adopt the candidate or keep the current model. */
+/** Ended trials: the measured comparison stays in view while the user adopts the candidate or keeps the current model. */
 async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState, config: StormConfig, trials: TrialView[]): Promise<void> {
 	for (const view of trials) {
 		if (view.phase !== "ended") continue;
@@ -190,7 +198,10 @@ async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState
 		const role = config.roles[trial.role];
 		if (!role) continue;
 		const title = ROLES.find(spec => spec.id === trial.role)?.title ?? trial.role;
-		const choice = await ui.select(`시험 사용이 끝났습니다: ${title} 역할의 ${trial.model}`, ["후보로 바꾸기", "지금 모델 유지", "나중에"]);
+		const choice = await ui.select(`시험 사용이 끝났습니다: ${title} 역할의 ${trial.model}`, ["후보로 바꾸기", "지금 모델 유지", "나중에"], {
+			title: "시험 사용 결과",
+			markdown: renderTrial(view),
+		});
 		if (choice !== "후보로 바꾸기" && choice !== "지금 모델 유지") return;
 		const adopt = choice === "후보로 바꾸기";
 		// The adopted model carries its own effort, so the role default and the other entries keep theirs.
@@ -226,7 +237,7 @@ async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: ProjectState
 /** Shows a proposal and applies it only on the exact approval label; a deferral is kept for the /storm menu. */
 async function decideProposal(env: FlowEnv, ui: UiPort, state: ProjectState, current: StormConfig, proposal: Proposal): Promise<void> {
 	const store = proposalStore(state);
-	const decision = await presentProposal(ui, proposal, current);
+	const decision = await presentProposal(ui, proposal, current, { shadows: state.shadows });
 	if (decision === "approved") {
 		const hash = await approveAndSave(env, state, proposal.config, deriveScope(proposal.config, state.shadows), proposal.evidence);
 		await store.remove(proposal.id);
@@ -254,7 +265,7 @@ export async function reviewFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		return;
 	}
 	if (state.config.status === "invalid") {
-		ui.report("Storm 설정 오류", state.config.errors.map(error => `- ${error}`).join("\n"));
+		await ui.report("Storm 설정 오류", state.config.errors.map(error => `- ${error}`).join("\n"));
 		ui.notify("설정 파일을 고치거나 /storm 으로 다시 만드세요.", "warning");
 		return;
 	}
@@ -328,13 +339,13 @@ export async function rollbackFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 
 /** Subagents of this session with reuse advice, plus lifecycle warnings for the team's providers. */
 async function agentsFlow(env: FlowEnv, ui: UiPort, state: ProjectState): Promise<void> {
-	const settings = (await env.lifecycleSettings?.()) ?? {};
+	const settings = await env.ompSettings?.();
 	const config = state.config.status === "ok" ? state.config.config : undefined;
-	ui.report(
+	await ui.report(
 		"서브에이전트 재사용 권장",
 		agentsReport(env.agents?.() ?? [], {
 			now: env.now(),
-			settings,
+			settings: settings ? lifecycleOf(settings) : {},
 			...(env.modelCost ? { cost: env.modelCost } : {}),
 			...(config ? { config } : {}),
 		}),
@@ -353,7 +364,7 @@ const MENU = {
 
 /**
  * Bare `/storm`: sets up a project without a valid config, asks for approval while something is unapproved,
- * and otherwise shows the status and a menu of everything else. Returns true when the user reset Storm.
+ * and otherwise opens the menu with the status in view. Returns true when the user reset Storm.
  */
 export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const before = await loadProjectState(env);
@@ -365,8 +376,9 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		await reviewFlow(env, ui);
 		return false;
 	}
-	await statusFlow(env, ui);
-	// A trial decision in the status flow may have changed the config.
+	const status = await buildStatus(env);
+	await offerTrialDecisions(env, ui, status.state, before.config.config, status.trials);
+	// A trial decision may have changed the config.
 	const state = await loadProjectState(env);
 	const [pending, rollbacks] = await Promise.all([proposalStore(state).list(), rollbackOptions(state)]);
 	const pendingLabel = `${MENU.pending} (${pending.length}건)`;
@@ -376,7 +388,7 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	if ((env.agents?.() ?? []).length) options.push(MENU.agents);
 	if (rollbacks.length) options.push(MENU.rollback);
 	options.push(MENU.reset, MENU.close);
-	const choice = await ui.select("Storm 메뉴", options);
+	const choice = await ui.select("Storm 메뉴", options, { title: "Storm 현황", markdown: status.brief });
 	if (choice === pendingLabel) await reviewFlow(env, ui);
 	else if (choice === MENU.setup) await setupFlow(env, ui);
 	else if (choice === MENU.models) await modelsFlow(env, ui);
@@ -465,8 +477,12 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		lines.push(`- 주의: 마지막 실행(${last.runId})이 진행 중으로 남아 있습니다. 다른 터미널에서 실행 중이면 끝난 뒤 초기화하세요.`);
 	}
 	lines.push("", "### 그대로 두는 것", "- `.omp/`의 다른 파일, 여러 프로젝트가 함께 쓰는 사용 기록 보관본, omp 설정");
-	ui.report("Storm 초기화", lines.join("\n"));
-	if ((await ui.select("Storm 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.", ["초기화", "취소"])) !== "초기화") {
+	if (
+		(await ui.select("Storm 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.", ["초기화", "취소"], {
+			title: "Storm 초기화",
+			markdown: lines.join("\n"),
+		})) !== "초기화"
+	) {
 		ui.notify("초기화하지 않았습니다.");
 		return false;
 	}

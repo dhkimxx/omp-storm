@@ -220,7 +220,7 @@ export class RunController {
 		await this.#liveWrite;
 		await writeRun(own.root, record);
 		await pruneRuns(own.root);
-		if (ctx) this.deps.ui(ctx).report("Storm 실행 결과", summarizeRun(record));
+		if (ctx) this.deps.ui(ctx).record("Storm 실행 결과", summarizeRun(record));
 		return record;
 	}
 
@@ -253,6 +253,7 @@ export class RunController {
 	}
 }
 
+/** The run's record in the transcript: at most four lines, the one Storm output that stays there. */
 export function summarizeRun(run: RunRecord): string {
 	const counts = new Map<string, number>();
 	for (const spawn of run.spawns) counts.set(spawn.outcome, (counts.get(spawn.outcome) ?? 0) + 1);
@@ -263,21 +264,21 @@ export function summarizeRun(run: RunRecord): string {
 		substituted: "대체 역할로 교체",
 		blocked: "차단",
 	};
+	const blocked = run.spawns.find(spawn => spawn.outcome === "blocked");
 	const spawnLine = run.spawns.length
 		? [...counts].map(([outcome, n]) => `${label[outcome as SpawnRecord["outcome"]] ?? outcome} ${n}`).join(" · ")
 		: "없음";
 	const status: Record<RunStatus, string> = { running: "진행 중", done: "완료", "budget-exceeded": "예산 초과", stopped: "중단" };
 	const lines = [
-		`- 실행: ${run.runId} (${status[run.status]})`,
-		`- 비용(정가 환산): ${money(run.costUsd)}${run.budget ? ` / 예산 ${money(run.budget.perRunUsd)}` : ""}`,
-		`- 스폰: ${spawnLine}`,
+		`- 실행: ${run.runId} (${status[run.status]}) · 비용(정가 환산) ${money(run.costUsd)}${run.budget ? ` / 예산 ${money(run.budget.perRunUsd)}` : ""}`,
+		`- 스폰: ${spawnLine}${blocked?.reason ? ` · 차단 사유: ${blocked.reason}` : ""}`,
 	];
-	const blocked = run.spawns.find(spawn => spawn.outcome === "blocked");
-	if (blocked?.reason) lines.push(`- 차단 사유: ${blocked.reason}`);
+	const main: string[] = [];
 	if (run.mainCostUsd !== undefined && run.costUsd > 0) {
-		lines.push(`- 메인(감독) 비용: ${money(run.mainCostUsd)} · 전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%`);
+		main.push(`비용 ${money(run.mainCostUsd)}(전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%)`);
 	}
-	if (run.blockedEdits) lines.push(`- 메인이 직접 고치려다 위임으로 돌린 수정: ${run.blockedEdits}회`);
+	if (run.blockedEdits) main.push(`직접 수정 ${run.blockedEdits}회를 위임으로 돌림`);
+	if (main.length) lines.push(`- 메인(감독): ${main.join(" · ")}`);
 	const agents = run.agents ?? [];
 	if (agents.length) {
 		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);

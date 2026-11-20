@@ -7,6 +7,7 @@
  * each request (model id, tools, keyword notices, role markers) for the driver to inspect.
  *
  * Directives are read from user-role text that arrived after the last assistant message:
+ *   <storm-setup>           call `storm` with action "propose", the <storm-recommended-config> JSON and rationale "E2E"
  *   SPIKE-TASK <agent...>   call `task` with one item per agent
  *   SPIKE-EVAL <agent...>   call `eval` (python) that spawns each agent through agent()
  *   SPIKE-APPROVE           call the spike extension's `storm_spike_approve` tool
@@ -59,6 +60,8 @@ const NOTICES = {
 	orchestrate: "orchestration request",
 } as const;
 const STORM_AGENTS = ["storm-implementer", "storm-reviewer"];
+/** Model id that always fails with an out-of-quota 429. */
+const QUOTA_OUT = "quota-out";
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -137,7 +140,12 @@ function decide(request: ChatRequest): Decision {
 		.filter(message => message.role === "user")
 		.map(message => textOf(message.content))
 		.join("\n");
-	// Checked first: a storm-tool argument (e.g. a run's task) may itself carry a SPIKE directive.
+	// Checked first: a setup request carries candidate text that must not trigger other directives.
+	if (fresh.includes("<storm-setup>")) {
+		const config = fresh.match(/<storm-recommended-config>([\s\S]*?)<\/storm-recommended-config>/)?.[1];
+		if (config) return { kind: "tool", name: "storm", args: { action: "propose", config: JSON.parse(config) as unknown, rationale: "E2E" } };
+	}
+	// A storm-tool argument (e.g. a run's task) may itself carry a SPIKE directive.
 	const stormTool = fresh.match(/STORM-TOOL[ \t]+(\{.*\})/);
 	if (stormTool?.[1]) return { kind: "tool", name: "storm", args: JSON.parse(stormTool[1]) as Record<string, unknown> };
 	const spawn = fresh.match(/SPIKE-(TASK|EVAL)((?:[ \t]+[\w.-]+)+)/);
@@ -241,6 +249,12 @@ Bun.serve({
 		}
 		if (req.method !== "POST" || !url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
 		const request = (await req.json()) as ChatRequest;
+		// A provider out of quota: omp falls back along retry.fallbackChains and emits retry_fallback_applied.
+		if (request.model === QUOTA_OUT) {
+			record(request, { kind: "text", text: "429 insufficient_quota" });
+			const error = { message: "You exceeded your current quota, please check your plan and billing details.", type: "insufficient_quota", code: "insufficient_quota" };
+			return Response.json({ error }, { status: 429 });
+		}
 		const decision = decide(request);
 		record(request, decision);
 		return request.stream ? stream(request.model, decision) : completion(request.model, decision);

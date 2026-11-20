@@ -212,6 +212,8 @@ describe("handoff", () => {
 		const rest = lines.slice(1).join("\n");
 		expect(rest).not.toContain("workflowz");
 		expect(rest).not.toContain("orchestrate");
+		expect(text).toContain("작업 항목마다 `isolated: true` 를 넣어");
+		expect(text).toContain("`task.isolation.enabled` 가 켜져 있어야 적용됩니다");
 	});
 
 	test("budget and fallback rules follow the config", () => {
@@ -223,6 +225,7 @@ describe("handoff", () => {
 		expect(text).toContain("- 이 실행 예산 $5.00: 넘으면 새 스폰이 막힙니다.");
 		expect(text).toContain("storm-explorer 역할의 모델로 바뀝니다.");
 		expect(text).toContain("격리 없음");
+		expect(text).not.toContain("isolated: true");
 		expect(text.startsWith("<storm-run ")).toBe(true);
 	});
 

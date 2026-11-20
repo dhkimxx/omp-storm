@@ -3,6 +3,7 @@
  * runs (keyword handoff, run-scoped policy, budget, telemetry). Module-level state is shared by every
  * session in the process, because subagent sessions reuse this module.
  */
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { resolveRepo } from "./approval/repo.ts";
@@ -23,14 +24,16 @@ import { execPort, ompBinary } from "./omp.ts";
 import { DIRECTOR_BLOCK_REASON, directorBlocks } from "./policy/director.ts";
 import { decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
-import { ROLE_AGENT_PREFIX } from "./roles.ts";
+import { ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import { listAgents, noteAgentEnd, noteAgentParked, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
 import { buildStormRequest, noteRunSpawn, RunController, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
 import { lastRun } from "./runtime/run.ts";
+import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { trialPhase } from "./runtime/trials.ts";
 import { trialViews } from "./runtime/views.ts";
+import { newerInstalledVersion } from "./runtime/version.ts";
 import { createStateCache, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
@@ -117,10 +120,25 @@ function lookupModel(ctx: ExtensionContext, selector: string): ModelInfo | undef
 	return undefined;
 }
 
+/** This plugin's own package.json: after `omp plugin install` it holds a newer version than the one this process loaded. */
+const PACKAGE_JSON = fileURLToPath(new URL("../package.json", import.meta.url));
+
+/** A newer Storm installed on disk than the one running here; `/restart` loads it. */
+function newerVersion(): string | undefined {
+	let text: string | undefined;
+	try {
+		text = readFileSync(PACKAGE_JSON, "utf8");
+	} catch {
+		text = undefined;
+	}
+	return newerInstalledVersion(STORM_VERSION, text);
+}
+
 function statusLabel(state: ProjectState): string | undefined {
 	if (state.config.status === "missing") return undefined;
-	if (state.config.status === "invalid") return "storm: 설정 오류";
-	return state.approval ? "storm ✓" : "storm: 승인 필요";
+	const base = state.config.status === "invalid" ? "storm: 설정 오류" : state.approval ? "storm ✓" : "storm: 승인 필요";
+	const newer = newerVersion();
+	return newer ? `${base} · 새 버전 ${newer} → /restart` : base;
 }
 
 export default function storm(pi: ExtensionAPI): void {
@@ -156,12 +174,13 @@ export default function storm(pi: ExtensionAPI): void {
 		};
 	};
 
-	/** Read on every use: these settings may change during a session, and only status and the agents action ask. */
+	/** Read on every use: these settings may change during a session, and only status, the agents action and setup ask. */
+	const ompSettings = (): Promise<ExplicitSettings> => readExplicitSettings(exec, ompBinary());
 	const lifecycleSettings = async (): Promise<LifecycleSettings> => {
-		const settings = await readExplicitSettings(exec, ompBinary()).catch(() => undefined);
+		const settings = await ompSettings();
 		return {
-			...(settings?.agentIdleTtlMs !== undefined ? { agentIdleTtlMs: settings.agentIdleTtlMs } : {}),
-			...(settings?.cacheRetention !== undefined ? { cacheRetention: settings.cacheRetention } : {}),
+			...(settings.agentIdleTtlMs !== undefined ? { agentIdleTtlMs: settings.agentIdleTtlMs } : {}),
+			...(settings.cacheRetention !== undefined ? { cacheRetention: settings.cacheRetention } : {}),
 		};
 	};
 	const modelCost = (ctx: ExtensionContext, selector: string) => {
@@ -193,7 +212,8 @@ export default function storm(pi: ExtensionAPI): void {
 		now: Date.now,
 		activeRun: () => runs.active(),
 		agents: () => listAgents({ ancestorId: ctx.agent.id }),
-		lifecycleSettings,
+		ompSettings,
+		newerVersion,
 		modelCost: selector => modelCost(ctx, selector),
 	});
 
@@ -342,6 +362,23 @@ export default function storm(pi: ExtensionAPI): void {
 			return;
 		}
 		await runs.onAgentEnd(event, ctx);
+		// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
+		if (!event.willContinue && !event.awaitingAsyncWork) await syncSession(ctx).catch(() => undefined);
+	});
+
+	// omp itself left a model after provider errors: its provider goes behind the approved fallbacks for a while.
+	pi.on("retry_fallback_applied", async (event, ctx) => {
+		const repo = await repoFor(ctx);
+		if ((await cachedConfig(repo.root)).status === "missing") return;
+		const mark = fallbackQuotaMark(event.from, Date.now());
+		if (mark) await addQuotaMark(repo.root, mark);
+		if (ctx.hasUI) ctx.ui.notify(quotaNotice(event.from, event.to, mark?.provider), "warning");
+	});
+
+	// One disabled credential need not mean the provider is out (other accounts may remain): notice only.
+	pi.on("credential_disabled", async (event, ctx) => {
+		if (!ctx.hasUI || (await cachedConfig((await repoFor(ctx)).root)).status === "missing") return;
+		ctx.ui.notify(credentialNotice(event.provider), "warning");
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -388,7 +425,17 @@ export default function storm(pi: ExtensionAPI): void {
 		},
 		handler: async (args, ctx) => {
 			const ui = createUiPort(pi, ctx);
-			const env = flowEnv(ctx);
+			const env: FlowEnv = {
+				...flowEnv(ctx),
+				// Setup is led by the session LLM; the storm tool must be on for it to propose the team.
+				requestSetup: async message => {
+					await ctx.waitForIdle();
+					await activateTool();
+					pi.sendUserMessage(message).catch((error: unknown) => {
+						ui.notify(`설정 요청을 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
+					});
+				},
+			};
 			const input = args.trim();
 			try {
 				if (input !== "" && !SHORTCUT_NAMES.includes(input)) {

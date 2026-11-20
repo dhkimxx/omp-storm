@@ -82,10 +82,11 @@ async function approvals(): Promise<number> {
 function scriptedUi(answers: Array<string | undefined>) {
 	const selects: Array<{ title: string; options: string[] }> = [];
 	const notes: string[] = [];
-	const reports: string[] = [];
+	const contexts: string[] = [];
 	const ui: UiPort = {
-		async select(title, options) {
+		async select(title, options, context) {
 			selects.push({ title, options: options.map(o => (typeof o === "string" ? o : o.label)) });
+			if (context) contexts.push(context.markdown);
 			return answers.shift();
 		},
 		async confirm() {
@@ -97,11 +98,10 @@ function scriptedUi(answers: Array<string | undefined>) {
 		notify(message) {
 			notes.push(message);
 		},
-		report(_title, markdown) {
-			reports.push(markdown);
-		},
+		async report() {},
+		record() {},
 	};
-	return { ui, selects, notes, reports };
+	return { ui, selects, notes, contexts };
 }
 
 describe("/storm reset", () => {
@@ -167,8 +167,8 @@ describe("/storm reset", () => {
 		await git(project, "worktree", "add", path.join(tmp, "wt"));
 		const f = scriptedUi(["초기화"]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
-		expect(f.reports[0]).toContain("git에 커밋된 파일 1개(.omp/storm/config.json)");
-		expect(f.reports[0]).toContain("다른 worktree 1개");
+		expect(f.contexts[0]).toContain("git에 커밋된 파일 1개(.omp/storm/config.json)");
+		expect(f.contexts[0]).toContain("다른 worktree 1개");
 		expect(f.notes.at(-1)).toContain("직접 커밋");
 	});
 
