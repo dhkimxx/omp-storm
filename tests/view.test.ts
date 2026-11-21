@@ -135,6 +135,7 @@ describe("config diff", () => {
 			c => delete c.roles.reviewer,
 			c => (c.disabledRoles = ["quick"]),
 			c => (c.parallelism = 5),
+			c => (c.rounds = 7),
 			c => (c.contextCap = 100_000),
 			c => (c.isolation = "isolated"),
 			c => (c.budget = { perRunUsd: 3, onExceed: "stop" }),
@@ -175,6 +176,24 @@ describe("config diff", () => {
 
 	test("a role's own agent definition is not listed", () => {
 		expect(renderConfigDiff(undefined, TEAM)).not.toContain("storm-reviewer");
+	});
+
+	test("extra rounds are shown in force, and a change is one row with both numbers", () => {
+		const next = changed(c => (c.rounds = 7));
+		const md = renderConfigDiff(TEAM, next);
+		expect(md).toContain("기본(3) → 7");
+		expect(changedFields(TEAM, next)).toHaveLength(1);
+		expect(changedFields(next, TEAM)).toHaveLength(1);
+	});
+
+	test("an explicit default is a change, because the hash sees it: absent rounds read 기본(3)", () => {
+		const explicit = changed(c => (c.rounds = 3));
+		expect(configHash(explicit)).not.toBe(configHash(TEAM));
+		expect(renderConfigDiff(TEAM, explicit)).toContain("기본(3) → 3");
+		expect(renderConfigDiff(explicit, TEAM)).toContain("3 → 기본(3)");
+		expect(changedFields(TEAM, explicit)).toHaveLength(1);
+		// The rendered values differ, but two explicit settings of the same number have no row.
+		expect(changedFields(explicit, structuredClone(explicit))).toEqual([]);
 	});
 
 	test("isolation and the budget action are shown in words, not as raw values", () => {
@@ -342,6 +361,22 @@ describe("status", () => {
 		}
 		expect(of({ contextCap: 123_456 })).toContain("123,456");
 		expect(renderStatus(view({ storage: "storage-line" }), NOW)).toContain("storage-line");
+	});
+
+	test("the run settings show the extra rounds in force, on the row that follows the setting", () => {
+		const of = (rounds?: number) => {
+			const config = rounds === undefined ? TEAM : { ...TEAM, rounds };
+			return renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config, hash, warnings: [] } }), NOW).split("\n");
+		};
+		const base = of();
+		const set = of(7);
+		const removed = base.filter(line => !set.includes(line));
+		const added = set.filter(line => !base.includes(line));
+		expect(removed).toHaveLength(1);
+		expect(added).toHaveLength(1);
+		expect(removed[0]).toContain("3");
+		expect(added[0]).toContain("7");
+		expect(set.indexOf(added[0]!)).toBe(base.indexOf(removed[0]!));
 	});
 
 	test("for the model: no commands, no cost flags and no paths, with the shadowing definition still named", () => {

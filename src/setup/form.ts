@@ -11,6 +11,7 @@ import { scoreText } from "../lineage/metrics.ts";
 import { dropAdoptedTrials, providerOf } from "../proposals/build.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
 import { DEFAULT_CONTEXT_CAP, MAX_WORKERS, REQUIRED_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
+import { DEFAULT_EXTRA_ROUNDS, MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { entryEffort, formatModelEntry, type ModelEntry, parseModelEntry } from "../selector.ts";
 import { type Analysis, type BudgetConfig, type Candidate, EFFORTS, type Effort, type FormData, type ModelInfo, type RoleConfig, type RoleId, type RoleRecommendation, type StormConfig } from "../types.ts";
 
@@ -59,6 +60,7 @@ export const FIELD = {
 	workersMax: (id: RoleId) => `workers_max_${id}`,
 	parallelism: "parallelism",
 	contextCap: "context_cap",
+	rounds: "rounds",
 	budget: "budget_usd",
 	budgetWarn: "budget_warn_usd",
 	budgetExceed: "budget_exceed",
@@ -71,6 +73,7 @@ const LABEL = {
 	workersMax: "워커 최대",
 	parallelism: "병렬도",
 	contextCap: "팀 컨텍스트 상한",
+	rounds: "검증이 안 됐을 때 추가 라운드",
 	budget: "실행당 예산",
 	budgetWarn: "예산 경고 수준",
 } as const;
@@ -299,6 +302,7 @@ export function settingsForm(input: SetupFormInput, picks: ModelPicks, retry?: F
 		"<fieldset><legend>실행</legend>",
 		numberInput(FIELD.parallelism, `${LABEL.parallelism} (동시에 도는 서브에이전트 수)`, typed(FIELD.parallelism, base.parallelism), 1, MAX_WORKERS),
 		numberInput(FIELD.contextCap, `${LABEL.contextCap} (토큰. 넘은 서브에이전트는 후속 지시를 받지 않습니다)`, typed(FIELD.contextCap, base.contextCap ?? DEFAULT_CONTEXT_CAP), 1, MAX_CONTEXT_CAP),
+		numberInput(FIELD.rounds, `${LABEL.rounds} (0이면 다시 보내지 않음)`, typed(FIELD.rounds, base.rounds ?? DEFAULT_EXTRA_ROUNDS), 0, MAX_EXTRA_ROUNDS),
 		"</fieldset>",
 		"<fieldset><legend>예산</legend>",
 		numberInput(FIELD.budget, `${LABEL.budget} (USD, 0 = 없음)`, typed(FIELD.budget, budget?.perRunUsd ?? 0), 0),
@@ -399,6 +403,8 @@ export function setupConfig(input: SetupFormInput, picks: ModelPicks, data: Form
 	const contextCap = whole(FIELD.contextCap, LABEL.contextCap, 1, MAX_CONTEXT_CAP);
 	// The default stays unwritten, as in a team that never set it.
 	if (base.contextCap !== undefined || contextCap !== DEFAULT_CONTEXT_CAP) config.contextCap = contextCap;
+	const rounds = whole(FIELD.rounds, LABEL.rounds, 0, MAX_EXTRA_ROUNDS);
+	if (base.rounds !== undefined || rounds !== DEFAULT_EXTRA_ROUNDS) config.rounds = rounds;
 	const perRunUsd = amount(FIELD.budget, LABEL.budget);
 	const warnAtUsd = amount(FIELD.budgetWarn, LABEL.budgetWarn);
 	if (perRunUsd === 0) delete config.budget;

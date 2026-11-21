@@ -3,10 +3,12 @@ import { agentRows, duration, renderAgentRows, tokens } from "../src/report/agen
 import {
 	listAgents,
 	markAgentsCleaned,
+	noteAgentChange,
 	noteAgentEnd,
 	noteAgentFollowUp,
 	noteAgentParked,
 	noteAgentReview,
+	noteAgentRun,
 	noteAgentStart,
 	noteAgentUsage,
 	resetAgents,
@@ -77,6 +79,21 @@ describe("agent ledger", () => {
 		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 3 });
 		expect(listAgents({ runId: "r1" })).toEqual([]);
 		expect(listAgents({ runId: "r2" }).map(e => e.id)).toEqual(["A"]);
+	});
+
+	test("noteAgentRun moves an entry to a run, starting its run-scoped fields over; the same run is a no-op", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", parentId: "Main", runId: "r1", now: T0 });
+		noteAgentChange("A", T0 + 1_000);
+		noteAgentReview("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
+		noteAgentRun("A", "r1");
+		expect(listAgents()[0]).toMatchObject({ runId: "r1", changes: 1, lastChangeAt: T0 + 1_000, lastVerdict: { at: T0 + 2_000, correct: true } });
+		noteAgentRun("A", "r2");
+		expect(listAgents({ runId: "r2" })[0]).toMatchObject({ id: "A", name: "storm-implementer", role: "implementer", parentId: "Main", state: "running" });
+		expect(listAgents()[0]?.changes).toBeUndefined();
+		expect(listAgents()[0]?.lastChangeAt).toBeUndefined();
+		expect(listAgents()[0]?.lastVerdict).toBeUndefined();
+		noteAgentRun("X", "r2");
+		expect(listAgents()).toHaveLength(1);
 	});
 
 	test("unknown ids are ignored", () => {
@@ -205,15 +222,56 @@ describe("noteAgentReview", () => {
 	test("accumulates a reviewer's yields on its own entry and ignores non-review yields", () => {
 		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: 0 });
 		noteAgentStart({ id: "Impl", name: "storm-implementer", now: 0 });
-		noteAgentReview("Impl", { data: { done: true } });
-		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } });
-		noteAgentReview("Rev", { error: "x" });
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } });
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } });
-		noteAgentReview("Ghost", { data: { overall_correctness: "correct" } });
+		noteAgentReview("Impl", { data: { done: true } }, T0);
+		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 1);
+		noteAgentReview("Rev", { error: "x" }, T0 + 2);
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 3);
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 4);
+		noteAgentReview("Ghost", { data: { overall_correctness: "correct" } }, T0 + 5);
 		const [rev, impl] = listAgents();
 		expect(rev?.review).toEqual({ reviews: 2, passed: 1, failed: 1, findings: [1, 0, 0, 0] });
 		expect(impl?.review).toBeUndefined();
 		expect(listAgents()).toHaveLength(2);
+	});
+
+	test("keeps the latest verdict with the time it was given; a findings section leaves it alone", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: T0 });
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 1_000);
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: false });
+		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 2_000);
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: false });
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 3_000);
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 3_000, correct: true });
+	});
+});
+
+describe("noteAgentChange", () => {
+	beforeEach(() => resetAgents());
+
+	test("counts and dates changes on a known entry and ignores an unknown id", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 });
+		noteAgentChange("A", T0 + 1_000);
+		noteAgentChange("A", T0 + 2_000);
+		noteAgentChange("Ghost", T0 + 3_000);
+		expect(listAgents()).toHaveLength(1);
+		expect(listAgents()[0]).toMatchObject({ changes: 2, lastChangeAt: T0 + 2_000, lastActivityAt: T0 + 2_000 });
+	});
+
+	test("another run starts the run-scoped fields over; the same run keeps them", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
+		noteAgentChange("A", T0 + 1_000);
+		noteAgentReview("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
+		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r1", now: T0 + 3_000 });
+		expect(listAgents()[0]).toMatchObject({
+			changes: 1,
+			lastChangeAt: T0 + 1_000,
+			lastVerdict: { at: T0 + 2_000, correct: true },
+		});
+		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 4_000 });
+		const [a] = listAgents();
+		expect(a?.runId).toBe("r2");
+		expect(a?.changes).toBeUndefined();
+		expect(a?.lastChangeAt).toBeUndefined();
+		expect(a?.lastVerdict).toBeUndefined();
 	});
 });

@@ -15,6 +15,12 @@ interface Finding {
 	kind?: unknown;
 }
 
+/** A final verdict payload and whether it passed. */
+interface Verdict {
+	payload: FinalPayload;
+	correct: boolean;
+}
+
 /** Findings and doc findings counted from one yield. */
 interface Counts {
 	findings: ReviewTally["findings"];
@@ -40,6 +46,23 @@ function countFindings(counts: Counts, list: unknown): number {
 
 const EMPTY: ReviewTally = { reviews: 0, passed: 0, failed: 0, findings: [0, 0, 0, 0] };
 
+/** The final verdict a `yield` input carries; undefined for a findings section and for anything that is no review. */
+function verdictPayload(input: unknown): Verdict | undefined {
+	if (typeof input !== "object" || input === null) return undefined;
+	const { data, type } = input as YieldArgs;
+	if (Array.isArray(type) && type.includes("findings")) return undefined;
+	if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+	const payload = data as FinalPayload;
+	const verdict = payload.overall_correctness;
+	if (verdict !== "correct" && verdict !== "incorrect") return undefined;
+	return { payload, correct: verdict === "correct" };
+}
+
+/** Whether a `yield` input is a review verdict, and whether it passed; undefined for a findings section and other inputs. */
+export function verdictOf(input: unknown): boolean | undefined {
+	return verdictPayload(input)?.correct;
+}
+
 /** `base` with new finding counts; `docFindings` appears once a doc finding was counted. */
 function withCounts(base: ReviewTally, counts: Counts): ReviewTally {
 	const next: ReviewTally = { ...base, findings: counts.findings };
@@ -61,17 +84,15 @@ export function tallyFromYield(prev: ReviewTally | undefined, input: unknown): R
 		if (countFindings(counts, data) === 0) return prev;
 		return withCounts(base, counts);
 	}
-	if (typeof data !== "object" || data === null || Array.isArray(data)) return prev;
-	const final = data as FinalPayload;
-	const verdict = final.overall_correctness;
-	if (verdict !== "correct" && verdict !== "incorrect") return prev;
-	if (Array.isArray(final.findings)) countFindings(counts, final.findings);
+	const verdict = verdictPayload(input);
+	if (!verdict) return prev;
+	if (Array.isArray(verdict.payload.findings)) countFindings(counts, verdict.payload.findings);
 	return withCounts(
 		{
 			...base,
 			reviews: base.reviews + 1,
-			passed: base.passed + (verdict === "correct" ? 1 : 0),
-			failed: base.failed + (verdict === "incorrect" ? 1 : 0),
+			passed: base.passed + (verdict.correct ? 1 : 0),
+			failed: base.failed + (verdict.correct ? 0 : 1),
 		},
 		counts,
 	);

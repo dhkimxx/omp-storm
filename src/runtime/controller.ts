@@ -1,12 +1,12 @@
 /**
  * Storm run lifecycle for one main session. A run starts from `/storm` at once, or from the storm tool once the turn
- * that queued it settles: team gate, mode preconditions, compaction of a heavy context, omp's goal or loop mode,
- * then the handoff. Its mode decides when it ends: a vibe run when the session settles, a goal run when omp's goal
- * ends, a loop run when omp's loop stops. Spawn decisions arrive from any session in the process (children
+ * that queued it settles: team gate, omp's session modes, compaction of a heavy context, then the handoff. At the end
+ * of every round the round rules decide whether the run is over; when it is not, Storm sends the next round itself,
+ * waiting out the hold while the session is busy. Spawn decisions arrive from any session in the process (children
  * included), so they are collected per run in module scope.
  */
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext, SessionModeRequest, SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ApprovalStore } from "../approval/store.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
@@ -31,8 +31,8 @@ import type {
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
-import { END_LABEL, END_STATUS, GOAL_NUDGE, goalEnd, MAX_NUDGES, MODE_LABEL, modeEnd, modeFailureText, modeRequest, modeText, STALL_MS } from "./modes.ts";
 import { reviewLine } from "./review.ts";
+import { buildRoundMessage, decideRound, END_STATUS, endLabel, HOLD_MS, maxRounds, reviewGate, ROUND_DELAY_MS, type RoundDecision } from "./rounds.ts";
 import { buildHandoff, newRunId, pruneRuns, writeRun } from "./run.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 
@@ -70,11 +70,6 @@ export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 
 /** How much of the request a run record keeps. */
 const TASK_CHARS = 200;
-/**
- * Ends after which omp's goal or loop must not stay on: those Storm decides itself, and a paused loop, whose next
- * typed message omp would take as a new loop body and repeat outside any run.
- */
-const LEAVE_MODE: readonly RunEndReason[] = ["budget", "goal-stalled", "start-failed", "loop-paused"];
 
 /** Whether a turn ended because it was interrupted: omp closes it with an assistant message marked aborted. */
 export function turnAborted(messages: readonly unknown[] | undefined): boolean {
@@ -89,6 +84,9 @@ export function turnAborted(messages: readonly unknown[] | undefined): boolean {
 
 const iso = (ms: number): string => new Date(ms).toISOString();
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** omp refuses a prompt whose setup the user interrupted with this error (`PromptDroppedError`, named in its class). */
+const promptDropped = (error: unknown): boolean => error instanceof Error && error.name === "PromptDroppedError";
 
 function withoutDocFindings(agent: AgentEntry): AgentEntry {
 	if (agent.review?.docFindings === undefined) return agent;
@@ -110,6 +108,9 @@ function artifactsOf(ctx: ExtensionContext): { artifactsDir?: string } {
 	return typeof dir === "string" && dir !== "" ? { artifactsDir: dir } : {};
 }
 
+/** The unverified gate a round message is built from, as `decideRound` hands it over. */
+type RoundGate = Extract<RoundDecision, { action: "continue" }>["gate"];
+
 interface OwnRun {
 	record: RunRecord;
 	root: string;
@@ -124,18 +125,22 @@ interface OwnRun {
 	inTurn: boolean;
 	/** Why the run is over, decided while a turn was still running: that turn's end finishes it, its last message counted. */
 	ending?: RunEndReason;
-	/** Nudges sent to a stalled goal in a row: a turn the goal started by itself resets the count. */
-	nudges: number;
-	/** The last thing that happened to the session was Storm's nudge: the turn that starts next is its doing. */
-	nudged: boolean;
-	/** The stall watchdog's pending timer. */
-	stall?: unknown;
+	/** Most rounds the run may take, fixed at start: a team edited mid-run must not move the goal posts. */
+	maxRounds: number;
+	/** The user's wall-time limit in minutes, when the request stated one. */
+	minutes?: number;
+	/** The gate's counts when Storm sent its last round message: what the next round is expected to move. */
+	progress?: { changes: number; reviews: number };
+	/** The pending look timer: the round delay, or the wait while the session is held. */
+	hold?: unknown;
+	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
+	awaitingAsync: boolean;
 }
 
 type Refusal = Extract<RunRequestResult, { ok: false }>;
 const refuse = (reason: string): Refusal => ({ ok: false, reason });
 
-const START = { vibeOff: "omp vibe 끄고 시작", free: "자유 실행으로 시작", cancel: "취소" } as const;
+const START = { vibeOff: "omp vibe 끄고 시작", cancel: "취소" } as const;
 
 export interface RunTimers {
 	set(run: () => void, ms: number): unknown;
@@ -148,7 +153,7 @@ const REAL_TIMERS: RunTimers = {
 		timer.unref?.();
 		return timer;
 	},
-	clear: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+	clear: handle => clearTimeout(handle as NodeJS.Timeout),
 };
 
 export interface RunControllerDeps {
@@ -164,15 +169,13 @@ export interface RunControllerDeps {
 	agentDir?: string;
 	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
 	flushMs?: number;
-	/** The user's omp `loop.mode` setting; a loop run is refused while it is `reset`. */
-	loopMode?(): Promise<string | undefined>;
-	/** The goal stall watchdog's clock; real timers when absent. */
+	/** The look timer's clock; real timers when absent. */
 	timers?: RunTimers;
 }
 
 export class RunController {
 	#pending: { runId: string; spec: RunSpec } | undefined;
-	/** A start is between its checks and its handoff (it may be asking, compacting, or entering a mode). */
+	/** A start is between its checks and its handoff (it may be asking, compacting, or recording the run). */
 	#starting = false;
 	#own: OwnRun | undefined;
 	#flushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -190,8 +193,8 @@ export class RunController {
 	}
 
 	/**
-	 * From the storm tool: the run starts once the current turn settles. omp refuses a mode change from inside a
-	 * tool call, so every tool-requested run waits for the terminal `agent_end`.
+	 * From the storm tool: the run starts once the current turn settles. A tool call cannot hand the session a
+	 * message of its own, so every tool-requested run waits for the terminal `agent_end`.
 	 */
 	request(spec: RunSpec): RunRequestResult {
 		const reason = this.refusal();
@@ -217,9 +220,9 @@ export class RunController {
 	}
 
 	/**
-	 * Checks the approved team and the mode's preconditions, compacts a heavy main context, enters omp's goal or loop
-	 * mode, records the run and sends the handoff. The session must be idle. It can take as long as a dialog or a
-	 * compaction: callers inside an omp event handler use `launch`.
+	 * Checks the approved team and omp's session modes, compacts a heavy main context, records the run and sends the
+	 * handoff. The session must be idle. It can take as long as a dialog or a compaction: callers inside an omp event
+	 * handler use `launch`.
 	 */
 	async start(ctx: ExtensionContext, spec: RunSpec, runId = newRunId(this.deps.now())): Promise<RunRequestResult> {
 		// A queued run is not in the way of its own start: `onAgentEnd` takes it off the queue first.
@@ -256,18 +259,22 @@ export class RunController {
 		const busy = refuse("이 프로젝트에서 다른 Storm 실행이 진행 중입니다.");
 		if (activeLedgerRun(state.repo.repoId)) return busy;
 		const ui = this.deps.ui(ctx);
-		const ready = await this.#readyMode(ctx, ui, requested);
+		const ready = await this.#ready(ctx, ui);
 		if (!ready.ok) return ready;
 		await this.#compactFirst(ctx, ui);
 		// The dialog and the compaction awaited: another session's run may have started meanwhile.
 		if (activeLedgerRun(state.repo.repoId)) return busy;
-		// Nothing of the run exists yet: a mode omp refuses leaves nothing behind.
-		const entered = await this.#enterMode(ctx, ready.spec, runId);
-		if (!entered.ok) return entered;
 
 		const { config, hash } = gate;
-		const { task } = entered;
-		const mode = ready.spec.mode;
+		const { task } = requested;
+		const roundLimit = maxRounds(requested, config);
+		const limits =
+			requested.rounds !== undefined || requested.minutes !== undefined
+				? {
+						...(requested.rounds !== undefined ? { rounds: requested.rounds } : {}),
+						...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
+					}
+				: undefined;
 		const record: RunRecord = {
 			schema: "storm.run/v1",
 			runId,
@@ -281,9 +288,8 @@ export class RunController {
 			spawns: [],
 			...artifactsOf(ctx),
 			process: processKey(),
-			mode,
 			turns: 0,
-			...entered.fields,
+			...(limits ? { limits } : {}),
 		};
 		const own: OwnRun = {
 			record,
@@ -293,8 +299,9 @@ export class RunController {
 			store: state.store,
 			turnStarted: false,
 			inTurn: false,
-			nudges: 0,
-			nudged: false,
+			maxRounds: roundLimit,
+			awaitingAsync: false,
+			...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
 		};
 		this.#own = own;
 		try {
@@ -308,72 +315,42 @@ export class RunController {
 			openRunReads(runId);
 			await writeRun(own.root, record);
 		} catch (error) {
-			// omp's mode is on and this session directs, but nothing was handed off: undo both rather than leave a run nobody started.
+			// This session directs and the ledger is open, but nothing was handed off: close both rather than leave a run nobody started.
 			await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 			return refuse(`실행을 기록하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 		}
 		liveWriters.set(runId, () => this.#scheduleFlush(own));
-		ui.notify(`Storm 실행을 시작합니다(${runId}, ${MODE_LABEL[mode]}).`);
-		this.deps.pi.sendUserMessage(buildHandoff({ runId, config, hash, task, mode })).catch((error: unknown) => {
+		ui.notify(`Storm 실행을 시작합니다(${runId}).`);
+		this.deps.pi.sendUserMessage(buildHandoff({ runId, config, hash, task, maxRounds: roundLimit })).catch((error: unknown) => {
 			ui.notify(`실행 계약을 보내지 못했습니다: ${errorText(error)}`, "error");
-			void this.#stop(own, "start-failed", ctx);
+			this.#stopSoon(own, "start-failed", ctx);
 		});
 		return { ok: true, runId };
 	}
 
 	/**
-	 * What must hold before a mode is entered, settled while nothing has started. omp's vibe mode replaces the
-	 * director's tools, so the team cannot run inside it. A goal or a loop needs omp's mode control, which only the
-	 * TUI has: elsewhere the user may take a vibe run instead. A loop that resets the session each turn would leave
-	 * the run behind.
+	 * What must hold before a run starts, settled while nothing has started. omp's goal and loop modes would move the
+	 * session outside Storm's run, which decides on its own when another round follows, so they are checked first: no
+	 * dialog offers to leave vibe only to be refused after it. omp's vibe mode replaces the director's tools, so the
+	 * team cannot run inside it either.
 	 */
-	async #readyMode(ctx: ExtensionContext, ui: UiPort, spec: RunSpec): Promise<{ ok: true; spec: RunSpec } | Refusal> {
+	async #ready(ctx: ExtensionContext, ui: UiPort): Promise<{ ok: true } | Refusal> {
 		const modes = ctx.sessionModes;
-		if (modes?.getState().vibe.status === "active") {
-			const choice = await ui.select("omp vibe 모드에서는 Storm 팀을 쓸 수 없습니다. vibe 모드를 끄고 시작할까요?", [START.vibeOff, START.cancel]);
-			if (choice !== START.vibeOff) return refuse("omp vibe 모드가 켜져 있어 시작하지 않았습니다.");
-			const left = await modes.set({ mode: "vibe", action: "exit" });
-			if (!left.ok) return refuse(modeFailureText(left));
+		if (!modes) return { ok: true };
+		const state = modes.getState();
+		if (state.goal.status === "active") {
+			return refuse("omp 목표 모드가 켜져 있어 시작하지 않았습니다. 목표를 끝내거나 일시 정지한 뒤 다시 하세요.");
 		}
-		if (spec.mode === "vibe") return { ok: true, spec };
-		if (!modes) {
-			const unsupported = `이 환경에서는 omp ${MODE_LABEL[spec.mode]} 모드를 쓸 수 없습니다(터미널 UI에서만 됩니다).`;
-			if ("resume" in spec) return refuse(unsupported);
-			const choice = await ui.select(`${unsupported} 자유 실행으로 시작할까요?`, [START.free, START.cancel]);
-			return choice === START.free ? { ok: true, spec: { mode: "vibe", task: spec.task } } : refuse(unsupported);
+		if (state.loop.status !== "inactive") return refuse("omp 반복 모드가 켜져 있어 시작하지 않았습니다. 반복을 끈 뒤 다시 하세요.");
+		if (state.vibe.status !== "active") return { ok: true };
+		const choice = await ui.select("omp vibe 모드에서는 Storm 팀을 쓸 수 없습니다. vibe 모드를 끄고 시작할까요?", [START.vibeOff, START.cancel]);
+		if (choice !== START.vibeOff) return refuse("omp vibe 모드가 켜져 있어 시작하지 않았습니다.");
+		const left = await modes.set({ mode: "vibe", action: "exit" });
+		if (!left.ok) {
+			const setting = left.code === "disabled" ? " 확장의 모드 제어가 꺼져 있으면 `omp config set extensionHandlers.modeControl true` 로 켜세요." : "";
+			return refuse(`${left.message}${setting}`);
 		}
-		if (spec.mode === "loop" && (await this.deps.loopMode?.()) === "reset") {
-			return refuse(
-				"omp 설정 loop.mode 가 reset 이라 반복마다 새 세션이 시작되어 Storm 실행이 이어지지 않습니다. `omp config set loop.mode prompt` 로 바꾼 뒤 다시 시도하세요.",
-			);
-		}
-		// omp's resume leaves an active goal as it is: a goal restored with the session can be put under a run too.
-		if ("resume" in spec && modes.getState().goal.status === "inactive") {
-			return refuse("이어갈 목표가 없습니다. /storm goal <목표> 로 시작하세요.");
-		}
-		return { ok: true, spec };
-	}
-
-	/** Enters omp's goal or loop mode for the run. Resolves the task (a resumed goal's objective) and what the record keeps of the mode. */
-	async #enterMode(
-		ctx: ExtensionContext,
-		spec: RunSpec,
-		runId: string,
-	): Promise<{ ok: true; task: string; fields: Pick<RunRecord, "goal" | "loop"> } | Refusal> {
-		if (spec.mode === "vibe") return { ok: true, task: spec.task, fields: {} };
-		const modes = ctx.sessionModes;
-		if (!modes) return refuse("이 환경에서는 omp 모드를 바꿀 수 없습니다.");
-		const result = await modes.set(modeRequest(spec, runId));
-		if (!result.ok) return refuse(modeFailureText(result));
-		if (spec.mode === "loop") {
-			const loop = { ...(spec.limit ? { limit: spec.limit } : {}), ...(spec.condition ? { condition: spec.condition } : {}) };
-			return { ok: true, task: spec.task, fields: { loop } };
-		}
-		const resumed = "resume" in spec;
-		const task = resumed ? (result.state.goal.objective ?? "") : spec.task;
-		const tokenBudget = resumed ? result.state.goal.tokenBudget : spec.tokenBudget;
-		const goal = { objective: task.slice(0, TASK_CHARS), ...(tokenBudget !== undefined ? { tokenBudget } : {}) };
-		return { ok: true, task, fields: { goal } };
+		return { ok: true };
 	}
 
 	/**
@@ -394,12 +371,10 @@ export class RunController {
 	onAgentStart(): void {
 		const own = this.#own;
 		if (!own) return;
+		this.#disarm(own);
+		own.awaitingAsync = false;
 		own.turnStarted = true;
 		own.inTurn = true;
-		// A turn Storm did not nudge into being means the goal moves by itself again.
-		if (!own.nudged) own.nudges = 0;
-		own.nudged = false;
-		this.#disarm(own);
 	}
 
 	/** True while this session runs Storm: the main session directs and does not change files itself. */
@@ -517,17 +492,26 @@ export class RunController {
 	}
 
 	/**
-	 * The main session's agent loop ended. When it settled (no automatic continuation, no background work that will
-	 * resume it) a turn of the run is over, which ends a vibe run; and a queued run starts, detached from this handler,
-	 * unless the user interrupted the turn that queued it.
+	 * The main session's agent loop ended. A `willContinue` end is no round: omp itself resumes the loop, and a paused
+	 * run that only async work resumes waits for one. When it settled (no automatic continuation, no background work
+	 * that will resume it) a round of the run is over and the round rules decide what follows; and a queued run
+	 * starts, detached from this handler, unless the user interrupted the turn that queued it.
 	 */
 	async onAgentEnd(
 		event: { willContinue?: boolean; awaitingAsyncWork?: boolean; messages?: readonly unknown[] },
 		ctx: ExtensionContext,
 	): Promise<void> {
-		if (event.willContinue || event.awaitingAsyncWork) return;
 		const own = this.#own;
-		if (own?.turnStarted) await this.#turnSettled(own, ctx);
+		if (event.awaitingAsyncWork) {
+			// Only a new turn resumes this run, so a terminal end with no turn in between stopped the wait.
+			if (own) own.awaitingAsync = true;
+			return;
+		}
+		if (event.willContinue) return;
+		// Esc while paused on async work ends the run without an aborted message and without a new agent_start.
+		const stoppedWait = own?.awaitingAsync === true;
+		if (own) own.awaitingAsync = false;
+		if (own?.turnStarted) await this.#turnSettled(own, ctx, stoppedWait || turnAborted(event.messages));
 		const pending = this.#pending;
 		if (!pending) return;
 		this.#pending = undefined;
@@ -539,104 +523,59 @@ export class RunController {
 	}
 
 	/**
-	 * A turn of the run settled. A vibe run is over. omp continues a goal or a loop by itself, so those end here only
-	 * when the end was already decided during the turn, or when omp's mode is no longer on; a goal that stays active
-	 * is watched for a stall.
+	 * A turn of the run settled: the reason decided during the turn stands, otherwise the round rules decide whether
+	 * another round follows.
 	 */
-	async #turnSettled(own: OwnRun, ctx: ExtensionContext): Promise<void> {
+	async #turnSettled(own: OwnRun, ctx: ExtensionContext, aborted: boolean): Promise<void> {
 		if (own.inTurn) {
 			own.inTurn = false;
 			own.record.turns = (own.record.turns ?? 0) + 1;
 			this.#scheduleFlush(own);
 		}
-		const mode = own.record.mode;
 		if (own.ending !== undefined) return this.#stop(own, own.ending, ctx);
-		if (mode !== "goal" && mode !== "loop") return this.#stop(own, "settled", ctx);
-		const state = ctx.sessionModes?.getState();
-		const over = state && modeEnd(mode, state);
-		if (over) await this.#stop(own, over, ctx);
-		else if (mode === "goal") this.#arm(own, ctx);
-	}
-
-	/** omp reported the goal: its token accounting, and whether it is over. */
-	async onGoalUpdated(goal: { status: string; tokensUsed?: number } | null, ctx: ExtensionContext): Promise<void> {
-		const own = this.#own;
-		if (!own || own.record.mode !== "goal") return;
-		if (goal && own.record.goal && goal.tokensUsed !== undefined) {
-			own.record.goal.tokensUsed = goal.tokensUsed;
-			this.#scheduleFlush(own);
-		}
-		// A goal omp no longer has was dropped.
-		const reason = goal ? goalEnd(goal.status) : "goal-dropped";
-		if (reason) await this.#endSoon(own, reason, ctx);
-	}
-
-	/** An omp session mode changed: a goal that is no longer active or a loop that stopped ends the run. */
-	async onModeChanged(state: SessionModeState, ctx: ExtensionContext): Promise<void> {
-		const own = this.#own;
-		const reason = own && modeEnd(own.record.mode, state);
-		if (own && reason) await this.#endSoon(own, reason, ctx);
-	}
-
-	/** The run is over for `reason` (the first reason given stands): now when the session is between turns, else at the turn's end. */
-	async #endSoon(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): Promise<void> {
-		own.ending ??= reason;
-		if (!own.inTurn) await this.#stop(own, own.ending, ctx);
+		await this.#decide(own, ctx, aborted);
 	}
 
 	/**
-	 * Ends `own` for `reason` unless an earlier reason stands; a run that is no longer this session's (a late failure
-	 * of an older run's handoff) is left alone. After the ends in `LEAVE_MODE` omp's mode is left first.
+	 * The decision after a settled round: the run ends here, or the next round waits out the delay. Inside this
+	 * handler omp is still closing the turn, so nothing is sent from it.
 	 */
-	async #stop(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): Promise<void> {
-		if (this.#own !== own) return;
-		own.ending ??= reason;
-		if (LEAVE_MODE.includes(own.ending)) await this.#leaveMode(own, ctx);
-		await this.finish(own.ending, ctx);
+	async #decide(own: OwnRun, ctx: ExtensionContext, aborted: boolean): Promise<void> {
+		const decision = this.#roundDecision(own, aborted);
+		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
+		this.#arm(own, ctx, ROUND_DELAY_MS);
+	}
+
+	/** The round's decision from the gate as the ledger has it now. */
+	#roundDecision(own: OwnRun, aborted: boolean): RoundDecision {
+		const gate = reviewGate(this.deps.agents?.(own.record.runId) ?? [], own.config);
+		return decideRound({
+			gate,
+			turns: own.record.turns ?? 0,
+			maxRounds: own.maxRounds,
+			aborted,
+			overBudget: activeLedgerRun(own.repoId)?.exceeded ?? false,
+			elapsedMs: this.deps.now() - Date.parse(own.record.startedAt),
+			...(own.minutes !== undefined ? { minutes: own.minutes } : {}),
+			...(own.progress ? { progressSince: own.progress } : {}),
+		});
 	}
 
 	/**
-	 * Takes omp out of the run's mode so it does not keep the session going without the run: a goal is paused (the
-	 * user can resume it), a loop exits. omp may refuse (it is busy tearing a goal down, or compacting); the user is
-	 * told, since the session may then move again by itself.
+	 * The look after a wait, taken from fresh gate data: ends the run, waits out a held session, or sends the next
+	 * round. The only place a round message is sent from.
 	 */
-	async #leaveMode(own: OwnRun, ctx: ExtensionContext): Promise<void> {
-		const modes = ctx.sessionModes;
-		const mode = own.record.mode;
-		if (!modes || (mode !== "goal" && mode !== "loop")) return;
-		let failure: string | undefined;
-		try {
-			const state = modes.getState();
-			let request: SessionModeRequest | undefined;
-			if (mode === "goal" && state.goal.status === "active") request = { mode: "goal", action: "pause" };
-			if (mode === "loop" && state.loop.status !== "inactive") request = { mode: "loop", action: "exit" };
-			const result = request && (await modes.set(request));
-			if (result && !result.ok) failure = modeFailureText(result);
-		} catch (error) {
-			failure = errorText(error);
-		}
-		if (failure === undefined) return;
-		this.deps.ui(ctx).notify(`omp ${MODE_LABEL[mode]} 모드를 끝내지 못했습니다(${failure}). 세션이 계속 이어지면 직접 멈추세요.`, "warning");
-	}
-
-	#disarm(own: OwnRun): void {
-		if (own.stall === undefined) return;
-		(this.deps.timers ?? REAL_TIMERS).clear(own.stall);
-		delete own.stall;
-	}
-
-	/** Watches a goal that should continue by itself: no new turn within `STALL_MS` is a stall. */
-	#arm(own: OwnRun, ctx: ExtensionContext): void {
-		this.#disarm(own);
-		own.stall = (this.deps.timers ?? REAL_TIMERS).set(() => {
-			delete own.stall;
-			void this.#stalled(own, ctx);
-		}, STALL_MS);
+	async #look(own: OwnRun, ctx: ExtensionContext): Promise<void> {
+		const decision = this.#roundDecision(own, false);
+		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
+		if (this.#held(ctx)) return this.#arm(own, ctx, HOLD_MS);
+		this.#sendRound(own, ctx, decision.gate, decision.round);
 	}
 
 	/**
-	 * Whether omp is holding the goal's continuation on purpose: the session is busy (a turn, a compaction), a
-	 * submission is queued, plan mode is on, or the user has a draft in the editor. None of that is a stall.
+	 * Whether omp is holding the next turn on purpose: the session is streaming, has a submission queued, plan mode is
+	 * on, or the user has a draft in the editor. `isIdle` only means "not streaming", so a send during a compaction
+	 * would also wait inside omp's `prompt()`. A held round is not a round.
 	 */
 	#held(ctx: ExtensionContext): boolean {
 		if (!ctx.isIdle() || ctx.hasPendingMessages()) return true;
@@ -644,28 +583,61 @@ export class RunController {
 		return ctx.hasUI && ctx.ui.getEditorText().trim() !== "";
 	}
 
+	/** Looks again after `ms`, as long as the run, the session state and the end decided so far still allow it. */
+	#arm(own: OwnRun, ctx: ExtensionContext, ms: number): void {
+		this.#disarm(own);
+		own.hold = (this.deps.timers ?? REAL_TIMERS).set(() => {
+			delete own.hold;
+			if (this.#own !== own || own.inTurn || own.ending !== undefined) return;
+			void this.#look(own, ctx).catch((error: unknown) =>
+				this.deps.ui(ctx).notify(`Storm 실행을 이어가지 못했습니다: ${errorText(error)}`, "error"),
+			);
+		}, ms);
+	}
+
+	#disarm(own: OwnRun): void {
+		if (own.hold === undefined) return;
+		(this.deps.timers ?? REAL_TIMERS).clear(own.hold);
+		delete own.hold;
+	}
+
+	/** Ends the run from a timer or a rejected send: a failure to record it is reported, not left unhandled. */
+	#stopSoon(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): void {
+		void this.#stop(own, reason, ctx).catch((error: unknown) =>
+			this.deps.ui(ctx).notify(`Storm 실행을 끝내지 못했습니다: ${errorText(error)}`, "error"),
+		);
+	}
+
 	/**
-	 * omp stops continuing a goal silently after a turn without tool activity. A visible nudge restarts it; after
-	 * `MAX_NUDGES` in a row with no turn of the goal's own in between, the goal is paused and the run ends, so nothing
-	 * waits on a session that will not move. While omp holds the continuation the watch goes on without counting.
+	 * Starts round `round`: remembers what the gate saw, says so, and hands the main session the round's message.
+	 * omp resolves `sendUserMessage` only when the turn it starts is over, so nothing here waits on it.
 	 */
-	async #stalled(own: OwnRun, ctx: ExtensionContext): Promise<void> {
-		if (this.#own !== own || own.inTurn || own.ending !== undefined) return;
-		if (ctx.sessionModes?.getState().goal.status !== "active") return;
-		if (this.#held(ctx)) return this.#arm(own, ctx);
+	#sendRound(own: OwnRun, ctx: ExtensionContext, gate: RoundGate, round: number): void {
 		const ui = this.deps.ui(ctx);
-		if (own.nudges < MAX_NUDGES) {
-			own.nudges += 1;
-			own.nudged = true;
-			// Armed again first: a nudge that starts no turn must not be the last thing that happens.
-			this.#arm(own, ctx);
-			this.deps.pi.sendUserMessage(GOAL_NUDGE).catch((error: unknown) => {
-				ui.notify(`목표를 이어가라는 메시지를 보내지 못했습니다: ${errorText(error)}`, "warning");
-			});
+		own.progress = { changes: gate.changes, reviews: gate.reviews };
+		// The gate reports unverified only for a team with a usable reviewer role, whose agent name the message carries.
+		const reviewer = own.config.roles.reviewer?.agent;
+		if (reviewer === undefined) {
+			this.#stopSoon(own, "settled", ctx);
 			return;
 		}
-		ui.notify(`목표가 ${MAX_NUDGES}번 재촉한 뒤에도 진행되지 않아 일시 정지하고 Storm 실행을 끝냅니다. /storm goal 로 이어갈 수 있습니다.`, "warning");
-		await this.#stop(own, "goal-stalled", ctx);
+		ui.notify(`검증되지 않은 변경이 있어 ${round}라운드를 시작합니다(최대 ${own.maxRounds}라운드).`);
+		this.deps.pi.sendUserMessage(buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, reviewer })).catch((error: unknown) => {
+			// The user interrupted the prompt's setup: no round started, so nothing about it is unverified progress.
+			if (promptDropped(error)) {
+				this.#stopSoon(own, "interrupted", ctx);
+				return;
+			}
+			ui.notify(`라운드 메시지를 보내지 못했습니다: ${errorText(error)}`, "warning");
+			this.#stopSoon(own, "no-progress", ctx);
+		});
+	}
+
+	/** Ends `own` for `reason` unless an earlier reason stands; a run that is no longer this session's is left alone. */
+	async #stop(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): Promise<void> {
+		if (this.#own !== own) return;
+		own.ending ??= reason;
+		await this.finish(own.ending, ctx);
 	}
 
 	/** Ends this session's run (if any), writes its record and reports the summary. */
@@ -777,7 +749,7 @@ export class RunController {
 			void this.#stop(own, "budget", ctx).catch((error: unknown) => ui.notify(`Storm 실행을 끝내지 못했습니다: ${errorText(error)}`, "error"));
 			return;
 		}
-		// The aborted turn's end finishes the run, and leaves omp's goal or loop so nothing continues it.
+		// The aborted turn's end finishes the run.
 		ctx.abort();
 	}
 }
@@ -821,11 +793,11 @@ export function summarizeRun(run: RunRecord): string {
 			)
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
-	const end = run.endReason ? ` · ${END_LABEL[run.endReason]}` : "";
-	// Records of 0.9 and earlier have no mode: nothing is shown for them.
-	const mode = run.mode ? ` · ${modeText(run)}${run.turns !== undefined ? ` ${run.turns}턴` : ""}` : "";
+	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
+	// Records of 0.10 and earlier counted no rounds.
+	const rounds = run.turns !== undefined ? ` · ${run.turns}라운드` : "";
 	const lines = [
-		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${mode} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
+		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${rounds} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
 		`- 스폰: ${spawnLine}${blockLine}`,
 	];
 	const main: string[] = [];
@@ -841,7 +813,6 @@ export function summarizeRun(run: RunRecord): string {
 	}
 	if (reads?.blocked) main.push(`큰 읽기 ${reads.blocked}회를 막음`);
 	if (run.maxMainContext) main.push(`최대 컨텍스트 ${tokens(run.maxMainContext)}`);
-	if (run.goal?.tokensUsed) main.push(`목표 토큰 ${tokens(run.goal.tokensUsed)}`);
 	if (run.checkpoints?.length) main.push(`실행 중 압축 ${run.checkpoints.length}회`);
 	if (main.length) lines.push(`- 감독: ${main.join(" · ")}`);
 	const agents = run.agents ?? [];

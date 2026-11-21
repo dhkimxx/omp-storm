@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
  * OMP Storm end-to-end check in omp's interactive TUI, on a pty: what only that host has. Setup through Storm's
- * dialog and its two forms, and runs in each mode: a plain request, a loop, a goal (omp's goal and loop modes exist
- * only in the TUI). Same isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
+ * dialog and its two forms, a plain request, and a run Storm sends back until its changes are reviewed. Same
+ * isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
  *
  * Usage: npm run e2e:tui   (env: see harness.ts)
  *
@@ -14,7 +14,6 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
-import { GOAL_NUDGE } from "../../src/runtime/modes.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, PROFILE_CONFIG, prepare, type Step, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
 
@@ -26,8 +25,6 @@ const OVERLAY_HINT = "PgDn";
 /** The head of omp's form panel (answered and total fields) and the label of its last stop. */
 const FORM_HEAD = /Ask · (\d+) of (\d+) answered/g;
 const FORM_SUBMIT = "Submit";
-/** omp continues a goal or a loop 0.8 s after a turn: this long after a run's end, a turn too many would have started. */
-const AFTER_END_MS = 2_500;
 
 const env = prepare("storm-e2e-tui", 18559);
 const suite = new Suite("E2E (tui)", env);
@@ -206,7 +203,7 @@ async function main(): Promise<void> {
 				const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"] }];
 				const run = await runOf(tui, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 150_000);
 				check("one side turn routed it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
-				check("a vibe run: one settled turn, ended by the settle", run.mode === "vibe" && run.turns === 1 && run.endReason === "settled" && run.status === "done", `${run.mode} turns=${run.turns} ${run.endReason} ${run.status}`);
+				check("one settled turn, ended by the settle", run.turns === 1 && run.endReason === "settled" && run.status === "done", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
 				check("it ended once", files.index().filter(line => line.runId === run.runId).length === 1);
 			});
@@ -215,49 +212,42 @@ async function main(): Promise<void> {
 	);
 
 	await suite.step(
-		"loop 3 runs three turns",
+		"a run is sent back until its changes are reviewed",
 		async () => {
+			const changed = join(env.project, "e2e-rounded.txt");
 			const llm = new LlmCursor(env);
-			await session(async tui => {
-				const run = await runOf(tui, `/storm loop 3 E2E-STEPS ${b64([{ read: "note.txt" }])}`, 150_000);
-				check("a loop run of exactly 3 turns", run.mode === "loop" && run.turns === 3, `${run.mode} turns=${run.turns}`);
-				check("ended by omp's loop limit", run.endReason === "loop-ended" && run.status === "done", `${run.endReason} ${run.status}`);
-				check("the record keeps the limit in turns", run.loop?.limit?.kind === "turns" && run.loop.limit.turns === 3, JSON.stringify(run.loop));
-				const reads = mains(llm.all()).filter(entry => entry.decision.tool === "read").length;
-				check("the prompt ran three times", reads === 3, `reads=${reads}`);
-				await Bun.sleep(AFTER_END_MS);
-				check("nothing runs after the end", mains(llm.all()).filter(entry => entry.decision.tool === "read").length === 3 && files.index().filter(line => line.runId === run.runId).length === 1);
-				const summary = files.index().find(line => line.runId === run.runId);
-				check("the index line has mode, turns and end reason", summary?.mode === "loop" && summary.turns === 3 && summary.endReason === "loop-ended", JSON.stringify(summary));
-			});
+			try {
+				await session(async tui => {
+					const steps: Step[] = [
+						{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code" }, { name: "review", kind: "review" }] } } },
+						{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
+						{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+					];
+					const run = await runOf(tui, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 240_000);
+					const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+					const stormMessages = [...new Set(mains(llm.all()).map(entry => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "")))].filter(user => user.startsWith("<storm-run"));
+					check(
+						"Storm sent round 2 by itself, exactly once",
+						stormMessages.length === 2 && stormMessages.filter(user => user.startsWith(roundTag)).length === 1,
+						`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
+					);
+					const implementer = run.agents?.find(agent => agent.role === "implementer");
+					const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+					check("round 1's file change is counted", implementer?.changes === 1 && existsSync(changed), `changes=${implementer?.changes} file=${existsSync(changed)}`);
+					check("round 2's verdict passes", reviewer?.lastVerdict?.correct === true, JSON.stringify(reviewer?.lastVerdict));
+					check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+					const lines = files.index().filter(line => line.runId === run.runId);
+					check(
+						"the index line agrees, once",
+						lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 2,
+						JSON.stringify(lines),
+					);
+				});
+			} finally {
+				rmSync(changed, { force: true });
+			}
 		},
-		240_000,
-	);
-
-	await suite.step(
-		"goal runs across turns and ends once",
-		async () => {
-			const llm = new LlmCursor(env);
-			await session(async tui => {
-				// Turns 1 and 2 use a tool, so omp continues by itself. Turn 3 does not: omp stops continuing without a
-				// word, and Storm's nudge starts turn 4, which completes the goal.
-				const turns: Step[][] = [[{ read: "note.txt" }], [{ read: "note2.txt" }], [], [{ read: "note3.txt" }, { goal: "complete" }]];
-				const runs = files.runs().length;
-				const run = await runOf(tui, `/storm goal E2E-TURNS ${b64(turns)}`, 240_000);
-				check("a goal run across several turns", run.mode === "goal" && (run.turns ?? 0) > 1, `${run.mode} turns=${run.turns}`);
-				check("ended by the goal tool's complete", run.endReason === "goal-complete" && run.status === "done", `${run.endReason} ${run.status}`);
-				check("the record keeps the objective", run.goal?.objective.startsWith("E2E-TURNS") === true, JSON.stringify(run.goal));
-				const director = mains(llm.all());
-				const completes = director.filter(entry => entry.decision.tool === "goal").length;
-				check("the model completed the goal once", completes === 1, `goal calls=${completes}`);
-				const nudges = director.at(-1)?.users.filter(user => user.includes(GOAL_NUDGE)).length ?? 0;
-				check("the turn without tool activity got Storm's nudge", nudges === 1, `nudges=${nudges}`);
-				await Bun.sleep(AFTER_END_MS);
-				check("it ended exactly once", files.runs().length === runs + 1 && files.index().filter(line => line.runId === run.runId).length === 1 && files.run(run.runId)?.endReason === "goal-complete", `runs=${files.runs().length - runs}`);
-				check("nothing runs after the end", mains(llm.all()).length === director.length, `requests=${mains(llm.all()).length}/${director.length}`);
-			});
-		},
-		360_000,
+		300_000,
 	);
 }
 

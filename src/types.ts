@@ -409,6 +409,8 @@ export interface StormConfig {
 	cleanup?: boolean;
 	/** "문서 정합": doc rules in the run contract and Storm role prompts, doc checks in reviews. Absent → on; false → off. */
 	docs?: boolean;
+	/** Extra rounds Storm may send a run back for when its changes are unverified (0..10); 3 when absent. */
+	rounds?: number;
 }
 
 export type ConfigLoad =
@@ -561,38 +563,26 @@ export interface RollbackOption {
 
 export type RunStatus = "running" | "done" | "budget-exceeded" | "stopped";
 
-/** How long a run lasts: until the session settles, until omp's goal ends, or while omp's loop repeats the task. */
-export type RunMode = "vibe" | "goal" | "loop";
-
 /** Why a run ended. `start-failed`: the handoff could not be sent. */
 export type RunEndReason =
 	| "settled"
-	| "goal-complete"
-	| "goal-dropped"
-	| "goal-paused"
-	| "goal-budget"
-	| "goal-stalled"
-	| "loop-ended"
-	| "loop-paused"
+	| "verified"
+	| "interrupted"
+	| "round-limit"
+	| "no-progress"
+	| "time-limit"
 	| "shutdown"
 	| "budget"
 	| "start-failed";
 
-/** A loop run's bound: main turns in total (the first one included), or wall time. */
-export type LoopLimit = { kind: "turns"; turns: number } | { kind: "duration"; durationMs: number };
-
-/** A shell command checked before each repeat: `until` repeats while it fails, otherwise while it succeeds. */
-export interface LoopCondition {
-	command: string;
-	until: boolean;
+/** A run as requested: the task verbatim and the limits the user stated, if any. */
+export interface RunSpec {
+	task: string;
+	/** Most rounds (main turns) the run may take, when the user set one. */
+	rounds?: number;
+	/** Wall-time limit in minutes, when the user set one. */
+	minutes?: number;
 }
-
-/** A run as requested: the task verbatim and what its mode needs. `resume` continues omp's paused goal. */
-export type RunSpec =
-	| { mode: "vibe"; task: string }
-	| { mode: "goal"; task: string; tokenBudget?: number }
-	| { mode: "goal"; resume: true }
-	| { mode: "loop"; task: string; limit?: LoopLimit; condition?: LoopCondition };
 
 /** One spawn Storm decided: every storm-* spawn, and non-Storm spawns during a run. */
 export interface SpawnRecord {
@@ -668,15 +658,11 @@ export interface RunRecord {
 	checkpoints?: RunCheckpoint[];
 	/** What the run-end janitor removed. */
 	cleanup?: CleanupResult;
-	/** Absent in records of 0.9 and earlier: those were vibe runs. */
-	mode?: RunMode;
 	/** Main-session turns that settled during the run. */
 	turns?: number;
 	endReason?: RunEndReason;
-	/** Goal runs: omp's goal as last reported (`tokensUsed` counts the main session only). */
-	goal?: { objective: string; tokenBudget?: number; tokensUsed?: number };
-	/** Loop runs: the bound and condition omp's loop was entered with. */
-	loop?: { limit?: LoopLimit; condition?: LoopCondition };
+	/** The limits the user stated with the request. */
+	limits?: { rounds?: number; minutes?: number };
 }
 
 export interface RunReads {
@@ -728,7 +714,6 @@ export interface RunSummary {
 	reads?: RunReads;
 	checkpoints?: number;
 	cleanup?: CleanupResult;
-	mode?: RunMode;
 	turns?: number;
 	endReason?: RunEndReason;
 }
@@ -887,13 +872,6 @@ export interface StormToolParams {
 	plan?: PlanRequest;
 	/** run: the user's request, verbatim */
 	task?: string;
-	/** run: how long the run lasts (default vibe) */
-	mode?: RunMode;
-	/** run, loop: total turns, or minutes of wall time; a loop asked for through the tool needs one of them */
-	iterations?: number;
-	minutes?: number;
-	/** run, goal: main-session token budget */
-	tokenBudget?: number;
 }
 
 // ── Agent ledger (implemented in src/runtime/agents.ts, src/report/agents.ts) ────────────────
@@ -926,6 +904,12 @@ export interface AgentEntry {
 	followUps: number;
 	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
 	review?: ReviewTally;
+	/** Successful file-changing tool results in this subagent. */
+	changes?: number;
+	/** ms since epoch of the last file-changing tool result. */
+	lastChangeAt?: number;
+	/** Its latest review verdict. */
+	lastVerdict?: { at: number; correct: boolean };
 	/** ms since epoch: the run-end janitor removed its omp records; its `agent://` output stays. */
 	cleanedAt?: number;
 }

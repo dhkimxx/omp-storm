@@ -152,7 +152,7 @@ describe("run files", () => {
 });
 
 describe("handoff", () => {
-	const base = { runId: "run-20261120-153012-a1b2", config, hash: HASH, task: "로그인 버그를 고쳐 주세요." };
+	const base = { runId: "run-20261120-153012-a1b2", config, hash: HASH, task: "로그인 버그를 고쳐 주세요.", maxRounds: 4 };
 	/** A team with all five roles, the size the limit is set for. */
 	const five: StormConfig = {
 		...config,
@@ -170,6 +170,8 @@ describe("handoff", () => {
 		expect(text.length).toBeLessThanOrEqual(1400);
 		expect(teamLines(text)).toHaveLength(5);
 		expect(buildHandoff({ ...base, config: { ...five, isolation: "isolated" } }).length).toBeLessThanOrEqual(1400);
+		// The longest fixed part without a task still fits the bound.
+		expect(buildHandoff({ ...base, config: five, task: "" }).length).toBeLessThanOrEqual(1400);
 	});
 
 	test("structure: the tag with run id and short hash, the task verbatim, team lines, rules, the closing tag", () => {
@@ -185,9 +187,37 @@ describe("handoff", () => {
 		expect(maxOf("storm-explorer")).toBe(4);
 		expect(maxOf("storm-architect")).toBe(1);
 		expect(maxOf("storm-explorer")).not.toBe(maxOf("storm-implementer"));
-		// Six rules without a budget, shared work tree.
-		expect(rules(text)).toHaveLength(6);
+		// Seven rules without a budget, shared work tree: the reviewer check is one of them.
+		expect(rules(text)).toHaveLength(7);
 		expect(rules(text).every(l => l.startsWith("- "))).toBe(true);
+	});
+
+	test("the review rule names the reviewer and the round budget, and needs a usable reviewer role", () => {
+		const text = buildHandoff({ ...base, config: five, maxRounds: 2 });
+		const review = rules(text).find(l => l.includes("Storm checks the run"));
+		expect(review).toContain("storm-reviewer");
+		expect(review).toContain("2 rounds");
+		// One rule line fewer without it: the same team with its reviewer disabled.
+		const disabled = buildHandoff({ ...base, config: { ...five, disabledRoles: ["reviewer"] } });
+		expect(rules(text)).toHaveLength(rules(disabled).length + 1);
+		expect(rules(disabled).some(l => l.includes("Storm checks the run"))).toBe(false);
+		// The two-role team has no reviewer: nothing to check the team's changes against.
+		const small = buildHandoff({ ...base, config });
+		expect(rules(small)).toHaveLength(6);
+		expect(rules(small).some(l => l.includes("Storm checks the run"))).toBe(false);
+	});
+
+	test("a single-round handoff never promises a round that will not come", () => {
+		const one = rules(buildHandoff({ ...base, config: five, maxRounds: 1 })).find(l => l.includes("Storm checks the run")) ?? "";
+		expect(one).toContain("storm-reviewer");
+		expect(one).not.toContain("sends you back");
+		expect(one).not.toContain("1 rounds");
+		expect(one).toContain("ends unverified");
+		// From two rounds on, the rule names the whole budget.
+		const four = rules(buildHandoff({ ...base, config: five, maxRounds: 4 })).find(l => l.includes("Storm checks the run")) ?? "";
+		expect(four).toContain("sends you back");
+		expect(four).toContain("4 rounds");
+		expect(four).not.toContain("ends unverified");
 	});
 
 	test("no keyword: the first line is the tag, and omp's matcher finds none, even one the user typed in the task", () => {

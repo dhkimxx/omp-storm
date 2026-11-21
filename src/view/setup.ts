@@ -48,6 +48,7 @@ export function recommendedConfig(recs: RoleRecommendation[], priority: Priority
 	};
 	if (current?.budget) config.budget = { ...current.budget };
 	if (current?.contextCap !== undefined) config.contextCap = current.contextCap;
+	if (current?.rounds !== undefined) config.rounds = current.rounds;
 	if (current ? current.cleanup === true : true) config.cleanup = true;
 	if (current?.docs === false) config.docs = false;
 	if (disabled.length) config.disabledRoles = [...disabled];

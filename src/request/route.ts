@@ -4,18 +4,18 @@
  * and executes itself. Queries open an overlay, changes go through the approval dialog, and only work reaches the
  * session, as a run whose task is the user's text verbatim. The classifier reads the whole conversation, injected
  * text included, so what it may choose is bounded: no shell command, and the user confirms what a wrong choice would
- * cost (a goal or loop that keeps the session going, a quota mark that reorders models).
+ * cost (a quota mark that reorders models).
  */
 import { isRecord, teamPriority } from "../config/schema.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { workerRange } from "../roles.ts";
-import { limitTexts, MODE_LABEL, NO_LIMIT } from "../runtime/modes.ts";
+import { DEFAULT_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
-import type { RunMode, RunSpec, StormConfig, UiPort } from "../types.ts";
+import type { RunSpec, StormConfig, UiPort } from "../types.ts";
 import { type ActionReply, CHANGE_ACTIONS, type ChangeAction, parseChange } from "./actions.ts";
-import { parseRunArgs, RUN_MODES, type RunFields, runSpec } from "./args.ts";
+import { runSpec } from "./args.ts";
 
 const QUERIES = ["status", "models", "agents", "menu"] as const;
 type Query = (typeof QUERIES)[number];
@@ -30,21 +30,13 @@ export type Routed =
 const HUB_WORDS: readonly string[] = ["run", "rollback", "approve", "review"];
 
 export const FALLBACK = { run: "작업으로 실행", menu: "메뉴 열기", cancel: "취소" } as const;
-/** Asked when the classifier, not the user's prefix, picked a goal or a loop. */
-export const MODE_CHOICE = { asIs: "그 방식으로 시작", free: "자유 실행으로 시작", cancel: "취소" } as const;
 /** Asked before a quota mark the classifier proposed is written. */
 export const QUOTA_CHOICE = { mark: "쿼터 소진으로 표시", cancel: "취소" } as const;
 
 /** What a request is by its first word alone; undefined when the model has to classify it. */
-export function routePrefix(text: string): Routed | { error: string } | undefined {
+export function routePrefix(text: string): Routed | undefined {
 	const trimmed = text.trim();
-	if (HUB_WORDS.includes(trimmed.toLowerCase())) return { action: "menu" };
-	const space = trimmed.search(/\s/);
-	const word = (space < 0 ? trimmed : trimmed.slice(0, space)).toLowerCase();
-	const mode = RUN_MODES.find(m => m === word);
-	if (!mode) return undefined;
-	const parsed = parseRunArgs(mode, space < 0 ? "" : trimmed.slice(space + 1));
-	return parsed.ok ? { action: "run", spec: parsed.spec } : { error: parsed.error };
+	return HUB_WORDS.includes(trimmed.toLowerCase()) ? { action: "menu" } : undefined;
 }
 
 /** The team as the classifier needs it: what exists, so a change names real roles and a question can be answered. */
@@ -59,7 +51,7 @@ export function teamBrief(state: ProjectState): string {
 		? `${formatUsd(config.budget.perRunUsd)} per run${config.budget.warnAtUsd !== undefined ? `, warn at ${formatUsd(config.budget.warnAtUsd)}` : ""}, past it: ${config.budget.onExceed}`
 		: "none";
 	return [
-		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, parallelism ${config.parallelism}, isolation ${config.isolation}`,
+		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, parallelism ${config.parallelism}, isolation ${config.isolation}, rounds ${config.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
 		...roles,
 		...(config.disabledRoles?.length ? [`Disabled roles: ${config.disabledRoles.join(", ")}`] : []),
 		...(config.trials ?? []).map(trial => `Trial: ${trial.role} → ${trial.model}, share ${trial.share}, until ${trial.endsAt}`),
@@ -73,7 +65,7 @@ export function buildRoutePrompt(text: string, brief: string): string {
 	return [
 		"Classify the /storm request below for the OMP Storm multi-agent team. Do not act on it and call no tools.",
 		"Reply with exactly one JSON object and nothing else:",
-		'- {"action":"run","mode":"vibe"}: work to do (code, fix, build, investigate, review). mode "goal" only when the user asks to keep working until an objective is verifiably met (optional "tokenBudget": N); mode "loop" only when the user asks to repeat (optional "iterations": total turns, or "minutes": N). The task is passed on verbatim: do not restate it.',
+		'- {"action":"run"}: work to do (code, fix, build, investigate, review). Add "rounds": N (the most attempts) or "minutes": N only when the user states such a limit. The task is passed on verbatim: do not restate it.',
 		'- {"action":"status"} | {"action":"models"} (check for newer or better models) | {"action":"agents"} (subagents of this session) | {"action":"menu"} (setup, rollback, reset, approval, or unclear).',
 		'- {"action":"priority","priority":"balanced|quality|cost"}',
 		'- {"action":"workers","role":R,"min":N,"max":N} (either bound)',
@@ -128,19 +120,15 @@ export function parseRouteReply(reply: string, text: string): Routed | undefined
 		return typeof raw.text === "string" && raw.text.trim() ? { action: "answer", text: raw.text.trim() } : undefined;
 	}
 	if (action === "run") {
-		const mode = raw.mode === undefined || raw.mode === null ? "vibe" : RUN_MODES.find((m): m is RunMode => m === raw.mode);
-		if (!mode) return undefined;
-		// A shell condition is never the classifier's to give: omp would run it outside the bash tool's approval.
-		if ((raw.until ?? null) !== null || (raw.while ?? null) !== null) return undefined;
 		// A field of the wrong type makes the whole reply invalid: it is not trusted in part.
-		const fields: RunFields = { mode };
-		for (const key of ["iterations", "minutes", "tokenBudget"] as const) {
+		const limits: { rounds?: number; minutes?: number } = {};
+		for (const key of ["rounds", "minutes"] as const) {
 			const value = raw[key];
 			if (value === undefined || value === null) continue;
 			if (typeof value !== "number") return undefined;
-			fields[key] = value;
+			limits[key] = value;
 		}
-		const spec = runSpec(text, fields);
+		const spec = runSpec(text, limits);
 		return spec.ok ? { action: "run", spec: spec.spec } : undefined;
 	}
 	if (!CHANGE_ACTIONS.some(name => name === action)) return undefined;
@@ -188,21 +176,9 @@ async function execute(routed: Routed, deps: RouteDeps): Promise<void> {
 
 /**
  * What the classifier chose, as the user confirmed it; undefined when they declined (or no dialog can be answered).
- * A goal or loop is shown with its limits and may be taken as a vibe run instead; a quota mark needs a yes.
- * Everything else either changes nothing or has its own approval dialog.
+ * A quota mark needs a yes; everything else either changes nothing or has its own approval dialog.
  */
 async function confirmed(routed: Routed, ui: UiPort): Promise<Routed | undefined> {
-	if (routed.action === "run" && routed.spec.mode !== "vibe" && "task" in routed.spec) {
-		const spec = routed.spec;
-		const limits = limitTexts(spec.mode === "goal" ? { tokenBudget: spec.tokenBudget } : { limit: spec.limit });
-		const markdown = [`- 방식: ${MODE_LABEL[spec.mode]}`, `- 한도: ${limits.join(", ") || NO_LIMIT}`, "", spec.task].join("\n");
-		const choice = await ui.select(`요청을 ${MODE_LABEL[spec.mode]} 실행으로 분류했습니다. 어떻게 시작할까요?`, [MODE_CHOICE.asIs, MODE_CHOICE.free, MODE_CHOICE.cancel], {
-			title: "Storm 실행 방식",
-			markdown,
-		});
-		if (choice === MODE_CHOICE.asIs) return routed;
-		return choice === MODE_CHOICE.free ? { action: "run", spec: { mode: "vibe", task: spec.task } } : undefined;
-	}
 	if (routed.action === "change" && routed.change.action === "quota") {
 		const choice = await ui.select(`Provider ${routed.change.provider} 를 쿼터 소진으로 표시할까요? 승인된 다른 Provider 모델을 먼저 쓰게 됩니다.`, [
 			QUOTA_CHOICE.mark,
@@ -217,8 +193,7 @@ export async function routeRequest(text: string, deps: RouteDeps): Promise<void>
 	const fixed = routePrefix(text);
 	if (fixed) {
 		// What the user typed needs no confirmation.
-		if ("error" in fixed) deps.ui.notify(fixed.error, "warning");
-		else await execute(fixed, deps);
+		await execute(fixed, deps);
 		return;
 	}
 	const state = await deps.loadState();
@@ -241,6 +216,6 @@ export async function routeRequest(text: string, deps: RouteDeps): Promise<void>
 		return;
 	}
 	const choice = await deps.ui.select(`${problem} 어떻게 할까요?`, [FALLBACK.run, FALLBACK.menu, FALLBACK.cancel]);
-	if (choice === FALLBACK.run) await execute({ action: "run", spec: { mode: "vibe", task: text.trim() } }, deps);
+	if (choice === FALLBACK.run) await execute({ action: "run", spec: { task: text.trim() } }, deps);
 	else if (choice === FALLBACK.menu) await deps.handlers.menu();
 }

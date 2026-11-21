@@ -256,6 +256,7 @@ describe("setup", () => {
 			roles: { ...TEAM.roles, implementer: { agent: "storm-implementer", models: ["a/i"], workers: { min: 2, max: 7 } } },
 			docs: false,
 			cleanup: true,
+			rounds: 2,
 			budget: { perRunUsd: 5, warnAtUsd: 3, onExceed: "stop" },
 			disabledRoles: ["architect"],
 		};
@@ -264,7 +265,7 @@ describe("setup", () => {
 		await setupFlow(env, f.ui);
 		const state = await load();
 		const saved = state.config.status === "ok" ? state.config.config : undefined;
-		expect(saved).toMatchObject({ docs: false, cleanup: true, budget: current.budget!, disabledRoles: ["architect"] });
+		expect(saved).toMatchObject({ docs: false, cleanup: true, rounds: 2, budget: current.budget!, disabledRoles: ["architect"] });
 		expect(saved?.roles.implementer?.workers).toEqual({ min: 2, max: 7 });
 		expect(saved?.roles.architect).toBeUndefined();
 		// The models are the recommendation's, from this catalog.

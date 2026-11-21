@@ -1,10 +1,11 @@
-/** A main session as the run controller sees it: omp's session modes, hand-fired timers, a scripted UI and a fake ctx. */
+/** A main session as the run controller sees it: omp's session modes, a scripted UI and a fake ctx. */
 import type { ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
-import { RunController, type RunTimers } from "../src/runtime/controller.ts";
+import type { RunTimers } from "../src/runtime/controller.ts";
+import { RunController } from "../src/runtime/controller.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RunSpec, StormConfig } from "../src/types.ts";
 import { approvedState, teamOf } from "./fixtures.ts";
-import { type Answer, scriptedUi } from "./support.ts";
+import { type Answer, type ScriptedUi, scriptedUi } from "./support.ts";
 
 /**
  * Resolves once `done()` holds; fails instead of hanging. Detached work (a queued start, a fired timer, a live write)
@@ -24,13 +25,30 @@ export async function until(done: () => boolean | Promise<boolean>): Promise<voi
 
 type ModeFailure = Pick<Extract<SessionModeResult, { ok: false }>, "code" | "message">;
 
+export interface FakeModes {
+	requests: SessionModeRequest[];
+	state: SessionModeState;
+	snapshot(): SessionModeState;
+	api: {
+		getState(): SessionModeState;
+		set(request: SessionModeRequest): Promise<SessionModeResult>;
+	};
+}
+
 /** omp's session modes as an extension sees them: transitions apply at once and every request is recorded. */
-export function fakeModes(opts: { vibe?: boolean; pausedGoal?: { objective: string; tokenBudget?: number }; fail?: (request: SessionModeRequest) => ModeFailure | undefined } = {}) {
+export function fakeModes(
+	opts: {
+		vibe?: boolean;
+		goal?: "inactive" | "active" | "paused";
+		loop?: "inactive" | "active" | "paused";
+		fail?: (request: SessionModeRequest) => ModeFailure | undefined;
+	} = {},
+): FakeModes {
 	const state: SessionModeState = {
 		plan: { status: "inactive" },
 		vibe: { status: opts.vibe ? "active" : "inactive" },
-		goal: opts.pausedGoal ? { status: "paused", ...opts.pausedGoal } : { status: "inactive" },
-		loop: { status: "inactive" },
+		goal: { status: opts.goal ?? "inactive" },
+		loop: { status: opts.loop ?? "inactive" },
 	};
 	const requests: SessionModeRequest[] = [];
 	const snapshot = (): SessionModeState => structuredClone(state);
@@ -45,42 +63,53 @@ export function fakeModes(opts: { vibe?: boolean; pausedGoal?: { objective: stri
 				const failure = opts.fail?.(request);
 				if (failure) return { ok: false, ...failure, state: snapshot() };
 				if (request.mode === "vibe") state.vibe.status = request.action === "enter" ? "active" : "inactive";
-				else if (request.mode === "loop") state.loop.status = request.action === "enter" ? "active" : "inactive";
-				else if (request.mode === "goal") {
-					if (request.action === "enter") {
-						state.goal = { status: "active", objective: request.objective, ...(request.tokenBudget !== undefined ? { tokenBudget: request.tokenBudget } : {}) };
-					} else state.goal.status = request.action === "pause" ? "paused" : request.action === "resume" ? "active" : "inactive";
-				}
 				return { ok: true, changed: true, state: snapshot() };
 			},
 		},
 	};
 }
 
-export type FakeModes = ReturnType<typeof fakeModes>;
+/** What the fake main session reports while Storm decides whether the next round may start. */
+export interface SessionHold {
+	/** No turn is streaming. */
+	idle: boolean;
+	/** A message is queued for the session. */
+	pending: boolean;
+	/** The user's draft in the editor. */
+	editor: string;
+}
 
-/** Timers the test fires by hand. */
-export function fakeTimers() {
-	const pending: Array<{ run: () => void; ms: number }> = [];
-	const timers: RunTimers = {
-		set: (run, ms) => {
-			const timer = { run, ms };
-			pending.push(timer);
-			return timer;
+/** The controller's wait timers as a test drives them: set, cleared and fired by hand instead of by the clock. */
+export interface FakeTimers {
+	api: RunTimers;
+	/** Timers set and neither fired nor cleared. */
+	pending(): number;
+	/** The delays of the pending timers, oldest first. */
+	delays(): number[];
+	/** Fires every timer pending now, once each. */
+	fire(): void;
+}
+
+export function fakeTimers(): FakeTimers {
+	const pending: Array<{ handle: object; run: () => void; ms: number }> = [];
+	return {
+		api: {
+			set: (run, ms) => {
+				const handle = {};
+				pending.push({ handle, run, ms });
+				return handle;
+			},
+			clear: handle => {
+				const at = pending.findIndex(timer => timer.handle === handle);
+				if (at >= 0) pending.splice(at, 1);
+			},
 		},
-		clear: handle => {
-			const at = pending.indexOf(handle as (typeof pending)[number]);
-			if (at >= 0) pending.splice(at, 1);
+		pending: () => pending.length,
+		delays: () => pending.map(timer => timer.ms),
+		fire: () => {
+			for (const timer of pending.splice(0)) timer.run();
 		},
 	};
-	/** Fires the one pending timer and waits for `done`, what it is expected to bring about. */
-	const fire = async (done: () => boolean): Promise<void> => {
-		const timer = pending.shift();
-		if (!timer) throw new Error("no timer is pending");
-		timer.run();
-		await until(done);
-	};
-	return { timers, pending, fire };
 }
 
 /** The team a session runs unless the test gives its own. */
@@ -99,15 +128,16 @@ export interface SessionOptions {
 	modes?: FakeModes | null;
 	/** Scripted dialog answers; a dialog past them fails the test. */
 	answers?: Answer[];
-	loopMode?: string;
 	/** What the session reports as its context usage. */
 	usage?: { tokens: number; contextWindow: number; percent: number };
 	/** Runs when the controller compacts the session. */
 	compact?: (instructions: string) => Promise<void>;
 	/** Runs when the controller sends a message to the session (a rejection is a failed send). */
 	send?: (message: string) => Promise<void>;
-	/** The run's subagents, as the agent ledger reports them at run end. */
-	agents?: AgentEntry[];
+	/** The run's subagents as the agent ledger reports them; a function is asked at every decision, an array may be mutated. */
+	agents?: AgentEntry[] | (() => AgentEntry[]);
+	/** What the session reports while Storm decides; idle and empty unless the test says otherwise. */
+	hold?: Partial<SessionHold>;
 	/** The whole process ledger; the run's agents when absent. */
 	ledger?: () => AgentEntry[];
 	/** omp's agent dir: with it the run-end janitor may delete omp records below `<agentDir>/sessions`. */
@@ -117,18 +147,43 @@ export interface SessionOptions {
 	now?: () => number;
 }
 
-/** A run controller over a fake main session. Nothing is waited for by the clock: stall timers are fired by hand. */
-export function fakeSession(opts: SessionOptions) {
+/** A run controller over a fake main session. */
+export interface FakeSession {
+	controller: RunController;
+	ctx: ExtensionContext;
+	config: StormConfig;
+	repo: ProjectState["repo"];
+	state: ProjectState;
+	modes: FakeModes | undefined;
+	ui: ScriptedUi;
+	/** Messages sent to the session. */
+	sent: string[];
+	notices: ScriptedUi["notices"];
+	/** What the fake ctx reports while Storm decides whether the next round may start. */
+	hold: SessionHold;
+	/** The hold timer: pending count and hand-fired callbacks. */
+	timers: FakeTimers;
+	/** What the session saw, in order: "select", "compact", "set:<mode>:<action>", "send". Notices and records are in `ui.events`. */
+	readonly events: string[];
+	/** One main turn: it starts, and settles. */
+	turn(): Promise<void>;
+	/** Starts a run or fails the test with the refusal. */
+	start(spec?: RunSpec): Promise<string>;
+	aborts(): number;
+	/** Run summaries posted: the last thing a finished run does. */
+	summaries(): number;
+}
+
+export function fakeSession(opts: SessionOptions): FakeSession {
 	const config = opts.config ?? SESSION_TEAM;
 	const approved = approvedState(opts.root, config);
 	const state = opts.state ? opts.state(approved) : approved;
 	const modes = opts.modes === null ? undefined : (opts.modes ?? fakeModes());
 	const ui = scriptedUi(opts.answers ?? []);
 	const sent: string[] = [];
-	const clock = fakeTimers();
+	const hold: SessionHold = { idle: opts.hold?.idle ?? true, pending: opts.hold?.pending ?? false, editor: opts.hold?.editor ?? "" };
+	const timers = fakeTimers();
 	let aborts = 0;
-	/** What makes omp hold a continuation: the test sets these as the session would be. */
-	const hold = { busy: false, pending: false, editor: "" };
 	const controller = new RunController({
 		pi: {
 			sendUserMessage: async message => {
@@ -141,18 +196,17 @@ export function fakeSession(opts: SessionOptions) {
 		ui: () => ui.ui,
 		loadState: opts.loadState ?? (async () => state),
 		now: opts.now ?? Date.now,
-		agents: () => opts.agents ?? [],
+		agents: () => (typeof opts.agents === "function" ? opts.agents() : (opts.agents ?? [])),
+		timers: timers.api,
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
 		...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
-		timers: clock.timers,
-		...(opts.loopMode !== undefined ? { loopMode: async () => opts.loopMode } : {}),
 	});
 	// The controller hands ctx to its own deps and reads only these members of it.
 	const ctx = {
 		cwd: opts.root,
-		isIdle: () => !hold.busy,
-		hasPendingMessages: () => hold.pending,
 		hasUI: true,
+		isIdle: () => hold.idle,
+		hasPendingMessages: () => hold.pending,
 		ui: { getEditorText: () => hold.editor },
 		getContextUsage: () => opts.usage,
 		compact: async (instructions: string) => {
@@ -183,30 +237,24 @@ export function fakeSession(opts: SessionOptions) {
 		state,
 		modes,
 		ui,
-		/** Messages sent to the session: the handoff first, then goal nudges. */
 		sent,
 		notices: ui.notices,
-		clock,
 		hold,
-		/** What the session saw, in order: "select", "compact", "set:<mode>:<action>", "send". Notices and records are in `ui.events`. */
+		timers,
 		get events(): string[] {
 			return ui.events.filter(event => !event.startsWith("notify:") && event !== "record" && event !== "report");
 		},
-		/** One main turn: it starts, and settles. */
 		turn: async (): Promise<void> => {
 			controller.onAgentStart();
 			await controller.onAgentEnd({}, ctx);
 		},
-		/** Starts a run or fails the test with the refusal. */
-		start: async (spec: RunSpec = { mode: "vibe", task: "task" }): Promise<string> => {
+		start: async (spec: RunSpec = { task: "task" }): Promise<string> => {
 			const started = await controller.start(ctx, spec);
 			if (!started.ok) throw new Error(started.reason);
 			return started.runId;
 		},
 		aborts: () => aborts,
-		/** Run summaries posted: the last thing a finished run does. */
 		summaries: () => ui.records.length,
 	};
 }
 
-export type FakeSession = ReturnType<typeof fakeSession>;

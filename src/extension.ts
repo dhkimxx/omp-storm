@@ -1,9 +1,9 @@
 /**
  * OMP Storm extension: /storm, the storm tool, spawn-time enforcement of the approved team, and Storm runs (handoff,
- * run-scoped policy, budget, run modes, telemetry). The handlers here gather inputs, call the policy, request and
- * runtime modules and apply their results. Storm sends one thing to the main session, a run's handoff; everything
- * else is decided in dialogs and overlays. Module-level state is shared by every session in the process, because
- * subagent sessions reuse this module.
+ * run-scoped policy, budget, telemetry). The handlers here gather inputs, call the policy, request and runtime modules
+ * and apply their results. Storm's only messages to the main session are a run's handoff and the rounds it starts;
+ * everything else is decided in dialogs and overlays. Module-level state is shared by every session in the process,
+ * because subagent sessions reuse this module.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,7 @@ import {
 } from "./flows.ts";
 import { serialized } from "./fsutil.ts";
 import { execPort, ompBinary } from "./omp.ts";
-import { pathOf } from "./policy/director.ts";
+import { changesFiles, pathOf } from "./policy/director.ts";
 import { docPromptFor } from "./policy/docs.ts";
 import { deliveredFollowUp, followUpAgent } from "./policy/followup.ts";
 import { directorRead, noteChildRead } from "./policy/reads.ts";
@@ -35,17 +35,18 @@ import { decideToolCall } from "./policy/toolcall.ts";
 import { directorCap, PACKAGE_JSON, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import {
 	listAgents,
+	noteAgentChange,
 	noteAgentEnd,
 	noteAgentFollowUp,
 	noteAgentParked,
 	noteAgentReview,
+	noteAgentRun,
 	noteAgentStart,
 	noteAgentUsage,
 } from "./runtime/agents.ts";
 import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, anyLedgerRun, recordCost } from "./runtime/ledger.ts";
-import { readLoopMode } from "./runtime/modes.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
@@ -72,12 +73,6 @@ const SHORTCUTS = [
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
 const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.value);
-/** Run modes take the rest of the line as their task; the request router parses them. */
-const MODE_HINTS = [
-	{ value: "vibe ", label: "vibe <작업>", description: "자유 실행: 세션이 멈출 때까지" },
-	{ value: "goal ", label: "goal <목표> [--budget N]", description: "목표가 달성될 때까지" },
-	{ value: "loop ", label: "loop [횟수|시간] [--until '<명령>'] <프롬프트>", description: "반복하며 개선" },
-] as const;
 const CONFIG_TTL_MS = 5_000;
 
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
@@ -166,6 +161,14 @@ export default function storm(pi: ExtensionAPI): void {
 		const run = activeLedgerRun((await repoFor(ctx)).repoId);
 		if (run) touchRun(run.runId);
 	};
+	/**
+	 * The project's active run, when its repo is already resolved: a subagent's tool events must not wait on a git
+	 * lookup (and one that times out would block the call). The start of a run records the repo.
+	 */
+	const activeRunFor = (ctx: ExtensionContext): string | undefined => {
+		const repo = resolvedRepos.get(ctx.cwd);
+		return repo && activeLedgerRun(repo.repoId)?.runId;
+	};
 
 	const runs = new RunController({
 		pi,
@@ -180,7 +183,6 @@ export default function storm(pi: ExtensionAPI): void {
 		agents: runId => listAgents({ runId }),
 		ledger: () => listAgents(),
 		agentDir: pi.pi.getAgentDir(),
-		loopMode: () => readLoopMode(exec, ompBinary()),
 	});
 
 	/** Compacts the director while it waits on subagents, once its context reaches the director cap. */
@@ -395,10 +397,12 @@ export default function storm(pi: ExtensionAPI): void {
 	// Director mode: blocking the call instead of swapping the tool list keeps the main session's prompt cache intact.
 	pi.on("tool_call", (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
-			// A subagent's reads are indexed under the run of its latest turn.
+			// A subagent's reads are indexed under the run it is working in; a reused live agent has no before_agent_start.
 			if (event.toolName !== "read") return undefined;
-			const runId = listAgents().find(agent => agent.id === ctx.agent.id)?.runId;
-			if (runId) noteChildRead(runId, ctx.agent.id, pathOf(event.input), ctx.cwd);
+			const runId = activeRunFor(ctx);
+			if (runId !== undefined) noteAgentRun(ctx.agent.id, runId);
+			const readRun = runId ?? listAgents().find(agent => agent.id === ctx.agent.id)?.runId;
+			if (readRun) noteChildRead(readRun, ctx.agent.id, pathOf(event.input), ctx.cwd);
 			return undefined;
 		}
 		const runId = runs.runId();
@@ -420,8 +424,14 @@ export default function storm(pi: ExtensionAPI): void {
 
 	pi.on("tool_result", (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
+			// omp emits no before_agent_start for a follow-up to a live idle agent, so the run it works in is taken here.
+			const runId = activeRunFor(ctx);
+			if (runId !== undefined) noteAgentRun(ctx.agent.id, runId);
 			// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
-			if (event.toolName === "yield" && !event.isError) noteAgentReview(ctx.agent.id, event.input);
+			const now = Date.now();
+			if (event.toolName === "yield" && !event.isError) noteAgentReview(ctx.agent.id, event.input, now);
+			// The review gate reads what the team changed; a file-changing call that failed changed nothing.
+			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now);
 			return undefined;
 		}
 		const runId = runs.runId();
@@ -444,14 +454,6 @@ export default function storm(pi: ExtensionAPI): void {
 		runs.onAgentStart();
 	});
 
-	// omp's goal and loop modes decide when a goal or loop run is over.
-	pi.on("goal_updated", async (event, ctx) => {
-		if (ctx.agent.kind === "main") await runs.onGoalUpdated(event.goal, ctx);
-	});
-	pi.on("mode_changed", async (event, ctx) => {
-		if (ctx.agent.kind === "main") await runs.onModeChanged(event.state, ctx);
-	});
-
 	pi.on("agent_end", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
 			noteAgentEnd({ id: ctx.agent.id, now: Date.now(), settled: !(event.willContinue || event.awaitingAsyncWork) });
@@ -460,7 +462,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		// Paused on async subagents: the moment to shed context before their results arrive.
 		if (event.awaitingAsyncWork) checkpointDirector(ctx);
-		// Ends a settled vibe run, counts a goal or loop run's turn; a queued run starts detached from this handler.
+		// Ends the run when the session settles; a queued run starts detached from this handler.
 		await runs.onAgentEnd(event, ctx);
 		// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
 		if (!event.willContinue && !event.awaitingAsyncWork) await syncSession(ctx).catch(() => undefined);
@@ -522,10 +524,10 @@ export default function storm(pi: ExtensionAPI): void {
 	registerReportRenderer(pi);
 
 	pi.registerCommand("storm", {
-		description: "Storm 멀티에이전트 팀 (/storm: 현황과 메뉴 · /storm <요청>: 작업 맡기기, 팀 변경, 질문 · /storm vibe|goal|loop <작업>)",
+		description: "Storm 멀티에이전트 팀 (/storm: 현황과 메뉴 · /storm <요청>: 작업 맡기기, 팀 변경, 질문)",
 		getArgumentCompletions: prefix => {
 			const typed = prefix.trim();
-			const matches = [...SHORTCUTS, ...MODE_HINTS].filter(hint => hint.value.startsWith(typed));
+			const matches = SHORTCUTS.filter(hint => hint.value.startsWith(typed));
 			return matches.length ? matches : null;
 		},
 		handler: async (args, ctx) => {

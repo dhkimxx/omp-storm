@@ -12,7 +12,7 @@ import { modelWarnings } from "../proposals/build.ts";
 import { NEEDS_APPROVAL } from "../proposals/decide.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { type ActionOutcome, type ActionReply, NO_CONFIG, propose } from "../request/actions.ts";
-import { RUN_MODES, runSpec } from "../request/args.ts";
+import { runSpec } from "../request/args.ts";
 import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import type { LaneKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
@@ -38,7 +38,7 @@ const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 
 const DESCRIPTION = `OMP Storm: hand work to this project's approved multi-agent team, and direct a run.
-- run {task, mode?, …}: the user wants work done by the team. task: the request verbatim. mode vibe (default) lasts until you settle; goal continues until the objective is met (tokenBudget optional); loop repeats the task and needs iterations (total turns) or minutes. Call it, then end your reply at once: Storm starts the run after this turn.
+- run {task}: the user wants work done by the team. task: the request verbatim. Call it, then end your reply at once: Storm starts the run after this turn.
 - plan {plan}: required during a run before any spawn. lanes [{name, kind, role?, files?, goal?}], kind explore|code|run|review|design; workers: live agents per role. Past the approved bounds the user approves a config change in a dialog. Resubmit when the plan changes.
 - status: team, approval, runs, trials, subagents.
 - agents: this session's subagents: context against the cap, whether a follow-up is allowed.
@@ -48,10 +48,6 @@ function stormParams(z: Zod): StormToolSchema {
 	return z.object({
 		action: z.enum(ACTIONS).describe("Operation to perform"),
 		task: z.string().optional().describe("run: the user's task request, verbatim"),
-		mode: z.enum(RUN_MODES).optional().describe("run: vibe (default) | goal | loop"),
-		iterations: z.number().optional().describe("run, loop: total turns"),
-		minutes: z.number().optional().describe("run, loop: wall-time limit"),
-		tokenBudget: z.number().optional().describe("run, goal: main-session token budget"),
 		plan: z
 			.object({
 				lanes: z
@@ -118,11 +114,9 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 			return { outcome: "ok", text: renderAgentRows(rows, host.now()) };
 		}
 		case "run": {
-			const spec = runSpec(params.task ?? "", params);
+			const spec = runSpec(params.task ?? "");
 			if (!spec.ok) return rejected(spec.error);
-			// The model, not the user, chose this loop: it must end by itself.
-			if (spec.spec.mode === "loop" && !spec.spec.limit) return rejected("loop 실행에는 iterations 또는 minutes 가 필요합니다. 한도 없는 반복은 사용자가 /storm loop 로 직접 시작합니다.");
-			// A mode can only be entered once this turn is over, so the run is queued for the turn's end.
+			// A run can only start once this turn is over, so it is queued for the turn's end.
 			const queued = host.runtime.requestRun(spec.spec);
 			if (!queued.ok) return rejected(queued.reason);
 			return {

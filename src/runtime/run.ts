@@ -5,7 +5,7 @@ import { readJson, writeJsonAtomic } from "../fsutil.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
 import { LANE_ROLES, ROLE_STAND_INS, roleTitle, workerRange } from "../roles.ts";
-import type { LaneKind, RoleId, RunMode, RunRecord, StormConfig } from "../types.ts";
+import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
 
 /** What a lane kind covers beyond its name, where the role alone does not say it. */
 const LANE_NOTE: Partial<Record<LaneKind, string>> = { run: "long builds, device runs, waiting, logs" };
@@ -118,11 +118,12 @@ export async function pruneRuns(root: string, keep = 50): Promise<void> {
 
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
- * rules are taught by their block reasons, so each has at most one clause here. A goal or loop run adds one line on
- * what its omp mode asks of the director. Everything sits in one XML section: omp's keyword matcher skips those, so
- * neither this text nor the task can attach an omp workflow notice (whose instructions contradict what Storm enforces).
+ * rules are taught by their block reasons, so each has at most one clause here. `maxRounds` is the run's whole round
+ * budget, fixed by the controller when the run starts. Everything sits in one XML section: omp's keyword matcher skips
+ * those, so neither this text nor the task can attach an omp workflow notice (whose instructions contradict what
+ * Storm enforces).
  */
-export function buildHandoff(input: { runId: string; config: StormConfig; hash: string; task: string; mode?: RunMode }): string {
+export function buildHandoff(input: { runId: string; config: StormConfig; hash: string; task: string; maxRounds: number }): string {
 	const { config } = input;
 	const team = Object.entries(config.roles).flatMap(([id, role]) => {
 		if (!usableRole(config, id)) return [];
@@ -140,12 +141,14 @@ export function buildHandoff(input: { runId: string; config: StormConfig; hash: 
 		`- Do not finish with an \`incorrect\` review verdict or an open P0${docsEnabled(config) ? "; doc findings count like code findings" : ""}.`,
 		"- Keep going until every lane is done or blocked.",
 	];
-	if (input.mode === "goal") {
+	const reviewer = usableRole(config, "reviewer")?.agent;
+	if (reviewer) {
+		const check = `- When you stop, Storm checks the run: files the team changed need a \`correct\` verdict from \`${reviewer}\` given after the last change.`;
 		rules.push(
-			`- Goal run: omp continues you until the goal ends. Call the \`goal\` tool's complete only after \`${agentFor(config, "reviewer") ?? "a reviewer"}\` checked the objective against the current state.`,
+			input.maxRounds === 1
+				? `${check} Without it the run ends unverified.`
+				: `${check} Without it Storm sends you back, up to ${input.maxRounds} rounds in all.`,
 		);
-	} else if (input.mode === "loop") {
-		rules.push("- Loop run: this task is sent again after each turn. Improve on the last result; keep notes in `local://`.");
 	}
 	if (config.budget) {
 		const past = config.budget.onExceed === "stop" ? "the run stops" : "new spawns are blocked";
@@ -160,20 +163,6 @@ export function buildHandoff(input: { runId: string; config: StormConfig; hash: 
 		...team,
 		"Rules:",
 		...rules,
-		"</storm-run>",
-	].join("\n");
-}
-
-/**
- * What omp's loop submits again on every repeat of a loop run: the task inside the run's section, so omp's keyword
- * matcher skips it like the handoff and the director knows it for the run's task, with the one rule a compacted
- * context must not lose.
- */
-export function buildLoopBody(runId: string, task: string): string {
-	return [
-		`<storm-run id="${runId}" repeat="true">`,
-		"Task, sent again by the loop. Improve on the last result. You still direct this run: delegate every change to the team, under the rules of the run's first message.",
-		task,
 		"</storm-run>",
 	].join("\n");
 }

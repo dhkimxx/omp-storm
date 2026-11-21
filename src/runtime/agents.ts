@@ -4,7 +4,7 @@
  * in the one map the parent reads.
  */
 import type { AgentEntry } from "../types.ts";
-import { tallyFromYield } from "./review.ts";
+import { tallyFromYield, verdictOf } from "./review.ts";
 
 /** Parked entries older than this are dropped when a new agent is added. */
 const PARKED_KEEP_MS = 24 * 3_600_000;
@@ -15,6 +15,19 @@ function prune(now: number): void {
 	for (const [id, e] of agents) {
 		if (e.state === "parked" && now - e.lastActivityAt > PARKED_KEEP_MS) agents.delete(id);
 	}
+}
+
+/**
+ * Makes an entry one of `runId`'s agents. A turn during a later run (a follow-up or a revive) counts there: its spend
+ * and reads belong to that run, and the change and verdict fields start over. Already there: a no-op.
+ */
+export function noteAgentRun(id: string, runId: string): void {
+	const e = agents.get(id);
+	if (!e || e.runId === runId) return;
+	delete e.changes;
+	delete e.lastChangeAt;
+	delete e.lastVerdict;
+	e.runId = runId;
 }
 
 export function noteAgentStart(input: {
@@ -31,8 +44,7 @@ export function noteAgentStart(input: {
 		e.lastActivityAt = input.now;
 		if (input.parentId !== undefined) e.parentId = input.parentId;
 		if (input.role !== undefined) e.role = input.role;
-		// A turn during a later run (a follow-up or a revive) makes it that run's agent: its spend and reads count there.
-		if (input.runId !== undefined) e.runId = input.runId;
+		if (input.runId !== undefined) noteAgentRun(input.id, input.runId);
 		return;
 	}
 	prune(input.now);
@@ -82,12 +94,23 @@ export function noteAgentParked(id: string): void {
 	if (e) e.state = "parked";
 }
 
-/** Folds a `yield` call's args into the agent's review tally (one review per verdict); input that is no review leaves it alone. */
-export function noteAgentReview(id: string, input: unknown): void {
+/** Folds a `yield` call's args into the agent's review tally (one review per verdict) and keeps its latest verdict; input that is no review leaves it alone. */
+export function noteAgentReview(id: string, input: unknown, now: number): void {
 	const e = agents.get(id);
 	if (!e) return;
 	const review = tallyFromYield(e.review, input);
 	if (review) e.review = review;
+	const correct = verdictOf(input);
+	if (correct !== undefined) e.lastVerdict = { at: now, correct };
+}
+
+/** One more successful file-changing tool result inside the agent; unknown ids are ignored. */
+export function noteAgentChange(id: string, now: number): void {
+	const e = agents.get(id);
+	if (!e) return;
+	e.changes = (e.changes ?? 0) + 1;
+	e.lastChangeAt = now;
+	e.lastActivityAt = now;
 }
 
 function descends(e: AgentEntry, ancestorId: string): boolean {

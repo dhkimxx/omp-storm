@@ -3,7 +3,7 @@
  * project files below a temp dir. As in omp, the main session and each subagent session load the extension
  * separately and share its module state.
  */
-import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
@@ -15,6 +15,7 @@ import { approveAndSave } from "../src/flows.ts";
 import { docPromptFor } from "../src/policy/docs.ts";
 import { listAgents, resetAgents } from "../src/runtime/agents.ts";
 import { activeLedgerRun, resetLedger } from "../src/runtime/ledger.ts";
+import { ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
 import { lastRun } from "../src/runtime/run.ts";
 import { readTrialStates } from "../src/runtime/state-files.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
@@ -87,12 +88,15 @@ function fakeOmp(project: TestProject) {
 			hasUI: true,
 			mode: "rpc",
 			agent,
+			isIdle: () => true,
+			hasPendingMessages: () => false,
 			ui: {
 				notify: (text: string, level = "info") => notices.push({ text, level }),
 				select: async () => undefined,
 				confirm: async () => false,
 				input: async () => undefined,
 				setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+				getEditorText: () => "",
 			},
 			getContextUsage: () => undefined,
 			compact: async () => undefined,
@@ -101,6 +105,7 @@ function fakeOmp(project: TestProject) {
 				waits.idle++;
 			},
 			modelRegistry: { getAll: () => [], getAvailable: () => [] },
+			runEphemeralTurn: async () => ({ replyText: '{"action":"run"}' }),
 		}) as unknown as ExtensionContext;
 	return {
 		sent,
@@ -149,6 +154,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	vi.useRealTimers();
 	setSystemTime();
 	resetLedger();
 	resetAgents();
@@ -159,7 +165,7 @@ afterEach(async () => {
 const approve = async (config: StormConfig) => approveAndSave(await loadProjectState(project.env), config, { shadowedAgents: [] });
 
 describe("a run through the hooks", () => {
-	test("/storm vibe starts it; director rules, spawn policy and the counters hold until the session settles", async () => {
+	test("/storm <text> starts it; director rules, spawn policy and the counters hold until the session settles", async () => {
 		await approve(TEAM);
 		await writeFile(path.join(project.root, "big.md"), "line\n".repeat(10_000));
 		const omp = fakeOmp(project);
@@ -170,7 +176,7 @@ describe("a run through the hooks", () => {
 
 		// Before a run the main session is an ordinary one.
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
-		await omp.command("vibe fix the bug", main);
+		await omp.command("fix the bug", main);
 		expect(omp.sent).toHaveLength(1);
 		expect(omp.activeTools()).toContain("storm");
 		expect(omp.statuses.at(-1)).toBeDefined();
@@ -224,6 +230,8 @@ describe("a run through the hooks", () => {
 		await omp.emit("agent_start", {}, main);
 		await omp.emit("agent_end", { awaitingAsyncWork: true }, main);
 		expect(activeLedgerRun((await loadProjectState(project.env)).repo.repoId)).toBeDefined();
+		// A subagent's result resumes the paused run with a new turn.
+		await omp.emit("agent_start", {}, main);
 		await omp.emit("agent_end", {}, main);
 		expect(activeLedgerRun((await loadProjectState(project.env)).repo.repoId)).toBeUndefined();
 
@@ -248,12 +256,124 @@ describe("a run through the hooks", () => {
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("task", "T", ["x/unapproved"]), main))).toBe("pass");
 	});
 
+	test("a subagent's change brings a round from Storm; a correct verdict after it ends the run verified", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		await omp.command("task", main);
+		expect(omp.sent).toHaveLength(1);
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+
+		vi.useFakeTimers();
+		const changedAt = Date.now();
+		setSystemTime(new Date(changedAt));
+		await child.emit("tool_result", { toolName: "edit", input: { path: "src/a.ts" }, isError: false, content: [] }, impl);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		// The handler returns without sending: the round waits out the delay.
+		expect(omp.sent).toHaveLength(1);
+		vi.advanceTimersByTime(ROUND_DELAY_MS);
+		await until(() => omp.sent.length === 2);
+		expect(omp.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		expect(activeLedgerRun((await loadProjectState(project.env)).repo.repoId)).toBeDefined();
+
+		setSystemTime(new Date(changedAt + 1_000));
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(activeLedgerRun((await loadProjectState(project.env)).repo.repoId)).toBeUndefined();
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("a reused live agent belongs to the next run: its read, its edit and the reviewer's verdict all count", async () => {
+		await approve(TEAM);
+		await writeFile(path.join(project.root, "big.md"), "line\n".repeat(10_000));
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		const edit = { toolName: "edit", input: { path: "src/a.ts" }, isError: false, content: [] };
+		const yielded = { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] };
+
+		// First run: the agents register through before_agent_start, as a spawn does.
+		await omp.command("first task", main);
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		const first = Date.now();
+		setSystemTime(new Date(first));
+		await child.emit("tool_result", edit, impl);
+		setSystemTime(new Date(first + 1_000));
+		await child.emit("tool_result", yielded, rev);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
+
+		// Second run, same session: omp emits no before_agent_start for these live agents.
+		vi.useFakeTimers();
+		const second = first + 60_000;
+		setSystemTime(new Date(second));
+		await omp.command("second task", main);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).repo.repoId)?.runId;
+		expect(runId).toBeDefined();
+		// The read is indexed under the new run: the director's wide read of the same file is blocked.
+		await child.emit("tool_call", { toolName: "read", input: { path: "big.md" } }, impl);
+		expect(verdict(await omp.emit("tool_call", { toolName: "read", input: { path: "big.md:1-5000" } }, main))).toBe("read-large");
+		// The edit lands in the new run's gate, so the first round stays open for a verdict.
+		await child.emit("tool_result", edit, impl);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(activeLedgerRun((await loadProjectState(project.env)).repo.repoId)).toBeDefined();
+		// The reused reviewer's verdict counts in the new run too.
+		setSystemTime(new Date(second + 1_000));
+		await child.emit("tool_result", yielded, rev);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ runId: runId as string, status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("a pending round wait does not send after a session switch", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		await omp.command("task", main);
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		vi.useFakeTimers();
+		await child.emit("tool_result", { toolName: "edit", input: { path: "src/a.ts" }, isError: false, content: [] }, impl);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(omp.sent).toHaveLength(1);
+		await omp.emit("session_switch", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ status: "stopped", endReason: "shutdown" });
+		vi.advanceTimersByTime(ROUND_DELAY_MS * 2);
+		expect(omp.sent).toHaveLength(1);
+	});
+
+	test("the same run without a file change settles after one round", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("task", main);
+		await child.emit("before_agent_start", { systemPrompt: [] }, child.ctx(sub("Impl")));
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(omp.sent).toHaveLength(1);
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "settled", turns: 1 });
+	});
+
 	test("a follow-up to an agent past its cap is refused and counted; one below it passes", async () => {
 		await approve({ ...TEAM, contextCap: 20_000 });
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		await omp.command("vibe task", main);
+		await omp.command("task", main);
 		for (const [id, tokens] of [["Big", 20_000], ["Small", 19_999]] as const) {
 			const ctx = child.ctx(sub(id));
 			await child.emit("before_agent_start", { systemPrompt: [] }, ctx);
@@ -301,6 +421,29 @@ describe("a run through the hooks", () => {
 	});
 });
 
+describe("a subagent's tool results on the ledger", () => {
+	test("successful file changes count; failed changes, reads, notes and the main session do not", async () => {
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		const result = (toolName: string, input: unknown, isError = false) =>
+			child.emit("tool_result", { toolName, input, isError, content: [] }, impl);
+
+		await result("edit", { path: "src/a.ts" });
+		await result("write", { path: "src/b.ts" });
+		await result("edit", { path: "src/c.ts" }, true);
+		await result("read", { path: "src/a.ts" });
+		await result("write", { path: "local://x.md" });
+		await omp.emit("tool_result", { toolName: "edit", input: { path: "src/d.ts" }, isError: false, content: [] }, main);
+
+		expect(listAgents()).toHaveLength(1);
+		expect(listAgents()[0]).toMatchObject({ id: "Impl", changes: 2 });
+		expect(listAgents()[0]?.lastChangeAt).toBeGreaterThan(0);
+	});
+});
+
 describe("the spawn hook", () => {
 	const T0 = Date.parse("2026-11-20T09:00:00Z");
 	const implementer = spawnOf("storm-implementer", "Impl");
@@ -329,10 +472,10 @@ describe("the spawn hook", () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		await omp.command("vibe first", main);
+		await omp.command("first work", main);
 		expect(omp.waits.idle).toBe(1);
 		const before = omp.transcript.length + omp.notices.length;
-		await omp.command("vibe second", main);
+		await omp.command("second work", main);
 		expect(omp.waits.idle).toBe(1);
 		expect(omp.sent).toHaveLength(1);
 		// The user is told once, wherever this host shows notices.
@@ -344,7 +487,7 @@ describe("the spawn hook", () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		await omp.command("vibe task", main);
+		await omp.command("task", main);
 		omp.broken.agentDir = true;
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("internal");
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("task", "T", ["a/i"]), main))).toBe("internal");
@@ -384,7 +527,7 @@ describe("what the wiring adds around a run", () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		await omp.command("vibe task", main);
+		await omp.command("task", main);
 		omp.broken.agentDir = true;
 		await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl", ["a/i"]), main);
 		omp.broken.agentDir = false;
@@ -417,11 +560,12 @@ describe("what the wiring adds around a run", () => {
 			onUsage?: (message: unknown) => void;
 		}
 		const turns: SideTurn[] = [];
+		const replies = ['{"action":"answer","text":"ok"}', '{"action":"run"}', '{"action":"answer","text":"ok"}'];
 		const main = {
 			...omp.ctx(MAIN),
 			runEphemeralTurn: async (options: SideTurn) => {
 				turns.push(options);
-				return { replyText: '{"action":"answer","text":"ok"}' };
+				return { replyText: replies[turns.length - 1] ?? '{"action":"answer","text":"ok"}' };
 			},
 		} as unknown as ExtensionContext;
 		const repoId = (await loadProjectState(project.env)).repo.repoId;
@@ -434,10 +578,10 @@ describe("what the wiring adds around a run", () => {
 		expect(turns[0] && "tools" in turns[0]).toBe(false);
 		expect(omp.sent).toEqual([]);
 
-		await omp.command("vibe task", main);
+		await omp.command("do the work", main);
 		await omp.command("which model reviews?", main);
-		expect(turns).toHaveLength(2);
-		turns[1]?.onUsage?.(assistant("m", "main", 40_000, 0.2).message);
+		expect(turns).toHaveLength(3);
+		turns[2]?.onUsage?.(assistant("m", "main", 40_000, 0.2).message);
 		await until(() => activeLedgerRun(repoId)?.costUsd === 0.2);
 		// Only the run's handoff ever reached the session.
 		expect(omp.sent).toHaveLength(1);
@@ -451,7 +595,7 @@ describe("what the wiring adds around a run", () => {
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		const edit = { toolName: "edit", input: { path: "src/a.ts" } };
-		await omp.command("vibe task", main);
+		await omp.command("task", main);
 		// A subagent's own session switching is not the run's business.
 		await child.emit("session_switch", { reason: "new" }, child.ctx(sub("Impl")));
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("director-edit");

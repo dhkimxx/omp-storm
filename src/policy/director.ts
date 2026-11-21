@@ -16,7 +16,8 @@ export function pathOf(input: unknown): string | undefined {
 	return typeof input === "object" && input !== null && "path" in input && typeof input.path === "string" ? input.path : undefined;
 }
 
-function changesFiles(toolName: string, input: unknown): boolean {
+/** Whether a tool call would change a working-tree file: `edit`, `ast_edit`, or `write` to a file path. */
+export function changesFiles(toolName: string, input: unknown): boolean {
 	if (EDIT_TOOLS[toolName] === true) return true;
 	if (toolName !== "write") return false;
 	const target = pathOf(input)?.trim() ?? "";

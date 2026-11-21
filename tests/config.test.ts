@@ -141,6 +141,28 @@ describe("validateConfig", () => {
 		expect(configHash(withoutContract)).not.toBe(TEAM_08_HASH);
 	});
 
+	test("rounds is a known field: an integer 0~10, and absent stays absent", () => {
+		for (const rounds of [0, 3, 10]) {
+			const c = clone();
+			c.rounds = rounds;
+			const r = validateConfig(c);
+			expect(r.errors).toEqual([]);
+			expect(r.warnings).toEqual([]);
+			expect(r.config?.rounds).toBe(rounds);
+		}
+		for (const rounds of [-1, 11, 2.5, "3", null]) {
+			const c = clone();
+			c.rounds = rounds;
+			expect(paths(validateConfig(c).errors)).toEqual(["rounds"]);
+		}
+		const absent = validateConfig(clone());
+		expect(absent.config).not.toHaveProperty("rounds");
+		expect(configHash(absent.config!)).toBe(configHash(base));
+		const set = clone();
+		set.rounds = 5;
+		expect(configHash(set)).not.toBe(configHash(base));
+	});
+
 	test("deprecated fields are accepted silently: contract, runtime, old priorities, numeric workers", () => {
 		for (const mutate of [
 			(c: Record<string, any>) => (c.contract = "orchestrate"),

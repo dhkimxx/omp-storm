@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /**
  * OMP Storm end-to-end check, RPC and print hosts: the real plugin, installed in an isolated profile, inside the
- * pinned omp against the scripted fake LLM. No paid model calls. The TUI scenarios (goal and loop runs, setup forms)
- * are in tui.ts.
+ * pinned omp against the scripted fake LLM. No paid model calls. The TUI scenarios (setup forms and a run) are in
+ * tui.ts.
  *
  * Usage: npm run e2e   (env: see harness.ts)
  *
@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { docPromptFor } from "../../src/policy/docs.ts";
 import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
-import { FALLBACK, MODE_CHOICE, QUOTA_CHOICE } from "../../src/request/route.ts";
+import { FALLBACK, QUOTA_CHOICE } from "../../src/request/route.ts";
 import type { RunRecord } from "../../src/types.ts";
 import {
 	type Answer,
@@ -43,7 +43,6 @@ import {
 
 /** Option labels Storm does not export. */
 const LABEL = {
-	free: "자유 실행으로 시작",
 	reset: "초기화",
 	rollback: "이전 승인으로 되돌리기",
 	keepModel: "지금 모델 유지",
@@ -87,12 +86,14 @@ async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>, option
 	}
 }
 
-const vibe = (steps: Step[]): string => `/storm vibe E2E-STEPS ${JSON.stringify(steps)}`;
 const route = (reply: Record<string, unknown>, rest = "please"): string => `/storm E2E-ROUTE ${JSON.stringify(reply)} ${rest}`;
+/** A run requested through the classifier, as work reaches a run: the task carries the scripted steps. */
+const runRequest = (reply: Record<string, unknown>, steps: Step[]): string => route(reply, `E2E-STEPS ${JSON.stringify(steps)}`);
+const startRun = (steps: Step[]): string => runRequest({ action: "run" }, steps);
 const plan = (lanes: Array<{ name: string; kind: string }>, workers?: Record<string, number>): Extract<Step, { storm: unknown }> => ({
 	storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } },
 });
-const CHEAP_RUN = vibe([plan([{ name: "impl", kind: "code" }])]);
+const CHEAP_RUN = startRun([plan([{ name: "impl", kind: "code" }])]);
 
 /**
  * Sends a message that starts a Storm run and returns the run's final record, once everything the run's end writes
@@ -127,6 +128,8 @@ const toolOutcomes = (frames: Frame[]): Array<{ action?: string; outcome?: strin
 const blockCodes = (run: RunRecord | undefined): string[] => (run?.spawns ?? []).flatMap(spawn => (spawn.outcome === "blocked" ? [spawn.code ?? "none"] : []));
 const children = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "child");
 const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "main");
+/** A main request's newest user message without the date reminder omp puts in front of the first one. */
+const newestUser = (entry: LlmEntry): string => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "");
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
 /** A config changed by hand, then approved through `/storm`'s dialog for an unapproved team. */
@@ -246,10 +249,12 @@ async function main(): Promise<void> {
 		];
 		const request = `E2E-ROUTE ${JSON.stringify({ action: "run" })} E2E-STEPS ${JSON.stringify(steps)}`;
 		let frames: Frame[] = [];
+		let dialogs = 0;
 		const run = await session(
 			cancelAll,
 			async rpc => {
 				const done = await runOf(rpc, `/storm ${request}`);
+				dialogs = rpc.dialogs.length;
 				frames = rpc.frames;
 				return done;
 			},
@@ -270,7 +275,8 @@ async function main(): Promise<void> {
 		const frame = handoff.length - request.length;
 		check("the handoff stays within 1,400 chars besides the task", frame > 200 && frame <= 1_400, `chars=${frame}`);
 
-		check("the run record: vibe, settled, done", run.mode === "vibe" && run.endReason === "settled" && run.status === "done" && (run.turns ?? 0) >= 1, `${run.mode} ${run.endReason} ${run.status} turns=${run.turns}`);
+		check("a classified run opens no dialog", dialogs === 0, `dialogs=${dialogs}`);
+		check("the run record: settled, done after one round", run.endReason === "settled" && run.status === "done" && run.turns === 1, `${run.endReason} ${run.status} turns=${run.turns}`);
 		const outcome = (agent: string) => run.spawns.find(spawn => spawn.agent === agent);
 		check(
 			"storm roles are routed, outside models are swapped for the role's",
@@ -294,7 +300,7 @@ async function main(): Promise<void> {
 		check("spawn records link to ledger agents", run.spawns.length === 4 && run.spawns.every(spawn => ledger.some(agent => agent.id === spawn.spawnKey)));
 		check("the plan is in the record", run.plan?.lanes.length === 3 && run.plan.workers.implementer === 2, JSON.stringify(run.plan?.workers));
 		const summary = files.index().find(line => line.runId === run.runId);
-		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.mode === "vibe" && summary.endReason === "settled", JSON.stringify(summary));
+		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.endReason === "settled" && summary.turns === 1, JSON.stringify(summary));
 		check("the run's report is in the transcript, off the model's context", reports(frames).some(report => report.includes(run.runId) && report.includes('"excludeFromContext":true')));
 
 		const verdict = ledger.find(agent => agent.role === "reviewer")?.review;
@@ -327,6 +333,99 @@ async function main(): Promise<void> {
 			entry !== undefined && entry.artifactsDir === run.artifactsDir && entry.agents.length === 4,
 			`trusted=${trusted.map(line => line.runId).join(",")} run=${run.runId} artifacts=${run.artifactsDir}`,
 		);
+
+		const stale = await session(cancelAll, async rpc => ({
+			run: await runOf(rpc, runRequest({ action: "run", mode: "loop" }, [plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }])),
+			dialogs: rpc.dialogs.length,
+		}));
+		check(
+			"a reply that still says mode loop is a plain run",
+			stale.dialogs === 0 && stale.run.endReason === "settled" && stale.run.status === "done" && stale.run.turns === 1 && stale.run.limits === undefined,
+			`${stale.run.endReason} ${stale.run.status} turns=${stale.run.turns} limits=${JSON.stringify(stale.run.limits)} dialogs=${stale.dialogs}`,
+		);
+	});
+
+	await suite.step("a run is sent back until its changes are reviewed", async () => {
+		const changed = join(env.project, "e2e-rounded.txt");
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
+			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+		];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				const director = mains(llm.all());
+				const roundAt = director.findIndex(entry => newestUser(entry).startsWith(roundTag));
+				check(
+					"Storm sent round 2 by itself, exactly once",
+					stormMessages.filter(user => user.startsWith(roundTag)).length === 1 && stormMessages.length === 2,
+					`rounds=${stormMessages.filter(user => user.startsWith(roundTag)).length} storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
+				);
+				const roundCall = String(JSON.stringify(director[roundAt]?.decision.args));
+				check(
+					"the round message starts round 2 of 4",
+					stormMessages.some(user => user.startsWith(roundTag)) && roundAt >= 0 && director[roundAt]?.decision.tool === "task" && roundCall.includes("storm-reviewer"),
+					`${director[roundAt]?.decision.tool} ${roundCall.slice(0, 120)}`,
+				);
+				const implementer = run.agents?.find(agent => agent.role === "implementer");
+				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+				check("round 1's file change is counted", implementer?.changes === 1 && existsSync(changed), `changes=${implementer?.changes} file=${existsSync(changed)}`);
+				check("round 2's verdict passes", reviewer?.lastVerdict?.correct === true && (reviewer?.lastVerdict?.at ?? 0) > (implementer?.lastChangeAt ?? 0), JSON.stringify(reviewer?.lastVerdict));
+				check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 2,
+					JSON.stringify(lines),
+				);
+				check("no dialog before either round", rpc.dialogs.length === 0, JSON.stringify(rpc.dialogs));
+			});
+		} finally {
+			rmSync(changed, { force: true });
+		}
+	});
+
+	await suite.step("a run that makes no progress is stopped", async () => {
+		const changed = join(env.project, "e2e-stalled.txt");
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-stalled.txt" },
+		];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const users = [...new Set(mains(llm.all()).map(newestUser))];
+				const stormMessages = users.filter(user => user.startsWith("<storm-run"));
+				const third = users.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="3/4">`));
+				check(
+					"round 2 was sent, and no third round followed",
+					stormMessages.length === 2 && stormMessages.some(user => user.startsWith(`<storm-run id="${run.runId}" round="2/4">`)) && third.length === 0,
+					`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
+				);
+				const implementer = run.agents?.find(agent => agent.role === "implementer");
+				check("round 1's change is counted", implementer?.changes === 1 && existsSync(changed), `changes=${implementer?.changes} file=${existsSync(changed)}`);
+				check("the run stops with no progress", run.status === "stopped" && run.endReason === "no-progress" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 2,
+					JSON.stringify(lines),
+				);
+			});
+		} finally {
+			rmSync(changed, { force: true });
+		}
 	});
 
 	await suite.step("the storm tool's four actions", async () => {
@@ -350,7 +449,11 @@ async function main(): Promise<void> {
 			await rpc.prompt(`E2E-TOOL ${JSON.stringify({ action: "run", task: `E2E-STEPS ${JSON.stringify([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }])}` })}`);
 			const run = await files.finishedRun(before);
 			check("run: queued, and started once the turn settled", toolOutcomes(rpc.frames.slice(from))[0]?.outcome === "queued", JSON.stringify(toolOutcomes(rpc.frames.slice(from))));
-			check("the queued run ran to its end", run.status === "done" && run.mode === "vibe" && run.spawns.some(spawn => spawn.outcome === "routed"), `${run.status} ${JSON.stringify(run.spawns.map(spawn => spawn.outcome))}`);
+			check(
+				"a run whose subagents changed no file settles after one round",
+				run.status === "done" && run.endReason === "settled" && run.turns === 1 && run.spawns.some(spawn => spawn.outcome === "routed"),
+				`${run.status} ${run.endReason} turns=${run.turns} ${JSON.stringify(run.spawns.map(spawn => spawn.outcome))}`,
+			);
 		});
 	});
 
@@ -378,8 +481,8 @@ async function main(): Promise<void> {
 			frames = await rpc.turn(`E2E-TOOL ${JSON.stringify(plan([{ name: "check", kind: "review" }], { reviewer: 9 }).storm)}`);
 			check("a plan past the bounds is rejected by the tool", same(toolOutcomes(frames), [{ action: "plan", outcome: "rejected", isError: false }]) && rpc.dialogs.length === 0, JSON.stringify(toolOutcomes(frames)));
 			const runs = files.runs().length;
-			await rpc.prompt("/storm vibe do the work");
-			check("a run does not start", files.runs().length === runs);
+			await rpc.prompt(route({ action: "run" }, "do the work"));
+			check("a run does not start", files.runs().length === runs && rpc.dialogs.length === 0, `runs=${files.runs().length}/${runs} dialogs=${rpc.dialogs.length}`);
 
 			rpc.answer = choose(APPROVE);
 			await rpc.prompt("/storm");
@@ -401,7 +504,7 @@ async function main(): Promise<void> {
 			let from = rpc.frames.length;
 			const run = await runOf(
 				rpc,
-				vibe([
+				startRun([
 					{ task: ["storm-explorer"], as: "Early" },
 					// omp decides the spawn in the background after task returns: submit the plan only once it was refused.
 					{
@@ -437,7 +540,7 @@ async function main(): Promise<void> {
 			check("a budget is set through the approval dialog", files.config().budget?.perRunUsd === 0.0001, JSON.stringify(files.config().budget));
 			const kids = children(llm.all()).length;
 			from = rpc.frames.length;
-			const capped = await runOf(rpc, vibe([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"], as: "Late" }]));
+			const capped = await runOf(rpc, startRun([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"], as: "Late" }]));
 			check(
 				"past the run budget: budget",
 				same(blockCodes(capped), ["budget"]) && asyncResults(rpc.frames.slice(from)).includes("[storm:budget]") && children(llm.all()).length === kids,
@@ -463,7 +566,7 @@ async function main(): Promise<void> {
 		await session(cancelAll, async rpc => {
 			const run = await runOf(
 				rpc,
-				vibe([
+				startRun([
 					plan([{ name: "scope", kind: "explore" }]),
 					{ task: ["storm-explorer"], as: "Reader", say: "E2E-CHILD-READ notes/big.ts,notes/big.txt,notes/small.txt" },
 					{ edit: "director-check.txt", afterResult: "Reader0" },
@@ -597,7 +700,7 @@ async function main(): Promise<void> {
 		await session(cancelAll, async rpc => {
 			const run = await runOf(
 				rpc,
-				vibe([
+				startRun([
 					plan([{ name: "impl", kind: "code" }]),
 					{ task: ["storm-implementer"], as: "Cap" },
 					{ followUp: "agent://Cap0" },
@@ -628,7 +731,7 @@ async function main(): Promise<void> {
 			// The fake LLM orders the two sessions: the director's last reply goes out once the child has made its first
 			// request (Storm's ledger knows it by then), and the child's reply once the director was compacted.
 			const steps: Step[] = [plan([{ name: "ckpt", kind: "code" }]), { task: ["storm-implementer"], as: "Ck", say: "E2E-CHILD-HOLD" }, { awaitChild: true }];
-			const run = await session(cancelAll, rpc => runOf(rpc, vibe(steps)));
+			const run = await session(cancelAll, rpc => runOf(rpc, startRun(steps)));
 			const compactions = llm.of("compaction");
 			const ledger = compactions.find(entry => entry.compactionContext.includes(run.runId) && entry.compactionContext.includes("ckpt") && entry.compactionContext.includes("agent://Ck0"));
 			check("the compaction request carries the run, its lanes and agent:// handles", ledger !== undefined, `compactions=${compactions.length} context=${(compactions[0]?.compactionContext ?? "").slice(0, 300).replace(/\s+/g, " ")}`);
@@ -721,22 +824,6 @@ async function main(): Promise<void> {
 				`trusted=${JSON.stringify(entry?.cleaned)} cleanup=${JSON.stringify(cleaned.cleanup)}`,
 			);
 			check("the index carries the cleanup numbers", same(files.index().find(line => line.runId === cleaned.runId)?.cleanup, cleaned.cleanup));
-		});
-	});
-
-	await suite.step("goal and loop under RPC", async () => {
-		const llm = new LlmCursor(env);
-		await session(cancelAll, async rpc => {
-			const runs = files.runs().length;
-			await rpc.prompt("/storm goal E2E reach the objective");
-			check("/storm goal offers a free run or cancel", same(rpc.dialogs.at(-1)?.options, [LABEL.free, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
-			check("cancel starts nothing and calls no model", files.runs().length === runs && llm.all().length === 0, `runs=${files.runs().length}/${runs} requests=${llm.all().length}`);
-			await rpc.prompt(route({ action: "run", mode: "goal" }, "keep at it until it is done"));
-			check("a goal the classifier picked is confirmed first", same(rpc.dialogs.at(-1)?.options, [MODE_CHOICE.asIs, MODE_CHOICE.free, MODE_CHOICE.cancel]) && files.runs().length === runs, JSON.stringify(rpc.dialogs.at(-1)));
-			rpc.answer = choose(LABEL.free);
-			const run = await runOf(rpc, `/storm loop 3 E2E-STEPS ${JSON.stringify([plan([{ name: "impl", kind: "code" }])])}`);
-			check("/storm loop 3 offers the same choice", same(rpc.dialogs.at(-1)?.options, [LABEL.free, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
-			check("the free run is a vibe run that ends at settle", run.mode === "vibe" && run.endReason === "settled" && run.status === "done" && run.loop === undefined, `${run.mode} ${run.endReason} ${run.status}`);
 		});
 	});
 

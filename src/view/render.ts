@@ -3,6 +3,7 @@ import { unknownFields } from "../config/schema.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
+import { DEFAULT_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import type {
 	BudgetConfig,
 	MetricValue,
@@ -154,6 +155,7 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig): DiffRow[] {
 	}
 	if (prev !== undefined || next.disabledRoles?.length) line("사용 안 함", prev && (disabledTitles(prev) || "없음"), disabledTitles(next) || "없음");
 	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));
+	line("추가 라운드", prev && roundsText(prev.rounds), roundsText(next.rounds));
 	if (prev?.contextCap !== undefined || next.contextCap !== undefined) line("컨텍스트 상한", prev && capText(prev.contextCap), capText(next.contextCap));
 	line("격리", prev && ISOLATION[prev.isolation], ISOLATION[next.isolation]);
 	line("예산", prev && (prev.budget ? budgetText(prev.budget) : "없음"), next.budget ? budgetText(next.budget) : "없음");
@@ -222,6 +224,11 @@ function capText(cap: number | undefined): string {
 	return cap === undefined ? `기본(${int(DEFAULT_CONTEXT_CAP)})` : int(cap);
 }
 
+/** The extra-rounds setting: the number in force, an absent one marked as the default like the context cap. */
+function roundsText(rounds: number | undefined): string {
+	return rounds === undefined ? `기본(${DEFAULT_EXTRA_ROUNDS})` : String(rounds);
+}
+
 /** One status line of a role: models, effort, worker range and its own context cap. */
 function roleLine(id: string, r: RoleConfig): string {
 	const cap = r.contextCap !== undefined ? ` · 컨텍스트 상한 ${int(r.contextCap)}` : "";
@@ -259,6 +266,7 @@ export function renderStatus(view: StatusView, now: number, audience: "user" | "
 			"",
 			"### 실행 설정",
 			`- 병렬도: ${team.parallelism} · ${ISOLATION[team.isolation]}`,
+			`- 추가 라운드: ${team.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
 			`- 컨텍스트 상한: ${int(team.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`,
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,
 			`- 실행 중 다른 에이전트: ${visible(fallbackText(team.fallbackRole))}`,

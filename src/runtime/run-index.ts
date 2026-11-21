@@ -38,7 +38,6 @@ export function summarizeForIndex(run: RunRecord): RunSummary {
 	if (run.blockedFollowUps !== undefined) summary.blockedFollowUps = run.blockedFollowUps;
 	if (run.reads) summary.reads = { ...run.reads };
 	if (run.checkpoints) summary.checkpoints = run.checkpoints.length;
-	if (run.mode !== undefined) summary.mode = run.mode;
 	if (run.turns !== undefined) summary.turns = run.turns;
 	if (run.endReason !== undefined) summary.endReason = run.endReason;
 	if (run.cleanup) summary.cleanup = { ...run.cleanup };

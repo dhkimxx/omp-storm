@@ -1,4 +1,5 @@
 import { MAX_WORKERS, REQUIRED_ROLES, ROLES } from "../roles.ts";
+import { MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { EFFORTS } from "../types.ts";
 import type { Priority, StoredPriority, StormConfig } from "../types.ts";
 import { escapeUnsafe } from "./canonical.ts";
@@ -33,6 +34,7 @@ const TOP_KEYS = [
 	"contextCap",
 	"cleanup",
 	"docs",
+	"rounds",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
 /** Highest `contextCap` a config may set (team or role), in tokens. */
@@ -220,6 +222,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 	}
 	if (value.contextCap !== undefined && !isIntIn(value.contextCap, 1, MAX_CONTEXT_CAP)) {
 		errors.push(`contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
+	}
+	if (value.rounds !== undefined && !isIntIn(value.rounds, 0, MAX_EXTRA_ROUNDS)) {
+		errors.push(`rounds: 0~${MAX_EXTRA_ROUNDS} 사이 정수여야 합니다`);
 	}
 	if (value.cleanup !== undefined && typeof value.cleanup !== "boolean") errors.push("cleanup: true|false여야 합니다");
 	if (value.docs !== undefined && typeof value.docs !== "boolean") errors.push("docs: true|false여야 합니다");

@@ -140,6 +140,7 @@ describe("settings form", () => {
 			...["explorer", "implementer"].flatMap(id => [`effort_${id}`, `workers_min_${id}`, `workers_max_${id}`]),
 			"parallelism",
 			"context_cap",
+			"rounds",
 			"budget_usd",
 			"budget_warn_usd",
 			"budget_exceed",
@@ -156,6 +157,7 @@ describe("settings form", () => {
 			workers_max_implementer: 2,
 			parallelism: 4,
 			context_cap: 200_000,
+			rounds: 3,
 			budget_usd: 0,
 			budget_warn_usd: 0,
 			budget_exceed: "block-spawns",
@@ -164,6 +166,8 @@ describe("settings form", () => {
 		});
 		const workers = textOf(form, "workers_max_explorer");
 		expect([workers.type, workers.min, workers.max, workers.required]).toEqual(["number", 1, 16, true]);
+		const rounds = textOf(form, "rounds");
+		expect([rounds.type, rounds.min, rounds.max, rounds.required]).toEqual(["number", 0, 10, true]);
 		expect(textOf(form, "budget_usd").min).toBe(0);
 		expect(values(choiceOf(form, "budget_exceed"))).toEqual(["block-spawns", "stop"]);
 	});
@@ -178,7 +182,7 @@ describe("settings form", () => {
 	});
 
 	test("re-setup opens on the current settings", () => {
-		const current: StormConfig = { ...TEAM, parallelism: 7, contextCap: 150_000, budget: { perRunUsd: 5, warnAtUsd: 3, onExceed: "stop" }, docs: false };
+		const current: StormConfig = { ...TEAM, parallelism: 7, contextCap: 150_000, rounds: 2, budget: { perRunUsd: 5, warnAtUsd: 3, onExceed: "stop" }, docs: false };
 		const inp = input(current);
 		const form = parseHtmlForm(settingsForm(inp, readModelPicks(inp, defaultFormData(parseHtmlForm(modelsForm(inp))))));
 		expect(defaultFormData(form)).toMatchObject({
@@ -187,6 +191,7 @@ describe("settings form", () => {
 			effort_reviewer: "high",
 			parallelism: 7,
 			context_cap: 150_000,
+			rounds: 2,
 			budget_usd: 5,
 			budget_warn_usd: 3,
 			budget_exceed: "stop",
@@ -217,6 +222,25 @@ describe("answers to config", () => {
 	test("both forms unchanged give the current team back on a re-setup, also one written before per-model efforts", () => {
 		for (const current of [TEAM, { ...TEAM, budget: { perRunUsd: 5, onExceed: "stop" }, cleanup: true, docs: false, contextCap: 150_000 } satisfies StormConfig]) {
 			expect(configOf(submit(input(current)).built)).toEqual(current);
+		}
+	});
+
+	test("rounds opens on the value in force and is written only when it differs from the default", () => {
+		expect(configOf(submit(input()).built)).not.toHaveProperty("rounds");
+		expect(configOf(submit(input(), { rounds: 0 }).built).rounds).toBe(0);
+		expect(configOf(submit(input(), { rounds: 10 }).built).rounds).toBe(10);
+		// Typing the default over an absent setting says nothing new.
+		expect(configOf(submit(input(), { rounds: 3 }).built)).not.toHaveProperty("rounds");
+		const current: StormConfig = { ...TEAM, rounds: 5 };
+		expect(configOf(submit(input(current)).built)).toEqual(current);
+		expect(configOf(submit(input(current), { rounds: 3 }).built).rounds).toBe(3);
+	});
+
+	test("rounds outside 0~10 is an error and gives no config", () => {
+		for (const rounds of [-1, 11, 2.5, ""]) {
+			const { built } = submit(input(), { rounds });
+			expect("errors" in built && built.errors).toHaveLength(1);
+			expect("config" in built).toBe(false);
 		}
 	});
 
@@ -313,6 +337,8 @@ describe("answers to config", () => {
 			{ budget_usd: 2, budget_warn_usd: 3 },
 			{ context_cap: 1.5 },
 			{ context_cap: 99_000_000 },
+			{ rounds: 11 },
+			{ rounds: 2.5 },
 			{ budget_usd: -1 },
 		];
 		for (const over of mistakes) {

@@ -16,10 +16,11 @@
  *   E2E-WRITE <path>        call `write` with that path
  * Main session, scripted:
  *   E2E-STEPS [step...]     the newest user message carrying it scripts the turn: one step per assistant tool call
- *   E2E-TURNS [[step...]…]  the oldest user message carrying it scripts the session: one list per turn (a turn ends
- *                           with a text reply), for goal runs whose objective omp repeats before every prompt
  * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered. In a child's assignment:
  *   E2E-CHILD-READ <a,b>    call `read` on each path first
+ *   E2E-CHILD-WRITE <path>  call `write` with that path first (before the yield)
+ *   E2E-CHILD-VERDICT correct
+ *                           yield a review verdict that passes, when its schema asks for one
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
  *                           answered), so the parent's turn ends and is compacted while the child still runs
  * A compaction request (one user message opening with `<conversation>`) gets a plain summary; the log keeps its
@@ -54,9 +55,9 @@ interface Message {
 }
 /**
  * One step of a scripted main turn: a storm tool call, a task batch (`as` prefixes the children's names, `say` is
- * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a follow-up to a subagent, a read, a
- * `goal` tool call, or `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the
- * last task call has made its first request, so the turn ends with that child known to be running.
+ * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a follow-up to a subagent, a read, or
+ * `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the last task call has made
+ * its first request, so the turn ends with that child known to be running.
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
@@ -67,7 +68,6 @@ export type Step = (
 	| { edit: string }
 	| { followUp: string }
 	| { read: string }
-	| { goal: string }
 	| { awaitChild: true }
 ) & {
 	after?: string;
@@ -236,11 +236,12 @@ function extensionCall(tools: Tool[] | undefined, name: string, args: Record<str
 	return writeCall(`xd://${name}`, JSON.stringify(args));
 }
 
-function yieldCall(schema: JsonSchema): Decision {
+function yieldCall(schema: JsonSchema, correct = false): Decision {
 	const args = requiredArgs(schema);
 	if (!JSON.stringify(schema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
+	const data = { ...REVIEW_VERDICT, overall_correctness: correct ? "correct" : "incorrect" };
 	// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
-	return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data: REVIEW_VERDICT } };
+	return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data } };
 }
 
 const userText = (messages: Message[]): string =>
@@ -284,7 +285,6 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("read" in step) return readCall(tools, step.read);
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
 	if ("followUp" in step) return writeCall(step.followUp, "follow-up");
-	if ("goal" in step) return { kind: "tool", name: "goal", args: { ...requiredArgs(schemaOf(tools, "goal")), op: step.goal } };
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
 
@@ -312,33 +312,21 @@ function scriptedSteps(messages: Message[], tools: Tool[] | undefined): Decision
 	return gatedStep((steps as Step[])[later.filter(hasCalls).length], later, tools);
 }
 
-/**
- * `E2E-TURNS`: the oldest user message carrying it scripts the session turn by turn. A text reply ends a turn, so the
- * turn is the number of text replies since, and the step the number of tool calls after the last of them.
- */
-function scriptedTurns(messages: Message[], tools: Tool[] | undefined): Decision | undefined {
-	const at = messages.findIndex(m => m.role === "user" && textOf(m.content).includes("E2E-TURNS"));
-	if (at < 0) return undefined;
-	const turns = payload(textOf(messages[at]?.content), "E2E-TURNS");
-	if (!Array.isArray(turns)) return undefined;
-	const later = messages.slice(at + 1);
-	const replies = later.filter(m => m.role === "assistant");
-	const lastText = replies.findLastIndex(m => !hasCalls(m));
-	const turn = (turns as Step[][])[replies.filter(m => !hasCalls(m)).length];
-	return gatedStep(turn?.[replies.slice(lastText + 1).length], later, tools);
-}
-
-/** A child reads what its assignment names, then yields; a follow-up message makes it yield again. */
+/** A child does what its assignment tells it — reads, then a write — and yields; a follow-up message makes it yield again. */
 function childDecision(request: ChatRequest): Decision {
 	const messages = request.messages;
-	const reads = (/E2E-CHILD-READ[ \t]+(\S+)/.exec(userText(messages))?.[1] ?? "").split(",").filter(Boolean);
+	const text = userText(messages);
+	const reads = (/E2E-CHILD-READ[ \t]+(\S+)/.exec(text)?.[1] ?? "").split(",").filter(Boolean);
+	const write = /E2E-CHILD-WRITE[ \t]+(\S+)/.exec(text)?.[1];
+	const correct = /E2E-CHILD-VERDICT[ \t]+correct\b/.test(text);
 	const calls = callNames(messages);
 	const done = calls.filter(name => name === "read").length;
 	const last = messages.at(-1);
 	if (last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: "done" };
 	if (done < reads.length) return readCall(request.tools, reads[done] ?? "");
+	if (write !== undefined && !calls.includes("write")) return writeCall(write, "storm child change\n");
 	const yieldSchema = schemaOf(request.tools, "yield");
-	return yieldSchema ? yieldCall(yieldSchema) : { kind: "text", text: "OK" };
+	return yieldSchema ? yieldCall(yieldSchema, correct) : { kind: "text", text: "OK" };
 }
 
 function decide(request: ChatRequest, who: Who): Decision {
@@ -353,7 +341,7 @@ function decide(request: ChatRequest, who: Who): Decision {
 		return { kind: "text", text: JSON.stringify(isRecord(reply) ? reply : { action: "menu" }) };
 	}
 	if (who === "child") return childDecision(request);
-	const scripted = scriptedTurns(messages, request.tools) ?? scriptedSteps(messages, request.tools);
+	const scripted = scriptedSteps(messages, request.tools);
 	if (scripted) return scripted;
 	if (messages.at(-1)?.role === "tool") return { kind: "text", text: "done" };
 	const lastAssistant = messages.findLastIndex(message => message.role === "assistant");

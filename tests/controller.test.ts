@@ -10,11 +10,12 @@ import { listAgents, noteAgentParked, noteAgentStart, resetAgents } from "../src
 import { noteRunSpawn, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
 import { activeLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
-import { lastRun, readRun, runIds, writeRun } from "../src/runtime/run.ts";
+import { HOLD_MS, ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
+import { lastRun, readRun, runIds, runsDir, writeRun } from "../src/runtime/run.ts";
 import { readRunIndex } from "../src/runtime/run-index.ts";
 import type { ProjectState } from "../src/state.ts";
-import type { RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
-import { fakeSession, SESSION_TEAM, type SessionOptions, until } from "./fake-session.ts";
+import type { AgentEntry, RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
+import { fakeModes, fakeSession, SESSION_TEAM, type SessionOptions, until } from "./fake-session.ts";
 import { agentEntry, approvedState, DEAD_PROCESS, runRecord, spawnRecord } from "./fixtures.ts";
 
 const spawn = spawnRecord();
@@ -34,8 +35,12 @@ afterEach(async () => {
 });
 
 const session = (opts: Omit<SessionOptions, "root"> = {}) => fakeSession({ root, ...opts });
-const vibe = (task: string): RunSpec => ({ mode: "vibe", task });
+const ask = (task: string): RunSpec => ({ task });
 const usage = (tokens: number, percent: number, contextWindow = 400_000) => ({ tokens, contextWindow, percent });
+const T0 = Date.parse("2026-11-20T09:00:00Z");
+const writer = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ changes: 1, lastChangeAt: T0, ...over });
+const verdict = (at: number, correct: boolean): AgentEntry =>
+	agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at, correct } });
 
 describe("live run record", () => {
 	// The live rewrite is debounced on a real timer: these two drive it with fake timers and wait only for the file.
@@ -78,13 +83,14 @@ describe("run start", () => {
 	test("starts without asking: record written, ledger opened, one handoff carrying the task and the run id", async () => {
 		const task = "fix the login bug";
 		const h = session();
-		const result = await h.controller.start(h.ctx, vibe(task));
+		const result = await h.controller.start(h.ctx, ask(task));
 		if (!result.ok) throw new Error(result.reason);
 		expect(h.controller.directing()).toBe(true);
 		expect(h.controller.runId()).toBe(result.runId);
 		expect(activeLedgerRun(h.repo.repoId)?.runId).toBe(result.runId);
 		const record = await readRun(root, result.runId);
-		expect(record).toMatchObject({ status: "running", configHash: configHash(SESSION_TEAM), task, process: processKey() });
+		expect(record).toMatchObject({ status: "running", configHash: configHash(SESSION_TEAM), task, process: processKey(), turns: 0 });
+		expect(record?.limits).toBeUndefined();
 		// Nothing of the retired keyword contract is written any more.
 		expect(record && "contract" in record).toBe(false);
 		expect(record && "approvalId" in record).toBe(false);
@@ -95,10 +101,65 @@ describe("run start", () => {
 		await h.controller.finish("settled");
 	});
 
+	test("the record keeps the limits the user stated with the request", async () => {
+		const h = session();
+		const runId = await h.start({ task: "t", rounds: 5, minutes: 30 });
+		expect(await readRun(root, runId)).toMatchObject({ turns: 0, limits: { rounds: 5, minutes: 30 } });
+		await h.controller.finish("settled");
+		const one = session();
+		const only = await one.start({ task: "t", minutes: 1 });
+		expect((await readRun(root, only))?.limits).toEqual({ minutes: 1 });
+		await one.controller.finish("settled");
+	});
+
+	test("a start is refused while omp's goal is active or its loop is on", async () => {
+		for (const modes of [fakeModes({ goal: "active" }), fakeModes({ loop: "active" }), fakeModes({ loop: "paused" })]) {
+			const h = session({ modes });
+			const result = await h.controller.start(h.ctx, ask("t"));
+			expect(result.ok).toBe(false);
+			expect(h.sent).toEqual([]);
+			expect(h.controller.directing()).toBe(false);
+			expect(await runIds(root)).toEqual([]);
+		}
+	});
+
+	test("a paused goal and a host without mode control still start", async () => {
+		for (const modes of [fakeModes({ goal: "paused" }), null]) {
+			const h = session({ modes });
+			const runId = await h.start(ask("t"));
+			expect((await readRun(root, runId))?.status).toBe("running");
+			await h.controller.finish("shutdown");
+		}
+	});
+
+	test("an active goal or loop refuses before asking to leave vibe", async () => {
+		for (const modes of [fakeModes({ vibe: true, goal: "active" }), fakeModes({ vibe: true, loop: "active" })]) {
+			const h = session({ modes, answers: [options => options[0]] });
+			expect((await h.controller.start(h.ctx, ask("t"))).ok).toBe(false);
+			expect(h.ui.selects).toEqual([]);
+			expect(h.modes?.state.vibe.status).toBe("active");
+			expect(h.sent).toEqual([]);
+		}
+	});
+
+	test("omp vibe mode is left first when the user agrees; declining starts nothing", async () => {
+		const h = session({ modes: fakeModes({ vibe: true }), answers: [options => options[0]] });
+		await h.start(ask("t"));
+		expect(h.ui.selects).toHaveLength(1);
+		expect(h.events.slice(0, 2)).toEqual(["select", "set:vibe:exit"]);
+		expect(h.modes?.state.vibe.status).toBe("inactive");
+		await h.controller.finish("shutdown");
+		for (const answer of [(options: string[]) => options[1], undefined]) {
+			const declined = session({ modes: fakeModes({ vibe: true }), answers: [answer] });
+			expect((await declined.controller.start(declined.ctx, ask("t"))).ok).toBe(false);
+			expect(declined.sent).toEqual([]);
+		}
+	});
+
 	test("the record keeps the first 200 characters of a long request; the handoff carries all of it", async () => {
 		const task = "x".repeat(450);
 		const h = session();
-		const runId = await h.start(vibe(task));
+		const runId = await h.start(ask(task));
 		expect((await readRun(root, runId))?.task).toHaveLength(200);
 		expect(h.sent[0]).toContain(task);
 		await h.controller.finish("settled");
@@ -116,7 +177,7 @@ describe("run start", () => {
 		const reasons = new Set<string>();
 		for (const state of broken) {
 			const h = session({ state });
-			const result = await h.controller.start(h.ctx, vibe("task"));
+			const result = await h.controller.start(h.ctx, ask("task"));
 			expect(result.ok).toBe(false);
 			if (!result.ok) reasons.add(result.reason);
 			expect(h.controller.directing()).toBe(false);
@@ -133,21 +194,21 @@ describe("run start", () => {
 	test("one run per session and per project", async () => {
 		const first = session();
 		await first.start();
-		expect((await first.controller.start(first.ctx, vibe("again"))).ok).toBe(false);
-		expect(first.controller.request(vibe("again")).ok).toBe(false);
+		expect((await first.controller.start(first.ctx, ask("again"))).ok).toBe(false);
+		expect(first.controller.request(ask("again")).ok).toBe(false);
 		const second = session();
-		expect((await second.controller.start(second.ctx, vibe("other session"))).ok).toBe(false);
+		expect((await second.controller.start(second.ctx, ask("other session"))).ok).toBe(false);
 		expect(second.sent).toEqual([]);
 		expect(await runIds(root)).toHaveLength(1);
 		await first.controller.finish("settled");
-		expect((await second.controller.start(second.ctx, vibe("other session"))).ok).toBe(true);
+		expect((await second.controller.start(second.ctx, ask("other session"))).ok).toBe(true);
 		await second.controller.finish("settled");
 	});
 
 	test("another session's run that starts while this one compacts wins: this start is refused and leaves nothing", async () => {
 		const other = session();
 		const h = session({ usage: usage(200_000, 50), compact: async () => void (await other.start()) });
-		const result = await h.controller.start(h.ctx, vibe("late"));
+		const result = await h.controller.start(h.ctx, ask("late"));
 		expect(result.ok).toBe(false);
 		expect(h.sent).toEqual([]);
 		expect(h.controller.directing()).toBe(false);
@@ -211,7 +272,7 @@ describe("run start", () => {
 		const compaction = Promise.withResolvers<void>();
 		const task = "after the slow compaction";
 		const h = session({ usage: usage(200_000, 50), compact: () => compaction.promise });
-		const queued = h.controller.request(vibe(task));
+		const queued = h.controller.request(ask(task));
 		if (!queued.ok) throw new Error(queued.reason);
 
 		// omp gives the handler 30 s; it returns while the compaction is still running.
@@ -221,8 +282,8 @@ describe("run start", () => {
 		expect(h.controller.directing()).toBe(false);
 		// The session settles again meanwhile (the compaction itself ends a loop): nothing starts twice, nothing ends.
 		await h.controller.onAgentEnd({}, h.ctx);
-		expect(h.controller.request(vibe("second")).ok).toBe(false);
-		expect((await h.controller.start(h.ctx, vibe("second"))).ok).toBe(false);
+		expect(h.controller.request(ask("second")).ok).toBe(false);
+		expect((await h.controller.start(h.ctx, ask("second"))).ok).toBe(false);
 
 		compaction.resolve();
 		await until(() => h.sent.length > 0);
@@ -235,11 +296,11 @@ describe("run start", () => {
 
 	test("a queued run waits for a terminal agent_end and starts exactly once", async () => {
 		const h = session();
-		const queued = h.controller.request(vibe("queued"));
+		const queued = h.controller.request(ask("queued"));
 		if (!queued.ok) throw new Error(queued.reason);
 		// Queued: a second request and a direct start are refused, and nothing has started.
-		expect(h.controller.request(vibe("second")).ok).toBe(false);
-		expect((await h.controller.start(h.ctx, vibe("second"))).ok).toBe(false);
+		expect(h.controller.request(ask("second")).ok).toBe(false);
+		expect((await h.controller.start(h.ctx, ask("second"))).ok).toBe(false);
 		await h.controller.onAgentEnd({ willContinue: true }, h.ctx);
 		await h.controller.onAgentEnd({ awaitingAsyncWork: true }, h.ctx);
 		expect(h.sent).toEqual([]);
@@ -260,7 +321,7 @@ describe("run start", () => {
 
 	test("a detached start that is refused or throws ends in a notice, never in a silent nothing", async () => {
 		const refused = session({ state: s => ({ ...s, approval: undefined }) });
-		refused.controller.request(vibe("task"));
+		refused.controller.request(ask("task"));
 		await refused.controller.onAgentEnd({}, refused.ctx);
 		await until(() => refused.notices.length > 0);
 		expect(refused.notices).toHaveLength(1);
@@ -271,21 +332,21 @@ describe("run start", () => {
 				throw new Error("git is gone");
 			},
 		});
-		failing.controller.request(vibe("task"));
+		failing.controller.request(ask("task"));
 		await failing.controller.onAgentEnd({}, failing.ctx);
 		await until(() => failing.notices.length > 0);
 		expect(failing.notices[0]).toMatchObject({ level: "error" });
 		expect(failing.notices[0]?.text).toContain("git is gone");
 		// The failed start left nothing behind: the next request is accepted.
-		expect(failing.controller.request(vibe("again")).ok).toBe(true);
+		expect(failing.controller.request(ask("again")).ok).toBe(true);
 	});
 
 	test("launch starts at once and reports a refusal the same way", async () => {
 		const h = session();
-		h.controller.launch(h.ctx, vibe("direct"));
+		h.controller.launch(h.ctx, ask("direct"));
 		await until(() => h.sent.length > 0);
 		expect(h.controller.directing()).toBe(true);
-		h.controller.launch(h.ctx, vibe("second"));
+		h.controller.launch(h.ctx, ask("second"));
 		await until(() => h.notices.some(n => n.level === "warning"));
 		expect(h.sent).toHaveLength(1);
 		await h.controller.finish("settled");
@@ -319,10 +380,12 @@ describe("run end", () => {
 		await h.controller.onAgentEnd({ willContinue: true }, h.ctx);
 		await h.controller.onAgentEnd({ awaitingAsyncWork: true }, h.ctx);
 		expect(h.controller.directing()).toBe(true);
+		// omp resumes a paused run with a new turn; its end is the round.
+		h.controller.onAgentStart();
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.controller.directing()).toBe(false);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", mode: "vibe", turns: 1, endReason: "settled" });
-		expect(await readRunIndex(root)).toMatchObject([{ runId, mode: "vibe", turns: 1, endReason: "settled" }]);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", turns: 1, endReason: "settled" });
+		expect(await readRunIndex(root)).toMatchObject([{ runId, turns: 1, endReason: "settled" }]);
 	});
 
 	test("a run ends once: one summary, one index line, the ledger closed, and later events change nothing", async () => {
@@ -342,7 +405,7 @@ describe("run end", () => {
 		expect(await readRunIndex(root)).toHaveLength(1);
 		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "settled", endedAt: ended as string });
 		// The session is free again: the next request is taken.
-		expect(h.controller.request(vibe("next")).ok).toBe(true);
+		expect(h.controller.request(ask("next")).ok).toBe(true);
 	});
 
 	test("the read index lives as long as the run: a subagent's read counts during it and is forgotten after", async () => {
@@ -409,6 +472,371 @@ describe("run end", () => {
 	});
 });
 
+describe("round loop", () => {
+	test("no writer: one round, settled, nothing sent besides the handoff", async () => {
+		const h = session();
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "settled", turns: 1 });
+	});
+
+	test("a writer with no verdict gets round 2; a correct verdict after the change then verifies it", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.controller.directing()).toBe(true);
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
+
+		agents.push(verdict(T0 + 1, true));
+		await h.turn();
+		expect(h.sent).toHaveLength(2);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("an incorrect verdict and a round that changes and reviews nothing ends no-progress", async () => {
+		const h = session({ agents: [writer(), verdict(T0 + 1, false)] });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		await h.turn();
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+	});
+
+	test("config extra rounds: progress every round but no verdict ends on the round limit after two rounds", async () => {
+		const agents = [writer()];
+		const h = session({ config: { ...SESSION_TEAM, rounds: 1 }, agents });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/2"');
+		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 2 }));
+		await h.turn();
+		expect(h.sent).toHaveLength(2);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 2 });
+	});
+
+	test("the request's own rounds limit of 1 ends the unverified first round at once", async () => {
+		const h = session({ agents: [writer()] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 1 });
+	});
+
+	test("the request's minutes limit is checked when a round ends", async () => {
+		let clock = T0;
+		const h = session({ now: () => clock, agents: [writer()] });
+		const runId = await h.start({ task: "t", minutes: 10 });
+		clock += 11 * 60_000;
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "time-limit", turns: 1 });
+	});
+
+	test("an aborted turn with unverified changes ends interrupted and sends nothing", async () => {
+		const h = session({ agents: [writer()] });
+		const runId = await h.start();
+		h.controller.onAgentStart();
+		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+	});
+
+	test("a held session waits: the delay look arms HOLD_MS until the draft is gone, and a turn clears the wait", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		await h.start();
+		h.hold.editor = "draft";
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		// The first look is held: it arms the hold wait instead of sending.
+		h.timers.fire();
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.delays()).toEqual([HOLD_MS]);
+		// Still held: firing only arms the next look.
+		h.timers.fire();
+		expect(h.timers.delays()).toEqual([HOLD_MS]);
+		expect(h.sent).toHaveLength(1);
+		// The draft is gone: the same timer sends the round.
+		h.hold.editor = "";
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.timers.pending()).toBe(0);
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+
+		// The next round's delay is pending; the turn that starts clears it.
+		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 3 }));
+		await h.turn();
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		h.controller.onAgentStart();
+		expect(h.timers.pending()).toBe(0);
+		await h.controller.finish("shutdown");
+	});
+
+	test("an unverified round waits out the delay: nothing is sent until the timer fires", async () => {
+		const h = session({ agents: [writer()] });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
+		await h.controller.finish("shutdown");
+	});
+
+	test("a verdict that arrives before the timer fires is used: the run verifies, nothing is sent", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		agents.push(verdict(T0 + 1, true));
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
+	});
+
+	test("a turn that starts before the timer fires clears it, and its end decides again", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		h.controller.onAgentStart();
+		expect(h.timers.pending()).toBe(0);
+		// The user's own turn ends: a round, decided from fresh evidence.
+		agents.push(verdict(T0 + 1, true));
+		await h.controller.onAgentEnd({}, h.ctx);
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("a round message that cannot be sent ends the run no-progress with a warning", async () => {
+		const h = session({
+			agents: [writer()],
+			send: async text => {
+				if (text.includes('round="2/4"')) throw new Error("session closed");
+			},
+		});
+		const runId = await h.start();
+		await h.turn();
+		// The agent_end handler has returned; the rejection arrives from the send the timer started.
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.endReason === "no-progress");
+		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 1 });
+	});
+
+	test("a round send that rejects after the run ended leaves the record alone", async () => {
+		const send = Promise.withResolvers<void>();
+		const h = session({
+			agents: [writer()],
+			send: async text => {
+				if (text.includes('round="2/4"')) await send.promise;
+			},
+		});
+		const runId = await h.start();
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		await h.controller.finish("shutdown");
+		const ended = await readRun(root, runId);
+		const summaries = h.summaries();
+		const warnings = h.notices.filter(n => n.level === "warning").length;
+
+		send.reject(new Error("session closed"));
+		await until(() => h.notices.filter(n => n.level === "warning").length === warnings + 1);
+		expect(h.summaries()).toBe(summaries);
+		expect(await readRun(root, runId)).toEqual(ended);
+	});
+
+	test("a send that never settles does not hold the round or the next turn", async () => {
+		const pending = Promise.withResolvers<void>();
+		const agents = [writer()];
+		const h = session({
+			agents,
+			send: async text => {
+				if (text.includes('round="2/4"')) await pending.promise;
+			},
+		});
+		const runId = await h.start();
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		// The next turn starts and settles while that send is still pending.
+		agents.push(verdict(T0 + 1, true));
+		await h.turn();
+		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		pending.resolve();
+	});
+
+	test("a team whose reviewer role is disabled settles a writer's changes", async () => {
+		const h = session({ config: { ...SESSION_TEAM, disabledRoles: ["reviewer"] }, agents: [writer()] });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "settled", turns: 1 });
+	});
+
+	test("a run past a block-spawns budget with unverified changes ends budget and sends nothing", async () => {
+		const h = session({
+			config: { ...SESSION_TEAM, budget: { perRunUsd: 1, onExceed: "block-spawns" } },
+			agents: [writer()],
+		});
+		const runId = await h.start();
+		recordCost(h.repo.repoId, "a/i", 2);
+		expect(activeLedgerRun(h.repo.repoId)?.exceeded).toBe(true);
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
+	});
+
+	test("a quick agent's changes alone are nothing to verify", async () => {
+		const h = session({ agents: [agentEntry({ role: "quick", changes: 2, lastChangeAt: T0 })] });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "settled", turns: 1 });
+	});
+
+	test("a streaming session, queued messages and plan mode each hold the round", async () => {
+		for (const hold of [{ idle: false }, { pending: true }] as const) {
+			const h = session({ agents: [writer()], hold });
+			await h.start();
+			await h.turn();
+			h.timers.fire();
+			expect(h.sent).toHaveLength(1);
+			expect(h.timers.delays()).toEqual([HOLD_MS]);
+			await h.controller.finish("shutdown");
+		}
+		const modes = fakeModes();
+		modes.state.plan.status = "active";
+		const planning = session({ agents: [writer()], modes });
+		await planning.start();
+		await planning.turn();
+		planning.timers.fire();
+		expect(planning.sent).toHaveLength(1);
+		expect(planning.timers.delays()).toEqual([HOLD_MS]);
+		await planning.controller.finish("shutdown");
+	});
+
+	test("a pending round wait dies with the run: shutdown and a budget stop between turns send nothing", async () => {
+		for (const end of ["shutdown", "budget"] as const) {
+			const h =
+				end === "budget"
+					? session({ config: { ...SESSION_TEAM, budget: { perRunUsd: 1, onExceed: "stop" } }, agents: [writer()] })
+					: session({ agents: [writer()] });
+			const runId = await h.start();
+			await h.turn();
+			expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+			if (end === "budget") recordCost(h.repo.repoId, "a/i", 2);
+			else await h.controller.finish("shutdown");
+			expect(h.controller.directing()).toBe(false);
+			expect(h.timers.pending()).toBe(0);
+			await until(async () => (await readRun(root, runId))?.status !== "running");
+			expect(await readRun(root, runId)).toMatchObject({ status: end === "budget" ? "budget-exceeded" : "stopped", endReason: end });
+			h.timers.fire();
+			expect(h.sent).toHaveLength(1);
+		}
+	});
+});
+
+describe("interrupted waits", () => {
+	test("Esc during an async wait ends the run interrupted and sends nothing", async () => {
+		const h = session({ agents: [writer()] });
+		const runId = await h.start();
+		h.controller.onAgentStart();
+		// omp pauses the run on the subagents; only their work can resume it.
+		await h.controller.onAgentEnd({ willContinue: true, awaitingAsyncWork: true }, h.ctx);
+		expect(h.controller.directing()).toBe(true);
+		// Esc ends the paused run: no new turn and no assistant message marked aborted names it.
+		await h.controller.onAgentEnd({}, h.ctx);
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.pending()).toBe(0);
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+	});
+
+	test("an async wait that resumes with a new turn decides as usual", async () => {
+		const h = session({ agents: [writer()] });
+		await h.start();
+		h.controller.onAgentStart();
+		await h.controller.onAgentEnd({ awaitingAsyncWork: true }, h.ctx);
+		h.controller.onAgentStart();
+		await h.controller.onAgentEnd({}, h.ctx);
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		expect(h.controller.directing()).toBe(true);
+	});
+
+	test("a prompt omp dropped because the user interrupted its setup ends interrupted, not no-progress", async () => {
+		const h = session({
+			agents: [writer()],
+			send: async text => {
+				if (!text.includes('round="2/4"')) return;
+				const error = new Error("Prompt dropped before provider dispatch.");
+				error.name = "PromptDroppedError";
+				throw error;
+			},
+		});
+		const runId = await h.start();
+		await h.turn();
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.endReason === "interrupted");
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(0);
+	});
+});
+
+describe("run failures behind a timer", () => {
+	/** Leaves the run records unwritable: a `finish` from a timer or a rejected send then throws. */
+	const breakRecords = async (): Promise<void> => {
+		await rm(runsDir(root), { recursive: true, force: true });
+		await writeFile(runsDir(root), "not a directory");
+	};
+
+	test("a look that cannot end the run reports the failure instead of leaving a rejected promise", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		await h.start();
+		await h.turn();
+		agents.push(verdict(T0 + 1, true));
+		await breakRecords();
+		h.timers.fire();
+		await until(() => h.notices.some(n => n.level === "error"));
+		expect(h.controller.directing()).toBe(false);
+	});
+
+	test("a rejected round send whose stop fails reports both the warning and the error", async () => {
+		const h = session({
+			agents: [writer()],
+			send: async text => {
+				if (text.includes('round="2/4"')) throw new Error("session closed");
+			},
+		});
+		await h.start();
+		await h.turn();
+		await breakRecords();
+		h.timers.fire();
+		await until(() => h.notices.some(n => n.level === "error"));
+		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(1);
+	});
+});
+
 describe("budget", () => {
 	const budget = (onExceed: "stop" | "block-spawns"): StormConfig => ({ ...SESSION_TEAM, budget: { perRunUsd: 2, warnAtUsd: 1, onExceed } });
 
@@ -442,6 +870,31 @@ describe("budget", () => {
 		expect(h.controller.directing()).toBe(true);
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "settled" });
+	});
+
+	test("a stop during a turn with unverified changes ends budget, not the aborted turn's interruption", async () => {
+		const h = session({ config: budget("stop"), agents: [writer()] });
+		const runId = await h.start();
+		h.controller.onAgentStart();
+		recordCost(h.repo.repoId, "a/i", 2);
+		expect(h.aborts()).toBe(1);
+		// omp marks the aborted turn's last assistant message; without the end decided earlier it would read interrupted.
+		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
+		expect(h.sent).toHaveLength(1);
+		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
+	});
+
+	test("a stop between turns ends the run at once, before any next turn", async () => {
+		const h = session({ config: budget("stop"), agents: [writer()] });
+		const runId = await h.start();
+		await h.turn();
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		recordCost(h.repo.repoId, "a/i", 2);
+		expect(h.aborts()).toBe(0);
+		expect(h.controller.directing()).toBe(false);
+		expect(h.timers.pending()).toBe(0);
+		await until(async () => (await readRun(root, runId))?.status === "budget-exceeded");
+		expect(await readRun(root, runId)).toMatchObject({ endReason: "budget", turns: 1 });
 	});
 
 	test("without a budget no spend warns or aborts", async () => {
@@ -720,21 +1173,16 @@ describe("run summary", () => {
 		expect(lines.join("\n")).not.toContain("NaN");
 	});
 
-	test("mode, turns and end reason are on the first line; a goal's tokens on the director line", () => {
-		const goal: RunRecord = { ...base, status: "stopped", mode: "goal", turns: 7, endReason: "goal-stalled", goal: { objective: "t", tokenBudget: 500_000, tokensUsed: 120_000 } };
-		const lines = summarizeRun(goal).split("\n");
-		const first = (run: RunRecord) => summarizeRun(run).split("\n")[0];
+	test("turns and the end reason are on the first line; a 0.10 record's reason shows as written", () => {
+		const first = (run: RunRecord) => summarizeRun(run).split("\n")[0] ?? "";
+		expect(first({ ...base, turns: 7 })).toContain("7");
+		expect(first({ ...base, turns: 8 })).toBe(first({ ...base, turns: 7 }).replace("7", "8"));
+		// Records of 0.10 may carry a mode and reasons this version no longer has: it renders and shows the raw reason.
+		const old = { ...base, status: "stopped", mode: "goal", turns: 7, endReason: "goal-complete", goal: { objective: "t" } } as unknown as RunRecord;
+		const lines = summarizeRun(old).split("\n");
 		expect(lines.length).toBeLessThanOrEqual(5);
-		expect(lines[0]).toContain(tokens(500_000));
-		// The turn count is on the first line, and the goal's tokens on the third, the director's.
-		expect(first({ ...goal, turns: 8 })).toBe(lines[0]?.replace("7", "8"));
-		expect(lines[2]).toContain(tokens(120_000));
-		expect(summarizeRun({ ...goal, goal: { objective: "t" } }).split("\n")).toHaveLength(lines.length - 1);
-		const loop: RunRecord = { ...base, mode: "loop", turns: 3, endReason: "loop-ended", loop: { limit: { kind: "turns", turns: 3 }, condition: { command: "bun test", until: true } } };
-		expect(first(loop)).toContain("`bun test`");
-		// Each end reason reads differently, and a record without a mode shows none.
-		expect(first({ ...goal, endReason: "goal-complete" })).not.toBe(first(goal));
-		expect(first({ ...base, mode: "vibe", turns: 1 })).not.toBe(first(base));
+		expect(first(old)).toContain("goal-complete");
+		expect(first(old)).toContain("7");
 	});
 });
 
