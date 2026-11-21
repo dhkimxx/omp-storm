@@ -143,4 +143,4 @@ npm run e2e      # 가짜 LLM 서버로 실제 omp에서 확인(유료 호출 �
 ```
 
 - 계획서: [docs/plan.md](docs/plan.md)
-- P0 결과: [docs/p0-results.md](docs/p0-results.md), 하네스: [spikes/p0](spikes/p0/README.md)
+- 스파이크 결과: [docs/p0-results.md](docs/p0-results.md), 하네스: [spikes/p0](spikes/p0/README.md), [spikes/b0](spikes/b0/README.md)
