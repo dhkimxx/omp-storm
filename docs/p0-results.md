@@ -39,7 +39,7 @@
 - **근거:** `prompt()`는 `synthetic`이 아닐 때 notice를 만든다(`session/agent-session.ts:9280`). `sendUserMessage`는 `deliverAs`가 지정되면 `prompt()`를 거치지 않고 `#queueUserMessage`를 직접 부르며 notice를 넘기지 않는다(`:11552`). notice가 붙으려면 `orchestrate`는 `task`가, `workflowz`는 `eval`과 `task`가 켜져 있어야 한다(`modes/magic-keywords.ts`).
 
 **결정**
-- `/storm <작업>` 명령에서는 `await ctx.waitForIdle()` 뒤 `sendUserMessage(text)`를 부른다.
+- `/storm <작업>` 명령에서는 `await ctx.waitForIdle()` 뒤 `sendUserMessage(text)`를 부른다. (v0.4에서 대체됨: 명령은 실행을 시작하지 않고 요청을 메인 LLM에 넘긴다. 실행은 `storm` 도구 경로로만 `agent_end` 뒤 시작한다.)
 - `storm` 도구에서는 실행 요청을 보관했다가 `agent_end`에서 보낸다. 스트리밍 중 steer 경로도 notice는 붙지만, steer는 진행 중인 도구 묶음을 끊을 수 있어 쓰지 않는다.
 - `followUp`·`steer`는 키워드 인계에 쓰지 않는다.
 
@@ -162,6 +162,7 @@
 
 - 판정은 `configHash`로만 한다. `rawSha256`은 감사용이다.
 - 계정 식별자와 토큰은 어느 필드에도 넣지 않는다.
+- 현재 형식은 `src/types.ts`의 `ApprovalRecord`가 정한다.
 
 ## Q7. `.omp/storm/` 충돌
 
@@ -188,7 +189,7 @@
 
 **결정:** 계획서 9.1.
 - 경로는 `getStatsDbPath()`로 얻고 읽기 전용으로 연다. `immutable=1`은 쓰지 않는다.
-- 필수 컬럼을 검사하고, 분위수는 윈도우 함수로 구한다.
+- 필수 컬럼을 검사한다. 분위수는 처음에 윈도우 함수로 구하기로 했으나, 구현은 단순 조회 뒤 TS에서 계산한다(`src/history/stats.ts`).
 - 결과에 데이터 기준 시각을 표시하고, 필요하면 `omp stats --summary`로 갱신한다.
 - 일 단위 집계를 따로 보관한다.
 
@@ -231,7 +232,6 @@
 | `ctx.modelRegistry`의 실제 `int` 커버리지 | 시뮬레이션값만 있다 | v0.1 탐지 코드에서 측정 |
 | eval 자식의 진행 중 비용 이벤트, `ctx.abort()`의 자식 중단 범위 | 예산 누계와 `onExceed: "stop"`의 정확도 | 하네스에 시나리오 추가 |
 | `omp stats --summary` 증분 갱신 시간 | 신선도 대책의 비용 | 실제 DB 사본을 둔 프로필에서 측정 |
-| Linux에서 SQLite 윈도우 함수·`percentile` | 이식성 | galaxybook에서 확인 |
 | `/agents` 허브의 플러그인 역할 에이전트 표시 | Q3의 일부 | TUI에서 확인 |
 | 카탈로그 모델로 처음 라우팅할 때의 기능 확인 프로브 | 시험 사용 비용 | 실제 모델 경로에서 확인 |
 
