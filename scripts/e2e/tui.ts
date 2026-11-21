@@ -15,7 +15,7 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
-import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, PROFILE_CONFIG, prepare, type Step, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
+import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, PROFILE_CONFIG, prepare, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
 const PICK_BY_ROLE = "역할별로 고르기";
@@ -196,14 +196,14 @@ async function main(): Promise<void> {
 	);
 
 	await suite.step(
-		"a plain request ends at settle",
+		"a plain request ends without changes",
 		async () => {
 			const llm = new LlmCursor(env);
 			await session(async tui => {
 				const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"] }];
 				const run = await runOf(tui, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 150_000);
 				check("one side turn routed it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
-				check("one settled turn, ended by the settle", run.turns === 1 && run.endReason === "settled" && run.status === "done", `turns=${run.turns} ${run.endReason} ${run.status}`);
+				check("one turn, ended with no changes", run.turns === 1 && run.endReason === "no-changes" && run.status === "ended", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
 				check("it ended once", files.index().filter(line => line.runId === run.runId).length === 1);
 			});
@@ -223,7 +223,24 @@ async function main(): Promise<void> {
 						{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
 						{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
 					];
-					const run = await runOf(tui, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 240_000);
+					const before = files.runIds();
+					await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+					// The run is on from here until its record ends; the status row is where the live label is shown.
+					await suite.eventually(
+						"the status line shows the live run while it is active",
+						() => statusLine(tui.raw)?.startsWith("storm ▶") ?? false,
+						() => statusLine(tui.raw) ?? "no status line",
+						30_000,
+					);
+					const run = await files.finishedRun(before, 240_000);
+					await suite.eventually(
+						"the status line returns to idle after the run",
+						() => statusLine(tui.raw)?.startsWith("storm ✓") ?? false,
+						() => statusLine(tui.raw) ?? "no status line",
+						60_000,
+					);
+					const idle = statusLine(tui.raw) ?? "";
+					check("the live status line is gone once the run ended", idle.startsWith("storm ✓") && !idle.includes("▶"), idle);
 					const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
 					const stormMessages = [...new Set(mains(llm.all()).map(entry => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "")))].filter(user => user.startsWith("<storm-run"));
 					check(

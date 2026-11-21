@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { ApprovalStore } from "../src/approval/store.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { configPath } from "../src/config/store.ts";
+import type { TreeState } from "../src/runtime/tree.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, ApprovalRecord, RepoIdentity, RoleConfig, RunRecord, ShadowInfo, SpawnRecord, StormConfig } from "../src/types.ts";
 
@@ -46,6 +47,11 @@ export function agentEntry(over: Partial<AgentEntry> = {}): AgentEntry {
 		followUps: 0,
 		...over,
 	};
+}
+
+/** A work tree as `treeState` reports it: hashes only, so tests can move it without a repository. */
+export function treeOf(diff = "diff-0", files = "files-0"): TreeState {
+	return { diff, files };
 }
 
 /** A finished run record without spend or spawns. */

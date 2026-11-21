@@ -104,6 +104,13 @@ export function noteAgentReview(id: string, input: unknown, now: number): void {
 	if (correct !== undefined) e.lastVerdict = { at: now, correct };
 }
 
+/** Ties the tree a verdict was given against to that verdict; a later verdict keeps its own tree. */
+export function noteVerdictTree(id: string, at: number, tree: string): void {
+	const e = agents.get(id);
+	if (!e || e.lastVerdict?.at !== at) return;
+	e.lastVerdict.tree = tree;
+}
+
 /** One more successful file-changing tool result inside the agent; unknown ids are ignored. */
 export function noteAgentChange(id: string, now: number): void {
 	const e = agents.get(id);

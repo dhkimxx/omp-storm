@@ -19,10 +19,14 @@
  * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered. In a child's assignment:
  *   E2E-CHILD-READ <a,b>    call `read` on each path first
  *   E2E-CHILD-WRITE <path>  call `write` with that path first (before the yield)
+ *   E2E-CHILD-BASH <path>   change that path with `bash` first, through no edit tool
+ *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
  *                           answered), so the parent's turn ends and is compacted while the child still runs
+ *   E2E-CHILD-HOLD-ONCE <key>
+ *                           the same, but only the first child carrying that key: a resumed copy of the request runs on
  * A compaction request (one user message opening with `<conversation>`) gets a plain summary; the log keeps its
  * `<additional-context>` block (what extensions added through `session.compacting`).
  *
@@ -55,9 +59,9 @@ interface Message {
 }
 /**
  * One step of a scripted main turn: a storm tool call, a task batch (`as` prefixes the children's names, `say` is
- * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a follow-up to a subagent, a read, or
- * `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the last task call has made
- * its first request, so the turn ends with that child known to be running.
+ * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a shell command, a follow-up to a
+ * subagent, a read, or `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the
+ * last task call has made its first request, so the turn ends with that child known to be running.
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
@@ -66,6 +70,7 @@ export type Step = (
 	| { storm: Record<string, unknown> }
 	| { task: string[]; as?: string; say?: string }
 	| { edit: string }
+	| { bash: string }
 	| { followUp: string }
 	| { read: string }
 	| { awaitChild: true }
@@ -145,6 +150,8 @@ const DOC_RULES = "## Storm doc rules";
 const HOLD_MAX_MS = 60_000;
 /** What the server has seen so far: the events held replies wait for. */
 const seen = { children: 0, childrenAtTask: 0, compactions: 0 };
+/** Keys whose one-time hold is spent: a resumed request must not hold again or it could never finish. */
+const heldOnce = new Set<string>();
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -230,6 +237,11 @@ function writeCall(path: string, content: string): Decision {
 	return { kind: "tool", name: "write", args: { path, content } };
 }
 
+/** A `bash` call: a change made this way is invisible to the edit-tool counter. */
+function bashCall(tools: Tool[] | undefined, command: string): Decision {
+	return { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command } };
+}
+
 /** A call of an extension tool: by name when omp offers it, else through its `xd://<tool>` device. */
 function extensionCall(tools: Tool[] | undefined, name: string, args: Record<string, unknown>): Decision {
 	if (tools?.some(tool => tool.function.name === name)) return { kind: "tool", name, args };
@@ -270,7 +282,16 @@ function classify(request: ChatRequest): Who {
 
 /** A child told to hold makes its first reply wait until its parent has been compacted. */
 function holdsForCompaction(who: Who, messages: Message[]): boolean {
-	return who === "child" && userText(messages).includes("E2E-CHILD-HOLD") && !messages.some(m => m.role === "assistant");
+	return who === "child" && /E2E-CHILD-HOLD(?!-)/.test(userText(messages)) && !messages.some(m => m.role === "assistant");
+}
+
+/** A child told to hold once does so only while its key is unspent; the copy a resumed run starts replies at once. */
+function holdsOnce(who: Who, messages: Message[]): boolean {
+	if (who !== "child" || messages.some(m => m.role === "assistant")) return false;
+	const key = /E2E-CHILD-HOLD-ONCE[ \t]+(\S+)/.exec(userText(messages))?.[1];
+	if (key === undefined || heldOnce.has(key)) return false;
+	heldOnce.add(key);
+	return true;
 }
 
 /** Waits until `open` holds, for `HOLD_MAX_MS` at most. */
@@ -284,6 +305,7 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("task" in step) return taskCall(tools, step.task, step.as, step.say);
 	if ("read" in step) return readCall(tools, step.read);
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
+	if ("bash" in step) return bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, "follow-up");
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
@@ -318,12 +340,16 @@ function childDecision(request: ChatRequest): Decision {
 	const text = userText(messages);
 	const reads = (/E2E-CHILD-READ[ \t]+(\S+)/.exec(text)?.[1] ?? "").split(",").filter(Boolean);
 	const write = /E2E-CHILD-WRITE[ \t]+(\S+)/.exec(text)?.[1];
+	const bash = /E2E-CHILD-BASH[ \t]+(\S+)/.exec(text)?.[1];
+	const commit = /E2E-CHILD-COMMIT[ \t]+(\S+)/.exec(text)?.[1];
 	const correct = /E2E-CHILD-VERDICT[ \t]+correct\b/.test(text);
 	const calls = callNames(messages);
 	const done = calls.filter(name => name === "read").length;
 	const last = messages.at(-1);
 	if (last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: "done" };
 	if (done < reads.length) return readCall(request.tools, reads[done] ?? "");
+	if (commit !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${commit} && git commit -qam storm-e2e-commit`);
+	if (bash !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${bash}`);
 	if (write !== undefined && !calls.includes("write")) return writeCall(write, "storm child change\n");
 	const yieldSchema = schemaOf(request.tools, "yield");
 	return yieldSchema ? yieldCall(yieldSchema, correct) : { kind: "text", text: "OK" };
@@ -460,7 +486,7 @@ Bun.serve({
 		record(request, who, decision);
 		if (decision.kind === "tool" && decision.name === "task") seen.childrenAtTask = seen.children;
 		if (decision.kind === "text" && decision.awaitChild) await hold(() => seen.children > seen.childrenAtTask);
-		if (holdsForCompaction(who, request.messages)) await hold(() => seen.compactions > compactionsBefore);
+		if (holdsForCompaction(who, request.messages) || holdsOnce(who, request.messages)) await hold(() => seen.compactions > compactionsBefore);
 		if (who === "compaction") seen.compactions++;
 		return request.stream ? stream(request.model, decision) : completion(request.model, decision);
 	},

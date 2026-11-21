@@ -2,12 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { renderApproval } from "../src/proposals/present.ts";
-import { changedFields, renderConfigDiff, renderStatus, renderStatusBrief, renderTrial } from "../src/view/render.ts";
+import { changedFields, renderConfigDiff, renderStatus, renderStatusBrief, renderTrial, resumeRunLine, runStatusText } from "../src/view/render.ts";
 import { rollbackLabels, runRollback } from "../src/view/review.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
 import { DEFAULT_WORKERS, roleTitle } from "../src/roles.ts";
-import type { RollbackOption, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
+import type { RollbackOption, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
 import { agentEntry, approvalRecord, runRecord } from "./fixtures.ts";
 import { cand, pick, rec, recs, scriptedUi, TEAM } from "./support.ts";
 import { TEAM_08 } from "./team-08.ts";
@@ -412,6 +412,17 @@ describe("status", () => {
 		expect(active).not.toMatch(ISO_UTC);
 	});
 
+	test("a last run of each status renders, briefly too", () => {
+		const statuses: RunStatus[] = ["running", "done", "ended", "budget-exceeded", "stopped"];
+		for (const status of statuses) {
+			const lastRun = runRecord({ runId: `run-${status}`, status });
+			expect(() => renderStatus(view({ lastRun }), NOW)).not.toThrow();
+			expect(renderStatus(view({ lastRun }), NOW)).toContain(lastRun.runId);
+			expect(() => renderStatusBrief(view({ lastRun }), NOW)).not.toThrow();
+			expect(renderStatusBrief(view({ lastRun }), NOW)).toContain(lastRun.runId);
+		}
+	});
+
 	test("the brief keeps hash, models and what needs a look in a few lines", () => {
 		const full = view({ run, trials: [{ trial, state: undefined, phase: "active" }], dataAsOf: NOW, quota: [{ provider: "prov-q", state: "limited", usedFraction: 0.42, resetsAt: null }] });
 		const brief = renderStatusBrief(full, NOW);
@@ -420,5 +431,69 @@ describe("status", () => {
 		expect(brief).not.toContain("prov-q");
 		expect(brief.split("\n").length).toBeLessThan(renderStatus(full, NOW).split("\n").length / 2);
 		expect(brief).not.toMatch(ISO_UTC);
+	});
+});
+
+describe("runStatusText", () => {
+	const numbers = (part: string | undefined): number[] => part?.match(/\d+/g)?.map(Number) ?? [];
+	const parts = (run: RunRecord, now = NOW): string[] => runStatusText(run, now).replace(/^storm ▶ /, "").split(" · ");
+	const at = (run: RunRecord, now = NOW): RunRecord & { startedAt: string } => ({ ...run, startedAt: new Date(now).toISOString() });
+
+	test("the round in progress starts at one and never passes the bound", () => {
+		const run = at(runRecord({ turns: 0, maxRounds: 4 }));
+		expect(parts(run)[0]).toStartWith("1/4");
+		expect(parts({ ...run, turns: 1 })[0]).toStartWith("2/4");
+		expect(parts({ ...run, turns: 4 })[0]).toStartWith("4/4");
+		expect(parts({ ...run, turns: 9 })[0]).toStartWith("4/4");
+		expect(numbers(parts(runRecord({ turns: 1 }))[0])).toEqual([2]);
+	});
+
+	test("the agents part is absent without agents and counts the running ones", () => {
+		const run = at(runRecord({ turns: 0, maxRounds: 4 }));
+		expect(parts(run)).toHaveLength(3);
+		const agents = [agentEntry({ id: "a", state: "running" }), agentEntry({ id: "b", state: "idle" }), agentEntry({ id: "c", state: "running" })];
+		const withAgents = parts({ ...run, agents });
+		expect(withAgents).toHaveLength(4);
+		expect(numbers(withAgents[1])).toEqual([3, 2]);
+		expect(numbers(parts({ ...run, agents: [agentEntry({ state: "idle" })] })[1])).toEqual([1]);
+	});
+
+	test("spend shows the budget only when the run has one", () => {
+		const run = at({ ...runRecord({ turns: 0, maxRounds: 4 }), costUsd: 1.25 });
+		expect(parts(run)[1]).toBe("$1.25");
+		expect(parts({ ...run, budget: { perRunUsd: 5, onExceed: "stop" } })[1]).toBe("$1.25/$5.00");
+	});
+
+	test("whole minutes come from the given now", () => {
+		const run = at(runRecord({ turns: 0, maxRounds: 4 }));
+		expect(numbers(parts(run, NOW + 59_999).at(-1))).toEqual([0]);
+		expect(numbers(parts(run, NOW + 12 * 60_000 + 59_000).at(-1))).toEqual([12]);
+		expect(numbers(parts(run, NOW + 60 * 60_000).at(-1))).toEqual([60]);
+	});
+});
+
+describe("resumeRunLine", () => {
+	test("one line with the request head, the rounds and the end time", () => {
+		const long = "t".repeat(200);
+		const run = runRecord({ task: "task-head-only", request: long, status: "stopped", endReason: "interrupted", turns: 2, maxRounds: 4, endedAt: "2026-11-20T09:30:00.000Z" });
+		const line = resumeRunLine(run);
+		expect(line.startsWith("- ")).toBe(true);
+		expect(line).not.toContain("\n");
+		expect(line).toContain("t".repeat(80));
+		expect(line).not.toContain("t".repeat(81));
+		// The line shows what resuming will send, never the 200-character head the record also keeps.
+		expect(line).not.toContain("task-head-only");
+		expect(line).toContain("2/4");
+		expect(line).not.toMatch(ISO_UTC);
+		// Without a round bound only the rounds taken are shown.
+		const unbounded = resumeRunLine(runRecord({ task: "short", request: "short", status: "stopped", endReason: "time-limit", turns: 3 }));
+		expect(unbounded).toContain("short");
+		expect(unbounded).not.toContain("3/");
+	});
+
+	test("control characters in the stored request are made visible", () => {
+		const line = resumeRunLine(runRecord({ request: "before\u0007after", status: "stopped", endReason: "interrupted" }));
+		expect(line).toContain("\\u0007");
+		expect(line).not.toContain("\u0007");
 	});
 });

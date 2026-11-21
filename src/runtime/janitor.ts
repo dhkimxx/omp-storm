@@ -237,14 +237,26 @@ async function removeLegacyDir(dir: string): Promise<number> {
 
 /**
  * Run records still `running` whose process is gone (a crash, a kill) become `stopped`, ended at their last live
- * write: they then count as the project's last run instead of staying invisible.
+ * write: they then count as the project's last run instead of staying invisible. At session start no process is
+ * named, so every record is probed; at a run end the starting process is passed and its other records are stale too.
  */
-async function stopDeadRuns(input: JanitorInput, alive: (key: string) => boolean): Promise<void> {
+export interface DeadRunSweep {
+	root: string;
+	/** This process, at a run end: another record of it cannot be live (one run per project). */
+	process?: string;
+	/** The run that is ending: its record is not swept. */
+	runId?: string;
+	alive?: (key: string) => boolean;
+}
+
+export async function stopDeadRuns(input: DeadRunSweep): Promise<void> {
+	const alive = input.alive ?? processAlive;
 	for (const id of await runIds(input.root)) {
 		if (id === input.runId) continue;
 		const record = await readRun(input.root, id);
 		if (record?.status !== "running") continue;
-		// This process has one run per project, and it is `input.runId`: any other record of it is stale too.
+		// Without a named process every record is probed: a live one stays, a dead one is closed. A record of the named
+		// process itself is stale (one run per project), so it is closed without a probe.
 		if (record.process !== undefined && record.process !== input.process && alive(record.process)) continue;
 		await writeRun(input.root, { ...record, status: "stopped", endedAt: record.updatedAt ?? record.startedAt });
 	}
@@ -265,7 +277,12 @@ export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 	result.stormFiles += await pruneTrialStates(input.root, trialIds);
 	result.stormFiles += await removeLegacyDir(path.join(stateDir(input.root), "proposals"));
 	if (input.agentDir) result.stormFiles += await removeLegacyDir(path.join(input.agentDir, "storm", "usage"));
-	await stopDeadRuns(input, alive);
+	await stopDeadRuns({
+		root: input.root,
+		process: input.process,
+		runId: input.runId,
+		...(input.alive ? { alive: input.alive } : {}),
+	});
 	if (input.config.cleanup !== true || input.startConfig.cleanup !== true) return { result, cleaned };
 
 	// Same-process agents absent from the ledger were parked long ago (the ledger only drops parked entries).

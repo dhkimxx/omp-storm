@@ -2,8 +2,9 @@
 import type { ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import type { RunTimers } from "../src/runtime/controller.ts";
 import { RunController } from "../src/runtime/controller.ts";
+import type { TreeReading } from "../src/runtime/tree.ts";
 import type { ProjectState } from "../src/state.ts";
-import type { AgentEntry, RunSpec, StormConfig } from "../src/types.ts";
+import type { AgentEntry, RunRecord, RunSpec, StormConfig } from "../src/types.ts";
 import { approvedState, teamOf } from "./fixtures.ts";
 import { type Answer, type ScriptedUi, scriptedUi } from "./support.ts";
 
@@ -136,6 +137,8 @@ export interface SessionOptions {
 	send?: (message: string) => Promise<void>;
 	/** The run's subagents as the agent ledger reports them; a function is asked at every decision, an array may be mutated. */
 	agents?: AgentEntry[] | (() => AgentEntry[]);
+	/** The work tree the controller reads, with the root and base it passed; absent → no tree dep, as in a host without git. */
+	tree?: (root: string, base?: string) => TreeReading | undefined | Promise<TreeReading | undefined>;
 	/** What the session reports while Storm decides; idle and empty unless the test says otherwise. */
 	hold?: Partial<SessionHold>;
 	/** The whole process ledger; the run's agents when absent. */
@@ -144,6 +147,8 @@ export interface SessionOptions {
 	agentDir?: string;
 	/** The main session's artifacts dir, where omp keeps its subagents' records. */
 	artifactsDir?: string;
+	/** Receives the live status record: the run while it is on, `undefined` at its end. */
+	live?: (ctx: ExtensionContext, run: RunRecord | undefined) => void;
 	now?: () => number;
 }
 
@@ -197,9 +202,11 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		loadState: opts.loadState ?? (async () => state),
 		now: opts.now ?? Date.now,
 		agents: () => (typeof opts.agents === "function" ? opts.agents() : (opts.agents ?? [])),
+		...(opts.tree ? { tree: async (root: string, base?: string) => opts.tree!(root, base) } : {}),
 		timers: timers.api,
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
 		...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
+		...(opts.live ? { live: opts.live } : {}),
 	});
 	// The controller hands ctx to its own deps and reads only these members of it.
 	const ctx = {

@@ -4,6 +4,10 @@ import type { BudgetConfig, RunPlan } from "../types.ts";
 export interface LedgerRun {
 	runId: string;
 	repoId: string;
+	/** The run's main work tree: subagent sessions of the run fingerprint it, whichever tree they work in. */
+	root: string;
+	/** The commit the run's start tree was read against; later reads of the run compare with it. */
+	base?: string;
 	budget?: BudgetConfig;
 	costUsd: number;
 	costByModel: Record<string, number>;
@@ -21,6 +25,8 @@ const runs = new Map<string, LedgerRun>();
 export function startLedgerRun(init: {
 	runId: string;
 	repoId: string;
+	root: string;
+	base?: string;
 	budget?: BudgetConfig;
 	onThreshold?: LedgerRun["onThreshold"];
 }): LedgerRun {
@@ -29,12 +35,14 @@ export function startLedgerRun(init: {
 	const run: LedgerRun = {
 		runId: init.runId,
 		repoId: init.repoId,
+		root: init.root,
 		costUsd: 0,
 		costByModel: {},
 		warned: false,
 		exceeded: false,
 	};
 	if (init.budget) run.budget = init.budget;
+	if (init.base !== undefined) run.base = init.base;
 	if (init.onThreshold) run.onThreshold = init.onThreshold;
 	runs.set(init.repoId, run);
 	return run;

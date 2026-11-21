@@ -22,6 +22,13 @@ export async function git(cwd: string, ...args: string[]): Promise<void> {
 	if (res.code !== 0) throw new Error(`git ${args.join(" ")}: ${res.stderr}`);
 }
 
+/** A git work tree at `root` with everything there committed: `treeState` compares the tree with a commit. */
+export async function gitRepo(root: string): Promise<void> {
+	await git(root, "init");
+	await git(root, "add", "-A");
+	await git(root, "commit", "-m", "base");
+}
+
 export interface TestProject {
 	tmp: string;
 	/** The project directory (not a git repo unless the test makes it one). */

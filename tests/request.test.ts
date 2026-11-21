@@ -49,6 +49,12 @@ describe("run spec", () => {
 		expect(spec("t", { rounds: 20, minutes: 1440 })).toEqual({ task: "t", rounds: 20, minutes: 1440 });
 	});
 
+	test("a non-empty resumeOf is passed through; an empty one is no resume", () => {
+		expect(spec("t", undefined, " run-1 ")).toEqual({ task: "t", resumeOf: "run-1" });
+		expect(spec("t", { rounds: 2 }, "run-1")).toEqual({ task: "t", rounds: 2, resumeOf: "run-1" });
+		expect(spec("t", undefined, "   ")).toEqual({ task: "t" });
+	});
+
 	test("a limit outside what a run accepts is an error", () => {
 		for (const rounds of [0, -1, 2.5, 21, Number.NaN]) expect(spec("t", { rounds })).toBeUndefined();
 		for (const minutes of [0, -1, 1441, Number.POSITIVE_INFINITY, Number.NaN]) expect(spec("t", { minutes })).toBeUndefined();
@@ -100,7 +106,7 @@ describe("route: the side turn's reply", () => {
 	});
 
 	test("queries, answers and changes", () => {
-		for (const action of ["status", "models", "agents", "menu"]) expect(parseRouteReply(JSON.stringify({ action }), TEXT)).toEqual({ action } as never);
+		for (const action of ["status", "models", "agents", "menu", "resume"]) expect(parseRouteReply(JSON.stringify({ action }), TEXT)).toEqual({ action } as never);
 		expect(parseRouteReply('{"action":"workers","role":"implementer","max":4}', TEXT)).toEqual({ action: "change", change: { action: "workers", role: "implementer", max: 4 } });
 		expect(parseRouteReply('{"action":"quota","provider":" OpenAI "}', TEXT)).toEqual({ action: "change", change: { action: "quota", provider: "OpenAI" } });
 	});
@@ -157,6 +163,7 @@ describe("route: prompt", () => {
 		expect(prompt).toContain(brief);
 		expect(prompt).toContain(`<storm-request>\n${request}\n</storm-request>`);
 		expect(prompt.length - brief.length).toBeLessThanOrEqual(1900);
+		expect(prompt).toContain('{"action":"resume"}');
 		// The classifier is not told of shell conditions at all.
 		expect(prompt).not.toContain('"until"');
 		expect(prompt).not.toContain('"while"');
@@ -170,6 +177,7 @@ function router(opts: { reply?: string | Error | null; answers?: Answer[]; host?
 	const calls: string[] = [];
 	const sent: RunSpec[] = [];
 	const changes: ChangeAction[] = [];
+	const resumes: string[] = [];
 	const prompts: string[] = [];
 	const note = (name: string) => async () => {
 		calls.push(name);
@@ -186,6 +194,10 @@ function router(opts: { reply?: string | Error | null; answers?: Answer[]; host?
 		status: note("status"),
 		models: note("models"),
 		agents: note("agents"),
+		resume: async text => {
+			calls.push("resume");
+			resumes.push(text);
+		},
 		change: async change => {
 			calls.push("change");
 			changes.push(change);
@@ -208,7 +220,7 @@ function router(opts: { reply?: string | Error | null; answers?: Answer[]; host?
 						},
 					}),
 		});
-	return { route, ui, calls, sent, changes, prompts };
+	return { route, ui, calls, sent, changes, resumes, prompts };
 }
 
 describe("route: execution", () => {
@@ -226,6 +238,7 @@ describe("route: execution", () => {
 			['{"action":"models"}', "models"],
 			['{"action":"agents"}', "agents"],
 			['{"action":"menu"}', "menu"],
+			['{"action":"resume"}', "resume"],
 			['{"action":"budget","budgetUsd":5}', "change"],
 			['{"action":"settings","docs":false}', "change"],
 		];
@@ -268,6 +281,16 @@ describe("route: execution", () => {
 		const r = router({ reply: '{"action":"run","minutes":30}' });
 		await r.route("t");
 		expect(r.sent).toEqual([{ task: "t", minutes: 30 }]);
+		expect(r.ui.selects).toEqual([]);
+	});
+
+	test("a resume reaches its handler with the user's text, with no dialog", async () => {
+		const text = "이어서 하되 X는 빼고";
+		const r = router({ reply: '{"action":"resume"}' });
+		await r.route(text);
+		expect(r.calls).toEqual(["resume"]);
+		expect(r.resumes).toEqual([text]);
+		expect(r.sent).toEqual([]);
 		expect(r.ui.selects).toEqual([]);
 	});
 

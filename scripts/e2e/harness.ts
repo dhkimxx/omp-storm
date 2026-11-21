@@ -63,7 +63,15 @@ export interface E2eEnv {
 	childEnv: Record<string, string | undefined>;
 }
 
-/** Resolves the environment and recreates the work dir: an empty git project, an isolated HOME and logs. */
+/** The tracked files the project's one commit holds: scenarios change them to prove git sees a change made by a shell. */
+export const TRACKED_FILE = "e2e-tracked.txt";
+export const TRACKED_TEXT = "storm e2e tracked file\n";
+export const COMMIT_FILE = "e2e-committed.txt";
+export const COMMIT_TEXT = "storm e2e commit file\n";
+export const REVIEW_FILE = "e2e-reviewed.txt";
+export const REVIEW_TEXT = "storm e2e review file\n";
+
+/** Resolves the environment and recreates the work dir: a git project with one commit, an isolated HOME and logs. */
 export function prepare(name: string, defaultPort: number): E2eEnv {
 	const omp = process.env.OMP_BIN ? resolve(process.env.OMP_BIN) : join(ROOT, "node_modules", ".bin", "omp");
 	const port = Number(process.env.E2E_PORT ?? defaultPort);
@@ -85,6 +93,24 @@ export function prepare(name: string, defaultPort: number): E2eEnv {
 	for (const dir of [project, logs, agentDir]) mkdirSync(dir, { recursive: true });
 	const git = Bun.spawnSync(["git", "init", "-q", project]);
 	if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
+	// The tree gate reads the commit a run started on: without a commit every tree read is undefined and git changes
+	// stay invisible. The scenarios commit from inside the run, so the repo carries its own identity.
+	for (const [file, text] of [
+		[TRACKED_FILE, TRACKED_TEXT],
+		[COMMIT_FILE, COMMIT_TEXT],
+		[REVIEW_FILE, REVIEW_TEXT],
+	]) {
+		writeFileSync(join(project, file), text);
+	}
+	for (const args of [
+		["config", "--local", "user.name", "Storm E2E"],
+		["config", "--local", "user.email", "storm-e2e@example.invalid"],
+		["add", "--", TRACKED_FILE, COMMIT_FILE, REVIEW_FILE],
+		["commit", "-q", "-m", "e2e initial commit"],
+	]) {
+		const step = Bun.spawnSync(["git", "-C", project, ...args]);
+		if (step.exitCode !== 0) throw new Error(`git ${args[0]} failed: ${step.stderr.toString()}`);
+	}
 	const version = Bun.spawnSync([omp, "--version"], { env: childEnv });
 	if (version.exitCode !== 0) throw new Error(`${omp} --version failed (${version.exitCode}): ${version.stderr.toString()}`);
 	const ompVersion = version.stdout.toString().trim();
@@ -405,6 +431,7 @@ export class Rpc {
 	}
 
 	async stop(): Promise<void> {
+		open.delete(this);
 		this.#proc.kill("SIGKILL");
 		await this.#proc.exited;
 	}
@@ -461,6 +488,15 @@ export function focused(text: string): string | undefined {
 	return rows(text)
 		.findLast(row => row.startsWith(`${FOCUS} `))
 		?.slice(FOCUS.length + 1);
+}
+
+/**
+ * What the status row says now: the last write that placed the row, which clears it (`EL`) and then prints the whole
+ * line. Only Storm's own component is written there in these sessions.
+ */
+export function statusLine(raw: string): string | undefined {
+	const writes = [...raw.matchAll(/\x1b\[[0-9;]*H(?:\x1b\[[0-9;]*m)*\x1b\[K(storm[^\x1b\r\n]*)/g)];
+	return writes.at(-1)?.[1]?.trimEnd();
 }
 
 /** The interactive TUI on a pty. Answers the terminal queries (DA1, OSC 11) the TUI waits for before it renders. */

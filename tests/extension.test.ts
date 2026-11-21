@@ -4,7 +4,7 @@
  * separately and share its module state.
  */
 import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -15,14 +15,18 @@ import { approveAndSave } from "../src/flows.ts";
 import { docPromptFor } from "../src/policy/docs.ts";
 import { listAgents, resetAgents } from "../src/runtime/agents.ts";
 import { activeLedgerRun, resetLedger } from "../src/runtime/ledger.ts";
+import { processKey } from "../src/runtime/janitor.ts";
 import { ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
-import { lastRun } from "../src/runtime/run.ts";
+import { lastRun, readRun, writeRun } from "../src/runtime/run.ts";
+import { noteResumePointer } from "../src/runtime/resume.ts";
 import { readTrialStates } from "../src/runtime/state-files.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
+import { treeAgainst } from "../src/runtime/tree.ts";
 import { loadProjectState } from "../src/state.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
 import { until } from "./fake-session.ts";
-import { makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
+import { git, gitRepo, makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 interface Agent {
@@ -42,6 +46,8 @@ function fakeOmp(project: TestProject) {
 	const sent: string[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
 	const statuses: Array<string | undefined> = [];
+	/** Answers to the next dialogs, by position; empty means the user dismissed them. */
+	const answers: Array<string | undefined | ((options: string[]) => string | undefined)> = [];
 	/** Transcript messages (notices and records outside the TUI); none of them reaches the model. */
 	const transcript: unknown[] = [];
 	let active = ["read", "write"];
@@ -92,7 +98,10 @@ function fakeOmp(project: TestProject) {
 			hasPendingMessages: () => false,
 			ui: {
 				notify: (text: string, level = "info") => notices.push({ text, level }),
-				select: async () => undefined,
+				select: async (_title: string, options: string[]) => {
+					const answer = answers.shift();
+					return typeof answer === "function" ? answer(options) : answer;
+				},
 				confirm: async () => false,
 				input: async () => undefined,
 				setStatus: (_key: string, text: string | undefined) => statuses.push(text),
@@ -111,6 +120,7 @@ function fakeOmp(project: TestProject) {
 		sent,
 		notices,
 		statuses,
+		answers,
 		transcript,
 		waits,
 		broken,
@@ -238,8 +248,8 @@ describe("a run through the hooks", () => {
 		const record = await lastRun(project.root);
 		expect(record).toMatchObject({
 			runId: runId as string,
-			status: "done",
-			endReason: "settled",
+			status: "ended",
+			endReason: "no-changes",
 			turns: 1,
 			costUsd: 0.75,
 			mainCostUsd: 0.25,
@@ -254,6 +264,204 @@ describe("a run through the hooks", () => {
 		// Afterwards the main session is ordinary again.
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("task", "T", ["x/unapproved"]), main))).toBe("pass");
+	});
+
+	test("the status line shows the live run, then the idle label again when it ends", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+
+		await omp.command("fix it", main);
+		const live = omp.statuses.at(-1);
+		expect(live?.startsWith("storm ▶")).toBe(true);
+		expect(live).not.toBe(idle);
+		expect(live).toContain("1/4");
+
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		await until(() => omp.statuses.at(-1) === idle);
+		expect(omp.statuses.at(-1)).toBe(idle);
+	});
+
+	test("an interrupted run leaves a resume hint; the menu's first option resumes it; a verified end clears the hint", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		const repoId = (await loadProjectState(project.env)).repo.repoId;
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+
+		await omp.command("resume me", main);
+		const first = activeLedgerRun(repoId)?.runId;
+		expect(first).toBeDefined();
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, main);
+		expect(await lastRun(project.root)).toMatchObject({ runId: first as string, status: "stopped", endReason: "interrupted" });
+		expect(activeLedgerRun(repoId)).toBeUndefined();
+
+		// The idle label now says a run can be continued; it said nothing of the sort before.
+		const hinted = omp.statuses.at(-1);
+		expect(hinted).not.toBe(idle);
+		expect(hinted?.startsWith("storm ✓")).toBe(true);
+
+		// The menu's first option resumes the old request under a new run record.
+		omp.answers.push(options => options[0]);
+		await omp.command("", main);
+		expect(omp.sent).toHaveLength(2);
+		expect(omp.sent[1]).toContain(first as string);
+		expect(omp.sent[1]).toContain("resume me");
+		const second = activeLedgerRun(repoId)?.runId;
+		expect(second).toBeDefined();
+		expect(await readRun(project.root, second as string)).toMatchObject({ status: "running", resumeOf: first, request: "resume me" });
+
+		// A change and a verdict after it verify the resumed run in its first round.
+		vi.useFakeTimers();
+		const at = Date.now();
+		setSystemTime(new Date(at));
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		await child.emit("tool_result", { toolName: "edit", input: { path: "src/a.ts" }, isError: false, content: [] }, impl);
+		setSystemTime(new Date(at + 1_000));
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		await until(() => omp.statuses.at(-1) === idle);
+		expect(await readRun(project.root, second as string)).toMatchObject({ status: "done", endReason: "verified" });
+	});
+
+	test("the idle hint needs this machine's pointer and the request it recorded", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+		const run = runRecord({
+			runId: "run-20261120-000000-abcd",
+			startedAt: "2026-11-20T00:00:00.000Z",
+			endedAt: "2026-11-20T00:05:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			turns: 1,
+			maxRounds: 4,
+			task: "planted-request",
+			request: "planted-request",
+		});
+		await writeRun(project.root, run);
+		await omp.emit("session_start", {}, main);
+		// A record in the repository is not a run this machine started.
+		expect(omp.statuses.at(-1)).toBe(idle);
+		await noteResumePointer((await loadProjectState(project.env)).store.dir, project.root, { ...run, runId: "run-20261120-000000-othr" });
+		await omp.emit("session_start", {}, main);
+		expect(omp.statuses.at(-1)).toBe(idle);
+		await noteResumePointer((await loadProjectState(project.env)).store.dir, project.root, run);
+		await omp.emit("session_start", {}, main);
+		const hinted = omp.statuses.at(-1);
+		expect(hinted).not.toBe(idle);
+		// The pointer covers the request: an edited one no longer matches.
+		await writeRun(project.root, { ...run, request: "edited-request" });
+		await omp.emit("session_start", {}, main);
+		expect(omp.statuses.at(-1)).toBe(idle);
+	});
+
+	test("the idle hint needs an approved team, without an unapproved shadow", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+		const run = runRecord({
+			runId: "run-20261120-000000-shad",
+			startedAt: "2026-11-20T00:00:00.000Z",
+			endedAt: "2026-11-20T00:05:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			task: "shadow-request",
+			request: "shadow-request",
+		});
+		await writeRun(project.root, run);
+		await noteResumePointer((await loadProjectState(project.env)).store.dir, project.root, run);
+		await omp.emit("session_start", {}, main);
+		expect(omp.statuses.at(-1)).not.toBe(idle);
+		// The approval is still there, but it does not cover this definition.
+		await mkdir(path.join(project.root, ".omp", "agents"), { recursive: true });
+		await writeFile(path.join(project.root, ".omp", "agents", "storm-reviewer.md"), "---\nname: storm-reviewer\n---\nbody\n");
+		await omp.emit("session_start", {}, main);
+		expect(omp.statuses.at(-1)).toBe(idle);
+	});
+
+	test("the idle hint needs an approved team, without its approval", async () => {
+		await approve(TEAM);
+		await writeConfig(project.root, { ...TEAM, parallelism: 2 });
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+		const run = runRecord({
+			runId: "run-20261120-000000-napr",
+			startedAt: "2026-11-20T00:00:00.000Z",
+			endedAt: "2026-11-20T00:05:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			task: "unapproved-request",
+			request: "unapproved-request",
+		});
+		await writeRun(project.root, run);
+		await noteResumePointer((await loadProjectState(project.env)).store.dir, project.root, run);
+		await omp.emit("session_start", {}, main);
+		expect(omp.statuses.at(-1)).toBe(idle);
+	});
+
+	test("session_start closes a dead run and offers it; a live run is left running", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const repoId = (await loadProjectState(project.env)).repo.repoId;
+		await omp.emit("session_start", {}, main);
+		const idle = omp.statuses.at(-1);
+		expect(idle).toBeDefined();
+		const store = (await loadProjectState(project.env)).store.dir;
+		const dead = runRecord({
+			runId: "run-20261120-000000-dead",
+			startedAt: "2026-11-20T00:00:00.000Z",
+			updatedAt: "2026-11-20T00:05:00.000Z",
+			status: "running",
+			process: DEAD_PROCESS,
+			task: "dead-request",
+			request: "dead-request",
+		});
+		const live = runRecord({
+			runId: "run-20261120-010000-live",
+			startedAt: "2026-11-20T01:00:00.000Z",
+			status: "running",
+			process: processKey(),
+			task: "live-request",
+			request: "live-request",
+		});
+		await writeRun(project.root, dead);
+		await noteResumePointer(store, project.root, dead);
+		await writeRun(project.root, live);
+		await omp.emit("session_start", {}, main);
+		expect(await readRun(project.root, dead.runId)).toMatchObject({ status: "stopped", endedAt: dead.updatedAt });
+		expect(await readRun(project.root, live.runId)).toMatchObject({ status: "running" });
+		expect(omp.statuses.at(-1)).not.toBe(idle);
+
+		omp.answers.push(options => options[0]);
+		await omp.command("", main);
+		expect(omp.sent).toHaveLength(1);
+		const resumed = activeLedgerRun(repoId)?.runId;
+		expect(resumed).toBeDefined();
+		expect(await readRun(project.root, resumed as string)).toMatchObject({ resumeOf: dead.runId, request: "dead-request" });
+		await omp.emit("session_shutdown", {}, main);
 	});
 
 	test("a subagent's change brings a round from Storm; a correct verdict after it ends the run verified", async () => {
@@ -336,6 +544,117 @@ describe("a run through the hooks", () => {
 		expect(await lastRun(project.root)).toMatchObject({ runId: runId as string, status: "done", endReason: "verified", turns: 2 });
 	});
 
+	test("a reviewer's verdict carries the run's tree, and none outside a run", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		const yieldReview = (correctness: "correct" | "incorrect") =>
+			child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: correctness } }, isError: false, content: [] }, rev);
+
+		// Outside a run there is no main work tree to tie the verdict to.
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		await yieldReview("correct");
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: expect.any(Number), correct: true });
+
+		await omp.command("task", main);
+		await writeFile(path.join(project.root, ".keep"), "changed\n");
+		await yieldReview("incorrect");
+		const expected = await treeAgainst(project.env.exec, project.root);
+		expect(expected).toBeDefined();
+		const pair = `${expected?.state.diff}:${expected?.state.files}`;
+		await until(() => listAgents()[0]?.lastVerdict?.tree === pair);
+		expect(listAgents()[0]?.lastVerdict).toMatchObject({ correct: false, tree: pair });
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a change committed after the run starts still needs a review", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		await omp.command("task", main);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+
+		// A shell change the team commits: HEAD moves, so the tree looks clean against it.
+		await writeFile(path.join(project.root, ".keep"), "committed change\n");
+		await git(project.root, "add", ".keep");
+		await git(project.root, "commit", "-m", "team change");
+		vi.useFakeTimers();
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		// The run's start commit still sees the change: something needs review, so a round follows.
+		expect(omp.sent).toHaveLength(1);
+		vi.advanceTimersByTime(ROUND_DELAY_MS);
+		await until(() => omp.sent.length === 2);
+		expect(omp.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+
+		// A verdict against that change verifies it; the commit after the run's start did not hide it.
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await until(() => listAgents().find(agent => agent.id === "Rev")?.lastVerdict?.tree !== undefined);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("a commit after a passing verdict costs no extra round", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		await omp.command("task", main);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+
+		// The change is in the tree when the verdict is given, then the team commits it: HEAD moves, the content does not.
+		await writeFile(path.join(project.root, ".keep"), "uncommitted change\n");
+		vi.useFakeTimers();
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(omp.sent).toHaveLength(1);
+		vi.advanceTimersByTime(ROUND_DELAY_MS);
+		await until(() => omp.sent.length === 2);
+
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await until(() => listAgents().find(agent => agent.id === "Rev")?.lastVerdict?.tree !== undefined);
+		await git(project.root, "add", ".keep");
+		await git(project.root, "commit", "-m", "commit after the verdict");
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+	});
+
+	test("a verdict reads the run's main tree against its base, not the subagent's cwd", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const side = path.join(project.tmp, "side");
+		await git(project.root, "worktree", "add", side, "-b", "review-side");
+		// The reviewer runs in another work tree of the same repository, as an isolated agent does.
+		const rev = { ...child.ctx(sub("Rev", "storm-reviewer")), cwd: side } as ExtensionContext;
+		await omp.command("task", main);
+		const ledger = activeLedgerRun((await loadProjectState(project.env)).repo.repoId);
+		expect(ledger?.base).toBeDefined();
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+
+		await writeFile(path.join(project.root, ".keep"), "changed in the main tree\n");
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		const expected = await treeAgainst(project.env.exec, project.root, ledger?.base);
+		expect(expected).toBeDefined();
+		const pair = `${expected?.state.diff}:${expected?.state.files}`;
+		await until(() => listAgents().find(agent => agent.id === "Rev")?.lastVerdict?.tree === pair);
+		// The side work tree is clean: a verdict read from there would not match the run's tree.
+		expect((await treeAgainst(project.env.exec, side, ledger?.base))?.state.diff).not.toBe(expected?.state.diff);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
 	test("a pending round wait does not send after a session switch", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
@@ -355,7 +674,7 @@ describe("a run through the hooks", () => {
 		expect(omp.sent).toHaveLength(1);
 	});
 
-	test("the same run without a file change settles after one round", async () => {
+	test("the same run without a file change ends no-changes after one round", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
@@ -365,7 +684,7 @@ describe("a run through the hooks", () => {
 		await omp.emit("agent_start", {}, main);
 		await omp.emit("agent_end", {}, main);
 		expect(omp.sent).toHaveLength(1);
-		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "settled", turns: 1 });
+		expect(await lastRun(project.root)).toMatchObject({ status: "ended", endReason: "no-changes", turns: 1 });
 	});
 
 	test("a follow-up to an agent past its cap is refused and counted; one below it passes", async () => {

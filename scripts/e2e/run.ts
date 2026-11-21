@@ -19,6 +19,7 @@ import type { RunRecord } from "../../src/types.ts";
 import {
 	type Answer,
 	cancelAll,
+	COMMIT_FILE,
 	customMessage,
 	choose,
 	type Frame,
@@ -31,6 +32,8 @@ import {
 	prepare,
 	price,
 	readJsonl,
+	REVIEW_FILE,
+	REVIEW_TEXT,
 	Rpc,
 	type SessionOptions,
 	type Step,
@@ -38,11 +41,14 @@ import {
 	Suite,
 	startFakeLlm,
 	TEAM_PROVIDERS,
+	TRACKED_FILE,
+	TRACKED_TEXT,
 	until,
 } from "./harness.ts";
 
 /** Option labels Storm does not export. */
 const LABEL = {
+	resume: "끝나지 않은 실행 이어 가기",
 	reset: "초기화",
 	rollback: "이전 승인으로 되돌리기",
 	keepModel: "지금 모델 유지",
@@ -131,6 +137,8 @@ const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry
 /** A main request's newest user message without the date reminder omp puts in front of the first one. */
 const newestUser = (entry: LlmEntry): string => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "");
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+/** No run left git's index lock behind and the repository still answers `git status`. */
+const gitUsable = (): boolean => !existsSync(join(env.project, ".git", "index.lock")) && Bun.spawnSync(["git", "-C", env.project, "status", "--porcelain"]).exitCode === 0;
 
 /** A config changed by hand, then approved through `/storm`'s dialog for an unapproved team. */
 async function editAndApprove(change: Parameters<StormFiles["editConfig"]>[0]): Promise<Rpc["dialogs"]> {
@@ -147,6 +155,8 @@ async function main(): Promise<void> {
 	linkPlugin(env);
 	/** The run started through the request router in a session kept on disk: the janitor step looks it up. */
 	let routedRunId: string | undefined;
+	/** The hub's options when the last finished run is not resumable. */
+	let hubWithoutResume: string[] = [];
 
 	await suite.step("no config", async () => {
 		const llm = new LlmCursor(env);
@@ -276,7 +286,12 @@ async function main(): Promise<void> {
 		check("the handoff stays within 1,400 chars besides the task", frame > 200 && frame <= 1_400, `chars=${frame}`);
 
 		check("a classified run opens no dialog", dialogs === 0, `dialogs=${dialogs}`);
-		check("the run record: settled, done after one round", run.endReason === "settled" && run.status === "done" && run.turns === 1, `${run.endReason} ${run.status} turns=${run.turns}`);
+		check(
+			"the run record keeps the whole request and the round bound",
+			run.request === request && run.task.length <= 200 && run.maxRounds === 4,
+			`request=${run.request === request} task=${run.task.length} maxRounds=${run.maxRounds}`,
+		);
+		check("the run record: no changes, ended after one round", run.endReason === "no-changes" && run.status === "ended" && run.turns === 1, `${run.endReason} ${run.status} turns=${run.turns}`);
 		const outcome = (agent: string) => run.spawns.find(spawn => spawn.agent === agent);
 		check(
 			"storm roles are routed, outside models are swapped for the role's",
@@ -300,7 +315,7 @@ async function main(): Promise<void> {
 		check("spawn records link to ledger agents", run.spawns.length === 4 && run.spawns.every(spawn => ledger.some(agent => agent.id === spawn.spawnKey)));
 		check("the plan is in the record", run.plan?.lanes.length === 3 && run.plan.workers.implementer === 2, JSON.stringify(run.plan?.workers));
 		const summary = files.index().find(line => line.runId === run.runId);
-		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.endReason === "settled" && summary.turns === 1, JSON.stringify(summary));
+		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.endReason === "no-changes" && summary.turns === 1, JSON.stringify(summary));
 		check("the run's report is in the transcript, off the model's context", reports(frames).some(report => report.includes(run.runId) && report.includes('"excludeFromContext":true')));
 
 		const verdict = ledger.find(agent => agent.role === "reviewer")?.review;
@@ -340,7 +355,7 @@ async function main(): Promise<void> {
 		}));
 		check(
 			"a reply that still says mode loop is a plain run",
-			stale.dialogs === 0 && stale.run.endReason === "settled" && stale.run.status === "done" && stale.run.turns === 1 && stale.run.limits === undefined,
+			stale.dialogs === 0 && stale.run.endReason === "no-changes" && stale.run.status === "ended" && stale.run.turns === 1 && stale.run.limits === undefined,
 			`${stale.run.endReason} ${stale.run.status} turns=${stale.run.turns} limits=${JSON.stringify(stale.run.limits)} dialogs=${stale.dialogs}`,
 		);
 	});
@@ -392,6 +407,218 @@ async function main(): Promise<void> {
 		}
 	});
 
+	await suite.step("a change made through bash is seen", async () => {
+		const tracked = join(env.project, TRACKED_FILE);
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Bash", say: `E2E-CHILD-BASH ${TRACKED_FILE}` },
+			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+		];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const implementer = run.agents?.find(agent => agent.role === "implementer");
+				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+				const childCalls = children(llm.all()).map(kid => kid.decision.tool);
+				check(
+					"the implementer changed a tracked file with bash, through no edit tool",
+					childCalls.includes("bash") && !childCalls.some(tool => tool === "write" || tool === "edit") && readFileSync(tracked, "utf8").includes("storm-child-bash"),
+					`tools=${childCalls.join(",")} file=${readFileSync(tracked, "utf8").trim().slice(-40)}`,
+				);
+				check("the bash change is not a tool change", (implementer?.changes ?? 0) === 0, `changes=${implementer?.changes}`);
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+				check("the changed tree brings a second round", stormMessages.filter(user => user.startsWith(roundTag)).length === 1 && stormMessages.length === 2, `storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`);
+				check("round 2's verdict passes on the changed tree", reviewer?.lastVerdict?.correct === true && reviewer?.lastVerdict?.tree !== undefined, JSON.stringify(reviewer?.lastVerdict));
+				check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 2,
+					JSON.stringify(lines),
+				);
+			});
+		} finally {
+			writeFileSync(tracked, TRACKED_TEXT);
+		}
+	});
+
+	await suite.step("the quick role's changes need no review", async () => {
+		const changed = join(env.project, "e2e-quick.txt");
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [plan([{ name: "impl", kind: "run" }]), { task: ["storm-quick"], as: "Quick", say: "E2E-CHILD-WRITE e2e-quick.txt" }];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const quick = run.agents?.find(agent => agent.role === "quick");
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				check("the quick worker's change is counted", quick?.changes === 1 && existsSync(changed), `changes=${quick?.changes} file=${existsSync(changed)}`);
+				check("no round followed: the quick role needs no reviewer", stormMessages.length === 1 && !stormMessages.some(user => user.includes('round="2/4"')), `storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`);
+				check("the run ends unreviewed after one round", run.status === "ended" && run.endReason === "unreviewed" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check("the index line agrees, once", lines.length === 1 && lines[0]?.status === "ended" && lines[0]?.endReason === "unreviewed" && lines[0]?.turns === 1, JSON.stringify(lines));
+				check("no dialog", rpc.dialogs.length === 0, JSON.stringify(rpc.dialogs));
+			});
+		} finally {
+			rmSync(changed, { force: true });
+		}
+	});
+
+	await suite.step("a change that was committed is still seen", async () => {
+		const committed = join(env.project, COMMIT_FILE);
+		const before = Bun.spawnSync(["git", "-C", env.project, "rev-parse", "HEAD"]).stdout.toString().trim();
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Commit", say: `E2E-CHILD-COMMIT ${COMMIT_FILE}` },
+			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+		];
+		await session(cancelAll, async rpc => {
+			const run = await runOf(rpc, startRun(steps));
+			const implementer = run.agents?.find(agent => agent.role === "implementer");
+			const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+			const childCalls = children(llm.all()).map(kid => kid.decision.tool);
+			const dirty = Bun.spawnSync(["git", "-C", env.project, "status", "--porcelain", "--", COMMIT_FILE]).stdout.toString().trim();
+			const head = Bun.spawnSync(["git", "-C", env.project, "rev-parse", "HEAD"]).stdout.toString().trim();
+			check(
+				"the implementer changed and committed a tracked file with bash",
+				childCalls.includes("bash") && !childCalls.includes("write") && !childCalls.includes("edit") && head !== before && dirty === "" && readFileSync(committed, "utf8").includes("storm-child-bash"),
+				`tools=${childCalls.join(",")} head=${head.slice(0, 8)} before=${before.slice(0, 8)} dirty=${JSON.stringify(dirty)}`,
+			);
+			const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+			const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+			check(
+				"the commit hides neither the change nor the round",
+				(implementer?.changes ?? 0) === 0 && stormMessages.filter(user => user.startsWith(roundTag)).length === 1 && stormMessages.length === 2,
+				`changes=${implementer?.changes} storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
+			);
+			check("round 2's verdict passes on the committed change", reviewer?.lastVerdict?.correct === true && reviewer?.lastVerdict?.tree !== undefined, JSON.stringify(reviewer?.lastVerdict));
+			check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+			const lines = files.index().filter(line => line.runId === run.runId);
+			check(
+				"the index line agrees, once",
+				lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 2,
+				JSON.stringify(lines),
+			);
+			check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
+		});
+	});
+
+	await suite.step("a verified run is not sent back forever", async () => {
+		const reviewed = join(env.project, REVIEW_FILE);
+		const llm = new LlmCursor(env);
+		const change = `printf '%s\\n' storm-director-change >> ${REVIEW_FILE}`;
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-BASH ${REVIEW_FILE}` },
+			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+			// `task` returns when the spawn is queued: each director change waits for the reviewer's result so it lands
+			// after the verdict, with no other agent active after it.
+			{ bash: change, afterResult: "Rev0" },
+			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3/4"' },
+			{ bash: change, afterResult: "Again0" },
+		];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}/4">`)).length;
+				const reviewers = run.agents?.filter(agent => agent.role === "reviewer") ?? [];
+				check(
+					"the change after the verdict brings one re-review, and no fourth round",
+					stormMessages.length === 3 && round(2) === 1 && round(3) === 1 && round(4) === 0,
+					`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")} agents=${JSON.stringify(run.agents?.map(agent => [agent.id, agent.lastActivityAt, agent.lastVerdict?.at]))}`,
+				);
+				check("both reviews pass", reviewers.length === 2 && reviewers.every(agent => agent.lastVerdict?.correct === true), JSON.stringify(reviewers.map(agent => agent.lastVerdict)));
+				const content = readFileSync(reviewed, "utf8");
+				check(
+					"the changes after both verdicts are in the tree",
+					content.split("storm-child-bash").length - 1 === 1 && content.split("storm-director-change").length - 1 === 2,
+					`content=${JSON.stringify(content)}`,
+				);
+				check(
+					"the second verdict stands after a later change",
+					run.status === "done" && run.endReason === "verified" && run.turns === 3,
+					`${run.status} ${run.endReason} turns=${run.turns}`,
+				);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 3,
+					JSON.stringify(lines),
+				);
+				check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
+			});
+		} finally {
+			writeFileSync(reviewed, REVIEW_TEXT);
+		}
+	});
+
+	await suite.step("a team change after the re-review is sent back again", async () => {
+		const reviewed = join(env.project, REVIEW_FILE);
+		const llm = new LlmCursor(env);
+		const change = `printf '%s\\n' storm-director-change >> ${REVIEW_FILE}`;
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code" },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-BASH ${REVIEW_FILE}` },
+			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
+			{ bash: change, afterResult: "Rev0" },
+			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3/4"' },
+			// An agent changes the file after the re-review's verdict: a team change, so no one-shot excuse applies.
+			{ task: ["storm-implementer"], as: "Fix", say: `E2E-CHILD-BASH ${REVIEW_FILE}`, afterResult: "Again0" },
+			{ task: ["storm-reviewer"], as: "Final", say: "E2E-CHILD-VERDICT correct", after: 'round="4/4"' },
+		];
+		try {
+			await session(cancelAll, async rpc => {
+				const run = await runOf(rpc, startRun(steps));
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}/4">`)).length;
+				const reviewers = run.agents?.filter(agent => agent.role === "reviewer") ?? [];
+				const fix = run.agents?.find(agent => agent.id === "Fix0");
+				const last = reviewers.find(agent => agent.id === "Final0");
+				check(
+					"the team change after the re-review is sent back again",
+					stormMessages.length === 4 && round(2) === 1 && round(3) === 1 && round(4) === 1 && round(5) === 0,
+					`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
+				);
+				check(
+					"the last verdict follows the agent's change",
+					reviewers.length === 3 && reviewers.every(agent => agent.lastVerdict?.correct === true) && last !== undefined && fix !== undefined && (last.lastVerdict?.at ?? 0) > (fix.lastActivityAt ?? 0),
+					`reviewers=${JSON.stringify(reviewers.map(agent => [agent.id, agent.lastVerdict]))} fix=${fix?.lastActivityAt}`,
+				);
+				const content = readFileSync(reviewed, "utf8");
+				check(
+					"the team change is in the tree",
+					content.split("storm-child-bash").length - 1 === 2 && content.split("storm-director-change").length - 1 === 1,
+					`content=${JSON.stringify(content)}`,
+				);
+				check("the run ends verified after four rounds", run.status === "done" && run.endReason === "verified" && run.turns === 4, `${run.status} ${run.endReason} turns=${run.turns}`);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 4,
+					JSON.stringify(lines),
+				);
+				check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
+			});
+		} finally {
+			writeFileSync(reviewed, REVIEW_TEXT);
+		}
+	});
+
 	await suite.step("a run that makes no progress is stopped", async () => {
 		const changed = join(env.project, "e2e-stalled.txt");
 		const llm = new LlmCursor(env);
@@ -402,6 +629,11 @@ async function main(): Promise<void> {
 			]),
 			{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-stalled.txt" },
 		];
+		// The hub while the finished run before this one is the last: its options without a resumable run.
+		hubWithoutResume = await session(cancelAll, async rpc => {
+			await rpc.prompt("/storm");
+			return rpc.dialogs.at(-1)?.options ?? [];
+		});
 		try {
 			await session(cancelAll, async rpc => {
 				const run = await runOf(rpc, startRun(steps));
@@ -428,6 +660,140 @@ async function main(): Promise<void> {
 		}
 	});
 
+	await suite.step("a run that stopped is resumed", async () => {
+		const limited = join(env.project, "e2e-limited.txt");
+		const steps: Step[] = [
+			plan([{ name: "impl", kind: "code" }]),
+			{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-limited.txt" },
+		];
+		try {
+			// The old run stops at its own two-round limit, so its record keeps a limit for the resume to carry.
+			const old = await session(cancelAll, rpc => runOf(rpc, runRequest({ action: "run", rounds: 2 }, steps)));
+			check(
+				"the old run stopped at its round limit",
+				old.status === "stopped" && old.endReason === "round-limit" && old.limits?.rounds === 2 && old.maxRounds === 2,
+				`${old.status} ${old.endReason} limits=${JSON.stringify(old.limits)} maxRounds=${old.maxRounds}`,
+			);
+
+			const first = new LlmCursor(env);
+			const resumed = await session(cancelAll, async rpc => {
+				await rpc.prompt("/storm");
+				const menu = rpc.dialogs.at(-1)?.options ?? [];
+				check(
+					"the hub offers the stopped run first, as one more option",
+					menu[0] === LABEL.resume && same(menu.slice(1), hubWithoutResume),
+					`menu=${JSON.stringify(menu)} without=${JSON.stringify(hubWithoutResume)}`,
+				);
+				const before = files.runIds();
+				rpc.answer = choose(LABEL.resume);
+				await rpc.prompt("/storm");
+				return files.finishedRun(before, 150_000);
+			});
+			const handoff = mains(first.all()).map(newestUser).find(user => user.startsWith(`<storm-run id="${resumed.runId}"`)) ?? "";
+			check(
+				"the resumed run records what it continues and the same request",
+				resumed.runId !== old.runId && resumed.resumeOf === old.runId && resumed.request !== undefined && resumed.request === old.request,
+				`resumeOf=${resumed.resumeOf} old=${old.runId} request=${resumed.request === old.request}`,
+			);
+			check("the resumed run carries the old limits", resumed.limits?.rounds === 2 && resumed.maxRounds === 2, `limits=${JSON.stringify(resumed.limits)} maxRounds=${resumed.maxRounds}`);
+			check("the handoff names the old run", handoff.includes(old.runId), handoff.slice(0, 240));
+
+			const second = new LlmCursor(env);
+			const again = await session(cancelAll, async rpc => {
+				const dialogs = rpc.dialogs.length;
+				const run = await runOf(rpc, route({ action: "resume" }, "continue the run that stopped"));
+				check("a classified resume opens no dialog", rpc.dialogs.length === dialogs, JSON.stringify(rpc.dialogs));
+				return run;
+			});
+			const nextHandoff = mains(second.all()).map(newestUser).find(user => user.startsWith(`<storm-run id="${again.runId}"`)) ?? "";
+			check(
+				"the classified resume continues the run that stopped",
+				again.runId !== resumed.runId && again.resumeOf === resumed.runId && again.request === resumed.request && again.limits?.rounds === 2 && again.maxRounds === 2,
+				`resumeOf=${again.resumeOf} old=${resumed.runId} request=${again.request === resumed.request} limits=${JSON.stringify(again.limits)}`,
+			);
+			check("its handoff names the run it continues", nextHandoff.includes(resumed.runId), nextHandoff.slice(0, 240));
+		} finally {
+			rmSync(limited, { force: true });
+		}
+	});
+
+	await suite.step("a run record that only sits in the repository is not offered", async () => {
+		const plantedId = "run-20990101-000000-e2e0";
+		const plantedFile = join(files.stateDir, "runs", `${plantedId}.json`);
+		const record: RunRecord = {
+			schema: "storm.run/v1",
+			runId: plantedId,
+			configHash: "jcs-sha256:e2e-planted",
+			startedAt: "2099-01-01T00:00:00.000Z",
+			endedAt: "2099-01-01T00:00:01.000Z",
+			status: "stopped",
+			endReason: "no-progress",
+			task: "E2E planted run",
+			request: "E2E planted request",
+			costUsd: 0,
+			costByModel: {},
+			spawns: [],
+			process: "99999999:1",
+			turns: 1,
+			maxRounds: 4,
+		};
+		writeFileSync(plantedFile, `${JSON.stringify(record, null, 2)}\n`);
+		try {
+			await session(cancelAll, async rpc => {
+				await rpc.prompt("/storm");
+				const menu = rpc.dialogs.at(-1)?.options ?? [];
+				check(
+					"a record only the repository holds is not offered for resume",
+					menu[0] !== LABEL.resume && !menu.includes(LABEL.resume) && files.runs().at(-1)?.runId === plantedId,
+					`menu=${JSON.stringify(menu)} last=${files.runs().at(-1)?.runId}`,
+				);
+				const runs = files.runs().length;
+				const dialogs = rpc.dialogs.length;
+				await rpc.prompt(route({ action: "resume" }, "continue the run that stopped"));
+				check(
+					"a classified resume of a planted record starts nothing",
+					files.runs().length === runs && rpc.dialogs.length === dialogs,
+					`runs=${files.runs().length}/${runs} dialogs=${rpc.dialogs.length}/${dialogs}`,
+				);
+			});
+		} finally {
+			rmSync(plantedFile, { force: true });
+		}
+	});
+
+	await suite.step("a run whose process died is offered after the next session start", async () => {
+		const llm = new LlmCursor(env);
+		const request = startRun([
+			plan([{ name: "impl", kind: "code" }]),
+			{ task: ["storm-implementer"], as: "Die", say: "E2E-CHILD-HOLD-ONCE E2E-DIE-MARK" },
+			{ awaitChild: true },
+		]);
+		const killed = new Rpc(env, cancelAll, { model: MAIN });
+		await killed.ready();
+		const before = files.runIds();
+		await killed.prompt(request);
+		const dead = await until(() => files.runs().find(run => !before.has(run.runId)), 30_000, "the run before the kill");
+		await until(() => children(llm.all()).some(kid => kid.lastUser.includes("E2E-DIE-MARK")), 60_000, "the held child");
+		check("the run is active when its process is killed", dead.status === "running" && dead.request !== undefined, `${dead.runId} ${dead.status}`);
+		await killed.stop();
+		await session(cancelAll, async rpc => {
+			await suite.eventually(
+				"the dead run is marked stopped at the next session start",
+				() => files.run(dead.runId)?.status === "stopped",
+				() => JSON.stringify(files.run(dead.runId)?.status),
+				30_000,
+			);
+			await rpc.prompt("/storm");
+			const menu = rpc.dialogs.at(-1)?.options ?? [];
+			check("the dead run is offered first", menu[0] === LABEL.resume, JSON.stringify(menu));
+			const started = files.runIds();
+			rpc.answer = choose(LABEL.resume);
+			await rpc.prompt("/storm");
+			const resumed = await files.finishedRun(started, 120_000);
+			check("resuming a dead run records what it continues", resumed.request === dead.request && resumed.resumeOf === dead.runId, `resumeOf=${resumed.resumeOf} old=${dead.runId} status=${resumed.status} ${resumed.endReason}`);
+		});
+	});
+
 	await suite.step("the storm tool's four actions", async () => {
 		const llm = new LlmCursor(env);
 		await session(cancelAll, async rpc => {
@@ -450,8 +816,8 @@ async function main(): Promise<void> {
 			const run = await files.finishedRun(before);
 			check("run: queued, and started once the turn settled", toolOutcomes(rpc.frames.slice(from))[0]?.outcome === "queued", JSON.stringify(toolOutcomes(rpc.frames.slice(from))));
 			check(
-				"a run whose subagents changed no file settles after one round",
-				run.status === "done" && run.endReason === "settled" && run.turns === 1 && run.spawns.some(spawn => spawn.outcome === "routed"),
+				"a run whose subagents changed no file ends after one round",
+				run.status === "ended" && run.endReason === "no-changes" && run.turns === 1 && run.spawns.some(spawn => spawn.outcome === "routed"),
 				`${run.status} ${run.endReason} turns=${run.turns} ${JSON.stringify(run.spawns.map(spawn => spawn.outcome))}`,
 			);
 		});
@@ -835,7 +1201,7 @@ async function main(): Promise<void> {
 				await rpc.turn("hello");
 				const run = await runOf(rpc, CHEAP_RUN);
 				const compactions = llm.of("compaction").length;
-				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "done" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} compactions=${compactions}`);
+				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "ended" && run.endReason === "no-changes" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} ${run.endReason} compactions=${compactions}`);
 			},
 			{ model: "fake/heavy-main" },
 		);
@@ -908,6 +1274,7 @@ async function main(): Promise<void> {
 
 	await suite.step("omp exit codes", async () => {
 		check("every omp session exited 0", exitCodes.length > 0 && exitCodes.every(code => code === 0), `exit=${exitCodes.join(",")}`);
+		check("no run left git's index lock and git status works", gitUsable(), "index.lock or git status failed");
 	});
 }
 

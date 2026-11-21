@@ -12,7 +12,7 @@ import { configPath, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
-import { renderStatus, renderStatusBrief, renderTrial, visible } from "./view/render.ts";
+import { renderStatus, renderStatusBrief, renderTrial, resumeRunLine, visible } from "./view/render.ts";
 import { runRollback } from "./view/review.ts";
 import { recommendedConfig } from "./view/setup.ts";
 import { buildTrialEnd, modelWarnings } from "./proposals/build.ts";
@@ -24,13 +24,15 @@ import { ompSettingsAdvice } from "./report/omp-settings.ts";
 import { roleTitle } from "./roles.ts";
 import { activeLedgerRun } from "./runtime/ledger.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
+import { resumeCandidate, resumePointerFile, resumeSpec } from "./runtime/resume.ts";
 import { formatStorage, readStorage } from "./runtime/janitor.ts";
 import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
 import { type FormRetry, modelsForm, readModelPicks, recommendationNotes, type SetupFormInput, settingsForm, setupConfig, subagentShares } from "./setup/form.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, RollbackOption, RunRecord, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { RunRequestResult } from "./tool/host.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -47,6 +49,8 @@ export interface FlowEnv extends ProjectEnv {
 	ompSettings?: () => Promise<ExplicitSettings>;
 	/** A newer Storm installed on disk than the one this process runs. */
 	newerVersion?: () => string | undefined;
+	/** Starts a run in this session; absent where the caller cannot start one. */
+	startRun?: (spec: RunSpec) => Promise<RunRequestResult>;
 }
 
 type OkState = ProjectState & { config: Extract<ConfigLoad, { status: "ok" }> };
@@ -306,6 +310,7 @@ async function rollbackFlow(env: FlowEnv, ui: UiPort, state: ProjectState, optio
 }
 
 const MENU = {
+	resume: "끝나지 않은 실행 이어 가기",
 	setup: "팀 다시 설정",
 	models: "모델 점검",
 	agents: "서브에이전트",
@@ -381,24 +386,58 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		state = await loadProjectState(env);
 		trials = undefined;
 	}
-	const [view, rollbacks] = await Promise.all([
+	const [view, rollbacks, last] = await Promise.all([
 		statusView(env, state, { quota: false, user: true, ...(trials ? { trials } : {}) }),
 		rollbackOptions(state),
+		env.startRun ? lastRun(state.repo.root) : undefined,
 	]);
-	const options: string[] = [MENU.setup, MENU.models];
+	const resume = await resumeCandidate(state.store.dir, state.repo.root, last);
+	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, MENU.models];
 	if (env.agents?.().length) options.push(MENU.agents);
 	if (rollbacks.length) options.push(MENU.rollback);
 	options.push(MENU.reset, MENU.close);
 	const choice = await ui.select("Storm 메뉴", options, {
 		title: "Storm 현황",
-		markdown: [renderStatusBrief(view, env.now()), view.storage].filter(Boolean).join("\n\n"),
+		markdown: [renderStatusBrief(view, env.now()), resume ? resumeRunLine(resume) : undefined, view.storage].filter(Boolean).join("\n\n"),
 	});
-	if (choice === MENU.setup) await setupFlow(env, ui);
+	if (choice === MENU.resume && resume) await startResume(env, ui, resume);
+	else if (choice === MENU.setup) await setupFlow(env, ui);
 	else if (choice === MENU.models) await modelsFlow(env, ui);
 	else if (choice === MENU.agents) await agentsFlow(env, ui);
 	else if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
 	else if (choice === MENU.reset) return resetFlow(env, ui);
 	return false;
+}
+
+/**
+ * The one start both resume paths make: the old request through `runSpec` (its limits carried over) and the user's
+ * words, when there were any, as a note for the director.
+ */
+async function startResume(env: FlowEnv, ui: UiPort, run: RunRecord & { request: string }, said?: string): Promise<void> {
+	const spec = resumeSpec(run, said);
+	if (!spec.ok) {
+		ui.notify(`Storm 실행을 시작하지 못했습니다: ${spec.error}`, "warning");
+		return;
+	}
+	const start = env.startRun;
+	if (!start) return;
+	const started = await start(spec.spec);
+	if (!started.ok) ui.notify(`Storm 실행을 시작하지 못했습니다: ${started.reason}`, "warning");
+}
+
+/**
+ * `/storm …` when the classifier reads the request as continuing the run that stopped unfinished: no menu, the
+ * same start the menu's first option makes. `said` is what the user typed, kept as a note beside the old request.
+ */
+export async function resumeFlow(env: FlowEnv, ui: UiPort, said?: string): Promise<void> {
+	const state = await loadProjectState(env);
+	const resume = await resumeCandidate(state.store.dir, state.repo.root, await lastRun(state.repo.root));
+	if (!resume) {
+		ui.notify("이어 갈 실행이 없습니다.");
+		return;
+	}
+	if (!env.startRun) return;
+	await startResume(env, ui, resume, said);
 }
 
 async function pathExists(file: string): Promise<boolean> {
@@ -451,8 +490,12 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	if (blockedByRun()) return false;
 	const root = state.repo.root;
 	const local = dirname(configPath(root));
-	const [hasLocal, approvals] = await Promise.all([pathExists(local), state.store.list()]);
-	if (!hasLocal && approvals.length === 0) {
+	const [hasLocal, hasPointer, approvals] = await Promise.all([
+		pathExists(local),
+		pathExists(resumePointerFile(state.store.dir, root)),
+		state.store.list(),
+	]);
+	if (!hasLocal && !hasPointer && approvals.length === 0) {
 		ui.notify("초기화할 Storm 팀 설정이나 기록이 없습니다.");
 		return false;
 	}
@@ -507,6 +550,8 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		await writeFile(join(local, ".gitignore"), "/state/\n");
 		await writeFile(runIndexFile(root), keptIndex);
 	}
+	// `clear` keeps the run list but not this pointer: it names a run whose request was sent from this machine.
+	await rm(resumePointerFile(state.store.dir, root), { force: true });
 	const removed = await state.store.clear();
 	ui.notify(
 		[

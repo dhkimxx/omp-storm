@@ -20,6 +20,7 @@ import {
 	hubFlow,
 	modelsFlow,
 	resetFlow,
+	resumeFlow,
 	setupFlow,
 	statusFlow,
 	statusText,
@@ -43,21 +44,28 @@ import {
 	noteAgentRun,
 	noteAgentStart,
 	noteAgentUsage,
+	noteVerdictTree,
 } from "./runtime/agents.ts";
 import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, anyLedgerRun, recordCost } from "./runtime/ledger.ts";
+import { stopDeadRuns } from "./runtime/janitor.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
+import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
+import { lastRun } from "./runtime/run.ts";
+import { resumeCandidate } from "./runtime/resume.ts";
+import { treeAgainst } from "./runtime/tree.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
-import { createStateCache, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
-import type { StormToolHost } from "./tool/host.ts";
+import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
+import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
-import type { ConfigLoad, ExplicitSettings, RepoIdentity, UiPort } from "./types.ts";
+import type { ConfigLoad, ExplicitSettings, RepoIdentity, RunSpec, UiPort } from "./types.ts";
 import { createUiPort, registerReportRenderer } from "./ui.ts";
+import { runStatusText } from "./view/render.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /**
@@ -126,11 +134,15 @@ function newerVersion(): string | undefined {
 	return newerInstalledVersion(STORM_VERSION, text);
 }
 
-function statusLabel(state: ProjectState): string | undefined {
+/** The idle label. A resumable last run is worth a hint only for a team that may actually run. */
+function statusLabel(state: ProjectState, resumable: boolean): string | undefined {
 	if (state.config.status === "missing") return undefined;
 	const base = state.config.status === "invalid" ? "storm: 설정 오류" : state.approval ? "storm ✓" : "storm: 승인 필요";
+	const parts = [base];
+	if (resumable && isApproved(state)) parts.push("이어 갈 실행 있음");
 	const newer = newerVersion();
-	return newer ? `${base} · 새 버전 ${newer} → /restart` : base;
+	if (newer) parts.push(`새 버전 ${newer} → /restart`);
+	return parts.join(" · ");
 }
 
 export default function storm(pi: ExtensionAPI): void {
@@ -165,10 +177,11 @@ export default function storm(pi: ExtensionAPI): void {
 	 * The project's active run, when its repo is already resolved: a subagent's tool events must not wait on a git
 	 * lookup (and one that times out would block the call). The start of a run records the repo.
 	 */
-	const activeRunFor = (ctx: ExtensionContext): string | undefined => {
+	const activeLedgerFor = (ctx: ExtensionContext) => {
 		const repo = resolvedRepos.get(ctx.cwd);
-		return repo && activeLedgerRun(repo.repoId)?.runId;
+		return repo && activeLedgerRun(repo.repoId);
 	};
+	const activeRunFor = (ctx: ExtensionContext): string | undefined => activeLedgerFor(ctx)?.runId;
 
 	const runs = new RunController({
 		pi,
@@ -181,8 +194,16 @@ export default function storm(pi: ExtensionAPI): void {
 		},
 		now: Date.now,
 		agents: runId => listAgents({ runId }),
+		tree: (root, base) => treeAgainst(exec, root, base),
 		ledger: () => listAgents(),
 		agentDir: pi.pi.getAgentDir(),
+		live: (ctx, run) => {
+			if (run) {
+				if (ctx.hasUI) ctx.ui.setStatus("storm", runStatusText(run, Date.now()));
+				return;
+			}
+			void syncSession(ctx).catch(() => undefined);
+		},
 	});
 
 	/** Compacts the director while it waits on subagents, once its context reaches the director cap. */
@@ -201,7 +222,7 @@ export default function storm(pi: ExtensionAPI): void {
 		);
 	};
 
-	const flowEnv = (ctx: ExtensionContext): FlowEnv => ({
+	const flowEnv = (ctx: ExtensionContext, startRun?: (spec: RunSpec) => Promise<RunRequestResult>): FlowEnv => ({
 		...projectEnv(ctx),
 		ompBin: ompBinary(),
 		registry: ctx.modelRegistry,
@@ -211,6 +232,7 @@ export default function storm(pi: ExtensionAPI): void {
 		agents: () => listAgents({ ancestorId: ctx.agent.id }),
 		ompSettings,
 		newerVersion,
+		...(startRun ? { startRun } : {}),
 	});
 
 	/** The approval path's host, and what a team change needs besides. Saving drops the caches the spawn hook reads. */
@@ -425,11 +447,22 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("tool_result", (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
 			// omp emits no before_agent_start for a follow-up to a live idle agent, so the run it works in is taken here.
-			const runId = activeRunFor(ctx);
+			const ledger = activeLedgerFor(ctx);
+			const runId = ledger?.runId;
 			if (runId !== undefined) noteAgentRun(ctx.agent.id, runId);
 			// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
 			const now = Date.now();
-			if (event.toolName === "yield" && !event.isError) noteAgentReview(ctx.agent.id, event.input, now);
+			if (event.toolName === "yield" && !event.isError) {
+				noteAgentReview(ctx.agent.id, event.input, now);
+				// The verdict is about the run's main tree, seen against the run's start commit, not the subagent's own cwd.
+				if (ledger !== undefined && verdictOf(event.input) !== undefined) {
+					void treeAgainst(exec, ledger.root, ledger.base)
+						.then(reading => {
+							if (reading) noteVerdictTree(ctx.agent.id, now, `${reading.state.diff}:${reading.state.files}`);
+						})
+						.catch(() => undefined);
+				}
+			}
 			// The review gate reads what the team changed; a file-changing call that failed changed nothing.
 			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now);
 			return undefined;
@@ -504,17 +537,24 @@ export default function storm(pi: ExtensionAPI): void {
 		if (active.includes(tool.name)) await pi.setActiveTools(active.filter(name => name !== tool.name));
 	};
 	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
-	const syncSession = async (ctx: ExtensionContext): Promise<void> => {
-		const state = await loadProjectState(projectEnv(ctx));
+	const syncSession = async (ctx: ExtensionContext, loaded?: ProjectState): Promise<void> => {
+		const state = loaded ?? (await loadProjectState(projectEnv(ctx)));
 		if (state.config.status !== "missing") await activateTool();
-		if (ctx.hasUI) ctx.ui.setStatus("storm", statusLabel(state));
+		if (!ctx.hasUI) return;
+		// A status refresh during a run must not put the idle label over the live one.
+		const run = runs.active();
+		const resumable = !run && isApproved(state) && (await resumeCandidate(state.store.dir, state.repo.root, await lastRun(state.repo.root))) !== undefined;
+		ctx.ui.setStatus("storm", run ? runStatusText(run, Date.now()) : statusLabel(state, resumable));
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Subagents never manage the team: no tool, no status line.
 		if (ctx.agent.kind !== "main") return;
 		try {
-			await syncSession(ctx);
+			const state = await loadProjectState(projectEnv(ctx));
+			// A run whose process died stays `running` until a later run ends; here it becomes the last run and resumable.
+			await stopDeadRuns({ root: state.repo.root });
+			await syncSession(ctx, state);
 		} catch {
 			// The status line and the tool are conveniences; /storm reports the actual error.
 		}
@@ -535,7 +575,16 @@ export default function storm(pi: ExtensionAPI): void {
 			// What the user runs sees the registry, quota and settings as they are now (a provider login just made);
 			// the flows inside this command and the model's tool calls share one analysis.
 			invalidateAnalysis(ctx.cwd);
-			const env = flowEnv(ctx);
+			/** Starts a run in this session, as a request does: refused while one is active, started once the session is idle. */
+			const startRun = async (spec: RunSpec): Promise<RunRequestResult> => {
+				// Refused before waiting: during a run the session is busy until that run ends.
+				const reason = runs.refusal();
+				if (reason !== undefined) return { ok: false, reason };
+				await ctx.waitForIdle();
+				await activateTool();
+				return runs.start(ctx, spec);
+			};
+			const env = flowEnv(ctx, startRun);
 			const input = args.trim();
 			/** Bare /storm: the hub, or just the status where no dialog can be answered. */
 			const menu = async (): Promise<void> => {
@@ -558,18 +607,12 @@ export default function storm(pi: ExtensionAPI): void {
 						loadState: () => loadProjectState(projectEnv(ctx)),
 						...(side ? { sideTurn: side } : {}),
 						handlers: {
-							run: async spec => {
-								// Refused before waiting: during a run the session is busy until that run ends.
-								const reason = runs.refusal();
-								if (reason !== undefined) return { ok: false, reason };
-								await ctx.waitForIdle();
-								await activateTool();
-								return runs.start(ctx, spec);
-							},
+							run: spec => startRun(spec),
 							menu,
 							status: () => statusFlow(env, ui),
 							models: () => modelsFlow(env, ui),
 							agents: () => agentsFlow(env, ui),
+							resume: text => resumeFlow(env, ui, text),
 							change: change => runChange(actionHost(ctx, ui), change),
 						},
 					});

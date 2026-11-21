@@ -11,6 +11,7 @@ import {
 	noteAgentRun,
 	noteAgentStart,
 	noteAgentUsage,
+	noteVerdictTree,
 	resetAgents,
 } from "../src/runtime/agents.ts";
 import type { AgentEntry, StormConfig } from "../src/types.ts";
@@ -242,6 +243,21 @@ describe("noteAgentReview", () => {
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: false });
 		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 3_000);
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 3_000, correct: true });
+	});
+
+	test("noteVerdictTree sets the matching verdict's tree and ignores an older time", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: T0 });
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		noteVerdictTree("Rev", T0, "tree-0");
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: true });
+		noteVerdictTree("Rev", T0 + 1_000, "tree-1");
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: true, tree: "tree-1" });
+		// A newer verdict is not given the tree of the one it replaced.
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
+		noteVerdictTree("Rev", T0 + 1_000, "tree-2");
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 2_000, correct: false });
+		noteVerdictTree("Ghost", T0 + 2_000, "tree-3");
+		expect(listAgents()).toHaveLength(1);
 	});
 });
 

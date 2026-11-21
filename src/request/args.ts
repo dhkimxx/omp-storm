@@ -9,8 +9,12 @@ export type SpecResult = { ok: true; spec: RunSpec } | { ok: false; error: strin
 const MAX_ROUNDS = 20;
 const MAX_MINUTES = 1440;
 
-/** A task and the limits stated with it. */
-export function runSpec(taskText: string, limits?: { rounds?: number | undefined; minutes?: number | undefined }): SpecResult {
+/** A task and the limits stated with it; `resumeOf` when the request continues an earlier run. */
+export function runSpec(
+	taskText: string,
+	limits?: { rounds?: number | undefined; minutes?: number | undefined },
+	resumeOf?: string,
+): SpecResult {
 	const task = taskText.trim();
 	if (!task) return { ok: false, error: "실행할 작업 내용이 비어 있습니다." };
 	const { rounds, minutes } = limits ?? {};
@@ -20,5 +24,14 @@ export function runSpec(taskText: string, limits?: { rounds?: number | undefined
 	if (minutes !== undefined && !(Number.isFinite(minutes) && minutes > 0 && minutes <= MAX_MINUTES)) {
 		return { ok: false, error: `시간 한도는 0보다 크고 ${MAX_MINUTES}분 이하인 숫자여야 합니다.` };
 	}
-	return { ok: true, spec: { task, ...(rounds !== undefined ? { rounds } : {}), ...(minutes !== undefined ? { minutes } : {}) } };
+	const resumed = resumeOf?.trim();
+	return {
+		ok: true,
+		spec: {
+			task,
+			...(rounds !== undefined ? { rounds } : {}),
+			...(minutes !== undefined ? { minutes } : {}),
+			...(resumed ? { resumeOf: resumed } : {}),
+		},
+	};
 }

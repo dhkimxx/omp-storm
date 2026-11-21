@@ -561,18 +561,41 @@ export interface RollbackOption {
 
 // ── Runtime: runs, cost ledger, quota marks, trials (implemented in src/runtime) ──────────────
 
-export type RunStatus = "running" | "done" | "budget-exceeded" | "stopped";
+export type RunStatus =
+	/** Under way. */
+	| "running"
+	/** The team's changes were verified. */
+	| "done"
+	/** Ran to its end and nothing was verified. */
+	| "ended"
+	/** Passed its budget. */
+	| "budget-exceeded"
+	/** Cut short. */
+	| "stopped";
 
-/** Why a run ended. `start-failed`: the handoff could not be sent. */
+/** Why a run ended, stated only as far as the evidence goes. */
 export type RunEndReason =
-	| "settled"
+	/** The team's changes were verified. */
 	| "verified"
+	/** The team changed no files. */
+	| "no-changes"
+	/** Only quick-role changes were made, which need no review. */
+	| "unreviewed"
+	/** Files changed but the team has no usable reviewer role. */
+	| "no-reviewer"
+	/** The user stopped the run. */
 	| "interrupted"
+	/** The run reached its round limit. */
 	| "round-limit"
+	/** A round added no tool changes, reviews or model requests. */
 	| "no-progress"
+	/** The run reached the user's time limit. */
 	| "time-limit"
+	/** The session closed. */
 	| "shutdown"
+	/** The run passed its budget. */
 	| "budget"
+	/** The handoff could not be sent. */
 	| "start-failed";
 
 /** A run as requested: the task verbatim and the limits the user stated, if any. */
@@ -582,6 +605,10 @@ export interface RunSpec {
 	rounds?: number;
 	/** Wall-time limit in minutes, when the user set one. */
 	minutes?: number;
+	/** The run this one continues. */
+	resumeOf?: string;
+	/** What the user said when asking to resume, shown to the director in the resume block. */
+	resumeNote?: string;
 }
 
 /** One spawn Storm decided: every storm-* spawn, and non-Storm spawns during a run. */
@@ -628,6 +655,10 @@ export interface RunRecord {
 	contract?: string;
 	/** The request, truncated to 200 characters. */
 	task: string;
+	/** The request in full, at most 20,000 characters: what a later run resumes from. */
+	request?: string;
+	/** The run this one continues. */
+	resumeOf?: string;
 	/** List-price spend of every assistant message in this process while the run was active. */
 	costUsd: number;
 	/** Spend by "provider/model". */
@@ -660,6 +691,8 @@ export interface RunRecord {
 	cleanup?: CleanupResult;
 	/** Main-session turns that settled during the run. */
 	turns?: number;
+	/** Most rounds the run may take, fixed at its start. */
+	maxRounds?: number;
 	endReason?: RunEndReason;
 	/** The limits the user stated with the request. */
 	limits?: { rounds?: number; minutes?: number };
@@ -909,7 +942,12 @@ export interface AgentEntry {
 	/** ms since epoch of the last file-changing tool result. */
 	lastChangeAt?: number;
 	/** Its latest review verdict. */
-	lastVerdict?: { at: number; correct: boolean };
+	lastVerdict?: {
+		at: number;
+		correct: boolean;
+		/** The `diff` and `files` hashes of the run's main work tree when the verdict was given, as `<diff>:<files>`. */
+		tree?: string;
+	};
 	/** ms since epoch: the run-end janitor removed its omp records; its `agent://` output stays. */
 	cleanedAt?: number;
 }

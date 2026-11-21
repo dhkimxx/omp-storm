@@ -17,7 +17,7 @@ import type { RunSpec, StormConfig, UiPort } from "../types.ts";
 import { type ActionReply, CHANGE_ACTIONS, type ChangeAction, parseChange } from "./actions.ts";
 import { runSpec } from "./args.ts";
 
-const QUERIES = ["status", "models", "agents", "menu"] as const;
+const QUERIES = ["status", "models", "agents", "menu", "resume"] as const;
 type Query = (typeof QUERIES)[number];
 
 export type Routed =
@@ -67,6 +67,7 @@ export function buildRoutePrompt(text: string, brief: string): string {
 		"Reply with exactly one JSON object and nothing else:",
 		'- {"action":"run"}: work to do (code, fix, build, investigate, review). Add "rounds": N (the most attempts) or "minutes": N only when the user states such a limit. The task is passed on verbatim: do not restate it.',
 		'- {"action":"status"} | {"action":"models"} (check for newer or better models) | {"action":"agents"} (subagents of this session) | {"action":"menu"} (setup, rollback, reset, approval, or unclear).',
+		'- {"action":"resume"}: continue the run that stopped unfinished.',
 		'- {"action":"priority","priority":"balanced|quality|cost"}',
 		'- {"action":"workers","role":R,"min":N,"max":N} (either bound)',
 		'- {"action":"reselect","role":R,"model":"provider/id"} (omit model to let the user pick)',
@@ -143,6 +144,7 @@ export interface RouteHandlers {
 	status(): Promise<void>;
 	models(): Promise<void>;
 	agents(): Promise<void>;
+	resume(text: string): Promise<void>;
 	change(change: ChangeAction): Promise<ActionReply>;
 }
 
@@ -154,7 +156,7 @@ export interface RouteDeps {
 	sideTurn?: (prompt: string) => Promise<string>;
 }
 
-async function execute(routed: Routed, deps: RouteDeps): Promise<void> {
+async function execute(routed: Routed, deps: RouteDeps, text: string): Promise<void> {
 	const { ui, handlers } = deps;
 	switch (routed.action) {
 		case "run": {
@@ -169,6 +171,8 @@ async function execute(routed: Routed, deps: RouteDeps): Promise<void> {
 			ui.notify(reply.text, reply.outcome === "rejected" ? "warning" : "info");
 			return;
 		}
+		case "resume":
+			return handlers.resume(text);
 		default:
 			return handlers[routed.action]();
 	}
@@ -193,7 +197,7 @@ export async function routeRequest(text: string, deps: RouteDeps): Promise<void>
 	const fixed = routePrefix(text);
 	if (fixed) {
 		// What the user typed needs no confirmation.
-		await execute(fixed, deps);
+		await execute(fixed, deps, text.trim());
 		return;
 	}
 	const state = await deps.loadState();
@@ -211,11 +215,11 @@ export async function routeRequest(text: string, deps: RouteDeps): Promise<void>
 	}
 	if (routed) {
 		const agreed = await confirmed(routed, deps.ui);
-		if (agreed) await execute(agreed, deps);
+		if (agreed) await execute(agreed, deps, text.trim());
 		else deps.ui.notify("아무것도 시작하거나 바꾸지 않았습니다.");
 		return;
 	}
 	const choice = await deps.ui.select(`${problem} 어떻게 할까요?`, [FALLBACK.run, FALLBACK.menu, FALLBACK.cancel]);
-	if (choice === FALLBACK.run) await execute({ action: "run", spec: { task: text.trim() } }, deps);
+	if (choice === FALLBACK.run) await execute({ action: "run", spec: { task: text.trim() } }, deps, text.trim());
 	else if (choice === FALLBACK.menu) await deps.handlers.menu();
 }

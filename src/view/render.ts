@@ -1,9 +1,10 @@
 import { shortHash } from "../config/canonical.ts";
 import { unknownFields } from "../config/schema.ts";
+import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
-import { DEFAULT_EXTRA_ROUNDS } from "../runtime/rounds.ts";
+import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import type {
 	BudgetConfig,
 	MetricValue,
@@ -11,7 +12,6 @@ import type {
 	RoleConfig,
 	RunRecord,
 	RunPlan,
-	RunStatus,
 	ShadowInfo,
 	SpawnRecord,
 	StatusView,
@@ -332,7 +332,7 @@ export function renderStatusBrief(view: StatusView, now: number): string {
 	} else out.push(c.status === "missing" ? "- 팀 설정 없음" : "- 팀 설정 오류");
 	if (view.run) out.push(`- 실행 중: ${view.run.runId} · ${spendText(view.run.costUsd, view.run.budget)}`);
 	else if (view.lastRun) {
-		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${RUN_STATUS[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
+		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${STATUS_LABEL[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
 	}
 	const notes: string[] = [];
 	if (view.trials?.length) notes.push(`시험 사용 ${view.trials.length}건`);
@@ -349,12 +349,6 @@ export function renderTrial(view: TrialView): string {
 	return trialViewLines(view).join("\n");
 }
 
-const RUN_STATUS: Record<RunStatus, string> = {
-	running: "진행 중",
-	done: "완료",
-	"budget-exceeded": "예산 초과",
-	stopped: "중단",
-};
 const OUTCOME: Record<SpawnRecord["outcome"], string> = {
 	routed: "배정",
 	trial: "시험 사용",
@@ -373,6 +367,32 @@ function spendText(cost: number, budget: BudgetConfig | undefined): string {
 	return `지출 ${usd(cost)}${budget ? ` / 예산 $${budget.perRunUsd}` : ""}`;
 }
 
+/** The status line while a run is on: the round in progress, its agents, spend against the budget, and whole minutes. */
+export function runStatusText(run: RunRecord, now: number): string {
+	const turns = run.turns ?? 0;
+	const round = run.maxRounds === undefined ? `${turns + 1}라운드` : `${Math.min(turns + 1, run.maxRounds)}/${run.maxRounds}라운드`;
+	const parts = [round];
+	const agents = run.agents ?? [];
+	if (agents.length) {
+		const running = agents.filter(agent => agent.state === "running").length;
+		parts.push(`서브에이전트 ${agents.length}${running ? `(실행 중 ${running})` : ""}`);
+	}
+	parts.push(run.budget ? `${formatUsd(run.costUsd)}/${formatUsd(run.budget.perRunUsd)}` : formatUsd(run.costUsd));
+	const minutes = Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
+	parts.push(`${minutes}분`);
+	return `storm ▶ ${parts.join(" · ")}`;
+}
+
+/** The head of the stored request (what resuming will send), why it stopped, its rounds and when. */
+export function resumeRunLine(run: RunRecord): string {
+	const request = visible((run.request ?? "").split(/\r?\n/)[0] ?? "").trim();
+	const head = request.length > 80 ? `${request.slice(0, 80)}…` : request;
+	const turns = run.turns ?? 0;
+	const rounds = run.maxRounds === undefined ? `${turns}라운드` : `${turns}/${run.maxRounds}라운드`;
+	const end = run.endReason !== undefined ? endLabel(run.endReason) : STATUS_LABEL[run.status];
+	return `- 이어 갈 실행: ${head} · ${end} · ${rounds} · ${isoText(run.endedAt ?? run.updatedAt ?? run.startedAt)}`;
+}
+
 function lastRunLines(run: RunRecord): string[] {
 	const counts = new Map<SpawnRecord["outcome"], number>();
 	for (const s of run.spawns) counts.set(s.outcome, (counts.get(s.outcome) ?? 0) + 1);
@@ -382,7 +402,7 @@ function lastRunLines(run: RunRecord): string[] {
 				.map((o) => `${OUTCOME[o]} ${counts.get(o)}`)
 				.join(", ")
 		: "없음";
-	const out = [`- ${run.runId} · ${RUN_STATUS[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
+	const out = [`- ${run.runId} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
 	if (blocked?.reason) out.push(`- 첫 차단: ${blocked.agent} · ${blocked.reason}`);
 	if (run.plan) out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);

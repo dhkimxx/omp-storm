@@ -1,11 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isRecord } from "../config/schema.ts";
 import { shortHash } from "../config/canonical.ts";
 import { readJson, writeJsonAtomic } from "../fsutil.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
 import { LANE_ROLES, ROLE_STAND_INS, roleTitle, workerRange } from "../roles.ts";
-import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
+import type { LaneKind, RoleId, RunPlan, RunRecord, StormConfig } from "../types.ts";
+import { END_STATUS } from "./rounds.ts";
 
 /** What a lane kind covers beyond its name, where the role alone does not say it. */
 const LANE_NOTE: Partial<Record<LaneKind, string>> = { run: "long builds, device runs, waiting, logs" };
@@ -54,7 +56,7 @@ function runFile(root: string, runId: string): string | undefined {
 	return RUN_ID.test(runId) ? path.join(runsDir(root), `${runId}.json`) : undefined;
 }
 
-const RUN_STATUSES: readonly string[] = ["running", "done", "budget-exceeded", "stopped"];
+const RUN_STATUSES: readonly string[] = ["running", "done", "ended", "budget-exceeded", "stopped"];
 
 function isRunRecord(value: unknown): value is RunRecord {
 	if (typeof value !== "object" || value === null) return false;
@@ -116,14 +118,111 @@ export async function pruneRuns(root: string, keep = 50): Promise<void> {
 	await Promise.all(ids.slice(Math.max(0, keep)).map(id => fs.rm(path.join(runsDir(root), `${id}.json`), { force: true })));
 }
 
+/** How much of a request a run record keeps for a later run to resume from. */
+export const REQUEST_LIMIT = 20_000;
+
+// END_STATUS is keyed by the current reasons; a run record from disk may carry a retired one, which has no status.
+const END_STATUS_BY_NAME = END_STATUS as Readonly<Record<string, string | undefined>>;
+
+/** A run a later run can continue: it stopped unfinished and kept its request. */
+export function resumableRun(run: RunRecord | undefined): run is RunRecord & { request: string } {
+	if (run === undefined || typeof run.request !== "string" || run.request.length === 0) return false;
+	if (run.status !== "stopped" && run.status !== "budget-exceeded") return false;
+	const reason = run.endReason;
+	return reason === undefined || (reason !== "start-failed" && END_STATUS_BY_NAME[reason] === "stopped");
+}
+
+/** The run this one continues, as much of it as the handoff needs. */
+export interface ResumeInfo {
+	runId: string;
+	endReason?: string;
+	turns?: number;
+	plan?: RunPlan;
+	/** Length of the stored request: the limit is named when the record itself holds no more. */
+	requestLength?: number;
+	/** The user's words when they asked to resume, not part of the task. */
+	said?: string;
+}
+
+/** Lanes a resume handoff names: the whole plan would bury the rules. */
+const RESUME_LANES = 12;
+/** One line is all a lane may take in the handoff. */
+const RESUME_LANE_CHARS = 160;
+/** The user's sentence is a note, not a second task. */
+const RESUME_SAID_CHARS = 1_000;
+
+interface ResumeLane {
+	name: string;
+	role: string;
+	goal?: string;
+}
+
+/** A stored plan is repository data: only an array of objects with a string name is a plan. */
+function resumeLanes(plan: unknown): ResumeLane[] | undefined {
+	if (!isRecord(plan) || !Array.isArray(plan.lanes)) return undefined;
+	const out: ResumeLane[] = [];
+	for (const lane of plan.lanes) {
+		if (!isRecord(lane) || typeof lane.name !== "string") return undefined;
+		out.push({
+			name: lane.name,
+			role: typeof lane.role === "string" ? lane.role : "",
+			...(typeof lane.goal === "string" && lane.goal.trim() ? { goal: lane.goal } : {}),
+		});
+	}
+	return out;
+}
+
+/** One plan line: its name and the agent doing it, and its goal when it had one. */
+function resumeLane(config: StormConfig, lane: ResumeLane): string {
+	const agent = lane.role === "" ? undefined : (usableRole(config, lane.role)?.agent ?? lane.role);
+	const head = agent === undefined ? `- ${lane.name}` : `- ${lane.name} (${agent})`;
+	const line = lane.goal ? `${head}: ${lane.goal}` : head;
+	// A goal is the model's text: keep its line breaks from adding lines the bounds above do not cover.
+	return line.replace(/\s+/g, " ").slice(0, RESUME_LANE_CHARS);
+}
+
+/** The user's sentence in one line, short enough to stay a note. */
+function resumeSaid(said: string | undefined): string | undefined {
+	if (said === undefined) return undefined;
+	const text = said.replace(/\s+/g, " ").trim();
+	if (!text) return undefined;
+	return `On resuming the user said: ${text}`.slice(0, RESUME_SAID_CHARS);
+}
+
+/** What the director of a resumed run reads before the team: the old run, where it stopped, and the plan it was following. */
+function resumeBlock(config: StormConfig, resume: ResumeInfo): string[] {
+	const lanes = (resumeLanes(resume.plan) ?? []).slice(0, RESUME_LANES);
+	const turns = resume.turns ?? 0;
+	const rounds = Number.isFinite(turns) ? Math.max(0, Math.trunc(turns)) : 0;
+	// Both came from a repository file: an id that is not a run id or a reason this version does not know is not shown.
+	const subject = RUN_ID.test(resume.runId) ? `run ${resume.runId}` : "the earlier run";
+	const reason =
+		resume.endReason !== undefined && Object.hasOwn(END_STATUS, resume.endReason) ? ` (${resume.endReason})` : "";
+	const said = resumeSaid(resume.said);
+	return [
+		`Continues ${subject}, which stopped${reason} after ${rounds} rounds. Its changes are in the working tree or committed.`,
+		"First check the current state (git status and diff, the tests), then finish what is left. Do not redo finished work.",
+		...(resume.requestLength === REQUEST_LIMIT ? ["The stored request was cut at 20,000 characters."] : []),
+		...(said ? [said] : []),
+		...(lanes.length ? ["Earlier plan:", ...lanes.map(lane => resumeLane(config, lane))] : []),
+	];
+}
+
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
  * rules are taught by their block reasons, so each has at most one clause here. `maxRounds` is the run's whole round
- * budget, fixed by the controller when the run starts. Everything sits in one XML section: omp's keyword matcher skips
- * those, so neither this text nor the task can attach an omp workflow notice (whose instructions contradict what
- * Storm enforces).
+ * budget, fixed by the controller when the run starts. `resume` names the run this one continues. Everything sits in
+ * one XML section: omp's keyword matcher skips those, so neither this text nor the task can attach an omp workflow
+ * notice (whose instructions contradict what Storm enforces).
  */
-export function buildHandoff(input: { runId: string; config: StormConfig; hash: string; task: string; maxRounds: number }): string {
+export function buildHandoff(input: {
+	runId: string;
+	config: StormConfig;
+	hash: string;
+	task: string;
+	maxRounds: number;
+	resume?: ResumeInfo;
+}): string {
 	const { config } = input;
 	const team = Object.entries(config.roles).flatMap(([id, role]) => {
 		if (!usableRole(config, id)) return [];
@@ -143,7 +242,7 @@ export function buildHandoff(input: { runId: string; config: StormConfig; hash: 
 	];
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {
-		const check = `- When you stop, Storm checks the run: files the team changed need a \`correct\` verdict from \`${reviewer}\` given after the last change.`;
+		const check = `- When you stop, Storm checks the run: files changed during it, with any tool or shell command, need a \`correct\` verdict from \`${reviewer}\` given after the last change.`;
 		rules.push(
 			input.maxRounds === 1
 				? `${check} Without it the run ends unverified.`
@@ -154,10 +253,12 @@ export function buildHandoff(input: { runId: string; config: StormConfig; hash: 
 		const past = config.budget.onExceed === "stop" ? "the run stops" : "new spawns are blocked";
 		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; past it ${past}.`);
 	}
+	const resume = input.resume ? resumeBlock(config, input.resume) : [];
 	return [
 		`<storm-run id="${input.runId}" config="${shortHash(input.hash)}">`,
 		"Task:",
 		input.task,
+		...(resume.length ? ["", ...resume] : []),
 		"",
 		"Team (spawn only these):",
 		...team,

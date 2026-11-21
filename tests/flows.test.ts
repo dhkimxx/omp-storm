@@ -7,12 +7,15 @@ import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
-import { agentsFlow, approveAndSave, type FlowEnv, hubFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { agentsFlow, approveAndSave, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { writeRun } from "../src/runtime/run.ts";
+import { noteResumePointer, resumeCandidate, resumePointerFile } from "../src/runtime/resume.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { isApproved, loadProjectState } from "../src/state.ts";
-import type { FormData, StormConfig, TrialConfig } from "../src/types.ts";
+import type { RunRequestResult } from "../src/tool/host.ts";
+import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
-import { agentEntry } from "./fixtures.ts";
+import { agentEntry, runRecord } from "./fixtures.ts";
 import { makeProject, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
@@ -555,5 +558,177 @@ describe("ended trials", () => {
 		expect(s.selects).toEqual([]);
 		expect(s.reports).toHaveLength(1);
 		expect(s.reports[0]?.markdown).toContain("c/j");
+	});
+});
+
+describe("resuming the last run", () => {
+	const resumable = (over: Partial<RunRecord> = {}): RunRecord =>
+		runRecord({
+			runId: "run-20261119-090000-aaaa",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			endedAt: "2026-11-19T09:30:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			turns: 2,
+			maxRounds: 4,
+			task: "resume-unique-request",
+			request: "resume-unique-request",
+			...over,
+		});
+	const storeDir = async (): Promise<string> => (await load()).store.dir;
+	/** The record and this machine's pointer to it: what a real start leaves behind. */
+	const plant = async (run: RunRecord): Promise<void> => {
+		await writeRun(project.root, run);
+		await noteResumePointer(await storeDir(), project.root, run);
+	};
+	/** A start that records its spec and answers with `result`. */
+	const starter = (started: RunSpec[], result: RunRequestResult = { ok: true, runId: "run-new" }) => {
+		return async (spec: RunSpec): Promise<RunRequestResult> => {
+			started.push(spec);
+			return result;
+		};
+	};
+
+	test("a resumable last run is the menu's first option, with one panel line about it", async () => {
+		await approve(TEAM);
+		const run = resumable();
+		await plant(run);
+		const started: RunSpec[] = [];
+		const f = scriptedUi([FIRST]);
+		await hubFlow({ ...env, startRun: starter(started) }, f.ui);
+		// One option more than the menu without a resumable run, and it comes first.
+		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
+		const about = f.selects[0]?.markdown?.split("\n").filter(line => line.includes("resume-unique-request")) ?? [];
+		expect(about).toHaveLength(1);
+		expect(f.notices).toEqual([]);
+	});
+
+	test("a start refusal from the menu is a warning", async () => {
+		await approve(TEAM);
+		await plant(resumable());
+		const f = scriptedUi([FIRST]);
+		await hubFlow({ ...env, startRun: starter([], { ok: false, reason: "run-active" }) }, f.ui);
+		expect(f.notices).toHaveLength(1);
+		expect(f.notices[0]?.level).toBe("warning");
+		expect(f.notices[0]?.text).toContain("run-active");
+	});
+
+	test("a last run that ended, or no way to start one, leaves the menu as it was", async () => {
+		await approve(TEAM);
+		for (const [runId, over] of [
+			["run-20261119-100000-aaaa", { status: "done", endReason: "verified" }],
+			["run-20261119-100001-aaaa", { status: "ended", endReason: "no-changes" }],
+		] as const) {
+			await writeRun(project.root, resumable({ runId, ...over }));
+			const started: RunSpec[] = [];
+			const f = scriptedUi([LAST]);
+			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
+			expect(f.selects[0]?.options).toHaveLength(4);
+			expect(started).toEqual([]);
+		}
+		// A resumable run, but this caller cannot start one.
+		await writeRun(project.root, resumable({ runId: "run-20261119-110000-aaaa" }));
+		const f = scriptedUi([LAST]);
+		await hubFlow(env, f.ui);
+		expect(f.selects[0]?.options).toHaveLength(4);
+	});
+
+	test("a planted record without a pointer, a pointer for another run, or an edited request is not offered", async () => {
+		await approve(TEAM);
+		const run = resumable();
+		await writeRun(project.root, run);
+		/** Neither the menu nor the classifier path starts anything. */
+		const notOffered = async (): Promise<void> => {
+			const started: RunSpec[] = [];
+			const f = scriptedUi([LAST]);
+			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
+			expect(f.selects[0]?.options).toHaveLength(4);
+			expect(started).toEqual([]);
+			const g = scriptedUi();
+			await resumeFlow({ ...env, startRun: starter(started) }, g.ui);
+			expect(started).toEqual([]);
+			expect(g.notices).toHaveLength(1);
+		};
+		await notOffered();
+		// The pointer names a different run.
+		await noteResumePointer(await storeDir(), project.root, resumable({ runId: "run-20261119-095000-bbbb" }));
+		await notOffered();
+		// The pointer is right but the request was rewritten after the run.
+		await noteResumePointer(await storeDir(), project.root, run);
+		await writeRun(project.root, resumable({ request: "edited-request", task: "edited-request" }));
+		await notOffered();
+	});
+
+	test("the old run's limits are carried into the resume spec", async () => {
+		await approve(TEAM);
+		const run = resumable({ limits: { rounds: 3, minutes: 20 } });
+		await plant(run);
+		const started: RunSpec[] = [];
+		const f = scriptedUi([FIRST]);
+		await hubFlow({ ...env, startRun: starter(started) }, f.ui);
+		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId, rounds: 3, minutes: 20 }]);
+	});
+
+	test("resumeFlow starts the last resumable run; without one it starts nothing and notifies once", async () => {
+		await approve(TEAM);
+		const started: RunSpec[] = [];
+		const none = scriptedUi();
+		await resumeFlow({ ...env, startRun: starter(started) }, none.ui);
+		expect(started).toEqual([]);
+		expect(none.selects).toEqual([]);
+		expect(none.notices).toHaveLength(1);
+
+		const run = resumable();
+		await plant(run);
+		const f = scriptedUi();
+		await resumeFlow({ ...env, startRun: starter(started) }, f.ui);
+		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
+		expect(f.selects).toEqual([]);
+		expect(f.notices).toEqual([]);
+	});
+
+	test("what the user typed when asking to resume becomes the note", async () => {
+		await approve(TEAM);
+		const run = resumable();
+		await plant(run);
+		const started: RunSpec[] = [];
+		const f = scriptedUi();
+		const said = "이어서 하되\nX는 빼고";
+		await resumeFlow({ ...env, startRun: starter(started) }, f.ui, said);
+		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId, resumeNote: said }]);
+		expect(f.selects).toEqual([]);
+		expect(f.notices).toEqual([]);
+	});
+
+	test("/storm reset removes the resume pointer; the approval prune keeps it", async () => {
+		await approve(TEAM);
+		const store = (await load()).store;
+		const run = resumable();
+		await noteResumePointer(store.dir, project.root, run);
+		await store.prune(configHash(TEAM));
+		expect(await readFile(resumePointerFile(store.dir, project.root), "utf8")).toContain(run.runId);
+		const f = scriptedUi([FIRST]);
+		await resetFlow(env, f.ui);
+		await expect(readFile(resumePointerFile(store.dir, project.root), "utf8")).rejects.toThrow();
+	});
+
+	test("resume pointers are per work tree: reset removes only this tree's pointer", async () => {
+		await approve(TEAM);
+		const store = (await load()).store;
+		const run = resumable();
+		const otherRoot = path.join(project.tmp, "other-worktree");
+		const other = resumable({ runId: "run-20261119-095500-bbbb" });
+		await noteResumePointer(store.dir, project.root, run);
+		await noteResumePointer(store.dir, otherRoot, other);
+		expect(resumePointerFile(store.dir, project.root)).not.toBe(resumePointerFile(store.dir, otherRoot));
+		// Another tree's start leaves this tree's candidate alone.
+		expect((await resumeCandidate(store.dir, project.root, run))?.runId).toBe(run.runId);
+		expect(await resumeCandidate(store.dir, project.root, other)).toBeUndefined();
+
+		const f = scriptedUi([FIRST]);
+		await resetFlow(env, f.ui);
+		await expect(readFile(resumePointerFile(store.dir, project.root), "utf8")).rejects.toThrow();
+		expect(await readFile(resumePointerFile(store.dir, otherRoot), "utf8")).toContain(other.runId);
 	});
 });

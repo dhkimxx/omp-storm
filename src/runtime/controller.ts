@@ -22,7 +22,6 @@ import type {
 	RunPlan,
 	RunRecord,
 	RunSpec,
-	RunStatus,
 	SpawnBlockCode,
 	SpawnRecord,
 	StormConfig,
@@ -32,9 +31,22 @@ import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
-import { buildRoundMessage, decideRound, END_STATUS, endLabel, HOLD_MS, maxRounds, reviewGate, ROUND_DELAY_MS, type RoundDecision } from "./rounds.ts";
-import { buildHandoff, newRunId, pruneRuns, writeRun } from "./run.ts";
+import {
+	buildRoundMessage,
+	decideRound,
+	END_STATUS,
+	endLabel,
+	HOLD_MS,
+	maxRounds,
+	reviewGate,
+	ROUND_DELAY_MS,
+	STATUS_LABEL,
+	type RoundDecision,
+} from "./rounds.ts";
+import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, writeRun } from "./run.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
+import { noteResumePointer } from "./resume.ts";
+import type { TreeReading, TreeState } from "./tree.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
 
@@ -115,6 +127,8 @@ interface OwnRun {
 	record: RunRecord;
 	root: string;
 	repoId: string;
+	/** The session that directs the run: live record writes happen without a ctx of their own. */
+	ctx: ExtensionContext;
 	/** The approved config the run started under. */
 	config: StormConfig;
 	/** Approval records of the repo: the run-end janitor keeps them within their limits. */
@@ -129,8 +143,14 @@ interface OwnRun {
 	maxRounds: number;
 	/** The user's wall-time limit in minutes, when the request stated one. */
 	minutes?: number;
-	/** The gate's counts when Storm sent its last round message: what the next round is expected to move. */
-	progress?: { changes: number; reviews: number };
+	/** The work tree when the run started: the gate compares it with the tree at each round. */
+	tree?: TreeState;
+	/** The commit the start tree was read against: every later read compares with it, so a commit does not hide a change. */
+	base?: string;
+	/** When Storm first sent a round for a tree-only stale review: a verdict after it is not stale because of the tree. */
+	rereviewedAt?: number;
+	/** The team's activity when Storm sent its last round message: what the next round is expected to move. */
+	progress?: { changes: number; reviews: number; requests: number };
 	/** The pending look timer: the round delay, or the wait while the session is held. */
 	hold?: unknown;
 	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
@@ -163,6 +183,8 @@ export interface RunControllerDeps {
 	now(): number;
 	/** Subagents whose latest turn was during the run, from the agent ledger. */
 	agents?(runId: string): AgentEntry[];
+	/** The work tree's state against `base` (HEAD when absent); absent in hosts and tests that have no git. */
+	tree?(root: string, base?: string): Promise<TreeReading | undefined>;
 	/** Every subagent this process has seen (any run): the janitor only cleans those omp has parked. */
 	ledger?(): AgentEntry[];
 	/** omp's agent dir: the janitor deletes omp records only below its `sessions/`. Absent → no omp record cleanup. */
@@ -171,6 +193,11 @@ export interface RunControllerDeps {
 	flushMs?: number;
 	/** The look timer's clock; real timers when absent. */
 	timers?: RunTimers;
+	/**
+	 * The live status record: the run after it was first written, on every live rewrite and when a round is sent;
+	 * `undefined` when the run ends. A failing hook never breaks the run.
+	 */
+	live?(ctx: ExtensionContext, run: RunRecord | undefined): void;
 }
 
 export class RunController {
@@ -264,6 +291,20 @@ export class RunController {
 		await this.#compactFirst(ctx, ui);
 		// The dialog and the compaction awaited: another session's run may have started meanwhile.
 		if (activeLedgerRun(state.repo.repoId)) return busy;
+		const startTree = await this.#treeAt(state.repo.root);
+		// A resumed run starts a new record; what it continues is the old record on disk, when that is still readable.
+		const continued = requested.resumeOf !== undefined ? await readRun(state.repo.root, requested.resumeOf) : undefined;
+		const resume =
+			continued === undefined
+				? undefined
+				: {
+						runId: continued.runId,
+						...(continued.endReason !== undefined ? { endReason: continued.endReason } : {}),
+						...(continued.turns !== undefined ? { turns: continued.turns } : {}),
+						...(continued.plan !== undefined ? { plan: continued.plan } : {}),
+						...(continued.request !== undefined ? { requestLength: continued.request.length } : {}),
+						...(requested.resumeNote !== undefined ? { said: requested.resumeNote } : {}),
+					};
 
 		const { config, hash } = gate;
 		const { task } = requested;
@@ -282,6 +323,8 @@ export class RunController {
 			startedAt: iso(this.deps.now()),
 			status: "running",
 			task: task.slice(0, TASK_CHARS),
+			request: task.slice(0, REQUEST_LIMIT),
+			...(requested.resumeOf !== undefined ? { resumeOf: requested.resumeOf } : {}),
 			costUsd: 0,
 			costByModel: {},
 			...(config.budget ? { budget: config.budget } : {}),
@@ -289,39 +332,55 @@ export class RunController {
 			...artifactsOf(ctx),
 			process: processKey(),
 			turns: 0,
+			maxRounds: roundLimit,
 			...(limits ? { limits } : {}),
 		};
 		const own: OwnRun = {
 			record,
 			root: state.repo.root,
 			repoId: state.repo.repoId,
+			ctx,
 			config,
 			store: state.store,
 			turnStarted: false,
 			inTurn: false,
 			maxRounds: roundLimit,
 			awaitingAsync: false,
+			...(startTree !== undefined ? { tree: startTree.state, base: startTree.base } : {}),
 			...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
 		};
+		// A stored record is untrusted input: build the message before anything of this run exists, so a bad plan or
+		// reason refuses the start instead of leaving a current run without a handoff.
+		let handoff: string;
+		try {
+			handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit, ...(resume ? { resume } : {}) });
+		} catch (error) {
+			return refuse(`실행 계약을 만들지 못해 시작하지 않았습니다: ${errorText(error)}`);
+		}
 		this.#own = own;
 		try {
 			startLedgerRun({
 				runId,
 				repoId: own.repoId,
+				root: own.root,
+				...(own.base !== undefined ? { base: own.base } : {}),
 				...(config.budget ? { budget: config.budget } : {}),
 				onThreshold: (kind, run) => this.#threshold(ctx, kind, run),
 			});
 			spawnsByRun.set(runId, []);
 			openRunReads(runId);
 			await writeRun(own.root, record);
+			// Outside the repository, so a record committed or rewritten there is not a run this machine started.
+			await noteResumePointer(state.store.dir, own.root, record).catch(() => undefined);
 		} catch (error) {
 			// This session directs and the ledger is open, but nothing was handed off: close both rather than leave a run nobody started.
 			await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 			return refuse(`실행을 기록하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 		}
 		liveWriters.set(runId, () => this.#scheduleFlush(own));
+		this.#liveStatus(own.ctx, this.active());
 		ui.notify(`Storm 실행을 시작합니다(${runId}).`);
-		this.deps.pi.sendUserMessage(buildHandoff({ runId, config, hash, task, maxRounds: roundLimit })).catch((error: unknown) => {
+		this.deps.pi.sendUserMessage(handoff).catch((error: unknown) => {
 			ui.notify(`실행 계약을 보내지 못했습니다: ${errorText(error)}`, "error");
 			this.#stopSoon(own, "start-failed", ctx);
 		});
@@ -329,7 +388,7 @@ export class RunController {
 	}
 
 	/**
-	 * What must hold before a run starts, settled while nothing has started. omp's goal and loop modes would move the
+	 * What must hold before a run starts, decided while nothing has started. omp's goal and loop modes would move the
 	 * session outside Storm's run, which decides on its own when another round follows, so they are checked first: no
 	 * dialog offers to leave vibe only to be refused after it. omp's vibe mode replaces the director's tools, so the
 	 * team cannot run inside it either.
@@ -541,14 +600,27 @@ export class RunController {
 	 * handler omp is still closing the turn, so nothing is sent from it.
 	 */
 	async #decide(own: OwnRun, ctx: ExtensionContext, aborted: boolean): Promise<void> {
-		const decision = this.#roundDecision(own, aborted);
+		const turns = own.record.turns ?? 0;
+		const decision = await this.#roundDecision(own, aborted);
+		// The tree read may have outlasted the round: a new turn or an end decided meanwhile owns the run now.
+		if (!this.#live(own, turns)) return;
 		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
 		this.#arm(own, ctx, ROUND_DELAY_MS);
 	}
 
-	/** The round's decision from the gate as the ledger has it now. */
-	#roundDecision(own: OwnRun, aborted: boolean): RoundDecision {
-		const gate = reviewGate(this.deps.agents?.(own.record.runId) ?? [], own.config);
+	/** Whether `own` is still what the decision was taken from: this session's run, the same round, and not already ending. */
+	#live(own: OwnRun, turns: number): boolean {
+		return this.#own === own && !own.inTurn && own.ending === undefined && (own.record.turns ?? 0) === turns;
+	}
+
+	/** The round's decision from the tree now and the gate as the ledger has it after that. */
+	async #roundDecision(own: OwnRun, aborted: boolean): Promise<RoundDecision> {
+		const now = await this.#treeAt(own.root, own.base);
+		const gate = reviewGate(this.deps.agents?.(own.record.runId) ?? [], own.config, {
+			...(own.tree !== undefined ? { start: own.tree } : {}),
+			...(now !== undefined ? { now: now.state } : {}),
+			...(own.rereviewedAt !== undefined ? { rereviewedAt: own.rereviewedAt } : {}),
+		});
 		return decideRound({
 			gate,
 			turns: own.record.turns ?? 0,
@@ -561,14 +633,26 @@ export class RunController {
 		});
 	}
 
+	/** The work tree at `root` against `base`, or no tree when the host has none or the read fails. */
+	async #treeAt(root: string, base?: string): Promise<TreeReading | undefined> {
+		try {
+			return await this.deps.tree?.(root, base);
+		} catch {
+			return undefined;
+		}
+	}
+
 	/**
 	 * The look after a wait, taken from fresh gate data: ends the run, waits out a held session, or sends the next
 	 * round. The only place a round message is sent from.
 	 */
 	async #look(own: OwnRun, ctx: ExtensionContext): Promise<void> {
-		const decision = this.#roundDecision(own, false);
-		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
+		// A held session is no round, and a tree read is two git processes: wait out the hold before deciding.
 		if (this.#held(ctx)) return this.#arm(own, ctx, HOLD_MS);
+		const turns = own.record.turns ?? 0;
+		const decision = await this.#roundDecision(own, false);
+		if (!this.#live(own, turns)) return;
+		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
 		this.#sendRound(own, ctx, decision.gate, decision.round);
 	}
 
@@ -614,14 +698,17 @@ export class RunController {
 	 */
 	#sendRound(own: OwnRun, ctx: ExtensionContext, gate: RoundGate, round: number): void {
 		const ui = this.deps.ui(ctx);
-		own.progress = { changes: gate.changes, reviews: gate.reviews };
+		own.progress = { changes: gate.changes, reviews: gate.reviews, requests: gate.requests };
 		// The gate reports unverified only for a team with a usable reviewer role, whose agent name the message carries.
 		const reviewer = own.config.roles.reviewer?.agent;
 		if (reviewer === undefined) {
-			this.#stopSoon(own, "settled", ctx);
+			this.#stopSoon(own, "no-reviewer", ctx);
 			return;
 		}
+		// Tree-only staleness is asked about once: a verdict given from now on is honoured whatever the tree does.
+		if (gate.by === "tree" && own.rereviewedAt === undefined) own.rereviewedAt = this.deps.now();
 		ui.notify(`검증되지 않은 변경이 있어 ${round}라운드를 시작합니다(최대 ${own.maxRounds}라운드).`);
+		this.#liveStatus(ctx, this.active());
 		this.deps.pi.sendUserMessage(buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, reviewer })).catch((error: unknown) => {
 			// The user interrupted the prompt's setup: no round started, so nothing about it is unverified progress.
 			if (promptDropped(error)) {
@@ -681,6 +768,8 @@ export class RunController {
 		const cleaned = ctx ? await this.#cleanUp(own, record, agents, ctx) : [];
 		await writeRun(own.root, record);
 		await appendRunIndex(own.root, summarizeForIndex(record)).catch(() => undefined);
+		// The idle status line reads the last run from disk: report only once the final record is there.
+		if (ctx) this.#liveStatus(ctx, undefined);
 		await pruneRuns(own.root);
 		if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now());
 		if (ctx) this.deps.ui(ctx).record("Storm 실행 결과", summarizeRun(record));
@@ -717,6 +806,15 @@ export class RunController {
 		}
 	}
 
+	/** The status line's live record; a hook that throws must not keep the run from ending. */
+	#liveStatus(ctx: ExtensionContext, run: RunRecord | undefined): void {
+		try {
+			this.deps.live?.(ctx, run);
+		} catch {
+			// A convenience of the screen: no run decision reads what it shows.
+		}
+	}
+
 	#scheduleFlush(own: OwnRun): void {
 		if (this.#flushTimer) return;
 		this.#flushTimer = setTimeout(() => {
@@ -724,6 +822,7 @@ export class RunController {
 			const live = this.active();
 			// A run that finished meanwhile has already written its final record.
 			if (!live || this.#own !== own) return;
+			this.#liveStatus(own.ctx, live);
 			this.#liveWrite = writeRun(own.root, { ...live, updatedAt: iso(this.deps.now()) }).catch(() => undefined);
 		}, this.deps.flushMs ?? LIVE_FLUSH_MS);
 		this.#flushTimer.unref?.();
@@ -775,8 +874,6 @@ const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
 	internal: "내부 오류",
 };
 
-const STATUS_LABEL: Record<RunStatus, string> = { running: "진행 중", done: "완료", "budget-exceeded": "예산 초과", stopped: "중단" };
-
 function tally<K extends string>(keys: readonly K[], label: (key: K) => string): string {
 	const counts = new Map<K, number>();
 	for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -794,8 +891,13 @@ export function summarizeRun(run: RunRecord): string {
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
-	// Records of 0.10 and earlier counted no rounds.
-	const rounds = run.turns !== undefined ? ` · ${run.turns}라운드` : "";
+	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept.
+	const rounds =
+		run.turns === undefined
+			? ""
+			: run.maxRounds !== undefined
+				? ` · ${run.turns}/${run.maxRounds}라운드`
+				: ` · ${run.turns}라운드`;
 	const lines = [
 		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${rounds} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
 		`- 스폰: ${spawnLine}${blockLine}`,
