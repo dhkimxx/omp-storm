@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildBudget, buildQuota, buildReselect, buildTrial, buildWorkers, newProposalId, quotaPlan, trialId } from "../src/proposals/build.ts";
+import { buildBudget, buildQuota, buildReselect, buildSettings, buildTrial, buildWorkers, newProposalId, quotaPlan, trialId } from "../src/proposals/build.ts";
 import { presentProposal, renderProposal } from "../src/proposals/present.ts";
 import { createProposalStore } from "../src/proposals/store.ts";
 import { ROLES } from "../src/roles.ts";
@@ -284,6 +284,17 @@ describe("builders", () => {
 		const off = buildBudget(set.config, 0, undefined, undefined);
 		if ("error" in off) throw new Error(off.error);
 		expect(off.config.budget).toBeUndefined();
+	});
+
+	test("settings keep only non-default switches, so turning one back restores the original config", () => {
+		expect(buildSettings(base, undefined, undefined)).toHaveProperty("error");
+		const on = buildSettings(base, true, false);
+		if ("error" in on) throw new Error(on.error);
+		expect(on.config.cleanup).toBe(true);
+		expect(on.config.docs).toBe(false);
+		const back = buildSettings(on.config, false, true);
+		if ("error" in back) throw new Error(back.error);
+		expect(back.config).toEqual(base);
 	});
 });
 

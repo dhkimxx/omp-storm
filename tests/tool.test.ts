@@ -93,7 +93,6 @@ const analysis: Analysis = {
 		main: { cheap: [], general: [], premium: [], unknown: [] },
 		subagent: { cheap: [], general: [], premium: [], unknown: [] },
 	},
-	stopped: [],
 	newer: [],
 	alternatives: {},
 	warnings: [],

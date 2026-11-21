@@ -543,8 +543,9 @@ describe("followUpBlock", () => {
 		expect(why).toContain("Impl(implementer)");
 		expect(why).toContain("230.0k 토큰(창의 23%)");
 		expect(why).toContain("상한 200.0k 토큰");
-		expect(why).toContain("새 storm-implementer");
-		expect(why).toContain("agent://Impl 에서 계속 읽을 수 있습니다");
+		expect(why).toContain("새 storm-implementer 를 띄워");
+		expect(why).toContain("agent://Impl 의 결과를 읽고 이어서 진행하라");
+		expect(why).toContain("요약해 넘길 필요는 없습니다");
 		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 200_000 })], config)).toBeDefined();
 		// Sub-paths and queries address the same agent.
 		expect(followUpBlock("write", write("agent://Impl/result?x=1"), [agent()], config)).toBeDefined();
@@ -561,6 +562,17 @@ describe("followUpBlock", () => {
 		const why = followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 150_000, contextWindow: 200_000 })], high) ?? "";
 		expect(why).toContain("상한 140.0k 토큰");
 		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 139_999, contextWindow: 200_000 })], high)).toBeUndefined();
+	});
+
+	test("a follow-up to a cleaned agent is blocked whatever its context, with the same handoff", () => {
+		const cleaned = agent({ contextTokens: 1_000, cleanedAt: 5 });
+		const why = followUpBlock("write", write("agent://Impl"), [cleaned], config) ?? "";
+		expect(why).toContain("omp 기록이 지워져");
+		expect(why).toContain("새 storm-implementer 를 띄워");
+		expect(why).toContain("agent://Impl 의 결과를 읽고");
+		const { role: _role, ...plain } = agent({ id: "X", name: "task", contextTokens: 1_000, cleanedAt: 5 });
+		expect(followUpBlock("write", write("agent://X"), [plain], config)).toContain("새 task 를 띄워");
+		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 1_000 })], config)).toBeUndefined();
 	});
 
 	test("other tools, other paths and unknown agents pass", () => {

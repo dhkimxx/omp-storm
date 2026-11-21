@@ -4,14 +4,20 @@
  * the process (children included), so they are collected per run in module scope.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ApprovalStore } from "../approval/store.ts";
+import { docsEnabled } from "../policy/docs.ts";
+import { clearRunReads, openRunReads } from "../policy/reads.ts";
 import { tokens } from "../report/agents.ts";
 import { PREFLIGHT_SHARE, PREFLIGHT_TOKENS, ROLES } from "../roles.ts";
 import type { ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
-import type { AgentEntry, RunPlan, RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
+import type { AgentEntry, RunCheckpoint, RunPlan, RunRecord, RunStatus, SpawnRecord, StormConfig, UiPort } from "../types.ts";
+import { markAgentsCleaned } from "./agents.ts";
+import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
 import { buildHandoff, newRunId, pickKeyword, pruneRuns, writeRun } from "./run.ts";
+import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
 
@@ -68,10 +74,34 @@ function unapprovedShadowPath(state: ProjectState): string | undefined {
 	return state.shadows.find(shadow => !approved.some(seen => seen.agent === shadow.agent && seen.sha256 === shadow.sha256))?.path;
 }
 
+function withoutDocFindings(agent: AgentEntry): AgentEntry {
+	if (agent.review?.docFindings === undefined) return agent;
+	const review = { ...agent.review };
+	delete review.docFindings;
+	return { ...agent, review };
+}
+
+function withoutCleanup(config: StormConfig): StormConfig {
+	const copy = { ...config };
+	delete copy.cleanup;
+	return copy;
+}
+
+/** Where the main session keeps its subagents' records: the run-end janitor finds them there later. */
+function artifactsOf(ctx: ExtensionContext): { artifactsDir?: string } {
+	// In-memory sessions (and bare test contexts) have no artifacts dir: their runs keep no cleanable records.
+	const dir = ctx.sessionManager?.getArtifactsDir();
+	return typeof dir === "string" && dir !== "" ? { artifactsDir: dir } : {};
+}
+
 interface OwnRun {
 	record: RunRecord;
 	root: string;
 	repoId: string;
+	/** The approved config the run started under. */
+	config: StormConfig;
+	/** Approval records of the repo: the run-end janitor keeps them within their limits. */
+	store: ApprovalStore;
 	/** The handoff turn has begun; the next settle ends the run. */
 	turnStarted: boolean;
 }
@@ -85,6 +115,10 @@ export interface RunControllerDeps {
 	now(): number;
 	/** Subagents that started during the run, from the agent ledger. */
 	agents?(runId: string): AgentEntry[];
+	/** Every subagent this process has seen (any run): the janitor only cleans those omp has parked. */
+	ledger?(): AgentEntry[];
+	/** omp's sessions dir (`<agentDir>/sessions`): the janitor deletes nothing outside it. Absent → no omp record cleanup. */
+	sessionsRoot?: string;
 	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
 	flushMs?: number;
 }
@@ -156,8 +190,10 @@ export class RunController {
 			costByModel: {},
 			...(config.budget ? { budget: config.budget } : {}),
 			spawns: [],
+			...artifactsOf(ctx),
+			process: processKey(),
 		};
-		const own: OwnRun = { record, root: state.repo.root, repoId: state.repo.repoId, turnStarted: false };
+		const own: OwnRun = { record, root: state.repo.root, repoId: state.repo.repoId, config, store: state.store, turnStarted: false };
 		startLedgerRun({
 			runId,
 			repoId: own.repoId,
@@ -167,6 +203,7 @@ export class RunController {
 		});
 		this.#own = own;
 		spawnsByRun.set(runId, []);
+		openRunReads(runId);
 		await writeRun(own.root, record);
 		liveWriters.set(runId, () => this.#scheduleFlush(own));
 		const ui = this.deps.ui(ctx);
@@ -186,6 +223,11 @@ export class RunController {
 	/** True while this session runs Storm: the main session directs and does not change files itself. */
 	directing(): boolean {
 		return this.#own !== undefined;
+	}
+
+	/** This session's run id while it directs, without building the live record. */
+	runId(): string | undefined {
+		return this.#own?.record.runId;
 	}
 
 	/** Spend of this (main) session while its run is active: what directing costs. */
@@ -210,6 +252,61 @@ export class RunController {
 		if (!own) return;
 		own.record.blockedFollowUps = (own.record.blockedFollowUps ?? 0) + 1;
 		this.#scheduleFlush(own);
+	}
+
+	/** A director `read` during the run: counted as one read, of a file a subagent of the run read, and refused. */
+	noteRead(kind: "plain" | "duplicate" | "blocked"): void {
+		const own = this.#own;
+		if (!own) return;
+		const reads = own.record.reads ?? { director: 0, duplicate: 0, blocked: 0 };
+		reads.director += 1;
+		if (kind !== "plain") reads.duplicate += 1;
+		if (kind === "blocked") reads.blocked += 1;
+		own.record.reads = reads;
+		this.#scheduleFlush(own);
+	}
+
+	/** Prompt size of a director request; the run keeps the largest. */
+	noteMainContext(promptTokens: number): void {
+		const own = this.#own;
+		if (!own || promptTokens <= (own.record.maxMainContext ?? 0)) return;
+		own.record.maxMainContext = promptTokens;
+		this.#scheduleFlush(own);
+	}
+
+	/** When this run last started a mid-run compaction (ms since epoch). */
+	lastCheckpointAt(): number | undefined {
+		const last = this.#own?.record.checkpoints?.at(-1);
+		return last ? Date.parse(last.at) : undefined;
+	}
+
+	/**
+	 * A mid-run compaction started at `before` tokens. `done` records the size after it; `failed` drops the entry, so a
+	 * compaction omp refused (one already running, nothing to compact) neither counts nor holds off the next try.
+	 */
+	noteCheckpoint(before: number): { done(after: number | undefined): void; failed(): void } {
+		const own = this.#own;
+		if (!own) return { done: () => undefined, failed: () => undefined };
+		const checkpoint: RunCheckpoint = { at: iso(this.deps.now()), before };
+		own.record.checkpoints = [...(own.record.checkpoints ?? []), checkpoint];
+		this.#scheduleFlush(own);
+		return {
+			done: after => {
+				if (after === undefined || this.#own !== own) return;
+				checkpoint.after = after;
+				this.#scheduleFlush(own);
+			},
+			failed: () => {
+				if (this.#own !== own) return;
+				own.record.checkpoints = (own.record.checkpoints ?? []).filter(entry => entry !== checkpoint);
+				this.#scheduleFlush(own);
+			},
+		};
+	}
+
+	/** The approved config this session's run started under. */
+	runConfig(): StormConfig | undefined {
+		return this.#own?.config;
 	}
 
 	/** From the storm tool's plan action: the plan this session's run spawns under, visible to every session. */
@@ -265,7 +362,10 @@ export class RunController {
 		const ledger = endLedgerRun(own.record.runId);
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
 		spawnsByRun.delete(own.record.runId);
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		clearRunReads(own.record.runId);
+		const seen = this.deps.agents?.(own.record.runId) ?? [];
+		// A team with doc consistency off asked for no doc findings, so none are counted.
+		const agents = docsEnabled(own.config) ? seen : seen.map(withoutDocFindings);
 		const record: RunRecord = {
 			...own.record,
 			endedAt: iso(this.deps.now()),
@@ -276,10 +376,54 @@ export class RunController {
 			...(agents.length ? { agents } : {}),
 		};
 		await this.#liveWrite;
+		// Only runs this machine recorded are ever cleaned later: run records in the repo are not trusted for paths.
+		if (record.artifactsDir && record.process) {
+			await recordTrustedRun(own.store.dir, {
+				runId: record.runId,
+				artifactsDir: record.artifactsDir,
+				process: record.process,
+				agents: agents.map(agent => agent.id),
+				endedAt: record.endedAt ?? iso(this.deps.now()),
+			}).catch(() => undefined);
+		}
+		// A shutdown (no ctx) must not wait on file cleanup; the next run's end catches up.
+		const cleaned = ctx ? await this.#cleanUp(own, record, agents, ctx) : [];
 		await writeRun(own.root, record);
+		await appendRunIndex(own.root, summarizeForIndex(record)).catch(() => undefined);
 		await pruneRuns(own.root);
+		if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now());
 		if (ctx) this.deps.ui(ctx).record("Storm 실행 결과", summarizeRun(record));
 		return record;
+	}
+
+	/** Storm's limits and, when the team allows it, omp records of older runs' parked agents; best-effort. */
+	async #cleanUp(own: OwnRun, record: RunRecord, agents: AgentEntry[], ctx: ExtensionContext): Promise<string[]> {
+		try {
+			// Consent and trials come from the approval in force now too: a consent withdrawn mid-run stops deletion.
+			const state = await this.deps.loadState(ctx);
+			const load = state.config;
+			const approved = load.status === "ok" && state.approval?.configHash === load.hash ? { config: load.config, hash: load.hash } : undefined;
+			const sessionsRoot = this.deps.sessionsRoot;
+			const { result, cleaned } = await runJanitor({
+				root: own.root,
+				storeDir: state.store.dir,
+				// Without a known sessions dir nothing of omp's is deleted: the config below then carries no consent.
+				sessionsRoot: sessionsRoot ?? "",
+				config: approved && sessionsRoot ? approved.config : withoutCleanup(approved?.config ?? own.config),
+				startConfig: own.config,
+				configHash: approved?.hash ?? own.record.configHash,
+				runId: own.record.runId,
+				process: own.record.process ?? processKey(),
+				now: this.deps.now(),
+				ledger: this.deps.ledger?.() ?? agents,
+				approvals: state.store,
+			});
+			if (result.agents || result.stormFiles) record.cleanup = result;
+			return cleaned;
+		} catch {
+			// The run's own record and summary come first; whatever was left is retried at the next run end.
+			return [];
+		}
 	}
 
 	#scheduleFlush(own: OwnRun): void {
@@ -337,12 +481,18 @@ export function summarizeRun(run: RunRecord): string {
 	}
 	if (run.blockedEdits) main.push(`직접 수정 ${run.blockedEdits}회를 위임으로 돌림`);
 	if (run.blockedFollowUps) main.push(`상한 넘은 후속 지시 ${run.blockedFollowUps}회를 새 에이전트로 돌림`);
+	if (run.reads?.blocked) main.push(`하위가 읽은 파일 통째 읽기 ${run.reads.blocked}회를 막음`);
+	if (run.maxMainContext) main.push(`최대 컨텍스트 ${tokens(run.maxMainContext)}`);
+	if (run.checkpoints?.length) main.push(`실행 중 압축 ${run.checkpoints.length}회`);
 	if (main.length) lines.push(`- 메인(감독): ${main.join(" · ")}`);
 	const agents = run.agents ?? [];
+	const cleanup = run.cleanup?.agents ? `정리: 이전 실행 하위 기록 ${run.cleanup.agents}개(${bytesText(run.cleanup.bytes)})` : "";
 	if (agents.length) {
 		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);
 		const reused = agents.filter(agent => agent.followUps > 0).length;
-		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)`);
+		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)${cleanup ? ` · ${cleanup}` : ""}`);
+	} else if (cleanup) {
+		lines.push(`- ${cleanup}`);
 	}
 	if (run.spawns.length) lines.push(reviewLine(agents));
 	return lines.join("\n");

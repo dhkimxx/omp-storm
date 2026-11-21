@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
+import { docContractLines } from "../src/policy/docs.ts";
 import {
 	activeLedgerRun,
 	endLedgerRun,
@@ -281,6 +282,19 @@ describe("handoff", () => {
 		});
 		expect(containsMagicKeyword(full, "workflowz")).toBe(false);
 		expect(containsMagicKeyword(full, "orchestrate")).toBe(false);
+	});
+
+	test("doc rules ride in the contract only while the team keeps docs on", () => {
+		const on = buildHandoff({ ...base, keyword: null });
+		const off = buildHandoff({ ...base, config: { ...config, docs: false }, keyword: null });
+		for (const line of docContractLines(config)) {
+			expect(on).toContain(line);
+			expect(off).not.toContain(line);
+		}
+		expect(on).toContain("문서 정합");
+		expect(off).not.toContain("문서 정합");
+		const contract = (text: string) => text.slice(0, text.indexOf("</storm-run>"));
+		expect(contract(on)).toContain("doc_conflict");
 	});
 });
 

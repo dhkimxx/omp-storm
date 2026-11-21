@@ -87,3 +87,15 @@ export function updateTrialState(
 		return next;
 	});
 }
+
+/** Storm limits: drops counters of trials no longer in the config. Returns how many it dropped. */
+export function pruneTrialStates(root: string, keepIds: readonly string[]): Promise<number> {
+	return serialized(root, async () => {
+		const all = await readTrialStates(root);
+		const stale = Object.keys(all).filter(id => !keepIds.includes(id));
+		if (stale.length === 0) return 0;
+		for (const id of stale) delete all[id];
+		await writeJsonAtomic(trialsFile(root), { schema: "storm.trials/v1", trials: all });
+		return stale.length;
+	});
+}

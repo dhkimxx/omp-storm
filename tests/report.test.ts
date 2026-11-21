@@ -67,7 +67,6 @@ function analysis(over: Partial<Analysis> = {}): Analysis {
 			main: { cheap: [], general: [], premium: [], unknown: [] },
 			subagent: { cheap: [], general: [], premium: [], unknown: [] },
 		},
-		stopped: [],
 		newer: [],
 		alternatives: {},
 		warnings: [],

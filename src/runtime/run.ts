@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { docContractLines } from "../policy/docs.ts";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
 import { BUILTIN_AGENT_ROLES, contextCapFor, LANE_ROLES, ROLE_STAND_INS, ROLES, workerRange } from "../roles.ts";
 import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
@@ -215,7 +216,9 @@ export function buildHandoff(input: {
 		);
 	}
 	rules.push(
-		"- 컨텍스트 상한: 같은 영역의 후속 작업(리뷰 지적 수정, 두 번째 패스)은 끝난 storm-* 에이전트가 컨텍스트 상한 아래일 때만 그 에이전트에 `write agent://<id>` 로 보냅니다. 상한을 넘은 에이전트로 가는 후속 지시는 Storm 이 막으니, 결과를 요약해 새 에이전트를 띄웁니다. 확실하지 않으면 먼저 storm 도구의 agents 동작으로 확인합니다.",
+		"- 컨텍스트 상한: 같은 영역의 후속 작업(리뷰 지적 수정, 두 번째 패스)은 끝난 storm-* 에이전트가 컨텍스트 상한 아래일 때만 그 에이전트에 `write agent://<id>` 로 보냅니다. 상한을 넘었거나 정리된 에이전트로 가는 후속 지시는 Storm 이 막으니, 같은 역할의 새 에이전트를 띄워 `agent://<이전 id>` 를 읽고 이어 가게 합니다. 확실하지 않으면 먼저 storm 도구의 agents 동작으로 확인합니다.",
+		"- 근거 위치: 서브에이전트에게 결과에 근거 위치(파일과 줄 범위, 명령과 종료 코드, 로그 경로)를 붙여 요약하게 하고, 그 위치만 범위를 정해 읽어 확인합니다. 서브에이전트가 읽은 파일을 통째로 다시 읽지 않습니다(Storm 이 막습니다).",
+		...docContractLines(config),
 	);
 	const lines = [
 		...(input.keyword ? [input.keyword] : []),

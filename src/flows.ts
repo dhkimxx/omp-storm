@@ -1,8 +1,9 @@
 /**
- * /storm flows: setup (detect → analyze → recommend → interview → approve → save), status, review, rollback, reset.
- * Nothing is written unless an interview step returned an explicit approval; reset deletes only after two explicit choices.
+ * /storm flows: setup (handed to the session LLM, which interviews the user and proposes through the storm tool), status,
+ * review, rollback, reset. Nothing is saved without the exact "승인" in Storm's approval dialog; reset deletes only after
+ * the single exact "초기화" choice.
  */
-import { readdir, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { configHash, sha256Hex } from "./config/canonical.ts";
 import { configPath, serializeConfig, writeConfig } from "./config/store.ts";
@@ -21,6 +22,8 @@ import { ompSettingsAdvice } from "./report/omp-settings.ts";
 import { ROLES } from "./roles.ts";
 import { activeLedgerRun } from "./runtime/ledger.ts";
 import { lastRun, runsDir, stateDir } from "./runtime/run.ts";
+import { formatStorage, readStorage } from "./runtime/janitor.ts";
+import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
 import { buildSetupRequest } from "./setup/request.ts";
@@ -385,7 +388,12 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	await offerTrialDecisions(env, ui, status.state, before.config.config, status.trials);
 	// A trial decision may have changed the config.
 	const state = await loadProjectState(env);
-	const [pending, rollbacks] = await Promise.all([proposalStore(state).list(), rollbackOptions(state)]);
+	const [pending, rollbacks, storage] = await Promise.all([
+		proposalStore(state).list(),
+		rollbackOptions(state),
+		readStorage(state.repo.root, state.store.dir, join(env.agentDir, "sessions")),
+	]);
+	const cleanupOn = state.config.status === "ok" && state.config.config.cleanup === true;
 	const pendingLabel = `${MENU.pending} (${pending.length}건)`;
 	const options: string[] = [];
 	if (pending.length) options.push(pendingLabel);
@@ -393,7 +401,10 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	if ((env.agents?.() ?? []).length) options.push(MENU.agents);
 	if (rollbacks.length) options.push(MENU.rollback);
 	options.push(MENU.reset, MENU.close);
-	const choice = await ui.select("Storm 메뉴", options, { title: "Storm 현황", markdown: status.brief });
+	const choice = await ui.select("Storm 메뉴", options, {
+		title: "Storm 현황",
+		markdown: `${status.brief}\n\n${formatStorage(storage, cleanupOn)}`,
+	});
 	if (choice === pendingLabel) await reviewFlow(env, ui);
 	else if (choice === MENU.setup) await setupFlow(env, ui);
 	else if (choice === MENU.models) await modelsFlow(env, ui);
@@ -434,9 +445,12 @@ async function otherWorktrees(env: FlowEnv, root: string): Promise<number> {
 	return Math.max(0, result.stdout.split("\n").filter(line => line.startsWith("worktree ")).length - 1);
 }
 
+const RESET_WITH_INDEX = "초기화하고 실행 요약 색인도 지우기";
+
 /**
  * `/storm reset`: deletes the project's `.omp/storm/` and this repo's approval records in one go, after one
- * exact "초기화". Refuses while a run is active. Returns true when something was deleted.
+ * exact "초기화". The run summary index stays unless the user picks the exact option that deletes it too.
+ * Refuses while a run is active. Returns true when something was deleted.
  */
 export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const state = await loadProjectState(env);
@@ -453,7 +467,7 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		return false;
 	}
 	const git = state.repo.kind === "git-common-dir";
-	const [runs, proposals, tracked, worktrees, approvals, log, last] = await Promise.all([
+	const [runs, proposals, tracked, worktrees, approvals, log, last, index] = await Promise.all([
 		countJson(runsDir(root)),
 		countJson(join(stateDir(root), "proposals")),
 		hasLocal && git ? trackedFiles(env, root, local) : Promise.resolve([]),
@@ -461,6 +475,7 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		state.store.list(),
 		state.store.log(),
 		lastRun(root),
+		readRunIndex(root),
 	]);
 	const c = state.config;
 	const configLine =
@@ -482,21 +497,30 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		lines.push(`- 주의: 마지막 실행(${last.runId})이 진행 중으로 남아 있습니다. 다른 터미널에서 실행 중이면 끝난 뒤 초기화하세요.`);
 	}
 	lines.push("", "### 그대로 두는 것", "- `.omp/`의 다른 파일, 여러 프로젝트가 함께 쓰는 사용 기록 보관본, omp 설정");
-	if (
-		(await ui.select("Storm 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.", ["초기화", "취소"], {
-			title: "Storm 초기화",
-			markdown: lines.join("\n"),
-		})) !== "초기화"
-	) {
+	if (index.length) lines.push(`- 실행 요약 색인 ${index.length}줄: 기본으로 남깁니다. 지우려면 "${RESET_WITH_INDEX}"를 고르세요.`);
+	const choice = await ui.select(
+		"Storm 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.",
+		index.length ? ["초기화", RESET_WITH_INDEX, "취소"] : ["초기화", "취소"],
+		{ title: "Storm 초기화", markdown: lines.join("\n") },
+	);
+	if (choice !== "초기화" && !(index.length && choice === RESET_WITH_INDEX)) {
 		ui.notify("초기화하지 않았습니다.");
 		return false;
 	}
+	const keptIndex = index.length && choice === "초기화" ? await readFile(runIndexFile(root), "utf8").catch(() => undefined) : undefined;
 	await rm(local, { recursive: true, force: true });
+	if (keptIndex !== undefined) {
+		// The index holds task text; the recreated `.omp/storm/` must keep `state/` out of git as setup does.
+		await mkdir(dirname(runIndexFile(root)), { recursive: true });
+		await writeFile(join(local, ".gitignore"), "/state/\n");
+		await writeFile(runIndexFile(root), keptIndex);
+	}
 	const removed = hasApprovals ? await state.store.clear() : 0;
 	ui.notify(
 		[
 			`Storm 설정과 기록을 지웠습니다(승인 ${removed}건 포함). 다시 쓰려면 /storm 으로 팀을 설정하세요.`,
 			tracked.length ? "git에서 지워진 파일은 직접 커밋하세요." : "",
+			keptIndex !== undefined ? "실행 요약 색인은 남겼습니다." : "",
 		]
 			.filter(Boolean)
 			.join(" "),

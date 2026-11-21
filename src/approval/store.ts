@@ -316,6 +316,75 @@ export class ApprovalStore {
 		});
 	}
 
+	/**
+	 * Storm limits: keeps the approved record, snapshot and evidence of `keepHash` plus the newest `keep` other hashes
+	 * (by approval time, file time for hashes without a record) and the newest `logLines` log lines.
+	 * Returns how many files it removed.
+	 */
+	async prune(keepHash: string | null, keep = 20, logLines = 2000): Promise<number> {
+		const keepHex = keepHash === null ? undefined : hexOf(keepHash);
+		// withLock creates the dir; a repo without approvals must stay without one.
+		try {
+			await stat(this.dir);
+		} catch (e) {
+			if (errCode(e) === "ENOENT") return 0;
+			throw e;
+		}
+		return this.withLock(async () => {
+			const kinds = ["approved", "snapshots", "evidence"] as const;
+			const rank = new Map<string, number>();
+			for (const kind of kinds) {
+				let names: string[];
+				try {
+					names = await readdir(path.join(this.dir, kind));
+				} catch (e) {
+					if (errCode(e) === "ENOENT") continue;
+					throw e;
+				}
+				for (const name of names) {
+					if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+					const hex = name.slice(0, -5);
+					const file = path.join(this.dir, kind, name);
+					let at = (await stat(file)).mtimeMs;
+					if (kind === "approved") {
+						const value = parseJson(await readText(file));
+						const approvedAt =
+							typeof value === "object" && value !== null && "approvedAt" in value && typeof value.approvedAt === "string"
+								? Date.parse(value.approvedAt)
+								: Number.NaN;
+						if (Number.isFinite(approvedAt)) at = approvedAt;
+					}
+					// The approval time wins over file times; otherwise the newest file of the hash.
+					const prev = rank.get(hex);
+					if (kind === "approved" || prev === undefined || at > prev) rank.set(hex, at);
+				}
+			}
+			const stale = [...rank.entries()]
+				.filter(([hex]) => hex !== keepHex)
+				.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? 1 : -1))
+				.slice(Math.max(0, keep))
+				.map(([hex]) => hex);
+			let removed = 0;
+			for (const hex of stale) {
+				for (const file of [this.approvedPath(hex), this.snapshotPath(hex), this.evidencePath(hex)]) {
+					try {
+						await rm(file);
+						removed++;
+					} catch (e) {
+						if (errCode(e) !== "ENOENT") throw e;
+					}
+				}
+			}
+			const logFile = path.join(this.dir, "log.jsonl");
+			const text = await readText(logFile);
+			if (text !== undefined) {
+				const lines = text.split("\n").filter(line => line.trim() !== "");
+				if (lines.length > logLines) await writeAtomic(logFile, `${lines.slice(lines.length - Math.max(0, logLines)).join("\n")}\n`);
+			}
+			return removed;
+		});
+	}
+
 	/** Deletes this repo's approvals, snapshots, evidence and log (`/storm reset`); returns how many approvals there were. */
 	async clear(): Promise<number> {
 		return this.withLock(async () => {

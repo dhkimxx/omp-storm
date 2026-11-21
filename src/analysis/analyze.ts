@@ -9,10 +9,8 @@ import type {
 	ModelInfo,
 	NewerVersion,
 	PriceTierInfo,
-	QuotaStatus,
 	RouteStats,
 	Seat,
-	StoppedLineage,
 	Tier,
 	UsageRow,
 	UsageSnapshot,
@@ -21,7 +19,6 @@ import type {
 export interface AnalyzeInput {
 	usage: UsageSnapshot;
 	catalog: ModelInfo[];
-	quota: QuotaStatus[];
 	lineage: LineageFn;
 	/** Keyed by modelKey. */
 	tiers: Map<string, PriceTierInfo>;
@@ -37,10 +34,6 @@ export interface AnalyzeInput {
 
 const DAY_MS = 86_400_000;
 const HALF_LIFE_DAYS = 7;
-const STOP_MIN_SHARE = 0.03;
-const STOP_IDLE_MS = 4 * DAY_MS;
-const ERROR_WINDOW_DAYS = 7;
-const ERROR_MIN_SAMPLES = 20;
 const STALE_MS = 6 * 3_600_000;
 const ALT_TOP = 5;
 const ALT_PER_KIND = 2;
@@ -114,11 +107,6 @@ export function compareRevision(a: string, b: string): number {
 	return 0;
 }
 
-function localDate(ts: number): string {
-	const d = new Date(ts);
-	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 /** Recency weight of a local "YYYY-MM-DD" day (noon) relative to now. */
 function dayWeight(day: string, now: number): number {
 	const [y, m, d] = day.split("-").map(Number);
@@ -183,7 +171,6 @@ function emptyTiers(): Record<Tier | "unknown", LineageUsage[]> {
 export function analyze(input: AnalyzeInput): Analysis {
 	const { usage, now } = input;
 	const idx = indexCatalog(input.catalog, input.lineage);
-	const quotaBy = new Map(input.quota.map(q => [q.provider, q]));
 
 	// Group rows by seat and lineage.
 	const groups = new Map<string, Group>();
@@ -220,7 +207,6 @@ export function analyze(input: AnalyzeInput): Analysis {
 	};
 
 	const preferences: Analysis["preferences"] = { main: emptyTiers(), subagent: emptyTiers() };
-	const usages = new Map<Group, LineageUsage>();
 	for (const g of groups.values()) {
 		const total = seatTotals[g.seat];
 		const routes: RouteStats[] = g.rows
@@ -257,7 +243,6 @@ export function analyze(input: AnalyzeInput): Analysis {
 			lastTs: g.lastTs,
 			routes,
 		};
-		usages.set(g, lu);
 		preferences[g.seat][tier ?? "unknown"].push(lu);
 	}
 	for (const seat of ["main", "subagent"] as const) {
@@ -265,39 +250,6 @@ export function analyze(input: AnalyzeInput): Analysis {
 			list.sort((a, b) => b.share - a.share || a.modelKey.localeCompare(b.modelKey));
 		}
 	}
-
-	const availableSelectors = (key: string): string[] =>
-		(idx.byKey.get(key) ?? [])
-			.filter(m => m.available)
-			.map(m => m.selector)
-			.sort();
-
-	// Stopped lineages. Idle time counts from the end of the data, so a late stats sync does not make everything look stopped.
-	const asOf = usage.dataAsOf ?? now;
-	const stopped: StoppedLineage[] = [];
-	for (const g of groups.values()) {
-		const lu = usages.get(g);
-		if (!lu || lu.share < STOP_MIN_SHARE || g.lastTs >= asOf - STOP_IDLE_MS) continue;
-		const reasons: string[] = [];
-		for (const route of lu.routes) {
-			if (!route.available) reasons.push(`route-unavailable:${route.selector}`);
-		}
-		const providers = [...new Set(lu.routes.map(r => r.provider))].sort();
-		for (const p of providers) {
-			if (quotaBy.get(p)?.state === "exhausted") reasons.push(`quota-exhausted:${p}`);
-		}
-		if (errorRateRose(g.rows, g.lastTs)) reasons.push("error-rate-up");
-		stopped.push({
-			modelKey: lu.modelKey,
-			label: lu.label,
-			seat: g.seat,
-			requests: g.requests,
-			lastTs: g.lastTs,
-			reasons,
-			currentRoutes: availableSelectors(lu.modelKey),
-		});
-	}
-	stopped.sort((a, b) => b.requests - a.requests || a.modelKey.localeCompare(b.modelKey));
 
 	// Newer versions on the same line.
 	const newer: NewerVersion[] = [];
@@ -369,35 +321,10 @@ export function analyze(input: AnalyzeInput): Analysis {
 		windowDays: usage.windowDays,
 		dataAsOf: usage.dataAsOf,
 		preferences,
-		stopped,
 		newer,
 		alternatives,
 		warnings,
 	};
-}
-
-/** Error rate of the last 7 days of use at least doubled versus before, with ≥20 samples on each side. */
-function errorRateRose(rows: readonly UsageRow[], lastTs: number): boolean {
-	const cutoff = localDate(lastTs - (ERROR_WINDOW_DAYS - 1) * DAY_MS);
-	let recentReq = 0;
-	let recentErr = 0;
-	let priorReq = 0;
-	let priorErr = 0;
-	for (const row of rows) {
-		for (const [day, n] of Object.entries(row.daily)) {
-			const e = row.dailyErrors[day] ?? 0;
-			if (day >= cutoff) {
-				recentReq += n;
-				recentErr += e;
-			} else {
-				priorReq += n;
-				priorErr += e;
-			}
-		}
-	}
-	if (recentReq < ERROR_MIN_SAMPLES || priorReq < ERROR_MIN_SAMPLES) return false;
-	const recentRate = recentErr / recentReq;
-	return recentRate > 0 && recentRate >= 2 * (priorErr / priorReq);
 }
 
 interface Scored {

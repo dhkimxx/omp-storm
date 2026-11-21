@@ -4,6 +4,7 @@
  * session in the process, because subagent sessions reuse this module.
  */
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { resolveRepo } from "./approval/repo.ts";
@@ -22,11 +23,14 @@ import {
 } from "./flows.ts";
 import { execPort, ompBinary } from "./omp.ts";
 import { DIRECTOR_BLOCK_REASON, directorBlocks } from "./policy/director.ts";
+import { docPromptFor } from "./policy/docs.ts";
 import { followUpBlock } from "./policy/followup.ts";
+import { directorRead, noteChildRead } from "./policy/reads.ts";
 import { activeAgents, decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
-import { ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
+import { contextCapFor, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import { listAgents, noteAgentEnd, noteAgentParked, noteAgentReview, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
+import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
 import { buildStormRequest, noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
 import { lastRun } from "./runtime/run.ts";
@@ -142,6 +146,12 @@ function statusLabel(state: ProjectState): string | undefined {
 	return newer ? `${base} · 새 버전 ${newer} → /restart` : base;
 }
 
+/** Files a subagent of a Storm run read whole: the director may not read them whole again during that run. */
+function noteSubagentRead(agentId: string, path: unknown, cwd: string): void {
+	const runId = listAgents().find(agent => agent.id === agentId)?.runId;
+	if (runId) noteChildRead(runId, agentId, path, cwd);
+}
+
 export default function storm(pi: ExtensionAPI): void {
 	const exec = execPort(pi);
 	const stateCache = createStateCache();
@@ -201,7 +211,25 @@ export default function storm(pi: ExtensionAPI): void {
 		usableKeywords: () => usableKeywords(),
 		now: Date.now,
 		agents: runId => listAgents({ runId }),
+		ledger: () => listAgents(),
+		sessionsRoot: join(pi.pi.getAgentDir(), "sessions"),
 	});
+
+	/** Compacts the director while it waits on subagents, once its context reaches the cap. */
+	const checkpointDirector = (ctx: ExtensionContext): void => {
+		const config = runs.runConfig();
+		const usage = ctx.getContextUsage();
+		if (!config || !usage) return;
+		const lastAt = runs.lastCheckpointAt();
+		const cap = contextCapFor(config, undefined, usage.contextWindow);
+		if (!shouldCheckpoint({ tokens: usage.tokens, cap, now: Date.now(), ...(lastAt !== undefined ? { lastAt } : {}) })) return;
+		const checkpoint = runs.noteCheckpoint(usage.tokens);
+		// Not awaited: agent_end handlers time out after 30s and a summary can take longer; async subagents keep running.
+		ctx.compact(CHECKPOINT_INSTRUCTIONS).then(
+			() => checkpoint.done(ctx.getContextUsage()?.tokens),
+			() => checkpoint.failed(),
+		);
+	};
 
 	const flowEnv = (ctx: ExtensionContext): FlowEnv => ({
 		...projectEnv(ctx),
@@ -308,6 +336,7 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("message_end", async (event, ctx) => {
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
+		if (ctx.agent.kind === "main" && usage.promptTokens > 0) runs.noteMainContext(usage.promptTokens);
 		if (ctx.agent.kind === "sub" && usage.promptTokens > 0) {
 			const contextWindow = lookupModel(ctx, usage.selector)?.contextWindow;
 			noteAgentUsage({
@@ -353,28 +382,51 @@ export default function storm(pi: ExtensionAPI): void {
 			revive: event.reason === "revive",
 		});
 		if (runId) touchRun(runId);
-		return undefined;
+		// Doc rules ride on every Storm role's system prompt (first turn and revive) while the team keeps docs on.
+		if (!name.startsWith(ROLE_AGENT_PREFIX)) return undefined;
+		const state = await stateCache.get(projectEnv(ctx));
+		const section = state.config.status === "ok" ? docPromptFor(name, state.config.config) : undefined;
+		return section && !event.systemPrompt.includes(section) ? { systemPrompt: [...event.systemPrompt, section] } : undefined;
 	});
 
 	// Director mode: while this session runs Storm, file changes go to storm-implementer. Blocking the call instead of
 	// swapping the tool list keeps the main session's prompt cache intact.
 	pi.on("tool_call", async (event, ctx) => {
+		// A subagent's reads: during its run the director may not read those files whole again.
+		if (ctx.agent.kind === "sub") {
+			if (event.toolName === "read") noteSubagentRead(ctx.agent.id, (event.input as { path?: unknown }).path, ctx.cwd);
+			return undefined;
+		}
 		if (!runs.directing()) return undefined;
 		if (directorBlocks(event.toolName, event.input)) {
 			runs.noteBlockedEdit();
 			return { block: true, reason: DIRECTOR_BLOCK_REASON };
 		}
-		// A follow-up to an agent past its context cap costs its whole context again on every turn: start a fresh one instead.
+		const runId = runs.runId();
+		if (!runId) return undefined;
+		if (event.toolName === "read") {
+			const verdict = directorRead({ runId, path: (event.input as { path?: unknown }).path, cwd: ctx.cwd });
+			if (!verdict) return undefined;
+			runs.noteRead(verdict.kind);
+			return verdict.kind === "blocked" && verdict.reason ? { block: true, reason: verdict.reason } : undefined;
+		}
+		// A follow-up to an agent past its context cap, or one whose records were cleaned, goes to a fresh agent instead.
 		const path = event.toolName === "write" ? (event.input as { path?: unknown }).path : undefined;
 		if (typeof path !== "string" || !path.startsWith("agent://")) return undefined;
-		const runId = runs.active()?.runId;
-		if (!runId) return undefined;
-		const state = await stateCache.get(projectEnv(ctx));
-		if (state.config.status !== "ok") return undefined;
-		const reason = followUpBlock(event.toolName, event.input, listAgents({ runId }), state.config.config);
+		const config = runs.runConfig();
+		if (!config) return undefined;
+		// Caps apply to this run's agents; a cleaned agent of any earlier run can never take a follow-up.
+		const targets = listAgents().filter(agent => agent.runId === runId || agent.cleanedAt !== undefined);
+		const reason = followUpBlock(event.toolName, event.input, targets, config);
 		if (!reason) return undefined;
 		runs.noteBlockedFollowUp();
 		return { block: true, reason };
+	});
+
+	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run.
+	pi.on("session.compacting", () => {
+		const run = runs.active();
+		return run ? { context: workingState(run, listAgents()) } : undefined;
 	});
 
 	// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
@@ -393,6 +445,8 @@ export default function storm(pi: ExtensionAPI): void {
 			await touchActiveRun(ctx);
 			return;
 		}
+		// Paused on async subagents: the moment to shed context before their results arrive.
+		if (event.awaitingAsyncWork) checkpointDirector(ctx);
 		await runs.onAgentEnd(event, ctx);
 		// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
 		if (!event.willContinue && !event.awaitingAsyncWork) await syncSession(ctx).catch(() => undefined);
@@ -461,6 +515,19 @@ export default function storm(pi: ExtensionAPI): void {
 				...flowEnv(ctx),
 				// Setup is led by the session LLM; the storm tool must be on for it to propose the team.
 				requestSetup: async message => {
+					// omp runs ACP clients as "rpc" too, and one without form support answers no dialog: the interview
+					// could never be approved there, so it is sent only after a dialog was actually answered.
+					if (ctx.mode === "rpc") {
+						const choice = await ui.select("Storm 팀 설정을 시작할까요?", ["시작", "취소"], {
+							title: "Storm 팀 설정",
+							markdown: "세션 LLM이 질문 폼으로 팀 구성을 묻고, 마지막에 승인 창에서 확정합니다.",
+						});
+						if (choice !== "시작") {
+							if (choice === undefined) ui.notify("승인 창에 답이 없어 팀 설정을 시작하지 않았습니다. 이 환경에서는 설정을 승인할 수 없습니다.", "warning");
+							else ui.notify("팀 설정을 시작하지 않았습니다.");
+							return;
+						}
+					}
 					await ctx.waitForIdle();
 					await activateTool();
 					pi.sendUserMessage(message).catch((error: unknown) => {

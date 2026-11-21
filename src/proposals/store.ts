@@ -74,3 +74,33 @@ export function createProposalStore(root: string, currentHash: () => Promise<str
 		},
 	};
 }
+
+export const PROPOSAL_MAX_AGE_MS = 30 * 86_400_000;
+
+/** Storm limits: deletes deferred proposals created more than `maxAgeMs` before `now`. Returns how many it deleted. */
+export async function pruneProposals(root: string, now: number, maxAgeMs = PROPOSAL_MAX_AGE_MS): Promise<number> {
+	const dir = path.join(root, ".omp", "storm", "state", "proposals");
+	let names: string[];
+	try {
+		names = await fs.readdir(dir);
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	for (const name of names) {
+		if (!name.endsWith(".json")) continue;
+		const file = path.join(dir, name);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await fs.readFile(file, "utf8"));
+		} catch {
+			continue;
+		}
+		if (!isProposal(parsed)) continue;
+		const created = Date.parse(parsed.createdAt);
+		if (!Number.isFinite(created) || now - created <= maxAgeMs) continue;
+		await fs.rm(file, { force: true });
+		removed++;
+	}
+	return removed;
+}

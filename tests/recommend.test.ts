@@ -101,7 +101,7 @@ function setup(catalog: ModelInfo[], opts: { rows?: UsageRow[]; quota?: QuotaSta
 	const usage: UsageSnapshot = { status: "ok", dbPath: "/tmp/x.db", windowDays: 30, now: NOW, dataAsOf: NOW, rows: opts.rows ?? [] };
 	const quota = opts.quota ?? [];
 	const label: AnalyzeInput["label"] = (m, lin) => m?.name ?? lin.modelKey;
-	const analysis = analyze({ usage, catalog, quota, lineage, tiers, fillInt, fillTps, label, now: NOW });
+	const analysis = analyze({ usage, catalog, lineage, tiers, fillInt, fillTps, label, now: NOW });
 	return { analysis, catalog, quota, usage, lineage, tiers, fillInt, fillTps, label, priority: opts.priority ?? "balanced", roles: ROLES };
 }
 

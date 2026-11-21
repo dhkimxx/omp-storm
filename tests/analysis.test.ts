@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { analyze, type AnalyzeInput } from "../src/analysis/analyze.ts";
-import type { Lineage, LineageFn, MetricValue, ModelInfo, PriceTierInfo, QuotaStatus, Tier, UsageRow, UsageSnapshot } from "../src/types.ts";
+import type { Lineage, LineageFn, MetricValue, ModelInfo, PriceTierInfo, Tier, UsageRow, UsageSnapshot } from "../src/types.ts";
 
 const DAY = 86_400_000;
 const NOW = new Date(2026, 10, 20, 12).getTime();
@@ -102,12 +102,11 @@ function tiersFor(catalog: ModelInfo[]): Map<string, PriceTierInfo> {
 	return tiers;
 }
 
-function input(catalog: ModelInfo[], rows: UsageRow[], quota: QuotaStatus[] = []): AnalyzeInput {
+function input(catalog: ModelInfo[], rows: UsageRow[]): AnalyzeInput {
 	const usage: UsageSnapshot = { status: "ok", dbPath: "/tmp/x.db", windowDays: 30, now: NOW, dataAsOf: NOW - 3600_000, rows };
 	return {
 		usage,
 		catalog,
-		quota,
 		lineage,
 		tiers: tiersFor(catalog),
 		fillInt: intOf,
@@ -148,42 +147,6 @@ describe("analyze preferences", () => {
 		const byKey = Object.fromEntries(a.preferences.subagent.cheap.map(l => [l.modelKey, l]));
 		expect(byKey["old/mini@1"]?.share).toBeCloseTo(0.5);
 		expect(byKey["new/mini@1"]?.shareRecent ?? 0).toBeGreaterThan(0.8);
-	});
-});
-
-describe("analyze stopped lineages", () => {
-	test("reports unavailable routes and the route usable now", () => {
-		const catalog = [
-			model("pa", "deep-flash-4.1", { ...CHEAP, available: false }),
-			model("pb", "deep-flash-4.1", { ...CHEAP, available: false }),
-			model("pc", "deep-flash-4.1", CHEAP),
-			model("pd", "big-opus-5", PREMIUM),
-		];
-		const rows = [
-			row("pa", "deep-flash-4.1", { requests: 300, lastTs: NOW - 9 * DAY }),
-			row("pb", "deep-flash-4.1", { requests: 100, lastTs: NOW - 12 * DAY }),
-			row("pd", "big-opus-5", { requests: 1000 }),
-		];
-		const quota: QuotaStatus[] = [{ provider: "pb", state: "exhausted", usedFraction: 1, resetsAt: null, observedAt: NOW }];
-		const a = analyze(input(catalog, rows, quota));
-		expect(a.stopped).toHaveLength(1);
-		const s = a.stopped[0];
-		expect(s?.modelKey).toBe("deep/flash@4.1");
-		expect(s?.reasons).toEqual(["route-unavailable:pa/deep-flash-4.1", "route-unavailable:pb/deep-flash-4.1", "quota-exhausted:pb"]);
-		expect(s?.currentRoutes).toEqual(["pc/deep-flash-4.1"]);
-	});
-
-	test("small or recently used lineages are not reported as stopped", () => {
-		const catalog = [model("pa", "tiny-mini-1", CHEAP), model("pa", "big-opus-5", PREMIUM)];
-		const rows = [row("pa", "tiny-mini-1", { requests: 20, lastTs: NOW - 10 * DAY }), row("pa", "big-opus-5", { requests: 1000, lastTs: NOW - 3 * DAY })];
-		expect(analyze(input(catalog, rows)).stopped).toEqual([]);
-	});
-
-	test("idle time counts from the end of the data, so a late stats sync stops nothing", () => {
-		const catalog = [model("pa", "big-opus-5", PREMIUM)];
-		const late = input(catalog, [row("pa", "big-opus-5", { requests: 1000, lastTs: NOW - 6 * DAY })]);
-		late.usage = { ...late.usage, dataAsOf: NOW - 5 * DAY };
-		expect(analyze(late).stopped).toEqual([]);
 	});
 });
 

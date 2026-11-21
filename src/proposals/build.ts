@@ -294,3 +294,24 @@ export function buildBudget(
 		summary: `실행당 예산을 $${budgetUsd}(경고 $${warn}, 초과 시 ${next.budget.onExceed})로 정합니다`,
 	};
 }
+
+/**
+ * The team switches. A switch at its default leaves the config (cleanup off, docs on), so turning one back costs no
+ * stray field; an unchanged request comes back as the same config and the proposal step reports nothing to change.
+ */
+export function buildSettings(current: StormConfig, cleanup: boolean | undefined, docs: boolean | undefined): Built {
+	if (cleanup === undefined && docs === undefined) return { error: "cleanup이나 docs가 필요합니다" };
+	const next = structuredClone(current);
+	const parts: string[] = [];
+	if (cleanup !== undefined) {
+		if (cleanup) next.cleanup = true;
+		else delete next.cleanup;
+		parts.push(`실행이 끝나면 정리를 ${cleanup ? "켭니다" : "끕니다"}`);
+	}
+	if (docs !== undefined) {
+		if (docs) delete next.docs;
+		else next.docs = false;
+		parts.push(`문서 정합을 ${docs ? "켭니다" : "끕니다"}`);
+	}
+	return { config: next, summary: parts.join(" · ") };
+}

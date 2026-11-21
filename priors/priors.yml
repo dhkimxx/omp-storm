@@ -1,5 +1,5 @@
 # OMP Storm priors: name rules, tier order, price-tier bounds, aliases (p0-results Q9-6).
-# Users may override any key in ~/.omp/storm/priors.yml; arrays replace, maps merge.
+# Users may override any key in <agentDir>/storm/priors.yml (default ~/.omp/agent/storm/priors.yml); arrays replace, maps merge.
 schema: 1
 updated: 2026-11-20 # Storm warns when this is more than 90 days old
 

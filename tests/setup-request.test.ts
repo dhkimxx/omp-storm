@@ -77,7 +77,6 @@ const analysis: Analysis = {
 			unknown: [],
 		},
 	},
-	stopped: [],
 	newer: [],
 	alternatives: {},
 	warnings: ["분석 경고"],
@@ -166,6 +165,7 @@ describe("buildSetupRequest", () => {
 			contract: "workflowz",
 			runtime: "omp",
 			fallbackRole: "implementer",
+			cleanup: true,
 		});
 		expect(facts).toContain("Storm 팀 처음 설정");
 		expect(facts).toContain("- a (쿼터 여유, 모델 3개): i, x, y");

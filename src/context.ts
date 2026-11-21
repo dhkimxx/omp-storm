@@ -114,7 +114,7 @@ export async function prepareAnalysis(env: ContextEnv, ui: UiPort): Promise<Anal
 		) => fillTps(route, measured, siblings, variantOf(route), new Map(siblings.map(s => [s.selector, variantOf(s)]))),
 		label: displayLabel,
 	};
-	const analysis = analyze({ usage, catalog, quota, ...deps, now });
+	const analysis = analyze({ usage, catalog, ...deps, now });
 	return {
 		now,
 		catalog,

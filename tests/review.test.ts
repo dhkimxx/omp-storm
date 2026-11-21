@@ -33,6 +33,24 @@ describe("tallyFromYield", () => {
 		expect(prev).toEqual({ reviews: 0, passed: 0, failed: 0, findings: [0, 1, 0, 0] });
 	});
 });
+describe("doc findings", () => {
+	test("doc kinds count in findings and in docFindings; code and unknown kinds only in findings", () => {
+		let r = tallyFromYield(undefined, { type: ["findings"], data: { priority: 1, kind: "doc_conflict" } });
+		expect(r).toEqual({ reviews: 0, passed: 0, failed: 0, findings: [0, 1, 0, 0], docFindings: 1 });
+		r = tallyFromYield(r, { type: ["findings"], data: [{ priority: 2, kind: "code" }, { priority: 3, kind: "other" }] });
+		expect(r?.docFindings).toBe(1);
+		r = tallyFromYield(r, { data: { overall_correctness: "incorrect", confidence: 0.7, findings: [{ priority: 2, kind: "doc_copy" }] } });
+		expect(r).toEqual({ reviews: 1, passed: 0, failed: 1, findings: [0, 1, 2, 1], docFindings: 2, lastConfidence: 0.7 });
+		// An invalid priority is not a finding, whatever its kind.
+		expect(tallyFromYield(r, { type: ["findings"], data: { priority: 9, kind: "doc_copy" } })).toBe(r);
+	});
+
+	test("a tally without doc findings has no docFindings field", () => {
+		const r = tallyFromYield(undefined, { data: { overall_correctness: "correct", confidence: 1, findings: [{ priority: 0, kind: "code" }] } });
+		expect(r && "docFindings" in r).toBe(false);
+	});
+});
+
 
 describe("reviewLine", () => {
 	const a = (review?: ReviewTally): AgentEntry => ({
@@ -59,5 +77,14 @@ describe("reviewLine", () => {
 		).toBe("- 리뷰 4회: 통과 2 · 수정 필요 2 (P0 1 · P1 2 · P3 2)");
 		expect(reviewLine([a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] })])).toBe("- 리뷰 1회: 통과 1 · 수정 필요 0");
 		expect(reviewLine([a({ reviews: 0, passed: 0, failed: 0, findings: [1, 0, 0, 0] })])).toBe("- 리뷰: 없음");
+	});
+
+	test("doc findings add a doc count only when above zero", () => {
+		const line = reviewLine([
+			a({ reviews: 1, passed: 0, failed: 1, findings: [0, 2, 0, 0], docFindings: 1 }),
+			a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 1, 0], docFindings: 2 }),
+		]);
+		expect(line).toBe("- 리뷰 2회: 통과 1 · 수정 필요 1 (P1 2 · P2 1) · 문서 상충 3건");
+		expect(reviewLine([a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0], docFindings: 0 })])).not.toContain("문서");
 	});
 });

@@ -119,6 +119,14 @@ export function listAgents(filter?: { runId?: string; ancestorId?: string }): Ag
 	return out.sort((a, b) => a.startedAt - b.startedAt);
 }
 
+/** The run-end janitor removed these agents' omp records; their ledger entries say so from now on. */
+export function markAgentsCleaned(ids: readonly string[], now: number): void {
+	for (const id of ids) {
+		const e = agents.get(id);
+		if (e) e.cleanedAt = now;
+	}
+}
+
 /** Tests only. */
 export function resetAgents(): void {
 	agents.clear();

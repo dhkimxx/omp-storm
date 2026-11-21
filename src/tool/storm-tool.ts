@@ -17,6 +17,7 @@ import {
 	buildPriority,
 	buildQuota,
 	buildReselect,
+	buildSettings,
 	buildTrial,
 	buildWorkers,
 	checkRoleModel,
@@ -67,7 +68,7 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "plan", "agents", "propose"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "settings", "run", "plan", "agents", "propose"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const QUOTA_MARK_MS = 5 * 3_600_000;
@@ -83,11 +84,12 @@ Actions:
 - quota {provider}: the user says a provider ran out of quota. Approved fallbacks go first for 5 hours; roles without one get a fallback proposal.
 - trial {role, model, share?, maxSpawns?, days?, budgetUsd?}: route a bounded share of a role's spawns to a candidate model for a while (defaults 0.25, 20 spawns, 7 days, $2).
 - budget {budgetUsd, warnAtUsd?, onExceed?}: per-run spend limit; 0 removes it.
+- settings {cleanup?, docs?}: team switches. cleanup: at each run end remove the omp records of older Storm runs' parked subagents (their outputs stay). docs: doc rules in Storm role prompts and the run contract, doc checks in reviews (on by default).
 - run {task}: the user wants work done by the Storm team. Call it, then end your reply at once; never do the task yourself in the same turn. Storm starts the run with the approved team contract right after.
 - plan {plan}: REQUIRED during a run before any spawn: Storm refuses every spawn until a plan is in force. plan.lanes: [{name, kind, role?, files?, goal?}], kind explore|code|run|review|design (default roles explorer|implementer|quick|reviewer|architect; run = long builds, device runs, waiting, log collection). plan.workers: live agents per role (default the role's min, at most its max). Within the approved bounds it applies at once; past them (workers above max, a disabled or missing role) the user approves or cancels a config change in a dialog. Resubmit any time the plan changes. Outside a run it only validates.
-- agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Follow-ups in the same area (fixing review findings, a second pass) go to a finished agent via \`write agent://<id>\` only while it is under its context cap; past the cap Storm blocks the follow-up during a run, so start a fresh agent with a summary of its results.
+- agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Follow-ups in the same area (fixing review findings, a second pass) go to a finished agent via \`write agent://<id>\` only while it is under its context cap and its records were not cleaned; otherwise Storm blocks the follow-up during a run, so start a fresh agent of the same role and tell it to read \`agent://<id>\` and continue (no summary needed).
 - propose {config, rationale}: only to answer a <storm-setup> request, after interviewing the user with the ask tool. config is the whole team (same shape as <storm-recommended-config>), rationale explains it in Korean. The user approves or cancels it in Storm's dialog.
-priority, workers, reselect, trial, budget (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned and never claim a change was saved unless the result says so.
+priority, workers, reselect, trial, budget, settings (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned and never claim a change was saved unless the result says so.
 Setting the team up (again), rolling back to an earlier approval and resetting Storm are not actions: tell the user to type /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
@@ -123,6 +125,8 @@ function stormParams(z: Zod): StormToolSchema {
 		budgetUsd: z.number().optional().describe("trial: spend cap in USD; budget: per-run limit in USD, 0 removes it"),
 		warnAtUsd: z.number().optional().describe("budget: warn at this run spend (below budgetUsd)"),
 		onExceed: z.enum(["block-spawns", "stop"]).optional().describe("budget: what happens past the limit"),
+		cleanup: z.boolean().optional().describe("settings: true turns run-end cleanup of omp records on, false off"),
+		docs: z.boolean().optional().describe("settings: true turns doc consistency rules on, false off"),
 		task: z.string().optional().describe("run: the user's task request, verbatim"),
 		config: z.record(z.string(), z.unknown()).optional().describe("propose: the whole team as a Storm config object"),
 		rationale: z.string().optional().describe("propose: why this team, in Korean"),
@@ -502,6 +506,8 @@ async function write(host: StormToolHost, params: StormToolInput): Promise<Storm
 			if (params.budgetUsd === undefined) return rejected("budgetUsd가 필요합니다(0은 예산 해제).");
 			return propose(host, cur, "budget", buildBudget(config, params.budgetUsd, params.warnAtUsd, params.onExceed));
 		}
+		case "settings":
+			return propose(host, cur, "settings", buildSettings(config, params.cleanup, params.docs));
 		default:
 			return rejected(`알 수 없는 동작: ${params.action}`);
 	}

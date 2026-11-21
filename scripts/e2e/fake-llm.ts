@@ -13,7 +13,11 @@
  *   SPIKE-APPROVE           call the spike extension's `storm_spike_approve` tool
  *   SPIKE-SLOW              stream a ~4 s text reply so messages can be queued mid-stream
  *   SPIKE-WRITE <path>      call `write` with that path (director mode blocks it inside a Storm run)
- * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered.
+ * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered. In a child's assignment:
+ *   SPIKE-CHILD-READ <path>  call `read` on that path first
+ *   SPIKE-CHILD-SLOW         hold the first reply ~4 s, so the parent's turn ends while the child still runs
+ * A compaction request (one user message opening with `<conversation>`) gets a plain summary; the log keeps its
+ * `<additional-context>` block (what extensions added through `session.compacting`).
  *
  * Env: FAKE_LLM_PORT (default 18555), FAKE_LLM_LOG (default /tmp/storm-p0/llm.jsonl).
  */
@@ -39,11 +43,23 @@ interface Message {
 	tool_calls?: unknown[];
 }
 /**
- * One step of a scripted main turn (`SPIKE-STEPS [...]`): a storm tool call, a task batch, or a follow-up write.
+ * One step of a scripted main turn (`SPIKE-STEPS [...]`): a storm tool call, a task batch (`say` is appended to each
+ * child's assignment, e.g. a SPIKE-CHILD directive), a follow-up write, a read, or a `wait`: a text reply held that
+ * many ms, like a real model's latency (a text reply ends the turn, so it belongs last).
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
+ * `afterResult` holds it until a later user message (an async result) carries that text.
  */
-type Step = ({ storm: Record<string, unknown> } | { task: string[] } | { write: string }) & { after?: string };
+type Step = (
+	| { storm: Record<string, unknown> }
+	| { task: string[]; say?: string }
+	| { write: string }
+	| { read: string }
+	| { wait: number }
+) & {
+	after?: string;
+	afterResult?: string;
+};
 interface ChatRequest {
 	model: string;
 	messages: Message[];
@@ -54,7 +70,7 @@ interface ChatRequest {
 	reasoning?: { effort?: string };
 }
 type Decision =
-	| { kind: "text"; text: string; slow?: boolean }
+	| { kind: "text"; text: string; slow?: boolean; holdMs?: number }
 	| { kind: "tool"; name: string; args: Record<string, unknown> };
 
 const PORT = Number(process.env.FAKE_LLM_PORT ?? 18555);
@@ -71,13 +87,23 @@ const STORM_AGENTS = ["storm-implementer", "storm-reviewer"];
 const QUOTA_OUT = "quota-out";
 /** Model id whose requests report a large prompt (see `usageOf`). */
 const HEAVY_MAIN = "heavy-main";
-/** A reviewer's verdict for agents whose yield schema asks for one (storm-reviewer): one P1 finding, so the run record has something to count. */
+/**
+ * A reviewer's verdict for agents whose yield schema asks for one (storm-reviewer): one P1 finding of kind
+ * `doc_conflict`, so the run record has a finding and a doc finding to count.
+ */
 const REVIEW_VERDICT = {
 	overall_correctness: "incorrect",
 	explanation: "E2E verdict",
 	confidence: 0.8,
-	findings: [{ title: "E2E finding", body: "E2E", priority: 1, confidence: 0.8, file_path: "README.md", line_start: 1, line_end: 1 }],
+	findings: [
+		{ title: "E2E finding", body: "E2E", priority: 1, confidence: 0.8, file_path: "README.md", line_start: 1, line_end: 1, kind: "doc_conflict" },
+	],
 };
+/** First text of omp's compaction requests: the conversation to summarize (pi-agent-core compaction.ts). */
+const COMPACTION_OPEN = "<conversation>";
+/** Heading of Storm's doc rules section in a role agent's system prompt (src/policy/docs.ts). */
+const DOC_RULES = "## Storm doc rules";
+const CHILD_SLOW_MS = 4_000;
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -115,16 +141,47 @@ function requiredArgs(schema: JsonSchema | undefined): Record<string, unknown> {
 	return args;
 }
 
-function taskCall(tools: Tool[] | undefined, agents: string[]): Decision {
+function taskCall(tools: Tool[] | undefined, agents: string[], say?: string): Decision {
 	const item = (agent: string, index: number) => ({
 		name: `Spike${index}`,
 		agent,
-		task: `Reply with OK (${CHILD_MARK} ${index}).`,
+		task: `Reply with OK (${CHILD_MARK} ${index}).${say ? ` ${say}` : ""}`,
 		solutionSpace: "spike: fixed reply",
 	});
 	const batch = Boolean(schemaOf(tools, "task")?.properties?.tasks);
 	const args = batch ? { context: "OMP Storm P0 spike", tasks: agents.map(item) } : item(agents[0] ?? "task", 0);
 	return { kind: "tool", name: "task", args };
+}
+
+function readCall(tools: Tool[] | undefined, path: string): Decision {
+	return { kind: "tool", name: "read", args: { ...requiredArgs(schemaOf(tools, "read")), path } };
+}
+
+function yieldCall(schema: JsonSchema): Decision {
+	const args = requiredArgs(schema);
+	if (!JSON.stringify(schema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
+	// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
+	return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data: REVIEW_VERDICT } };
+}
+
+const userText = (messages: Message[]): string =>
+	messages
+		.filter(message => message.role === "user")
+		.map(message => textOf(message.content))
+		.join("\n");
+const toolCalls = (messages: Message[]): number => messages.filter(m => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0).length;
+
+/** omp's compaction and short-summary requests: one user message holding the serialized conversation. */
+function isCompaction(messages: Message[]): boolean {
+	const users = messages.filter(message => message.role === "user");
+	return users.length === 1 && textOf(users[0]?.content).trimStart().startsWith(COMPACTION_OPEN);
+}
+
+/** How long to hold a reply: a SPIKE-CHILD-SLOW child's first reply waits, so its parent's turn ends first. */
+function holdMs(messages: Message[]): number {
+	if (isCompaction(messages)) return 0;
+	const text = userText(messages);
+	return text.includes(CHILD_MARK) && text.includes("SPIKE-CHILD-SLOW") && !messages.some(m => m.role === "assistant") ? CHILD_SLOW_MS : 0;
 }
 
 function evalCall(tools: Tool[] | undefined, agents: string[]): Decision {
@@ -157,21 +214,34 @@ function scriptedStep(messages: Message[], tools: Tool[] | undefined): Decision 
 	if (at < 0) return undefined;
 	const steps = JSON.parse(textOf(messages[at]?.content).match(/SPIKE-STEPS[ \t]+(\[.*\])/)?.[1] ?? "[]") as Step[];
 	const later = messages.slice(at + 1);
-	const step = steps[later.filter(m => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0).length];
+	const step = steps[toolCalls(later)];
 	if (!step) return { kind: "text", text: "done" };
 	const seen = (text: string, from: (role: string) => boolean) => later.some(m => from(m.role) && textOf(m.content).includes(text));
 	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) return { kind: "text", text: "waiting" };
+	if (step.afterResult !== undefined && !seen(step.afterResult, role => role === "user")) return { kind: "text", text: "waiting" };
 	// A follow-up write waits for its target's async result (a user message), so the target's usage is on the ledger by then.
 	if ("write" in step && !seen(step.write.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
 	if ("storm" in step) return { kind: "tool", name: "storm", args: step.storm };
-	if ("task" in step) return taskCall(tools, step.task);
+	if ("task" in step) return taskCall(tools, step.task, step.say);
+	if ("read" in step) return readCall(tools, step.read);
+	if ("wait" in step) return { kind: "text", text: "waiting", holdMs: step.wait };
 	return { kind: "tool", name: "write", args: { path: step.write, content: "follow-up" } };
 }
 
 function decide(request: ChatRequest): Decision {
 	const messages = request.messages;
+	// Checked first: the serialized conversation quotes every directive of the session being compacted.
+	if (isCompaction(messages)) return { kind: "text", text: "## Goal\nE2E compaction summary" };
 	const scripted = scriptedStep(messages, request.tools);
 	if (scripted) return scripted;
+	const yieldSchema = schemaOf(request.tools, "yield");
+	// A child told to read a file reads it first, then yields.
+	const childRead = userText(messages).match(/SPIKE-CHILD-READ[ \t]+(\S+)/)?.[1];
+	if (childRead && userText(messages).includes(CHILD_MARK)) {
+		const calls = toolCalls(messages);
+		if (calls === 0) return readCall(request.tools, childRead);
+		if (calls === 1 && yieldSchema) return yieldCall(yieldSchema);
+	}
 	if (messages.at(-1)?.role === "tool") return { kind: "text", text: "done" };
 	const lastAssistant = messages.findLastIndex(message => message.role === "assistant");
 	const fresh = messages
@@ -196,13 +266,7 @@ function decide(request: ChatRequest): Decision {
 	if (fresh.includes("SPIKE-SLOW")) return { kind: "text", text: "slow reply ".repeat(8).trim(), slow: true };
 	const write = fresh.match(/SPIKE-WRITE[ \t]+(\S+)/);
 	if (write?.[1]) return { kind: "tool", name: "write", args: { path: write[1], content: "storm director check\n" } };
-	const yieldSchema = schemaOf(request.tools, "yield");
-	if (fresh.includes(CHILD_MARK) && yieldSchema) {
-		const args = requiredArgs(yieldSchema);
-		if (!JSON.stringify(yieldSchema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
-		// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
-		return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data: REVIEW_VERDICT } };
-	}
+	if (fresh.includes(CHILD_MARK) && yieldSchema) return yieldCall(yieldSchema);
 	return { kind: "text", text: "OK" };
 }
 
@@ -214,6 +278,8 @@ function record(request: ChatRequest, decision: Decision): void {
 		for (const mark of entry.text.match(/SPIKE-MARK [\w-]+/g) ?? []) (marks[mark] ??= []).push(`${entry.index}:${entry.role}`);
 	const taskTool = request.tools?.find(tool => tool.function.name === "task")?.function;
 	if (taskTool && !existsSync(TASK_TOOL_DUMP)) writeFileSync(TASK_TOOL_DUMP, `${taskTool.description ?? ""}\n\n${JSON.stringify(taskTool.parameters, null, 2)}`);
+	const compaction = isCompaction(request.messages);
+	const last = messages.at(-1);
 	const entry = {
 		ts: Date.now(),
 		model: request.model,
@@ -225,7 +291,16 @@ function record(request: ChatRequest, decision: Decision): void {
 		notices: { workflowz: where(NOTICES.workflowz), orchestrate: where(NOTICES.orchestrate) },
 		roles: [...new Set(messages.flatMap(entry => [...entry.text.matchAll(/STORM-ROLE ([\w-]+)/g)].map(match => match[1])))],
 		spike: [...new Set(messages.filter(entry => entry.role === "user").flatMap(entry => entry.text.match(/SPIKE-[A-Z]+/g) ?? []))],
-		child: messages.some(entry => entry.role === "user" && entry.text.includes(CHILD_MARK)),
+		child: !compaction && messages.some(entry => entry.role === "user" && entry.text.includes(CHILD_MARK)),
+		compaction,
+		/** What extensions added to a compaction request (`<additional-context>`), verbatim. */
+		compactionContext: compaction
+			? (messages.find(entry => entry.role === "user")?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ?? "")
+			: "",
+		docRules: messages.some(entry => (entry.role === "system" || entry.role === "developer") && entry.text.includes(DOC_RULES)),
+		setup: messages.some(entry => entry.role === "user" && entry.text.includes("<storm-setup>")),
+		/** The tool result this request answers, cut. */
+		lastTool: last?.role === "tool" ? last.text.slice(0, 1_000) : "",
 		taskToolAgents: STORM_AGENTS.filter(name => taskTool?.description?.includes(name) || JSON.stringify(taskTool?.parameters ?? {}).includes(name)),
 		users: messages.filter(entry => entry.role === "user").map(entry => `${entry.index}: ${entry.text.slice(0, 120).replace(/\s+/g, " ")}`),
 		decision: decision.kind === "tool" ? { tool: decision.name, args: decision.args } : { text: decision.text.slice(0, 40), slow: decision.slow === true },
@@ -307,6 +382,8 @@ Bun.serve({
 		}
 		const decision = decide(request);
 		record(request, decision);
+		const hold = Math.max(holdMs(request.messages), decision.kind === "text" ? (decision.holdMs ?? 0) : 0);
+		if (hold > 0) await Bun.sleep(hold);
 		return request.stream ? stream(request.model, decision) : completion(request.model, decision);
 	},
 });

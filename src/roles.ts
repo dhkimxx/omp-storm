@@ -1,6 +1,6 @@
 import type { LaneKind, RoleConfig, RoleId, RoleSpec, StormConfig, WorkerRange } from "./types.ts";
 
-export const STORM_VERSION = "0.8.1";
+export const STORM_VERSION = "0.9.0";
 
 /** Roles Storm ships. Each maps to an agent definition in agents/. */
 export const ROLES: readonly RoleSpec[] = [

@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { approveAndSave, type FlowEnv, resetFlow } from "../src/flows.ts";
 import { deriveScope } from "../src/interview/setup.ts";
 import { loadProjectState } from "../src/state.ts";
-import type { Exec, RunRecord, StormConfig, UiPort } from "../src/types.ts";
+import { appendRunIndex, readRunIndex } from "../src/runtime/run-index.ts";
+import type { Exec, RunRecord, RunSummary, StormConfig, UiPort } from "../src/types.ts";
 
 const exec: Exec = async (command, args, options) => {
 	const p = Bun.spawn([command, ...args], {
@@ -128,6 +129,33 @@ describe("/storm reset", () => {
 			expect(existsSync(path.join(stormDir(), "config.json"))).toBe(true);
 			expect(await approvals()).toBe(1);
 		}
+	});
+
+	test("the run summary index stays by default; only the exact delete option removes it", async () => {
+		const summary = (runId: string): RunSummary => ({
+			schema: "storm.run-summary/v1",
+			runId,
+			startedAt: "2026-11-20T09:00:00.000Z",
+			status: "done",
+			task: "t",
+			costUsd: 1,
+			agents: 0,
+			spawns: { total: 0, blocked: 0 },
+		});
+		await seed();
+		await appendRunIndex(project, summary("run-a"));
+		const keep = scriptedUi(["초기화"]);
+		expect(await resetFlow(env, keep.ui)).toBe(true);
+		expect(keep.selects[0]?.options).toEqual(["초기화", "초기화하고 실행 요약 색인도 지우기", "취소"]);
+		expect(existsSync(path.join(stormDir(), "config.json"))).toBe(false);
+		expect((await readRunIndex(project)).map(s => s.runId)).toEqual(["run-a"]);
+		expect(await readFile(path.join(stormDir(), ".gitignore"), "utf8")).toBe("/state/\n");
+
+		await seed();
+		const drop = scriptedUi(["초기화하고 실행 요약 색인도 지우기"]);
+		expect(await resetFlow(env, drop.ui)).toBe(true);
+		expect(existsSync(stormDir())).toBe(false);
+		expect(await readRunIndex(project)).toEqual([]);
 	});
 
 	test("approval records left after .omp/storm was deleted by hand are still cleared", async () => {

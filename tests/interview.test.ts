@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { ROLES, STORM_VERSION } from "../src/roles.ts";
 import type {
 	AgentEntry,
-	Analysis,
 	Candidate,
 	Effort,
 	MetricValue,
@@ -20,12 +19,9 @@ import type {
 } from "../src/types.ts";
 import {
 	type RolePick,
-	renderAnalysis,
 	renderConfigDiff,
-	renderEvidence,
 	renderStatus,
 	renderStatusBrief,
-	renderTeam,
 } from "../src/interview/render.ts";
 import { runReview, runRollback } from "../src/interview/review.ts";
 import { buildConfig, deriveScope, recommendedConfig } from "../src/interview/setup.ts";
@@ -106,40 +102,6 @@ const MODEL_EFFORTS: Record<string, Effort[]> = {
 };
 const efforts = (s: string): Effort[] => MODEL_EFFORTS[s] ?? MODEL_EFFORTS[s.replace(/2$/, "")] ?? [];
 
-const analysis: Analysis = {
-	status: "ok",
-	windowDays: 30,
-	dataAsOf: null,
-	preferences: {
-		main: { cheap: [], general: [], premium: [], unknown: [] },
-		subagent: {
-			cheap: [],
-			general: [
-				{
-					modelKey: "k",
-					lineKey: "l",
-					label: "Fake Flash",
-					tier: "general",
-					seat: "subagent",
-					requests: 10,
-					share: 0.5,
-					shareRecent: 0.25,
-					errorRate: 0,
-					lastTs: 0,
-					routes: [
-						{ selector: "a/x", provider: "a", id: "x", requests: 10, errors: 0, lastTs: 0, ompTps: null, decodeTps: 42.4, ttftP50: null, ttftP90: null, costPerRequest: null, available: true, variant: {} },
-					],
-				},
-			],
-			premium: [],
-			unknown: [],
-		},
-	},
-	stopped: [],
-	newer: [],
-	alternatives: {},
-	warnings: [],
-};
 const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.omp/agents/storm-reviewer.md", scope: "project", sha256: "ab" };
 const trialCfg: TrialConfig = {
 	id: "reviewer-c",
@@ -298,18 +260,6 @@ describe("review / rollback", () => {
 
 
 describe("render", () => {
-	test("null metrics render as dash, not zero", () => {
-		const a = renderAnalysis(analysis, 0);
-		expect(a).toMatch(/omp — tok\/s · 생성 42 tok\/s · TTFT p50 —(?!ms)/);
-		expect(a).toContain("30일 50% · 최근 25%");
-		const rs = recs();
-		rs[0]!.candidates[0] = cand("a/x", { int: mv(null), speed: mv(null), referenceUsd: null, tier: null });
-		const ev = renderEvidence(rs);
-		expect(ev).toContain("지능 — · — tok/s · —");
-		const picks = { explorer: { primary: { selector: "a/x", label: "x", effort: "medium" as const } } };
-		expect(renderTeam(rs, picks, { parallelism: 1, isolation: "isolated", contract: "workflowz" })).toContain("| 탐색 | x (a/x) | medium | — |");
-	});
-
 	test("status shows hash prefix, unapproved next step and max-cost advice", () => {
 		const md = renderStatus(
 			{
@@ -482,6 +432,16 @@ describe("render", () => {
 		const fresh = renderConfigDiff(undefined, next);
 		expect(fresh).toContain("- explorer 워커: 3");
 		expect(fresh).toMatch(/- 시험 new: 리뷰 · c\/cand/);
+	});
+
+	test("config diff shows cleanup and docs switches", () => {
+		const base = cfg("a/x");
+		expect(renderConfigDiff(base, { ...base, cleanup: true })).toBe("- 실행이 끝나면 정리: 끔 → 켬");
+		expect(renderConfigDiff(base, { ...base, docs: false })).toBe("- 문서 정합: 켬 → 끔");
+		expect(renderConfigDiff({ ...base, docs: true }, base)).toBe("변경 없음");
+		const fresh = renderConfigDiff(undefined, base);
+		expect(fresh).toContain("- 실행이 끝나면 정리: 끔");
+		expect(fresh).toContain("- 문서 정합: 켬");
 	});
 });
 

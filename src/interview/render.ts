@@ -2,10 +2,8 @@ import { agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "
 import { DEFAULT_CONTEXT_CAP, ROLES, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
 import type {
-	Analysis,
 	BudgetConfig,
 	Candidate,
-	DetectionSummary,
 	Effort,
 	MetricValue,
 	QuotaState,
@@ -14,7 +12,6 @@ import type {
 	RunRecord,
 	RunPlan,
 	RunStatus,
-	Seat,
 	SpawnRecord,
 	StatusView,
 	StormConfig,
@@ -42,19 +39,6 @@ function ms(v: number | null | undefined): string {
 export function speedText(m: MetricValue): string {
 	return m.value === null ? `${DASH} tok/s` : `${m.source === "measured" ? "" : "≈"}${int(m.value)} tok/s`;
 }
-const REASON: Record<string, string> = {
-	"route-unavailable": "경로 사용 불가",
-	"quota-exhausted": "쿼터 소진",
-	"error-rate-up": "오류율 증가",
-};
-function reasonText(code: string): string {
-	const i = code.indexOf(":");
-	const text = REASON[i < 0 ? code : code.slice(0, i)] ?? code;
-	return i < 0 ? text : `${text}(${code.slice(i + 1)})`;
-}
-/** Lineages below this share in both windows are summarized instead of listed. */
-const MIN_SHARE = 0.005;
-const EXCLUDED_SHOWN = 3;
 export function tierLabel(t: Tier | null | undefined): string {
 	return t === "cheap" ? "저가" : t === "general" ? "일반" : t === "premium" ? "고가" : DASH;
 }
@@ -86,118 +70,8 @@ function age(ms: number | null, now: number): string {
 	const h = Math.max(0, Math.round((now - ms) / 3_600_000));
 	return h < 48 ? `${h}시간 전` : `${Math.round(h / 24)}일 전`;
 }
-function yes(b: boolean): string {
-	return b ? "사용 가능" : "없음";
-}
-function warnings(ws: string[]): string {
-	return ws.length ? `\n### 경고\n${ws.map((w) => `- ${w}`).join("\n")}\n` : "";
-}
 function cell(s: string): string {
 	return s.replace(/\|/g, "\\|").replace(/\n/g, " ");
-}
-
-export function renderDetection(d: DetectionSummary, now: number): string {
-	const out: string[] = ["### Provider", "| Provider | 모델 수 | 쿼터 |", "|---|---|---|"];
-	for (const p of d.providers) out.push(`| ${cell(p.provider)} | ${p.models} | ${QUOTA[p.quota]} |`);
-	if (!d.providers.length) out.push(`| ${DASH} | 0 | ${DASH} |`);
-	out.push(
-		"",
-		"### 도구",
-		`- task: ${yes(d.tools.task)} · eval: ${yes(d.tools.eval)}`,
-		`- 키워드 workflowz: ${yes(d.keywords.workflowz)} · orchestrate: ${yes(d.keywords.orchestrate)}`,
-	);
-	const e = d.explicit;
-	if (e) {
-		out.push("", "### 설정에 적힌 선호", `- 기본 모델: ${e.defaultModel ?? DASH}`);
-		const roles = Object.entries(e.modelRoles);
-		out.push(`- modelRoles: ${roles.length ? roles.map(([k, v]) => `${k}=${v}`).join(", ") : DASH}`);
-		const ov = Object.entries(e.agentModelOverrides);
-		out.push(
-			`- agentModelOverrides: ${ov.length ? ov.map(([k, v]) => `${k}=${Array.isArray(v) ? v.join(",") : v}`).join(", ") : DASH}`,
-		);
-	}
-	out.push(
-		"",
-		`### 사용 데이터\n- 기준 시각: ${time(d.dataAsOf)} (${age(d.dataAsOf, now)})${d.stale ? " · 오래됨" : ""}`,
-	);
-	return out.join("\n") + warnings(d.warnings);
-}
-
-const SEAT_LABEL: Record<Seat, string> = { main: "메인 세션", subagent: "서브에이전트" };
-
-export function renderAnalysis(a: Analysis, now: number): string {
-	const out: string[] = [
-		`### 사용 분석 (${a.windowDays}일, 상태 ${a.status}, 기준 ${time(a.dataAsOf)} · ${age(a.dataAsOf, now)})`,
-	];
-	for (const seat of ["main", "subagent"] as Seat[]) {
-		out.push("", `#### ${SEAT_LABEL[seat]}`);
-		const byTier = a.preferences[seat];
-		let any = false;
-		let hidden = 0;
-		for (const t of ["premium", "general", "cheap", "unknown"] as const) {
-			const list = byTier?.[t] ?? [];
-			const shown = list.filter((l) => l.share >= MIN_SHARE || l.shareRecent >= MIN_SHARE).slice(0, 3);
-			hidden += list.length - shown.length;
-			if (!shown.length) continue;
-			any = true;
-			out.push(`- ${t === "unknown" ? "계층 미상" : tierLabel(t)}`);
-			for (const l of shown) {
-				out.push(
-					`  - ${l.label}: 30일 ${pct(l.share)} · 최근 ${pct(l.shareRecent)} · 경로 ${l.routes.length}개`,
-				);
-				for (const r of l.routes) {
-					const measured = r.ompTps !== null || r.decodeTps !== null || r.ttftP50 !== null;
-					out.push(
-						measured
-							? `    - ${r.selector}: omp ${int(r.ompTps)} tok/s · 생성 ${int(r.decodeTps)} tok/s · TTFT p50 ${ms(r.ttftP50)}`
-							: `    - ${r.selector}: 속도 미측정 (${r.requests.toLocaleString("en-US")}건)`,
-					);
-				}
-			}
-		}
-		if (!any) out.push(`- ${DASH}`);
-		if (hidden) out.push(`- 그 밖의 계열 ${hidden}개는 생략(비중 1% 미만이거나 계층별 상위 3개 밖)`);
-	}
-	if (a.stopped.length) {
-		out.push("", "### 쓰다 멈춘 계열");
-		const groups = new Map<string, { label: string; seats: Seat[]; reasons: Set<string>; current: Set<string> }>();
-		for (const s of a.stopped) {
-			const g = groups.get(s.modelKey) ?? { label: s.label, seats: [], reasons: new Set<string>(), current: new Set<string>() };
-			g.seats.push(s.seat);
-			for (const r of s.reasons) g.reasons.add(reasonText(r));
-			for (const c of s.currentRoutes) g.current.add(c);
-			groups.set(s.modelKey, g);
-		}
-		for (const g of groups.values()) {
-			out.push(
-				`- ${g.label} (${g.seats.map((s) => SEAT_LABEL[s]).join("·")}): ${g.reasons.size ? [...g.reasons].join(", ") : "확인된 사유 없음"} · 지금 쓸 수 있는 경로 ${g.current.size ? [...g.current].join(", ") : DASH}`,
-			);
-		}
-	}
-	if (a.newer.length) {
-		out.push("", "### 새 버전");
-		for (const n of a.newer) {
-			out.push(
-				`- ${n.from} → ${n.to}${n.needsCheck ? " (확인 필요)" : ""} · 지능 ${int(n.int.value)} · ${n.selectors.join(", ") || DASH}`,
-			);
-		}
-	}
-	const alts = Object.entries(a.alternatives).filter(([, v]) => v.length);
-	if (alts.length) {
-		out.push("", "### 대안");
-		for (const [base, list] of alts) {
-			out.push(
-				`- ${base}: ${list
-					.slice(0, 3)
-					.map(
-						(x) =>
-							`${x.label} (${x.kind}, 지능 ${int(x.int.value)}, ${speedText(x.speed)}, 비용 ${x.costRatio == null ? DASH : `×${x.costRatio.toFixed(2)}`})`,
-					)
-					.join("; ")}`,
-			);
-		}
-	}
-	return out.join("\n") + warnings(a.warnings);
 }
 
 /** A model the interview picked for a role, with its own effort (none when the model has no effort control). */
@@ -210,52 +84,6 @@ export interface PickedModel {
 export interface RolePick {
 	primary: PickedModel;
 	fallback?: PickedModel;
-}
-
-export function renderTeam(
-	recs: RoleRecommendation[],
-	picks: Record<string, RolePick>,
-	extra: {
-		parallelism: number;
-		isolation: string;
-		contract: string;
-		budget?: BudgetConfig;
-		/** Workers per role id; missing roles show the contract default of 1. */
-		workers?: Record<string, number>;
-		/** Role id whose models non-Storm agents get during a run; absent → blocked. */
-		fallbackRole?: string;
-		trials?: TrialConfig[];
-	},
-): string {
-	const out = ["| 역할 | 모델 | effort | 계층 | 근거 | 폴백 | 폴백 effort | 워커 |", "|---|---|---|---|---|---|---|---|"];
-	for (const rec of recs) {
-		const pick = picks[rec.role.id];
-		const workers = extra.workers?.[rec.role.id] ?? 1;
-		if (!pick) {
-			out.push(`| ${rec.role.title} | 후보 없음 | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${DASH} | ${workers} |`);
-			continue;
-		}
-		const c = rec.candidates.find((x) => x.selector === pick.primary.selector);
-		const model = c ? `${cell(c.label)} (${cell(c.selector)})` : `${cell(pick.primary.selector)} (직접 입력)`;
-		const basis = c ? `${tierLabel(c.tier)} | ${cell(c.why[0] ?? DASH)}` : `${DASH} | 사용자 지정`;
-		const fb = pick.fallback;
-		out.push(
-			`| ${rec.role.title} | ${model} | ${pick.primary.effort ?? DASH} | ${basis} | ${fb ? cell(fb.selector) : DASH} | ${fb?.effort ?? DASH} | ${workers} |`,
-		);
-	}
-	out.push(
-		"",
-		`- 병렬도: ${extra.parallelism}`,
-		`- 격리: ${extra.isolation}`,
-		`- 실행 계약: ${extra.contract}`,
-		`- 예산: ${extra.budget ? budgetText(extra.budget) : "없음"}`,
-		`- 실행 중 다른 에이전트: ${fallbackText(extra.fallbackRole)}`,
-	);
-	if (extra.trials?.length) {
-		out.push("- 시험:");
-		for (const t of extra.trials) out.push(`  - ${trialText(t)}`);
-	}
-	return out.join("\n");
 }
 
 export function roleTitle(id: string): string {
@@ -293,32 +121,6 @@ export function fallbackOf(rec: RoleRecommendation, selected: string | undefined
 	return rec.candidates.find((c) => c.selector !== selected && providerOf(c.selector) !== prov);
 }
 
-export function renderEvidence(recs: RoleRecommendation[]): string {
-	const out: string[] = [];
-	for (const rec of recs) {
-		out.push(`### ${rec.role.title} (${rec.role.agent})`);
-		if (!rec.candidates.length) out.push("- 후보 없음");
-		rec.candidates.forEach((c, i) => {
-			out.push(
-				`- ${i === rec.chosenIndex ? "★ " : ""}${c.label} (${c.selector}) · 지능 ${int(c.int.value)} · ${speedText(c.speed)} · ${usd(c.referenceUsd)}`,
-			);
-			for (const w of c.why) out.push(`  - 근거: ${w}`);
-			for (const w of c.whyNot) out.push(`  - 제외 이유: ${w}`);
-		});
-		if (rec.excluded.length) {
-			out.push("- 제외된 모델:");
-			const byReason = new Map<string, string[]>();
-			for (const x of rec.excluded) byReason.set(x.reason, [...(byReason.get(x.reason) ?? []), x.selector]);
-			for (const [reason, selectors] of byReason) {
-				const more = selectors.length > EXCLUDED_SHOWN ? ` 외 ${selectors.length - EXCLUDED_SHOWN}개` : "";
-				out.push(`  - ${reason}: ${selectors.slice(0, EXCLUDED_SHOWN).join(", ")}${more}`);
-			}
-		}
-		out.push("");
-	}
-	return out.join("\n").trimEnd();
-}
-
 export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfig): string {
 	const rows: string[] = [];
 	const line = (field: string, a: string | undefined, b: string) => {
@@ -346,6 +148,8 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 	line("실행 계약", prev?.contract, next.contract);
 	line("예산", prev && (prev.budget ? budgetText(prev.budget) : "없음"), next.budget ? budgetText(next.budget) : "없음");
 	line("실행 중 다른 에이전트", prev && fallbackText(prev.fallbackRole), fallbackText(next.fallbackRole));
+	line("실행이 끝나면 정리", prev && (prev.cleanup === true ? "켬" : "끔"), next.cleanup === true ? "켬" : "끔");
+	line("문서 정합", prev && (prev.docs === false ? "끔" : "켬"), next.docs === false ? "끔" : "켬");
 	const prevTrials = new Map((prev?.trials ?? []).map((t) => [t.id, t]));
 	const nextTrials = new Map((next.trials ?? []).map((t) => [t.id, t]));
 	for (const id of new Set([...prevTrials.keys(), ...nextTrials.keys()])) {

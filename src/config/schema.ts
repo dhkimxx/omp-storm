@@ -21,6 +21,8 @@ const TOP_KEYS = [
 	"trials",
 	"disabledRoles",
 	"contextCap",
+	"cleanup",
+	"docs",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
 const MAX_CONTEXT_CAP = 10_000_000;
@@ -169,6 +171,8 @@ export function validateConfig(value: unknown): ConfigValidation {
 	if (value.contextCap !== undefined && !isIntIn(value.contextCap, 1, MAX_CONTEXT_CAP)) {
 		errors.push(`contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
 	}
+	if (value.cleanup !== undefined && typeof value.cleanup !== "boolean") errors.push("cleanup: true|false여야 합니다");
+	if (value.docs !== undefined && typeof value.docs !== "boolean") errors.push("docs: true|false여야 합니다");
 	if (!oneOf(value.isolation, ["isolated", "shared"])) errors.push("isolation: isolated|shared 중 하나여야 합니다");
 	if (!oneOf(value.contract, ["workflowz", "orchestrate"])) {
 		errors.push("contract: workflowz|orchestrate 중 하나여야 합니다");

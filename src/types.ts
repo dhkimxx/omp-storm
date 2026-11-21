@@ -290,18 +290,6 @@ export interface LineageUsage {
 	routes: RouteStats[];
 }
 
-export interface StoppedLineage {
-	modelKey: string;
-	label: string;
-	seat: Seat;
-	requests: number;
-	lastTs: number;
-	/** Confirmed reasons only: "route-unavailable:<selector>", "quota-exhausted:<provider>", "error-rate-up". */
-	reasons: string[];
-	/** Selectors of the same lineage usable now. */
-	currentRoutes: string[];
-}
-
 export interface NewerVersion {
 	/** modelKey in use. */
 	from: string;
@@ -335,7 +323,6 @@ export interface Analysis {
 	dataAsOf: number | null;
 	/** Preferences per seat and tier, each list sorted by share desc. */
 	preferences: Record<Seat, Record<Tier | "unknown", LineageUsage[]>>;
-	stopped: StoppedLineage[];
 	newer: NewerVersion[];
 	/** Keyed by the base lineage's modelKey. */
 	alternatives: Record<string, Alternative[]>;
@@ -464,6 +451,10 @@ export interface StormConfig {
 	 */
 	contextCap?: number;
 	trials?: TrialConfig[];
+	/** "실행이 끝나면 정리": the run-end janitor also removes omp records of older Storm runs' parked agents. Absent → off. */
+	cleanup?: boolean;
+	/** "문서 정합": doc rules in the run contract and Storm role prompts, doc checks in reviews. Absent → on; false → off. */
+	docs?: boolean;
 }
 
 export type ConfigLoad =
@@ -680,6 +671,64 @@ export interface RunRecord {
 	blockedFollowUps?: number;
 	/** ISO 8601 of the last write while the run was active. */
 	updatedAt?: string;
+	/** Artifacts dir of the main session that ran it (`<session>/`): where its subagents' records live. */
+	artifactsDir?: string;
+	/** "<pid>:<process start ms>" of the omp process that ran it; agents of another process are not live here. */
+	process?: string;
+	/** Director `read` calls during the run: all, those of a file a subagent of the run had read, and the ones Storm refused. */
+	reads?: RunReads;
+	/** Largest prompt (tokens) of a director request during the run. */
+	maxMainContext?: number;
+	/** Mid-run compactions of the director's context. */
+	checkpoints?: RunCheckpoint[];
+	/** What the run-end janitor removed. */
+	cleanup?: CleanupResult;
+}
+
+export interface RunReads {
+	director: number;
+	duplicate: number;
+	blocked: number;
+}
+
+export interface RunCheckpoint {
+	/** ISO 8601. */
+	at: string;
+	/** Director context tokens when the compaction started, and after it when known. */
+	before: number;
+	after?: number;
+}
+
+export interface CleanupResult {
+	/** Subagents whose omp records were removed (their outputs stay). */
+	agents: number;
+	/** omp record files removed and their bytes. */
+	files: number;
+	bytes: number;
+	/** Storm's own files removed by its limits: run records, approval snapshots and evidence, trial counters, proposals. */
+	stormFiles: number;
+}
+
+/** `<root>/.omp/storm/state/runs/index.jsonl`: one line per finished run, kept after the run record is pruned. */
+export interface RunSummary {
+	schema: "storm.run-summary/v1";
+	runId: string;
+	startedAt: string;
+	endedAt?: string;
+	status: RunStatus;
+	task: string;
+	costUsd: number;
+	mainCostUsd?: number;
+	maxMainContext?: number;
+	/** Largest last-request context of any subagent of the run. */
+	maxAgentContext?: number;
+	agents: number;
+	spawns: { total: number; blocked: number };
+	reviews?: { reviews: number; passed: number; failed: number; docFindings: number };
+	blockedFollowUps?: number;
+	reads?: RunReads;
+	checkpoints?: number;
+	cleanup?: CleanupResult;
 }
 
 /** Kinds of work a run plan's lanes do; each defaults to a role (`LANE_ROLES`). */
@@ -784,7 +833,7 @@ export interface SpawnOutcome {
 
 // ── Proposals and evidence (implemented in src/proposals) ─────────────────────────────────────
 
-export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "setup" | "plan";
+export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "settings" | "setup" | "plan";
 
 /** Why the approved models were chosen, stored per config hash next to the approval. */
 export interface EvidenceRecord {
@@ -862,6 +911,7 @@ export type StormToolAction =
 	| "quota"
 	| "trial"
 	| "budget"
+	| "settings"
 	| "run"
 	| "plan"
 	| "agents"
@@ -905,6 +955,9 @@ export interface StormToolParams {
 	/** budget */
 	warnAtUsd?: number;
 	onExceed?: BudgetConfig["onExceed"];
+	/** settings: "실행이 끝나면 정리" and "문서 정합" switches */
+	cleanup?: boolean;
+	docs?: boolean;
 	/** run */
 	task?: string;
 	/** propose: the whole team as a Storm config object (version, priority, roles, parallelism, isolation, contract, …). */
@@ -946,6 +999,8 @@ export interface AgentEntry {
 	lastCacheReadShare?: number;
 	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
 	review?: ReviewTally;
+	/** ms since epoch: the run-end janitor removed its omp records; its `agent://` output stays. */
+	cleanedAt?: number;
 }
 
 /** A reviewer's yields counted as reviews: each final verdict payload is one review; findings add up across them. */
@@ -956,6 +1011,8 @@ export interface ReviewTally {
 	failed: number;
 	/** Findings by priority: [P0, P1, P2, P3]. */
 	findings: [number, number, number, number];
+	/** Findings about docs (kind doc_conflict or doc_copy); also counted in `findings`. */
+	docFindings?: number;
 	/** 0..1, from the latest verdict. */
 	lastConfidence?: number;
 }
