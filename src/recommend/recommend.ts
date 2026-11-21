@@ -37,12 +37,15 @@ export interface RecommendInput {
 const MAX_CANDIDATES = 5;
 /** Catalog scores come from different sources; gaps this small are noise, so the user's own preference decides instead. */
 const QUALITY_TOLERANCE = 1;
-/** Default effort per role; recommendations and proposals start from it. */
+/**
+ * Default effort per role; recommendations and proposals start from it. Never below medium: on the cheap models these
+ * roles run, low saves little and costs quality. Code changes get high.
+ */
 export const ROLE_EFFORT: Record<RoleId, Effort> = {
-	explorer: "low",
-	implementer: "medium",
+	explorer: "medium",
+	implementer: "high",
 	reviewer: "high",
-	quick: "low",
+	quick: "medium",
 	architect: "xhigh",
 };
 const TIER_LABEL: Record<Tier, string> = { cheap: "저가", general: "범용", premium: "고성능" };

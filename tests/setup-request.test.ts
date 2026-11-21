@@ -157,8 +157,8 @@ describe("buildSetupRequest", () => {
 			version: 1,
 			priority: "balanced",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 2, max: 4 } },
-				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: { min: 1, max: 2 } },
+				explorer: { agent: "storm-explorer", models: ["a/x:medium", "b/z:medium"], workers: { min: 2, max: 4 } },
+				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:high"], workers: { min: 1, max: 2 } },
 				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } },
 			},
 			parallelism: 4,

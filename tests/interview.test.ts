@@ -159,8 +159,8 @@ describe("recommendedConfig", () => {
 			version: 1,
 			priority: "balanced",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 2, max: 4 } },
-				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: { min: 1, max: 2 } },
+				explorer: { agent: "storm-explorer", models: ["a/x:medium", "b/z:medium"], workers: { min: 2, max: 4 } },
+				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:high"], workers: { min: 1, max: 2 } },
 				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } },
 			},
 			parallelism: 4,
@@ -177,7 +177,7 @@ describe("recommendedConfig", () => {
 		const story: RoleRecommendation[] = [{ role: ROLES[0]!, candidates: [haiku, deepseek], chosenIndex: 0, excluded: [] }];
 		const levels: Record<string, Effort[]> = { [deepseek.selector]: ["high", "max"], [haiku.selector]: ["low", "medium"] };
 		const c = recommendedConfig(story, (s) => levels[s] ?? [], "speed");
-		expect(c.roles.explorer!.models).toEqual(["anthropic/haiku:low", "deepseek/flash:high"]);
+		expect(c.roles.explorer!.models).toEqual(["anthropic/haiku:medium", "deepseek/flash:high"]);
 		expect(c.priority).toBe("speed");
 	});
 
@@ -196,7 +196,7 @@ describe("recommendedConfig", () => {
 		};
 		const c = recommendedConfig(recs(), efforts, "balanced", current);
 		// A legacy count carries over as n~n; ranges and caps carry over as they are.
-		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 4, max: 4 }, contextCap: 50_000 });
+		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x:medium", "b/z:medium"], workers: { min: 4, max: 4 }, contextCap: 50_000 });
 		expect(c.roles.reviewer!.workers).toEqual({ min: 1, max: 3 });
 		expect(c.roles.implementer!.workers).toEqual({ min: 1, max: 2 });
 		expect(c).toMatchObject({ parallelism: 7, isolation: "isolated", contract: "orchestrate", contextCap: 100_000, budget: { perRunUsd: 2, onExceed: "stop" }, trials: [trialCfg] });

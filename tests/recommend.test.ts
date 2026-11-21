@@ -234,7 +234,8 @@ describe("recommend effort", () => {
 	test("uses the role effort, else the nearest supported one", () => {
 		const catalog = [model("pa", "g-pro-1", "general", { int: 40, efforts: ["minimal", "medium", "xhigh"] }), model("pa", "c-flash-1", "cheap", { int: 20, efforts: [] })];
 		const recs = recommend(setup(catalog));
-		expect(recs.find(r => r.role.id === "implementer")?.candidates[0]?.effort).toBe("medium");
+		// implementer wants high: medium and xhigh are equally near, and ties go up.
+		expect(recs.find(r => r.role.id === "implementer")?.candidates[0]?.effort).toBe("xhigh");
 		expect(recs.find(r => r.role.id === "reviewer")?.candidates[0]?.effort).toBe("xhigh");
 		expect(recs.find(r => r.role.id === "explorer")?.candidates[0]?.effort).toBeNull();
 		expect(pickEffort("low", ["minimal", "medium"])).toBe("medium");

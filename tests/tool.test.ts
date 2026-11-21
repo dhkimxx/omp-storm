@@ -505,8 +505,8 @@ describe("priority", () => {
 		const s = f.saved[0]!;
 		expect(s.config.priority).toBe("quality");
 		// Per-model effort: the primary keeps the candidate's effort, the fallback gets the role default it supports.
-		expect(s.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x2:low", "b/z2:low"] });
-		expect(s.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["a/i2", "c/j2:medium"], workers: 3 });
+		expect(s.config.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x2:low", "b/z2:medium"] });
+		expect(s.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["a/i2", "c/j2:high"], workers: 3 });
 		expect(s.config.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r2:high"] });
 		expect(s.evidence).toMatchObject({ source: "priority", priority: "quality", dataAsOf: NOW - 3_600_000 });
 		expect(s.evidence!.roles.implementer!.chosen).toBe("a/i2");
@@ -613,7 +613,7 @@ describe("reselect", () => {
 		const f = fakeHost({ answers: ["승인"] });
 		const r = await run(f, { action: "reselect", role: "implementer", model: "c/j" });
 		expect(r.outcome).toBe("approved");
-		expect(f.saved[0]!.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j:medium", "a/i"], workers: 3 });
+		expect(f.saved[0]!.config.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j:high", "a/i"], workers: 3 });
 		expect(f.saved[0]!.evidence?.source).toBe("reselect");
 
 		const g = fakeHost({ answers: ["승인"] });
