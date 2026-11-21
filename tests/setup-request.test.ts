@@ -157,9 +157,9 @@ describe("buildSetupRequest", () => {
 			version: 1,
 			priority: "balanced",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: 2 },
-				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: 1 },
-				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: 1 },
+				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 2, max: 4 } },
+				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: { min: 1, max: 2 } },
+				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } },
 			},
 			parallelism: 4,
 			isolation: "shared",
@@ -193,6 +193,10 @@ describe("buildSetupRequest", () => {
 		expect(after).toContain('action "propose"');
 		expect(after).toContain("`rationale`");
 		expect(after).toContain("저장했다고 먼저 말하지 마세요");
+		// The settings form writes the range and the team cap into keys the schema knows.
+		expect(after).toContain("`workers` {min, max}");
+		expect(after).toContain("`contextCap`에 200000/100000/400000");
+		expect(after).toContain("`local://` 계획 노트");
 	});
 
 	test("stays bounded with many candidates, reasons and models", () => {
@@ -234,7 +238,7 @@ describe("buildSetupRequest", () => {
 		const config = recommendedOf(text) as StormConfig;
 		expect(validateConfig(config).errors).toEqual([]);
 		expect(config).toMatchObject({ priority: "cost", parallelism: 6, isolation: "isolated", contract: "orchestrate" });
-		expect(config.roles.explorer!.workers).toBe(3);
+		expect(config.roles.explorer!.workers).toEqual({ min: 3, max: 3 });
 		// A v0.2 config with workers but no fallbackRole blocked other agents on purpose; that carries over.
 		expect(config.fallbackRole).toBeUndefined();
 	});

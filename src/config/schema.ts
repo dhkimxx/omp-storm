@@ -1,4 +1,4 @@
-import { REQUIRED_ROLES, ROLES } from "../roles.ts";
+import { MAX_WORKERS, REQUIRED_ROLES, ROLES } from "../roles.ts";
 import { EFFORTS, PRIORITIES } from "../types.ts";
 import type { StormConfig } from "../types.ts";
 
@@ -20,8 +20,10 @@ const TOP_KEYS = [
 	"fallbackRole",
 	"trials",
 	"disabledRoles",
+	"contextCap",
 ];
-const ROLE_KEYS = ["agent", "models", "effort", "workers"];
+const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
+const MAX_CONTEXT_CAP = 10_000_000;
 const BUDGET_KEYS = ["perRunUsd", "warnAtUsd", "onExceed"];
 const TRIAL_KEYS = ["id", "role", "model", "effort", "share", "maxSpawns", "startsAt", "endsAt", "budgetUsd"];
 // Full timestamps with an explicit zone; date-only or zone-less strings parse differently across hosts.
@@ -30,7 +32,7 @@ const AGENT_RE = /^storm-[a-z0-9-]+$/;
 // "provider/id" with an optional ":<suffix>"; the id may contain more '/' (aggregator routes).
 const MODEL_RE = /^[^\s/:]+\/[^\s]*[^\s/:]$/;
 
-function isRecord(v: unknown): v is Record<string, unknown> {
+export function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
@@ -50,6 +52,15 @@ function isPositiveNumber(v: unknown): v is number {
 
 function isIntIn(v: unknown, min: number, max: number): v is number {
 	return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+}
+
+/** A worker count 1..MAX_WORKERS, or a { min, max } range of them with min ≤ max. */
+function validateWorkers(w: unknown, path: string, errors: string[]): void {
+	if (isRecord(w)) {
+		if (!isIntIn(w.min, 1, MAX_WORKERS) || !isIntIn(w.max, 1, MAX_WORKERS) || w.min > w.max || Object.keys(w).length !== 2) {
+			errors.push(`${path}: {min, max}는 1 ≤ min ≤ max ≤ ${MAX_WORKERS} 정수여야 합니다`);
+		}
+	} else if (!isIntIn(w, 1, MAX_WORKERS)) errors.push(`${path}: 1~${MAX_WORKERS} 사이 정수 또는 {min, max}여야 합니다`);
 }
 
 /** Epoch ms of a zoned ISO 8601 timestamp, or undefined. */
@@ -143,8 +154,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 			if (role.effort !== undefined && !oneOf(role.effort, EFFORTS)) {
 				errors.push(`${path}.effort: ${EFFORTS.join("|")} 중 하나여야 합니다`);
 			}
-			if (role.workers !== undefined && !isIntIn(role.workers, 1, 16)) {
-				errors.push(`${path}.workers: 1~16 사이 정수여야 합니다`);
+			if (role.workers !== undefined) validateWorkers(role.workers, `${path}.workers`, errors);
+			if (role.contextCap !== undefined && !isIntIn(role.contextCap, 1, MAX_CONTEXT_CAP)) {
+				errors.push(`${path}.contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
 			}
 			warnUnknown(role, ROLE_KEYS, path, warnings);
 		}
@@ -153,6 +165,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 	const p = value.parallelism;
 	if (typeof p !== "number" || !Number.isInteger(p) || p < 1 || p > 16) {
 		errors.push("parallelism: 1~16 사이 정수여야 합니다");
+	}
+	if (value.contextCap !== undefined && !isIntIn(value.contextCap, 1, MAX_CONTEXT_CAP)) {
+		errors.push(`contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
 	}
 	if (!oneOf(value.isolation, ["isolated", "shared"])) errors.push("isolation: isolated|shared 중 하나여야 합니다");
 	if (!oneOf(value.contract, ["workflowz", "orchestrate"])) {

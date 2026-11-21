@@ -40,17 +40,17 @@ export async function presentProposal(
 	ui: UiPort,
 	proposal: Proposal,
 	current: StormConfig | undefined,
-	extra: { shadows?: ShadowInfo[]; warnings?: string[] } = {},
+	extra: { shadows?: ShadowInfo[]; warnings?: string[]; context?: string } = {},
 ): Promise<"approved" | "deferred" | "cancelled"> {
-	const setup = proposal.kind === "setup";
+	// A setup has nothing to defer to; a run plan waits on the answer now.
+	const final = proposal.kind === "setup" || proposal.kind === "plan";
 	let markdown = renderProposal(proposal, current);
+	if (extra.context) markdown = `${extra.context}\n\n${markdown}`;
 	if (extra.warnings?.length) markdown += `\n\n### 경고\n${extra.warnings.map((w) => `- ${w}`).join("\n")}`;
 	markdown += renderShadows(extra.shadows ?? []);
-	const answer = await ui.select("이 변경을 승인할까요?", setup ? [APPROVE, CANCEL] : [APPROVE, LATER, CANCEL], {
-		title: setup ? "Storm 팀 제안" : "Storm 변경 제안",
-		markdown,
-	});
+	const title = proposal.kind === "setup" ? "Storm 팀 제안" : proposal.kind === "plan" ? "Storm 실행 계획" : "Storm 변경 제안";
+	const answer = await ui.select("이 변경을 승인할까요?", final ? [APPROVE, CANCEL] : [APPROVE, LATER, CANCEL], { title, markdown });
 	if (answer === APPROVE) return "approved";
-	if (setup || answer === CANCEL) return "cancelled";
+	if (final || answer === CANCEL) return "cancelled";
 	return "deferred";
 }

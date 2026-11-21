@@ -1,5 +1,5 @@
-/** Reviewer verdicts read from omp's `yield` tool args, and the one line the summary and status show. */
-import type { AgentEntry, ReviewVerdict } from "../types.ts";
+/** Reviewer yields from omp's `yield` tool args counted as reviews, and the one line the summary and status show. */
+import type { AgentEntry, ReviewTally } from "../types.ts";
 
 /** The parts of omp's `yield` args Storm reads; every field is checked before use. */
 interface YieldArgs {
@@ -15,8 +15,8 @@ interface Finding {
 	priority?: unknown;
 }
 
-/** Counts findings with an integer priority 0..3 into a copy of `findings`; returns how many counted. */
-function countFindings(findings: ReviewVerdict["findings"], list: unknown): number {
+/** Counts findings with an integer priority 0..3 into `findings`; returns how many counted. */
+function countFindings(findings: ReviewTally["findings"], list: unknown): number {
 	let counted = 0;
 	for (const f of Array.isArray(list) ? list : [list]) {
 		if (typeof f !== "object" || f === null) continue;
@@ -28,41 +28,54 @@ function countFindings(findings: ReviewVerdict["findings"], list: unknown): numb
 	return counted;
 }
 
-/** Folds one `yield` call (`{ data?, type?, error? }`) into the verdict; unrelated input returns `prev`. */
-export function reviewFromYield(prev: ReviewVerdict | undefined, input: unknown): ReviewVerdict | undefined {
+const EMPTY: ReviewTally = { reviews: 0, passed: 0, failed: 0, findings: [0, 0, 0, 0] };
+
+/**
+ * Folds one `yield` call (`{ data?, type?, error? }`) into the tally: a findings section adds its findings, a final
+ * payload with `overall_correctness` is one more review (plus its findings). Unrelated input returns `prev`.
+ */
+export function tallyFromYield(prev: ReviewTally | undefined, input: unknown): ReviewTally | undefined {
 	if (typeof input !== "object" || input === null) return prev;
-	const findings: ReviewVerdict["findings"] = prev ? [...prev.findings] : [0, 0, 0, 0];
+	const base = prev ?? EMPTY;
+	const findings: ReviewTally["findings"] = [...base.findings];
 	const { data, type } = input as YieldArgs;
 	if (Array.isArray(type) && type.includes("findings")) {
 		if (countFindings(findings, data) === 0) return prev;
-		return { ...prev, findings };
+		return { ...base, findings };
 	}
 	if (typeof data !== "object" || data === null || Array.isArray(data)) return prev;
 	const final = data as FinalPayload;
 	const verdict = final.overall_correctness;
 	if (verdict !== "correct" && verdict !== "incorrect") return prev;
-	const next: ReviewVerdict = { ...prev, verdict, findings };
-	const confidence = final.confidence;
-	if (typeof confidence === "number" && confidence >= 0 && confidence <= 1) next.confidence = confidence;
 	if (Array.isArray(final.findings)) countFindings(findings, final.findings);
+	const next: ReviewTally = {
+		...base,
+		reviews: base.reviews + 1,
+		passed: base.passed + (verdict === "correct" ? 1 : 0),
+		failed: base.failed + (verdict === "incorrect" ? 1 : 0),
+		findings,
+	};
+	const confidence = final.confidence;
+	if (typeof confidence === "number" && confidence >= 0 && confidence <= 1) next.lastConfidence = confidence;
 	return next;
 }
 
-/** `- 리뷰: 통과 N · 수정 필요 M (P0 a · P1 b)`, or `- 리뷰: 없음` when no agent has a verdict. */
+/** `- 리뷰 N회: 통과 a · 수정 필요 b (P0 x · P1 y)` summed over agents, or `- 리뷰: 없음` before any verdict. */
 export function reviewLine(agents: readonly AgentEntry[]): string {
-	let pass = 0;
-	let fail = 0;
+	let passed = 0;
+	let failed = 0;
 	const totals = [0, 0, 0, 0];
 	for (const agent of agents) {
 		const review = agent.review;
-		if (!review?.verdict) continue;
-		if (review.verdict === "correct") pass++;
-		else fail++;
+		if (!review || review.reviews === 0) continue;
+		passed += review.passed;
+		failed += review.failed;
 		review.findings.forEach((n, i) => {
 			totals[i] = (totals[i] ?? 0) + n;
 		});
 	}
-	if (pass + fail === 0) return "- 리뷰: 없음";
+	const reviews = passed + failed;
+	if (reviews === 0) return "- 리뷰: 없음";
 	const ps = totals.flatMap((n, i) => (n > 0 ? [`P${i} ${n}`] : []));
-	return `- 리뷰: 통과 ${pass} · 수정 필요 ${fail}${ps.length ? ` (${ps.join(" · ")})` : ""}`;
+	return `- 리뷰 ${reviews}회: 통과 ${passed} · 수정 필요 ${failed}${ps.length ? ` (${ps.join(" · ")})` : ""}`;
 }

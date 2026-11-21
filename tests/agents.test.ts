@@ -187,6 +187,27 @@ describe("adviseAgents", () => {
 		expect(advise(entry({ contextTokens: tokens, state: "parked", lastActivityAt: T0 })).action).toBe("fresh");
 	});
 
+	test("at or past the context cap it is always fresh, saying follow-ups are blocked; below it the usual thresholds apply", () => {
+		const team: StormConfig = {
+			version: 1,
+			priority: "balanced",
+			roles: { implementer: { agent: "storm-implementer", models: ["anthropic/sonnet"], contextCap: 50_000 } },
+			parallelism: 2,
+			isolation: "shared",
+			contract: "workflowz",
+			runtime: "omp",
+		};
+		const withCap = (e: AgentEntry) => adviseAgents([e], { now: NOW, settings: AUTO, config: team })[0]!;
+		// 50k is only 25% of the window: without the cap this agent would be reused.
+		const past = withCap(entry({ role: "implementer", contextTokens: 50_000, lastActivityAt: NOW - 2 * MIN }));
+		expect(past.action).toBe("fresh");
+		expect(past.handle).toBeUndefined();
+		expect(past.reason).toContain("후속 지시가 막힙니다");
+		expect(withCap(entry({ role: "implementer", contextTokens: 49_999, lastActivityAt: NOW - 2 * MIN })).action).toBe("reuse");
+		// A running agent stays busy.
+		expect(withCap(entry({ role: "implementer", contextTokens: 60_000, state: "running" })).action).toBe("busy");
+	});
+
 	test("expired cache with a big context: fresh, with the rewrite cost when prices are known", () => {
 		const a = advise(entry({ lastActivityAt: NOW - 10 * MIN }), AUTO, () => SONNET);
 		expect(a.action).toBe("fresh");
@@ -295,9 +316,10 @@ describe("noteAgentReview", () => {
 		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } });
 		noteAgentReview("Rev", { error: "x" });
 		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } });
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } });
 		noteAgentReview("Ghost", { data: { overall_correctness: "correct" } });
 		const [rev, impl] = listAgents();
-		expect(rev?.review).toEqual({ verdict: "incorrect", findings: [1, 0, 0, 0] });
+		expect(rev?.review).toEqual({ reviews: 2, passed: 1, failed: 1, findings: [1, 0, 0, 0] });
 		expect(impl?.review).toBeUndefined();
 		expect(listAgents()).toHaveLength(2);
 	});

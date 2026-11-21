@@ -198,13 +198,21 @@ describe("handoff", () => {
 		const lines = text.split("\n");
 		expect(lines[0]).toBe("workflowz");
 		expect(lines[1]).toBe('<storm-run id="run-20261120-153012-a1b2" config="ab12ab12ab12">');
-		expect(text).toContain("- storm-explorer: 탐색(넓게 읽고 근거 모으기), 동시에 최대 2개");
+		expect(text).toContain("- storm-explorer: 탐색(넓게 읽고 근거 모으기), 기본 2 · 최대 2개 · 컨텍스트 상한 200k 토큰");
 		expect(text).not.toContain("effort");
-		expect(text).toContain("- storm-implementer: 구현(코드 수정), 동시에 최대 1개");
-		expect(text).toContain("최대 3개");
+		expect(text).toContain("- storm-implementer: 구현(코드 수정), 기본 1 · 최대 2개 · 컨텍스트 상한 200k 토큰");
+		expect(text).toContain("전체로 3개까지");
 		expect(text).toContain("model 을 넘기지 않습니다");
 		expect(text).toContain("승인 밖 모델을 요청하면 scout → explorer, task → implementer 역할 모델로 바뀌고, 그 밖의 에이전트는 스폰이 막힙니다.");
-		expect(text).toContain("끝난 storm-* 에이전트에 agent://<id> 로 보냅니다");
+		// Plan first, with lane kinds resolved to usable roles (missing ones fall back along the stand-ins).
+		expect(text).toContain("storm 도구의 plan 동작으로 실행 계획을 냅니다");
+		expect(text).toContain(
+			"explore→storm-explorer, code→storm-implementer, run→storm-implementer(긴 빌드·기기 실행·대기·로그 수집), review→storm-implementer, design→storm-implementer",
+		);
+		expect(text).toContain("계획 없이 띄우는 스폰은 막힙니다");
+		// Reuse only under the context cap; past it Storm blocks the follow-up.
+		expect(text).toContain("컨텍스트 상한 아래일 때만 그 에이전트에 `write agent://<id>` 로 보냅니다");
+		expect(text).toContain("후속 지시는 Storm 이 막으니");
 		expect(text).toContain("storm 도구의 agents 동작");
 		expect(text).not.toContain("예산");
 		expect(text.endsWith(`</storm-run>\n\n${base.task}`)).toBe(true);

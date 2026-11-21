@@ -162,14 +162,16 @@ export function buildSetupRequest(input: SetupRequestInput): string {
 
 const INSTRUCTIONS = `사용자가 /storm 에서 Storm 팀 설정을 요청했습니다. 위 storm-setup의 사실만으로 다음 순서대로 진행하세요.
 
+먼저: 이 세션에 이미 작업 계획이 있으면(사용자가 언급한 계획 문서, \`local://\` 계획 노트, 대화 속 계획) 인터뷰 전에 읽으세요. 그 계획의 레인 종류(탐색 explore → explorer, 코드 code → implementer, 빌드·기기 실행·대기·로그 수집 run → quick, 리뷰 review → reviewer, 설계 design → architect)와 동시에 돌릴 수를 보고, 계획에 필요 없는 역할은 "사용 안 함"을, 쓰는 역할은 워커 최소~최대를 추천하세요. 이 추천은 storm-recommended-config에 반영해 보여 주고, 계획에서 왔다고 밝히세요. 계획이 없으면 이 단계는 건너뜁니다.
+
 1. \`ask\` 도구로 사용자와 인터뷰하세요. 질문마다 ask 를 따로 부르지 말고, 아래 단계마다 ask 한 번(form 하나)에 그 단계의 질문을 모두 넣으세요(질문마다 fieldset 하나, 폼이 길어도 됩니다). 추천하는 선택지는 label 끝에 " (추천)"을 붙이고 checked 로 미리 골라 두세요. ask 도구의 \`recommended\` 필드는 쓰지 마세요.
-2. 첫 form: storm-recommended-config 의 팀(역할별 주 모델 → 폴백과 effort, 워커, 실행 설정)을 표로 보여 주고, 질문 하나의 선택지는 정확히 "Storm 추천안 그대로 (추천)", "역할별로 고르기", "취소" 세 개입니다.
+2. 첫 form: storm-recommended-config 의 팀(역할별 주 모델 → 폴백과 effort, 워커 최소~최대, 컨텍스트 상한, 실행 설정)을 표로 보여 주고, 질문 하나의 선택지는 정확히 "Storm 추천안 그대로 (추천)", "역할별로 고르기", "취소" 세 개입니다.
    - Storm 추천안 그대로: storm-recommended-config를 그대로 제안합니다.
    - 역할별로 고르기: form 두 개로 묻습니다. 선택지는 위 후보에서 만들고, storm-recommended-config에 있는 값에 (추천)을 붙이세요.
      - 모델 form: 역할마다 주 모델 질문과 폴백 질문 두 개씩. 후보의 가격·속도·점수를 form 안에 표로 함께 보여 주세요. 폴백 질문에는 "폴백 없음"을 둡니다. 주 모델과 같은 모델을 폴백으로 고르면 폴백 없음으로 봅니다.
      - implementer를 뺀 모든 역할의 주 모델 질문은 마지막 선택지로 "사용 안 함"을 둡니다. 이를 고르면 그 역할의 폴백 답은 버리고, 설정 form에서 그 역할을 빼고, 그 역할을 \`roles\`에서 빼고 id를 \`disabledRoles\`에 넣으세요.
      - implementer는 필수 역할이라 "사용 안 함" 선택지가 없습니다.
-     - 설정 form: 모델 form 에서 쓰기로 한 역할마다 effort 질문(그 역할의 주 모델이 지원하는 단계만), 이어서 병렬도, 역할별 워커 수, 실행 계약, 실행당 예산.
+     - 설정 form: 모델 form 에서 쓰기로 한 역할마다 effort 질문(그 역할의 주 모델이 지원하는 단계만), 워커 최소 질문과 워커 최대 질문(1~16, 최소 ≤ 최대, storm-recommended-config의 \`workers\` {min, max}에 (추천)), 이어서 병렬도, 팀 컨텍스트 상한("20만 (추천)", "10만", "40만" 토큰, \`contextCap\`에 200000/100000/400000으로), 실행 계약, 실행당 예산.
    - 취소하거나 답이 없으면 아무것도 호출하지 말고, 바뀐 것이 없다고만 짧게 알리세요.
 3. 사용자가 위 사실에 없는 모델을 물을 때만 웹 검색을 하고, 출처를 밝히세요.
 4. 마지막으로 \`storm\` 도구를 action "propose"로 호출하세요. \`config\`에는 팀 전체 설정 객체(storm-recommended-config와 같은 형식, 모델 항목은 "provider/id:effort", 쓰지 않는 역할은 \`disabledRoles\` 배열)를, \`rationale\`에는 왜 이 팀인지 한국어 2~4문장을 넣으세요. 도구가 설정 오류를 돌려주면 고쳐서 다시 호출하세요.

@@ -1,5 +1,5 @@
 import { agentProviders, lifecycleWarnings, renderAgents, teamProviders } from "../report/agents.ts";
-import { ROLES, STORM_VERSION } from "../roles.ts";
+import { DEFAULT_CONTEXT_CAP, ROLES, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
 import type {
 	Analysis,
@@ -9,8 +9,10 @@ import type {
 	Effort,
 	MetricValue,
 	QuotaState,
+	RoleConfig,
 	RoleRecommendation,
 	RunRecord,
+	RunPlan,
 	RunStatus,
 	Seat,
 	SpawnRecord,
@@ -332,10 +334,14 @@ export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfi
 		line(`${id} 모델`, a && a.models.join(", "), b ? b.models.join(", ") : "(삭제)");
 		// Role-level effort is only a default for entries without a suffix; the interview no longer writes it.
 		if (a?.effort !== undefined || b?.effort !== undefined) line(`${id} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
-		line(`${id} 워커`, a ? String(a.workers ?? 1) : undefined, b ? String(b.workers ?? 1) : DASH);
+		line(`${id} 워커`, a ? workerText(id, a) : undefined, b ? workerText(id, b) : DASH);
+		if (a?.contextCap !== undefined || b?.contextCap !== undefined) {
+			line(`${id} 컨텍스트 상한`, a ? capText(a.contextCap) : undefined, b ? capText(b.contextCap) : DASH);
+		}
 	}
 	if (prev !== undefined || next.disabledRoles?.length) line("사용 안 함", prev && (disabledTitles(prev) || "없음"), disabledTitles(next) || "없음");
 	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));
+	if (prev?.contextCap !== undefined || next.contextCap !== undefined) line("컨텍스트 상한", prev && capText(prev.contextCap), capText(next.contextCap));
 	line("격리", prev?.isolation, next.isolation);
 	line("실행 계약", prev?.contract, next.contract);
 	line("예산", prev && (prev.budget ? budgetText(prev.budget) : "없음"), next.budget ? budgetText(next.budget) : "없음");
@@ -367,6 +373,23 @@ function disabledTitles(config: StormConfig): string {
 	return (config.disabledRoles ?? []).map(roleTitle).join(", ");
 }
 
+/** "2~4", or "2" when min equals max. */
+export function workerText(id: string, role: RoleConfig | undefined): string {
+	const w = workerRange(id, role);
+	return w.min === w.max ? String(w.min) : `${w.min}~${w.max}`;
+}
+
+/** Tokens of a context cap; unset → the default it falls back to. */
+function capText(cap: number | undefined): string {
+	return cap === undefined ? `기본(${int(DEFAULT_CONTEXT_CAP)})` : int(cap);
+}
+
+/** One status line of a role: models, effort, worker range and its own context cap. */
+function roleLine(id: string, r: RoleConfig): string {
+	const cap = r.contextCap !== undefined ? ` · 컨텍스트 상한 ${int(r.contextCap)}` : "";
+	return `- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""} · 워커 ${workerText(id, r)}${cap}`;
+}
+
 export function renderStatus(view: StatusView, now: number): string {
 	const version = view.newerVersion
 		? `- Storm ${STORM_VERSION} · 새 버전 ${view.newerVersion} 설치됨 → /restart 로 적용`
@@ -382,10 +405,8 @@ export function renderStatus(view: StatusView, now: number): string {
 	else out.push("- 미승인");
 	if (c.status === "ok") {
 		out.push("", "### 역할별 모델");
-		for (const [id, r] of Object.entries(c.config.roles)) {
-			const workers = r.workers !== undefined ? ` · 워커 ${r.workers}` : "";
-			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}${workers}`);
-		}
+		for (const [id, r] of Object.entries(c.config.roles)) out.push(roleLine(id, r));
+		out.push(`- 컨텍스트 상한: ${int(c.config.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`);
 		if (c.config.fallbackRole !== undefined) {
 			out.push(`- 실행 중 다른 에이전트: ${fallbackText(c.config.fallbackRole)}`);
 		}
@@ -448,9 +469,8 @@ export function renderStatusBrief(view: StatusView, now: number): string {
 	if (c.status === "ok") {
 		const hash = c.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
 		out.push(`- 설정 ${hash} · ${view.approval ? "승인됨" : "미승인"} · 우선순위 ${priorityLabel(c.config.priority)}`);
-		for (const [id, r] of Object.entries(c.config.roles)) {
-			out.push(`- ${id}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""}${r.workers !== undefined ? ` · 워커 ${r.workers}` : ""}`);
-		}
+		for (const [id, r] of Object.entries(c.config.roles)) out.push(roleLine(id, r));
+		out.push(`- 컨텍스트 상한 ${int(c.config.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`);
 		if (c.config.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(c.config)}`);
 	} else out.push(c.status === "missing" ? "- 설정 없음" : "- 설정 오류");
 	if (view.run) out.push(`- 실행 중: ${view.run.runId} · ${spendText(view.run.costUsd, view.run.budget)}`);
@@ -513,8 +533,16 @@ function lastRunLines(run: RunRecord): string[] {
 	const out = [`- ${run.runId} · ${RUN_STATUS[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
 	if (blocked?.reason) out.push(`- 첫 차단: ${blocked.agent} · ${blocked.reason}`);
+	if (run.plan) out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
 	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
 	return out;
+}
+
+/** Lanes per role of a run plan: "구현 2, 리뷰 1". */
+export function planCounts(plan: RunPlan): string {
+	const counts = new Map<string, number>();
+	for (const l of plan.lanes) counts.set(l.role, (counts.get(l.role) ?? 0) + 1);
+	return [...counts].map(([role, n]) => `${roleTitle(role)} ${n}`).join(", ");
 }
 
 function trialViewLines(v: TrialView): string[] {

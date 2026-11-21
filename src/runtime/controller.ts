@@ -4,10 +4,12 @@
  * the process (children included), so they are collected per run in module scope.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { tokens } from "../report/agents.ts";
+import { PREFLIGHT_SHARE, PREFLIGHT_TOKENS, ROLES } from "../roles.ts";
 import type { ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
-import type { AgentEntry, RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
-import { activeLedgerRun, endLedgerRun, type LedgerRun, startLedgerRun } from "./ledger.ts";
+import type { AgentEntry, RunPlan, RunRecord, RunStatus, SpawnRecord, UiPort } from "../types.ts";
+import { activeLedgerRun, endLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
 import { buildHandoff, newRunId, pickKeyword, pruneRuns, writeRun } from "./run.ts";
 
@@ -22,6 +24,18 @@ const LIVE_FLUSH_MS = 2_000;
 export function touchRun(runId: string): void {
 	liveWriters.get(runId)?.();
 }
+
+/** The spawns decided so far in a run, from whichever session decided them (a copy). */
+export function runSpawns(runId: string): SpawnRecord[] {
+	return [...(spawnsByRun.get(runId) ?? [])];
+}
+
+const PREFLIGHT_COMPACT = "압축 후 시작 (추천)";
+const PREFLIGHT_AS_IS = "그대로 시작";
+const PREFLIGHT_CANCEL = "취소";
+/** What compaction before a run must keep: the director works from it for the whole run. */
+const PREFLIGHT_INSTRUCTIONS =
+	"곧 Storm 실행을 시작합니다. 작업 계획, 내린 결정과 그 이유, 남은 문제, 관련 파일 경로는 빠짐없이 남기고 나머지는 짧게 줄이세요.";
 
 /** Called by the spawn hook of whichever session decided the spawn. */
 export function noteRunSpawn(runId: string, record: SpawnRecord): void {
@@ -122,6 +136,10 @@ export class RunController {
 		const shadow = unapprovedShadowPath(state);
 		if (shadow) return { ok: false, reason: `승인되지 않은 역할 정의가 있습니다: ${shadow}. /storm 으로 확인하세요.` };
 		if (activeLedgerRun(state.repo.repoId)) return { ok: false, reason: "이 프로젝트에서 다른 Storm 실행이 진행 중입니다." };
+		const declined = await this.#preflight(ctx);
+		if (declined) return { ok: false, reason: declined };
+		// The dialog and the compaction awaited: another run may have started meanwhile.
+		if (this.#own || activeLedgerRun(state.repo.repoId)) return { ok: false, reason: "이 프로젝트에서 다른 Storm 실행이 진행 중입니다." };
 
 		const config = load.config;
 		const keyword = pickKeyword(config, await this.deps.usableKeywords(ctx));
@@ -184,6 +202,45 @@ export class RunController {
 		if (!own) return;
 		own.record.blockedEdits = (own.record.blockedEdits ?? 0) + 1;
 		this.#scheduleFlush(own);
+	}
+
+	/** A follow-up to an agent past its context cap that Storm sent back to a fresh agent. */
+	noteBlockedFollowUp(): void {
+		const own = this.#own;
+		if (!own) return;
+		own.record.blockedFollowUps = (own.record.blockedFollowUps ?? 0) + 1;
+		this.#scheduleFlush(own);
+	}
+
+	/** From the storm tool's plan action: the plan this session's run spawns under, visible to every session. */
+	setPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string } {
+		const own = this.#own;
+		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 계획을 저장하지 않았습니다." };
+		setLedgerPlan(own.record.runId, plan);
+		own.record.plan = plan;
+		this.#scheduleFlush(own);
+		return { ok: true };
+	}
+
+	/** A heavy main context costs on every director request: offer compaction first. Returns why the run does not start. */
+	async #preflight(ctx: ExtensionContext): Promise<string | undefined> {
+		if (!ctx.hasUI) return undefined;
+		const usage = ctx.getContextUsage();
+		if (!usage || !(usage.tokens >= PREFLIGHT_TOKENS || usage.percent >= PREFLIGHT_SHARE * 100)) return undefined;
+		const choice = await this.deps
+			.ui(ctx)
+			.select("메인 세션 컨텍스트가 큽니다. Storm 실행을 어떻게 시작할까요?", [PREFLIGHT_COMPACT, PREFLIGHT_AS_IS, PREFLIGHT_CANCEL], {
+				title: "메인 세션 컨텍스트",
+				markdown: `- ${tokens(usage.tokens)} 토큰 / 창 ${tokens(usage.contextWindow)} (${Math.round(usage.percent)}%)\n- 감독은 요청마다 이 맥락을 다시 싣습니다. 압축하면 실행 내내 비용이 줄어듭니다.`,
+			});
+		if (choice === PREFLIGHT_AS_IS) return undefined;
+		if (choice !== PREFLIGHT_COMPACT) return "Storm 실행을 취소했습니다.";
+		try {
+			await ctx.compact(PREFLIGHT_INSTRUCTIONS);
+		} catch (error) {
+			return `컨텍스트를 압축하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		return undefined;
 	}
 
 	async onAgentEnd(event: { willContinue?: boolean; awaitingAsyncWork?: boolean }, ctx: ExtensionContext): Promise<void> {
@@ -271,7 +328,7 @@ export function summarizeRun(run: RunRecord): string {
 		: "없음";
 	const status: Record<RunStatus, string> = { running: "진행 중", done: "완료", "budget-exceeded": "예산 초과", stopped: "중단" };
 	const lines = [
-		`- 실행: ${run.runId} (${status[run.status]}) · 비용(정가 환산) ${money(run.costUsd)}${run.budget ? ` / 예산 ${money(run.budget.perRunUsd)}` : ""}`,
+		`- 실행: ${run.runId} (${status[run.status]}) · 비용(정가 환산) ${money(run.costUsd)}${run.budget ? ` / 예산 ${money(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
 		`- 스폰: ${spawnLine}${blocked?.reason ? ` · 차단 사유: ${blocked.reason}` : ""}`,
 	];
 	const main: string[] = [];
@@ -279,6 +336,7 @@ export function summarizeRun(run: RunRecord): string {
 		main.push(`비용 ${money(run.mainCostUsd)}(전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%)`);
 	}
 	if (run.blockedEdits) main.push(`직접 수정 ${run.blockedEdits}회를 위임으로 돌림`);
+	if (run.blockedFollowUps) main.push(`상한 넘은 후속 지시 ${run.blockedFollowUps}회를 새 에이전트로 돌림`);
 	if (main.length) lines.push(`- 메인(감독): ${main.join(" · ")}`);
 	const agents = run.agents ?? [];
 	if (agents.length) {
@@ -288,4 +346,12 @@ export function summarizeRun(run: RunRecord): string {
 	}
 	if (run.spawns.length) lines.push(reviewLine(agents));
 	return lines.join("\n");
+}
+
+/** `계획 레인 3(구현 2 · 리뷰 1)`: the plan's lanes counted per role, in lane order. */
+function planText(plan: RunPlan): string {
+	const byRole = new Map<string, number>();
+	for (const lane of plan.lanes) byRole.set(lane.role, (byRole.get(lane.role) ?? 0) + 1);
+	const roles = [...byRole].map(([role, n]) => `${ROLES.find(r => r.id === role)?.title ?? role} ${n}`).join(" · ");
+	return `계획 레인 ${plan.lanes.length}${roles ? `(${roles})` : ""}`;
 }

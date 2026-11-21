@@ -4,7 +4,7 @@
  */
 import { fallbackOf, priorityLabel, roleTitle } from "../interview/render.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
-import { ROLES } from "../roles.ts";
+import { MAX_WORKERS, ROLES, workerRange } from "../roles.ts";
 import { entryEffort, formatModelEntry, parseModelEntry } from "../selector.ts";
 import type {
 	BudgetConfig,
@@ -21,7 +21,6 @@ export type Built = { config: StormConfig; summary: string } | { error: string }
 export type ModelCheck = { ok: true; label: string; efforts: Effort[] } | { ok: false; reason: string };
 
 const DAY_MS = 86_400_000;
-export const MAX_WORKERS = 16;
 export const TRIAL_DEFAULTS = { share: 0.25, maxSpawns: 20, days: 7, budgetUsd: 2 } as const;
 
 export function roleSpec(role: string): RoleSpec | undefined {
@@ -130,17 +129,19 @@ function missingRole(config: StormConfig, role: string): string {
 	return `${role}: 설정에 없는 역할입니다`;
 }
 
-export function buildWorkers(current: StormConfig, role: string, workers: number): Built {
-	if (!current.roles[role]) return { error: missingRole(current, role) };
-	if (!Number.isInteger(workers) || workers < 1 || workers > MAX_WORKERS) {
-		return { error: `workers: 1~${MAX_WORKERS} 사이 정수여야 합니다` };
+/** Sets a role's worker range; an unset bound keeps the current one. Writes the { min, max } form. */
+export function buildWorkers(current: StormConfig, role: string, min: number | undefined, max: number | undefined): Built {
+	const prev = current.roles[role];
+	if (!prev) return { error: missingRole(current, role) };
+	if (min === undefined && max === undefined) return { error: "min이나 max가 필요합니다" };
+	const now = workerRange(role, prev);
+	const range = { min: min ?? Math.min(now.min, max ?? now.min), max: max ?? Math.max(now.max, min ?? now.max) };
+	if (![range.min, range.max].every((n) => Number.isInteger(n) && n >= 1 && n <= MAX_WORKERS) || range.min > range.max) {
+		return { error: `workers: 1 ≤ min ≤ max ≤ ${MAX_WORKERS} 정수여야 합니다` };
 	}
 	const next = structuredClone(current);
-	const r = next.roles[role]!;
-	// 1 is the default; leaving it out keeps v0.1 configs byte-identical.
-	if (workers === 1) delete r.workers;
-	else r.workers = workers;
-	return { config: next, summary: `${roleTitle(role)} 워커를 ${workers}개로 바꿉니다` };
+	next.roles[role]!.workers = range;
+	return { config: next, summary: `${roleTitle(role)} 워커를 ${range.min}~${range.max}개로 바꿉니다` };
 }
 
 /**

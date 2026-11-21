@@ -70,6 +70,8 @@ const MODELS = {
 		// Below every role's minimum context, so no team ever approves it: the model outside the team. Priced like premium-c,
 		// so one main request of a run already passes the budget step's cap.
 		["outsider-z", { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, context: 60_000 }],
+		// Reports a 35k prompt on a 60k window (fake-llm.ts): a heavy main session for the run-start check. Never in a team.
+		["heavy-main", { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1, context: 60_000 }],
 	],
 	fake2: [
 		["cheap-d", { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0.2 }],
@@ -417,13 +419,14 @@ async function main(): Promise<void> {
 		);
 
 		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
-		type StoredRole = { models: string[]; effort?: string; workers?: number };
+		type StoredRole = { models: string[]; effort?: string; workers?: number | { min: number; max: number } };
 		type StoredConfig = {
 			priority: string;
 			roles: Record<string, StoredRole>;
 			trials?: unknown[];
 			budget?: { perRunUsd: number };
 			disabledRoles?: string[];
+			contextCap?: number;
 		};
 		type StoredAgent = {
 			id: string;
@@ -432,15 +435,17 @@ async function main(): Promise<void> {
 			contextTokens: number;
 			state: string;
 			followUps: number;
-			review?: { verdict?: string; findings: number[] };
+			review?: { reviews: number; passed: number; failed: number; findings: number[] };
 		};
 		type StoredRun = {
 			status: string;
 			contract: string;
-			spawns: Array<{ outcome: string; agent: string; spawnKey?: string; role?: string }>;
+			spawns: Array<{ outcome: string; agent: string; spawnKey?: string; role?: string; reason?: string }>;
 			agents?: StoredAgent[];
 			mainCostUsd?: number;
 			blockedEdits?: number;
+			blockedFollowUps?: number;
+			plan?: { lanes: unknown[]; workers: Record<string, number> };
 		};
 		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
 		const idOf = (entry: string | undefined): string | undefined =>
@@ -462,6 +467,11 @@ async function main(): Promise<void> {
 		};
 		/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
 		const OUTSIDER = "fake/outsider-z";
+		/** A run whose director follows scripted steps (fake-llm.ts SPIKE-STEPS): plans, spawns and follow-ups in order. */
+		const runTask = (steps: unknown[]): string => `/storm STORM-TOOL ${JSON.stringify({ action: "run", task: `SPIKE-STEPS ${JSON.stringify(steps)}` })}`;
+		const planStep = (lanes: Array<{ name: string; kind: string }>, workers: Record<string, number> = {}) => ({
+			storm: { action: "plan", plan: { lanes, workers } },
+		});
 
 		let team = readConfig();
 		let primary = team.roles.implementer?.models[0];
@@ -469,7 +479,9 @@ async function main(): Promise<void> {
 			"v0.2 전제: 대체 확인용 모델은 승인 밖",
 			!Object.values(team.roles).some(role => role.models.some(model => bare(model) === OUTSIDER)),
 		);
-		let talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK storm-implementer task"}', noAnswer, { model: OUTSIDER });
+		let talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer", "task"] }]), noAnswer, {
+			model: OUTSIDER,
+		});
 		// The hidden notice is delivered with the handoff, so the logged (truncated) user text may not show the contract itself.
 		const noticed = talk.llm.some(entry => !entry.child && entry.notices.workflowz.length > 0);
 		check("실행: 인계에 workflowz 계약", noticed && runFiles().at(-1)?.contract === "workflowz", `contract=${runFiles().at(-1)?.contract} noticed=${noticed}`);
@@ -498,12 +510,20 @@ async function main(): Promise<void> {
 			spawnKeys.length > 0 && spawnKeys.every(key => ledger.some(agent => agent.id === key)),
 			`spawnKeys=${spawnKeys.join(",")} agents=${ledger.map(agent => agent.id).join(",")}`,
 		);
+		check("실행 계획: 실행 기록에 남음", firstRun?.plan?.lanes.length === 1 && firstRun.plan.workers.implementer === 1, JSON.stringify(firstRun?.plan));
 		// omp's built-in agents get their mapped role's models, and a reviewer's yielded verdict lands in the run record.
 		const explorerPrimary = team.roles.explorer?.models[0];
-		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK scout storm-reviewer"}', noAnswer, {
-			model: OUTSIDER,
-			flags: ["--smol", OUTSIDER],
-		});
+		talk = await converse(
+			runTask([
+				planStep([
+					{ name: "scope", kind: "explore" },
+					{ name: "review", kind: "review" },
+				]),
+				{ task: ["scout", "storm-reviewer"] },
+			]),
+			noAnswer,
+			{ model: OUTSIDER, flags: ["--smol", OUTSIDER] },
+		);
 		const reviewRun = runFiles().at(-1);
 		const scoutSpawn = reviewRun?.spawns.find(spawn => spawn.agent === "scout");
 		check(
@@ -514,9 +534,40 @@ async function main(): Promise<void> {
 		const verdicts = (reviewRun?.agents ?? []).flatMap(agent => (agent.review ? [agent.review] : []));
 		check(
 			"리뷰 판정: 실행 기록과 결과 보고에 남음",
-			verdicts.some(review => review.verdict === "incorrect" && review.findings[1] === 1) &&
-				talk.frames.some(frame => textOf(frame).includes("수정 필요 1 (P1 1)")),
-			`verdicts=${JSON.stringify(verdicts)} agents=${JSON.stringify((reviewRun?.agents ?? []).map(agent => [agent.id, agent.role, agent.review]))} yields=${JSON.stringify(talk.llm.filter(entry => entry.child).map(entry => entry.decision))}`,
+			verdicts.some(review => review.reviews === 1 && review.failed === 1 && review.findings[1] === 1) &&
+				talk.frames.some(frame => textOf(frame).includes("리뷰 1회") && textOf(frame).includes("수정 필요 1 (P1 1)")),
+			`verdicts=${JSON.stringify(verdicts)} agents=${JSON.stringify((reviewRun?.agents ?? []).map(agent => [agent.id, agent.role, agent.review]))}`,
+		);
+
+		// A run refuses spawns until the director submits a plan, each role stays within the plan's workers,
+		// and a plan past the team's bounds needs an approved config change.
+		const planHash = configHashOnDisk();
+		talk = await converse(
+			runTask([
+				{ task: ["storm-explorer"] },
+				// omp decides the spawn in the background after task returns: submit the plan only once it was refused.
+				{ ...planStep([{ name: "scope", kind: "explore" }], { explorer: 1 }), after: "실행 계획이 없어" },
+				{ task: ["storm-explorer", "storm-explorer"] },
+				planStep([{ name: "scope", kind: "explore" }], { explorer: 9 }),
+			]),
+			choose("취소"),
+		);
+		const planRun = runFiles().at(-1);
+		const explorerSpawns = (planRun?.spawns ?? []).filter(spawn => spawn.agent === "storm-explorer");
+		check(
+			"실행 계획: 계획 전 스폰은 막힘",
+			explorerSpawns[0]?.outcome === "blocked" && (explorerSpawns[0].reason ?? "").includes("계획"),
+			JSON.stringify((planRun?.spawns ?? []).map(spawn => [spawn.agent, spawn.outcome, spawn.spawnKey, (spawn.reason ?? "").slice(0, 40)])),
+		);
+		check(
+			"실행 계획: 계획의 워커 수를 넘는 스폰은 막힘",
+			explorerSpawns[1]?.outcome === "routed" && explorerSpawns[2]?.outcome === "blocked",
+			JSON.stringify(explorerSpawns.slice(1).map(spawn => [spawn.outcome, spawn.reason?.slice(0, 60)])),
+		);
+		check(
+			"실행 계획: 범위 밖 계획은 승인 창, 취소하면 그대로",
+			uiTitled(talk.frames, "이 변경을 승인할까요") && configHashOnDisk() === planHash && planRun?.plan?.workers.explorer === 1,
+			JSON.stringify(planRun?.plan?.workers),
 		);
 		talk = await converse(["SPIKE-TASK storm-implementer", '/storm STORM-TOOL {"action":"agents"}'], noAnswer);
 		const agentsReply = talk.frames.map(textOf).find(text => text.includes("(implementer)") && text.includes("| 권장 |"));
@@ -570,7 +621,7 @@ async function main(): Promise<void> {
 
 		hash = configHashOnDisk();
 		approvals = approvalFiles().length;
-		await converse('/storm STORM-TOOL {"action":"workers","role":"reviewer","workers":3}', noAnswer, { flags: ["--no-ui"] });
+		await converse('/storm STORM-TOOL {"action":"workers","role":"reviewer","min":1,"max":3}', noAnswer, { flags: ["--no-ui"] });
 		check(
 			"UI 없음: 제안만 보류",
 			configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 1,
@@ -583,7 +634,12 @@ async function main(): Promise<void> {
 			return options.includes("승인") ? "승인" : undefined;
 		});
 		team = readConfig();
-		check("메뉴: 보류 제안 승인", team.roles.reviewer?.workers === 3 && proposalFiles().length === 0, `workers=${team.roles.reviewer?.workers}`);
+		const reviewerWorkers = team.roles.reviewer?.workers;
+		check(
+			"메뉴: 보류 제안 승인",
+			typeof reviewerWorkers === "object" && reviewerWorkers.min === 1 && reviewerWorkers.max === 3 && proposalFiles().length === 0,
+			`workers=${JSON.stringify(reviewerWorkers)}`,
+		);
 
 		const implementerModels = team.roles.implementer?.models ?? [];
 		const fallback = implementerModels.find(model => providerOf(model) !== providerOf(implementerModels[0]));
@@ -637,7 +693,9 @@ async function main(): Promise<void> {
 		await converse('/storm STORM-TOOL {"action":"budget","budgetUsd":0.0005}', choose("승인"));
 		team = readConfig();
 		check("예산: 승인 후 설정", team.budget?.perRunUsd === 0.0005, JSON.stringify(team.budget));
-		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-TASK storm-implementer"}', noAnswer, { model: OUTSIDER });
+		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }]), noAnswer, {
+			model: OUTSIDER,
+		});
 		const budgetRun = runFiles().at(-1);
 		check(
 			"예산: 넘으면 새 스폰 차단",
@@ -666,6 +724,28 @@ async function main(): Promise<void> {
 			"설정에 없는 역할: 가까운 역할(구현) 모델로",
 			run.children[0]?.model === idOf(implementerPrimary),
 			`child=${run.children[0]?.model} expected=${idOf(implementerPrimary)}`,
+		);
+
+		// An agent at or past its context cap takes no follow-ups during a run: the director must start a fresh one.
+		const capped = readConfig();
+		capped.contextCap = 50;
+		delete capped.budget;
+		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: capped, rationale: "E2E" })}`, choose("승인"));
+		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }, { write: "agent://Spike0" }]), noAnswer);
+		const capRun = runFiles().at(-1);
+		check(
+			"컨텍스트 상한: 넘은 에이전트로 가는 후속 지시는 막힘",
+			readConfig().contextCap === 50 && talk.frames.some(frame => textOf(frame).includes("컨텍스트 상한")) && capRun?.blockedFollowUps === 1,
+			`blockedFollowUps=${capRun?.blockedFollowUps}`,
+		);
+
+		// A heavy main session is asked whether to compact before the run starts; cancelling starts nothing.
+		const runsBefore = runFiles().length;
+		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }])]), choose("취소"), { model: "fake/heavy-main" });
+		check(
+			"실행 전 점검: 메인 컨텍스트가 크면 묻고, 취소하면 시작 안 함",
+			uiTitled(talk.frames, "메인 세션 컨텍스트가 큽니다") && runFiles().length === runsBefore,
+			`runs=${runFiles().length}/${runsBefore}`,
 		);
 
 		const approvalsBeforeReset = approvalFiles().length;

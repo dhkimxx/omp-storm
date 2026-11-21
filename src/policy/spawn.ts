@@ -1,7 +1,8 @@
-import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES } from "../roles.ts";
+import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES, workerRange } from "../roles.ts";
 import { activeTrialFor, shouldRouteToTrial } from "../runtime/trials.ts";
 import { formatModelEntry, parseModelEntry } from "../selector.ts";
 import type {
+	AgentEntry,
 	Effort,
 	QuotaMark,
 	SpawnEvent,
@@ -89,6 +90,69 @@ export function usableRole(config: StormConfig, id: string): StormConfig["roles"
 	return role && role.models.length > 0 && !config.disabledRoles?.includes(id) ? role : undefined;
 }
 
+/** A spawn decided this recently whose agent has not reported yet still counts as live: it is starting. */
+export const PENDING_SPAWN_MS = 120_000;
+
+/** The role a live spawn counts against: a stand-in spawn counts against the role it asked for, not the borrowed one. */
+function countedRole(record: SpawnRecord): string | undefined {
+	if (record.outcome === "substituted" && record.agent.startsWith(ROLE_AGENT_PREFIX)) {
+		return ROLES.find(r => r.agent === record.agent)?.id ?? record.role;
+	}
+	return record.role;
+}
+
+/**
+ * Live agents of a run: spawns Storm let through whose agent is running in the ledger, or that have no ledger entry
+ * yet and were decided within `PENDING_SPAWN_MS`. Records without a spawn key cannot be matched and do not count.
+ */
+export function activeAgents(
+	spawns: readonly SpawnRecord[],
+	agents: readonly AgentEntry[],
+	now: number,
+): { total: number; byRole: Record<string, number> } {
+	const byId = new Map(agents.map(a => [a.id, a]));
+	const byRole: Record<string, number> = {};
+	let total = 0;
+	for (const record of spawns) {
+		if (record.outcome === "blocked" || record.spawnKey === undefined) continue;
+		const agent = byId.get(record.spawnKey);
+		const live = agent ? agent.state === "running" : now - Date.parse(record.ts) < PENDING_SPAWN_MS;
+		if (!live) continue;
+		total++;
+		const role = countedRole(record);
+		if (role !== undefined) byRole[role] = (byRole[role] ?? 0) + 1;
+	}
+	return { total, byRole };
+}
+
+/** During a run every Storm-decided spawn waits for the director's run plan. */
+function planBlock(runtime: SpawnRuntime): string | undefined {
+	if (!runtime.run || runtime.run.plan) return undefined;
+	return "실행 계획이 없어 스폰을 막았습니다. 먼저 storm 도구의 plan 동작으로 실행 계획을 내세요: 레인(kind·role·files)과 역할별 워커 수. 작은 작업은 레인 하나면 됩니다.";
+}
+
+/** Live agents of the run against the team's parallelism. */
+function totalBlock(config: StormConfig, runtime: SpawnRuntime): string | undefined {
+	const total = runtime.run?.active?.total ?? 0;
+	if (!runtime.run || total < config.parallelism) return undefined;
+	return `서브에이전트 ${total}개가 실행 중이라 팀 동시 상한 ${config.parallelism}개에 닿아 스폰을 막았습니다. 하나가 끝나기를 기다리거나, 컨텍스트 상한 아래의 유휴 에이전트를 재사용하세요(write agent://<id>).`;
+}
+
+/** Live agents of one role against the run plan's workers for it. */
+function roleCapBlock(config: StormConfig, runtime: SpawnRuntime, roleId: string, agent: string): string | undefined {
+	const run = runtime.run;
+	const plan = run?.plan;
+	if (!run || !plan) return undefined;
+	const cap = plan.workers[roleId] ?? 0;
+	if (cap <= 0) {
+		return `실행 계획에 ${roleId} 역할 레인이 없어 ${agent} 스폰을 막았습니다. 이 역할이 필요하면 storm 도구의 plan 동작으로 계획을 다시 내세요.`;
+	}
+	const running = run.active?.byRole[roleId] ?? 0;
+	if (running < cap) return undefined;
+	const max = workerRange(roleId, config.roles[roleId]).max;
+	return `${agent} ${running}개가 실행 중이라 실행 계획의 ${roleId} 상한 ${cap}개에 닿아 스폰을 막았습니다. 컨텍스트 상한 아래의 유휴 ${agent} 를 재사용하거나(write agent://<id>), 하나가 끝나기를 기다리거나, plan 동작으로 워커를 늘려 계획을 다시 내세요(이 역할 최대 ${max}개).`;
+}
+
 /** Decides how a spawn runs: `storm-*` agents always, other agents only while a Storm run is active. */
 export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: SpawnRuntime): SpawnOutcome {
 	const base: SpawnRecord = {
@@ -114,6 +178,8 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		if (!checked.ok) return block(checked.reason);
 		const overBudget = budgetBlock(runtime);
 		if (overBudget) return block(overBudget);
+		const runBlock = planBlock(runtime) ?? totalBlock(checked.config, runtime);
+		if (runBlock) return block(runBlock);
 		const requested = stripEffort(event.patterns[0] ?? "");
 		if (approvedSelectors(checked.config).has(requested)) {
 			return { decision: undefined, record: { ...base, outcome: "allowed" } };
@@ -148,10 +214,14 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	const config = checked.config;
 	const entry = Object.entries(config.roles).find(([, r]) => r.agent === event.agent);
 	let roleKey: string;
+	/** The role id this spawn asked for: a stand-in borrows `roleKey`'s models but counts against this one. */
+	let requestedRole: string;
 	let role: StormConfig["roles"][string];
 	let standIn = false;
-	if (entry) [roleKey, role] = entry;
-	else {
+	if (entry) {
+		[roleKey, role] = entry;
+		requestedRole = roleKey;
+	} else {
 		const spec = ROLES.find(r => r.agent === event.agent);
 		if (!spec) return block(`Storm 설정에 ${event.agent} 역할이 없습니다.`);
 		const usable = ROLE_STAND_INS[spec.id].find(id => usableRole(config, id));
@@ -166,6 +236,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		roleKey = usable;
 		role = borrowed;
 		standIn = true;
+		requestedRole = spec.id;
 	}
 
 	const approvedShadows = checked.approved.scope.shadowedAgents;
@@ -178,6 +249,9 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	if (role.models.length === 0) return block(`Storm 설정의 ${event.agent} 역할에 모델이 없습니다.`, { role: roleKey });
 	const overBudget = budgetBlock(runtime);
 	if (overBudget) return block(overBudget, { role: roleKey });
+	const runBlock =
+		planBlock(runtime) ?? roleCapBlock(config, runtime, requestedRole, event.agent) ?? totalBlock(config, runtime);
+	if (runBlock) return block(runBlock, { role: roleKey });
 
 	const ordered = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));
 	if (standIn) return route(ordered, { outcome: "substituted", role: roleKey, reason: `설정에 없는 역할 → ${roleKey} 역할 모델` });

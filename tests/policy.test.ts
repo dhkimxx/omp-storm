@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { approvedSelectors, decideSpawn, orderByQuota, stripEffort, withEffort } from "../src/policy/spawn.ts";
+import { followUpBlock } from "../src/policy/followup.ts";
+import { activeAgents, approvedSelectors, decideSpawn, orderByQuota, stripEffort, withEffort } from "../src/policy/spawn.ts";
 import type {
+	AgentEntry,
 	ApprovalRecord,
 	ConfigLoad,
 	QuotaMark,
+	RunPlan,
 	ShadowInfo,
 	SpawnDecision,
 	SpawnEvent,
+	SpawnRecord,
 	SpawnRuntime,
 	SpawnState,
 	StormConfig,
@@ -62,7 +66,12 @@ function approval(overrides: Partial<ApprovalRecord> = {}, shadowedAgents: Shado
 const ev = (agent: string, patterns: string[] = []): SpawnEvent => ({ agent, invocationKind: "task", patterns });
 const state = (over: Partial<SpawnState> = {}): SpawnState => ({ config: ok, approval: approval(), shadows: [], ...over });
 const runtime = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => ({ now: NOW, quotaMarks: [], trials: {}, ...over });
-const inRun = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => runtime({ run: { runId: "run-1", costUsd: 0 }, ...over });
+const PLAN: RunPlan = {
+	lanes: [{ name: "lane", kind: "code", role: "reviewer" }],
+	workers: { reviewer: 2, explorer: 2, implementer: 2 },
+	submittedAt: "2026-11-20T11:00:00.000Z",
+};
+const inRun = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => runtime({ run: { runId: "run-1", costUsd: 0, plan: PLAN }, ...over });
 const decide = (e: SpawnEvent, s: SpawnState, rt: SpawnRuntime = runtime()): SpawnDecision => decideSpawn(e, s, rt).decision;
 const reason = (d: SpawnDecision): string | undefined => (d && "block" in d ? d.reason : undefined);
 const models = (d: SpawnDecision): string[] | undefined => (d && "model" in d ? d.model : undefined);
@@ -212,7 +221,7 @@ describe("decideSpawn (v0.2 storm agents)", () => {
 		expect(reason(decide(ev("storm-explorer"), state(), small))).toBe(
 			"Storm 실행 예산 $0.5000을 넘었습니다(누계 $0.7500). 새 스폰을 막습니다.",
 		);
-		const under = inRun({ run: { runId: "run-1", costUsd: 4.99, budget } });
+		const under = inRun({ run: { runId: "run-1", costUsd: 4.99, budget, plan: PLAN } });
 		expect(models(decide(ev("storm-explorer"), state(), under))).toEqual(["google/gemini-flash"]);
 	});
 
@@ -398,5 +407,168 @@ describe("decideSpawn (v0.7 role states)", () => {
 		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
 		const blocked = decideSpawn(ev("task", ["x/unknown"]), withConfig(config), inRun());
 		expect(blocked.record?.outcome).toBe("blocked");
+	});
+});
+
+describe("decideSpawn (v0.8 run plan and live caps)", () => {
+	const run = (plan: RunPlan | undefined, active: { total: number; byRole: Record<string, number> } = { total: 0, byRole: {} }) =>
+		runtime({ run: { runId: "run-1", costUsd: 0, ...(plan ? { plan } : {}), active } });
+	const plan = (workers: Record<string, number>): RunPlan => ({ ...PLAN, workers });
+
+	test("during a run every Storm-decided spawn waits for a plan; outside runs nothing changes", () => {
+		const storm = decideSpawn(ev("storm-explorer"), state(), run(undefined));
+		expect(reason(storm.decision)).toContain("storm 도구의 plan 동작");
+		expect(storm.record).toMatchObject({ outcome: "blocked", role: "explorer" });
+		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state(), run(undefined)))).toContain("plan 동작");
+		expect(reason(decide(ev("task", ["evil/model"]), state(), run(undefined)))).toContain("plan 동작");
+		// Outside a run: no plan, no caps.
+		expect(models(decide(ev("storm-explorer"), state(), runtime()))).toEqual(["google/gemini-flash"]);
+		expect(decideSpawn(ev("task", ["evil/model"]), state(), runtime())).toEqual({ decision: undefined });
+	});
+
+	test("a storm role the plan gives no workers is blocked with a resubmit hint", () => {
+		const out = decideSpawn(ev("storm-reviewer"), state(), run(plan({ explorer: 2 })));
+		expect(reason(out.decision)).toContain("reviewer 역할 레인이 없어");
+		expect(reason(out.decision)).toContain("계획을 다시 내세요");
+		expect(reason(decide(ev("storm-reviewer"), state(), run(plan({ reviewer: 0, explorer: 2 }))))).toContain("레인이 없어");
+	});
+
+	test("the role cap is the plan's workers for it; the reason names the cap, the count and the role max", () => {
+		const full = decideSpawn(ev("storm-explorer"), state(), run(plan({ explorer: 2 }), { total: 2, byRole: { explorer: 2 } }));
+		const why = reason(full.decision) ?? "";
+		expect(why).toContain("storm-explorer 2개가 실행 중");
+		expect(why).toContain("상한 2개");
+		expect(why).toContain("재사용");
+		expect(why).toContain("최대 4개");
+		const roomy = { ...config, parallelism: 8 };
+		expect(models(decide(ev("storm-explorer"), withConfig(roomy), run(plan({ explorer: 2 }), { total: 1, byRole: { explorer: 1 } })))).toEqual([
+			"google/gemini-flash",
+		]);
+		// Other roles' agents do not use up this role's cap.
+		expect(models(decide(ev("storm-explorer"), withConfig(roomy), run(plan({ explorer: 1 }), { total: 3, byRole: { reviewer: 3 } })))).toEqual([
+			"google/gemini-flash",
+		]);
+		// The max comes from the role's configured range.
+		const ranged = withConfig({ ...config, roles: { ...config.roles, explorer: { ...config.roles.explorer!, workers: { min: 1, max: 6 } } } });
+		expect(reason(decide(ev("storm-explorer"), ranged, run(plan({ explorer: 1 }), { total: 1, byRole: { explorer: 1 } })))).toContain("최대 6개");
+	});
+
+	test("the team's parallelism caps all live agents, storm and other agents alike", () => {
+		const busy = run(plan({ explorer: 4 }), { total: 2, byRole: { reviewer: 2 } });
+		expect(reason(decide(ev("storm-explorer"), state(), busy))).toContain("팀 동시 상한 2개");
+		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state(), busy))).toContain("팀 동시 상한 2개");
+		expect(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), run(plan({}), { total: 1, byRole: {} })).record?.outcome).toBe("allowed");
+	});
+
+	test("a stand-in spawn counts against the role it asked for, not the borrowed one", () => {
+		const team = withConfig({
+			...config,
+			parallelism: 8,
+			roles: { implementer: { agent: "storm-implementer", models: ["openai/gpt-5.2"] }, reviewer: config.roles.reviewer! },
+		});
+		const p = plan({ explorer: 1, implementer: 1 });
+		expect(reason(decide(ev("storm-explorer"), team, run(p, { total: 1, byRole: { explorer: 1 } })))).toContain("상한 1개");
+		const out = decideSpawn(ev("storm-explorer"), team, run(p, { total: 1, byRole: { implementer: 1 } }));
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "implementer" });
+		// A plan without the requested role blocks the stand-in even when the borrowed role has room.
+		expect(reason(decide(ev("storm-explorer"), team, run(plan({ implementer: 2 }))))).toContain("explorer 역할 레인이 없어");
+	});
+});
+
+describe("activeAgents", () => {
+	const rec = (spawnKey: string | undefined, over: Partial<SpawnRecord> = {}): SpawnRecord => ({
+		ts: new Date(NOW - 10_000).toISOString(),
+		agent: "storm-explorer",
+		invocationKind: "task",
+		requested: [],
+		outcome: "routed",
+		role: "explorer",
+		...(spawnKey === undefined ? {} : { spawnKey }),
+		...over,
+	});
+	const agent = (id: string, state: AgentEntry["state"]): AgentEntry => ({
+		id,
+		name: "storm-explorer",
+		state,
+		startedAt: NOW - 60_000,
+		lastActivityAt: NOW,
+		contextTokens: 0,
+		requests: 0,
+		costUsd: 0,
+		followUps: 0,
+	});
+
+	test("running and just-decided agents count; settled, stale, blocked and unkeyed ones do not", () => {
+		const { role: _role, ...task } = rec("Task", { agent: "task", outcome: "allowed" });
+		const spawns = [
+			rec("Running"),
+			rec("Idle"),
+			rec("Parked", { role: "reviewer", agent: "storm-reviewer" }),
+			rec("Pending", { role: "reviewer", agent: "storm-reviewer" }),
+			rec("Stale", { ts: new Date(NOW - 3 * 60_000).toISOString() }),
+			rec("Refused", { outcome: "blocked" }),
+			rec(undefined),
+			task,
+		];
+		const agents = [agent("Running", "running"), agent("Idle", "idle"), agent("Parked", "parked"), agent("Task", "running")];
+		expect(activeAgents(spawns, agents, NOW)).toEqual({ total: 3, byRole: { explorer: 1, reviewer: 1 } });
+	});
+
+	test("a storm stand-in counts under the role it asked for", () => {
+		const standIn = rec("Scout", { outcome: "substituted", role: "implementer" });
+		const builtin = rec("Task", { agent: "task", outcome: "substituted", role: "implementer" });
+		expect(activeAgents([standIn, builtin], [], NOW).byRole).toEqual({ explorer: 1, implementer: 1 });
+	});
+});
+
+describe("followUpBlock", () => {
+	const agent = (over: Partial<AgentEntry> = {}): AgentEntry => ({
+		id: "Impl",
+		name: "storm-implementer",
+		role: "implementer",
+		state: "idle",
+		startedAt: 0,
+		lastActivityAt: 0,
+		contextTokens: 230_000,
+		contextWindow: 1_000_000,
+		requests: 40,
+		costUsd: 3,
+		followUps: 2,
+		...over,
+	});
+	const write = (path: string) => ({ path, content: "다음 단계" });
+
+	test("a follow-up to an agent at or past its cap is blocked with a fresh-agent instruction", () => {
+		const why = followUpBlock("write", write("agent://Impl"), [agent()], config) ?? "";
+		expect(why).toContain("Impl(implementer)");
+		expect(why).toContain("230.0k 토큰(창의 23%)");
+		expect(why).toContain("상한 200.0k 토큰");
+		expect(why).toContain("새 storm-implementer");
+		expect(why).toContain("agent://Impl 에서 계속 읽을 수 있습니다");
+		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 200_000 })], config)).toBeDefined();
+		// Sub-paths and queries address the same agent.
+		expect(followUpBlock("write", write("agent://Impl/result?x=1"), [agent()], config)).toBeDefined();
+	});
+
+	test("under the cap, or with a role cap set higher, it passes", () => {
+		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 199_999 })], config)).toBeUndefined();
+		const roomy = { ...config, roles: { ...config.roles, implementer: { agent: "storm-implementer", models: ["a/i"], contextCap: 300_000 } } };
+		expect(followUpBlock("write", write("agent://Impl"), [agent()], roomy)).toBeUndefined();
+	});
+
+	test("70% of the window beats a higher token cap", () => {
+		const high = { ...config, contextCap: 500_000 };
+		const why = followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 150_000, contextWindow: 200_000 })], high) ?? "";
+		expect(why).toContain("상한 140.0k 토큰");
+		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 139_999, contextWindow: 200_000 })], high)).toBeUndefined();
+	});
+
+	test("other tools, other paths and unknown agents pass", () => {
+		expect(followUpBlock("read", write("agent://Impl"), [agent()], config)).toBeUndefined();
+		expect(followUpBlock("write", write("local://notes.md"), [agent()], config)).toBeUndefined();
+		expect(followUpBlock("write", write("src/agent://Impl"), [agent()], config)).toBeUndefined();
+		expect(followUpBlock("write", write("agent://Other"), [agent()], config)).toBeUndefined();
+		expect(followUpBlock("write", { content: "x" }, [agent()], config)).toBeUndefined();
+		expect(followUpBlock("write", null, [agent()], config)).toBeUndefined();
 	});
 });

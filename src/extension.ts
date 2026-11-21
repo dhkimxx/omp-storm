@@ -22,11 +22,12 @@ import {
 } from "./flows.ts";
 import { execPort, ompBinary } from "./omp.ts";
 import { DIRECTOR_BLOCK_REASON, directorBlocks } from "./policy/director.ts";
-import { decideSpawn, stripEffort } from "./policy/spawn.ts";
+import { followUpBlock } from "./policy/followup.ts";
+import { activeAgents, decideSpawn, stripEffort } from "./policy/spawn.ts";
 import { createProposalStore } from "./proposals/store.ts";
 import { ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import { listAgents, noteAgentEnd, noteAgentParked, noteAgentReview, noteAgentStart, noteAgentUsage } from "./runtime/agents.ts";
-import { buildStormRequest, noteRunSpawn, RunController, touchRun } from "./runtime/controller.ts";
+import { buildStormRequest, noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { activeLedgerRun, recordCost } from "./runtime/ledger.ts";
 import { lastRun } from "./runtime/run.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
@@ -251,6 +252,7 @@ export default function storm(pi: ExtensionAPI): void {
 				quotaMarks: async () => readQuotaMarks(await root(), Date.now()),
 				addQuotaMark: async mark => addQuotaMark(await root(), mark),
 				requestRun: task => runs.request(task),
+				setRunPlan: plan => runs.setPlan(plan),
 				agents: () => listAgents({ ancestorId: ctx.agent.id }),
 			},
 			lifecycleSettings,
@@ -279,7 +281,18 @@ export default function storm(pi: ExtensionAPI): void {
 					now,
 					quotaMarks,
 					trials,
-					...(run ? { run: { runId: run.runId, costUsd: run.costUsd, ...(run.budget ? { budget: run.budget } : {}) } } : {}),
+					// The plan and live counts come from the process-wide ledger, so nested sessions see the same run.
+					...(run
+						? {
+								run: {
+									runId: run.runId,
+									costUsd: run.costUsd,
+									...(run.budget ? { budget: run.budget } : {}),
+									...(run.plan ? { plan: run.plan } : {}),
+									active: activeAgents(runSpawns(run.runId), listAgents({ runId: run.runId }), now),
+								},
+							}
+						: {}),
 				},
 			);
 			const record = outcome.record;
@@ -345,10 +358,23 @@ export default function storm(pi: ExtensionAPI): void {
 
 	// Director mode: while this session runs Storm, file changes go to storm-implementer. Blocking the call instead of
 	// swapping the tool list keeps the main session's prompt cache intact.
-	pi.on("tool_call", event => {
-		if (!runs.directing() || !directorBlocks(event.toolName, event.input)) return undefined;
-		runs.noteBlockedEdit();
-		return { block: true, reason: DIRECTOR_BLOCK_REASON };
+	pi.on("tool_call", async (event, ctx) => {
+		if (!runs.directing()) return undefined;
+		if (directorBlocks(event.toolName, event.input)) {
+			runs.noteBlockedEdit();
+			return { block: true, reason: DIRECTOR_BLOCK_REASON };
+		}
+		// A follow-up to an agent past its context cap costs its whole context again on every turn: start a fresh one instead.
+		const path = event.toolName === "write" ? (event.input as { path?: unknown }).path : undefined;
+		if (typeof path !== "string" || !path.startsWith("agent://")) return undefined;
+		const runId = runs.active()?.runId;
+		if (!runId) return undefined;
+		const state = await stateCache.get(projectEnv(ctx));
+		if (state.config.status !== "ok") return undefined;
+		const reason = followUpBlock(event.toolName, event.input, listAgents({ runId }), state.config.config);
+		if (!reason) return undefined;
+		runs.noteBlockedFollowUp();
+		return { block: true, reason };
 	});
 
 	// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.

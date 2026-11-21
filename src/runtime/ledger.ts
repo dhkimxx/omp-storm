@@ -1,4 +1,4 @@
-import type { BudgetConfig } from "../types.ts";
+import type { BudgetConfig, RunPlan } from "../types.ts";
 
 /** Spend of the Storm run active for one project in this process. */
 export interface LedgerRun {
@@ -10,6 +10,8 @@ export interface LedgerRun {
 	costByModel: Record<string, number>;
 	warned: boolean;
 	exceeded: boolean;
+	/** The run plan in force; spawn decisions in any session of the process read it from here. */
+	plan?: RunPlan;
 	/** Called once when spend first reaches budget.warnAtUsd and once when it first reaches budget.perRunUsd, by whichever session recorded the cost. */
 	onThreshold?: (kind: "warn" | "limit", run: LedgerRun) => void;
 }
@@ -43,6 +45,16 @@ export function startLedgerRun(init: {
 
 export function activeLedgerRun(repoId: string): LedgerRun | undefined {
 	return runs.get(repoId);
+}
+
+/** Stores the plan on the active run with this id; false when no such run is active. */
+export function setLedgerPlan(runId: string, plan: RunPlan): boolean {
+	for (const run of runs.values()) {
+		if (run.runId !== runId) continue;
+		run.plan = plan;
+		return true;
+	}
+	return false;
 }
 
 export function endLedgerRun(runId: string): LedgerRun | undefined {

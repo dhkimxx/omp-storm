@@ -1,8 +1,9 @@
 /**
  * Subagent lifecycle advice: reuse a finished agent (warm cache, context already loaded), hand new
- * work to a fresh one with a summary, or leave it to omp's idle park. Pure; Storm only advises and
- * never changes omp settings.
+ * work to a fresh one with a summary, or leave it to omp's idle park. Pure; Storm never changes omp
+ * settings. Past an agent's context cap Storm blocks follow-ups during a run, and the advice says so.
  */
+import { contextCapFor } from "../roles.ts";
 import type { AgentAdvice, AgentEntry, AgentLiveState, LifecycleSettings, ModelCost, StormConfig } from "../types.ts";
 
 /** omp's `task.agentIdleTtlMs` default. */
@@ -74,12 +75,22 @@ export interface AdviceInput {
 	now: number;
 	settings: LifecycleSettings;
 	cost?: (model: string) => ModelCost | undefined;
+	/** The approved team: agents at or past their context cap (`contextCapFor`) are always fresh. */
+	config?: StormConfig;
 }
 
 export function adviseAgents(entries: AgentEntry[], input: AdviceInput): AgentAdvice[] {
 	return entries.map((e) => {
 		const id = e.id;
 		if (e.state === "running") return { id, action: "busy", reason: "작업 중" };
+		const cap = input.config ? contextCapFor(input.config, e.role, e.contextWindow) : undefined;
+		if (cap !== undefined && e.contextTokens >= cap) {
+			return {
+				id,
+				action: "fresh",
+				reason: `컨텍스트 ${contextText(e)}이 상한 ${tokens(cap)} 토큰에 닿아 Storm 실행 중에는 후속 지시가 막힙니다. 새 에이전트에 이전 결과 요약을 넘기세요.`,
+			};
+		}
 		const s = share(e);
 		if (s !== undefined && s > COMPACTION_SHARE) {
 			return {
@@ -208,7 +219,7 @@ export function lifecycleWarnings(settings: LifecycleSettings, providers: readon
 }
 
 /** The advice table (or a note that none ran yet) plus lifecycle warnings for the team's providers (the agents' without a team). */
-export function agentsReport(entries: AgentEntry[], input: AdviceInput & { config?: StormConfig }): string {
+export function agentsReport(entries: AgentEntry[], input: AdviceInput): string {
 	const body = entries.length ? renderAgents(adviseRows(entries, input), input.now) : "이 세션에서 아직 실행된 서브에이전트가 없습니다.";
 	const warnings = lifecycleWarnings(input.settings, input.config ? teamProviders(input.config) : agentProviders(entries));
 	return warnings.length ? `${body}\n\n### 수명 관리\n${warnings.map((w) => `- ${w}`).join("\n")}` : body;

@@ -1,5 +1,6 @@
 /** Turns recommendations into a Storm config and an approved config into its approval scope. */
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
+import { DEFAULT_WORKERS, workerRange } from "../roles.ts";
 import { formatModelEntry, parseModelEntry } from "../selector.ts";
 import type {
 	ApprovalScope,
@@ -11,6 +12,7 @@ import type {
 	ShadowInfo,
 	StormConfig,
 	TrialConfig,
+	WorkerRange,
 } from "../types.ts";
 import { fallbackOf, type PickedModel, type RolePick } from "./render.ts";
 
@@ -30,8 +32,11 @@ export function buildConfig(
 		isolation: StormConfig["isolation"];
 		contract: StormConfig["contract"];
 		budget?: BudgetConfig;
-		/** Workers per role id; roles not listed get `defaultWorkers`. */
-		workers?: Record<string, number>;
+		/** Worker range per role id; roles not listed get `DEFAULT_WORKERS`. */
+		workers?: Record<string, WorkerRange>;
+		/** Team context cap; per-role caps by role id. */
+		contextCap?: number;
+		roleContextCaps?: Record<string, number>;
 		/** undefined → implementer when present; null → non-Storm agents are blocked during a run. */
 		fallbackRole?: string | null;
 		/** Kept for roles that still exist. */
@@ -50,7 +55,8 @@ export function buildConfig(
 		roles[rec.role.id] = {
 			agent: rec.role.agent,
 			models,
-			workers: opts.workers?.[rec.role.id] ?? defaultWorkers(rec.role.id),
+			workers: { ...(opts.workers?.[rec.role.id] ?? DEFAULT_WORKERS[rec.role.id]) },
+			...(opts.roleContextCaps?.[rec.role.id] !== undefined ? { contextCap: opts.roleContextCaps[rec.role.id]! } : {}),
 		};
 	}
 	const config: StormConfig = {
@@ -63,6 +69,7 @@ export function buildConfig(
 		runtime: "omp",
 	};
 	if (opts.budget) config.budget = opts.budget;
+	if (opts.contextCap !== undefined) config.contextCap = opts.contextCap;
 	const disabled = opts.disabledRoles?.filter((id) => !Object.hasOwn(roles, id));
 	if (disabled?.length) config.disabledRoles = [...disabled];
 	const fallback = opts.fallbackRole === undefined ? "implementer" : opts.fallbackRole;
@@ -96,8 +103,12 @@ export function recommendedConfig(
 		const fb = fallbackOf(rec, c.selector);
 		picks[rec.role.id] = fb ? { primary: pick(c.selector, c.label), fallback: pick(fb.selector, fb.label) } : { primary: pick(c.selector, c.label) };
 	}
-	const workers: Record<string, number> = {};
-	for (const [id, r] of Object.entries(current?.roles ?? {})) if (r.workers !== undefined) workers[id] = r.workers;
+	const workers: Record<string, WorkerRange> = {};
+	const roleContextCaps: Record<string, number> = {};
+	for (const [id, r] of Object.entries(current?.roles ?? {})) {
+		if (r.workers !== undefined) workers[id] = workerRange(id, r);
+		if (r.contextCap !== undefined) roleContextCaps[id] = r.contextCap;
+	}
 	const fallbackRole = initialFallback(current);
 	return buildConfig(recs, picks, {
 		priority,
@@ -105,6 +116,8 @@ export function recommendedConfig(
 		isolation: current?.isolation ?? SETUP_DEFAULTS.isolation,
 		contract: current?.contract ?? SETUP_DEFAULTS.contract,
 		workers,
+		roleContextCaps,
+		...(current?.contextCap !== undefined ? { contextCap: current.contextCap } : {}),
 		...(fallbackRole !== undefined ? { fallbackRole } : {}),
 		...(current?.budget ? { budget: current.budget } : {}),
 		...(current?.trials ? { trials: current.trials } : {}),
@@ -132,11 +145,6 @@ export function deriveScope(config: StormConfig, shadows: ShadowInfo[]): Approva
 	if (config.trials) scope.trials = structuredClone(config.trials);
 	if (config.disabledRoles) scope.disabledRoles = [...config.disabledRoles];
 	return scope;
-}
-
-/** Explorers and quick workers fan out over independent small tasks; other roles default to one worker. */
-export function defaultWorkers(roleId: string): number {
-	return roleId === "explorer" || roleId === "quick" ? 2 : 1;
 }
 
 /** Fallback role carried over from the current config. A v0.2 config (roles carry workers) without fallbackRole was blocked on purpose. */

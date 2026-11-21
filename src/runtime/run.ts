@@ -1,8 +1,24 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
-import { BUILTIN_AGENT_ROLES, ROLE_STAND_INS, ROLES } from "../roles.ts";
-import type { RoleId, RunRecord, StormConfig } from "../types.ts";
+import { BUILTIN_AGENT_ROLES, contextCapFor, LANE_ROLES, ROLE_STAND_INS, ROLES, workerRange } from "../roles.ts";
+import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
+
+/** What each lane kind covers beyond its name, where the role alone does not say it. */
+const LANE_NOTE: Partial<Record<LaneKind, string>> = { run: "긴 빌드·기기 실행·대기·로그 수집" };
+
+/** `explore→storm-explorer, …`: each lane kind's role, falling back along `ROLE_STAND_INS` when it is not usable. */
+function laneRoles(config: StormConfig): string {
+	return Object.entries(LANE_ROLES)
+		.flatMap(([kind, roleId]) => {
+			const id = usableRole(config, roleId) ? roleId : ROLE_STAND_INS[roleId].find(r => usableRole(config, r));
+			const agent = id === undefined ? undefined : config.roles[id]?.agent;
+			if (agent === undefined) return [];
+			const note = LANE_NOTE[kind as LaneKind];
+			return [`${kind}→${agent}${note ? `(${note})` : ""}`];
+		})
+		.join(", ");
+}
 
 /** When the director should reach for each role, as the team line shows it. */
 const ROLE_USE: Record<RoleId, string> = {
@@ -145,11 +161,13 @@ export function buildHandoff(input: {
 }): string {
 	const { config } = input;
 	const short = input.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
-	// Effort is per model and chosen at spawn, so the team line names only the role and its worker cap.
+	// Effort is per model and chosen at spawn, so the team line names only the role, its workers and its context cap.
 	const team = Object.entries(config.roles).map(([key, role]) => {
 		const spec = ROLES.find(r => r.id === key) ?? ROLES.find(r => r.agent === role.agent);
 		const use = spec ? ROLE_USE[spec.id] : undefined;
-		return `- ${role.agent}: ${spec?.title ?? key}${use ? `(${use})` : ""}, 동시에 최대 ${role.workers ?? 1}개`;
+		const range = workerRange(key, role);
+		const cap = Math.round(contextCapFor(config, key, undefined) / 1000);
+		return `- ${role.agent}: ${spec?.title ?? key}${use ? `(${use})` : ""}, 기본 ${range.min} · 최대 ${range.max}개 · 컨텍스트 상한 ${cap}k 토큰`;
 	});
 	const usable = new Set<RoleId>(ROLES.filter(r => r.id in config.roles).map(r => r.id));
 	for (const spec of ROLES) {
@@ -175,7 +193,8 @@ export function buildHandoff(input: {
 		"- bash 는 테스트·빌드 확인·git 조회 같은 검증에만 쓰고, bash 로 파일을 바꾸지 않습니다. 메모는 local:// 에 씁니다.",
 		"- 서브에이전트는 위 storm-* 에이전트로만 띄웁니다(task 도구 또는 eval 의 agent()).",
 		"- model 을 넘기지 않습니다. 스폰할 때 Storm 이 승인된 모델을 고릅니다.",
-		`- 서브에이전트는 한 번에 최대 ${config.parallelism}개까지 띄웁니다.`,
+		`- 계획 먼저: 스폰하기 전에 storm 도구의 plan 동작으로 실행 계획을 냅니다. 레인(이름·kind·role·files·goal)과 역할별 워커 수를 넣고, 작은 작업은 레인 하나면 됩니다. kind 는 ${laneRoles(config)} 로 이어집니다. 워커는 역할별 최대 안에서 정합니다. 범위 안이면 바로 적용되고, 넘으면 승인 창이 뜹니다. 실행 중 언제든 다시 낼 수 있습니다. 계획 없이 띄우는 스폰은 막힙니다.`,
+		`- 동시 상한: 역할별로 계획의 워커 수, 전체로 ${config.parallelism}개까지 서브에이전트가 동시에 돕니다. 넘는 스폰은 Storm 이 막습니다.`,
 		config.isolation === "isolated"
 			? "- 격리: task 도구의 작업 항목마다 `isolated: true` 를 넣어 각자 격리된 작업 공간에서 일하게 합니다. omp 설정 `task.isolation.enabled` 가 켜져 있어야 적용됩니다."
 			: "- 격리 없음: 서브에이전트가 같은 작업 트리를 함께 씁니다.",
@@ -196,7 +215,7 @@ export function buildHandoff(input: {
 		);
 	}
 	rules.push(
-		"- 같은 영역의 후속 작업(리뷰 지적 수정, 두 번째 패스)은 새로 띄우지 말고 끝난 storm-* 에이전트에 agent://<id> 로 보냅니다. 확실하지 않으면 먼저 storm 도구의 agents 동작으로 재사용할 에이전트를 확인합니다.",
+		"- 컨텍스트 상한: 같은 영역의 후속 작업(리뷰 지적 수정, 두 번째 패스)은 끝난 storm-* 에이전트가 컨텍스트 상한 아래일 때만 그 에이전트에 `write agent://<id>` 로 보냅니다. 상한을 넘은 에이전트로 가는 후속 지시는 Storm 이 막으니, 결과를 요약해 새 에이전트를 띄웁니다. 확실하지 않으면 먼저 storm 도구의 agents 동작으로 확인합니다.",
 	);
 	const lines = [
 		...(input.keyword ? [input.keyword] : []),

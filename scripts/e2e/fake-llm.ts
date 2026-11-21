@@ -36,7 +36,14 @@ interface Tool {
 interface Message {
 	role: string;
 	content?: unknown;
+	tool_calls?: unknown[];
 }
+/**
+ * One step of a scripted main turn (`SPIKE-STEPS [...]`): a storm tool call, a task batch, or a follow-up write.
+ * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
+ * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
+ */
+type Step = ({ storm: Record<string, unknown> } | { task: string[] } | { write: string }) & { after?: string };
 interface ChatRequest {
 	model: string;
 	messages: Message[];
@@ -62,6 +69,8 @@ const NOTICES = {
 const STORM_AGENTS = ["storm-implementer", "storm-reviewer"];
 /** Model id that always fails with an out-of-quota 429. */
 const QUOTA_OUT = "quota-out";
+/** Model id whose requests report a large prompt (see `usageOf`). */
+const HEAVY_MAIN = "heavy-main";
 /** A reviewer's verdict for agents whose yield schema asks for one (storm-reviewer): one P1 finding, so the run record has something to count. */
 const REVIEW_VERDICT = {
 	overall_correctness: "incorrect",
@@ -138,8 +147,31 @@ function evalCall(tools: Tool[] | undefined, agents: string[]): Decision {
 	return { kind: "tool", name: "eval", args: { ...requiredArgs(schemaOf(tools, "eval")), language: "py", code } };
 }
 
+/**
+ * The next step of the newest user message carrying `SPIKE-STEPS [...]` (one that is not a STORM-TOOL request quoting
+ * it). Each assistant tool call since that message is one step done. A follow-up write waits for the target's async
+ * result: until it has arrived the turn ends, and omp starts the next one when it lands.
+ */
+function scriptedStep(messages: Message[], tools: Tool[] | undefined): Decision | undefined {
+	const at = messages.findLastIndex(m => m.role === "user" && textOf(m.content).includes("SPIKE-STEPS") && !textOf(m.content).includes("STORM-TOOL"));
+	if (at < 0) return undefined;
+	const steps = JSON.parse(textOf(messages[at]?.content).match(/SPIKE-STEPS[ \t]+(\[.*\])/)?.[1] ?? "[]") as Step[];
+	const later = messages.slice(at + 1);
+	const step = steps[later.filter(m => m.role === "assistant" && (m.tool_calls?.length ?? 0) > 0).length];
+	if (!step) return { kind: "text", text: "done" };
+	const seen = (text: string, from: (role: string) => boolean) => later.some(m => from(m.role) && textOf(m.content).includes(text));
+	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) return { kind: "text", text: "waiting" };
+	// A follow-up write waits for its target's async result (a user message), so the target's usage is on the ledger by then.
+	if ("write" in step && !seen(step.write.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
+	if ("storm" in step) return { kind: "tool", name: "storm", args: step.storm };
+	if ("task" in step) return taskCall(tools, step.task);
+	return { kind: "tool", name: "write", args: { path: step.write, content: "follow-up" } };
+}
+
 function decide(request: ChatRequest): Decision {
 	const messages = request.messages;
+	const scripted = scriptedStep(messages, request.tools);
+	if (scripted) return scripted;
 	if (messages.at(-1)?.role === "tool") return { kind: "text", text: "done" };
 	const lastAssistant = messages.findLastIndex(message => message.role === "assistant");
 	const fresh = messages
@@ -208,9 +240,15 @@ function chunk(id: string, model: string, delta: Record<string, unknown>, finish
 	return `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
 }
 
+/** Usage the fake reports: `heavy-main` claims a large prompt so Storm's run-start check sees a heavy main session. */
+function usageOf(model: string): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
+	const prompt = model === HEAVY_MAIN ? 35_000 : 100;
+	return { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10 };
+}
+
 function stream(model: string, decision: Decision): Response {
 	const id = `chatcmpl-${crypto.randomUUID()}`;
-	const usage = { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 };
+	const usage = usageOf(model);
 	const body = new ReadableStream<Uint8Array>({
 		async start(controller) {
 			const send = (text: string) => controller.enqueue(encoder.encode(text));
@@ -246,7 +284,7 @@ function completion(model: string, decision: Decision): Response {
 		created: Math.floor(Date.now() / 1000),
 		model,
 		choices: [{ index: 0, message, finish_reason: decision.kind === "text" ? "stop" : "tool_calls" }],
-		usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+		usage: usageOf(model),
 	});
 }
 

@@ -231,17 +231,21 @@ describe("builders", () => {
 		expect(quota.config.roles.explorer!.models).toEqual(["a/x:max", "b/z:medium"]);
 	});
 
-	test("workers bounds and default", () => {
-		expect(buildWorkers(base, "implementer", 0)).toHaveProperty("error");
-		expect(buildWorkers(base, "implementer", 17)).toHaveProperty("error");
-		expect(buildWorkers(base, "implementer", 1.5)).toHaveProperty("error");
-		expect(buildWorkers(base, "nope", 2)).toHaveProperty("error");
-		const two = buildWorkers(base, "implementer", 2);
-		if ("error" in two) throw new Error(two.error);
-		expect(two.config.roles.implementer!.workers).toBe(2);
-		const one = buildWorkers(two.config, "implementer", 1);
-		if ("error" in one) throw new Error(one.error);
-		expect(one.config.roles.implementer).toEqual(base.roles.implementer!);
+	test("workers bounds and range form", () => {
+		expect(buildWorkers(base, "implementer", 0, 2)).toHaveProperty("error");
+		expect(buildWorkers(base, "implementer", undefined, 17)).toHaveProperty("error");
+		expect(buildWorkers(base, "implementer", 1.5, undefined)).toHaveProperty("error");
+		expect(buildWorkers(base, "implementer", 3, 2)).toHaveProperty("error");
+		expect(buildWorkers(base, "implementer", undefined, undefined)).toHaveProperty("error");
+		expect(buildWorkers(base, "nope", 2, 2)).toHaveProperty("error");
+		// implementer unset → default 1~2; raising max keeps min.
+		const wide = buildWorkers(base, "implementer", undefined, 4);
+		if ("error" in wide) throw new Error(wide.error);
+		expect(wide.config.roles.implementer!.workers).toEqual({ min: 1, max: 4 });
+		// A legacy number reads as n~n; a min above it lifts max along.
+		const legacy = buildWorkers({ ...base, roles: { ...base.roles, implementer: { ...base.roles.implementer!, workers: 2 } } }, "implementer", 3, undefined);
+		if ("error" in legacy) throw new Error(legacy.error);
+		expect(legacy.config.roles.implementer!.workers).toEqual({ min: 3, max: 3 });
 		expect(base.roles.implementer!.workers).toBeUndefined();
 	});
 
@@ -287,9 +291,9 @@ describe("role-targeted proposals for a role not in roles", () => {
 	const disabled: StormConfig = { ...base, disabledRoles: ["architect"] };
 	test("a disabled role points to team re-setup; a missing one says it is not configured", () => {
 		const off = "설계·자문(architect): 사용 안 함으로 설정된 역할입니다. 다시 쓰려면 /storm 에서 팀 다시 설정을 고르세요";
-		expect(buildWorkers(disabled, "architect", 2)).toEqual({ error: off });
+		expect(buildWorkers(disabled, "architect", 2, 2)).toEqual({ error: off });
 		expect(buildReselect(disabled, "architect", "a/new", ["high"])).toEqual({ error: off });
 		expect(buildTrial(disabled, { role: "architect", model: "a/new", efforts: ["high"], now: 0 })).toEqual({ error: off });
-		expect(buildWorkers(disabled, "quick", 2)).toEqual({ error: "quick: 설정에 없는 역할입니다" });
+		expect(buildWorkers(disabled, "quick", 2, 2)).toEqual({ error: "quick: 설정에 없는 역할입니다" });
 	});
 });

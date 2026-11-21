@@ -1,30 +1,41 @@
 import { describe, expect, test } from "bun:test";
-import { reviewFromYield, reviewLine } from "../src/runtime/review.ts";
-import type { AgentEntry, ReviewVerdict } from "../src/types.ts";
+import { reviewLine, tallyFromYield } from "../src/runtime/review.ts";
+import type { AgentEntry, ReviewTally } from "../src/types.ts";
 
-describe("reviewFromYield", () => {
-	test("counts incremental findings, then takes the final verdict", () => {
-		let r = reviewFromYield(undefined, { type: ["findings"], data: { priority: 0, title: "x" } });
-		expect(r).toEqual({ findings: [1, 0, 0, 0] });
-		r = reviewFromYield(r, { type: ["findings"], data: [{ priority: 2 }, { priority: 2 }] });
-		r = reviewFromYield(r, { data: { overall_correctness: "incorrect", confidence: 0.8, findings: [{ priority: 1 }] } });
-		expect(r).toEqual({ verdict: "incorrect", confidence: 0.8, findings: [1, 1, 2, 0] });
+describe("tallyFromYield", () => {
+	test("counts incremental findings, then the final verdict as one review", () => {
+		let r = tallyFromYield(undefined, { type: ["findings"], data: { priority: 0, title: "x" } });
+		expect(r).toEqual({ reviews: 0, passed: 0, failed: 0, findings: [1, 0, 0, 0] });
+		r = tallyFromYield(r, { type: ["findings"], data: [{ priority: 2 }, { priority: 2 }] });
+		r = tallyFromYield(r, { data: { overall_correctness: "incorrect", confidence: 0.8, findings: [{ priority: 1 }] } });
+		expect(r).toEqual({ reviews: 1, passed: 0, failed: 1, findings: [1, 1, 2, 0], lastConfidence: 0.8 });
+	});
+
+	test("two verdicts from one agent are two reviews; findings add up", () => {
+		let r = tallyFromYield(undefined, { data: { overall_correctness: "incorrect", confidence: 0.6, findings: [{ priority: 0 }] } });
+		r = tallyFromYield(r, { data: { overall_correctness: "correct", confidence: 0.9, findings: [{ priority: 3 }] } });
+		expect(r).toEqual({ reviews: 2, passed: 1, failed: 1, findings: [1, 0, 0, 1], lastConfidence: 0.9 });
 	});
 
 	test("ignores invalid priorities, bad confidence and non-review payloads", () => {
-		const prev: ReviewVerdict = { findings: [0, 1, 0, 0] };
-		expect(reviewFromYield(prev, { type: ["findings"], data: [{ priority: 4 }, { priority: 1.5 }, { priority: "0" }, {}] })).toBe(prev);
-		expect(reviewFromYield(prev, { error: "boom" })).toBe(prev);
-		expect(reviewFromYield(prev, { data: { summary: "done" } })).toBe(prev);
-		expect(reviewFromYield(undefined, { data: { overall_correctness: "maybe" } })).toBeUndefined();
-		expect(reviewFromYield(prev, { data: { overall_correctness: "correct", confidence: 2 } })).toEqual({ verdict: "correct", findings: [0, 1, 0, 0] });
+		const prev: ReviewTally = { reviews: 0, passed: 0, failed: 0, findings: [0, 1, 0, 0] };
+		expect(tallyFromYield(prev, { type: ["findings"], data: [{ priority: 4 }, { priority: 1.5 }, { priority: "0" }, {}] })).toBe(prev);
+		expect(tallyFromYield(prev, { error: "boom" })).toBe(prev);
+		expect(tallyFromYield(prev, { data: { summary: "done" } })).toBe(prev);
+		expect(tallyFromYield(undefined, { data: { overall_correctness: "maybe" } })).toBeUndefined();
+		expect(tallyFromYield(prev, { data: { overall_correctness: "correct", confidence: 2 } })).toEqual({
+			reviews: 1,
+			passed: 1,
+			failed: 0,
+			findings: [0, 1, 0, 0],
+		});
 		// The input is never mutated through prev.
-		expect(prev.findings).toEqual([0, 1, 0, 0]);
+		expect(prev).toEqual({ reviews: 0, passed: 0, failed: 0, findings: [0, 1, 0, 0] });
 	});
 });
 
 describe("reviewLine", () => {
-	const a = (review?: ReviewVerdict): AgentEntry => ({
+	const a = (review?: ReviewTally): AgentEntry => ({
 		id: "x",
 		name: "storm-reviewer",
 		state: "idle",
@@ -37,16 +48,16 @@ describe("reviewLine", () => {
 		...(review ? { review } : {}),
 	});
 
-	test("sums verdicts and nonzero priorities; findings without a verdict do not count", () => {
+	test("sums reviews and nonzero priorities across agents; findings without a verdict do not count", () => {
 		expect(
 			reviewLine([
-				a({ verdict: "correct", findings: [0, 0, 0, 2] }),
-				a({ verdict: "incorrect", findings: [1, 2, 0, 0] }),
-				a({ findings: [5, 0, 0, 0] }),
+				a({ reviews: 3, passed: 1, failed: 2, findings: [1, 2, 0, 0] }),
+				a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 2] }),
+				a({ reviews: 0, passed: 0, failed: 0, findings: [5, 0, 0, 0] }),
 				a(),
 			]),
-		).toBe("- 리뷰: 통과 1 · 수정 필요 1 (P0 1 · P1 2 · P3 2)");
-		expect(reviewLine([a({ verdict: "correct", findings: [0, 0, 0, 0] })])).toBe("- 리뷰: 통과 1 · 수정 필요 0");
-		expect(reviewLine([a({ findings: [1, 0, 0, 0] })])).toBe("- 리뷰: 없음");
+		).toBe("- 리뷰 4회: 통과 2 · 수정 필요 2 (P0 1 · P1 2 · P3 2)");
+		expect(reviewLine([a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] })])).toBe("- 리뷰 1회: 통과 1 · 수정 필요 0");
+		expect(reviewLine([a({ reviews: 0, passed: 0, failed: 0, findings: [1, 0, 0, 0] })])).toBe("- 리뷰: 없음");
 	});
 });

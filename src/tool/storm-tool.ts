@@ -29,11 +29,16 @@ import { renderModelCheck } from "../report/models.ts";
 import { adviseRows, agentsReport } from "../report/agents.ts";
 import { parseModelEntry } from "../selector.ts";
 import type { ProjectState } from "../state.ts";
-import { ROLES } from "../roles.ts";
+import { planChange } from "../plan/change.ts";
+import { type PlanGap, validatePlan } from "../plan/validate.ts";
+import { LANE_ROLES, ROLES, workerRange } from "../roles.ts";
 import type {
 	AgentEntry,
 	EvidenceRecord,
+	LaneKind,
 	LifecycleSettings,
+	PlanRequest,
+	RunPlan,
 	Proposal,
 	ProposalKind,
 	RoleId,
@@ -62,8 +67,9 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "agents", "propose"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["status", "models", "priority", "workers", "reselect", "quota", "trial", "budget", "run", "plan", "agents", "propose"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
+const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const QUOTA_MARK_MS = 5 * 3_600_000;
 const NO_CONFIG = "Storm 설정이 없습니다(또는 오류). /storm 으로 먼저 팀을 설정하세요.";
 
@@ -72,13 +78,14 @@ Actions:
 - status: team, approval, active/last run, trials, quota marks, pending proposals, subagents of this session.
 - models: check configured models for newer versions, better/cheaper/faster alternatives and upgrades that need another provider login. Slow (reads usage history).
 - priority {priority}: re-recommend every role's model for a new optimization priority.
-- workers {role, workers}: how many workers of a role one run may keep busy (1-16).
+- workers {role, min?, max?}: a role's worker range in one run: max caps its live agents (Storm refuses spawns past it), min is what a run plan gets when it sets none (1 ≤ min ≤ max ≤ 16).
 - reselect {role, model?}: change a role's model; omit model to let the user pick from recommendations.
 - quota {provider}: the user says a provider ran out of quota. Approved fallbacks go first for 5 hours; roles without one get a fallback proposal.
 - trial {role, model, share?, maxSpawns?, days?, budgetUsd?}: route a bounded share of a role's spawns to a candidate model for a while (defaults 0.25, 20 spawns, 7 days, $2).
 - budget {budgetUsd, warnAtUsd?, onExceed?}: per-run spend limit; 0 removes it.
 - run {task}: the user wants work done by the Storm team. Call it, then end your reply at once; never do the task yourself in the same turn. Storm starts the run with the approved team contract right after.
-- agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Before giving new work to a subagent, check for a reusable one: follow-ups in the same area (fixing review findings, a second pass) go to the finished agent via \`write agent://<id>\` (or the eval handle's .send()) instead of a new spawn.
+- plan {plan}: REQUIRED during a run before any spawn: Storm refuses every spawn until a plan is in force. plan.lanes: [{name, kind, role?, files?, goal?}], kind explore|code|run|review|design (default roles explorer|implementer|quick|reviewer|architect; run = long builds, device runs, waiting, log collection). plan.workers: live agents per role (default the role's min, at most its max). Within the approved bounds it applies at once; past them (workers above max, a disabled or missing role) the user approves or cancels a config change in a dialog. Resubmit any time the plan changes. Outside a run it only validates.
+- agents: subagents of this session with lifecycle advice (reuse / fresh / cleanup) and warnings on omp's idle park vs prompt cache. Follow-ups in the same area (fixing review findings, a second pass) go to a finished agent via \`write agent://<id>\` only while it is under its context cap; past the cap Storm blocks the follow-up during a run, so start a fresh agent with a summary of its results.
 - propose {config, rationale}: only to answer a <storm-setup> request, after interviewing the user with the ask tool. config is the whole team (same shape as <storm-recommended-config>), rationale explains it in Korean. The user approves or cancels it in Storm's dialog.
 priority, workers, reselect, trial, budget (and quota when new models are needed) only propose: the user sees a diff and approves or defers it in a dialog. Do not ask for approval yourself; relay the result as returned and never claim a change was saved unless the result says so.
 Setting the team up (again), rolling back to an earlier approval and resetting Storm are not actions: tell the user to type /storm.`;
@@ -88,7 +95,26 @@ function stormParams(z: Zod): StormToolSchema {
 		action: z.enum(ACTIONS).describe("Operation to perform"),
 		priority: z.enum(["balanced", "quality", "cost", "speed", "quota"]).optional().describe("priority: new optimization priority"),
 		role: z.enum(ROLE_IDS).optional().describe("workers, reselect, trial: target role (must be configured, not disabled)"),
-		workers: z.number().optional().describe("workers: absolute worker count for the role (1-16)"),
+		min: z.number().optional().describe("workers: worker minimum for the role (1-16)"),
+		max: z.number().optional().describe("workers: worker maximum for the role (1-16)"),
+		plan: z
+			.object({
+				lanes: z
+					.array(
+						z.object({
+							name: z.string().describe("Unique lane name"),
+							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
+							role: z.enum(ROLE_IDS).optional().describe("Role doing the lane; default from kind"),
+							files: z.array(z.string()).optional().describe("Files the lane may change"),
+							goal: z.string().optional().describe("What the lane delivers"),
+						}),
+					)
+					.describe("1-50 lanes"),
+				workers: z.record(z.string(), z.number()).optional().describe("Live agents per role id used by the lanes"),
+				note: z.string().optional(),
+			})
+			.optional()
+			.describe("plan: the run plan"),
 		model: z.string().optional().describe('reselect: model the user named; trial: candidate. "provider/id"'),
 		provider: z.string().optional().describe("quota: provider that ran out"),
 		share: z.number().optional().describe("trial: fraction of the role's spawns routed to the candidate (0-1]"),
@@ -161,6 +187,7 @@ async function propose(
 	built: Built,
 	evidence?: EvidenceRecord,
 	warnings: string[] = [],
+	context?: string,
 ): Promise<StormToolReply> {
 	if ("error" in built) return rejected(built.error);
 	const next = built.config;
@@ -182,7 +209,11 @@ async function propose(
 	};
 	if (evidence) proposal.evidence = evidence;
 
-	const answer = await presentProposal(host.ui, proposal, cur.config, { shadows: cur.state.shadows, warnings: [...checked.warnings, ...warnings] });
+	const answer = await presentProposal(host.ui, proposal, cur.config, {
+		shadows: cur.state.shadows,
+		warnings: [...checked.warnings, ...warnings],
+		...(context ? { context } : {}),
+	});
 	if (answer === "cancelled") return { outcome: "cancelled", text: "바꾸지 않았습니다." };
 	if (answer === "deferred") {
 		await host.proposals.save(proposal);
@@ -254,7 +285,7 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 			const entries = host.runtime.agents();
 			if (entries.length) {
 				const settings = await host.lifecycleSettings();
-				view.agents = agentRows(host, entries, settings);
+				view.agents = agentRows(host, entries, settings, state.config.status === "ok" ? state.config.config : undefined);
 				view.lifecycle = settings;
 			}
 			return { outcome: "ok", text: renderStatus(view, host.now()) };
@@ -287,6 +318,8 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 					"응답이 끝나면 Storm이 승인된 팀 계약으로 실행을 시작합니다.",
 			};
 		}
+		case "plan":
+			return submitPlan(host, params.plan);
 		case "propose":
 			return proposeSetup(host, params);
 		default:
@@ -294,8 +327,90 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 	}
 }
 
-function agentRows(host: StormToolHost, entries: AgentEntry[], settings: LifecycleSettings): NonNullable<StatusView["agents"]> {
-	return adviseRows(entries, { now: host.now(), settings, cost: (m) => host.modelCost(m) });
+/** Lanes and workers of a plan per role, as the director and the dialog read them. */
+function planLines(config: StormConfig, plan: RunPlan): string[] {
+	const out: string[] = [];
+	for (const [role, n] of Object.entries(plan.workers)) {
+		const lanes = plan.lanes.filter((l) => l.role === role).map((l) => l.name);
+		out.push(`- ${roleTitle(role)}(${role}): 워커 ${n}개/최대 ${workerRange(role, config.roles[role]).max} · 레인 ${lanes.join(", ")}`);
+	}
+	return out;
+}
+
+/** What lies past the approved bounds, one line each. */
+function gapLines(gaps: readonly PlanGap[]): string[] {
+	return gaps.map((g) =>
+		g.kind === "workers"
+			? `- ${roleTitle(g.role)}(${g.role}): 워커 ${g.want}개 요청, 최대 ${g.max}`
+			: `- ${roleTitle(g.role)}(${g.role}): ${g.state === "disabled" ? "사용 안 함으로 설정된 역할" : "설정에 없는 역할"}`,
+	);
+}
+
+/**
+ * Validates a run plan; past the approved bounds the user approves (or cancels) the config change first.
+ * The plan goes in force for the active run; outside a run it is only checked.
+ */
+async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Promise<StormToolReply> {
+	if (raw === undefined) return rejected("plan이 필요합니다.");
+	const cur = await loadCurrent(host);
+	if ("outcome" in cur) return cur;
+	let config = cur.config;
+	let check = validatePlan(config, raw, host.now());
+	if (check.errors.length) return rejected(`계획이 올바르지 않습니다. 고쳐서 다시 제출하세요.\n${check.errors.map((e) => `- ${e}`).join("\n")}`);
+	const head: string[] = [];
+	const gaps = check.outOfBounds;
+	if (gaps.length && check.plan) {
+		const adding = gaps.filter((g) => g.kind === "role").map((g) => g.role);
+		const ctx = adding.length ? await host.prepare() : undefined;
+		const recs = ctx?.recommend(config.priority) ?? [];
+		const built = planChange(config, gaps, ctx && { recs, efforts: (s) => effortsOf(ctx.checkModel, s) });
+		const maxima = Object.keys(check.plan.workers)
+			.filter((id) => config.roles[id])
+			.map((id) => `${roleTitle(id)} 최대 ${workerRange(id, config.roles[id]).max}`)
+			.join(", ");
+		const fit = `승인된 범위 안으로 계획을 줄여 다시 제출하세요(${maxima || "설정된 역할만 쓰세요"}).`;
+		if ("error" in built) return rejected(`계획이 승인된 범위를 넘습니다.\n${gapLines(gaps).join("\n")}\n${built.error}\n${fit}`);
+		const evidence = buildEvidence({
+			source: "plan",
+			priority: config.priority,
+			dataAsOf: ctx?.usage.dataAsOf ?? null,
+			recommendations: recs.filter((r) => adding.includes(r.role.id)),
+			config: built.config,
+			now: host.now(),
+		});
+		const context = ["### 실행 계획", ...check.plan.lanes.map((l) => `- ${l.name} (${l.kind} → ${roleTitle(l.role)})${l.files?.length ? `: ${l.files.join(", ")}` : ""}`), "", "### 범위를 넘는 것", ...gapLines(gaps)].join("\n");
+		const reply = await propose(host, cur, "plan", built, evidence, check.warnings, context);
+		if (reply.outcome === "cancelled") {
+			return { outcome: "cancelled", text: `설정을 바꾸지 않아 계획을 적용하지 않았습니다. 범위를 넘는 것:\n${gapLines(gaps).join("\n")}\n${fit}` };
+		}
+		if (reply.outcome !== "approved") return reply;
+		head.push(reply.text);
+		const fresh = await loadCurrent(host);
+		if ("outcome" in fresh) return fresh;
+		config = fresh.config;
+		check = validatePlan(config, raw, host.now());
+		if (check.errors.length || check.outOfBounds.length) {
+			return rejected(`${head.join("\n")}\n저장한 설정으로도 계획이 범위를 넘습니다. 다시 제출하세요.\n${[...check.errors.map((e) => `- ${e}`), ...gapLines(check.outOfBounds)].join("\n")}`);
+		}
+	}
+	const plan = check.plan!;
+	const set = host.runtime.setRunPlan(plan);
+	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(config, plan)];
+	if (check.warnings.length) body.push("경고:", ...check.warnings.map((w) => `- ${w}`));
+	if (!set.ok) {
+		const saved = head.length ? " 승인한 범위 변경은 저장했습니다." : "";
+		return { outcome: head.length ? "approved" : "ok", text: [...head, `실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다).${saved} ${set.reason}`, ...body].join("\n") };
+	}
+	return { outcome: head.length ? "approved" : "ok", text: [...head, "실행 계획을 적용했습니다. 이 범위 안에서 스폰하세요.", ...body].join("\n") };
+}
+
+function agentRows(
+	host: StormToolHost,
+	entries: AgentEntry[],
+	settings: LifecycleSettings,
+	config: StormConfig | undefined,
+): NonNullable<StatusView["agents"]> {
+	return adviseRows(entries, { now: host.now(), settings, cost: (m) => host.modelCost(m), ...(config ? { config } : {}) });
 }
 
 async function write(host: StormToolHost, params: StormToolInput): Promise<StormToolReply> {
@@ -323,8 +438,8 @@ async function write(host: StormToolHost, params: StormToolInput): Promise<Storm
 			return propose(host, cur, "priority", built, evidence);
 		}
 		case "workers": {
-			if (role === undefined || params.workers === undefined) return rejected("role과 workers가 필요합니다.");
-			return propose(host, cur, "workers", buildWorkers(config, role, params.workers));
+			if (role === undefined || (params.min === undefined && params.max === undefined)) return rejected("role과 min 또는 max가 필요합니다.");
+			return propose(host, cur, "workers", buildWorkers(config, role, params.min, params.max));
 		}
 		case "reselect": {
 			if (role === undefined) return rejected("role이 필요합니다.");

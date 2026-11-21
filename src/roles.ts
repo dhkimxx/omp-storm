@@ -1,6 +1,6 @@
-import type { RoleId, RoleSpec } from "./types.ts";
+import type { LaneKind, RoleConfig, RoleId, RoleSpec, StormConfig, WorkerRange } from "./types.ts";
 
-export const STORM_VERSION = "0.7.1";
+export const STORM_VERSION = "0.8.0";
 
 /** Roles Storm ships. Each maps to an agent definition in agents/. */
 export const ROLES: readonly RoleSpec[] = [
@@ -66,5 +66,49 @@ export const BUILTIN_AGENT_ROLES: Readonly<Record<string, RoleId>> = {
 
 /** Roles a team cannot go without: the director never edits files, so someone must. */
 export const REQUIRED_ROLES: readonly RoleId[] = ["implementer"];
+
+/** The role a run plan's lane goes to when the director names none (falls back along `ROLE_STAND_INS`). */
+export const LANE_ROLES: Readonly<Record<LaneKind, RoleId>> = {
+	explore: "explorer",
+	code: "implementer",
+	run: "quick",
+	review: "reviewer",
+	design: "architect",
+};
+
+/** Worker ranges a new team starts from: explorers and quick workers fan out, the expensive roles stay narrow. */
+export const DEFAULT_WORKERS: Readonly<Record<RoleId, WorkerRange>> = {
+	explorer: { min: 2, max: 4 },
+	implementer: { min: 1, max: 2 },
+	reviewer: { min: 1, max: 2 },
+	quick: { min: 1, max: 3 },
+	architect: { min: 1, max: 1 },
+};
+
+/** Highest `workers.max` a config may set (parallelism shares the bound). */
+export const MAX_WORKERS = 16;
+
+/** Default context ceiling for subagents, in tokens. */
+export const DEFAULT_CONTEXT_CAP = 200_000;
+/** Share of a model's context window that also caps an agent: compaction gets close past it. */
+export const CONTEXT_CAP_SHARE = 0.7;
+
+/** The main session counts as heavy at run start from this many context tokens or this share of its window. */
+export const PREFLIGHT_TOKENS = 150_000;
+export const PREFLIGHT_SHARE = 0.5;
+
+/** A role's worker range: a bare number n (pre-v0.8 configs) is { min: n, max: n }; absent → the role's default. */
+export function workerRange(roleId: string, role: RoleConfig | undefined): WorkerRange {
+	const w = role?.workers;
+	if (typeof w === "number") return { min: w, max: w };
+	if (w) return { min: w.min, max: w.max };
+	return DEFAULT_WORKERS[roleId as RoleId] ?? { min: 1, max: 1 };
+}
+
+/** Tokens past which an agent of `roleId` takes no follow-ups: the role's or team's cap, and 70% of its window when known. */
+export function contextCapFor(config: StormConfig, roleId: string | undefined, contextWindow: number | undefined): number {
+	const cap = (roleId === undefined ? undefined : config.roles[roleId]?.contextCap) ?? config.contextCap ?? DEFAULT_CONTEXT_CAP;
+	return contextWindow ? Math.min(cap, Math.floor(contextWindow * CONTEXT_CAP_SHARE)) : cap;
+}
 
 export const ROLE_AGENT_PREFIX = "storm-";

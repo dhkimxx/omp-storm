@@ -159,9 +159,9 @@ describe("recommendedConfig", () => {
 			version: 1,
 			priority: "balanced",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: 2 },
-				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: 1 },
-				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: 1 },
+				explorer: { agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 2, max: 4 } },
+				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: { min: 1, max: 2 } },
+				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } },
 			},
 			parallelism: 4,
 			isolation: "shared",
@@ -187,12 +187,19 @@ describe("recommendedConfig", () => {
 			parallelism: 7,
 			contract: "orchestrate",
 			budget: { perRunUsd: 2, onExceed: "stop" },
-			roles: { explorer: { agent: "storm-explorer", models: ["a/x"], effort: "low", workers: 4 }, reviewer: { agent: "storm-reviewer", models: ["b/r"], workers: 1 } },
+			contextCap: 100_000,
+			roles: {
+				explorer: { agent: "storm-explorer", models: ["a/x"], effort: "low", workers: 4, contextCap: 50_000 },
+				reviewer: { agent: "storm-reviewer", models: ["b/r"], workers: { min: 1, max: 3 } },
+			},
 			trials: [trialCfg],
 		};
 		const c = recommendedConfig(recs(), efforts, "balanced", current);
-		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: 4 });
-		expect(c).toMatchObject({ parallelism: 7, isolation: "isolated", contract: "orchestrate", budget: { perRunUsd: 2, onExceed: "stop" }, trials: [trialCfg] });
+		// A legacy count carries over as n~n; ranges and caps carry over as they are.
+		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x:low", "b/z:low"], workers: { min: 4, max: 4 }, contextCap: 50_000 });
+		expect(c.roles.reviewer!.workers).toEqual({ min: 1, max: 3 });
+		expect(c.roles.implementer!.workers).toEqual({ min: 1, max: 2 });
+		expect(c).toMatchObject({ parallelism: 7, isolation: "isolated", contract: "orchestrate", contextCap: 100_000, budget: { perRunUsd: 2, onExceed: "stop" }, trials: [trialCfg] });
 		expect(c.fallbackRole).toBeUndefined();
 	});
 
@@ -215,21 +222,21 @@ describe("buildConfig / deriveScope", () => {
 
 	test("models are written with per-model effort suffixes and no role effort", () => {
 		const c = buildConfig(recs(), { explorer: pick("b/custom:thinking", "max", ["a/x", "low"]), implementer: pick("c/j") }, opts);
-		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["b/custom:thinking:max", "a/x:low"], workers: 2 });
-		expect(c.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j"], workers: 1 });
+		expect(c.roles.explorer).toEqual({ agent: "storm-explorer", models: ["b/custom:thinking:max", "a/x:low"], workers: { min: 2, max: 4 } });
+		expect(c.roles.implementer).toEqual({ agent: "storm-implementer", models: ["c/j"], workers: { min: 1, max: 2 } });
 		expect(c.roles.reviewer).toBeUndefined();
 		expect(deriveScope(c, []).providers).toEqual(["a", "b", "c"]);
 	});
 
-	test("defaults: explorer 2 workers, others 1, fallback implementer only when that role exists", () => {
+	test("defaults: DEFAULT_WORKERS ranges, fallback implementer only when that role exists", () => {
 		const full = buildConfig(recs(), all, opts);
 		expect(full.fallbackRole).toBe("implementer");
-		expect(Object.values(full.roles).map((r) => r.workers)).toEqual([2, 1, 1]);
+		expect(Object.values(full.roles).map((r) => r.workers)).toEqual([{ min: 2, max: 4 }, { min: 1, max: 2 }, { min: 1, max: 2 }]);
 		const noImpl = buildConfig(recs(), { explorer: all.explorer, reviewer: all.reviewer }, opts);
 		expect("fallbackRole" in noImpl).toBe(false);
-		const blocked = buildConfig(recs(), { explorer: all.explorer, implementer: all.implementer }, { ...opts, fallbackRole: null, workers: { explorer: 6 } });
+		const blocked = buildConfig(recs(), { explorer: all.explorer, implementer: all.implementer }, { ...opts, fallbackRole: null, workers: { explorer: { min: 3, max: 6 } } });
 		expect("fallbackRole" in blocked).toBe(false);
-		expect(blocked.roles.explorer!.workers).toBe(6);
+		expect(blocked.roles.explorer!.workers).toEqual({ min: 3, max: 6 });
 		expect(buildConfig(recs(), { reviewer: all.reviewer }, { ...opts, fallbackRole: "toString" }).fallbackRole).toBeUndefined();
 	});
 
@@ -326,7 +333,7 @@ describe("render", () => {
 	test("v0.1 status view renders none of the v0.2 sections", () => {
 		const md = renderStatus(statusBase(), 0);
 		expect(md.split("\n")[0]).toBe(`- Storm ${STORM_VERSION}`);
-		for (const h of ["### 실행 중", "### 마지막 실행", "### 시험", "### 쿼터 소진 표시", "### 승인 대기", "다른 에이전트", "워커", "### 서브에이전트", "### 수명 관리"]) {
+		for (const h of ["### 실행 중", "### 마지막 실행", "### 시험", "### 쿼터 소진 표시", "### 승인 대기", "다른 에이전트", "### 서브에이전트", "### 수명 관리"]) {
 			expect(md).not.toContain(h);
 		}
 	});
@@ -461,14 +468,17 @@ describe("render", () => {
 			budget: { perRunUsd: 2, onExceed: "stop" },
 		};
 		const diff = renderConfigDiff(prev, next);
-		expect(diff).toContain("- explorer 워커: 1 → 3");
+		expect(diff).toContain("- explorer 워커: 2~4 → 3");
 		expect(diff).toContain("- 실행 중 다른 에이전트: 차단 → 탐색 역할 모델로 대체");
 		expect(diff).toContain("- 예산: 없음 → 실행당 $2, 초과 시 stop");
 		expect(diff).toMatch(/- 시험 reviewer-c: .*비율 25% .* → .*비율 50%/);
 		expect(diff).toContain("- 시험 gone: 삭제");
 		expect(diff).toMatch(/- 시험 new: 추가 · 리뷰 · c\/cand:high · 비율 25% · 최대 10회 · .* ~ .* · 예산 \$5/);
 		expect(renderConfigDiff(next, structuredClone(next))).toBe("변경 없음");
-		expect(renderConfigDiff(cfg("a/x"), { ...cfg("a/x"), roles: { explorer: { agent: "storm-explorer", models: ["a/x"], workers: 1 } } })).toBe("변경 없음");
+		expect(renderConfigDiff(cfg("a/x"), { ...cfg("a/x"), roles: { explorer: { agent: "storm-explorer", models: ["a/x"], workers: { min: 2, max: 4 } } } })).toBe("변경 없음");
+		const capped = renderConfigDiff(cfg("a/x"), { ...cfg("a/x"), contextCap: 100_000, roles: { explorer: { agent: "storm-explorer", models: ["a/x"], contextCap: 80_000 } } });
+		expect(capped).toContain("- explorer 컨텍스트 상한: 기본(");
+		expect(capped).toMatch(/- 컨텍스트 상한: 기본\(.*\) → 100/);
 		const fresh = renderConfigDiff(undefined, next);
 		expect(fresh).toContain("- explorer 워커: 3");
 		expect(fresh).toMatch(/- 시험 new: 리뷰 · c\/cand/);
@@ -519,9 +529,11 @@ describe("render per-model effort", () => {
 			config: { status: "ok", path: "/r/c", config: { ...cfg("a/x"), roles }, hash: "jcs-sha256:abcdef0123456789", rawSha256: "x", warnings: [] },
 		});
 		const md = renderStatus(view({ explorer: { agent: "storm-explorer", models: ["mistral/x:max", "anthropic/y:low"] } }), 0);
-		expect(md).toContain("- explorer: mistral/x:max → anthropic/y:low\n");
+		expect(md).toContain("- explorer: mistral/x:max → anthropic/y:low · 워커 2~4\n");
 		const legacy = renderStatus(view({ explorer: { agent: "storm-explorer", models: ["a/x", "b/y:max"], effort: "low" } }), 0);
-		expect(legacy).toContain("- explorer: a/x → b/y:max · low\n");
+		expect(legacy).toContain("- explorer: a/x → b/y:max · low · 워커 2~4\n");
+		const capped = renderStatus(view({ implementer: { agent: "storm-implementer", models: ["a/x"], workers: 3, contextCap: 90_000 } }), 0);
+		expect(capped).toMatch(/- implementer: a\/x · 워커 3 · 컨텍스트 상한 90/);
 	});
 
 	test("config diff prints the role effort line only when either side sets it", () => {
@@ -545,8 +557,8 @@ describe("v0.7 roles", () => {
 	test("recommendedConfig builds every role, quick with 2 workers, and skips roles the current config disabled", () => {
 		const c = recommendedConfig(all(), efforts, "balanced");
 		expect(Object.keys(c.roles)).toEqual(ROLES.map((r) => r.id));
-		expect(c.roles.quick).toMatchObject({ agent: "storm-quick", workers: 2 });
-		expect(c.roles.architect).toMatchObject({ agent: "storm-architect", workers: 1 });
+		expect(c.roles.quick).toMatchObject({ agent: "storm-quick", workers: { min: 1, max: 3 } });
+		expect(c.roles.architect).toMatchObject({ agent: "storm-architect", workers: { min: 1, max: 1 } });
 		expect(c.disabledRoles).toBeUndefined();
 		const current: StormConfig = { ...c, disabledRoles: ["reviewer", "architect"] };
 		delete current.roles.reviewer;

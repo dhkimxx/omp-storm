@@ -20,6 +20,7 @@ import type {
 	QuotaMark,
 	RepoIdentity,
 	RoleRecommendation,
+	RunPlan,
 	ShadowInfo,
 	StormConfig,
 	TrialConfig,
@@ -175,6 +176,7 @@ function fakeHost(
 		run?: RunRequestResult;
 		agents?: AgentEntry[];
 		lifecycle?: LifecycleSettings;
+		runActive?: boolean;
 	} = {},
 ) {
 	let config: StormConfig | null = opts.config === undefined ? structuredClone(base) : opts.config;
@@ -183,6 +185,7 @@ function fakeHost(
 	const reports: Array<{ title: string; md: string }> = [];
 	const selects: Array<{ title: string; options: string[]; context?: UiContext }> = [];
 	const saved: Saved[] = [];
+	const plans: RunPlan[] = [];
 	const proposals: Proposal[] = [];
 	const marks: QuotaMark[] = [];
 	const runs: string[] = [];
@@ -242,6 +245,11 @@ function fakeHost(
 				runs.push(task);
 				return opts.run ?? { ok: true, runId: "run-1" };
 			},
+			setRunPlan: (plan) => {
+				if (!opts.runActive) return { ok: false, reason: "진행 중인 Storm 실행이 없습니다." };
+				plans.push(plan);
+				return { ok: true };
+			},
 			agents: () => structuredClone(opts.agents ?? []),
 		},
 		lifecycleSettings: async () => opts.lifecycle ?? { agentIdleTtlMs: 420_000, cacheRetention: "auto" },
@@ -265,6 +273,7 @@ function fakeHost(
 		proposals,
 		marks,
 		runs,
+		plans,
 		prepares: () => prepares,
 		left: () => queue.length,
 		config: () => config,
@@ -397,7 +406,7 @@ describe("approval gate", () => {
 		const f = fakeHost({ config: null });
 		for (const params of [
 			{ action: "priority", priority: "cost" },
-			{ action: "workers", role: "implementer", workers: 2 },
+			{ action: "workers", role: "implementer", max: 2 },
 			{ action: "budget", budgetUsd: 3 },
 		] satisfies StormToolInput[]) {
 			const r = await run(f, params);
@@ -409,20 +418,20 @@ describe("approval gate", () => {
 	test("only the exact label approves; everything else defers and saves the proposal", async () => {
 		for (const answer of [undefined, "나중에", "승인 ", "approve", "승인 후 저장"]) {
 			const f = fakeHost({ answers: [answer] });
-			const r = await run(f, { action: "workers", role: "implementer", workers: 2 });
+			const r = await run(f, { action: "workers", role: "implementer", max: 2 });
 			expect(r.outcome).toBe("deferred");
 			expect(r.text).toContain("보류했습니다. /storm 메뉴에서 승인할 수 있습니다.");
 			expect(f.saved).toEqual([]);
 			expect(f.config()).toEqual(base);
 			expect(f.proposals).toHaveLength(1);
 			expect(f.proposals[0]).toMatchObject({ schema: "storm.proposal/v1", kind: "workers", baseHash: configHash(base) });
-			expect(f.proposals[0]!.config.roles.implementer!.workers).toBe(2);
+			expect(f.proposals[0]!.config.roles.implementer!.workers).toEqual({ min: 2, max: 2 });
 		}
 	});
 
 	test("cancel saves nothing", async () => {
 		const f = fakeHost({ answers: ["취소"] });
-		const r = await run(f, { action: "workers", role: "implementer", workers: 2 });
+		const r = await run(f, { action: "workers", role: "implementer", max: 2 });
 		expect(r).toEqual({ outcome: "cancelled", text: "바꾸지 않았습니다." });
 		expect(f.saved).toEqual([]);
 		expect(f.proposals).toEqual([]);
@@ -430,12 +439,12 @@ describe("approval gate", () => {
 
 	test("approval saves through approveAndSave with scope, then the deferred proposal is stale", async () => {
 		const f = fakeHost({ answers: [undefined, "승인"] });
-		await run(f, { action: "workers", role: "implementer", workers: 2 });
-		const r = await run(f, { action: "workers", role: "reviewer", workers: 4 });
+		await run(f, { action: "workers", role: "implementer", max: 2 });
+		const r = await run(f, { action: "workers", role: "reviewer", max: 4 });
 		expect(r.outcome).toBe("approved");
 		expect(r.text).toContain(configHash(f.config()).slice("jcs-sha256:".length, "jcs-sha256:".length + 12));
 		expect(f.saved).toHaveLength(1);
-		expect(f.saved[0]!.config.roles.reviewer!.workers).toBe(4);
+		expect(f.saved[0]!.config.roles.reviewer!.workers).toEqual({ min: 1, max: 4 });
 		expect(f.saved[0]!.baseHash).toBe(configHash(base));
 		expect(f.saved[0]!.scope.providers).toEqual(["a", "b"]);
 		expect(await f.host.proposals.list()).toEqual([]);
@@ -452,7 +461,7 @@ describe("approval gate", () => {
 				},
 			],
 		});
-		const r = await run(g, { action: "workers", role: "implementer", workers: 2 });
+		const r = await run(g, { action: "workers", role: "implementer", max: 2 });
 		expect(r.outcome).toBe("rejected");
 		expect(g.saved).toEqual([]);
 	});
@@ -460,7 +469,7 @@ describe("approval gate", () => {
 	test("shadowing definitions are shown in the approval dialog, and a new one blocks the write", async () => {
 		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.omp/agents/storm-reviewer.md", scope: "project", sha256: "ab" };
 		const f = fakeHost({ shadows: [shadow], answers: ["승인"] });
-		expect((await run(f, { action: "workers", role: "implementer", workers: 2 })).outcome).toBe("approved");
+		expect((await run(f, { action: "workers", role: "implementer", max: 2 })).outcome).toBe("approved");
 		expect(f.reports).toEqual([]);
 		expect(f.selects[0]!.context).toMatchObject({ title: "Storm 변경 제안" });
 		expect(f.selects[0]!.context!.markdown).toContain(shadow.path);
@@ -474,13 +483,15 @@ describe("approval gate", () => {
 				},
 			],
 		});
-		expect((await run(g, { action: "workers", role: "implementer", workers: 2 })).outcome).toBe("rejected");
+		expect((await run(g, { action: "workers", role: "implementer", max: 2 })).outcome).toBe("rejected");
 		expect(g.saved).toEqual([]);
 	});
 
 	test("no-op change asks nothing", async () => {
-		const f = fakeHost();
-		const r = await run(f, { action: "workers", role: "explorer", workers: 1 });
+		const cfg = structuredClone(base);
+		cfg.roles.explorer!.workers = { min: 2, max: 4 };
+		const f = fakeHost({ config: cfg });
+		const r = await run(f, { action: "workers", role: "explorer", max: 4 });
 		expect(r.outcome).toBe("ok");
 		expect(f.selects).toEqual([]);
 	});
@@ -509,13 +520,91 @@ describe("priority", () => {
 
 describe("workers", () => {
 	test("bounds and unknown role", async () => {
-		for (const workers of [0, 17, 2.5, Number.NaN]) {
-			expect((await run(fakeHost(), { action: "workers", role: "implementer", workers })).outcome).toBe("rejected");
+		for (const [min, max] of [[0, 2], [1, 17], [2.5, 3], [Number.NaN, 2], [3, 2]] as const) {
+			expect((await run(fakeHost(), { action: "workers", role: "implementer", min, max })).outcome).toBe("rejected");
 		}
 		const cfg = structuredClone(base);
 		delete cfg.roles.reviewer;
-		expect((await run(fakeHost({ config: cfg }), { action: "workers", role: "reviewer", workers: 2 })).outcome).toBe("rejected");
+		expect((await run(fakeHost({ config: cfg }), { action: "workers", role: "reviewer", max: 2 })).outcome).toBe("rejected");
 		expect((await run(fakeHost(), { action: "workers", role: "reviewer" })).outcome).toBe("rejected");
+	});
+
+	test("one bound keeps the other, widening it when needed, and writes the range form", async () => {
+		const f = fakeHost({ answers: ["승인", "승인"] });
+		await run(f, { action: "workers", role: "reviewer", max: 3 });
+		expect(f.config()!.roles.reviewer!.workers).toEqual({ min: 1, max: 3 });
+		await run(f, { action: "workers", role: "reviewer", min: 5 });
+		expect(f.config()!.roles.reviewer!.workers).toEqual({ min: 5, max: 5 });
+	});
+});
+
+describe("plan", () => {
+	const lanes = [
+		{ name: "core", kind: "code" as const, files: ["src/a.ts"] },
+		{ name: "scan", kind: "explore" as const },
+	];
+
+	test("within bounds applies at once with no dialog", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 2 } } });
+		expect(r.outcome).toBe("ok");
+		expect(f.selects).toEqual([]);
+		expect(f.saved).toEqual([]);
+		expect(f.plans).toHaveLength(1);
+		expect(f.plans[0]!.workers).toEqual({ implementer: 2, explorer: 2 });
+		expect(f.plans[0]!.lanes.map((l) => l.role)).toEqual(["implementer", "explorer"]);
+		expect(r.text).toContain("구현(implementer): 워커 2개/최대 3");
+	});
+
+	test("errors reject without a dialog", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, { action: "plan", plan: { lanes: [], workers: {} } });
+		expect(r.outcome).toBe("rejected");
+		expect(f.plans).toEqual([]);
+		expect((await run(f, { action: "plan" })).outcome).toBe("rejected");
+	});
+
+	test("workers past max: 승인 raises the max, then the plan applies", async () => {
+		const f = fakeHost({ runActive: true, answers: ["승인"] });
+		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
+		expect(r.outcome).toBe("approved");
+		expect(f.selects[0]!.options).toEqual(["승인", "취소"]);
+		expect(f.selects[0]!.context!.markdown).toContain("core");
+		expect(f.saved).toHaveLength(1);
+		expect(f.saved[0]!.config.roles.implementer!.workers).toEqual({ min: 3, max: 5 });
+		expect(f.saved[0]!.evidence).toMatchObject({ source: "plan" });
+		expect(f.prepares()).toBe(0);
+		expect(f.plans[0]!.workers.implementer).toBe(5);
+	});
+
+	test("a disabled role: 승인 adds it with recommended models, then the plan applies", async () => {
+		const cfg = structuredClone(base);
+		delete cfg.roles.reviewer;
+		cfg.disabledRoles = ["reviewer"];
+		const f = fakeHost({ config: cfg, runActive: true, answers: ["승인"] });
+		const r = await run(f, { action: "plan", plan: { lanes: [...lanes, { name: "check", kind: "review", role: "reviewer" }] } });
+		expect(r.outcome).toBe("approved");
+		const saved = f.saved[0]!.config;
+		expect(saved.disabledRoles).toBeUndefined();
+		expect(saved.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } });
+		expect(f.plans[0]!.lanes[2]!.role).toBe("reviewer");
+	});
+
+	test("취소 saves nothing and applies nothing, naming the max", async () => {
+		const f = fakeHost({ runActive: true, answers: ["취소"] });
+		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
+		expect(r.outcome).toBe("cancelled");
+		expect(r.text).toContain("구현 최대 3");
+		expect(f.saved).toEqual([]);
+		expect(f.plans).toEqual([]);
+	});
+
+	test("no active run: validated, not stored; an approved change still saves", async () => {
+		const f = fakeHost({ answers: ["승인"] });
+		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
+		expect(r.text).toContain("계획을 저장하지 않았습니다");
+		expect(f.saved).toHaveLength(1);
+		expect(f.plans).toEqual([]);
 	});
 });
 

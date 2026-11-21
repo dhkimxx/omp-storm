@@ -399,8 +399,19 @@ export interface RoleConfig {
 	models: string[];
 	/** Default effort for entries without their own suffix. The interview writes a suffix per model and leaves this unset. */
 	effort?: Effort;
-	/** Workers of this role one Storm run may keep busy at once (default 1); stated in the run contract. */
-	workers?: number;
+	/**
+	 * Workers of this role in one Storm run. `min` is the count a run plan gets when it sets none for a role it uses;
+	 * `max` caps the role's live agents (Storm refuses spawns past it) and bounds what a plan may ask for.
+	 * A bare number n (configs before v0.8) means { min: n, max: n }; read it through `workerRange`.
+	 */
+	workers?: number | WorkerRange;
+	/** Context ceiling in tokens for this role's agents; overrides `StormConfig.contextCap`. */
+	contextCap?: number;
+}
+
+export interface WorkerRange {
+	min: number;
+	max: number;
 }
 
 /** A bounded trial of a candidate model for one role (plan 9.3). Part of the hashed config, so approving the config approves the trial. */
@@ -447,6 +458,11 @@ export interface StormConfig {
 	 * borrow the nearest configured stand-in's models (`ROLE_STAND_INS`).
 	 */
 	disabledRoles?: string[];
+	/**
+	 * Context ceiling in tokens for subagents (default `DEFAULT_CONTEXT_CAP`). An agent at or past
+	 * min(this, 70% of its window) takes no follow-ups during a run: the director starts a fresh one with a summary.
+	 */
+	contextCap?: number;
 	trials?: TrialConfig[];
 }
 
@@ -658,8 +674,39 @@ export interface RunRecord {
 	mainCostUsd?: number;
 	/** File changes the main session tried itself and director mode sent back to delegation. */
 	blockedEdits?: number;
+	/** The run plan in force when the run ended (the last one the director submitted). */
+	plan?: RunPlan;
+	/** Follow-ups to agents past their context ceiling that Storm sent back to a fresh agent. */
+	blockedFollowUps?: number;
 	/** ISO 8601 of the last write while the run was active. */
 	updatedAt?: string;
+}
+
+/** Kinds of work a run plan's lanes do; each defaults to a role (`LANE_ROLES`). */
+export type LaneKind = "explore" | "code" | "run" | "review" | "design";
+
+/** One lane of a run plan: a piece of work with its kind, the role that does it, and the files it may change. */
+export interface PlanLane {
+	name: string;
+	kind: LaneKind;
+	/** Role key; resolved from `kind` when the director names none. */
+	role: string;
+	/** Write scope; lanes that run at the same time should not share files. */
+	files?: string[];
+	goal?: string;
+}
+
+/**
+ * The director's plan for one Storm run, validated against the approved team. Within the team's bounds it applies
+ * at once; past them it needs an approved config change first. Storm refuses spawns during a run until one exists.
+ */
+export interface RunPlan {
+	lanes: PlanLane[];
+	/** Live agents allowed per role in this run (each ≤ the role's max); roles without lanes get none. */
+	workers: Record<string, number>;
+	/** ISO 8601. */
+	submittedAt: string;
+	note?: string;
 }
 
 /** A provider reported out of quota; approved fallbacks on other providers go first until `until`. */
@@ -714,7 +761,15 @@ export interface TrialView {
 export interface SpawnRuntime {
 	now: number;
 	/** The run active in this process for this project, if any. */
-	run?: { runId: string; costUsd: number; budget?: BudgetConfig };
+	run?: {
+		runId: string;
+		costUsd: number;
+		budget?: BudgetConfig;
+		/** The run plan in force; spawns during a run are refused without one. */
+		plan?: RunPlan;
+		/** Agents of this run alive now (spawned and not yet settled), excluding the one being decided. */
+		active?: { total: number; byRole: Record<string, number> };
+	};
 	/** Active marks only. */
 	quotaMarks: QuotaMark[];
 	/** Trial counters by trial id. */
@@ -729,7 +784,7 @@ export interface SpawnOutcome {
 
 // ── Proposals and evidence (implemented in src/proposals) ─────────────────────────────────────
 
-export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "setup";
+export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "setup" | "plan";
 
 /** Why the approved models were chosen, stored per config hash next to the approval. */
 export interface EvidenceRecord {
@@ -808,8 +863,22 @@ export type StormToolAction =
 	| "trial"
 	| "budget"
 	| "run"
+	| "plan"
 	| "agents"
 	| "propose";
+
+/** A run plan as the director sends it; `validatePlan` checks it and resolves roles and workers. */
+export interface PlanRequest {
+	lanes: Array<{
+		name: string;
+		kind: LaneKind;
+		role?: RoleId | undefined;
+		files?: string[] | undefined;
+		goal?: string | undefined;
+	}>;
+	workers?: Record<string, number> | undefined;
+	note?: string | undefined;
+}
 
 /** Arguments the LLM passes; each action reads only its own fields. */
 export interface StormToolParams {
@@ -818,8 +887,11 @@ export interface StormToolParams {
 	priority?: Priority;
 	/** workers, reselect, trial */
 	role?: RoleId;
-	/** workers: absolute count for the role */
-	workers?: number;
+	/** workers: the role's new worker range (either bound may be left out) */
+	min?: number;
+	max?: number;
+	/** plan: the run plan */
+	plan?: PlanRequest;
 	/** reselect: the model the user named; trial: the candidate */
 	model?: string;
 	/** quota */
@@ -872,18 +944,20 @@ export interface AgentEntry {
 	followUps: number;
 	/** Cache-read share of the last request's prompt, 0..1. */
 	lastCacheReadShare?: number;
-	/** Structured verdict it yielded (omp reviewer output schema), when it reviewed. */
-	review?: ReviewVerdict;
+	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
+	review?: ReviewTally;
 }
 
-/** A reviewer's verdict from its `yield`: overall correctness plus its findings counted by priority. */
-export interface ReviewVerdict {
-	/** Absent until the final payload arrives (findings can come first, one section at a time). */
-	verdict?: "correct" | "incorrect";
-	/** 0..1 */
-	confidence?: number;
+/** A reviewer's yields counted as reviews: each final verdict payload is one review; findings add up across them. */
+export interface ReviewTally {
+	/** Verdict payloads received: passed + failed. */
+	reviews: number;
+	passed: number;
+	failed: number;
 	/** Findings by priority: [P0, P1, P2, P3]. */
 	findings: [number, number, number, number];
+	/** 0..1, from the latest verdict. */
+	lastConfidence?: number;
 }
 
 export interface AgentAdvice {

@@ -145,10 +145,17 @@ describe("validateConfig", () => {
 		["warn above limit", c => (c.budget.warnAtUsd = 3), "budget.warnAtUsd:"],
 		["warn zero", c => (c.budget.warnAtUsd = 0), "budget.warnAtUsd:"],
 		["onExceed", c => (c.budget.onExceed = "ignore"), "budget.onExceed:"],
-		["workers zero", c => (c.roles.reviewer.workers = 0), "roles.reviewer.workers: 1~16 사이 정수여야 합니다"],
+		["workers zero", c => (c.roles.reviewer.workers = 0), "roles.reviewer.workers:"],
 		["workers 17", c => (c.roles.reviewer.workers = 17), "roles.reviewer.workers:"],
 		["workers fraction", c => (c.roles.reviewer.workers = 1.5), "roles.reviewer.workers:"],
 		["workers string", c => (c.roles.reviewer.workers = "2"), "roles.reviewer.workers:"],
+		["workers min above max", c => (c.roles.reviewer.workers = { min: 3, max: 2 }), "roles.reviewer.workers:"],
+		["workers max 17", c => (c.roles.reviewer.workers = { min: 1, max: 17 }), "roles.reviewer.workers:"],
+		["workers min zero", c => (c.roles.reviewer.workers = { min: 0, max: 2 }), "roles.reviewer.workers:"],
+		["workers range missing max", c => (c.roles.reviewer.workers = { min: 1 }), "roles.reviewer.workers:"],
+		["team contextCap zero", c => (c.contextCap = 0), "contextCap:"],
+		["team contextCap fraction", c => (c.contextCap = 1.5), "contextCap:"],
+		["role contextCap too big", c => (c.roles.reviewer.contextCap = 10_000_001), "roles.reviewer.contextCap:"],
 		["fallbackRole unknown", c => (c.fallbackRole = "implementer"), "fallbackRole: roles에 있는 역할이어야 합니다"],
 		["fallbackRole non-string", c => (c.fallbackRole = 1), "fallbackRole:"],
 		["fallbackRole prototype key", c => (c.fallbackRole = "toString"), "fallbackRole:"],
@@ -191,7 +198,9 @@ describe("validateConfig", () => {
 	test("accepts workers, fallbackRole and trials, and warns on unknown trial fields", () => {
 		const c = clone();
 		c.roles.reviewer.workers = 16;
-		c.roles.explorer.workers = 1;
+		c.roles.explorer.workers = { min: 1, max: 16 };
+		c.roles.explorer.contextCap = 10_000_000;
+		c.contextCap = 1;
 		c.fallbackRole = "reviewer";
 		c.trials = [trial, { ...trial, id: "t2", effort: "high", share: 1, maxSpawns: 1000, endsAt: "2026-11-27T09:00:00.5+09:00", note: 1 }];
 		const r = validateConfig(c);

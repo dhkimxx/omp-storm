@@ -6,9 +6,9 @@ import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { ApprovalStore } from "../src/approval/store.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { configPath } from "../src/config/store.ts";
-import { noteRunSpawn, RunController, summarizeRun, touchRun } from "../src/runtime/controller.ts";
-import { recordCost, resetLedger } from "../src/runtime/ledger.ts";
-import { readRun } from "../src/runtime/run.ts";
+import { noteRunSpawn, RunController, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
+import { activeLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
+import { lastRun, readRun, runsDir } from "../src/runtime/run.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RepoIdentity, RunRecord, SpawnRecord, StormConfig, UiPort } from "../src/types.ts";
 
@@ -64,7 +64,7 @@ afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
 });
 
-function harness(agents: AgentEntry[]) {
+function harness(agents: AgentEntry[], opts: { select?: UiPort["select"]; ctx?: object } = {}) {
 	const repo: RepoIdentity = { repoId: "git-test-000000000000000000000000", kind: "git-common-dir", root };
 	const hash = configHash(config);
 	const state: ProjectState = {
@@ -88,7 +88,7 @@ function harness(agents: AgentEntry[]) {
 		store: new ApprovalStore(path.join(root, "agent"), repo),
 	};
 	const ui: UiPort = {
-		select: async () => undefined,
+		select: opts.select ?? (async () => undefined),
 		confirm: async () => false,
 		input: async () => undefined,
 		notify: () => undefined,
@@ -104,8 +104,9 @@ function harness(agents: AgentEntry[]) {
 		agents: () => agents,
 		flushMs: FLUSH_MS,
 	});
-	// The controller only hands ctx to its own deps here.
-	return { controller, repo, ctx: {} as ExtensionContext };
+	// The controller only hands ctx to its own deps, plus the context usage and compaction the preflight reads.
+	const ctx = (opts.ctx ?? {}) as ExtensionContext;
+	return { controller, repo, ctx };
 }
 
 async function startRun(h: ReturnType<typeof harness>): Promise<string> {
@@ -200,13 +201,118 @@ describe("run summary", () => {
 			costUsd: 2,
 			mainCostUsd: 1,
 			blockedEdits: 1,
+			blockedFollowUps: 2,
+			plan: {
+				lanes: [
+					{ name: "a", kind: "code", role: "implementer" },
+					{ name: "b", kind: "code", role: "implementer" },
+					{ name: "c", kind: "review", role: "reviewer" },
+				],
+				workers: { implementer: 2, reviewer: 1 },
+				submittedAt: "2026-11-20T09:00:00.000Z",
+			},
 			costByModel: {},
 			spawns: [spawn, { ...spawn, outcome: "blocked", reason: "x" }],
-			agents: [agent({ review: { verdict: "incorrect", findings: [1, 0, 0, 0] } })],
+			agents: [
+				agent({ review: { reviews: 3, passed: 1, failed: 2, findings: [1, 0, 0, 0] } }),
+				agent({ id: "Rev2", review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 2] } }),
+			],
 		};
 		const lines = summarizeRun(run).split("\n");
-		expect(lines).toContain("- 리뷰: 통과 0 · 수정 필요 1 (P0 1)");
+		expect(lines).toContain("- 리뷰 4회: 통과 2 · 수정 필요 2 (P0 1 · P3 2)");
+		expect(lines[0]).toContain("계획 레인 3(구현 2 · 리뷰 1)");
+		expect(lines.find(l => l.startsWith("- 메인(감독):"))).toContain("상한 넘은 후속 지시 2회를 새 에이전트로 돌림");
 		expect(lines.length).toBeLessThanOrEqual(5);
-		expect(summarizeRun({ ...run, spawns: [] })).not.toContain("리뷰");
+		expect(summarizeRun({ ...run, spawns: [] }).split("\n").some(l => l.startsWith("- 리뷰"))).toBe(false);
+	});
+});
+
+describe("run plan and blocked follow-ups", () => {
+	const plan = { lanes: [{ name: "a", kind: "code" as const, role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+
+	test("setPlan needs an active run; the plan reaches the ledger, the live record and the final record", async () => {
+		const h = harness([]);
+		expect(h.controller.setPlan(plan)).toMatchObject({ ok: false });
+		h.controller.noteBlockedFollowUp();
+		const runId = await startRun(h);
+		expect(activeLedgerRun(h.repo.repoId)?.plan).toBeUndefined();
+		expect(h.controller.setPlan(plan)).toEqual({ ok: true });
+		expect(activeLedgerRun(h.repo.repoId)?.plan).toEqual(plan);
+		expect(h.controller.active()?.plan).toEqual(plan);
+		h.controller.noteBlockedFollowUp();
+		noteRunSpawn(runId, spawn);
+		expect(runSpawns(runId)).toEqual([spawn]);
+		const record = await h.controller.finish("done");
+		expect(record).toMatchObject({ plan, blockedFollowUps: 1 });
+		expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+	});
+});
+
+describe("preflight", () => {
+	const heavy = (compacted: string[]) => ({
+		hasUI: true,
+		getContextUsage: () => ({ tokens: 160_000, contextWindow: 400_000, percent: 40 }),
+		compact: async (instructions: string) => {
+			compacted.push(instructions);
+		},
+	});
+
+	test("compact first: compacts with instructions to keep the plan, then starts", async () => {
+		const compacted: string[] = [];
+		const asked: string[][] = [];
+		const h = harness([], {
+			ctx: heavy(compacted),
+			select: async (_title, options, context) => {
+				asked.push(options.map(o => (typeof o === "string" ? o : o.label)));
+				expect(context?.markdown).toContain("160.0k 토큰 / 창 400.0k (40%)");
+				return "압축 후 시작 (추천)";
+			},
+		});
+		const runId = await startRun(h);
+		expect(asked).toEqual([["압축 후 시작 (추천)", "그대로 시작", "취소"]]);
+		expect(compacted).toHaveLength(1);
+		expect(compacted[0]).toContain("작업 계획");
+		expect(compacted[0]).toContain("파일 경로");
+		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		await h.controller.finish("done");
+	});
+
+	test("start as is skips compaction; cancel records nothing", async () => {
+		const compacted: string[] = [];
+		const asIs = harness([], { ctx: heavy(compacted), select: async () => "그대로 시작" });
+		await startRun(asIs);
+		expect(compacted).toEqual([]);
+		await asIs.controller.finish("done");
+		await rm(runsDir(root), { recursive: true, force: true });
+
+		for (const answer of ["취소", undefined]) {
+			const h = harness([], { ctx: heavy(compacted), select: async () => answer });
+			const result = await h.controller.start(h.ctx, "task");
+			expect(result.ok).toBe(false);
+			expect(h.controller.directing()).toBe(false);
+			expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+			expect(await lastRun(root)).toBeUndefined();
+		}
+		expect(compacted).toEqual([]);
+	});
+
+	test("a small context or no UI asks nothing; half the window alone is heavy", async () => {
+		let asked = 0;
+		const select = async () => {
+			asked++;
+			return "그대로 시작";
+		};
+		const usage = (tokens: number, percent: number) => ({ hasUI: true, getContextUsage: () => ({ tokens, contextWindow: 200_000, percent }) });
+		const small = harness([], { ctx: usage(149_999, 49), select });
+		await startRun(small);
+		await small.controller.finish("done");
+		const headless = harness([], { ctx: { ...usage(190_000, 95), hasUI: false }, select });
+		await startRun(headless);
+		await headless.controller.finish("done");
+		expect(asked).toBe(0);
+		const half = harness([], { ctx: usage(100_000, 50), select });
+		await startRun(half);
+		await half.controller.finish("done");
+		expect(asked).toBe(1);
 	});
 });

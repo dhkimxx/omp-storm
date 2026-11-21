@@ -152,7 +152,12 @@ async function buildStatus(env: FlowEnv): Promise<{ state: ProjectState; markdow
 	const lifecycle = settings ? lifecycleOf(settings) : undefined;
 	const entries = env.agents?.() ?? [];
 	const agents = entries.length
-		? adviseRows(entries, { now, settings: lifecycle ?? {}, ...(env.modelCost ? { cost: env.modelCost } : {}) })
+		? adviseRows(entries, {
+				now,
+				settings: lifecycle ?? {},
+				...(env.modelCost ? { cost: env.modelCost } : {}),
+				...(config ? { config } : {}),
+			})
 		: [];
 	const ompAdvice = config && settings ? ompSettingsAdvice(config, settings) : [];
 	const newerVersion = env.newerVersion?.();

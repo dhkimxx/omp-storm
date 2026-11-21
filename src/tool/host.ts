@@ -14,6 +14,7 @@ import type {
 	Proposal,
 	QuotaMark,
 	RunRecord,
+	RunPlan,
 	StormConfig,
 	TrialView,
 	UiPort,
@@ -41,6 +42,8 @@ export interface StormToolHost {
 		addQuotaMark(mark: QuotaMark): Promise<void>;
 		/** Queues a run that starts once the current agent turn settles. */
 		requestRun(task: string): RunRequestResult;
+		/** Puts a validated plan in force for the active run (replacing any earlier one); fails when no run is active. */
+		setRunPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string };
 		/** Subagents spawned under this session (any depth), from the agent ledger. */
 		agents(): AgentEntry[];
 	};
