@@ -1,17 +1,18 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { agentRows, duration, renderAgentRows, tokens } from "../src/report/agents.ts";
 import {
-	adviseAgents,
-	agentProviders,
-	cacheWindow,
-	COMPACTION_SHARE,
-	FRESH_MIN_TOKENS,
-	lifecycleWarnings,
-	REUSE_MARGIN_MS,
-	renderAgents,
-	teamProviders,
-} from "../src/report/agents.ts";
-import { listAgents, noteAgentEnd, noteAgentParked, noteAgentReview, noteAgentStart, noteAgentUsage, resetAgents } from "../src/runtime/agents.ts";
-import type { AgentEntry, LifecycleSettings, ModelCost, StormConfig } from "../src/types.ts";
+	listAgents,
+	markAgentsCleaned,
+	noteAgentEnd,
+	noteAgentFollowUp,
+	noteAgentParked,
+	noteAgentReview,
+	noteAgentStart,
+	noteAgentUsage,
+	resetAgents,
+} from "../src/runtime/agents.ts";
+import type { AgentEntry, StormConfig } from "../src/types.ts";
+import { agentEntry, teamOf } from "./fixtures.ts";
 
 const T0 = Date.parse("2026-11-20T09:00:00Z");
 const MIN = 60_000;
@@ -20,10 +21,10 @@ const HOUR = 3_600_000;
 describe("agent ledger", () => {
 	beforeEach(resetAgents);
 
-	test("start, usage, settle, follow-up by message and by revive", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", parentId: "Main", role: "implementer", runId: "r1", now: T0, revive: false });
-		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 10_000, cacheReadTokens: 9_600, costUsd: 0.01, contextWindow: 200_000, now: T0 + 1_000 });
-		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 12_000, cacheReadTokens: 11_400, costUsd: 0.02, now: T0 + 2_000 });
+	test("start, usage and settle; later turns keep the entry and do not count as follow-ups", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", parentId: "Main", role: "implementer", runId: "r1", now: T0 });
+		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 10_000, costUsd: 0.01, now: T0 + 1_000 });
+		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 12_000, costUsd: 0.02, now: T0 + 2_000 });
 		let [a] = listAgents();
 		expect(a).toMatchObject({
 			id: "A",
@@ -36,57 +37,69 @@ describe("agent ledger", () => {
 			startedAt: T0,
 			lastActivityAt: T0 + 2_000,
 			contextTokens: 12_000,
-			contextWindow: 200_000,
 			requests: 2,
 			followUps: 0,
-			lastCacheReadShare: 0.95,
 		});
 		expect(a!.costUsd).toBeCloseTo(0.03);
 
 		// A turn that does not settle (more turns follow) keeps the agent running.
 		noteAgentEnd({ id: "A", now: T0 + 3_000, settled: false });
 		expect(listAgents()[0]!.state).toBe("running");
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 3_500, revive: false });
-		expect(listAgents()[0]!.followUps).toBe(0);
-
 		noteAgentEnd({ id: "A", now: T0 + 4_000, settled: true });
 		[a] = listAgents();
 		expect(a).toMatchObject({ state: "idle", lastActivityAt: T0 + 4_000 });
 
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 60_000, revive: false });
-		expect(listAgents()[0]).toMatchObject({ state: "running", followUps: 1, runId: "r1", role: "implementer" });
+		// A wake, a message turn or a revive is a turn, not a counted follow-up: those are the director's delivered writes.
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 60_000 });
 		noteAgentEnd({ id: "A", now: T0 + 70_000, settled: true });
-
 		noteAgentParked("A");
-		// Parking keeps the last activity: it dates the cache.
 		expect(listAgents()[0]).toMatchObject({ state: "parked", lastActivityAt: T0 + 70_000 });
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 600_000, revive: true });
-		expect(listAgents()[0]).toMatchObject({ state: "running", followUps: 2 });
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 600_000 });
+		expect(listAgents()[0]).toMatchObject({ state: "running", followUps: 0, role: "implementer", startedAt: T0 });
 	});
 
-	test("unknown ids are ignored; a revive of an unseen agent counts one follow-up", () => {
-		noteAgentUsage({ id: "X", model: "a/b", promptTokens: 1, cacheReadTokens: 0, costUsd: 0, now: T0 });
+	test("follow-ups count delivered writes, one each, however many turns the agent takes", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 });
+		noteAgentEnd({ id: "A", now: T0 + 1, settled: true });
+		// 14 messages were sent in the 0.8 run and one was reported: every delivery counts.
+		for (let i = 0; i < 14; i++) noteAgentFollowUp("A");
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 2 });
+		expect(listAgents()[0]!.followUps).toBe(14);
+		noteAgentFollowUp("Nobody");
+		expect(listAgents()).toHaveLength(1);
+	});
+
+	test("an agent that takes a turn during a later run becomes that run's agent; a turn outside a run keeps its run", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r1", now: T0 });
+		noteAgentEnd({ id: "A", now: T0 + 1, settled: true });
+		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 2 });
+		expect(listAgents({ runId: "r1" }).map(e => e.id)).toEqual(["A"]);
+		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 3 });
+		expect(listAgents({ runId: "r1" })).toEqual([]);
+		expect(listAgents({ runId: "r2" }).map(e => e.id)).toEqual(["A"]);
+	});
+
+	test("unknown ids are ignored", () => {
+		noteAgentUsage({ id: "X", model: "a/b", promptTokens: 1, costUsd: 0, now: T0 });
 		noteAgentEnd({ id: "X", now: T0, settled: true });
 		noteAgentParked("X");
 		expect(listAgents()).toEqual([]);
-		noteAgentStart({ id: "R", name: "task", now: T0, revive: true });
-		expect(listAgents()[0]!.followUps).toBe(1);
 	});
 
 	test("listing returns copies", () => {
-		noteAgentStart({ id: "A", name: "task", now: T0, revive: false });
+		noteAgentStart({ id: "A", name: "task", now: T0 });
 		listAgents()[0]!.state = "parked";
 		expect(listAgents()[0]!.state).toBe("running");
 	});
 
 	test("ancestor filter follows parent links at any depth; run filter matches the run", () => {
-		noteAgentStart({ id: "C1", name: "task", parentId: "Main", runId: "r1", now: T0, revive: false });
-		noteAgentStart({ id: "G1", name: "task", parentId: "C1", now: T0 + 1, revive: false });
-		noteAgentStart({ id: "GG1", name: "task", parentId: "G1", now: T0 + 2, revive: false });
-		noteAgentStart({ id: "O1", name: "task", parentId: "Other", runId: "r2", now: T0 + 3, revive: false });
-		noteAgentStart({ id: "Loop1", name: "task", parentId: "Loop2", now: T0 + 4, revive: false });
-		noteAgentStart({ id: "Loop2", name: "task", parentId: "Loop1", now: T0 + 5, revive: false });
-		const ids = (f: Parameters<typeof listAgents>[0]) => listAgents(f).map((e) => e.id);
+		noteAgentStart({ id: "C1", name: "task", parentId: "Main", runId: "r1", now: T0 });
+		noteAgentStart({ id: "G1", name: "task", parentId: "C1", now: T0 + 1 });
+		noteAgentStart({ id: "GG1", name: "task", parentId: "G1", now: T0 + 2 });
+		noteAgentStart({ id: "O1", name: "task", parentId: "Other", runId: "r2", now: T0 + 3 });
+		noteAgentStart({ id: "Loop1", name: "task", parentId: "Loop2", now: T0 + 4 });
+		noteAgentStart({ id: "Loop2", name: "task", parentId: "Loop1", now: T0 + 5 });
+		const ids = (f: Parameters<typeof listAgents>[0]) => listAgents(f).map(e => e.id);
 		expect(ids({ ancestorId: "Main" })).toEqual(["C1", "G1", "GG1"]);
 		expect(ids({ ancestorId: "C1" })).toEqual(["G1", "GG1"]);
 		expect(ids({ ancestorId: "Nobody" })).toEqual([]);
@@ -96,213 +109,93 @@ describe("agent ledger", () => {
 	});
 
 	test("parked entries older than 24 h are dropped when a new agent arrives", () => {
-		noteAgentStart({ id: "Old", name: "task", now: T0, revive: false });
+		noteAgentStart({ id: "Old", name: "task", now: T0 });
 		noteAgentEnd({ id: "Old", now: T0, settled: true });
 		noteAgentParked("Old");
-		noteAgentStart({ id: "IdleOld", name: "task", now: T0, revive: false });
+		noteAgentStart({ id: "IdleOld", name: "task", now: T0 });
 		noteAgentEnd({ id: "IdleOld", now: T0, settled: true });
-		noteAgentStart({ id: "Recent", name: "task", now: T0 + 20 * HOUR, revive: false });
+		noteAgentStart({ id: "Recent", name: "task", now: T0 + 20 * HOUR });
 		noteAgentEnd({ id: "Recent", now: T0 + 20 * HOUR, settled: true });
 		noteAgentParked("Recent");
-		noteAgentStart({ id: "New", name: "task", now: T0 + 25 * HOUR, revive: false });
-		expect(listAgents().map((e) => e.id)).toEqual(["IdleOld", "Recent", "New"]);
+		noteAgentStart({ id: "New", name: "task", now: T0 + 25 * HOUR });
+		expect(listAgents().map(e => e.id)).toEqual(["IdleOld", "Recent", "New"]);
+	});
+
+	test("markAgentsCleaned marks ledger entries", () => {
+		noteAgentStart({ id: "A", name: "task", now: T0 });
+		markAgentsCleaned(["A", "Ghost"], T0 + 5);
+		expect(listAgents()[0]!.cleanedAt).toBe(T0 + 5);
 	});
 });
 
-const AUTO: LifecycleSettings = { agentIdleTtlMs: 420_000, cacheRetention: "auto" };
 const NOW = T0 + HOUR;
-const SONNET: ModelCost = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
 
-function entry(over: Partial<AgentEntry> = {}): AgentEntry {
-	return {
-		id: "A",
-		name: "storm-implementer",
-		model: "anthropic/sonnet",
-		state: "idle",
-		startedAt: T0,
-		lastActivityAt: NOW - MIN,
-		contextTokens: 30_000,
-		contextWindow: 200_000,
-		requests: 3,
-		costUsd: 0.05,
-		followUps: 0,
-		...over,
-	};
-}
+const entry = (over: Partial<AgentEntry> = {}): AgentEntry =>
+	agentEntry({ id: "A", model: "anthropic/sonnet", startedAt: T0, lastActivityAt: NOW - MIN, contextTokens: 30_000, requests: 3, costUsd: 0.05, ...over });
 
-function advise(e: AgentEntry, settings: LifecycleSettings = AUTO, cost?: (m: string) => ModelCost | undefined) {
-	const input: Parameters<typeof adviseAgents>[1] = { now: NOW, settings };
-	if (cost) input.cost = cost;
-	return adviseAgents([e], input)[0]!;
-}
+const config: StormConfig = teamOf({ implementer: "anthropic/sonnet", quick: { models: ["mistral/small"], contextCap: 40_000 } }, { contextCap: 150_000 });
 
-describe("cacheWindow", () => {
-	test("encodes provider retention and labels estimates", () => {
-		expect(cacheWindow("anthropic", AUTO)).toEqual({
-			ms: 5 * MIN,
-			estimated: true,
-			source: "Anthropic 기본: API 키 5분(추정, OAuth면 1시간일 수 있음)",
-		});
-		expect(cacheWindow("anthropic", { cacheRetention: "short" }).ms).toBe(5 * MIN);
-		expect(cacheWindow("anthropic", { cacheRetention: "long" })).toMatchObject({ ms: HOUR, estimated: false });
-		expect(cacheWindow("openai", AUTO)).toMatchObject({ ms: 30 * MIN, estimated: false });
-		expect(cacheWindow("openai", { cacheRetention: "long" })).toMatchObject({ ms: 12 * HOUR, estimated: false });
-		expect(cacheWindow("openai-codex", { cacheRetention: "long" })).toMatchObject({ ms: 5 * MIN, estimated: true });
-		expect(cacheWindow("anthropic", { cacheRetention: "none" })).toMatchObject({ ms: 0, estimated: false });
-		expect(cacheWindow("anthropic", {}).source).toContain("auto로 가정");
+describe("agentRows", () => {
+	test("the cap is the role's, else the team's, else the default; without a team the default", () => {
+		const caps = (c: StormConfig | undefined) => agentRows([entry(), entry({ role: "quick" }), entry({ role: "ghost" })], c).map(r => r.cap);
+		expect(caps(config)).toEqual([150_000, 40_000, 150_000]);
+		const { contextCap: _cap, ...noTeamCap } = config;
+		expect(caps(noTeamCap)).toEqual([200_000, 40_000, 200_000]);
+		expect(caps(undefined)).toEqual([200_000, 200_000, 200_000]);
+	});
+
+	test("follow-up state is what enforcement uses: ok below the cap, cap from it on, cleaned whatever the context", () => {
+		const states = agentRows(
+			[
+				entry({ contextTokens: 149_999 }),
+				entry({ contextTokens: 150_000 }),
+				entry({ contextTokens: 10, cleanedAt: NOW }),
+				entry({ contextTokens: 900_000, cleanedAt: NOW }),
+				entry({ role: "quick", contextTokens: 40_000 }),
+				entry({ state: "running", contextTokens: 1 }),
+			],
+			config,
+		).map(r => r.followUp);
+		expect(states).toEqual(["ok", "cap", "cleaned", "cleaned", "cap", "ok"]);
+	});
+
+	test("rows keep the entries and their order", () => {
+		const entries = [entry({ id: "B" }), entry({ id: "A" })];
+		const rows = agentRows(entries, config);
+		expect(rows.map(r => r.entry)).toEqual(entries);
 	});
 });
 
-describe("adviseAgents", () => {
-	test("running agents are busy", () => {
-		expect(advise(entry({ state: "running", lastActivityAt: T0 })).action).toBe("busy");
+describe("renderAgentRows", () => {
+	test("one table row per agent with its id, context and cap; no advice text after the table", () => {
+		const rows = agentRows([entry({ id: "Impl|1", followUps: 3 }), entry({ id: "Rev", state: "running", contextTokens: 151_000 })], config);
+		const lines = renderAgentRows(rows, NOW).split("\n");
+		// Header, separator, one line per agent, nothing else.
+		expect(lines).toHaveLength(4);
+		expect(lines.every(l => l.startsWith("|") && l.endsWith("|"))).toBe(true);
+		const columns = (line: string) => line.split(/(?<!\\)\|/).length;
+		expect(new Set(lines.map(columns)).size).toBe(1);
+		// A pipe in an id cannot break the table.
+		expect(lines[2]).toContain("Impl\\|1");
+		expect(lines[2]).toContain(`${tokens(30_000)}/${tokens(150_000)}`);
+		expect(lines[2]).toContain(duration(MIN));
+		expect(lines[3]).toContain(`${tokens(151_000)}/${tokens(150_000)}`);
+		// The two rows differ in their follow-up verdict.
+		expect(lines[2]!.split("|").at(-2)).not.toBe(lines[3]!.split("|").at(-2));
 	});
 
-	test("reuse within the cache window minus the margin, with the handle and time left", () => {
-		const a = advise(entry({ lastActivityAt: NOW - 2 * MIN }));
-		expect(a).toMatchObject({ id: "A", action: "reuse", handle: "agent://A" });
-		expect(a.reason).toContain("캐시 약 3분 남음(추정)");
-		expect(a.reason).toContain("30.0k 토큰(창의 15%)");
-		// Parked agents revive with their history; a warm cache still pays off.
-		expect(advise(entry({ state: "parked", lastActivityAt: NOW - 2 * MIN })).action).toBe("reuse");
-		// Inside the margin the cache counts as gone.
-		const edge = advise(entry({ lastActivityAt: NOW - (5 * MIN - REUSE_MARGIN_MS) }));
-		expect(edge.action).toBe("fresh");
+	test("no agents: a single line, not a table", () => {
+		const text = renderAgentRows([], NOW);
+		expect(text.split("\n")).toHaveLength(1);
+		expect(text).not.toContain("|");
 	});
 
-	test("reuse needs the context at most 40% of the window; unknown windows do not block it", () => {
-		expect(advise(entry({ contextTokens: 80_000 })).action).toBe("reuse");
-		const big = advise(entry({ contextTokens: 80_001 }));
-		expect(big.action).toBe("fresh");
-		expect(big.handle).toBeUndefined();
-		const { contextWindow: _, ...noWindow } = entry({ contextTokens: 150_000 });
-		expect(advise(noWindow).action).toBe("reuse");
-	});
-
-	test("near the window it is always fresh: compaction is close", () => {
-		const tokens = 200_000 * COMPACTION_SHARE + 1;
-		const a = advise(entry({ contextTokens: tokens }));
-		expect(a.action).toBe("fresh");
-		expect(a.reason).toContain("압축(compaction)이 가깝습니다");
-		expect(advise(entry({ contextTokens: tokens, state: "parked", lastActivityAt: T0 })).action).toBe("fresh");
-	});
-
-	test("at or past the context cap it is always fresh, saying follow-ups are blocked; below it the usual thresholds apply", () => {
-		const team: StormConfig = {
-			version: 1,
-			priority: "balanced",
-			roles: { implementer: { agent: "storm-implementer", models: ["anthropic/sonnet"], contextCap: 50_000 } },
-			parallelism: 2,
-			isolation: "shared",
-			contract: "workflowz",
-			runtime: "omp",
-		};
-		const withCap = (e: AgentEntry) => adviseAgents([e], { now: NOW, settings: AUTO, config: team })[0]!;
-		// 50k is only 25% of the window: without the cap this agent would be reused.
-		const past = withCap(entry({ role: "implementer", contextTokens: 50_000, lastActivityAt: NOW - 2 * MIN }));
-		expect(past.action).toBe("fresh");
-		expect(past.handle).toBeUndefined();
-		expect(past.reason).toContain("후속 지시가 막힙니다");
-		expect(withCap(entry({ role: "implementer", contextTokens: 49_999, lastActivityAt: NOW - 2 * MIN })).action).toBe("reuse");
-		// A running agent stays busy.
-		expect(withCap(entry({ role: "implementer", contextTokens: 60_000, state: "running" })).action).toBe("busy");
-	});
-
-	test("expired cache with a big context: fresh, with the rewrite cost when prices are known", () => {
-		const a = advise(entry({ lastActivityAt: NOW - 10 * MIN }), AUTO, () => SONNET);
-		expect(a.action).toBe("fresh");
-		expect(a.reason).toContain("30.0k 토큰을 캐시에 다시 씁니다(약 $0.1125)");
-		expect(a.reason).toContain("요약");
-		const unpriced = advise(entry({ lastActivityAt: NOW - 10 * MIN }), AUTO, () => undefined);
-		expect(unpriced.action).toBe("fresh");
-		expect(unpriced.reason).not.toContain("$");
-		expect(advise(entry({ lastActivityAt: NOW - 10 * MIN, contextTokens: FRESH_MIN_TOKENS })).action).toBe("fresh");
-	});
-
-	test("expired cache with a small context, or parked and expired: cleanup", () => {
-		const small = advise(entry({ lastActivityAt: NOW - 10 * MIN, contextTokens: FRESH_MIN_TOKENS - 1 }));
-		expect(small.action).toBe("cleanup");
-		expect(small.reason).toContain("잃을 것이 없습니다");
-		const parked = advise(entry({ state: "parked", lastActivityAt: NOW - 10 * MIN, contextTokens: 100_000 }));
-		expect(parked.action).toBe("cleanup");
-		expect(parked.reason).toContain("보관됨");
-	});
-
-	test("the window follows the model's provider and retention", () => {
-		const openai = entry({ model: "openai/gpt", lastActivityAt: NOW - 20 * MIN });
-		expect(advise(openai).action).toBe("reuse");
-		expect(advise(openai).reason).not.toContain("추정");
-		expect(advise(entry({ lastActivityAt: NOW - 40 * MIN }), { cacheRetention: "long" }).action).toBe("reuse");
-		// Unknown provider and model: 5-minute estimate.
-		const { model: _, ...noModel } = entry({ lastActivityAt: NOW - 2 * MIN });
-		expect(advise(noModel).reason).toContain("(추정)");
-		const none = advise(entry({ lastActivityAt: NOW - 1_000 }), { agentIdleTtlMs: 420_000, cacheRetention: "none" }, () => SONNET);
-		expect(none.action).toBe("fresh");
-		expect(none.reason).toContain("캐시 꺼짐");
-		expect(none.reason).toContain("다시 읽습니다(약 $0.0900)");
-	});
-});
-
-describe("renderAgents", () => {
-	test("table rows, idle time, context share and the reuse how-to", () => {
-		const rows = [
-			{ entry: entry({ id: "Imp", role: "implementer", followUps: 2 }), advice: { id: "Imp", action: "reuse" as const, reason: "a|b", handle: "agent://Imp" } },
-			{ entry: entry({ id: "Run", name: "task", state: "running", lastActivityAt: NOW, contextTokens: 900 }), advice: { id: "Run", action: "busy" as const, reason: "작업 중" } },
-		];
-		const md = renderAgents(rows, NOW);
-		const lines = md.split("\n");
-		expect(lines[0]).toBe("| 에이전트 | 모델 | 상태 | 유휴 | 컨텍스트 | 후속 | 권장 | 이유 |");
-		expect(lines[2]).toBe("| Imp (implementer) | anthropic/sonnet | 유휴 | 1분 | 30.0k (15%) | 2 | 재사용 | a\\|b |");
-		expect(lines[3]).toBe("| Run (task) | anthropic/sonnet | 실행 중 | — | 900 (0%) | 0 | 작업 중 | 작업 중 |");
-		expect(md).toContain("`write agent://<id>`");
-		expect(md).toContain(".send()");
-		expect(renderAgents([], NOW)).toContain("서브에이전트가 없습니다");
-	});
-});
-
-describe("lifecycleWarnings", () => {
-	test("idle TTL longer than the cache window: reuse in between rewrites the cache", () => {
-		const ws = lifecycleWarnings(AUTO, ["anthropic", "anthropic"]);
-		expect(ws).toEqual(["anthropic: 유휴 TTL 7분이 캐시 유지 5분(추정)보다 깁니다. 그 사이에 재사용하면 컨텍스트 전체를 캐시에 다시 씁니다."]);
-	});
-
-	test("a much longer cache window suggests raising the omp TTL, which Storm never changes", () => {
-		const ws = lifecycleWarnings({ agentIdleTtlMs: 420_000, cacheRetention: "long" }, ["anthropic"]);
-		expect(ws).toHaveLength(1);
-		expect(ws[0]).toContain("캐시 유지 1시간이 유휴 TTL 7분보다 훨씬 깁니다");
-		expect(ws[0]).toContain("task.agentIdleTtlMs");
-		expect(ws[0]).toContain("Storm 은 omp 설정을 바꾸지 않습니다");
-		// Matching windows say nothing.
-		expect(lifecycleWarnings({ agentIdleTtlMs: HOUR, cacheRetention: "long" }, ["anthropic"])).toEqual([]);
-		expect(lifecycleWarnings({ agentIdleTtlMs: 30 * MIN, cacheRetention: "auto" }, ["openai"])).toEqual([]);
-	});
-
-	test("TTL 0 never parks, so it outlives every cache", () => {
-		expect(lifecycleWarnings({ agentIdleTtlMs: 0, cacheRetention: "long" }, ["openai"])[0]).toContain("무제한");
-	});
-
-	test("retention none and unreadable settings", () => {
-		const none = lifecycleWarnings({ agentIdleTtlMs: 420_000, cacheRetention: "none" }, ["anthropic"]);
-		expect(none).toHaveLength(1);
-		expect(none[0]).toContain("캐시 절감은 없습니다");
-		const unread = lifecycleWarnings({}, ["anthropic"]);
-		expect(unread[0]).toBe("omp 설정을 읽지 못해 기본값(task.agentIdleTtlMs 7분, providers.cacheRetention auto)으로 가정합니다.");
-		expect(unread[1]).toContain("anthropic: 유휴 TTL 7분");
-		expect(lifecycleWarnings({ cacheRetention: "auto" }, [])).toEqual([
-			"omp 설정을 읽지 못해 기본값(task.agentIdleTtlMs 7분)으로 가정합니다.",
-		]);
-	});
-
-	test("providers of the team and of the agents", () => {
-		const config = {
-			roles: {
-				explorer: { agent: "storm-explorer", models: ["openai/a:low", "anthropic/b"] },
-				reviewer: { agent: "storm-reviewer", models: ["openai/c"] },
-			},
-		} as unknown as StormConfig;
-		expect(teamProviders(config)).toEqual(["openai", "anthropic"]);
-		const { model: _, ...noModel } = entry();
-		expect(agentProviders([entry(), entry({ model: "openai/x" }), noModel])).toEqual(["anthropic", "openai"]);
+	test("tokens and duration formats", () => {
+		expect([tokens(999), tokens(1_000), tokens(12_345)]).toEqual(["999", "1.0k", "12.3k"]);
+		// Seconds, minutes and hours: the number is rounded per unit and each unit reads differently.
+		const texts = [duration(30_000), duration(5 * MIN), duration(2 * HOUR), duration(1.5 * HOUR)];
+		expect(texts.map(Number.parseFloat)).toEqual([30, 5, 2, 1.5]);
+		expect(new Set(texts.map(text => text.replace(/[\d.]/g, ""))).size).toBe(3);
 	});
 });
 
@@ -310,8 +203,8 @@ describe("noteAgentReview", () => {
 	beforeEach(() => resetAgents());
 
 	test("accumulates a reviewer's yields on its own entry and ignores non-review yields", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: 0, revive: false });
-		noteAgentStart({ id: "Impl", name: "storm-implementer", now: 0, revive: false });
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: 0 });
+		noteAgentStart({ id: "Impl", name: "storm-implementer", now: 0 });
 		noteAgentReview("Impl", { data: { done: true } });
 		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } });
 		noteAgentReview("Rev", { error: "x" });

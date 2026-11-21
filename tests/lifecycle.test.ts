@@ -1,16 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ApprovalStore } from "../src/approval/store.ts";
-import { createProposalStore, pruneProposals } from "../src/proposals/store.ts";
-import { listAgents, markAgentsCleaned, noteAgentParked, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
+import { resetAgents } from "../src/runtime/agents.ts";
 import { agentRecordFiles, bytesText, formatStorage, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
 import { appendRunIndex, readRunIndex, summarizeForIndex } from "../src/runtime/run-index.ts";
 import { pruneRuns, readRun, writeRun } from "../src/runtime/run.ts";
 import { pruneTrialStates, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import type { AgentEntry, RunRecord, StormConfig } from "../src/types.ts";
+import { agentEntry, DEAD_PROCESS, runRecord, teamOf } from "./fixtures.ts";
 
 let tmp: string;
 let root: string;
@@ -35,37 +34,21 @@ afterEach(async () => {
 	resetAgents();
 });
 
-const config = (extra: Partial<StormConfig> = {}): StormConfig => ({
-	version: 1,
-	priority: "balanced",
-	roles: { implementer: { agent: "storm-implementer", models: ["a/i"] } },
-	parallelism: 4,
-	isolation: "shared",
-	contract: "workflowz",
-	runtime: "omp",
-	...extra,
-});
+const config = (extra: Partial<StormConfig> = {}): StormConfig => teamOf({ implementer: "a/i" }, extra);
 
 function agent(id: string, extra: Partial<AgentEntry> = {}): AgentEntry {
-	return { id, name: "storm-implementer", state: "parked", startedAt: 1, lastActivityAt: 1, contextTokens: 10, requests: 1, costUsd: 0, followUps: 0, ...extra };
+	return agentEntry({ id, state: "parked", ...extra });
 }
 
 function run(n: number, extra: Partial<RunRecord> = {}): RunRecord {
-	return {
-		schema: "storm.run/v1",
+	return runRecord({
 		runId: `run-20261120-0900${String(n).padStart(2, "0")}-abcd`,
-		configHash: "h",
-		approvalId: "ap",
 		startedAt: `2026-11-20T09:00:${String(n).padStart(2, "0")}.000Z`,
 		endedAt: `2026-11-20T09:30:${String(n).padStart(2, "0")}.000Z`,
-		status: "done",
-		contract: "workflowz",
 		task: `task ${n}`,
 		costUsd: n,
-		costByModel: {},
-		spawns: [],
 		...extra,
-	};
+	});
 }
 
 /** The janitor at the end of run 5 in this process, cleanup approved in both configs, unless overridden. */
@@ -104,7 +87,7 @@ describe("run index", () => {
 				{ ts: "t", agent: "storm-implementer", invocationKind: "task", requested: [], outcome: "blocked" },
 			],
 			checkpoints: [{ at: "t", before: 1 }],
-			reads: { director: 5, duplicate: 2, blocked: 1 },
+			reads: { director: 5, directorChars: 5000, duplicateChars: 2000, blocked: 1 },
 		});
 		const s = summarizeForIndex(r);
 		expect(s).toMatchObject({
@@ -114,7 +97,7 @@ describe("run index", () => {
 			spawns: { total: 2, blocked: 1 },
 			reviews: { reviews: 2, passed: 1, failed: 1, docFindings: 1 },
 			checkpoints: 1,
-			reads: { director: 5, duplicate: 2, blocked: 1 },
+			reads: { director: 5, directorChars: 5000, duplicateChars: 2000, blocked: 1 },
 		});
 		for (let i = 1; i <= 5; i++) {
 			await writeRun(root, run(i));
@@ -133,7 +116,7 @@ describe("run index", () => {
 
 describe("janitor omp records", () => {
 	const me = processKey();
-	const dead = "999999:1";
+	const dead = DEAD_PROCESS;
 
 	/** Records of `id` as omp lays them out, plus outputs and an unrelated file inside its dir. */
 	async function seedAgent(id: string): Promise<void> {
@@ -195,8 +178,9 @@ describe("janitor omp records", () => {
 		expect(trusted[1]?.cleaned?.sort()).toEqual(["Gone", "P"]);
 		expect((await readRun(root, run(1).runId))?.agents?.[0]?.cleanedAt).toBe(42);
 
-		// A second pass finds nothing more; re-recording a run keeps its cleaned ids.
+		// Re-recording a run keeps its cleaned ids, and a second pass finds nothing more.
 		await recordTrustedRun(storeDir, { runId: run(1).runId, artifactsDir: artifacts, process: dead, agents: ["Old"], endedAt: "t" });
+		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toEqual(["Old"]);
 		const again = await jan({ ledger, now: 50 });
 		expect(again.cleaned).toEqual([]);
 		expect(again.result.agents).toBe(0);
@@ -245,22 +229,99 @@ describe("janitor omp records", () => {
 		expect(existsSync(path.join(artifacts, "Old.jsonl"))).toBe(true);
 	});
 
+	test("another omp process that is still alive keeps its agents' records; once it is gone they are cleaned", async () => {
+		const other = "4242:1700000000000";
+		for (const id of ["Theirs", "Mine"]) await seedAgent(id);
+		await trust([
+			{ process: other, agents: ["Theirs"] },
+			{ process: me, agents: ["Mine"] },
+			{ process: other, agents: [] },
+			{ process: other, agents: [] },
+			{ process: me, agents: [] },
+		]);
+		const asked: string[] = [];
+		const live = await jan({
+			alive: key => {
+				asked.push(key);
+				return true;
+			},
+		});
+		// Only other processes are probed; this process's own old run is judged by the ledger.
+		expect(asked).toEqual([other]);
+		expect(live.cleaned).toEqual(["Mine"]);
+		expect(live.result.agents).toBe(1);
+		expect(existsSync(path.join(artifacts, "Theirs.jsonl"))).toBe(true);
+		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toBeUndefined();
+
+		const gone = await jan({ alive: () => false });
+		expect(gone.result.agents).toBe(1);
+		// Cleaned for another process's run: nothing to mark in this process's ledger.
+		expect(gone.cleaned).toEqual([]);
+		expect(existsSync(path.join(artifacts, "Theirs.jsonl"))).toBe(false);
+		expect(existsSync(path.join(artifacts, "Theirs.md"))).toBe(true);
+		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toEqual(["Theirs"]);
+	});
+
 	test("never follows symlinks out of the artifacts dir and rejects path-like ids", async () => {
 		const outside = path.join(tmp, "outside");
-		await touch(path.join(outside, "X.X.jsonl"));
-		await touch(path.join(outside, "X.jsonl"));
+		for (const name of ["X.X.jsonl", "X.jsonl", "Y.Z.jsonl"]) await touch(path.join(outside, name));
 		await mkdir(path.join(artifacts, "X"), { recursive: true });
 		await symlink(outside, path.join(artifacts, "X", "X.link"));
 		await symlink(path.join(outside, "X.jsonl"), path.join(artifacts, "X.jsonl"));
+		// A nested id whose parent directory is a link out of the artifacts dir.
 		await symlink(outside, path.join(artifacts, "Y"));
+		// A real record in a subdirectory: an id is a name, never a path to it.
+		await touch(path.join(artifacts, "nested", "N.jsonl"));
 		expect(await agentRecordFiles(artifacts, "X")).toEqual([]);
 		expect(await agentRecordFiles(artifacts, "Y.Z")).toEqual([]);
 		expect(await agentRecordFiles(artifacts, "../outside/X")).toEqual([]);
-		await trust([{ process: dead, agents: ["X", "Y.Z"] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: me, agents: [] }]);
+		expect(await agentRecordFiles(artifacts, "nested/N")).toEqual([]);
+		await trust([{ process: dead, agents: ["X", "Y.Z", "nested/N"] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: me, agents: [] }]);
 		const { result } = await jan({});
 		expect(result.agents).toBe(0);
-		expect(existsSync(path.join(outside, "X.X.jsonl"))).toBe(true);
-		expect(existsSync(path.join(outside, "X.jsonl"))).toBe(true);
+		for (const name of ["X.X.jsonl", "X.jsonl", "Y.Z.jsonl"]) expect(existsSync(path.join(outside, name))).toBe(true);
+		expect(existsSync(path.join(artifacts, "nested", "N.jsonl"))).toBe(true);
+	});
+
+	test("the run that just ended is never cleaned, even when the list records it as old", async () => {
+		await seedAgent("Mine");
+		// Run 5 was first recorded long ago (a resumed session re-records in place), with four newer runs after it.
+		await recordTrustedRun(storeDir, { runId: run(5).runId, artifactsDir: artifacts, process: dead, agents: ["Mine"], endedAt: "t" });
+		await trust([{ process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }]);
+		const { result } = await jan({});
+		expect(result.agents).toBe(0);
+		expect(existsSync(path.join(artifacts, "Mine.jsonl"))).toBe(true);
+	});
+
+	test("an agent whose records could not all be removed is not marked cleaned and is retried at the next run end", async () => {
+		// A read-only directory refuses the unlink; root ignores directory modes, so the case cannot be staged there.
+		if (process.getuid?.() === 0) return;
+		await seedAgent("Old");
+		await trust([{ process: me, agents: ["Old"] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: me, agents: [] }]);
+		const locked = path.join(artifacts, "Old");
+		await chmod(locked, 0o555);
+		try {
+			const first = await jan({});
+			expect(first.result.agents).toBe(0);
+			expect(first.cleaned).toEqual([]);
+			// What could be removed was, and is counted: every record but the one in the locked directory.
+			expect(first.result.files).toBe(4);
+			expect(existsSync(path.join(locked, "Old.sub.jsonl"))).toBe(true);
+			expect((await readTrustedRuns(storeDir))[0]?.cleaned).toBeUndefined();
+		} finally {
+			await chmod(locked, 0o755);
+		}
+		const second = await jan({});
+		expect(second.result.agents).toBe(1);
+		expect(second.cleaned).toEqual(["Old"]);
+		expect(existsSync(path.join(locked, "Old.sub.jsonl"))).toBe(false);
+	});
+
+	test("a trusted line with a relative artifacts dir is not trusted", async () => {
+		await recordTrustedRun(storeDir, { runId: "run-abs", artifactsDir: artifacts, process: me, agents: [], endedAt: "t" });
+		const line = JSON.stringify({ runId: "run-rel", artifactsDir: "sessions/proj/sess", process: me, agents: ["A"], endedAt: "t" });
+		await writeFile(path.join(storeDir, "runs.jsonl"), `${line}\n{ torn\n`, { flag: "a" });
+		expect((await readTrustedRuns(storeDir)).map(r => r.runId)).toEqual(["run-abs"]);
 	});
 
 	test("the trusted list keeps its newest 200 runs", async () => {
@@ -279,73 +340,87 @@ describe("janitor omp records", () => {
 		expect(view.ompBytes).toBe(3 * 5 + 1 + 1);
 		expect(view.stormBytes).toBeGreaterThan(0);
 		const line = formatStorage(view, false);
-		expect(line).toContain("파일 5개, 자동 정리 꺼짐");
-		expect(line).toContain("에이전트 3개 3MB");
+		// The numbers are on the line; a team without cleanup consent gets a longer one that says so.
+		for (const part of [bytesText(view.ompBytes), String(view.ompFiles), "3MB"]) expect(line).toContain(part);
+		expect(formatStorage(view, true).length).toBeLessThan(line.length);
 		expect(line.includes("\n")).toBe(false);
 		expect([bytesText(512), bytesText(512 * 1024), bytesText(38 * 1024 ** 2), bytesText(1.3 * 1024 ** 3)]).toEqual(["512B", "512KB", "38MB", "1.3GB"]);
 	});
+});
 
-	test("markAgentsCleaned marks ledger entries", () => {
-		noteAgentStart({ id: "A", name: "storm-quick", now: 1, revive: false });
-		noteAgentParked("A");
-		markAgentsCleaned(["A", "missing"], 7);
-		expect(listAgents()[0]?.cleanedAt).toBe(7);
+describe("stale run records", () => {
+	const other = "4242:1700000000000";
+	const running = (n: number, extra: Partial<RunRecord>): RunRecord => {
+		const { endedAt: _endedAt, ...record } = run(n, { status: "running", ...extra });
+		return record;
+	};
+
+	test("a running record whose process is gone becomes stopped, ended at its last live write; live ones stay", async () => {
+		await writeRun(root, running(1, { process: other, updatedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 }));
+		await writeRun(root, running(2, { process: "4343:1" }));
+		await writeRun(root, running(3, { process: "4444:1" }));
+		// The run that is ending now is still `running` on disk: the janitor leaves it to its controller.
+		await writeRun(root, running(5, { process: processKey() }));
+		await jan({ config: config(), startConfig: config(), alive: key => key === "4444:1" });
+		expect(await readRun(root, run(1).runId)).toMatchObject({ status: "stopped", endedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 });
+		// Never rewritten live: it ended, as far as anyone knows, when it started.
+		expect(await readRun(root, run(2).runId)).toMatchObject({ status: "stopped", endedAt: run(2).startedAt });
+		expect((await readRun(root, run(3).runId))?.status).toBe("running");
+		expect((await readRun(root, run(5).runId))?.status).toBe("running");
+	});
+
+	test("an older running record of this very process, or one without a process, is stale too; finished records are untouched", async () => {
+		const { process: _process, ...unowned } = running(2, {});
+		await writeRun(root, running(1, { process: processKey() }));
+		await writeRun(root, unowned);
+		await writeRun(root, run(3, { process: other }));
+		await jan({ config: config(), startConfig: config(), alive: () => true });
+		expect((await readRun(root, run(1).runId))?.status).toBe("stopped");
+		expect((await readRun(root, run(2).runId))?.status).toBe("stopped");
+		expect(await readRun(root, run(3).runId)).toEqual(run(3, { process: other }));
 	});
 });
 
 describe("Storm limits", () => {
-	const hash = (n: number): string => `jcs-sha256:${n.toString(16).padStart(64, "0")}`;
-
-	test("approvals keep the current hash plus the newest 20; the log keeps its newest 2000 lines", async () => {
-		const store = new ApprovalStore(path.join(tmp, "base"), { repoId: "git-x", kind: "git-common-dir" } as ConstructorParameters<typeof ApprovalStore>[1]);
-		for (let n = 1; n <= 23; n++) {
-			await store.approve({ configHash: hash(n), rawSha256: "r", config: config(), scope: { shadowedAgents: [] } as never, via: "test", ompVersion: "1", supersedes: null });
-		}
-		const logFile = path.join(store.dir, "log.jsonl");
-		const extra = Array.from({ length: 2100 }, (_, i) => JSON.stringify({ ts: "t", event: "x", n: i })).join("\n");
-		await writeFile(logFile, `${await readFile(logFile, "utf8")}${extra}\n`);
-		const { result } = await jan({ configHash: hash(1), approvals: store });
-		// 23 hashes, keep 1 (current, oldest) + newest 20 → hashes 2 and 3 go, each with approved record and snapshot.
-		expect(result.stormFiles).toBe(4);
-		expect(await store.snapshot(hash(1))).toBeDefined();
-		expect(await store.snapshot(hash(2))).toBeUndefined();
-		expect(await store.snapshot(hash(3))).toBeUndefined();
-		expect(await store.snapshot(hash(4))).toBeDefined();
-		const log = await store.log();
-		expect(log.length).toBe(2000);
-		expect(log.at(-1)).toMatchObject({ n: 2099 });
+	test("the approval store prunes around the hash in force and its count joins the result", async () => {
+		const asked: Array<string | null> = [];
+		const approvals = {
+			prune: async (keepHash: string | null) => {
+				asked.push(keepHash);
+				return 4;
+			},
+		};
+		expect((await jan({ configHash: "jcs-sha256:abc", approvals })).result.stormFiles).toBe(4);
+		expect((await jan({ approvals })).result.stormFiles).toBe(4);
+		expect(asked).toEqual(["jcs-sha256:abc", null]);
 	});
 
-	test("prune of a repo without approvals creates nothing", async () => {
-		const store = new ApprovalStore(path.join(tmp, "base"), { repoId: "git-y", kind: "git-common-dir" } as ConstructorParameters<typeof ApprovalStore>[1]);
-		expect(await store.prune(null)).toBe(0);
-		expect(existsSync(store.dir)).toBe(false);
-	});
-
-	test("trial counters outside config.trials and proposals older than 30 days are removed", async () => {
-		await updateTrialState(root, "keep", s => ({ ...s, seen: 1 }));
-		await updateTrialState(root, "gone", s => ({ ...s, seen: 1 }));
-		const now = Date.parse("2026-11-21T00:00:00.000Z");
-		const proposals = createProposalStore(root, async () => "h");
-		const proposal = (id: string, days: number) => ({
-			schema: "storm.proposal/v1" as const,
-			id,
-			kind: "trial" as const,
-			createdAt: new Date(now - days * 86_400_000).toISOString(),
-			summary: id,
-			baseHash: "h",
-			config: config(),
-		});
-		await proposals.save(proposal("old", 31));
-		await proposals.save(proposal("new", 29));
+	test("trial counters outside both configs' trials are removed", async () => {
+		for (const id of ["keep", "gone", "start"]) await updateTrialState(root, id, s => ({ ...s, seen: 1 }));
 		// Counters of trials in either the start config or the config in force stay.
 		const trial = (id: string) => ({ id, role: "implementer", model: "a/x" }) as unknown as NonNullable<StormConfig["trials"]>[number];
-		await updateTrialState(root, "start", s => ({ ...s, seen: 1 }));
-		const { result } = await jan({ config: config({ trials: [trial("keep")] }), startConfig: config({ trials: [trial("start")] }), now });
-		expect(result.stormFiles).toBe(2);
+		const { result } = await jan({ config: config({ trials: [trial("keep")] }), startConfig: config({ trials: [trial("start")] }) });
+		expect(result.stormFiles).toBe(1);
 		expect(Object.keys(await readTrialStates(root)).sort()).toEqual(["keep", "start"]);
-		expect((await proposals.list()).map(p => p.id)).toEqual(["new"]);
 		expect(await pruneTrialStates(root, ["keep", "start"])).toBe(0);
-		expect(await pruneProposals(root, now)).toBe(0);
+	});
+
+	test("directories of retired features are removed: deferred proposals and the usage archive", async () => {
+		const agentDir = path.join(tmp, "agent");
+		const proposals = path.join(root, ".omp", "storm", "state", "proposals");
+		const usage = path.join(agentDir, "storm", "usage");
+		await touch(path.join(proposals, "p1.json"));
+		await touch(path.join(usage, "2026-10.jsonl"));
+		await touch(path.join(agentDir, "storm", "approvals", "git-x", "runs.jsonl"), "");
+		// Without the agent dir only the project's own leftovers go.
+		expect((await jan({})).result.stormFiles).toBe(1);
+		expect(existsSync(proposals)).toBe(false);
+		expect(existsSync(usage)).toBe(true);
+		expect((await jan({ agentDir })).result.stormFiles).toBe(1);
+		expect(existsSync(usage)).toBe(false);
+		expect(existsSync(path.join(agentDir, "storm", "approvals", "git-x", "runs.jsonl"))).toBe(true);
+		// Nothing left: nothing counted, nothing created.
+		expect((await jan({ agentDir })).result.stormFiles).toBe(0);
+		expect(existsSync(proposals)).toBe(false);
 	});
 });

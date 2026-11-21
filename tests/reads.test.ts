@@ -1,162 +1,211 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { childReaders, clearRunReads, directorRead, noteChildRead, openRunReads, readTarget } from "../src/policy/reads.ts";
+import {
+	clearRunReads,
+	directorRead,
+	MAX_RANGE_LINES,
+	PAGE_LINES,
+	noteChildRead,
+	openRunReads,
+	readTarget,
+	SMALL_FILE_BYTES,
+} from "../src/policy/reads.ts";
 
 const CWD = "/work/repo";
-const file = (key: string, ranged = false) => ({ key, ranged, dir: false });
+
+/** Real files of known sizes: the policy stats what the director asks for. */
+const dir = realpathSync(mkdtempSync(join(tmpdir(), "storm-reads-")));
+const BIG = "x".repeat(79) + "\n";
+const big = BIG.repeat(Math.ceil((SMALL_FILE_BYTES + 1) / BIG.length));
+const files = {
+	"big.ts": big,
+	"big.md": big,
+	"big.txt": big,
+	"big.log": big,
+	"big": big,
+	"small.md": "short\n",
+	"edge.md": "y".repeat(SMALL_FILE_BYTES),
+	"huge.ts": "z".repeat(2 * 1024 * 1024 + 1),
+};
+for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+mkdirSync(join(dir, "sub"));
+afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe("readTarget", () => {
 	test("local paths resolve against cwd and lose their selectors", () => {
-		expect(readTarget("src/a.ts", CWD)).toEqual(file("/work/repo/src/a.ts"));
-		expect(readTarget("./src/../src/a.ts:50-200", CWD)).toEqual(file("/work/repo/src/a.ts", true));
-		expect(readTarget("/abs/b.ts:50", CWD)).toEqual(file("/abs/b.ts", true));
-		expect(readTarget("~/no-such-storm-file.txt:-5", CWD)).toEqual(file(`${homedir()}/no-such-storm-file.txt`, true));
-	});
-
-	test("bounded selectors are ranged, open ends and raw alone are not", () => {
-		const ranged = (p: string) => readTarget(p, CWD)?.ranged;
-		expect(ranged("a.ts:50+150")).toBe(true);
-		expect(ranged("a.ts:-60")).toBe(true);
-		expect(ranged("a.ts:5-16,960-973")).toBe(true);
-		expect(ranged("a.ts:2-4:raw")).toBe(true);
-		expect(ranged("a.ts:raw:2-4")).toBe(true);
-		expect(ranged("a.ts:50-")).toBe(false);
-		expect(ranged("a.ts:5-16,960-")).toBe(false);
-		expect(ranged("a.ts:raw")).toBe(false);
-		expect(ranged("a.ts:50-:raw")).toBe(false);
-		for (const p of ["a.ts:50+150", "a.ts:raw", "a.ts:2-4:raw", "a.ts:5-16,960-"]) {
+		expect(readTarget("src/a.ts", CWD)?.key).toBe("/work/repo/src/a.ts");
+		expect(readTarget("./src/../src/a.ts:50-200", CWD)?.key).toBe("/work/repo/src/a.ts");
+		expect(readTarget("/abs/b.ts:50", CWD)?.key).toBe("/abs/b.ts");
+		expect(readTarget("~/no-such-storm-file.txt:-5", CWD)?.key).toBe(`${homedir()}/no-such-storm-file.txt`);
+		for (const p of ["a.ts:50+150", "a.ts:raw", "a.ts:2-4:raw", "a.ts:raw:2-4", "a.ts:5-16,960-"]) {
 			expect(readTarget(p, CWD)?.key).toBe("/work/repo/a.ts");
 		}
 	});
 
+	test("the selector's ranges add up to the lines it asks for; an open end and a read without ranges count one page", () => {
+		const lines = (p: string) => readTarget(p, CWD)?.lines;
+		expect(PAGE_LINES).toBe(300);
+		expect(lines("a.ts")).toBe(PAGE_LINES);
+		expect(lines("a.ts:raw")).toBe(PAGE_LINES);
+		expect(lines("a.ts:50")).toBe(1);
+		expect(lines("a.ts:50-200")).toBe(151);
+		expect(lines("a.ts:50+150")).toBe(150);
+		expect(lines("a.ts:-60")).toBe(60);
+		expect(lines("a.ts:5-16,960-973")).toBe(26);
+		expect(lines("a.ts:2-4:raw")).toBe(3);
+		expect(lines("a.ts:raw:2-4")).toBe(3);
+		expect(lines("a.ts:50-")).toBe(PAGE_LINES);
+		expect(lines("a.ts:5-16,960-")).toBe(12 + PAGE_LINES);
+	});
+
+	test("`raw` is a selector in any case, as omp reads it", () => {
+		for (const p of ["a.ts:RAW", "a.ts:Raw:1-5000", "a.ts:1-5000:rAw"]) expect(readTarget(p, CWD)?.key).toBe("/work/repo/a.ts");
+		expect(readTarget("a.ts:Raw:1-5000", CWD)?.lines).toBe(5000);
+	});
+
 	test("colons that are not selectors stay in the path", () => {
 		expect(readTarget("C:\\proj\\a.ts", CWD)?.key).toBe("/work/repo/C:\\proj\\a.ts");
-		expect(readTarget("dir/a:b.ts", CWD)).toEqual(file("/work/repo/dir/a:b.ts"));
+		expect(readTarget("dir/a:b.ts", CWD)?.key).toBe("/work/repo/dir/a:b.ts");
 		expect(readTarget("a.ts:12abc", CWD)?.key).toBe("/work/repo/a.ts:12abc");
 	});
 
-	test("ssh paths keep host and port, the selector goes; a trailing slash is a directory", () => {
-		expect(readTarget("ssh://box/etc/app.conf:10-20", CWD)).toEqual(file("ssh://box/etc/app.conf", true));
-		expect(readTarget("ssh://box:2222/etc/app.conf", CWD)).toEqual(file("ssh://box:2222/etc/app.conf"));
+	test("ssh paths keep host and port and have no size; a trailing slash is a directory", () => {
+		expect(readTarget("ssh://box/etc/app.conf:10-20", CWD)).toMatchObject({ key: "ssh://box/etc/app.conf", remote: true, lines: 11, dir: false });
+		expect(readTarget("ssh://box:2222/etc/app.conf", CWD)?.key).toBe("ssh://box:2222/etc/app.conf");
+		expect(readTarget("ssh://box:2222/etc/app.conf", CWD)?.bytes).toBeUndefined();
 		expect(readTarget("ssh://box:2222", CWD)?.dir).toBe(true);
 		expect(readTarget("ssh://box/etc/", CWD)?.dir).toBe(true);
 	});
 
+	test("local files carry their size, directories are listings, missing files have neither", () => {
+		expect(readTarget("small.md", dir)).toMatchObject({ bytes: 6, dir: false, remote: false });
+		expect(readTarget("sub", dir)?.dir).toBe(true);
+		expect(readTarget("sub/", dir)?.dir).toBe(true);
+		expect(readTarget("nope.ts", dir)).toMatchObject({ dir: false });
+		expect(readTarget("nope.ts", dir)?.bytes).toBeUndefined();
+	});
+
 	test("internal and remote schemes are exempt", () => {
-		for (const p of [
-			"agent://Impl",
-			"agent://Impl/result:1-5",
-			"history://Impl",
-			"skill://orca-cli",
-			"local://notes.md",
-			"xd://lsp",
-			"proc://bg_1",
-			"cfg://x",
-			"mcp://res",
-			"omp://docs",
-			"pr://12",
-			"issue://3",
-			"https://example.com:8443/a",
-			"http://localhost:3000/",
-		]) {
+		for (const p of ["agent://Impl", "agent://Impl/result:1-5", "history://Impl", "skill://x", "local://notes.md", "xd://lsp", "proc://bg_1", "https://example.com/a.ts", ""]) {
 			expect(readTarget(p, CWD)).toBeUndefined();
 		}
-		expect(readTarget("  ", CWD)).toBeUndefined();
 	});
 });
 
-describe("directorRead", () => {
-	const repo = mkdtempSync(join(tmpdir(), "storm-reads-"));
-	mkdirSync(join(repo, "src"));
-	writeFileSync(join(repo, "src", "a.ts"), "x");
+describe("director reads by size", () => {
+	const RUN = "run-reads";
+	beforeEach(() => openRunReads(RUN));
+	afterEach(() => clearRunReads(RUN));
 
-	beforeEach(() => {
-		openRunReads("r1");
-		openRunReads("r2");
-	});
-	afterEach(() => {
-		clearRunReads("r1");
-		clearRunReads("r2");
-	});
-	afterAll(() => rmSync(repo, { recursive: true, force: true }));
+	const childRead = (path: string, agent = "Scout") => noteChildRead(RUN, agent, path, dir);
+	const read = (path: string) => directorRead({ runId: RUN, path, cwd: dir });
+	const code = (path: string) => read(path)?.block?.code;
 
-	test("plain when no subagent of the run read the file", () => {
-		noteChildRead("r2", "Other", "src/a.ts", CWD);
-		expect(directorRead({ runId: "r1", path: "src/a.ts", cwd: CWD })).toEqual({ kind: "plain" });
+	test("a file no subagent of the run read passes at any size and is not indexed", () => {
+		for (const p of ["big.md", "big.md:raw", "big.md:1-5000", "big.log", "ssh://box/var/log/app.log"]) {
+			expect(read(p)).toEqual({ indexed: false });
+		}
 	});
 
-	test("a whole-file read of a file a subagent read is blocked; a bounded one is a duplicate", () => {
-		// The child ran in another cwd; keys are absolute.
-		noteChildRead("r1", "Scout", "repo/src/a.ts", "/work");
-		noteChildRead("r1", "Impl", "/work/repo/src/a.ts:raw", "/");
-		noteChildRead("r1", "Scout", "src/a.ts", CWD);
-		expect(childReaders("r1", "/work/repo/src/a.ts")).toEqual(["Scout", "Impl"]);
-
-		const blocked = directorRead({ runId: "r1", path: "src/a.ts", cwd: CWD });
-		expect(blocked?.kind).toBe("blocked");
-		expect(blocked?.reason).toContain("agent://Scout, agent://Impl");
-		expect(blocked?.reason).toContain("src/a.ts:120-180");
-		expect(blocked?.reason).toContain("write agent://<id>");
-		expect(directorRead({ runId: "r1", path: "src/a.ts:50-", cwd: CWD })?.kind).toBe("blocked");
-		expect(directorRead({ runId: "r1", path: "src/a.ts:raw", cwd: CWD })?.kind).toBe("blocked");
-		expect(directorRead({ runId: "r1", path: "src/a.ts:10-30", cwd: CWD })).toEqual({ kind: "duplicate" });
-		expect(directorRead({ runId: "r1", path: "/work/repo/src/a.ts:-20", cwd: CWD })).toEqual({ kind: "duplicate" });
+	test("every subagent read indexes its file, ranged or not", () => {
+		childRead("big.md:10-20");
+		childRead("big.ts");
+		childRead("big.log:raw");
+		for (const p of ["big.md", "big.ts", "big.log"]) expect(read(`${p}:1-10`)).toEqual({ indexed: true });
 	});
 
-	test("a child's ranged read does not mark the file", () => {
-		noteChildRead("r1", "Scout", "src/a.ts:1-20", CWD);
-		noteChildRead("r1", "Scout", "src/a.ts:-5", CWD);
-		expect(directorRead({ runId: "r1", path: "src/a.ts", cwd: CWD })).toEqual({ kind: "plain" });
-		noteChildRead("r1", "Scout", "src/a.ts:30-", CWD);
-		expect(directorRead({ runId: "r1", path: "src/a.ts", cwd: CWD })?.kind).toBe("blocked");
+	test("a read without an end returns one page of omp's, so it passes at any file size: bare, :raw, open-ended", () => {
+		for (const name of ["big.md", "big.txt", "big.log", "big", "big.ts", "huge.ts"]) {
+			childRead(name);
+			for (const selector of ["", ":raw", ":50-", ":RAW"]) expect(read(`${name}${selector}`)).toEqual({ indexed: true });
+		}
 	});
 
-	test("directory listings are neither noted nor blocked", () => {
-		noteChildRead("r1", "Explorer", ".", repo);
-		noteChildRead("r1", "Explorer", "src", repo);
-		noteChildRead("r1", "Explorer", "lib/", repo);
-		expect(directorRead({ runId: "r1", path: repo, cwd: "/" })).toEqual({ kind: "plain" });
-		expect(directorRead({ runId: "r1", path: "src", cwd: repo })).toEqual({ kind: "plain" });
-		expect(directorRead({ runId: "r1", path: "lib/", cwd: repo })).toEqual({ kind: "plain" });
-		// Even if a key were noted, the director's directory read passes.
-		noteChildRead("r1", "Explorer", "src/a.ts", repo);
-		expect(directorRead({ runId: "r1", path: "src/a.ts", cwd: repo })?.kind).toBe("blocked");
-		expect(directorRead({ runId: "r1", path: `${repo}/src`, cwd: "/" })).toEqual({ kind: "plain" });
-		noteChildRead("r1", "Ssh", "ssh://box/etc/", CWD);
-		expect(directorRead({ runId: "r1", path: "ssh://box/etc/", cwd: CWD })).toEqual({ kind: "plain" });
+	test("the selector's case does not get a wide range past the limit, nor past the index", () => {
+		childRead("big.md:Raw");
+		expect(code("big.md:RAW:1-5000")).toBe("read-large");
+		expect(code("big.md:Raw:1-5000")).toBe("read-large");
+		expect(read("big.md:RAW:1-10")).toEqual({ indexed: true });
 	});
 
-	test("many readers are cut and counted", () => {
-		for (const id of ["A", "B", "C", "D", "E"]) noteChildRead("r1", id, "x.ts", CWD);
-		const why = directorRead({ runId: "r1", path: "x.ts", cwd: CWD })?.reason ?? "";
-		expect(why).toContain("agent://A, agent://B, agent://C 외 2개");
+	test("a small file passes whole, raw or not; the limit is inclusive", () => {
+		childRead("small.md");
+		childRead("edge.md");
+		for (const p of ["small.md", "small.md:raw", "edge.md", "edge.md:raw"]) expect(read(p)).toEqual({ indexed: true });
+	});
+
+	test("a range passes up to the line limit and is refused past it, counting all its ranges", () => {
+		childRead("big.md");
+		expect(MAX_RANGE_LINES).toBe(400);
+		expect(code(`big.md:1-${MAX_RANGE_LINES}`)).toBeUndefined();
+		expect(code(`big.md:1-${MAX_RANGE_LINES + 1}`)).toBe("read-large");
+		expect(code("big.md:1-99999")).toBe("read-large");
+		expect(code("big.md:1+401:raw")).toBe("read-large");
+		expect(code("big.md:1-300,500-600")).toBe("read-large");
+		expect(code("big.md:1-200,500-600")).toBeUndefined();
+		expect(code("big.md:-400")).toBeUndefined();
+		// A page past explicit ranges counts with them.
+		expect(code("big.md:1-150,500-")).toBe("read-large");
+		expect(code("big.md:1-100,500-")).toBeUndefined();
+		// The file's kind does not matter: a wide range of code is as large as one of prose.
+		childRead("big.ts");
+		expect(code("big.ts:1-99999")).toBe("read-large");
+		// A small file bounds any range: nothing it returns is a lot.
+		childRead("small.md");
+		expect(code("small.md:1-99999")).toBeUndefined();
+	});
+
+	test("ssh targets have no known size: only a wide range is refused", () => {
+		childRead("ssh://box/var/log/app.log:1-20");
+		for (const selector of ["", ":raw", ":100-", ":100-200"]) expect(code(`ssh://box/var/log/app.log${selector}`)).toBeUndefined();
+		expect(code("ssh://box/var/log/app.log:1-401")).toBe("read-large");
+		// Another host's file of the same path is another file.
+		expect(read("ssh://other/var/log/app.log")).toEqual({ indexed: false });
+	});
+
+	test("a file that is gone, a directory and an exempt path are never refused", () => {
+		childRead("gone.md");
+		expect(read("gone.md")).toEqual({ indexed: true });
+		childRead("sub");
+		expect(read("sub")).toEqual({ indexed: false });
+		childRead("agent://Impl");
+		expect(read("agent://Scout")).toBeUndefined();
+		expect(directorRead({ runId: RUN, path: 42, cwd: dir })).toBeUndefined();
+		expect(directorRead({ runId: RUN, path: undefined, cwd: dir })).toBeUndefined();
+	});
+
+	test("the reason names the readers, at most three, and the lines asked for", () => {
+		for (const id of ["A", "B", "C", "D", "E"]) childRead("big.md", id);
+		const why = read("big.md:1-1234")?.block?.reason ?? "";
+		for (const id of ["A", "B", "C"]) expect(why).toContain(`agent://${id}`);
 		expect(why).not.toContain("agent://D");
+		expect(why).toContain("1234");
+		expect(why).toContain(String(MAX_RANGE_LINES));
 	});
 
-	test("exempt or non-string paths are not classified or noted", () => {
-		noteChildRead("r1", "Scout", "agent://Impl", CWD);
-		noteChildRead("r1", "Scout", 42, CWD);
-		expect(directorRead({ runId: "r1", path: "agent://Scout", cwd: CWD })).toBeUndefined();
-		expect(directorRead({ runId: "r1", path: 42, cwd: CWD })).toBeUndefined();
-		expect(directorRead({ runId: "r1", path: undefined, cwd: CWD })).toBeUndefined();
+	test("an isolated team is not sent to ask the subagent: its agents take no messages", () => {
+		childRead("big.md");
+		const why = (isolated: boolean) => directorRead({ runId: RUN, path: "big.md:1-999", cwd: dir, isolated })?.block?.reason ?? "";
+		expect(why(false)).toContain("write agent://");
+		expect(why(true)).not.toContain("write agent://");
+		expect(why(true)).toContain("agent://");
 	});
 
-	test("reads of runs that are not open are ignored; clearing closes the run", () => {
-		noteChildRead("r1", "Scout", "src/a.ts", CWD);
-		clearRunReads("r1");
-		expect(childReaders("r1", "/work/repo/src/a.ts")).toEqual([]);
-		// A revived agent of the finished run reads again: nothing comes back.
-		noteChildRead("r1", "Scout", "src/a.ts", CWD);
-		noteChildRead("never-opened", "Scout", "src/a.ts", CWD);
-		expect(childReaders("r1", "/work/repo/src/a.ts")).toEqual([]);
-		expect(childReaders("never-opened", "/work/repo/src/a.ts")).toEqual([]);
-		expect(directorRead({ runId: "r1", path: "src/a.ts", cwd: CWD })).toEqual({ kind: "plain" });
+	test("the index is per run and closes with it", () => {
+		childRead("big.md");
+		expect(directorRead({ runId: "other-run", path: "big.md", cwd: dir })).toEqual({ indexed: false });
+		clearRunReads(RUN);
+		// A revived agent of the finished run reads again: nothing is indexed.
+		childRead("big.md");
+		noteChildRead("never-opened", "Scout", "big.md", dir);
+		expect(read("big.md")).toEqual({ indexed: false });
+		expect(directorRead({ runId: "never-opened", path: "big.md", cwd: dir })).toEqual({ indexed: false });
 		// Reopening an open run keeps what it has.
-		openRunReads("r2");
-		noteChildRead("r2", "Scout", "src/a.ts", CWD);
-		openRunReads("r2");
-		expect(childReaders("r2", "/work/repo/src/a.ts")).toEqual(["Scout"]);
+		openRunReads(RUN);
+		childRead("big.md");
+		openRunReads(RUN);
+		expect(read("big.md:1-5")).toEqual({ indexed: true });
 	});
 });

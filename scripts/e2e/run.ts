@@ -1,744 +1,675 @@
 #!/usr/bin/env bun
 /**
- * OMP Storm end-to-end check: the real plugin inside omp (RPC and print modes) against the scripted
- * fake LLM, in an isolated profile and a throwaway git project. No paid model calls.
+ * OMP Storm end-to-end check, RPC and print hosts: the real plugin, installed in an isolated profile, inside the
+ * pinned omp against the scripted fake LLM. No paid model calls. The TUI scenarios (goal and loop runs, setup forms)
+ * are in tui.ts.
  *
- * Usage: bun scripts/e2e/run.ts   (needs omp on ~/.local/bin or OMP_BIN; port 18556 free)
+ * Usage: npm run e2e   (env: see harness.ts)
+ *
+ * Checks compare block codes (`[storm:<code>]`), outcomes, files and numbers. The only Korean in here are dialog
+ * option labels, which are what a client answers with.
  */
-import type { Subprocess } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { STORM_VERSION } from "../../src/roles.ts";
-import { parseModelEntry } from "../../src/selector.ts";
+import { docPromptFor } from "../../src/policy/docs.ts";
+import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
+import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
+import { FALLBACK, MODE_CHOICE, QUOTA_CHOICE } from "../../src/request/route.ts";
+import type { RunRecord } from "../../src/types.ts";
+import {
+	type Answer,
+	cancelAll,
+	customMessage,
+	choose,
+	type Frame,
+	LlmCursor,
+	type LlmEntry,
+	linkPlugin,
+	modelId,
+	modelsYml,
+	PROFILE_CONFIG,
+	prepare,
+	price,
+	readJsonl,
+	Rpc,
+	type SessionOptions,
+	type Step,
+	StormFiles,
+	Suite,
+	startFakeLlm,
+	TEAM_PROVIDERS,
+	until,
+} from "./harness.ts";
 
-type Frame = { type?: string; [key: string]: unknown };
-interface LlmEntry {
-	model: string;
-	effort: string | null;
-	tools: string[];
-	lastRole?: string;
-	roles: string[];
-	spike: string[];
-	child: boolean;
-	notices: { workflowz: string[]; orchestrate: string[] };
-	users: string[];
-	decision?: { tool?: string; args?: { action?: string } };
-	/** An omp compaction request, and the `<additional-context>` block extensions added to it. */
-	compaction: boolean;
-	compactionContext: string;
-	/** The system prompt carries Storm's doc rules section. */
-	docRules: boolean;
-	/** A user message carries `<storm-setup>`. */
-	setup: boolean;
-	/** The tool result this request answers (cut). */
-	lastTool: string;
-}
-
-const ROOT = join(import.meta.dir, "..", "..");
-const OMP = process.env.OMP_BIN ?? join(homedir(), ".local/bin/omp");
-const BUN = process.execPath;
-const PROFILE = "storm-e2e";
-const PORT = 18556;
-const WORK = "/tmp/storm-e2e";
-const PROJECT = join(WORK, "project");
-const LLM_LOG = join(WORK, "llm.jsonl");
-const PROFILE_ROOT = join(homedir(), ".omp", "profiles", PROFILE);
-const AGENT_DIR = join(PROFILE_ROOT, "agent");
-const CONFIG = join(PROJECT, ".omp", "storm", "config.json");
-const SHADOW = join(PROJECT, ".omp", "agents", "storm-implementer.md");
-const MAIN_MODEL = "fake/general-b";
-const baseArgs = (model = MAIN_MODEL): string[] => [
-	"--profile",
-	PROFILE,
-	"--no-session",
-	"--no-title",
-	"--auto-approve",
-	"--model",
-	model,
-	"--smol",
-	"fake/cheap-a",
-	"--slow",
-	"fake/general-b",
-	"--plan",
-	"fake/general-b",
-	"-e",
-	ROOT,
-];
-/** Session flavor: the main model (one outside the approved team makes non-Storm agents ask for it) and extra flags. */
-interface Flavor {
-	model?: string;
-	flags?: string[];
-}
-
-const MODELS = {
-	fake: [
-		["cheap-a", { input: 0.1, output: 0.4, cacheRead: 0.01, cacheWrite: 0.1 }],
-		["general-b", { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 }],
-		["premium-c", { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }],
-		// Below every role's minimum context, so no team ever approves it: the model outside the team. Priced like premium-c,
-		// so one main request of a run already passes the budget step's cap.
-		["outsider-z", { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, context: 60_000 }],
-		// Reports a 35k prompt on a 60k window (fake-llm.ts): a heavy main session for the run-start check. Never in a team.
-		["heavy-main", { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1, context: 60_000 }],
-	],
-	fake2: [
-		["cheap-d", { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0.2 }],
-		["general-e", { input: 1.5, output: 8, cacheRead: 0.15, cacheWrite: 2 }],
-	],
+/** Option labels Storm does not export. */
+const LABEL = {
+	free: "자유 실행으로 시작",
+	reset: "초기화",
+	rollback: "이전 승인으로 되돌리기",
+	keepModel: "지금 모델 유지",
 } as const;
+
+const env = prepare("storm-e2e", 18556);
+const suite = new Suite("E2E (rpc)", env);
+const files = new StormFiles(env);
+const check = suite.check.bind(suite);
+
+const PROVIDERS = {
+	fake: [
+		...TEAM_PROVIDERS.fake,
+		// Below every role's minimum context, so no team ever approves it: the model outside the team.
+		{ id: "outsider-z", cost: price(5, 25), context: 60_000 },
+		// Reports a 35k prompt on a 60k window (fake-llm.ts): a heavy main session for the run-start check. Never in a team.
+		{ id: "heavy-main", cost: price(1, 4), context: 60_000 },
+	],
+	fake2: TEAM_PROVIDERS.fake2,
+};
 /** A provider whose only model always answers 429 (fake-llm.ts); added only for the fallback step, so it never enters the team. */
-const QUOTA_OUT = { fake3: [["quota-out", { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 }]] } as const;
-
-function modelsYml(withQuotaOut = false): string {
-	const lines = ["providers:"];
-	for (const [provider, models] of Object.entries(withQuotaOut ? { ...MODELS, ...QUOTA_OUT } : MODELS)) {
-		lines.push(`  ${provider}:`, `    baseUrl: http://127.0.0.1:${PORT}/v1`, "    apiKey: storm-e2e-dummy", "    api: openai-completions", "    models:");
-		for (const [id, cost] of models) {
-			lines.push(`      - id: ${id}`, `        contextWindow: ${"context" in cost ? cost.context : 200_000}`, "        maxTokens: 8192");
-			lines.push(`        cost: { input: ${cost.input}, output: ${cost.output}, cacheRead: ${cost.cacheRead}, cacheWrite: ${cost.cacheWrite} }`);
-		}
-	}
-	return `${lines.join("\n")}\n`;
-}
-
-const PROFILE_CONFIG = "setupVersion: 3\n";
+const QUOTA_OUT = { fake3: [{ id: "quota-out", cost: price(1, 4) }] };
 /** No same-model retries, so omp walks the chain at once. */
 const FALLBACK_CONFIG = `${PROFILE_CONFIG}retry:\n  maxRetries: 0\n  modelFallback: true\n  fallbackOn: any\n  fallbackChains:\n    fake3/quota-out:\n      - fake/general-b\n`;
+const MAIN = "fake/general-b";
+/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
+const OUTSIDER = "fake/outsider-z";
+const MODELS_FILE = join(env.agentDir, "models.yml");
+const PROFILE_FILE = join(env.agentDir, "config.yml");
 
-const readLlm = (): LlmEntry[] =>
-	existsSync(LLM_LOG) ? readFileSync(LLM_LOG, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as LlmEntry) : [];
+const exitCodes: number[] = [];
 
-async function until<T>(probe: () => T | undefined, timeoutMs: number, label: string): Promise<T> {
-	const deadline = Date.now() + timeoutMs;
-	for (;;) {
-		const value = probe();
-		if (value !== undefined) return value;
-		if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
-		await Bun.sleep(150);
-	}
-}
-
-type Answer = (request: Frame) => string | undefined;
-
-class Rpc {
-	readonly frames: Frame[] = [];
-	readonly #proc: Subprocess<"pipe", "pipe", "pipe">;
-	#seq = 0;
-
-	constructor(
-		readonly answer: Answer,
-		flavor: Flavor = {},
-	) {
-		this.#proc = Bun.spawn([OMP, "--mode", "rpc", ...baseArgs(flavor.model), ...(flavor.flags ?? [])], {
-			cwd: PROJECT,
-			stdin: "pipe",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		void this.#pump();
-	}
-
-	async #pump(): Promise<void> {
-		const decoder = new TextDecoder();
-		let buffer = "";
-		for await (const chunk of this.#proc.stdout) {
-			buffer += decoder.decode(chunk, { stream: true });
-			for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
-				const line = buffer.slice(0, newline).trim();
-				buffer = buffer.slice(newline + 1);
-				if (!line.startsWith("{")) continue;
-				let frame: Frame;
-				try {
-					frame = JSON.parse(line) as Frame;
-				} catch {
-					continue;
-				}
-				this.frames.push(frame);
-				if (frame.type !== "extension_ui_request") continue;
-				const value = frame.method === "select" ? this.answer(frame) : undefined;
-				this.send(
-					value === undefined
-						? { type: "extension_ui_response", id: frame.id, cancelled: true }
-						: { type: "extension_ui_response", id: frame.id, value },
-				);
-			}
-		}
-	}
-
-	send(command: Frame): string {
-		const id = typeof command.id === "string" ? command.id : `c${++this.#seq}`;
-		this.#proc.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
-		this.#proc.stdin.flush();
-		return id;
-	}
-
-	find(match: (frame: Frame) => boolean, from = 0): Frame | undefined {
-		return this.frames.slice(from).find(match);
-	}
-
-	async close(): Promise<void> {
-		this.#proc.stdin.end();
-		const exited = await Promise.race([this.#proc.exited.then(() => true), Bun.sleep(5_000).then(() => false)]);
-		if (!exited) this.#proc.kill();
-		await this.#proc.exited;
-	}
-}
-
-async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>, flavor: Flavor = {}): Promise<T> {
-	const rpc = new Rpc(answer, flavor);
+/** One omp RPC process: started, used and closed; its exit code is checked at the end. */
+async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>, options: Partial<SessionOptions> = {}): Promise<T> {
+	const rpc = new Rpc(env, answer, { model: MAIN, ...options });
 	try {
-		await until(() => rpc.find(frame => frame.type === "ready"), 30_000, "rpc ready");
+		await rpc.ready();
 		return await body(rpc);
 	} finally {
-		await rpc.close();
+		exitCodes.push(await rpc.close());
 	}
 }
 
-const textOf = (frame: Frame): string => JSON.stringify(frame);
-const noAnswer: Answer = () => undefined;
-const choose =
-	(label: string): Answer =>
-	request =>
-		((request.options as string[] | undefined) ?? []).includes(label) ? label : undefined;
-const uiTitled = (frames: Frame[], title: string): boolean =>
-	frames.some(frame => frame.type === "extension_ui_request" && String(frame.title).startsWith(title));
+const vibe = (steps: Step[]): string => `/storm vibe E2E-STEPS ${JSON.stringify(steps)}`;
+const route = (reply: Record<string, unknown>, rest = "please"): string => `/storm E2E-ROUTE ${JSON.stringify(reply)} ${rest}`;
+const plan = (lanes: Array<{ name: string; kind: string }>, workers?: Record<string, number>): Extract<Step, { storm: unknown }> => ({
+	storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } },
+});
+const CHEAP_RUN = vibe([plan([{ name: "impl", kind: "code" }])]);
 
-/** Runs a slash command and returns its frames once it has completed and the session is quiet. */
-async function command(line: string, answer: Answer): Promise<Frame[]> {
-	return session(answer, async rpc => {
-		const from = rpc.frames.length;
-		const id = rpc.send({ type: "prompt", message: line });
-		await until(() => rpc.find(frame => frame.type === "prompt_result" && frame.id === id, from), 120_000, line);
-		await Bun.sleep(300);
-		return rpc.frames.slice(from);
+/**
+ * Sends a message that starts a Storm run and returns the run's final record, once everything the run's end writes
+ * is on disk and its report, the last thing Storm does for a run, has come after the session's last turn.
+ */
+async function runOf(rpc: Rpc, message: string): Promise<RunRecord> {
+	const before = files.runIds();
+	await rpc.prompt(message);
+	const run = await files.finishedRun(before);
+	const reported = (): true | undefined => {
+		const lastTurn = rpc.frames.findLastIndex(frame => frame.type === "agent_end");
+		return rpc.frames.slice(lastTurn + 1).some(frame => customMessage(frame) === "storm-report" && text(frame).includes(run.runId)) ? true : undefined;
+	};
+	await until(reported, 60_000, `the report of ${run.runId}`);
+	return run;
+}
+
+const text = (frame: Frame): string => JSON.stringify(frame);
+/** Async results delivered to the main session (a blocked spawn's reason arrives as one). */
+const asyncResults = (frames: Frame[]): string =>
+	frames
+		.filter(frame => customMessage(frame) === "async-result")
+		.map(text)
+		.join("\n");
+/** Storm's transcript records (`storm-report` messages, never sent to the model). */
+const reports = (frames: Frame[]): string[] => frames.filter(frame => customMessage(frame) === "storm-report").map(text);
+/** `details` of the storm tool's results, in call order. */
+const toolOutcomes = (frames: Frame[]): Array<{ action?: string; outcome?: string; isError: boolean }> =>
+	frames
+		.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "storm")
+		.map(frame => ({ ...frame.result?.details, isError: frame.isError === true }));
+const blockCodes = (run: RunRecord | undefined): string[] => (run?.spawns ?? []).flatMap(spawn => (spawn.outcome === "blocked" ? [spawn.code ?? "none"] : []));
+const children = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "child");
+const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "main");
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+
+/** A config changed by hand, then approved through `/storm`'s dialog for an unapproved team. */
+async function editAndApprove(change: Parameters<StormFiles["editConfig"]>[0]): Promise<Rpc["dialogs"]> {
+	files.editConfig(change);
+	return session(choose(APPROVE), async rpc => {
+		await rpc.prompt("/storm");
+		return rpc.dialogs;
 	});
 }
-
-/** Asks the fake model to spawn the agents; returns child requests and async results. */
-async function spawn(agents: string[], flavor: Flavor = {}): Promise<{ children: LlmEntry[]; main: LlmEntry[]; results: string }> {
-	const before = readLlm().length;
-	return session(noAnswer, async rpc => {
-		const from = rpc.frames.length;
-		rpc.send({ type: "prompt", message: `SPIKE-TASK ${agents.join(" ")}` });
-		await until(
-			() => rpc.find(frame => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true), from),
-			120_000,
-			"spawn settle",
-		);
-		await Bun.sleep(500);
-		const results = rpc.frames
-			.slice(from)
-			.filter(frame => frame.type === "message_start" && textOf(frame).includes("async-result"))
-			.map(textOf)
-			.join("\n");
-		const fresh = readLlm().slice(before).filter(entry => entry.tools.length > 0);
-		return { children: fresh.filter(entry => entry.child), main: fresh.filter(entry => !entry.child), results };
-	}, flavor);
-}
-
-/** Waits until the session has settled and stayed quiet (handoffs start follow-up turns). */
-async function settleQuietly(rpc: Rpc, from: number, label: string): Promise<void> {
-	const deadline = Date.now() + 120_000;
-	let seen = rpc.frames.length;
-	let quietSince = Date.now();
-	for (;;) {
-		await Bun.sleep(200);
-		if (rpc.frames.length !== seen) {
-			seen = rpc.frames.length;
-			quietSince = Date.now();
-			continue;
-		}
-		const settled = rpc.find(frame => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true), from);
-		if (settled && Date.now() - quietSince >= 3_000) return;
-		if (Date.now() > deadline) throw new Error(`timeout waiting for quiet: ${label}`);
-	}
-}
-
-/** Sends the prompts one after another in one session; returns every frame once each has settled. */
-async function converse(messages: string | string[], answer: Answer, flavor: Flavor = {}): Promise<{ frames: Frame[]; llm: LlmEntry[] }> {
-	const before = readLlm().length;
-	return session(
-		answer,
-		async rpc => {
-			const from = rpc.frames.length;
-			for (const message of [messages].flat()) {
-				const at = rpc.frames.length;
-				rpc.send({ type: "prompt", message });
-				await settleQuietly(rpc, at, message);
-			}
-			return { frames: rpc.frames.slice(from), llm: readLlm().slice(before) };
-		},
-		flavor,
-	);
-}
-
-const failures: string[] = [];
-function check(name: string, ok: boolean, detail = ""): void {
-	console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
-	if (!ok) failures.push(name);
-}
-
-function configHashOnDisk(): string | null {
-	if (!existsSync(CONFIG)) return null;
-	return new Bun.CryptoHasher("sha256").update(readFileSync(CONFIG)).digest("hex");
-}
-
-function approvalFiles(): string[] {
-	const base = join(AGENT_DIR, "storm", "approvals");
-	if (!existsSync(base)) return [];
-	return readdirSync(base).flatMap(repo => {
-		const dir = join(base, repo, "approved");
-		return existsSync(dir) ? readdirSync(dir) : [];
-	});
-}
-
-/** Starts the rpc setup dialog (0.9.0: it precedes the `<storm-setup>` message) and approves every approval dialog. */
-const approveAnswers: Answer = request => {
-	const options = (request.options as string[] | undefined) ?? [];
-	if (request.title === "Storm 팀 설정을 시작할까요?" && options.includes("시작")) return "시작";
-	return options.includes("승인") ? "승인" : undefined;
-};
 
 async function main(): Promise<void> {
-	rmSync(WORK, { recursive: true, force: true });
-	rmSync(PROFILE_ROOT, { recursive: true, force: true });
-	mkdirSync(PROJECT, { recursive: true });
-	mkdirSync(AGENT_DIR, { recursive: true });
-	writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml());
-	writeFileSync(join(AGENT_DIR, "config.yml"), PROFILE_CONFIG);
-	Bun.spawnSync(["git", "init", "-q", PROJECT]);
-	const server = Bun.spawn([BUN, join(import.meta.dir, "fake-llm.ts")], {
-		env: { ...process.env, FAKE_LLM_PORT: String(PORT), FAKE_LLM_LOG: LLM_LOG },
-		stdout: "pipe",
-		stderr: "pipe",
+	writeFileSync(MODELS_FILE, modelsYml(env.port, PROVIDERS));
+	writeFileSync(PROFILE_FILE, PROFILE_CONFIG);
+	linkPlugin(env);
+	/** The run started through the request router in a session kept on disk: the janitor step looks it up. */
+	let routedRunId: string | undefined;
+
+	await suite.step("no config", async () => {
+		const llm = new LlmCursor(env);
+		const frames = await session(cancelAll, rpc => rpc.turn("E2E-TASK storm-implementer task"));
+		check("storm role spawn is blocked with no-config", asyncResults(frames).includes("[storm:no-config]"));
+		check("other agents are untouched", children(llm.all()).length === 1, `children=${children(llm.all()).length}`);
+		check("no storm tool without a config", mains(llm.all()).length > 0 && mains(llm.all()).every(entry => entry.stormTool === null));
 	});
-	try {
-		await Bun.sleep(800);
 
-		let run = await spawn(["storm-implementer", "task"]);
-		check("설정 없음: storm 역할 차단", run.results.includes("Storm 설정이 없습니다") && run.children.every(c => !c.roles.length));
-		check("설정 없음: 일반 에이전트는 영향 없음", run.children.length === 1, `children=${run.children.length}`);
-		check(
-			"도구: 설정 없는 프로젝트엔 storm 도구 없음",
-			run.main.length > 0 && run.main.every(entry => !entry.tools.includes("storm")),
-			`main=${run.main.length}`,
-		);
-
-		// C2: under rpc a dialog precedes the setup request, so a client that answers no dialog never gets the interview.
-		const SETUP_DIALOG = "Storm 팀 설정을 시작할까요?";
-		const declined = await converse("/storm", choose("취소"));
-		check(
-			"setup(rpc): 시작 확인 창에서 취소하면 설정 요청 없음",
-			uiTitled(declined.frames, SETUP_DIALOG) && !declined.llm.some(entry => entry.setup) && !existsSync(CONFIG),
-			`dialog=${uiTitled(declined.frames, SETUP_DIALOG)} setupRequests=${declined.llm.filter(entry => entry.setup).length}`,
-		);
-
-		// Setup is led by the session LLM: the fake model proposes Storm's recommendation, and only "승인" in Storm's dialog saves it.
-		const setup = await converse("/storm", approveAnswers);
-		let frames = setup.frames;
-		check(
-			"setup(rpc): 시작을 고르면 설정 요청(<storm-setup>)을 보냄",
-			uiTitled(frames, SETUP_DIALOG) && setup.llm.some(entry => !entry.child && entry.setup),
-		);
-		const config = existsSync(CONFIG) ? (JSON.parse(readFileSync(CONFIG, "utf8")) as { roles: Record<string, { models: string[]; effort?: string }> }) : undefined;
-		check(
-			"setup: 세션 LLM이 팀 제안(propose)",
-			setup.llm.some(entry => !entry.child && entry.decision?.tool === "storm" && entry.decision.args?.action === "propose"),
-		);
-		check("setup: 팀 제안 승인 창", uiTitled(frames, "이 변경을 승인할까요") && frames.some(frame => textOf(frame).includes("Storm 팀 제안")));
-		check("setup: 설정 저장", config !== undefined);
-		check("setup: 승인 기록", approvalFiles().length === 1, `approvals=${approvalFiles().length}`);
-		check("setup: .gitignore", existsSync(join(PROJECT, ".omp", "storm", ".gitignore")));
-		check(
-			"setup: 새 역할(단순 작업·설계·자문)도 추천안에",
-			config?.roles.quick !== undefined && config.roles.architect !== undefined,
-			Object.keys(config?.roles ?? {}).join(","),
-		);
-		const implementer = config?.roles.implementer;
-		const primaryEntry = implementer?.models[0] === undefined ? undefined : parseModelEntry(implementer.models[0]);
-		const expectedModel = primaryEntry?.selector.split("/").slice(1).join("/");
-		const expectedEffort = primaryEntry?.effort ?? implementer?.effort;
-
-		run = await spawn(["storm-implementer"]);
-		const child = run.children[0];
-		check("승인 후: 승인 모델로 교체", child?.model === expectedModel, `child=${child?.model} expected=${expectedModel}`);
-		check("승인 후: effort 전달", expectedEffort === undefined || child?.effort === expectedEffort, `effort=${child?.effort} expected=${expectedEffort}`);
-		check("문서 정합(켬): storm 역할 시스템 프롬프트에 문서 규칙", child?.docRules === true, `docRules=${child?.docRules}`);
-		check(
-			"도구: 설정 있으면 메인 세션에만 storm 도구",
-			run.main.length > 0 && run.main.every(entry => entry.tools.includes("storm")) && run.children.every(entry => !entry.tools.includes("storm")),
-			`main=${run.main.map(entry => entry.tools.includes("storm")).join(",")} children=${run.children.map(entry => entry.tools.includes("storm")).join(",")}`,
-		);
-		run = await spawn(["storm-quick", "storm-architect"]);
-		const newRoleModels = ["quick", "architect"].map(id => {
-			const entry = config?.roles[id]?.models[0];
-			return entry === undefined ? undefined : parseModelEntry(entry).selector.split("/").slice(1).join("/");
+	await suite.step("setup through Storm's dialog", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			await rpc.prompt("/storm");
+			check("the dialog offers exactly approve and cancel (no forms in RPC)", same(rpc.dialogs.at(-1)?.options, [APPROVE, CANCEL]), JSON.stringify(rpc.dialogs));
+			check("cancel saves nothing", !existsSync(files.configFile) && files.approvals().length === 0);
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			check("approve saves the config", existsSync(files.configFile));
+			check("approve writes one approval record", files.approvals().length === 1, `approvals=${files.approvals().length}`);
+			check("state stays out of git (.gitignore)", existsSync(join(env.project, ".omp", "storm", ".gitignore")));
+			check("no model request during setup", llm.all().length === 0, `requests=${llm.all().length}`);
+			const roles = Object.keys(existsSync(files.configFile) ? files.config().roles : {}).sort();
+			check("the recommended team has all five roles", same(roles, ["architect", "explorer", "implementer", "quick", "reviewer"]), roles.join(","));
+			await rpc.turn("hello");
+			const [first] = mains(llm.all());
+			check(
+				"setup added nothing to the main session",
+				first?.messageCount === 1 && first.lastUser.trimEnd().endsWith("hello") && !first.lastUser.includes("<storm"),
+				`messages=${first?.messageCount} user=${first?.lastUser.slice(-80)}`,
+			);
+			check("the main session has the storm tool now", first?.stormTool !== null);
 		});
+	});
+
+	await suite.step("spawn routing outside a run", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, rpc => rpc.turn("E2E-TASK storm-implementer storm-quick storm-architect"));
+		const config = files.config();
+		const kids = children(llm.all());
+		const primary = config.roles.implementer?.models[0];
+		const effort = /:(\w+)$/.exec(primary ?? "")?.[1];
+		const implementer = kids.find(kid => kid.model === modelId(primary) && kid.effort === effort);
+		check("the implementer runs on its approved model", implementer !== undefined, `children=${kids.map(kid => `${kid.model}:${kid.effort}`).join(",")} expected=${primary}`);
+		check("the approved effort is sent", effort !== undefined && implementer?.effort === effort, `effort=${implementer?.effort} expected=${effort}`);
+		const expected = ["implementer", "quick", "architect"].map(id => modelId(config.roles[id]?.models[0]));
 		check(
-			"새 역할: 단순 작업·설계·자문 스폰이 각자 승인 모델로",
-			run.children.length === 2 && newRoleModels.every(model => run.children.some(child => child.model === model)),
-			`children=${run.children.map(child => child.model).join(",")} expected=${newRoleModels.join(",")}`,
+			"each role runs on its own approved model",
+			kids.length === 3 && expected.every(model => kids.some(kid => kid.model === model)),
+			`children=${kids.map(kid => kid.model).join(",")} expected=${expected.join(",")}`,
 		);
+		check("only the main session has the storm tool", mains(llm.all()).every(entry => entry.stormTool !== null) && kids.every(kid => kid.stormTool === null));
+	});
 
-		const edited = JSON.parse(readFileSync(CONFIG, "utf8")) as { parallelism: number };
-		edited.parallelism = edited.parallelism === 3 ? 5 : 3;
-		writeFileSync(CONFIG, `${JSON.stringify(edited, null, 2)}\n`);
-		run = await spawn(["storm-implementer"]);
-		check("직접 편집: 승인 전 차단", run.results.includes("승인되지 않은 Storm 설정") && run.children.length === 0);
-		frames = await command("/storm", approveAnswers);
-		check("허브: 미승인이면 승인 화면", uiTitled(frames, "이 설정을 승인할까요?") && !uiTitled(frames, "Storm 메뉴"));
-		run = await spawn(["storm-implementer"]);
-		check("리뷰 승인 후: 다시 허용", run.children.length === 1 && run.children[0]?.model === expectedModel);
+	await suite.step("request routing: query, change, invalid reply", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			let frames = await rpc.prompt(route({ action: "answer", text: "E2E-ANSWER-42" }, "who reviews?"));
+			check("a question costs one side turn", llm.all().filter(entry => entry.who !== "side").length === 1 && llm.of("route").length === 1, `route=${llm.of("route").length}`);
+			check("the answer is shown, off the model's context", reports(frames).some(report => report.includes("E2E-ANSWER-42") && report.includes('"excludeFromContext":true')));
+			frames = await rpc.prompt(route({ action: "status" }, "how is the team?"));
+			check("a status query opens the report", reports(frames).length === 1 && rpc.dialogs.length === 0, `reports=${reports(frames).length}`);
 
-		mkdirSync(join(PROJECT, ".omp", "agents"), { recursive: true });
-		writeFileSync(SHADOW, "---\nname: storm-implementer\ndescription: shadow\n---\nSTORM-ROLE shadow. Reply with OK.\n");
-		run = await spawn(["storm-implementer"]);
-		check("역할 가림: 승인 전 차단", run.results.includes("승인되지 않은 역할 정의") && run.children.length === 0);
-		frames = await command("/storm", approveAnswers);
-		check("허브: 승인 안 된 가림 정의도 승인 화면", uiTitled(frames, "이 설정을 승인할까요?") && !uiTitled(frames, "Storm 메뉴"));
-		run = await spawn(["storm-implementer"]);
-		check("역할 가림: 승인 후 가림 정의로 실행", run.children[0]?.roles.includes("shadow") === true);
-		rmSync(join(PROJECT, ".omp", "agents"), { recursive: true, force: true });
+			const change = route({ action: "workers", role: "reviewer", min: 1, max: 3 }, "let three reviewers run");
+			const bytes = files.configBytes();
+			const approvals = files.approvals().length;
+			await rpc.prompt(change);
+			check("a change opens the approval dialog", same(rpc.dialogs.at(-1)?.options, [APPROVE, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
+			check("cancel changes nothing", files.configBytes() === bytes && files.approvals().length === approvals);
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt(change);
+			const workers = files.config().roles.reviewer?.workers;
+			check("approve applies the change", typeof workers === "object" && workers.min === 1 && workers.max === 3, JSON.stringify(workers));
+			check("approve adds an approval record", files.approvals().length === approvals + 1, `approvals=${files.approvals().length}`);
 
-		const beforeRollback = configHashOnDisk();
-		frames = await command("/storm", request => {
-			const options = (request.options as string[] | undefined) ?? [];
-			if (request.title === "Storm 메뉴") return "이전 설정으로 되돌리기";
-			if (options.includes("승인 후 되돌리기")) return "승인 후 되돌리기";
-			return options.find(option => option !== "취소");
+			rpc.answer = cancelAll;
+			const runs = files.runs().length;
+			await rpc.prompt("/storm E2E-ROUTE-BAD do something");
+			check("an unreadable reply offers run, menu or cancel", same(rpc.dialogs.at(-1)?.options, [FALLBACK.run, FALLBACK.menu, FALLBACK.cancel]), JSON.stringify(rpc.dialogs.at(-1)));
+			check("cancel starts nothing", files.runs().length === runs);
+			check("every request was classified in one side turn", llm.of("route").length === 5 && mains(llm.all()).length === 0, `route=${llm.of("route").length} main=${mains(llm.all()).length}`);
+
+			await rpc.turn("hello");
+			const hello = mains(llm.all()).at(-1);
+			check("none of the requests entered the main session", hello?.messageCount === 1 && hello.lastUser.trimEnd().endsWith("hello"), `messages=${hello?.messageCount}`);
 		});
-		check("롤백: 메뉴에서 설정 파일 변경", uiTitled(frames, "Storm 메뉴") && configHashOnDisk() !== beforeRollback);
-		run = await spawn(["storm-implementer"]);
-		check("롤백 후: 승인된 설정으로 허용", run.children.length === 1);
+	});
 
-		const hashBefore = configHashOnDisk();
-		const approvalsBefore = approvalFiles().length;
-		const llmBefore = readLlm().length;
-		const print = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm setup"], { cwd: PROJECT, timeout: 120_000 });
-		const printReset = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm reset"], { cwd: PROJECT, timeout: 120_000 });
-		const printHub = Bun.spawnSync([OMP, "-p", ...baseArgs(), "/storm"], { cwd: PROJECT, timeout: 120_000 });
-		check(
-			"print 모드: /storm·setup·reset 모두 변경 없음",
-			configHashOnDisk() === hashBefore && approvalFiles().length === approvalsBefore,
-			`exit=${print.exitCode},${printReset.exitCode},${printHub.exitCode}`,
-		);
-		check("print 모드: 모델 호출 없음", readLlm().length === llmBefore);
-
-		frames = await command("/storm", noAnswer);
-		check(
-			"허브: 메뉴와 함께 짧은 현황",
-			frames.some(frame => textOf(frame).includes("Storm 현황") && textOf(frame).includes(`- Storm ${STORM_VERSION}`) && textOf(frame).includes("/storm status")),
-		);
-		const menu = frames.find(frame => frame.type === "extension_ui_request" && frame.title === "Storm 메뉴")?.options as string[] | undefined;
-		check(
-			"허브: 해당하는 메뉴만",
-			JSON.stringify(menu) === JSON.stringify(["팀 다시 설정", "모델 점검", "이전 설정으로 되돌리기", "초기화", "닫기"]),
-			JSON.stringify(menu),
-		);
-		frames = await command("/storm status", noAnswer);
-		check("현황: 수명 관리 경고", frames.some(frame => textOf(frame).includes("### 수명 관리")));
-		check(
-			"현황: omp 설정 점검(복사용 명령)",
-			frames.some(frame => textOf(frame).includes("### omp 설정 점검") && textOf(frame).includes("omp config set")),
-		);
-
-		// ── v0.2: runs, natural-language changes, deferral, quota, trial, budget ──
-		type StoredRole = { models: string[]; effort?: string; workers?: number | { min: number; max: number } };
-		type StoredConfig = {
-			priority: string;
-			roles: Record<string, StoredRole>;
-			trials?: unknown[];
-			budget?: { perRunUsd: number };
-			disabledRoles?: string[];
-			contextCap?: number;
-			cleanup?: boolean;
-			docs?: boolean;
-		};
-		type StoredAgent = {
-			id: string;
-			role?: string;
-			model?: string;
-			contextTokens: number;
-			state: string;
-			followUps: number;
-			review?: { reviews: number; passed: number; failed: number; findings: number[]; docFindings?: number };
-			cleanedAt?: number;
-		};
-		type StoredRun = {
-			runId: string;
-			status: string;
-			contract: string;
-			spawns: Array<{ outcome: string; agent: string; spawnKey?: string; role?: string; reason?: string }>;
-			agents?: StoredAgent[];
-			mainCostUsd?: number;
-			blockedEdits?: number;
-			blockedFollowUps?: number;
-			plan?: { lanes: unknown[]; workers: Record<string, number> };
-			reads?: { director: number; duplicate: number; blocked: number };
-			checkpoints?: Array<{ at: string; before: number; after?: number }>;
-			cleanup?: { agents: number; files: number; bytes: number; stormFiles: number };
-		};
-		const readConfig = (): StoredConfig => JSON.parse(readFileSync(CONFIG, "utf8")) as StoredConfig;
-		const idOf = (entry: string | undefined): string | undefined =>
-			entry === undefined ? undefined : parseModelEntry(entry).selector.split("/").slice(1).join("/");
-		const bare = (entry: string | undefined): string | undefined => (entry === undefined ? undefined : parseModelEntry(entry).selector);
-		const providerOf = (selector: string | undefined): string | undefined => selector?.split("/")[0];
-		const stateDir = join(PROJECT, ".omp", "storm", "state");
-		const runFiles = (): StoredRun[] => {
-			const dir = join(stateDir, "runs");
-			if (!existsSync(dir)) return [];
-			return readdirSync(dir)
-				.filter(file => file.endsWith(".json"))
-				.sort()
-				.map(file => JSON.parse(readFileSync(join(dir, file), "utf8")) as StoredRun);
-		};
-		const proposalFiles = (): string[] => {
-			const dir = join(stateDir, "proposals");
-			return existsSync(dir) ? readdirSync(dir).filter(file => file.endsWith(".json")) : [];
-		};
-		type StoredSummary = {
-			schema: string;
-			runId: string;
-			reads?: { director: number; duplicate: number; blocked: number };
-			reviews?: { reviews: number; docFindings: number };
-		};
-		const runIndexFile = join(stateDir, "runs", "index.jsonl");
-		const runIndex = (): StoredSummary[] =>
-			existsSync(runIndexFile)
-				? readFileSync(runIndexFile, "utf8")
-						.split("\n")
-						.filter(Boolean)
-						.map(line => JSON.parse(line) as StoredSummary)
-				: [];
-		/** A main model outside the approved team: non-Storm agents ask for it unless Storm swaps it. */
-		const OUTSIDER = "fake/outsider-z";
-		/** A run whose director follows scripted steps (fake-llm.ts SPIKE-STEPS): plans, spawns and follow-ups in order. */
-		const runTask = (steps: unknown[]): string => `/storm STORM-TOOL ${JSON.stringify({ action: "run", task: `SPIKE-STEPS ${JSON.stringify(steps)}` })}`;
-		const planStep = (lanes: Array<{ name: string; kind: string }>, workers: Record<string, number> = {}) => ({
-			storm: { action: "plan", plan: { lanes, workers } },
-		});
-
-		let team = readConfig();
-		let primary = team.roles.implementer?.models[0];
-		check(
-			"v0.2 전제: 대체 확인용 모델은 승인 밖",
-			!Object.values(team.roles).some(role => role.models.some(model => bare(model) === OUTSIDER)),
-		);
-		let talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer", "task"] }]), noAnswer, {
-			model: OUTSIDER,
-		});
-		// The hidden notice is delivered with the handoff, so the logged (truncated) user text may not show the contract itself.
-		const noticed = talk.llm.some(entry => !entry.child && entry.notices.workflowz.length > 0);
-		check("실행: 인계에 workflowz 계약", noticed && runFiles().at(-1)?.contract === "workflowz", `contract=${runFiles().at(-1)?.contract} noticed=${noticed}`);
-		const runChildren = talk.llm.filter(entry => entry.child && entry.tools.length > 0);
-		check(
-			"실행: storm 역할·승인 밖 요청 모두 승인 모델로",
-			runChildren.length === 2 && runChildren.every(entry => entry.model === idOf(primary)),
-			`children=${runChildren.map(entry => entry.model).join(",")} expected=${idOf(primary)}`,
-		);
-		const firstRun = runFiles().at(-1);
-		check(
-			"실행: 기록(완료, 교체·대체)",
-			firstRun?.status === "done" && firstRun.spawns.some(s => s.outcome === "routed") && firstRun.spawns.some(s => s.outcome === "substituted"),
-			`${firstRun?.status} ${firstRun?.spawns.map(s => s.outcome).join(",")}`,
-		);
-		check("실행: 결과 보고", talk.frames.some(frame => textOf(frame).includes("Storm 실행 결과")));
-		const ledger = firstRun?.agents ?? [];
-		check(
-			"실행: 서브에이전트 장부(역할·모델·컨텍스트)",
-			ledger.length === 2 && ledger.some(agent => agent.role === "implementer") && ledger.every(agent => agent.contextTokens > 0 && agent.model !== undefined),
-			JSON.stringify(ledger.map(agent => [agent.id, agent.role, agent.model, agent.contextTokens, agent.state])),
-		);
-		const spawnKeys = (firstRun?.spawns ?? []).map(spawn => spawn.spawnKey);
-		check(
-			"실행: 스폰 기록이 에이전트 id로 이어짐",
-			spawnKeys.length > 0 && spawnKeys.every(key => ledger.some(agent => agent.id === key)),
-			`spawnKeys=${spawnKeys.join(",")} agents=${ledger.map(agent => agent.id).join(",")}`,
-		);
-		check("실행 계획: 실행 기록에 남음", firstRun?.plan?.lanes.length === 1 && firstRun.plan.workers.implementer === 1, JSON.stringify(firstRun?.plan));
-		const firstSummary = runIndex().find(summary => summary.runId === firstRun?.runId);
-		check(
-			"실행 요약 색인: 끝난 실행이 index.jsonl 에 한 줄(storm.run-summary/v1)",
-			firstSummary?.schema === "storm.run-summary/v1",
-			`runId=${firstRun?.runId} lines=${runIndex().length} schema=${firstSummary?.schema}`,
-		);
-		// omp's built-in agents get their mapped role's models, and a reviewer's yielded verdict lands in the run record.
-		const explorerPrimary = team.roles.explorer?.models[0];
-		talk = await converse(
-			runTask([
-				planStep([
+	await suite.step("request routing: work becomes a run", async () => {
+		const llm = new LlmCursor(env);
+		const steps: Step[] = [
+			plan(
+				[
+					{ name: "impl", kind: "code" },
 					{ name: "scope", kind: "explore" },
 					{ name: "review", kind: "review" },
-				]),
-				{ task: ["scout", "storm-reviewer"] },
-			]),
-			noAnswer,
-			{ model: OUTSIDER, flags: ["--smol", OUTSIDER] },
-		);
-		const reviewRun = runFiles().at(-1);
-		const scoutSpawn = reviewRun?.spawns.find(spawn => spawn.agent === "scout");
-		check(
-			"기본 에이전트: 승인 밖 scout 는 탐색 역할 모델로",
-			scoutSpawn?.outcome === "substituted" && scoutSpawn.role === "explorer" && talk.llm.some(entry => entry.child && entry.model === idOf(explorerPrimary)),
-			`scout=${JSON.stringify(scoutSpawn)} expected=${idOf(explorerPrimary)}`,
-		);
-		const verdicts = (reviewRun?.agents ?? []).flatMap(agent => (agent.review ? [agent.review] : []));
-		check(
-			"리뷰 판정: 실행 기록과 결과 보고에 남음",
-			verdicts.some(review => review.reviews === 1 && review.failed === 1 && review.findings[1] === 1) &&
-				talk.frames.some(frame => textOf(frame).includes("리뷰 1회") && textOf(frame).includes("수정 필요 1 (P1 1)")),
-			`verdicts=${JSON.stringify(verdicts)} agents=${JSON.stringify((reviewRun?.agents ?? []).map(agent => [agent.id, agent.role, agent.review]))}`,
-		);
-		// D2: the reviewer's finding carries `kind: "doc_conflict"`; omp's yield schema (agents/storm-reviewer.md) accepts it.
-		const reviewSummary = runIndex().find(summary => summary.runId === reviewRun?.runId);
-		check(
-			"리뷰 문서 지적: doc_conflict 가 결과 보고·실행 기록·색인에 문서 상충으로",
-			verdicts.some(review => review.docFindings === 1) &&
-				talk.frames.some(frame => textOf(frame).includes("문서 상충 1건")) &&
-				reviewSummary?.reviews?.docFindings === 1,
-			`verdicts=${JSON.stringify(verdicts)} index=${JSON.stringify(reviewSummary?.reviews)}`,
-		);
-
-		// A run refuses spawns until the director submits a plan, each role stays within the plan's workers,
-		// and a plan past the team's bounds needs an approved config change.
-		const planHash = configHashOnDisk();
-		talk = await converse(
-			runTask([
-				{ task: ["storm-explorer"] },
-				// omp decides the spawn in the background after task returns: submit the plan only once it was refused.
-				{ ...planStep([{ name: "scope", kind: "explore" }], { explorer: 1 }), after: "실행 계획이 없어" },
-				{ task: ["storm-explorer", "storm-explorer"] },
-				planStep([{ name: "scope", kind: "explore" }], { explorer: 9 }),
-			]),
-			choose("취소"),
-		);
-		const planRun = runFiles().at(-1);
-		const explorerSpawns = (planRun?.spawns ?? []).filter(spawn => spawn.agent === "storm-explorer");
-		check(
-			"실행 계획: 계획 전 스폰은 막힘",
-			explorerSpawns[0]?.outcome === "blocked" && (explorerSpawns[0].reason ?? "").includes("계획"),
-			JSON.stringify((planRun?.spawns ?? []).map(spawn => [spawn.agent, spawn.outcome, spawn.spawnKey, (spawn.reason ?? "").slice(0, 40)])),
-		);
-		check(
-			"실행 계획: 계획의 워커 수를 넘는 스폰은 막힘",
-			explorerSpawns[1]?.outcome === "routed" && explorerSpawns[2]?.outcome === "blocked",
-			JSON.stringify(explorerSpawns.slice(1).map(spawn => [spawn.outcome, spawn.reason?.slice(0, 60)])),
-		);
-		check(
-			"실행 계획: 범위 밖 계획은 승인 창, 취소하면 그대로",
-			uiTitled(talk.frames, "이 변경을 승인할까요") && configHashOnDisk() === planHash && planRun?.plan?.workers.explorer === 1,
-			JSON.stringify(planRun?.plan?.workers),
-		);
-		talk = await converse(["SPIKE-TASK storm-implementer", '/storm STORM-TOOL {"action":"agents"}'], noAnswer);
-		const agentsReply = talk.frames.map(textOf).find(text => text.includes("(implementer)") && text.includes("| 권장 |"));
-		check("agents: 끝난 에이전트 재사용 권장", agentsReply?.includes("재사용") === true && agentsReply.includes("agent://"), agentsReply?.slice(0, 300) ?? "no table");
-		const hubAgents = await session(
-			request => (request.title === "Storm 메뉴" ? "서브에이전트 재사용 권장" : undefined),
+				],
+				{ implementer: 2 },
+			),
+			{ task: ["storm-implementer", "task", "scout", "storm-reviewer"] },
+		];
+		const request = `E2E-ROUTE ${JSON.stringify({ action: "run" })} E2E-STEPS ${JSON.stringify(steps)}`;
+		let frames: Frame[] = [];
+		const run = await session(
+			cancelAll,
 			async rpc => {
-				const first = rpc.frames.length;
-				rpc.send({ type: "prompt", message: "SPIKE-TASK storm-implementer" });
-				await settleQuietly(rpc, first, "spawn before /storm");
-				const from = rpc.frames.length;
-				const id = rpc.send({ type: "prompt", message: "/storm" });
-				await until(() => rpc.find(frame => frame.type === "prompt_result" && frame.id === id, from), 120_000, "/storm");
-				await Bun.sleep(300);
-				return rpc.frames.slice(from);
+				const done = await runOf(rpc, `/storm ${request}`);
+				frames = rpc.frames;
+				return done;
 			},
+			{ model: OUTSIDER, flags: ["--smol", OUTSIDER], persist: true },
 		);
-		check(
-			"허브: 서브에이전트가 있으면 재사용 권장 메뉴",
-			hubAgents.some(frame => textOf(frame).includes("### 서브에이전트 재사용 권장") && textOf(frame).includes("| 권장 |")),
-		);
-		run = await spawn(["task"], { model: OUTSIDER });
-		check("실행 밖: 일반 에이전트는 그대로", run.children[0]?.model === idOf(OUTSIDER), `child=${run.children[0]?.model}`);
+		routedRunId = run.runId;
+		const config = files.config();
+		const director = mains(llm.all());
+		// omp puts its date reminder in front of the first user message.
+		const handoff = (director[0]?.lastUser ?? "").replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "");
+		const sent = new Set(director.flatMap(entry => entry.users).filter(user => !user.startsWith("<system-notice>")));
+		check("one side turn classified it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
+		check("the handoff is the only user message Storm sends", sent.size === 1 && director[0]?.messageCount === 1, `user messages=${sent.size}`);
+		const firstLine = handoff.split("\n", 1)[0] ?? "";
+		check("the handoff opens with the run tag, no keyword", /^<storm-run id="run-\d{8}-\d{6}-[0-9a-f]{4}" config="[0-9a-f]{12}">$/.test(firstLine), firstLine);
+		check("no omp keyword notice rides along", director.length > 0 && director.every(entry => !entry.keywordNotice));
+		check("the task is passed on verbatim", handoff.includes(request));
+		const frame = handoff.length - request.length;
+		check("the handoff stays within 1,400 chars besides the task", frame > 200 && frame <= 1_400, `chars=${frame}`);
 
-		const directed = join(PROJECT, "director-check.txt");
-		talk = await converse('/storm STORM-TOOL {"action":"run","task":"SPIKE-WRITE director-check.txt"}', noAnswer);
-		const directorRun = runFiles().at(-1);
+		check("the run record: vibe, settled, done", run.mode === "vibe" && run.endReason === "settled" && run.status === "done" && (run.turns ?? 0) >= 1, `${run.mode} ${run.endReason} ${run.status} turns=${run.turns}`);
+		const outcome = (agent: string) => run.spawns.find(spawn => spawn.agent === agent);
 		check(
-			"감독 모드: 실행 중 메인의 파일 쓰기는 막고 위임하라고 알림",
-			!existsSync(directed) && directorRun?.blockedEdits === 1 && talk.frames.some(frame => textOf(frame).includes("Storm 감독 모드")),
-			`exists=${existsSync(directed)} blocked=${directorRun?.blockedEdits}`,
+			"storm roles are routed, outside models are swapped for the role's",
+			outcome("storm-implementer")?.outcome === "routed" &&
+				outcome("storm-reviewer")?.outcome === "routed" &&
+				outcome("task")?.outcome === "substituted" &&
+				outcome("task")?.role === "implementer" &&
+				outcome("scout")?.outcome === "substituted" &&
+				outcome("scout")?.role === "explorer",
+			JSON.stringify(run.spawns.map(spawn => [spawn.agent, spawn.outcome, spawn.role])),
 		);
+		const approved = new Set(Object.values(config.roles).flatMap(role => role.models.map(modelId)));
+		const kids = children(llm.all());
+		check("every subagent ran on an approved model", kids.length >= 4 && kids.every(kid => approved.has(kid.model)), kids.map(kid => kid.model).join(","));
+		const ledger = run.agents ?? [];
 		check(
-			"감독 모드: 실행 기록에 메인 비용",
-			(directorRun?.mainCostUsd ?? 0) > 0 && talk.frames.some(frame => textOf(frame).includes("메인(감독): 비용")),
-			`main=${directorRun?.mainCostUsd}`,
+			"the agent ledger has role, model and context",
+			ledger.length === 4 && ledger.every(agent => agent.contextTokens > 0 && agent.model !== undefined) && ledger.some(agent => agent.role === "reviewer"),
+			JSON.stringify(ledger.map(agent => [agent.id, agent.role, agent.model, agent.contextTokens])),
 		);
-		await converse("SPIKE-WRITE director-check.txt", noAnswer);
-		check("감독 모드: 실행 밖에서는 메인이 그대로 씀", existsSync(directed));
-		rmSync(directed, { force: true });
+		check("spawn records link to ledger agents", run.spawns.length === 4 && run.spawns.every(spawn => ledger.some(agent => agent.id === spawn.spawnKey)));
+		check("the plan is in the record", run.plan?.lanes.length === 3 && run.plan.workers.implementer === 2, JSON.stringify(run.plan?.workers));
+		const summary = files.index().find(line => line.runId === run.runId);
+		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.mode === "vibe" && summary.endReason === "settled", JSON.stringify(summary));
+		check("the run's report is in the transcript, off the model's context", reports(frames).some(report => report.includes(run.runId) && report.includes('"excludeFromContext":true')));
 
-		// ── v0.9: director reads, run summary index, run-end cleanup, doc rules ──
-		// A1: a storm-explorer reads the file; the director's whole-file read of it is refused, a bounded one passes.
-		const EVIDENCE = "notes/evidence.txt";
-		mkdirSync(join(PROJECT, "notes"), { recursive: true });
-		writeFileSync(join(PROJECT, EVIDENCE), `${[1, 2, 3, 4, 5].map(n => `E2E-EVIDENCE-${n}`).join("\n")}\n`);
-		talk = await converse(
-			runTask([
-				planStep([{ name: "scope", kind: "explore" }], { explorer: 1 }),
-				{ task: ["storm-explorer"], say: `SPIKE-CHILD-READ ${EVIDENCE}` },
-				{ read: EVIDENCE, afterResult: "Spike0" },
-				{ read: `${EVIDENCE}:1-3` },
-			]),
-			noAnswer,
-		);
-		const readRun = runFiles().at(-1);
-		const childReads = talk.llm.filter(entry => entry.child && entry.decision?.tool === "read").length;
-		const directorResults = talk.llm.filter(entry => !entry.child && !entry.compaction && entry.lastTool !== "");
-		const blockedRead = directorResults.find(entry => entry.lastTool.includes("통째로 읽기를 막았습니다"));
-		const rangedRead = directorResults.find(entry => entry.lastTool.includes("E2E-EVIDENCE-2"));
+		const verdict = ledger.find(agent => agent.role === "reviewer")?.review;
 		check(
-			"감독 읽기: 하위가 읽은 파일 통째 읽기는 막고 읽은 에이전트(agent://)를 알려 줌",
-			childReads >= 1 && blockedRead?.lastTool.includes("agent://Spike0") === true,
-			`childReads=${childReads} reason=${blockedRead?.lastTool.slice(0, 200) ?? "none"}`,
+			"review tally: one failed review, one P1 finding, one doc finding",
+			verdict?.reviews === 1 && verdict.failed === 1 && verdict.findings[1] === 1 && verdict.docFindings === 1,
+			JSON.stringify(verdict),
 		);
-		check(
-			"감독 읽기: 범위를 정한 읽기는 통과",
-			rangedRead !== undefined && !rangedRead.lastTool.includes("막았습니다"),
-			rangedRead?.lastTool.slice(0, 120) ?? directorResults.map(entry => entry.lastTool.slice(0, 80)).join(" | "),
-		);
-		const readSummary = runIndex().find(summary => summary.runId === readRun?.runId);
-		check(
-			"감독 읽기: 실행 기록·색인에 읽기 2·중복 2·막음 1",
-			JSON.stringify(readRun?.reads) === JSON.stringify({ director: 2, duplicate: 2, blocked: 1 }) &&
-				JSON.stringify(readSummary?.reads) === JSON.stringify(readRun?.reads),
-			`run=${JSON.stringify(readRun?.reads)} index=${JSON.stringify(readSummary?.reads)}`,
-		);
-		rmSync(join(PROJECT, "notes"), { recursive: true, force: true });
+		check("the index counts the doc finding", summary?.reviews?.docFindings === 1 && summary.reviews.failed === 1, JSON.stringify(summary?.reviews));
 
-		// B2: older runs whose omp process is gone. Their agents' records go only when the team approved cleanup, and
-		// only for runs on this machine's trusted list (`<store.dir>/runs.jsonl`) whose artifacts dir sits under the
-		// profile's sessions dir beside its `<dir>.jsonl`. Run records seeded only in the repo are never trusted.
-		const SESSIONS = join(AGENT_DIR, "sessions");
+		// The fake LLM logs a hash of the doc rules section each system prompt carries; the sections come from Storm.
+		const variant = (agent: string): string | undefined => {
+			const section = docPromptFor(agent, config);
+			return section === undefined ? undefined : new Bun.CryptoHasher("sha256").update(section).digest("hex").slice(0, 12);
+		};
+		const seen = kids.filter(kid => kid.lastUser.includes("e2e child")).map(kid => kid.docRules?.hash ?? null);
+		const count = (hash: string | undefined) => seen.filter(value => value === hash).length;
+		check("doc rules: nothing in the director's prompt", director.every(entry => entry.docRules === null));
+		check(
+			"doc rules: the writing rules reach only the implementer, the review variant only the reviewer",
+			variant("storm-implementer") !== variant("storm-reviewer") && count(variant("storm-implementer")) === 1 && count(variant("storm-reviewer")) === 1,
+			JSON.stringify(seen),
+		);
+		check("doc rules: omp's own agents (task, scout) get none", seen.filter(value => value === null).length === 2, JSON.stringify(seen));
+
+		const trusted = readJsonl<{ runId: string; artifactsDir: string; agents: string[] }>(files.trustedFile());
+		const entry = trusted.find(line => line.runId === run.runId);
+		check(
+			"the run is on this machine's trusted list (runs.jsonl) with its agents",
+			entry !== undefined && entry.artifactsDir === run.artifactsDir && entry.agents.length === 4,
+			`trusted=${trusted.map(line => line.runId).join(",")} run=${run.runId} artifacts=${run.artifactsDir}`,
+		);
+	});
+
+	await suite.step("the storm tool's four actions", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			let frames = await rpc.turn('E2E-TOOL {"action":"status"}');
+			const offered = mains(llm.all())[0]?.stormTool;
+			check("the tool offers run, plan, status, agents", same(offered?.actions, ["run", "plan", "status", "agents"]), JSON.stringify(offered?.actions));
+			check("its description stays within 900 chars", (offered?.descriptionChars ?? 0) > 0 && (offered?.descriptionChars ?? 0) <= 900, `chars=${offered?.descriptionChars}`);
+			check("status: ok", same(toolOutcomes(frames), [{ action: "status", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
+			frames = await rpc.turn('E2E-TOOL {"action":"agents"}');
+			check("agents: ok", same(toolOutcomes(frames), [{ action: "agents", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
+			frames = await rpc.turn(`E2E-TOOL ${JSON.stringify(plan([{ name: "impl", kind: "code" }]).storm)}`);
+			check("plan outside a run: checked only", same(toolOutcomes(frames), [{ action: "plan", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
+			frames = await rpc.turn('E2E-TOOL {"action":"priority","priority":"cost"}');
+			const bytes = files.configBytes();
+			check("a team change is no tool action", toolOutcomes(frames).every(result => result.isError) && rpc.dialogs.length === 0 && files.configBytes() === bytes, JSON.stringify(toolOutcomes(frames)));
+
+			const before = files.runIds();
+			const from = rpc.frames.length;
+			await rpc.prompt(`E2E-TOOL ${JSON.stringify({ action: "run", task: `E2E-STEPS ${JSON.stringify([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }])}` })}`);
+			const run = await files.finishedRun(before);
+			check("run: queued, and started once the turn settled", toolOutcomes(rpc.frames.slice(from))[0]?.outcome === "queued", JSON.stringify(toolOutcomes(rpc.frames.slice(from))));
+			check("the queued run ran to its end", run.status === "done" && run.mode === "vibe" && run.spawns.some(spawn => spawn.outcome === "routed"), `${run.status} ${JSON.stringify(run.spawns.map(spawn => spawn.outcome))}`);
+		});
+	});
+
+	await suite.step("approval gate on an unapproved config", async () => {
+		// A teammate's edit: fewer parallel agents, no architect.
+		files.editConfig(config => {
+			config.parallelism = 2;
+			delete config.roles.architect;
+			config.disabledRoles = ["architect"];
+		});
+		const bytes = files.configBytes();
+		const approvals = files.approvals().length;
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			let frames = await rpc.turn("E2E-TASK storm-implementer");
+			check("spawns are blocked with unapproved", asyncResults(frames).includes("[storm:unapproved]") && children(llm.all()).length === 0);
+			const from = rpc.frames.length;
+			await rpc.prompt(route({ action: "budget", budgetUsd: 5 }, "cap runs at five dollars"));
+			const said = reports(rpc.frames.slice(from));
+			check(
+				"a change through /storm is rejected without a dialog",
+				rpc.dialogs.length === 0 && said.some(report => report.includes(NEEDS_APPROVAL)) && files.configBytes() === bytes && files.approvals().length === approvals,
+				`dialogs=${rpc.dialogs.length} reports=${said.length}`,
+			);
+			frames = await rpc.turn(`E2E-TOOL ${JSON.stringify(plan([{ name: "check", kind: "review" }], { reviewer: 9 }).storm)}`);
+			check("a plan past the bounds is rejected by the tool", same(toolOutcomes(frames), [{ action: "plan", outcome: "rejected", isError: false }]) && rpc.dialogs.length === 0, JSON.stringify(toolOutcomes(frames)));
+			const runs = files.runs().length;
+			await rpc.prompt("/storm vibe do the work");
+			check("a run does not start", files.runs().length === runs);
+
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			const dialog = rpc.dialogs.at(-1);
+			check(
+				"/storm asks: approve, go back to an earlier approval, set up again, cancel",
+				dialog?.options[0] === APPROVE && dialog.options.includes(LABEL.rollback) && dialog.options.at(-1) === CANCEL && dialog.options.length === 4,
+				JSON.stringify(dialog?.options),
+			);
+			check("approve records the file as it is", files.configBytes() === bytes && files.approvals().length === approvals + 1, `approvals=${files.approvals().length}`);
+			await rpc.turn("E2E-TASK storm-implementer");
+			check("spawns run again", children(llm.all()).length === 1, `children=${children(llm.all()).length}`);
+		});
+	});
+
+	await suite.step("spawn enforcement codes", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			let from = rpc.frames.length;
+			const run = await runOf(
+				rpc,
+				vibe([
+					{ task: ["storm-explorer"], as: "Early" },
+					// omp decides the spawn in the background after task returns: submit the plan only once it was refused.
+					{
+						...plan(
+							[
+								{ name: "scope", kind: "explore" },
+								{ name: "impl", kind: "code" },
+							],
+							{ explorer: 3, implementer: 1 },
+						),
+						after: "[storm:no-plan]",
+					},
+					{ task: ["storm-implementer", "storm-implementer"], as: "Impl" },
+					{ task: ["storm-explorer", "storm-explorer", "storm-explorer"], as: "Exp" },
+					{ task: ["storm-architect"], as: "Arch" },
+					{ task: ["storm-reviewer"], as: "Rev" },
+				]),
+			);
+			const codes = blockCodes(run);
+			const results = asyncResults(rpc.frames.slice(from));
+			const detail = JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.outcome, spawn.code]));
+			const blocked = (key: string) => run.spawns.find(spawn => spawn.spawnKey === key)?.code;
+			check("no plan yet: no-plan", blocked("Early0") === "no-plan" && results.includes("[storm:no-plan]"), detail);
+			check("past the plan's workers for the role: role-cap", blocked("Impl1") === "role-cap" && results.includes("[storm:role-cap]"), detail);
+			check("past the team's parallelism (2): parallelism", codes.includes("parallelism") && results.includes("[storm:parallelism]"), detail);
+			check("a role the team does not use: disabled-role", blocked("Arch0") === "disabled-role" && results.includes("[storm:disabled-role]"), detail);
+			check("a role without a lane: role-not-in-plan", blocked("Rev0") === "role-not-in-plan" && results.includes("[storm:role-not-in-plan]"), detail);
+			check("every blocked spawn has a code", run.spawns.filter(spawn => spawn.outcome === "blocked").every(spawn => spawn.code !== undefined), detail);
+			check("the allowed ones ran", run.spawns.filter(spawn => spawn.outcome === "routed").length >= 2 && children(llm.all()).length >= 2, detail);
+
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt(route({ action: "budget", budgetUsd: 0.0001 }, "cap each run"));
+			check("a budget is set through the approval dialog", files.config().budget?.perRunUsd === 0.0001, JSON.stringify(files.config().budget));
+			const kids = children(llm.all()).length;
+			from = rpc.frames.length;
+			const capped = await runOf(rpc, vibe([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"], as: "Late" }]));
+			check(
+				"past the run budget: budget",
+				same(blockCodes(capped), ["budget"]) && asyncResults(rpc.frames.slice(from)).includes("[storm:budget]") && children(llm.all()).length === kids,
+				JSON.stringify(capped.spawns.map(spawn => [spawn.outcome, spawn.code])),
+			);
+			check("the run ends as budget-exceeded", capped.status === "budget-exceeded" && capped.costUsd >= 0.0001, `${capped.status} cost=${capped.costUsd}`);
+			await rpc.prompt(route({ action: "budget", budgetUsd: 0 }, "drop the cap"));
+			check("budget 0 removes it", files.config().budget === undefined, JSON.stringify(files.config().budget));
+		});
+	});
+
+	await suite.step("director: edit block, read policy, follow-ups", async () => {
+		const notes = join(env.project, "notes");
+		mkdirSync(notes, { recursive: true });
+		const lines = (count: number, line: (n: number) => string) => `${Array.from({ length: count }, (_, n) => line(n + 1)).join("\n")}\n`;
+		// Past 16 KiB each: a code file omp folds, and prose it returns verbatim.
+		writeFileSync(join(notes, "big.ts"), lines(700, n => `export const value${n} = "e2e evidence line ${n}";`));
+		writeFileSync(join(notes, "big.txt"), lines(700, n => `E2E-EVIDENCE-${n} ${"x".repeat(24)}`));
+		writeFileSync(join(notes, "small.txt"), lines(5, n => `E2E-SMALL-${n}`));
+		writeFileSync(join(notes, "other.txt"), lines(5, n => `E2E-OTHER-${n}`));
+		const directed = join(env.project, "director-check.txt");
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			const run = await runOf(
+				rpc,
+				vibe([
+					plan([{ name: "scope", kind: "explore" }]),
+					{ task: ["storm-explorer"], as: "Reader", say: "E2E-CHILD-READ notes/big.ts,notes/big.txt,notes/small.txt" },
+					{ edit: "director-check.txt", afterResult: "Reader0" },
+					{ read: "notes/big.ts" },
+					{ read: "notes/big.txt" },
+					{ read: "notes/big.txt:1-500" },
+					{ read: "notes/big.txt:1-10" },
+					{ read: "notes/small.txt" },
+					{ read: "notes/other.txt" },
+					{ followUp: "agent://Reader0" },
+					{ followUp: "agent://Reader0" },
+				]),
+			);
+			const results = mains(llm.all()).map(entry => entry.lastTool);
+			const answerTo = (index: number) => results[index + 1] ?? "";
+			const director = mains(llm.all());
+			const resultOf = (path: string) => answerTo(director.findIndex(entry => entry.decision.tool === "read" && entry.decision.args?.path === path));
+			check("the director's file write is blocked with director-edit", !existsSync(directed) && run.blockedEdits === 1 && results.some(result => result.includes("[storm:director-edit]")), `blockedEdits=${run.blockedEdits}`);
+			check("a bare read of a large code file passes", resultOf("notes/big.ts") !== "" && !resultOf("notes/big.ts").includes("[storm:"), resultOf("notes/big.ts").slice(0, 80));
+			check("a bare read of large prose passes too (omp pages it)", resultOf("notes/big.txt").includes("E2E-EVIDENCE-2") && !resultOf("notes/big.txt").includes("[storm:"), resultOf("notes/big.txt").slice(0, 120));
+			const refused = resultOf("notes/big.txt:1-500");
+			check("a 500-line range is refused with read-large, naming the agent that read it", refused.includes("[storm:read-large]") && refused.includes("agent://Reader0"), refused.slice(0, 120));
+			check("a 10-line range passes", resultOf("notes/big.txt:1-10").includes("E2E-EVIDENCE-2") && !resultOf("notes/big.txt:1-10").includes("[storm:"));
+			check("a small file passes whole", resultOf("notes/small.txt").includes("E2E-SMALL-5") && !resultOf("notes/small.txt").includes("[storm:"));
+			const reads = run.reads;
+			check(
+				"the run record counts reads: 5 returned, 1 blocked, shared chars below the total",
+				reads?.director === 5 && reads.blocked === 1 && reads.directorChars > 0 && reads.duplicateChars > 0 && reads.duplicateChars < reads.directorChars,
+				JSON.stringify(reads),
+			);
+			check("the index carries the same numbers", same(files.index().find(line => line.runId === run.runId)?.reads, reads), JSON.stringify(files.index().find(line => line.runId === run.runId)?.reads));
+
+			const writes = rpc.frames.filter(frame => frame.type === "tool_execution_start" && frame.toolName === "write" && frame.args?.path === "agent://Reader0");
+			const ok = writes.filter(start => rpc.frames.some(end => end.type === "tool_execution_end" && end.toolCallId === start.toolCallId && end.isError !== true)).length;
+			const reader = run.agents?.find(agent => agent.id === "Reader0");
+			check("follow-ups counted equal the writes delivered", ok === 2 && reader?.followUps === ok && (run.blockedFollowUps ?? 0) === 0, `delivered=${ok} followUps=${reader?.followUps}`);
+		});
+		rmSync(notes, { recursive: true, force: true });
+	});
+
+	await suite.step("shadowing role definition", async () => {
+		const agents = join(env.project, ".omp", "agents");
+		mkdirSync(agents, { recursive: true });
+		writeFileSync(join(agents, "storm-implementer.md"), "---\nname: storm-implementer\ndescription: shadow\n---\nSTORM-ROLE shadow. Reply with OK.\n");
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			const frames = await rpc.turn("E2E-TASK storm-implementer");
+			check("an unapproved definition blocks the role with shadow", asyncResults(frames).includes("[storm:shadow]") && children(llm.all()).length === 0);
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			check("/storm asks to approve it", rpc.dialogs.at(-1)?.options[0] === APPROVE, JSON.stringify(rpc.dialogs.at(-1)?.options));
+			await rpc.turn("E2E-TASK storm-implementer");
+			check("approved, the role runs the shadowing definition", children(llm.all()).some(kid => kid.roles.includes("shadow")));
+		});
+		rmSync(agents, { recursive: true, force: true });
+	});
+
+	await suite.step("quota marks", async () => {
+		const marksFile = join(files.stateDir, "quota-marks.json");
+		const marks = (): Array<{ provider: string; source: string }> => (existsSync(marksFile) ? (JSON.parse(readFileSync(marksFile, "utf8")) as { marks: Array<{ provider: string; source: string }> }).marks : []);
+		const models = files.config().roles.implementer?.models ?? [];
+		const provider = (entry: string | undefined) => entry?.split("/")[0];
+		const fallback = models.find(model => provider(model) !== provider(models[0]));
+		if (!fallback) return suite.skip("quota mark routes to the other provider", `the implementer has no fallback on another provider (${models.join(", ")})`);
+		const bytes = files.configBytes();
+		let llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			// Typed in another case than the team's models spell it.
+			const request = route({ action: "quota", provider: provider(models[0])?.toUpperCase() }, "that provider ran out");
+			await rpc.prompt(request);
+			check("a classified quota mark asks first; cancel marks nothing", same(rpc.dialogs.at(-1)?.options, [QUOTA_CHOICE.mark, QUOTA_CHOICE.cancel]) && marks().length === 0, JSON.stringify(rpc.dialogs.at(-1)));
+			rpc.answer = choose(QUOTA_CHOICE.mark);
+			await rpc.prompt(request);
+			check(
+				"a quota mark needs no approval",
+				rpc.dialogs.every(dialog => !dialog.options.includes(APPROVE)) && files.configBytes() === bytes && marks().some(mark => mark.provider === provider(models[0]) && mark.source === "user"),
+				JSON.stringify(marks()),
+			);
+			await rpc.turn("E2E-TASK storm-implementer");
+			check("the role runs on its fallback on another provider", children(llm.all())[0]?.model === modelId(fallback), `child=${children(llm.all())[0]?.model} expected=${modelId(fallback)}`);
+		});
+		rmSync(marksFile, { force: true });
+
+		// omp itself leaves a model after provider errors: Storm marks that provider (source "fallback") and says so, with no approval.
+		writeFileSync(MODELS_FILE, modelsYml(env.port, { ...PROVIDERS, ...QUOTA_OUT }));
+		writeFileSync(PROFILE_FILE, FALLBACK_CONFIG);
+		llm = new LlmCursor(env);
+		try {
+			await session(
+				cancelAll,
+				async rpc => {
+					await rpc.turn("hello");
+					// omp announces the fallback while the turn goes on; Storm's handler writes the mark and notifies.
+					await suite.eventually("omp's own fallback marks the provider", () => marks().some(mark => mark.provider === "fake3" && mark.source === "fallback") && files.configBytes() === bytes, () => JSON.stringify(marks()));
+					await suite.eventually("and the user is told", () => rpc.notices().some(([level, message]) => level === "warning" && message.includes("fake3")), () => JSON.stringify(rpc.notices().map(([level]) => level)));
+				},
+				{ model: "fake3/quota-out" },
+			);
+		} finally {
+			writeFileSync(MODELS_FILE, modelsYml(env.port, PROVIDERS));
+			writeFileSync(PROFILE_FILE, PROFILE_CONFIG);
+		}
+		rmSync(marksFile, { force: true });
+	});
+
+	await suite.step("trial routing", async () => {
+		const primary = files.config().roles.implementer?.models[0];
+		const candidate = "fake/premium-c";
+		const llm = new LlmCursor(env);
+		await session(choose(APPROVE), async rpc => {
+			await rpc.prompt(route({ action: "trial", role: "implementer", model: candidate, share: 0.5, maxSpawns: 1, days: 1, budgetUsd: 1 }, "try the premium model"));
+			check("a trial is added through the approval dialog", files.config().trials?.length === 1, JSON.stringify(files.config().trials));
+			for (let i = 0; i < 3; i++) await rpc.turn("E2E-TASK storm-implementer");
+			const routed = children(llm.all()).map(kid => kid.model);
+			check("spawns follow the share and the spawn limit", same(routed, [modelId(primary), modelId(candidate), modelId(primary)]), `${routed.join(",")} expected=${modelId(primary)},${modelId(candidate)},${modelId(primary)}`);
+			rpc.answer = choose(LABEL.keepModel);
+			await rpc.prompt("/storm");
+			const asked = rpc.dialogs.find(dialog => dialog.options.includes(LABEL.keepModel));
+			check("the ended trial is decided in one dialog with three options", asked?.options.length === 3, JSON.stringify(asked?.options));
+			check("keeping the current model removes the trial without a second dialog", !files.config().trials?.length && rpc.dialogs.filter(dialog => dialog.options.includes(APPROVE)).length === 1, JSON.stringify(files.config().trials));
+		});
+	});
+
+	await suite.step("follow-up cap and the fresh-agent handoff", async () => {
+		// A subagent at or past its context cap takes no follow-ups during a run: the director starts a fresh one.
+		const dialogs = await editAndApprove(config => {
+			config.contextCap = 50;
+		});
+		check("the tiny cap is approved through /storm", dialogs.at(-1)?.answer === APPROVE && files.config().contextCap === 50, JSON.stringify(dialogs.at(-1)));
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			const run = await runOf(
+				rpc,
+				vibe([
+					plan([{ name: "impl", kind: "code" }]),
+					{ task: ["storm-implementer"], as: "Cap" },
+					{ followUp: "agent://Cap0" },
+					{ task: ["storm-implementer"], as: "Fresh", say: "E2E-CHILD-READ agent://Cap0" },
+				]),
+			);
+			const reason = mains(llm.all()).find(entry => entry.lastTool.includes("[storm:followup-cap]"))?.lastTool ?? "";
+			const capped = run.agents?.find(agent => agent.id === "Cap0");
+			check("the follow-up is refused with followup-cap", reason !== "" && run.blockedFollowUps === 1 && capped?.followUps === 0, `blockedFollowUps=${run.blockedFollowUps} followUps=${capped?.followUps}`);
+			check("the reason names the agent's result and the agent to start", reason.includes("agent://Cap0") && reason.includes("storm-implementer"), reason.slice(0, 200));
+			const fresh = children(llm.all()).filter(kid => kid.lastUser.includes("E2E-CHILD-READ"));
+			const readBack = fresh.find(kid => kid.lastTool !== "");
+			check(
+				"a fresh agent reads the capped agent's result and finishes",
+				fresh.some(kid => kid.decision.tool === "read" && kid.decision.args?.path === "agent://Cap0") && readBack !== undefined && !readBack.lastTool.includes("[storm:") && run.agents?.some(agent => agent.id === "Fresh0") === true,
+				`${readBack?.lastTool.slice(0, 120)} agents=${run.agents?.map(agent => agent.id).join(",")}`,
+			);
+		});
+	});
+
+	await suite.step("mid-run compaction keeps Storm's ledger", async () => {
+		// Past its cap, the director is compacted while it waits on an async child. omp keeps the last 20k tokens
+		// verbatim by default, so this tiny session would have nothing to summarize: the profile keeps almost nothing
+		// for this one run.
+		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}compaction:\n  keepRecentTokens: 100\n`);
+		const llm = new LlmCursor(env);
+		try {
+			// The fake LLM orders the two sessions: the director's last reply goes out once the child has made its first
+			// request (Storm's ledger knows it by then), and the child's reply once the director was compacted.
+			const steps: Step[] = [plan([{ name: "ckpt", kind: "code" }]), { task: ["storm-implementer"], as: "Ck", say: "E2E-CHILD-HOLD" }, { awaitChild: true }];
+			const run = await session(cancelAll, rpc => runOf(rpc, vibe(steps)));
+			const compactions = llm.of("compaction");
+			const ledger = compactions.find(entry => entry.compactionContext.includes(run.runId) && entry.compactionContext.includes("ckpt") && entry.compactionContext.includes("agent://Ck0"));
+			check("the compaction request carries the run, its lanes and agent:// handles", ledger !== undefined, `compactions=${compactions.length} context=${(compactions[0]?.compactionContext ?? "").slice(0, 300).replace(/\s+/g, " ")}`);
+			check("the run record has one checkpoint with its size before", run.checkpoints?.length === 1 && (run.checkpoints[0]?.before ?? 0) > 0, JSON.stringify(run.checkpoints));
+			check("the index counts it", files.index().find(line => line.runId === run.runId)?.checkpoints === 1);
+		} finally {
+			writeFileSync(PROFILE_FILE, PROFILE_CONFIG);
+		}
+	});
+
+	await suite.step("janitor and doc rules off", async () => {
+		// Older runs whose omp process is gone. Their agents' records go only when the team approved cleanup, and only
+		// for runs on this machine's trusted list whose artifacts dir sits under the profile's sessions dir beside its
+		// `<dir>.jsonl`. Run records seeded only in the repo are never trusted.
+		const trustedFile = files.trustedFile();
+		type Trusted = { runId: string; cleaned?: string[] };
+		const real = readJsonl<Trusted>(trustedFile);
+		check("a real run is on the trusted list before any seeding", routedRunId !== undefined && real.some(line => line.runId === routedRunId), `trusted=${real.map(line => line.runId).join(",")}`);
+
+		const sessions = join(env.agentDir, "sessions");
 		/** A pid above every pid_max: never alive (pid 1 is, and EPERM counts as alive). */
 		const DEAD_PROCESS = "99999999:1";
-		const approvalsBase = join(AGENT_DIR, "storm", "approvals");
-		const storeDir = join(approvalsBase, readdirSync(approvalsBase)[0] ?? "missing");
-		const trustedFile = join(storeDir, "runs.jsonl");
 		type Seed = { runId: string; agent: string; at: number; dir: string };
-		const seedOf = (group: string, runId: string, agent: string, at: number): Seed => ({ runId, agent, at, dir: join(SESSIONS, group, runId) });
+		const seedOf = (group: string, runId: string, agent: string, at: number): Seed => ({ runId, agent, at, dir: join(sessions, group, runId) });
 		const seeds = [1, 2, 3, 4].map(n => seedOf("e2e-seed", `run-20000101-00000${n}-e2e0`, `Seed${n}`, Date.UTC(2000, 0, 1, 0, 0, n)));
 		const rogues = [1, 2].map(n => seedOf("e2e-rogue", `run-19990101-00000${n}-e2e0`, `Rogue${n}`, Date.UTC(1999, 0, 1, 0, 0, n)));
-		const seedRecords = (seed: Seed): string[] =>
-			[`${seed.agent}.jsonl`, `${seed.agent}.json`, join(seed.agent, `${seed.agent}.Sub.jsonl`)].map(file => join(seed.dir, file));
-		const seedOutputs = (seed: Seed): string[] => [`${seed.agent}.md`, join(seed.agent, `${seed.agent}.Sub.md`)].map(file => join(seed.dir, file));
-		mkdirSync(join(stateDir, "runs"), { recursive: true });
+		const records = (seed: Seed): string[] => [`${seed.agent}.jsonl`, `${seed.agent}.json`, join(seed.agent, `${seed.agent}.Sub.jsonl`)].map(file => join(seed.dir, file));
+		const outputs = (seed: Seed): string[] => [`${seed.agent}.md`, join(seed.agent, `${seed.agent}.Sub.md`)].map(file => join(seed.dir, file));
+		mkdirSync(join(files.stateDir, "runs"), { recursive: true });
 		for (const seed of [...seeds, ...rogues]) {
 			mkdirSync(join(seed.dir, seed.agent), { recursive: true });
 			writeFileSync(`${seed.dir}.jsonl`, "{}\n");
-			for (const file of [...seedRecords(seed), ...seedOutputs(seed)]) writeFileSync(file, "seed\n");
+			for (const file of [...records(seed), ...outputs(seed)]) writeFileSync(file, "seed\n");
 			const iso = new Date(seed.at).toISOString();
-			const record = {
+			const record: RunRecord = {
 				schema: "storm.run/v1",
 				runId: seed.runId,
 				configHash: "jcs-sha256:e2e-seed",
-				approvalId: "e2e-seed",
 				startedAt: iso,
 				endedAt: iso,
 				status: "done",
-				contract: "workflowz",
 				task: "E2E seed",
 				costUsd: 0,
 				costByModel: {},
@@ -746,324 +677,163 @@ async function main(): Promise<void> {
 				artifactsDir: seed.dir,
 				process: DEAD_PROCESS,
 				agents: [
-					{
-						id: seed.agent,
-						name: "storm-implementer",
-						role: "implementer",
-						runId: seed.runId,
-						model: "fake/general-b",
-						state: "parked",
-						startedAt: seed.at,
-						lastActivityAt: seed.at,
-						contextTokens: 100,
-						requests: 1,
-						costUsd: 0,
-						followUps: 0,
-					},
+					{ id: seed.agent, name: "storm-implementer", role: "implementer", runId: seed.runId, model: "fake/general-b", state: "parked", startedAt: seed.at, lastActivityAt: seed.at, contextTokens: 100, requests: 1, costUsd: 0, followUps: 0 },
 				],
 			};
-			writeFileSync(join(stateDir, "runs", `${seed.runId}.json`), `${JSON.stringify(record, null, 2)}\n`);
+			writeFileSync(join(files.stateDir, "runs", `${seed.runId}.json`), `${JSON.stringify(record, null, 2)}\n`);
 		}
 		// Trusted list: oldest first, so the seeds go before whatever the earlier runs recorded.
-		const trustedSeeds = seeds.map(seed =>
-			JSON.stringify({ runId: seed.runId, artifactsDir: seed.dir, process: DEAD_PROCESS, agents: [seed.agent], endedAt: new Date(seed.at).toISOString() }),
-		);
-		const trustedBefore = existsSync(trustedFile) ? readFileSync(trustedFile, "utf8").split("\n").filter(Boolean) : [];
-		writeFileSync(trustedFile, `${[...trustedSeeds, ...trustedBefore].join("\n")}\n`);
-		const seedRun = (runId: string): StoredRun | undefined => runFiles().find(stored => stored.runId === runId);
-		const present = (files: string[]): boolean[] => files.map(file => existsSync(file));
-		const cheapRun = runTask([planStep([{ name: "impl", kind: "code" }])]);
-		const allSeedFiles = [...seeds, ...rogues].flatMap(seed => [...seedRecords(seed), ...seedOutputs(seed)]);
-		const rogueFiles = rogues.flatMap(seed => [...seedRecords(seed), ...seedOutputs(seed)]);
+		const trustedSeeds = seeds.map(seed => JSON.stringify({ runId: seed.runId, artifactsDir: seed.dir, process: DEAD_PROCESS, agents: [seed.agent], endedAt: new Date(seed.at).toISOString() }));
+		writeFileSync(trustedFile, `${[...trustedSeeds, ...real.map(line => JSON.stringify(line))].join("\n")}\n`);
+		const present = (paths: string[]): number => paths.filter(path => existsSync(path)).length;
+		const seedFiles = [...seeds, ...rogues].flatMap(seed => [...records(seed), ...outputs(seed)]);
+		const rogueFiles = rogues.flatMap(seed => [...records(seed), ...outputs(seed)]);
+		const [oldest] = seeds;
+		if (!oldest) throw new Error("no seed");
 
-		// Cleanup absent (and docs off, D1/D3): nothing of the seeded agents is removed.
-		const keepAll = readConfig();
-		delete keepAll.cleanup;
-		keepAll.docs = false;
-		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: keepAll, rationale: "E2E" })}`, choose("승인"));
-		team = readConfig();
-		run = await spawn(["storm-implementer"]);
-		check(
-			"문서 정합(끔): docs:false 를 승인하면 storm 역할 시스템 프롬프트에 문서 규칙 없음",
-			team.docs === false && run.children.length === 1 && run.children[0]?.docRules === false,
-			`docs=${team.docs} children=${run.children.length} docRules=${run.children[0]?.docRules}`,
-		);
-		await converse(cheapRun, noAnswer);
-		const keptRun = runFiles().at(-1);
-		check(
-			"실행 정리(끔): cleanup 이 없으면 이전 실행 하위 기록을 지우지 않음",
-			team.cleanup === undefined &&
-				present(allSeedFiles).every(Boolean) &&
-				seeds.every(seed => seedRun(seed.runId)?.agents?.[0]?.cleanedAt === undefined) &&
-				!keptRun?.cleanup?.agents,
-			`cleanup=${team.cleanup} present=${present(allSeedFiles).filter(Boolean).length}/${allSeedFiles.length} live=${JSON.stringify(keptRun?.cleanup)}`,
-		);
-
-		// Cleanup approved (start and end config): the run end removes the trusted older runs' agents' records, keeps
-		// every output (.md), and leaves runs that are only in the repo alone.
-		const cleanAll = readConfig();
-		cleanAll.cleanup = true;
-		delete cleanAll.docs;
-		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: cleanAll, rationale: "E2E" })}`, choose("승인"));
-		team = readConfig();
-		talk = await converse(cheapRun, noAnswer);
-		const cleanRun = runFiles().at(-1);
-		const oldest = seeds[0];
-		const oldestRun = oldest ? seedRun(oldest.runId) : undefined;
-		check(
-			"실행 정리(켬): 가장 오래된 신뢰 실행 에이전트의 기록(.jsonl·.json·하위 .jsonl)만 지우고 .md 는 남김",
-			team.cleanup === true &&
-				oldest !== undefined &&
-				present(seedRecords(oldest)).every(exists => !exists) &&
-				present(seedOutputs(oldest)).every(Boolean),
-			oldest ? `records=${present(seedRecords(oldest)).join(",")} outputs=${present(seedOutputs(oldest)).join(",")}` : "no seed",
-		);
-		check(
-			"실행 정리(켬): 저장소에만 있는 실행 기록은 신뢰하지 않아 아무것도 지우지 않음",
-			present(rogueFiles).every(Boolean) && rogues.every(seed => seedRun(seed.runId)?.agents?.[0]?.cleanedAt === undefined),
-			`present=${present(rogueFiles).filter(Boolean).length}/${rogueFiles.length}`,
-		);
-		const trustedOldest = (existsSync(trustedFile) ? readFileSync(trustedFile, "utf8").split("\n").filter(Boolean) : [])
-			.map(line => JSON.parse(line) as { runId: string; cleaned?: string[] })
-			.find(entry => entry.runId === oldest?.runId);
-		check(
-			"실행 정리(켬): 신뢰 목록·실행 기록에 정리 표시, 이번 실행 기록에 cleanup.agents",
-			trustedOldest?.cleaned?.includes(oldest?.agent ?? "") === true &&
-				oldestRun?.agents?.[0]?.cleanedAt !== undefined &&
-				(cleanRun?.cleanup?.agents ?? 0) >= 1,
-			`trusted=${JSON.stringify(trustedOldest?.cleaned)} cleanedAt=${oldestRun?.agents?.[0]?.cleanedAt} cleanup=${JSON.stringify(cleanRun?.cleanup)}`,
-		);
-		check("실행 정리(켬): 결과 보고에 정리 한 줄", talk.frames.some(frame => textOf(frame).includes("정리: 이전 실행 하위 기록")));
-		// B3: the hub panel shows what Storm keeps on disk and the last cleanup.
-		frames = await command("/storm", noAnswer);
-		const storageLine = frames.map(textOf).find(text => text.includes("저장: Storm 데이터"));
-		check(
-			"허브: 저장 데이터 한 줄(Storm 데이터·남은 omp 기록·마지막 정리)",
-			storageLine?.includes("남은 omp 기록") === true && storageLine.includes("마지막 정리"),
-			storageLine?.match(/저장: Storm 데이터[^"\\]*/)?.[0] ?? "no storage line",
-		);
-
-		let hash = configHashOnDisk();
-		let approvals = approvalFiles().length;
-		const priorityRequest = '/storm STORM-TOOL {"action":"priority","priority":"cost"}';
-		talk = await converse(priorityRequest, choose("취소"));
-		check("자연어 변경: 승인 창 표시", uiTitled(talk.frames, "이 변경을 승인할까요"));
-		check("자연어 변경: 취소하면 그대로", configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 0);
-		await converse(priorityRequest, choose("승인"));
-		team = readConfig();
-		check("자연어 변경: 승인하면 적용", team.priority === "cost" && approvalFiles().length === approvals + 1, `priority=${team.priority}`);
-
-		hash = configHashOnDisk();
-		approvals = approvalFiles().length;
-		await converse('/storm STORM-TOOL {"action":"workers","role":"reviewer","min":1,"max":3}', noAnswer, { flags: ["--no-ui"] });
-		check(
-			"UI 없음: 제안만 보류",
-			configHashOnDisk() === hash && approvalFiles().length === approvals && proposalFiles().length === 1,
-			`proposals=${proposalFiles().length}`,
-		);
-		await command("/storm", request => {
-			const options = (request.options as string[] | undefined) ?? [];
-			if (request.title === "Storm 메뉴") return options.find(option => option.startsWith("보류 제안 승인"));
-			if (String(request.title).startsWith("보류 중인 변경 제안")) return options[0];
-			return options.includes("승인") ? "승인" : undefined;
-		});
-		team = readConfig();
-		const reviewerWorkers = team.roles.reviewer?.workers;
-		check(
-			"메뉴: 보류 제안 승인",
-			typeof reviewerWorkers === "object" && reviewerWorkers.min === 1 && reviewerWorkers.max === 3 && proposalFiles().length === 0,
-			`workers=${JSON.stringify(reviewerWorkers)}`,
-		);
-
-		const implementerModels = team.roles.implementer?.models ?? [];
-		const fallback = implementerModels.find(model => providerOf(model) !== providerOf(implementerModels[0]));
-		if (fallback) {
-			hash = configHashOnDisk();
-			await converse(`/storm STORM-TOOL {"action":"quota","provider":"${providerOf(implementerModels[0])}"}`, noAnswer);
-			check("쿼터 대응: 승인 없이 표시만", configHashOnDisk() === hash && existsSync(join(stateDir, "quota-marks.json")));
-			run = await spawn(["storm-implementer"]);
-			check("쿼터 대응: 다른 Provider 폴백으로", run.children[0]?.model === idOf(fallback), `child=${run.children[0]?.model} expected=${idOf(fallback)}`);
-			rmSync(join(stateDir, "quota-marks.json"), { force: true });
-		} else console.log(`SKIP 쿼터 대응: 구현 역할의 폴백이 다른 Provider에 없음 (${implementerModels.join(", ")})`);
-
-		// omp itself leaves a model after provider errors: Storm marks that provider (source "fallback") and says so, with no approval.
-		hash = configHashOnDisk();
-		writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml(true));
-		writeFileSync(join(AGENT_DIR, "config.yml"), FALLBACK_CONFIG);
-		try {
-			talk = await converse("hello", noAnswer, { model: "fake3/quota-out" });
-		} finally {
-			writeFileSync(join(AGENT_DIR, "models.yml"), modelsYml());
-			writeFileSync(join(AGENT_DIR, "config.yml"), PROFILE_CONFIG);
-		}
-		const marksFile = join(stateDir, "quota-marks.json");
-		const marks = existsSync(marksFile) ? (JSON.parse(readFileSync(marksFile, "utf8")) as { marks: Array<{ provider: string; source: string }> }).marks : [];
-		check(
-			"자동 쿼터 표시: omp 폴백이면 Provider 표시(승인 없이)",
-			marks.some(mark => mark.provider === "fake3" && mark.source === "fallback") && configHashOnDisk() === hash,
-			JSON.stringify(marks),
-		);
-		check("자동 쿼터 표시: 알림", talk.frames.some(frame => textOf(frame).includes("fake3 를 5시간 동안 쿼터 소진으로 표시")));
-		rmSync(marksFile, { force: true });
-
-		primary = team.roles.implementer?.models[0];
-		const candidate = ["fake/general-b", "fake2/general-e", "fake/cheap-a"].find(model => model !== bare(primary)) ?? "fake/general-b";
-		await converse(
-			`/storm STORM-TOOL {"action":"trial","role":"implementer","model":"${candidate}","share":0.5,"maxSpawns":1,"days":1,"budgetUsd":1}`,
-			choose("승인"),
-		);
-		team = readConfig();
-		check("시험 사용: 승인 후 설정에 추가", (team.trials?.length ?? 0) === 1);
-		const routedTo: Array<string | undefined> = [];
-		for (let i = 0; i < 3; i++) routedTo.push((await spawn(["storm-implementer"])).children[0]?.model);
-		check(
-			"시험 사용: 비율·횟수대로 라우팅",
-			routedTo.join(",") === [idOf(primary), idOf(candidate), idOf(primary)].join(","),
-			`${routedTo.join(",")} expected=${idOf(primary)},${idOf(candidate)},${idOf(primary)}`,
-		);
-		frames = await command("/storm", request => (String(request.title).startsWith("시험 사용이 끝났습니다") ? "나중에" : undefined));
-		check("시험 사용: 끝나면 교체 여부 질문", uiTitled(frames, "시험 사용이 끝났습니다"));
-
-		await converse('/storm STORM-TOOL {"action":"budget","budgetUsd":0.0005}', choose("승인"));
-		team = readConfig();
-		check("예산: 승인 후 설정", team.budget?.perRunUsd === 0.0005, JSON.stringify(team.budget));
-		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }]), noAnswer, {
-			model: OUTSIDER,
-		});
-		const budgetRun = runFiles().at(-1);
-		check(
-			"예산: 넘으면 새 스폰 차단",
-			talk.frames.some(frame => textOf(frame).includes("Storm 실행 예산")) && !talk.llm.some(entry => entry.child),
-			`children=${talk.llm.filter(entry => entry.child).length}`,
-		);
-		check("예산: 실행 기록", budgetRun?.status === "budget-exceeded", `status=${budgetRun?.status}`);
-
-		// A role set to "사용 안 함" is refused; a role missing from the config borrows its nearest stand-in's models.
-		const trimmed = readConfig();
-		const implementerPrimary = trimmed.roles.implementer?.models[0];
-		delete trimmed.roles.reviewer;
-		delete trimmed.roles.quick;
-		trimmed.disabledRoles = ["reviewer"];
-		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: trimmed, rationale: "E2E" })}`, choose("승인"));
-		team = readConfig();
-		check(
-			"사용 안 함: 승인 후 설정",
-			team.disabledRoles?.includes("reviewer") === true && team.roles.reviewer === undefined,
-			JSON.stringify(team.disabledRoles),
-		);
-		run = await spawn(["storm-reviewer"]);
-		check("사용 안 함: 그 역할 스폰은 막힘", run.results.includes("사용 안 함") && run.children.length === 0, run.results.slice(0, 200));
-		run = await spawn(["storm-quick"]);
-		check(
-			"설정에 없는 역할: 가까운 역할(구현) 모델로",
-			run.children[0]?.model === idOf(implementerPrimary),
-			`child=${run.children[0]?.model} expected=${idOf(implementerPrimary)}`,
-		);
-
-		// An agent at or past its context cap takes no follow-ups during a run: the director must start a fresh one.
-		const capped = readConfig();
-		capped.contextCap = 50;
-		delete capped.budget;
-		await converse(`/storm STORM-TOOL ${JSON.stringify({ action: "propose", config: capped, rationale: "E2E" })}`, choose("승인"));
-
-		// A2: past its cap, the director is compacted while it waits on an async child, and the compaction request carries
-		// Storm's ledger. omp keeps the last 20k tokens verbatim by default, so this tiny session would have nothing to
-		// summarize: the profile keeps almost nothing for this one run. The child's first reply waits so the turn ends first.
-		writeFileSync(join(AGENT_DIR, "config.yml"), `${PROFILE_CONFIG}compaction:\n  keepRecentTokens: 100\n`);
-		try {
-			// `wait` holds the director's reply after the spawn ~1 s, as a real model's would take: by then the child has
-			// started its first turn and Storm's ledger knows it.
-			talk = await converse(
-				runTask([planStep([{ name: "ckpt", kind: "code" }]), { task: ["storm-implementer"], say: "SPIKE-CHILD-SLOW" }, { wait: 1_000 }]),
-				noAnswer,
+		const llm = new LlmCursor(env);
+		await session(choose(APPROVE), async rpc => {
+			await rpc.prompt(route({ action: "settings", cleanup: false, docs: false }, "keep records, no doc rules"));
+			check("cleanup and doc rules are switched off through the approval dialog", files.config().cleanup !== true && files.config().docs === false, JSON.stringify([files.config().cleanup, files.config().docs]));
+			await rpc.turn("E2E-TASK storm-implementer");
+			const kid = children(llm.all()).at(-1);
+			check("docs off: no doc rules in a role's prompt", kid !== undefined && kid.docRules === null, JSON.stringify(kid?.docRules));
+			const kept = await runOf(rpc, CHEAP_RUN);
+			check(
+				"cleanup off: a run end deletes nothing",
+				present(seedFiles) === seedFiles.length && !kept.cleanup?.agents && seeds.every(seed => files.run(seed.runId)?.agents?.[0]?.cleanedAt === undefined),
+				`present=${present(seedFiles)}/${seedFiles.length} cleanup=${JSON.stringify(kept.cleanup)}`,
 			);
-		} finally {
-			writeFileSync(join(AGENT_DIR, "config.yml"), PROFILE_CONFIG);
-		}
-		const checkpointRun = runFiles().at(-1);
-		const compactions = talk.llm.filter(entry => entry.compaction);
-		const ledgerContext = compactions.find(
-			entry => entry.compactionContext.includes("Storm 실행") && entry.compactionContext.includes("- ckpt (") && entry.compactionContext.includes("agent://Spike0 —"),
-		);
-		check(
-			"감독 압축: 상한 넘은 감독이 하위를 기다릴 때 압축, 요청에 레인·agent:// 장부",
-			ledgerContext !== undefined,
-			`compactions=${compactions.length} context=${(compactions[0]?.compactionContext ?? "").slice(0, 400).replace(/\s+/g, " ")}`,
-		);
-		check(
-			"감독 압축: 실행 기록에 압축 1회(시각·전후 토큰)",
-			checkpointRun?.checkpoints?.length === 1 && checkpointRun.checkpoints[0]?.before !== undefined,
-			JSON.stringify(checkpointRun?.checkpoints),
-		);
 
-		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"] }, { write: "agent://Spike0" }]), noAnswer);
-		const capRun = runFiles().at(-1);
-		check(
-			"컨텍스트 상한: 넘은 에이전트로 가는 후속 지시는 막힘",
-			readConfig().contextCap === 50 && talk.frames.some(frame => textOf(frame).includes("컨텍스트 상한")) && capRun?.blockedFollowUps === 1,
-			`blockedFollowUps=${capRun?.blockedFollowUps}`,
-		);
-		// A3: the reason the director gets back names the capped agent's result to hand to a fresh agent.
-		const capReason = talk.llm.find(entry => !entry.child && entry.lastTool.includes("후속 지시를 막았습니다"))?.lastTool;
-		check(
-			"컨텍스트 상한: 막힘 사유에 새 에이전트가 agent://<id> 를 읽고 이어 가라는 안내",
-			capReason?.includes("새 storm-implementer 를 띄워") === true && capReason.includes("agent://Spike0 의 결과를 읽고 이어서 진행하라"),
-			capReason?.slice(0, 300) ?? "no reason",
-		);
+			await rpc.prompt(route({ action: "settings", cleanup: true, docs: true }, "clean up again"));
+			check("cleanup is switched on through the approval dialog", files.config().cleanup === true);
+			const cleaned = await runOf(rpc, CHEAP_RUN);
+			check(
+				"cleanup on: a trusted older run's agent records are deleted, its outputs kept",
+				present(records(oldest)) === 0 && present(outputs(oldest)) === outputs(oldest).length,
+				`records=${present(records(oldest))} outputs=${present(outputs(oldest))}`,
+			);
+			check("runs known only from the repo lose nothing", present(rogueFiles) === rogueFiles.length && rogues.every(seed => files.run(seed.runId)?.agents?.[0]?.cleanedAt === undefined), `present=${present(rogueFiles)}/${rogueFiles.length}`);
+			const entry = readJsonl<Trusted>(trustedFile).find(line => line.runId === oldest.runId);
+			check(
+				"the trusted list, the old run record and this run's record say what was cleaned",
+				entry?.cleaned?.includes(oldest.agent) === true && files.run(oldest.runId)?.agents?.[0]?.cleanedAt !== undefined && (cleaned.cleanup?.agents ?? 0) >= 1,
+				`trusted=${JSON.stringify(entry?.cleaned)} cleanup=${JSON.stringify(cleaned.cleanup)}`,
+			);
+			check("the index carries the cleanup numbers", same(files.index().find(line => line.runId === cleaned.runId)?.cleanup, cleaned.cleanup));
+		});
+	});
 
-		// A heavy main session is asked whether to compact before the run starts; cancelling starts nothing.
-		const runsBefore = runFiles().length;
-		talk = await converse(runTask([planStep([{ name: "impl", kind: "code" }])]), choose("취소"), { model: "fake/heavy-main" });
-		check(
-			"실행 전 점검: 메인 컨텍스트가 크면 묻고, 취소하면 시작 안 함",
-			uiTitled(talk.frames, "메인 세션 컨텍스트가 큽니다") && runFiles().length === runsBefore,
-			`runs=${runFiles().length}/${runsBefore}`,
-		);
+	await suite.step("goal and loop under RPC", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			const runs = files.runs().length;
+			await rpc.prompt("/storm goal E2E reach the objective");
+			check("/storm goal offers a free run or cancel", same(rpc.dialogs.at(-1)?.options, [LABEL.free, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
+			check("cancel starts nothing and calls no model", files.runs().length === runs && llm.all().length === 0, `runs=${files.runs().length}/${runs} requests=${llm.all().length}`);
+			await rpc.prompt(route({ action: "run", mode: "goal" }, "keep at it until it is done"));
+			check("a goal the classifier picked is confirmed first", same(rpc.dialogs.at(-1)?.options, [MODE_CHOICE.asIs, MODE_CHOICE.free, MODE_CHOICE.cancel]) && files.runs().length === runs, JSON.stringify(rpc.dialogs.at(-1)));
+			rpc.answer = choose(LABEL.free);
+			const run = await runOf(rpc, `/storm loop 3 E2E-STEPS ${JSON.stringify([plan([{ name: "impl", kind: "code" }])])}`);
+			check("/storm loop 3 offers the same choice", same(rpc.dialogs.at(-1)?.options, [LABEL.free, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
+			check("the free run is a vibe run that ends at settle", run.mode === "vibe" && run.endReason === "settled" && run.status === "done" && run.loop === undefined, `${run.mode} ${run.endReason} ${run.status}`);
+		});
+	});
 
-		const approvalsBeforeReset = approvalFiles().length;
-		frames = await command("/storm", request => (request.title === "Storm 메뉴" ? "초기화" : choose("취소")(request)));
-		check(
-			"초기화: 메뉴에서 확인 한 번, 취소하면 그대로",
-			uiTitled(frames, "Storm 설정과 기록을 모두 지울까요") && existsSync(CONFIG) && approvalFiles().length === approvalsBeforeReset,
+	await suite.step("heavy main context at run start", async () => {
+		const llm = new LlmCursor(env);
+		await session(
+			cancelAll,
+			async rpc => {
+				await rpc.turn("hello");
+				const run = await runOf(rpc, CHEAP_RUN);
+				const compactions = llm.of("compaction").length;
+				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "done" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} compactions=${compactions}`);
+			},
+			{ model: "fake/heavy-main" },
 		);
-		// The reset shortcut opens the same confirmation directly; "초기화" keeps the run summary index (B4).
-		const indexBeforeReset = runIndex().length;
-		frames = await command("/storm reset", choose("초기화"));
-		const leftAfterReset = existsSync(join(PROJECT, ".omp", "storm"))
-			? readdirSync(join(PROJECT, ".omp", "storm"), { recursive: true, withFileTypes: true })
-					.filter(entry => entry.isFile())
-					.map(entry => join(entry.parentPath, entry.name))
-			: [];
-		check(
-			"초기화: 설정과 승인 기록을 한 번에 삭제",
-			frames.filter(frame => frame.type === "extension_ui_request" && frame.method === "select").length === 1 &&
-				!existsSync(CONFIG) &&
-				leftAfterReset.every(file => file === runIndexFile || file === join(PROJECT, ".omp", "storm", ".gitignore")) &&
-				approvalsBeforeReset > 0 &&
-				approvalFiles().length === 0,
-			`approvals=${approvalFiles().length}/${approvalsBeforeReset} left=${leftAfterReset.join(",")}`,
-		);
-		const gitAfterReset = Bun.spawnSync(["git", "-C", PROJECT, "status", "--porcelain", "--untracked-files=all"]).stdout.toString().trim();
-		check(
-			"초기화: 기본(초기화) 선택이면 실행 요약 색인은 남김",
-			indexBeforeReset > 0 && runIndex().length === indexBeforeReset && !gitAfterReset.includes("index.jsonl"),
-			`index=${runIndex().length}/${indexBeforeReset} git=${gitAfterReset.replace(/\n/g, "; ") || "clean"}`,
-		);
-		run = await spawn(["storm-implementer", "task"]);
-		check("초기화 후: storm 역할 차단", run.results.includes("Storm 설정이 없습니다"));
-		check("초기화 후: 일반 에이전트 정상", run.children.length === 1);
-		check("초기화 후: storm 도구 없음", run.main.length > 0 && run.main.every(entry => !entry.tools.includes("storm")));
-	} finally {
-		server.kill();
-		await server.exited;
-		// E2E_KEEP=1 leaves the project, the LLM log and the profile for a look after a failure.
-		if (!process.env.E2E_KEEP) {
-			rmSync(WORK, { recursive: true, force: true });
-			rmSync(PROFILE_ROOT, { recursive: true, force: true });
-		}
-	}
-	console.log(failures.length === 0 ? "\nE2E: all passed" : `\nE2E: ${failures.length} failed: ${failures.join(", ")}`);
-	process.exit(failures.length === 0 ? 0 : 1);
+	});
+
+	await suite.step("hub, status, rollback", async () => {
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			let frames = await rpc.prompt("/storm status");
+			check("/storm status reports and asks nothing", reports(frames).length === 1 && rpc.dialogs.length === 0);
+			frames = await rpc.prompt("/storm");
+			const menu = rpc.dialogs.at(-1)?.options ?? [];
+			check("/storm opens the menu with the status in view", reports(frames).length === 1 && menu.includes(LABEL.rollback) && menu.includes(LABEL.reset) && menu.length >= 5, JSON.stringify(menu));
+			const bytes = files.configBytes();
+			const approvals = files.approvals().length;
+			// The menu, then the list of earlier approvals: the first one offered.
+			rpc.answer = dialog => (dialog.options.includes(LABEL.rollback) ? LABEL.rollback : dialog.options.find(option => option !== CANCEL));
+			await rpc.prompt("/storm");
+			check("rollback puts an earlier approved config back without a new approval", files.configBytes() !== bytes && files.approvals().length === approvals, `approvals=${files.approvals().length}/${approvals}`);
+			check("none of it called a model", llm.all().length === 0, `requests=${llm.all().length}`);
+			await rpc.turn("E2E-TASK storm-implementer");
+			check("the restored config counts as approved", children(llm.all()).length === 1);
+		});
+	});
+
+	await suite.step("print mode changes nothing", async () => {
+		const bytes = files.configBytes();
+		const approvals = files.approvals().length;
+		const runs = files.runs().length;
+		const llm = new LlmCursor(env);
+		const codes = ["/storm setup", "/storm reset", "/storm", "/storm status"].map(command => {
+			const args = [env.omp, "-p", "--profile", env.profile, "--no-session", "--no-title", "--auto-approve", "--model", MAIN, command];
+			return Bun.spawnSync(args, { cwd: env.project, env: env.childEnv, timeout: 60_000, stderr: Bun.file(join(env.logs, "print.stderr.log")) }).exitCode;
+		});
+		check("every command exits 0", codes.every(code => code === 0), `exit=${codes.join(",")}`);
+		check("config, approvals and runs are untouched", files.configBytes() === bytes && files.approvals().length === approvals && files.runs().length === runs);
+		check("no model request", llm.all().length === 0, `requests=${llm.all().length}`);
+	});
+
+	await suite.step("reset", async () => {
+		const approvals = files.approvals().length;
+		const index = files.index().length;
+		const trusted = readJsonl<{ runId: string }>(files.trustedFile()).length;
+		const llm = new LlmCursor(env);
+		await session(cancelAll, async rpc => {
+			await rpc.prompt("/storm reset");
+			check("one confirmation; cancel keeps everything", rpc.dialogs.length === 1 && rpc.dialogs[0]?.options[0] === LABEL.reset && existsSync(files.configFile) && files.approvals().length === approvals, JSON.stringify(rpc.dialogs));
+			rpc.answer = choose(LABEL.reset);
+			await rpc.prompt("/storm reset");
+			const storm = join(env.project, ".omp", "storm");
+			const left = existsSync(storm)
+				? readdirSync(storm, { recursive: true, withFileTypes: true })
+						.filter(entry => entry.isFile())
+						.map(entry => join(entry.parentPath, entry.name))
+				: [];
+			check(
+				"the config and the approvals are gone",
+				!existsSync(files.configFile) && approvals > 0 && files.approvals().length === 0 && left.every(file => file === files.indexFile || file === join(storm, ".gitignore")),
+				`approvals=${files.approvals().length}/${approvals} left=${left.join(",")}`,
+			);
+			const git = Bun.spawnSync(["git", "-C", env.project, "status", "--porcelain", "--untracked-files=all"]).stdout.toString();
+			check("the run summary index stays, out of git", index > 0 && files.index().length === index && !git.includes("index.jsonl"), `index=${files.index().length}/${index}`);
+			const kept = readJsonl<{ runId: string }>(files.trustedFile());
+			check("the trusted run list (runs.jsonl) stays", trusted > 0 && kept.length === trusted && kept.some(line => line.runId === routedRunId), `runs.jsonl=${kept.length}/${trusted}`);
+			const frames = await rpc.turn("E2E-TASK storm-implementer task");
+			check("afterwards storm roles are blocked with no-config", asyncResults(frames).includes("[storm:no-config]") && children(llm.all()).length === 1);
+			check("and the storm tool is gone", mains(llm.all()).length > 0 && mains(llm.all()).every(entry => entry.stormTool === null));
+		});
+	});
+
+	await suite.step("omp exit codes", async () => {
+		check("every omp session exited 0", exitCodes.length > 0 && exitCodes.every(code => code === 0), `exit=${exitCodes.join(",")}`);
+	});
 }
 
-await main();
+let code = 1;
+const server = await startFakeLlm(env);
+try {
+	await main();
+} catch (error) {
+	// Outside any step (the profile could not be prepared): still a failure in the summary.
+	suite.check("harness", false, error instanceof Error ? (error.stack ?? error.message) : String(error));
+} finally {
+	server.kill();
+	await server.exited;
+	code = suite.finish();
+}
+process.exit(code);

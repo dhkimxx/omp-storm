@@ -11,7 +11,7 @@ function num(value: unknown): number | undefined {
 }
 
 const LIMITED_FRACTION = 0.8;
-const STATE_RANK: Record<QuotaState, number> = { available: 0, limited: 1, unknown: 2, unavailable: 3, exhausted: 4 };
+const STATE_RANK: Record<QuotaState, number> = { available: 0, limited: 1, unknown: 2, exhausted: 3 };
 
 /** Same precedence as omp's `resolveUsedFraction` (pi-ai/src/usage.ts). */
 function usedFraction(amount: Rec): number | undefined {
@@ -26,41 +26,79 @@ function usedFraction(amount: Rec): number | undefined {
 	return undefined;
 }
 
-interface AccountQuota {
-	state: QuotaState;
-	usedFraction: number | null;
-	resetsAt: number | null;
-}
+type AccountQuota = Omit<QuotaStatus, "provider">;
 
+/**
+ * Provider-wide state comes from omp's account-wide windows (`scope.shared` without a subpool or model), or from every
+ * limit that names no model when the provider marks none: the rule `omp usage` itself applies. An exhausted limit
+ * outside that pool stops only its own models: the one `scope.modelId` names, or the model tier `scope.tier` names.
+ */
 function accountQuota(report: Rec): AccountQuota {
 	// Only boolean flags are read from metadata; identity fields there are never touched.
 	const meta = isRec(report.metadata) ? report.metadata : {};
 	let exhausted = meta.limitReached === true || meta.allowed === false;
-	const limits = Array.isArray(report.limits) ? report.limits.filter(isRec) : [];
-	let maxFraction: number | null = null;
-	let resetsAt: number | null = null;
-	for (const limit of limits) {
+	const limits = (Array.isArray(report.limits) ? report.limits.filter(isRec) : []).map((limit) => {
+		const scope = isRec(limit.scope) ? limit.scope : {};
 		const amount = isRec(limit.amount) ? limit.amount : {};
-		const fraction = usedFraction(amount);
 		const used = num(amount.used);
 		const cap = num(amount.limit);
-		const limitExhausted = limit.status === "exhausted" || (used !== undefined && cap !== undefined && cap > 0 && used >= cap);
-		if (limitExhausted) exhausted = true;
-		if (fraction !== undefined) maxFraction = Math.max(maxFraction ?? 0, fraction);
-		const pressured = limitExhausted || (fraction !== undefined && fraction >= LIMITED_FRACTION);
-		const reset = isRec(limit.window) ? num(limit.window.resetsAt) : undefined;
-		if (pressured && reset !== undefined) resetsAt = resetsAt === null ? reset : Math.min(resetsAt, reset);
+		const model = typeof scope.modelId === "string" && scope.modelId ? scope.modelId : undefined;
+		return {
+			model,
+			tier: typeof scope.tier === "string" && scope.tier ? scope.tier : undefined,
+			accountWide: scope.shared === true && scope.sharedGroup === undefined && model === undefined,
+			fraction: usedFraction(amount),
+			exhausted: limit.status === "exhausted" || (used !== undefined && cap !== undefined && cap > 0 && used >= cap),
+			reset: isRec(limit.window) ? num(limit.window.resetsAt) : undefined,
+		};
+	});
+	const accountWide = limits.filter((limit) => limit.accountWide);
+	const pool = accountWide.length > 0 ? accountWide : limits.filter((limit) => limit.model === undefined);
+	let maxFraction: number | null = null;
+	let resetsAt: number | null = null;
+	for (const limit of pool) {
+		if (limit.exhausted) exhausted = true;
+		if (limit.fraction !== undefined) maxFraction = Math.max(maxFraction ?? 0, limit.fraction);
+		const pressured = limit.exhausted || (limit.fraction !== undefined && limit.fraction >= LIMITED_FRACTION);
+		if (pressured && limit.reset !== undefined) resetsAt = resetsAt === null ? limit.reset : Math.min(resetsAt, limit.reset);
 	}
 	let state: QuotaState;
 	if (exhausted) state = "exhausted";
 	else if (limits.length === 0) state = "unknown";
 	else if (maxFraction !== null && maxFraction >= LIMITED_FRACTION) state = "limited";
 	else state = "available";
-	return { state, usedFraction: maxFraction === null ? null : Math.min(1, maxFraction), resetsAt };
+	const quota: AccountQuota = { state, usedFraction: maxFraction === null ? null : Math.min(1, maxFraction), resetsAt };
+	for (const limit of limits) {
+		const name = limit.model ?? limit.tier;
+		if (!limit.exhausted || name === undefined || pool.includes(limit)) continue;
+		const scoped = limit.model === undefined ? (quota.exhaustedTiers ??= {}) : (quota.exhaustedModels ??= {});
+		const key = name.toLowerCase();
+		const prev = scoped[key];
+		scoped[key] = limit.reset === undefined ? (prev ?? null) : prev == null ? limit.reset : Math.min(prev, limit.reset);
+	}
+	return quota;
+}
+
+/**
+ * The exhausted limit that stops a model on this provider now: the provider-wide one, else one scoped to its id, else
+ * one scoped to its lineage tier ("opus"). A scope tier is compared with the lineage tier only: plan names such as
+ * "pro" or "max" also travel in that field and must not match a word of some model id. Undefined when the model can run.
+ */
+export function exhaustedLimit(
+	quota: QuotaStatus | undefined,
+	modelId: string,
+	lineageTier: string,
+): { resetsAt: number | null } | undefined {
+	if (!quota) return undefined;
+	if (quota.state === "exhausted") return { resetsAt: quota.resetsAt };
+	const byModel = quota.exhaustedModels?.[modelId.toLowerCase()];
+	if (byModel !== undefined) return { resetsAt: byModel };
+	const byTier = quota.exhaustedTiers?.[lineageTier];
+	return byTier === undefined ? undefined : { resetsAt: byTier };
 }
 
 /** Parses `omp usage --json`. With several accounts per provider, the account with the most headroom wins. */
-export function parseUsageJson(text: string, now: number): QuotaStatus[] {
+export function parseUsageJson(text: string): QuotaStatus[] {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(text);
@@ -89,16 +127,14 @@ export function parseUsageJson(text: string, now: number): QuotaStatus[] {
 			best.set(account.provider, { state: "unknown", usedFraction: null, resetsAt: null });
 		}
 	}
-	return [...best.entries()]
-		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-		.map(([provider, q]) => ({ provider, state: q.state, usedFraction: q.usedFraction, resetsAt: q.resetsAt, observedAt: now }));
+	return [...best.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([provider, q]) => ({ provider, ...q }));
 }
 
-export async function readQuota(exec: Exec, ompBin: string, now: number = Date.now()): Promise<QuotaStatus[]> {
+export async function readQuota(exec: Exec, ompBin: string): Promise<QuotaStatus[]> {
 	try {
 		const result = await exec(ompBin, ["usage", "--json"], { timeout: 30_000 });
 		if (result.code !== 0 || result.killed) return [];
-		return parseUsageJson(result.stdout, now);
+		return parseUsageJson(result.stdout);
 	} catch {
 		return [];
 	}

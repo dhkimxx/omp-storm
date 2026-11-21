@@ -16,6 +16,7 @@ const SELECTOR_ROWS = 11;
 const FULL_VIEW = "전체 내용 보기";
 /** Share of the terminal a report overlay may take. */
 const OVERLAY_SHARE = 0.85;
+const NOTICE_TITLE = { info: "알림", warning: "경고", error: "오류" } as const;
 
 /** Draws Storm's transcript records in omp's own frame, headed by Storm's mark and name instead of a package glyph and the raw type. */
 export function registerReportRenderer(pi: ExtensionAPI): void {
@@ -142,6 +143,9 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 			overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" },
 		});
 	};
+	// RPC hosts have no form surface. An ACP client without form support does have the method (omp tells extensions
+	// nothing about the client's capabilities), but there it answers undefined, as its selects do: every dialog is a cancel.
+	const formDialog = ctx.hasUI ? ctx.ui.formDialog?.bind(ctx.ui) : undefined;
 	return {
 		select: async (title, options, context) => {
 			if (!context) return ctx.ui.select(title, options);
@@ -149,6 +153,8 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 				transcript(context.title, context.markdown);
 				return ctx.ui.select(title, options);
 			}
+			// Whether the whole context was put on screen (the overlay) during this dialog.
+			let seen = false;
 			for (;;) {
 				// omp builds the widget right away, so the panel can say whether it was cut before the selector opens.
 				let panel: PanelView | undefined;
@@ -156,20 +162,36 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 					panel = new PanelView(tui, context.title, context.markdown, options.length + SELECTOR_ROWS);
 					return panel;
 				});
+				let offered = options;
+				if (panel?.cut()) {
+					// A cut panel hides the end of what an accepting option covers: until the whole of it was opened,
+					// those options are held back and the full view comes first.
+					const held = seen ? [] : (context.consent ?? []);
+					offered = held.length ? [FULL_VIEW, ...options.filter(option => !held.includes(option))] : [...options, FULL_VIEW];
+				}
 				let answer: string | undefined;
 				try {
-					answer = await ctx.ui.select(title, panel?.cut() ? [...options, FULL_VIEW] : options);
+					answer = await ctx.ui.select(title, offered);
 				} finally {
 					ctx.ui.setWidget(PANEL_KEY, undefined);
 				}
 				if (answer !== FULL_VIEW) return answer;
 				await report(context.title, context.markdown);
+				seen = true;
 			}
 		},
-		confirm: (title, message) => ctx.ui.confirm(title, message),
-		input: (title, placeholder) => ctx.ui.input(title, placeholder),
-		notify: (message, level = "info") => ctx.ui.notify(message, level),
+		// Outside the TUI a notification may go nowhere (ACP only logs it), and it is the only word on how a flow ended.
+		notify: (message, level = "info") => (drawsComponents ? ctx.ui.notify(message, level) : transcript(NOTICE_TITLE[level], message)),
 		report,
 		record: transcript,
+		...(formDialog
+			? {
+					form: async (html: string) => {
+						const answer = await formDialog(html);
+						// A timeout submits the form as it stands; nobody answered, so it is a cancel.
+						return answer?.timedOut ? undefined : answer?.data;
+					},
+				}
+			: {}),
 	};
 }

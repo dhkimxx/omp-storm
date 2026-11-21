@@ -3,7 +3,8 @@
  * B0 spike: does omp tolerate deleting a finished subagent's records (`<id>.jsonl`, `<id>.md`, `<id>/`)
  * while the parent session lives on, after it parks the child, and across a resume? No plugins loaded.
  *
- * Usage: bun spikes/b0/run.ts   (omp on ~/.local/bin or OMP_BIN; port 18557 free; profile storm-b0 is wiped and recreated)
+ * Usage: PATH=$PWD/node_modules/.bin:$PATH bun spikes/b0/run.ts
+ * (pinned omp, or OMP_BIN; port 18557 free; profile storm-b0 is wiped and recreated)
  */
 import { Database } from "bun:sqlite";
 import type { Subprocess } from "bun";
@@ -13,7 +14,7 @@ import { join } from "node:path";
 
 type Frame = { type?: string; [key: string]: unknown };
 
-const OMP = process.env.OMP_BIN ?? join(homedir(), ".local/bin/omp");
+const OMP = process.env.OMP_BIN ?? join(import.meta.dir, "..", "..", "node_modules", ".bin", "omp");
 const PROFILE = "storm-b0";
 const PORT = 18557;
 const WORK = "/tmp/storm-b0";
@@ -50,11 +51,12 @@ class Rpc {
 	#seq = 0;
 
 	constructor(args: string[]) {
-		this.proc = Bun.spawn([OMP, "--mode", "rpc", ...baseArgs, ...args], { cwd: PROJECT, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		const proc = Bun.spawn([OMP, "--mode", "rpc", ...baseArgs, ...args], { cwd: PROJECT, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+		this.proc = proc;
 		void this.#pump();
 		void (async () => {
 			const decoder = new TextDecoder();
-			for await (const chunk of this.proc.stderr) this.stderr.push(decoder.decode(chunk));
+			for await (const chunk of proc.stderr) this.stderr.push(decoder.decode(chunk));
 		})();
 	}
 

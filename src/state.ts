@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { resolveRepo } from "./approval/repo.ts";
-import { findShadows } from "./approval/shadow.ts";
+import { findShadows, unapprovedShadows } from "./approval/shadow.ts";
 import { ApprovalStore } from "./approval/store.ts";
 import { loadConfig } from "./config/store.ts";
 import type { ApprovalRecord, ConfigLoad, Exec, RepoIdentity, ShadowInfo } from "./types.ts";
@@ -17,7 +17,7 @@ export interface ProjectEnv {
 export interface ProjectState {
 	repo: RepoIdentity;
 	config: ConfigLoad;
-	/** Active approval for the current config hash. */
+	/** The approval of the current config hash. */
 	approval: ApprovalRecord | undefined;
 	shadows: ShadowInfo[];
 	store: ApprovalStore;
@@ -27,6 +27,7 @@ export function stormDir(agentDir: string): string {
 	return join(agentDir, "storm");
 }
 
+/** One git call (the repo's top level and common dir), the config file, the approval of its hash and the agent dirs. */
 export async function loadProjectState(env: ProjectEnv): Promise<ProjectState> {
 	const repo = await resolveRepo(env.cwd, env.exec);
 	const store = new ApprovalStore(stormDir(env.agentDir), repo);
@@ -36,6 +37,11 @@ export async function loadProjectState(env: ProjectEnv): Promise<ProjectState> {
 	]);
 	const approval = config.status === "ok" ? await store.active(config.hash) : undefined;
 	return { repo, config, approval, shadows, store };
+}
+
+/** The user approved exactly what is on disk now: this config hash and every shadowing definition. */
+export function isApproved(state: ProjectState): boolean {
+	return state.approval !== undefined && unapprovedShadows(state.approval, state.shadows).length === 0;
 }
 
 /** A batch of parallel spawns asks for the same state; a short cache keeps it to one git round trip. */

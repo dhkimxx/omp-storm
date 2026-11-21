@@ -1,200 +1,115 @@
 import { describe, expect, test } from "bun:test";
+import { recommend } from "../src/recommend/recommend.ts";
 import { renderModelCheck } from "../src/report/models.ts";
 import { compareTrial } from "../src/report/trials.ts";
-import type {
-	Analysis,
-	AnalysisContext,
-	Lineage,
-	MetricValue,
-	ModelInfo,
-	StormConfig,
-	TrialConfig,
-	UsageRow,
-	UsageSnapshot,
-} from "../src/types.ts";
+import type { AnalysisContext, ModelInfo, StormConfig, TrialConfig, UsageRow, UsageSnapshot } from "../src/types.ts";
+import { teamOf } from "./fixtures.ts";
+import { COST, model, NOW, row as usageRow, setup, type SetupOptions } from "./rank-fixture.ts";
 
-const NOW = Date.parse("2026-11-20T00:00:00Z");
-
-function model(selector: string, over: Partial<ModelInfo> = {}): ModelInfo {
-	const i = selector.indexOf("/");
-	return {
-		provider: selector.slice(0, i),
-		id: selector.slice(i + 1),
-		selector,
-		name: selector.slice(i + 1).toUpperCase(),
-		identity: { class: "x" },
-		cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 },
-		pricingKnown: true,
-		contextWindow: 200_000,
-		maxTokens: 32_000,
-		reasoning: true,
-		efforts: ["low", "medium", "high"],
-		supportsTools: true,
-		int: 50,
-		tps: 100,
-		available: true,
-		...over,
-	};
-}
-
-/** "<line>-<rev>" ids: lineKey "<line>/-", revision "<rev>". */
-function lineage(_provider: string, id: string): Lineage {
-	const dash = id.lastIndexOf("-");
-	const line = dash < 0 ? id : id.slice(0, dash);
-	const revision = dash < 0 ? null : id.slice(dash + 1);
-	const lineKey = `${line}/-`;
-	return {
-		modelKey: `${lineKey}@${revision ?? "?"}`,
-		lineKey,
-		cls: line,
-		tier: "-",
-		revision,
-		revisionSource: revision ? "name" : null,
-		classSource: "stem",
-		suspect: false,
-		variant: {},
-	};
-}
-
-const mv = (value: number | null, source = "catalog"): MetricValue => ({ value, source, confidence: "medium" });
-
-function analysis(over: Partial<Analysis> = {}): Analysis {
-	return {
-		status: "ok",
-		windowDays: 30,
-		dataAsOf: null,
-		preferences: {
-			main: { cheap: [], general: [], premium: [], unknown: [] },
-			subagent: { cheap: [], general: [], premium: [], unknown: [] },
-		},
-		newer: [],
-		alternatives: {},
-		warnings: [],
-		...over,
-	};
-}
-
-function ctxOf(catalog: ModelInfo[], a: Analysis): AnalysisContext {
+/** A context whose `recommend` is the real ranker over the fixture catalog. */
+function ctxOf(catalog: ModelInfo[], opts: SetupOptions = {}): AnalysisContext {
+	const base = setup(catalog, opts);
 	return {
 		now: NOW,
 		catalog,
 		available: catalog.filter((m) => m.available),
-		quota: [],
-		explicit: { modelRoles: {}, agentModelOverrides: {} },
-		usage: { status: "ok", dbPath: "", windowDays: 30, now: NOW, dataAsOf: null, rows: [] },
-		analysis: a,
-		lineage,
-		tiers: new Map(),
-		warnings: [],
-		recommend: () => [],
+		explicit: { modelRoles: {} },
+		usage: base.usage,
+		analysis: base.analysis,
+		recommend: (priority, current) => recommend({ ...base, priority, ...(current ? { current } : {}) }),
 		checkModel: () => ({ ok: false, reason: "n/a" }),
-		detection: () => ({
-			providers: [],
-			tools: { task: true, eval: true },
-			keywords: { workflowz: true, orchestrate: true },
-			dataAsOf: null,
-			stale: false,
-			warnings: [],
-		}),
+		detection: () => ({ providers: [], tools: { task: true, eval: true }, warnings: [] }),
 	};
 }
 
-const config: StormConfig = {
-	version: 1,
-	priority: "balanced",
-	roles: {
-		implementer: { agent: "storm-implementer", models: ["a/coder-1.0"] },
-		reviewer: { agent: "storm-reviewer", models: ["b/judge-2.0"] },
-	},
-	parallelism: 4,
-	isolation: "shared",
-	contract: "workflowz",
-	runtime: "omp",
-};
+const team = (roles: Record<string, string>, priority: StormConfig["priority"] = "balanced"): StormConfig => teamOf(roles, { priority });
+
+/** The report's section for the role whose primary is `selector`, and the selectors it lists as "  - Label (selector)" items. */
+function section(text: string, selector: string): { body: string; listed: string[] } {
+	const body = text.split("### ").find((part) => part.split("\n")[0]?.includes(`(${selector})`));
+	if (body === undefined) throw new Error(`no section for ${selector}`);
+	const listed = [...body.matchAll(/^ {2}- .*?\(([a-z]+\/[a-z0-9.-]+)\)/gm)].map((match) => match[1] ?? "");
+	return { body, listed };
+}
 
 describe("renderModelCheck", () => {
 	const catalog = [
-		model("a/coder-1.0"),
-		model("a/coder-1.1", { int: null }),
-		model("z/coder-2.0", { available: false, name: "Coder 2" }),
-		model("y/coder-2.0", { available: false, name: "Coder 2" }),
-		model("z/coder-0.9", { available: false }),
-		// Newer revision available on one provider, also sold elsewhere behind a login: not a login item.
-		model("a/coder-1.5"),
-		model("q/coder-1.5", { available: false }),
-		model("b/judge-2.0"),
+		model("pa", "a-pro-1", "general", { int: 50 }),
+		model("pb", "b-pro-1", "general", { int: 45 }),
+		model("pa", "c-pro-1", "general", { int: 40 }),
+		model("pa", "d-pro-1", "general", { int: 30 }),
+		model("pa", "e-flash-1", "cheap", { int: 20 }),
+		model("pa", "f-flash-1", "cheap", { int: 25, cost: { ...COST.cheap, output: 0.2 } }),
 	];
-	const a = analysis({
-		newer: [{ from: "coder/-@1.0", to: "coder/-@1.1", selectors: ["a/coder-1.1"], needsCheck: true, int: mv(null) }],
-		alternatives: {
-			"coder/-@1.0": [
-				{ selector: "c/fast", modelKey: "fast/-@?", label: "Fast", tier: "general", kind: "faster", int: mv(null), speed: mv(300, "prior:x"), costRatio: null, why: "" },
-				{ selector: "c/cheap", modelKey: "cheap/-@?", label: "Cheap", tier: "cheap", kind: "cheaper", int: mv(51), speed: mv(80, "measured"), costRatio: 0.4, why: "" },
-			],
-		},
-	});
-	const text = renderModelCheck(ctxOf(catalog, a), config);
 
-	test("lists newer versions from the analysis and the catalog without duplicates", () => {
-		expect(text).toContain("coder/-@1.1 (확인 필요) · 지능 —");
-		expect(text).toContain("coder/-@1.5 · 지능 50 · a/coder-1.5");
-		expect(text.match(/coder\/-@1\.1/g)?.length).toBe(1);
-	});
-
-	test("marks estimated speeds and missing metrics", () => {
-		expect(text).toContain("Fast (c/fast) · 더 빠름 · 지능 — · ≈300 tok/s · 비용 —");
-		expect(text).toContain("Cheap (c/cheap) · 더 쌈 · 지능 51 · 80 tok/s · 비용 ×0.40");
+	test("each role lists exactly the candidates the recommender ranks above its current model, in rank order", () => {
+		const ctx = ctxOf(catalog);
+		const config = team({ implementer: "pa/c-pro-1:high", explorer: "pa/e-flash-1" });
+		const text = renderModelCheck(ctx, config);
+		const recs = ctx.recommend("balanced", { implementer: "pa/c-pro-1", explorer: "pa/e-flash-1" });
+		for (const [roleId, selector] of [["implementer", "pa/c-pro-1"], ["explorer", "pa/e-flash-1"]] as const) {
+			const above = recs.find((r) => r.role.id === roleId)?.current?.above.map((a) => a.candidate.selector) ?? [];
+			expect(above.length).toBeGreaterThan(0);
+			expect(section(text, selector).listed).toEqual(above);
+		}
+		// The first one listed is what a fresh recommendation would choose.
+		expect(section(text, "pa/c-pro-1").listed[0]).toBe(ctx.recommend("balanced").find((r) => r.role.id === "implementer")?.candidates[0]?.selector ?? "");
+		expect(section(text, "pa/c-pro-1").body).not.toContain("pa/d-pro-1");
 	});
 
-	test("login-needed upgrades: unavailable, same line, higher revision only", () => {
-		expect(text).toContain("Coder 2 · 지능 50 · 로그인 필요: y, z");
-		expect(text).not.toContain("q/coder");
-		expect(text).not.toContain("로그인 필요: q");
-		expect(text).not.toContain("0.9");
+	test("a role already on the top-ranked model lists no candidate", () => {
+		expect(section(renderModelCheck(ctxOf(catalog), team({ implementer: "pa/a-pro-1" })), "pa/a-pro-1").listed).toEqual([]);
 	});
 
-	test("roles with nothing better say so, and the report ends with the web-research note", () => {
-		const reviewer = text.slice(text.indexOf("### 리뷰"));
-		expect(reviewer).toContain("지금 모델보다 나은 선택지를 찾지 못했습니다.");
-		expect(text.trimEnd().split("\n").at(-1)).toContain("웹에서 찾아볼 수 있습니다");
+	test("the team's priority decides the ranking shown; a stored speed or quota reads as balanced", () => {
+		const ctx = ctxOf(catalog);
+		const listed = (priority: StormConfig["priority"]) => section(renderModelCheck(ctx, team({ explorer: "pa/e-flash-1" }, priority)), "pa/e-flash-1").listed;
+		expect(listed("balanced")).toEqual(["pa/f-flash-1"]);
+		// Quality shifts the explorer to the general tier: every general model outranks a cheap one.
+		expect(listed("quality").slice(0, 2)).toEqual(["pa/a-pro-1", "pb/b-pro-1"]);
+		expect(listed("speed")).toEqual(listed("balanced"));
+		expect(listed("quota")).toEqual(listed("balanced"));
 	});
 
-	test("without a config it still renders the note", () => {
-		const t = renderModelCheck(ctxOf(catalog, a), undefined);
-		expect(t).toContain("Storm 설정이 없어");
-		expect(t).toContain("웹에서 찾아볼 수 있습니다");
+	test("at most five higher-ranked candidates are listed", () => {
+		const many = ["a", "b", "c", "d", "e", "f", "g"].map((cls, i) => model("pa", `${cls}-pro-1`, "general", { int: 80 - i * 5 }));
+		expect(section(renderModelCheck(ctxOf(many), team({ implementer: "pa/g-pro-1" })), "pa/g-pro-1").listed).toEqual([
+			"pa/a-pro-1",
+			"pa/b-pro-1",
+			"pa/c-pro-1",
+			"pa/d-pro-1",
+			"pa/e-pro-1",
+		]);
+	});
+
+	test("a current model that is not a candidate gets the recommended candidates instead", () => {
+		const withGone = [...catalog, model("pz", "gone-pro-1", "general", { available: false })];
+		expect(section(renderModelCheck(ctxOf(withGone), team({ implementer: "pz/gone-pro-1" })), "pz/gone-pro-1").listed.slice(0, 3)).toEqual([
+			"pa/a-pro-1",
+			"pb/b-pro-1",
+			"pa/c-pro-1",
+		]);
+	});
+
+	test("newer versions name their usable routes, or the providers to log in to", () => {
+		const versions = [
+			model("pa", "a-pro-1", "general", { int: 50 }),
+			model("pa", "a-pro-2", "general", { int: 30 }),
+			model("pz", "a-pro-3", "general", { int: 30, available: false }),
+			model("pz", "a-pro-0", "general", { int: 30, available: false }),
+		];
+		const { body } = section(renderModelCheck(ctxOf(versions), team({ implementer: "pa/a-pro-1" })), "pa/a-pro-1");
+		const lines = body.split("\n").filter((line) => line.startsWith("  - "));
+		expect(lines.map((line) => line.includes("a-pro-2") || line.includes("a-pro-3"))).toEqual([true, true]);
+		expect(lines.find((line) => line.includes("a-pro-2"))).toContain("pa/a-pro-2");
+		expect(lines.find((line) => line.includes("a-pro-3"))).toContain("pz");
+		expect(body).not.toContain("a-pro-0");
+	});
+
+	test("without a config there is no role section", () => {
+		expect(renderModelCheck(ctxOf(catalog), undefined)).not.toContain("### ");
 	});
 });
-
-function row(provider: string, model: string, over: Partial<UsageRow> = {}): UsageRow {
-	return {
-		provider,
-		model,
-		seat: "subagent",
-		requests: 10,
-		errors: 0,
-		aborted: 0,
-		inputTokens: 0,
-		outputTokens: 0,
-		cacheReadTokens: 0,
-		cacheWriteTokens: 0,
-		costTotal: 1,
-		unpricedRequests: 0,
-		ompTps: null,
-		decodeTps: null,
-		ttftP50: null,
-		ttftP90: null,
-		ttftSamples: 0,
-		durationP50: null,
-		durationP90: null,
-		durationSamples: 0,
-		firstTs: 0,
-		lastTs: 0,
-		daily: {},
-		dailyErrors: {},
-		...over,
-	};
-}
 
 describe("compareTrial", () => {
 	const trial: TrialConfig = {
@@ -207,35 +122,33 @@ describe("compareTrial", () => {
 		endsAt: "2026-11-20T00:00:00.000Z",
 		budgetUsd: 2,
 	};
+	const measured = (provider: string, id: string, over: Partial<UsageRow>): UsageRow => ({ ...usageRow(provider, id, 10), ...over });
 	const usage: UsageSnapshot = {
 		status: "ok",
-		dbPath: "",
 		windowDays: 7,
-		now: NOW,
 		dataAsOf: NOW - 1000,
 		rows: [
-			row("c", "cand", { requests: 10, errors: 1, ompTps: 100, decodeTps: 120, ttftP50: 500, costTotal: 1 }),
-			row("c", "cand", { requests: 30, errors: 1, ompTps: 200, decodeTps: null, ttftP50: 900, costTotal: 2 }),
-			row("c", "cand", { seat: "main", requests: 1000, errors: 500, ompTps: 1 }),
-			row("a", "prim", { requests: 5, unpricedRequests: 5, costTotal: 0 }),
+			measured("c", "cand", { requests: 40, errors: 2, ompTps: 100, decodeTps: 120, ttftP50: 500, costTotal: 3 }),
+			measured("c", "cand", { seat: "main", requests: 1000, errors: 500, ompTps: 1 }),
+			measured("a", "prim", { requests: 5, unpricedRequests: 5, costTotal: 0 }),
 		],
 	};
 
-	test("merges subagent rows by request weight and ignores the main seat", () => {
+	test("each side is the selector's subagent usage; the main seat is ignored", () => {
 		const c = compareTrial(trial, "a/prim", usage);
 		expect(c.dataAsOf).toBe(NOW - 1000);
 		expect(c.candidate).toEqual({
 			selector: "c/cand",
 			requests: 40,
 			errorRate: 2 / 40,
-			ompTps: (100 * 10 + 200 * 30) / 40,
+			ompTps: 100,
 			decodeTps: 120,
-			ttftP50: (500 * 10 + 900 * 30) / 40,
+			ttftP50: 500,
 			costPerRequest: 3 / 40,
 		});
 	});
 
-	test("null metrics when absent or unpriced; empty side has no rates", () => {
+	test("null metrics when absent or unpriced; an unused side has no rates", () => {
 		const c = compareTrial(trial, "a/prim", usage);
 		expect(c.current).toEqual({
 			selector: "a/prim",
@@ -246,9 +159,14 @@ describe("compareTrial", () => {
 			ttftP50: null,
 			costPerRequest: null,
 		});
-		const none = compareTrial(trial, "x/none", usage).current;
-		expect(none.requests).toBe(0);
-		expect(none.errorRate).toBeNull();
-		expect(none.costPerRequest).toBeNull();
+		expect(compareTrial(trial, "x/none", usage).current).toEqual({
+			selector: "x/none",
+			requests: 0,
+			errorRate: null,
+			ompTps: null,
+			decodeTps: null,
+			ttftP50: null,
+			costPerRequest: null,
+		});
 	});
 });

@@ -87,13 +87,16 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 	const workers: Record<string, number> = {};
 	if (isRecord(asked)) {
 		for (const [role, n] of Object.entries(asked)) {
-			if (!used.includes(role)) errors.push(`plan.workers.${role}: 레인이 없는 역할입니다`);
+			// A worker count for a role without lanes changes nothing: the role cannot spawn in this run either way.
+			if (!used.includes(role)) warnings.push(`plan.workers.${role}: 레인이 없는 역할이라 무시했습니다`);
 			else if (typeof n !== "number" || !Number.isInteger(n) || n < 1) errors.push(`plan.workers.${role}: 1 이상 정수여야 합니다`);
 		}
 	}
 	for (const role of used) {
 		const range = workerRange(role, config.roles[role]);
-		const n = isRecord(asked) && typeof asked[role] === "number" ? asked[role] : range.min;
+		// Without a count the role gets one worker per lane, inside its approved range.
+		const laneCount = lanes.filter((l) => l.role === role).length;
+		const n = isRecord(asked) && typeof asked[role] === "number" ? asked[role] : Math.min(range.max, Math.max(range.min, laneCount));
 		workers[role] = n;
 		// A role being added gets its default range (workerRange of an absent role), so its max is checked too.
 		if (n > range.max) outOfBounds.push({ kind: "workers", role, want: n, max: range.max });

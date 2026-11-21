@@ -16,19 +16,27 @@ const TIER_EXCLUDED_ROUTES = new Set([
 	"tee",
 ]);
 
-type Mix = { input: number; output: number; cacheRead: number; cacheWrite: number };
+/** Tokens per request. */
+export interface TokenMix {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
 
-/** Reference request cost in USD: 4 rates × reference token mix. */
-export function referenceCost(
-	model: Pick<ModelInfo, "cost" | "pricingKnown">,
-	priors: Priors,
-): { usd: number | null; estimated: boolean } {
-	if (!model.pricingKnown) return { usd: null, estimated: false };
+/** USD per request for the mix at the model's rates (rates are per 1M tokens); null without pricing. */
+export function mixCost(model: Pick<ModelInfo, "cost" | "pricingKnown">, mix: TokenMix): number | null {
+	if (!model.pricingKnown) return null;
+	const c = model.cost;
+	return (c.input * mix.input + c.output * mix.output + c.cacheRead * mix.cacheRead + c.cacheWrite * mix.cacheWrite) / 1e6;
+}
+
+/** Reference request cost in USD: 4 rates × reference token mix. A missing cacheRead price is estimated from the input price. */
+export function referenceCost(model: Pick<ModelInfo, "cost" | "pricingKnown">, priors: Priors): number | null {
+	if (!model.pricingKnown) return null;
 	const { cost } = model;
-	const estimated = cost.cacheRead === 0 && cost.input > 0;
-	const cacheRead = estimated ? cost.input * priors.priceTier.cacheReadFallbackRatio : cost.cacheRead;
-	const usd = userMixCost({ pricingKnown: true, cost: { ...cost, cacheRead } }, priors.priceTier.referenceMix);
-	return { usd, estimated };
+	const cacheRead = cost.cacheRead === 0 && cost.input > 0 ? cost.input * priors.priceTier.cacheReadFallbackRatio : cost.cacheRead;
+	return mixCost({ pricingKnown: true, cost: { ...cost, cacheRead } }, priors.priceTier.referenceMix);
 }
 
 export function tierOf(usd: number | null, priors: Priors): Tier | null {
@@ -38,7 +46,19 @@ export function tierOf(usd: number | null, priors: Priors): Tier | null {
 	return usd < premiumFrom ? "general" : "premium";
 }
 
-/** Tier per modelKey from the cheapest non-variant route, preferring available routes. */
+function cheapestReference(models: ModelInfo[], priors: Priors): number | null {
+	let best: number | null = null;
+	for (const m of models) {
+		const usd = referenceCost(m, priors);
+		if (usd !== null && (best === null || usd < best)) best = usd;
+	}
+	return best;
+}
+
+/**
+ * Tier per modelKey from the cheapest non-variant route. Available routes decide; when none of them is priced
+ * (a subscription at cost 0), the lineage's other routes do, so a usable model is not left without a tier.
+ */
 export function assignTiers(models: ModelInfo[], lineage: LineageFn, priors: Priors): Map<string, PriceTierInfo> {
 	const groups = new Map<string, { model: ModelInfo; variant: boolean }[]>();
 	for (const model of models) {
@@ -52,21 +72,8 @@ export function assignTiers(models: ModelInfo[], lineage: LineageFn, priors: Pri
 	for (const [key, routes] of groups) {
 		const plain = routes.filter((r) => !r.variant);
 		const candidates = (plain.length > 0 ? plain : routes).map((r) => r.model);
-		const avail = candidates.filter((m) => m.available);
-		let best: PriceTierInfo = { tier: null, referenceUsd: null, estimated: false, basis: null };
-		for (const m of avail.length > 0 ? avail : candidates) {
-			const { usd, estimated } = referenceCost(m, priors);
-			if (usd === null || (best.referenceUsd !== null && usd >= best.referenceUsd)) continue;
-			best = { tier: tierOf(usd, priors), referenceUsd: usd, estimated, basis: m.selector };
-		}
-		out.set(key, best);
+		const referenceUsd = cheapestReference(candidates.filter((m) => m.available), priors) ?? cheapestReference(candidates, priors);
+		out.set(key, { tier: tierOf(referenceUsd, priors), referenceUsd });
 	}
 	return out;
-}
-
-/** Expected USD per request for a user's mean token mix. */
-export function userMixCost(model: Pick<ModelInfo, "cost" | "pricingKnown">, mix: Mix): number | null {
-	if (!model.pricingKnown) return null;
-	const c = model.cost;
-	return (c.input * mix.input + c.output * mix.output + c.cacheRead * mix.cacheRead + c.cacheWrite * mix.cacheWrite) / 1e6;
 }

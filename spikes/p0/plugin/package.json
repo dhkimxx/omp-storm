@@ -1,8 +1,0 @@
-{
-  "name": "omp-storm-spike",
-  "version": "0.0.0",
-  "private": true,
-  "description": "OMP Storm P0 spike plugin: spawn hook, sendUserMessage probes, approval UI probe, role agents",
-  "type": "module",
-  "omp": { "extensions": ["./extension.ts"] }
-}

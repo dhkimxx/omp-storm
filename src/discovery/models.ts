@@ -19,11 +19,7 @@ function rate(value: unknown): number {
 function toIdentity(value: unknown): ModelIdentityInfo {
 	if (!isRec(value)) return { class: "unknown" };
 	const identity: ModelIdentityInfo = { class: typeof value.class === "string" ? value.class : "unknown" };
-	if (typeof value.family === "string") identity.family = value.family;
 	if (typeof value.revision === "string") identity.revision = value.revision;
-	if (typeof value.effort === "string") identity.effort = value.effort;
-	if (typeof value.thinkingVariant === "boolean") identity.thinkingVariant = value.thinkingVariant;
-	if (typeof value.logicalId === "string") identity.logicalId = value.logicalId;
 	return identity;
 }
 
@@ -43,7 +39,6 @@ export function toModelInfo(model: unknown, available: boolean): ModelInfo | und
 	const rawEfforts = isRec(model.thinking) && Array.isArray(model.thinking.efforts) ? model.thinking.efforts : [];
 	const efforts = EFFORTS.filter(e => rawEfforts.includes(e)) as Effort[];
 	const contextWindow = finite(model.contextWindow);
-	const maxTokens = finite(model.maxTokens);
 	return {
 		provider,
 		id,
@@ -53,8 +48,6 @@ export function toModelInfo(model: unknown, available: boolean): ModelInfo | und
 		cost,
 		pricingKnown: cost.input > 0 || cost.output > 0 || cost.cacheRead > 0 || cost.cacheWrite > 0,
 		contextWindow: contextWindow !== null && contextWindow > 0 ? contextWindow : null,
-		maxTokens: maxTokens !== null && maxTokens > 0 ? maxTokens : null,
-		reasoning: model.reasoning === true,
 		efforts,
 		supportsTools: model.supportsTools !== false,
 		int: finite(model.int),

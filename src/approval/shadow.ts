@@ -2,7 +2,7 @@ import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { sha256Hex } from "../config/canonical.ts";
 import { ROLE_AGENT_PREFIX } from "../roles.ts";
-import type { ShadowInfo } from "../types.ts";
+import type { ApprovalRecord, ShadowInfo } from "../types.ts";
 
 async function isDir(p: string): Promise<boolean> {
 	try {
@@ -83,4 +83,10 @@ export async function findShadows(opts: {
 	const project = projectDir ? await scan(projectDir, "project", pluginReal) : [];
 	const user = await scan(path.resolve(opts.userAgentsDir), "user", pluginReal);
 	return [...project, ...user];
+}
+
+/** Shadowing definitions the approval does not cover (new, or changed since the user saw them). */
+export function unapprovedShadows(approval: ApprovalRecord | undefined, shadows: readonly ShadowInfo[]): ShadowInfo[] {
+	const seen = approval?.scope.shadowedAgents ?? [];
+	return shadows.filter(shadow => !seen.some(s => s.agent === shadow.agent && s.sha256 === shadow.sha256));
 }

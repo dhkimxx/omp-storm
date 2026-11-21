@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compareRevision, createLineage, displayLabel } from "../src/lineage/key.ts";
-import { fillInt, fillTps } from "../src/lineage/metrics.ts";
+import { fillInt, fillTps, leadTolerance, scoreText } from "../src/lineage/metrics.ts";
 import { loadPriors } from "../src/lineage/priors.ts";
-import { assignTiers, referenceCost, tierOf, userMixCost } from "../src/lineage/price.ts";
+import { assignTiers, mixCost, referenceCost, tierOf } from "../src/lineage/price.ts";
 import type { LineageVariant, ModelIdentityInfo, ModelInfo } from "../src/types.ts";
 
 const { priors } = loadPriors({ now: Date.parse("2026-11-21") });
@@ -21,8 +21,6 @@ function m(selector: string, identity: ModelIdentityInfo, extra: Partial<ModelIn
 		cost: { input: 1, output: 1, cacheRead: 0.1, cacheWrite: 1 },
 		pricingKnown: true,
 		contextWindow: null,
-		maxTokens: null,
-		reasoning: false,
 		efforts: [],
 		supportsTools: true,
 		int: null,
@@ -32,22 +30,33 @@ function m(selector: string, identity: ModelIdentityInfo, extra: Partial<ModelIn
 	};
 }
 
-const DS = { class: "deepseek", family: "flash", revision: "4.1.0" };
+const DS = { class: "deepseek", revision: "4.1.0" };
+const OPUS = { class: "anthropic", revision: "4.7.0" };
 const catalog: ModelInfo[] = [
 	m("opencode-go/deepseek-v4.1-flash", DS),
 	m("commandcode/deepseek/deepseek-v4.1-flash-fast", DS),
 	m("mistral/deepseek-v4-1-flash-1017", DS),
-	m("openai-codex/gpt-6.1-terra", { class: "openai", family: "gpt", revision: "6.1.0" }),
-	m("openai-codex/gpt-6.1-sol", { class: "openai", family: "gpt", revision: "6.1.0" }),
-	m("openai-codex/gpt-6-luna", { class: "openai", family: "gpt", revision: "6.0.0" }),
-	m("openai-codex/gpt-6-astra", { class: "openai", family: "gpt", revision: "6.0.0" }),
-	m("openai-codex/gpt-5.6-terra", { class: "openai", family: "gpt", revision: "5.6.0" }),
-	m("minimax/MiniMax-M3.1-Flash", { class: "minimax", family: "m3" }),
-	m("minimax/MiniMax-M3.1-Flash-Preview", { class: "minimax", family: "m3" }),
+	m("openai-codex/gpt-6.1-terra", { class: "openai", revision: "6.1.0" }),
+	m("openai-codex/gpt-6.1-sol", { class: "openai", revision: "6.1.0" }),
+	m("openai-codex/gpt-6-luna", { class: "openai", revision: "6.0.0" }),
+	m("openai-codex/gpt-6-astra", { class: "openai", revision: "6.0.0" }),
+	m("openai-codex/gpt-5.6-terra", { class: "openai", revision: "5.6.0" }),
+	m("minimax/MiniMax-M3.1-Flash", { class: "minimax" }),
+	m("minimax/MiniMax-M3.1-Flash-Preview", { class: "minimax" }),
 	m("mistral/zai-glm-5-3-flash", { class: "glm", revision: "5.3.0" }),
-	m("opencode-go/glm-5.3-flash", { class: "glm", family: "glm", revision: "5.3.0" }),
-	m("anthropic/claude-haiku-5-5", { class: "anthropic", family: "haiku", revision: "5.5.0" }),
+	m("opencode-go/glm-5.3-flash", { class: "glm", revision: "5.3.0" }),
+	m("anthropic/claude-haiku-5-5", { class: "anthropic", revision: "5.5.0" }),
 	m("opencode-go/claude-haiku-5-5", { class: "unknown" }),
+	// Effort variants as one provider lists them, next to model names that end in the same words.
+	m("anthropic/claude-opus-4-7", OPUS),
+	m("cursor/claude-opus-4-7-high", OPUS),
+	m("cursor/claude-opus-4-7-max", OPUS),
+	m("cursor/claude-opus-4-7-low-fast", OPUS),
+	m("azure/gpt-5.1-codex", { class: "openai", revision: "5.1.0" }),
+	m("azure/gpt-5.1-codex-max", { class: "openai", revision: "5.1.0" }),
+	m("cursor/gpt-5.1-codex-max-high", { class: "openai", revision: "5.1.0" }),
+	m("mistral/mistral-medium", { class: "mistral" }),
+	m("mistral/mistral-large", { class: "mistral" }),
 ];
 const lineage = createLineage(catalog, priors);
 const key = (sel: string, identity?: ModelIdentityInfo) => {
@@ -56,13 +65,12 @@ const key = (sel: string, identity?: ModelIdentityInfo) => {
 };
 
 describe("lineage key", () => {
-	test("DeepSeek routes merge with route/snapshot variants", () => {
+	test("DeepSeek routes merge; route words become the variant and dates are dropped", () => {
 		const a = key("opencode-go/deepseek-v4.1-flash");
 		const b = key("commandcode/deepseek/deepseek-v4.1-flash-fast");
 		const c = key("mistral/deepseek-v4-1-flash-1017");
 		expect([a.modelKey, b.modelKey, c.modelKey]).toEqual(Array(3).fill("deepseek/flash@4.1.0"));
-		expect(b.variant.route).toBe("fast");
-		expect(c.variant.snapshot).toBe("1017");
+		expect([a.variant, b.variant, c.variant]).toEqual([{}, { route: "fast" }, {}]);
 	});
 
 	test("GPT tiers split even with identical identity", () => {
@@ -81,19 +89,69 @@ describe("lineage key", () => {
 
 	test.each([
 		["mistral/zai-glm-5-3-flash", "opencode-go/glm-5.3-flash", "glm/flash@5.3.0"],
+		// The second row has no class of its own: it is filled from the rows that share its stem.
 		["anthropic/claude-haiku-5-5", "opencode-go/claude-haiku-5-5", "anthropic/haiku@5.5.0"],
 	])("%s and %s share a key", (x, y, expected) => {
 		expect(key(x).modelKey).toBe(expected);
 		expect(key(y).modelKey).toBe(expected);
 	});
 
-	test("unknown class filled from stem", () => {
-		expect(key("opencode-go/claude-haiku-5-5").classSource).toBe("stem");
+	test.each([
+		"cursor/claude-opus-4-7-high",
+		"cursor/claude-opus-4-7-max",
+		"cursor/claude-opus-4-7-low-fast",
+		"nanogpt/anthropic/claude-opus-4.7:thinking:low",
+		"nanogpt/anthropic/claude-opus-4.7:high",
+	])("%s is an effort variant of the model, like a `:effort` suffix", (selector) => {
+		expect(key(selector, OPUS).modelKey).toBe(key("anthropic/claude-opus-4-7").modelKey);
+	});
+
+	test("`-max` and `-medium` stay part of the name unless the catalog proves them efforts", () => {
+		expect(key("azure/gpt-5.1-codex-max").modelKey).toBe("openai/codex-max@5.1.0");
+		expect(key("azure/gpt-5.1-codex").modelKey).toBe("openai/codex@5.1.0");
+		// "-high" is never a model name, so it comes off and leaves the real model.
+		expect(key("cursor/gpt-5.1-codex-max-high").modelKey).toBe("openai/codex-max@5.1.0");
+		expect(key("mistral/mistral-medium").modelKey).not.toBe(key("mistral/mistral-large").modelKey);
+	});
+
+	test("only two tails that cannot be names prove a stem, and an id listed with its own effort tail stays a model", () => {
+		const codex = { class: "openai", revision: "5.1.0" };
+		const keys = (tails: string[]) => {
+			const of = createLineage(tails.map((tail) => m(`cursor/gpt-5.1-codex-${tail}`, codex)), priors);
+			return Object.fromEntries(tails.map((tail) => [tail, of("cursor", `gpt-5.1-codex-${tail}`, codex).modelKey]));
+		};
+		// One real effort tail next to "-max" proves nothing about "-max".
+		expect(keys(["high", "max"])).toEqual({ high: "openai/codex@5.1.0", max: "openai/codex-max@5.1.0" });
+		expect(keys(["high", "low", "max"])).toEqual({ high: "openai/codex@5.1.0", low: "openai/codex@5.1.0", max: "openai/codex@5.1.0" });
+		// "codex-max-high" makes "codex-max" a model, whatever the stem proves.
+		expect(keys(["high", "low", "max", "max-high"])).toEqual({
+			high: "openai/codex@5.1.0",
+			low: "openai/codex@5.1.0",
+			max: "openai/codex-max@5.1.0",
+			"max-high": "openai/codex-max@5.1.0",
+		});
+	});
+
+	test("a single `-medium` tail is an effort when the catalog lists the bare model itself", () => {
+		const oss = { class: "gpt-oss" };
+		const mistral = { class: "mistral" };
+		const of = createLineage(
+			[
+				m("cerebras/gpt-oss-120b", oss),
+				m("antigravity/gpt-oss-120b-medium", oss),
+				m("mistral/devstral-2512", mistral),
+				m("ollama/devstral:24b", mistral),
+				m("mistral/devstral-medium", mistral),
+			],
+			priors,
+		);
+		expect(of("antigravity", "gpt-oss-120b-medium", oss).modelKey).toBe(of("cerebras", "gpt-oss-120b", oss).modelKey);
+		// "devstral" is listed only dated or tagged, never bare: Devstral Medium is its own model.
+		expect(of("mistral", "devstral-medium", mistral).modelKey).not.toBe(of("mistral", "devstral-2512", mistral).modelKey);
 	});
 
 	test.each([
-		["moonshot/kimi-k2-thinking", { class: "kimi", family: "k2" }, "moonshot/kimi-k2", { class: "kimi", family: "k2" }],
-		["mistral/mistral-medium", { class: "mistral", effort: "medium", logicalId: "mistral" }, "mistral/mistral", { class: "mistral" }],
+		["moonshot/kimi-k2-thinking", { class: "kimi" }, "moonshot/kimi-k2", { class: "kimi" }],
 		["openai/o1", { class: "openai" }, "openai/o3", { class: "openai" }],
 	])("%s stays apart from %s", (a, ia, b, ib) => {
 		expect(key(a, ia).modelKey).not.toBe(key(b, ib).modelKey);
@@ -125,13 +183,13 @@ describe("lineage key", () => {
 });
 
 describe("price tier", () => {
-	test("reference cost uses 4 rates and estimates missing cacheRead", () => {
+	test("reference cost uses 4 rates and estimates a missing cacheRead from the input price", () => {
 		const opus = { pricingKnown: true, cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 } };
-		expect(referenceCost(opus, priors).usd).toBeCloseTo(0.073, 6);
-		const noCache = referenceCost({ pricingKnown: true, cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }, priors);
-		expect(noCache).toEqual({ usd: (4000 + 16000) / 1e6, estimated: true });
-		expect(referenceCost({ ...opus, pricingKnown: false }, priors).usd).toBeNull();
-		expect(userMixCost({ ...opus, pricingKnown: false }, { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 })).toBeNull();
+		expect(referenceCost(opus, priors)).toBeCloseTo(0.073, 6);
+		expect(referenceCost({ pricingKnown: true, cost: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }, priors)).toBe((4000 + 16000) / 1e6);
+		expect(referenceCost({ ...opus, pricingKnown: false }, priors)).toBeNull();
+		expect(mixCost(opus, { input: 1e6, output: 0, cacheRead: 1e6, cacheWrite: 0 })).toBeCloseTo(4.2);
+		expect(mixCost({ ...opus, pricingKnown: false }, { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 })).toBeNull();
 	});
 
 	test.each([
@@ -144,9 +202,10 @@ describe("price tier", () => {
 		expect(tierOf(usd, priors)).toBe(tier);
 	});
 
-	test("assignTiers ignores preview and fast routes", () => {
-		const cheap = { input: 0.1, output: 0.6, cacheRead: 0.01, cacheWrite: 0 };
-		const dear = { input: 10, output: 50, cacheRead: 1, cacheWrite: 10 };
+	const cheap = { input: 0.1, output: 0.6, cacheRead: 0.01, cacheWrite: 0 };
+	const dear = { input: 10, output: 50, cacheRead: 1, cacheWrite: 10 };
+
+	test("assignTiers ignores preview and fast routes, and unavailable routes while an available one is priced", () => {
 		const models = [
 			m("minimax/MiniMax-M3.1-Flash", { class: "minimax" }, { cost: dear }),
 			m("minimax/MiniMax-M3.1-Flash-Preview", { class: "minimax" }, { cost: cheap }),
@@ -155,31 +214,64 @@ describe("price tier", () => {
 			m("x/deepseek-v4.1-flash", DS, { cost: { ...cheap, output: 0.7 }, available: false }),
 		];
 		const tiers = assignTiers(models, lineage, priors);
-		expect(tiers.get("minimax/m-flash@3.1.0")?.basis).toBe("minimax/MiniMax-M3.1-Flash");
-		expect(tiers.get("deepseek/flash@4.1.0")).toMatchObject({ basis: "opencode-go/deepseek-v4.1-flash", tier: "premium" });
+		const dearUsd = referenceCost({ pricingKnown: true, cost: dear }, priors);
+		expect(tiers.get("minimax/m-flash@3.1.0")).toEqual({ tier: "premium", referenceUsd: dearUsd });
+		expect(tiers.get("deepseek/flash@4.1.0")).toEqual({ tier: "premium", referenceUsd: dearUsd });
+	});
+
+	test("a lineage whose available routes are all unpriced takes its tier from a priced route elsewhere", () => {
+		const free = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+		const subscription = m("opencode-go/deepseek-v4.1-flash", DS, { cost: free, pricingKnown: false });
+		const listed = m("x/deepseek-v4.1-flash", DS, { cost: cheap, available: false });
+		expect(assignTiers([subscription, listed], lineage, priors).get("deepseek/flash@4.1.0")).toEqual({
+			tier: "cheap",
+			referenceUsd: referenceCost({ pricingKnown: true, cost: cheap }, priors),
+		});
+		expect(assignTiers([subscription], lineage, priors).get("deepseek/flash@4.1.0")).toEqual({ tier: null, referenceUsd: null });
 	});
 });
 
 describe("metric fill", () => {
 	const K = "deepseek/flash@4.1.0";
 	const self = m("a/x", DS);
-	test("int: self, mode by providers, tie lower, conflict, missing", () => {
-		expect(fillInt({ ...self, int: 40 }, [], priors, K)).toMatchObject({ value: 40, source: "catalog" });
-		const sib = [
-			m("p1/x", DS, { int: 32.6 }),
-			m("p2/x", DS, { int: 32.6 }),
-			m("p2/y", DS, { int: 39.5 }),
-			m("p3/x", DS, { int: 39.5 }),
-			m("p3/y", DS, { int: 39.5 }),
-			m("p4/x", DS, { int: 32.6 }),
+
+	test("int: routes that agree give an exact score, approximate only for a route without its own", () => {
+		expect(fillInt({ ...self, int: 40 }, [], priors, K)).toEqual({ value: 40, source: "lineage" });
+		const agreeing = [m("p1/x", DS, { int: 40 }), m("p2/x", DS, { int: 40 })];
+		expect(fillInt(agreeing[0]!, agreeing, priors, K)).toEqual({ value: 40, source: "lineage" });
+		expect(fillInt(self, agreeing, priors, K)).toEqual({ value: 40, source: "lineage", approx: true });
+	});
+
+	test("int: routes that disagree give every route the same median, marked approximate with the spread", () => {
+		// The bundled catalog's DeepSeek V4 Flash: 34.3 on five providers, 51.8 on six.
+		const routes = [
+			...["a", "b", "c", "d", "e"].map((p) => m(`${p}/x`, DS, { int: 34.3 })),
+			...["f", "g", "h", "i", "j", "k"].map((p) => m(`${p}/x`, DS, { int: 51.8 })),
 		];
-		expect(fillInt(self, sib, priors, K)).toMatchObject({ value: 32.6, source: "catalog:sibling(3)", conflict: true });
-		expect(fillInt(self, sib.slice(0, 5), priors, K)).toMatchObject({ value: 32.6, conflict: true });
-		expect(fillInt(self, sib.slice(0, 2), priors, K).conflict).toBeUndefined();
+		const scores = [routes[0]!, routes[10]!, self].map((route) => fillInt(route, routes, priors, K));
+		for (const score of scores) {
+			expect(score.value).toBe(51.8);
+			expect(score.approx).toBe(true);
+			expect(score.spread).toBeCloseTo(17.5);
+		}
+		// An even split takes the middle.
+		expect(fillInt(routes[0]!, [routes[0]!, routes[10]!], priors, K).value).toBeCloseTo(43.05);
+	});
+
+	test("int: a prior fills a lineage without scores; an unknown revision never borrows from other routes", () => {
 		const withPrior = { ...priors, qualityPriors: [{ key: K, metric: "int", value: 30, source: "bench" }] };
-		expect(fillInt(self, [], withPrior, K)).toMatchObject({ value: 30, confidence: "low" });
-		expect(fillInt(self, [], priors, K)).toMatchObject({ value: null, missingReason: "catalog_no_score" });
-		expect(fillInt(self, sib, priors, "deepseek/flash@?").value).toBeNull();
+		expect(fillInt(self, [], withPrior, K)).toEqual({ value: 30, source: "prior:bench", approx: true });
+		expect(fillInt(self, [], priors, K)).toEqual({ value: null, source: "none" });
+		const rolling = [m("p1/x", DS, { int: 32 }), m("p2/x", DS, { int: 60 })];
+		expect(fillInt(self, rolling, priors, "deepseek/flash@?").value).toBeNull();
+		expect(fillInt(rolling[0]!, rolling, priors, "deepseek/flash@?")).toEqual({ value: 32, source: "catalog" });
+	});
+
+	test("a score leads by more than 1 point, or more than half its own spread; scores print with ≈ when approximate", () => {
+		expect(leadTolerance({ value: 58, source: "lineage" })).toBe(1);
+		expect(leadTolerance({ value: 58, source: "lineage", approx: true, spread: 20 })).toBe(10);
+		expect(leadTolerance({ value: 58, source: "lineage", approx: true, spread: 1.2 })).toBe(1);
+		expect([{ value: 51.8, source: "lineage" }, { value: 51.8, source: "lineage", approx: true }, { value: null, source: "none" }].map(scoreText)).toEqual(["52", "≈52", "—"]);
 	});
 
 	test("tps: measured, catalog, same-speed sibling, missing", () => {
@@ -187,11 +279,11 @@ describe("metric fill", () => {
 		const fast: LineageVariant = { route: "fast" };
 		const sib = [m("f/x", DS, { tps: 500 }), m("b/x", DS, { tps: 80 })];
 		const vars = new Map([["f/x", fast], ["b/x", plain]]);
-		expect(fillTps(self, { decodeTps: 99, samples: 30 }, sib, plain, vars)).toMatchObject({ value: 99, source: "measured" });
-		expect(fillTps({ ...self, tps: 70 }, { decodeTps: 99, samples: 29 }, sib, plain, vars).value).toBe(70);
-		expect(fillTps(self, undefined, sib, plain, vars)).toMatchObject({ value: 80, confidence: "low" });
+		expect(fillTps(self, { decodeTps: 99, samples: 30 }, sib, plain, vars)).toEqual({ value: 99, source: "measured" });
+		expect(fillTps({ ...self, tps: 70 }, { decodeTps: 99, samples: 29 }, sib, plain, vars)).toEqual({ value: 70, source: "catalog" });
+		expect(fillTps(self, undefined, sib, plain, vars)).toEqual({ value: 80, source: "catalog:sibling" });
 		expect(fillTps(self, undefined, sib, fast, vars).value).toBe(500);
-		expect(fillTps(self, undefined, sib.slice(0, 1), plain, vars)).toMatchObject({ value: null, missingReason: "unmeasured" });
+		expect(fillTps(self, undefined, sib.slice(0, 1), plain, vars)).toEqual({ value: null, source: "none" });
 	});
 });
 
@@ -199,14 +291,23 @@ describe("loadPriors", () => {
 	const dir = mkdtempSync(join(tmpdir(), "storm-priors-"));
 	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-	test("user file merges maps and replaces arrays; stale warns", () => {
+	test("user file merges maps and replaces arrays; its age is no warning", () => {
 		const p = join(dir, "ok.yml");
-		writeFileSync(p, "updated: 2026-01-01\nlineage:\n  route_tokens: [turbo]\nprice_tier:\n  bounds_usd_per_request: {cheap_below: 0.02}\n");
+		writeFileSync(p, "updated: 2020-01-01\nlineage:\n  route_tokens: [turbo]\nprice_tier:\n  bounds_usd_per_request: {cheap_below: 0.02}\n");
 		const { priors: u, warnings } = loadPriors({ userPath: p, now: Date.parse("2026-11-20") });
 		expect(u.lineage.routeTokens).toEqual(["turbo"]);
 		expect(u.priceTier.boundsUsdPerRequest).toEqual({ cheapBelow: 0.02, premiumFrom: 0.06 });
 		expect(u.lineage.genericBrand.openai).toContain("gpt");
-		expect(warnings).toEqual(["사전값이 오래됐습니다(2026-01-01)"]);
+		expect(warnings).toEqual([]);
+	});
+
+	test("an expired alias is dropped with one warning", () => {
+		const live = loadPriors({ now: Date.parse("2026-11-20") });
+		expect(live.priors.lineage.aliases.length).toBeGreaterThan(0);
+		expect(live.warnings).toEqual([]);
+		const later = loadPriors({ now: Date.parse("2030-01-01") });
+		expect(later.priors.lineage.aliases).toEqual([]);
+		expect(later.warnings).toHaveLength(1);
 	});
 
 	test("malformed user file falls back to defaults", () => {

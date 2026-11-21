@@ -1,6 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { followUpBlock } from "../src/policy/followup.ts";
-import { activeAgents, approvedSelectors, decideSpawn, orderByQuota, stripEffort, withEffort } from "../src/policy/spawn.ts";
+import { deliveredFollowUp, followUpAgent, followUpBlock } from "../src/policy/followup.ts";
+import {
+	activeAgents,
+	blockedSpawn,
+	approvedSelectors,
+	decideSpawn,
+	failClosed,
+	orderByQuota,
+	PENDING_SPAWN_MS,
+	stripEffort,
+	teamGate,
+	withEffort,
+} from "../src/policy/spawn.ts";
 import type {
 	AgentEntry,
 	ApprovalRecord,
@@ -10,6 +21,7 @@ import type {
 	ShadowInfo,
 	SpawnDecision,
 	SpawnEvent,
+	SpawnOutcome,
 	SpawnRecord,
 	SpawnRuntime,
 	SpawnState,
@@ -17,53 +29,35 @@ import type {
 	TrialConfig,
 	TrialState,
 } from "../src/types.ts";
+import { agentEntry, approvalRecord, spawnRecord, teamOf } from "./fixtures.ts";
 
 const HASH = `jcs-sha256:${"ab12".repeat(16)}`;
 const NOW = Date.parse("2026-11-20T12:00:00.000Z");
 
-const config: StormConfig = {
-	version: 1,
-	priority: "balanced",
-	roles: {
-		reviewer: { agent: "storm-reviewer", models: ["openai/gpt-5.2", "anthropic/claude-x:low", "openrouter/qwen/qwen3"], effort: "high" },
-		explorer: { agent: "storm-explorer", models: ["google/gemini-flash"] },
-	},
-	parallelism: 2,
-	isolation: "isolated",
-	contract: "workflowz",
-	runtime: "omp",
-};
+const config: StormConfig = teamOf(
+	{ reviewer: { models: ["openai/gpt-5.2", "anthropic/claude-x:low", "openrouter/qwen/qwen3"], effort: "high" }, explorer: "google/gemini-flash" },
+	{ parallelism: 2, isolation: "isolated" },
+);
 
 const ok: Extract<ConfigLoad, { status: "ok" }> = {
 	status: "ok",
 	path: "/r/.omp/storm/config.json",
 	config,
 	hash: HASH,
-	rawSha256: "0".repeat(64),
 	warnings: [],
 };
 
 const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/r/.omp/agents/rev.md", scope: "project", sha256: "1".repeat(64) };
 
-function approval(overrides: Partial<ApprovalRecord> = {}, shadowedAgents: ShadowInfo[] = []): ApprovalRecord {
-	return {
-		schema: "storm.approval/v1",
-		approvalId: "apr_01JZ0000000000000000000000",
-		status: "active",
-		repoId: "git-r-000000000000000000000000",
-		configHash: HASH,
-		rawSha256: "0".repeat(64),
-		approvedAt: "2026-11-20T00:00:00.000Z",
-		approvedVia: { mode: "dialog" },
-		versions: { omp: "19.0.1", storm: "0.1.0", configSchema: 1 },
-		scope: { providers: ["openai"], roles: config.roles, runtime: "omp", shadowedAgents },
-		supersedes: null,
-		expiresAt: null,
-		...overrides,
-	};
-}
+const approval = (overrides: Partial<ApprovalRecord> = {}, shadowedAgents: ShadowInfo[] = []): ApprovalRecord =>
+	approvalRecord(HASH, { repoId: "git-r-000000000000000000000000", ...overrides }, shadowedAgents);
 
-const ev = (agent: string, patterns: string[] = []): SpawnEvent => ({ agent, invocationKind: "task", patterns });
+const ev = (agent: string, patterns: string[] = [], spawnKey?: string): SpawnEvent => ({
+	agent,
+	invocationKind: "task",
+	patterns,
+	...(spawnKey ? { spawnKey } : {}),
+});
 const state = (over: Partial<SpawnState> = {}): SpawnState => ({ config: ok, approval: approval(), shadows: [], ...over });
 const runtime = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => ({ now: NOW, quotaMarks: [], trials: {}, ...over });
 const PLAN: RunPlan = {
@@ -71,70 +65,316 @@ const PLAN: RunPlan = {
 	workers: { reviewer: 2, explorer: 2, implementer: 2 },
 	submittedAt: "2026-11-20T11:00:00.000Z",
 };
-const inRun = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => runtime({ run: { runId: "run-1", costUsd: 0, plan: PLAN }, ...over });
-const decide = (e: SpawnEvent, s: SpawnState, rt: SpawnRuntime = runtime()): SpawnDecision => decideSpawn(e, s, rt).decision;
-const reason = (d: SpawnDecision): string | undefined => (d && "block" in d ? d.reason : undefined);
+type Run = NonNullable<SpawnRuntime["run"]>;
+const inRun = (run: Partial<Run> = {}, over: Partial<SpawnRuntime> = {}): SpawnRuntime =>
+	runtime({ run: { runId: "run-1", costUsd: 0, plan: PLAN, ...run }, ...over });
 const models = (d: SpawnDecision): string[] | undefined => (d && "model" in d ? d.model : undefined);
-
-/** Config `c` loaded and approved under the same hash. */
-function withConfig(c: StormConfig): SpawnState {
-	return state({ config: { ...ok, config: c } });
+/** The block code of an outcome, checked on both the record and the text the model sees. */
+function code(outcome: SpawnOutcome): string | undefined {
+	const decision = outcome.decision;
+	if (!decision || !("block" in decision)) return undefined;
+	const recorded = outcome.record?.code;
+	expect(outcome.record?.outcome).toBe("blocked");
+	expect(decision.reason.startsWith(`[storm:${recorded}] `)).toBe(true);
+	return recorded;
 }
+const withConfig = (c: StormConfig): SpawnState => state({ config: { ...ok, config: c } });
 
-describe("decideSpawn (v0.1 cases)", () => {
-	test("leaves non-storm agents alone even when nothing is approved", () => {
+const baseTrial: TrialConfig = {
+	id: "reviewer-glm",
+	role: "reviewer",
+	model: "zai/glm-5",
+	share: 0.5,
+	maxSpawns: 3,
+	startsAt: "2026-11-20T00:00:00.000Z",
+	endsAt: "2026-11-27T00:00:00.000Z",
+	budgetUsd: 1,
+};
+
+describe("team gate", () => {
+	test("missing and invalid configs are no-config; another hash or no approval is unapproved", () => {
+		const gateCode = (s: SpawnState) => {
+			const gate = teamGate(s);
+			return gate.ok ? "ok" : gate.block.code;
+		};
+		expect(gateCode(state({ config: { status: "missing", path: "x" } }))).toBe("no-config");
+		expect(gateCode(state({ config: { status: "invalid", path: "x", errors: ["a", "b"] } }))).toBe("no-config");
+		expect(gateCode(state({ approval: undefined }))).toBe("unapproved");
+		expect(gateCode(state({ approval: approval({ configHash: `jcs-sha256:${"f".repeat(64)}` }) }))).toBe("unapproved");
+		expect(gateCode(state())).toBe("ok");
+	});
+
+	test("an approval record written by 0.8 (extra fields, approvalId) still passes", () => {
+		const old = {
+			...approval(),
+			approvalId: "apr_01JZ0000000000000000000000",
+			rawSha256: "0".repeat(64),
+			approvedVia: { mode: "dialog" },
+			versions: { omp: "19.0.1", storm: "0.8.0", configSchema: 1 },
+			supersedes: null,
+			expiresAt: null,
+		};
+		expect(teamGate(state({ approval: old })).ok).toBe(true);
+	});
+});
+
+describe("decideSpawn: storm agents", () => {
+	test("non-storm agents outside a run are left alone, with no record", () => {
 		expect(decideSpawn(ev("task"), state({ config: { status: "missing", path: "x" }, approval: undefined }), runtime())).toEqual({
 			decision: undefined,
 		});
 	});
 
-	test("blocks when config is missing or invalid", () => {
-		expect(reason(decide(ev("storm-reviewer"), state({ config: { status: "missing", path: "x" } })))).toBe(
-			"Storm 설정이 없습니다. /storm 으로 팀을 설정하세요.",
-		);
-		const invalid: ConfigLoad = { status: "invalid", path: "x", errors: ["version: 1이어야 합니다", "b"] };
-		expect(reason(decide(ev("storm-reviewer"), state({ config: invalid })))).toBe("Storm 설정 오류: version: 1이어야 합니다");
+	test("gate failures block with their code", () => {
+		expect(code(decideSpawn(ev("storm-reviewer"), state({ config: { status: "missing", path: "x" } }), runtime()))).toBe("no-config");
+		expect(code(decideSpawn(ev("storm-reviewer"), state({ approval: undefined }), runtime()))).toBe("unapproved");
 	});
 
-	test("blocks without an active approval for this exact hash", () => {
-		const expected = "승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.";
-		expect(reason(decide(ev("storm-reviewer"), state({ approval: undefined })))).toBe(expected);
-		expect(reason(decide(ev("storm-reviewer"), state({ approval: approval({ status: "revoked" }) })))).toBe(expected);
-		const other = approval({ configHash: `jcs-sha256:${"f".repeat(64)}` });
-		expect(reason(decide(ev("storm-reviewer"), state({ approval: other })))).toBe(expected);
+	test("a storm agent without a role or stand-in in the config, and a role without models, are no-config", () => {
+		expect(code(decideSpawn(ev("storm-implementer"), state(), runtime()))).toBe("no-config");
+		expect(code(decideSpawn(ev("storm-unknown"), state(), runtime()))).toBe("no-config");
+		const empty = withConfig({ ...config, roles: { ...config.roles, explorer: { agent: "storm-explorer", models: [] } } });
+		expect(code(decideSpawn(ev("storm-explorer"), empty, runtime()))).toBe("no-config");
 	});
 
-	test("blocks a storm agent the config has no role for", () => {
-		expect(reason(decide(ev("storm-implementer"), state()))).toBe("Storm 설정에 storm-implementer 역할이 없습니다.");
-	});
-
-	test("blocks unapproved shadow definitions of the spawned role only", () => {
-		const blocked = "승인되지 않은 역할 정의가 있습니다: /r/.omp/agents/rev.md. /storm 으로 확인하세요.";
-		expect(reason(decide(ev("storm-reviewer"), state({ shadows: [shadow] })))).toBe(blocked);
+	test("an unapproved shadow definition blocks the spawned role only", () => {
+		expect(code(decideSpawn(ev("storm-reviewer"), state({ shadows: [shadow] }), runtime()))).toBe("shadow");
 		// Same agent approved with different content is still unapproved.
 		const stale = approval({}, [{ ...shadow, sha256: "2".repeat(64) }]);
-		expect(reason(decide(ev("storm-reviewer"), state({ shadows: [shadow], approval: stale })))).toBe(blocked);
-		// A shadow of another role does not block this one.
-		expect(reason(decide(ev("storm-explorer"), state({ shadows: [shadow] })))).toBeUndefined();
-		// Approved (agent, sha256) pair passes.
-		const d = decide(ev("storm-reviewer"), state({ shadows: [shadow], approval: approval({}, [shadow]) }));
-		expect(d && "model" in d).toBe(true);
+		expect(code(decideSpawn(ev("storm-reviewer"), state({ shadows: [shadow], approval: stale }), runtime()))).toBe("shadow");
+		expect(code(decideSpawn(ev("storm-explorer"), state({ shadows: [shadow] }), runtime()))).toBeUndefined();
+		const seen = state({ shadows: [shadow], approval: approval({}, [shadow]) });
+		expect(decideSpawn(ev("storm-reviewer"), seen, runtime()).record?.outcome).toBe("routed");
 	});
 
-	test("routes to approved models with effort applied only where no suffix exists", () => {
-		expect(decide(ev("storm-reviewer"), state())).toEqual({
-			model: ["openai/gpt-5.2:high", "anthropic/claude-x:low", "openrouter/qwen/qwen3:high"],
-			note: "storm: storm-reviewer → openai/gpt-5.2:high",
+	test("routes to the approved models, effort applied only where no suffix exists; the record keeps key and request", () => {
+		const out = decideSpawn(ev("storm-reviewer", ["x/y"], "Rev1"), state(), runtime());
+		expect(models(out.decision)).toEqual(["openai/gpt-5.2:high", "anthropic/claude-x:low", "openrouter/qwen/qwen3:high"]);
+		expect(out.record).toMatchObject({
+			ts: "2026-11-20T12:00:00.000Z",
+			agent: "storm-reviewer",
+			requested: ["x/y"],
+			outcome: "routed",
+			role: "reviewer",
+			spawnKey: "Rev1",
 		});
-		expect(decide(ev("storm-explorer"), state())).toEqual({
-			model: ["google/gemini-flash"],
-			note: "storm: storm-explorer → google/gemini-flash",
-		});
+		expect(out.record?.code).toBeUndefined();
 	});
 
-	test("blocks a role with no models", () => {
-		const empty: ConfigLoad = { ...ok, config: { ...config, roles: { r: { agent: "storm-reviewer", models: [] } } } };
-		expect(reason(decide(ev("storm-reviewer"), state({ config: empty })))).toBeDefined();
+	test("quota marks push a role's marked providers back", () => {
+		const marks: QuotaMark[] = [{ provider: "openai", source: "user", markedAt: "2026-11-20T00:00:00Z", until: "2026-11-21T00:00:00Z" }];
+		const out = decideSpawn(ev("storm-reviewer"), state(), runtime({ quotaMarks: marks }));
+		expect(models(out.decision)).toEqual(["anthropic/claude-x:low", "openrouter/qwen/qwen3:high", "openai/gpt-5.2:high"]);
+	});
+
+	test("a spent run budget blocks storm and other agents alike, approved model or not", () => {
+		const spent = { costUsd: 5, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun(spent)))).toBe("budget");
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), inRun(spent)))).toBe("budget");
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ ...spent, costUsd: 4.99 })))).toBeUndefined();
+	});
+});
+
+describe("decideSpawn: trials", () => {
+	test("routing follows the share deterministically and tags every spawn of the role", () => {
+		const s = withConfig({ ...config, trials: [baseTrial] });
+		let counters: TrialState = { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0 };
+		const outcomes: string[] = [];
+		for (let i = 0; i < 4; i++) {
+			const out = decideSpawn(ev("storm-reviewer"), s, runtime({ trials: { [baseTrial.id]: counters } }));
+			expect(out.record?.trialId).toBe(baseTrial.id);
+			outcomes.push(out.record?.outcome ?? "");
+			if (out.record?.outcome === "trial") expect(models(out.decision)?.[0]).toBe("zai/glm-5:high");
+			counters = { ...counters, seen: counters.seen + 1, routed: counters.routed + (out.record?.outcome === "trial" ? 1 : 0) };
+		}
+		expect(outcomes).toEqual(["routed", "trial", "routed", "trial"]);
+	});
+
+	test("the candidate keeps its own effort and is not listed twice", () => {
+		const trial: TrialConfig = { ...baseTrial, model: "anthropic/claude-x", effort: "medium", share: 1 };
+		const out = decideSpawn(ev("storm-reviewer"), withConfig({ ...config, trials: [trial] }), runtime());
+		expect(models(out.decision)).toEqual(["anthropic/claude-x:medium", "openai/gpt-5.2:high", "openrouter/qwen/qwen3:high"]);
+	});
+
+	test("trials stop routing at maxSpawns, end time and budget, and wait for start", () => {
+		const s = withConfig({ ...config, trials: [{ ...baseTrial, share: 1 }] });
+		const at = (over: Partial<TrialState>, now = NOW) =>
+			decideSpawn(ev("storm-reviewer"), s, runtime({ now, trials: { [baseTrial.id]: { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0, ...over } } })).record;
+		expect(at({})?.outcome).toBe("trial");
+		expect(at({ seen: 3, routed: 3 })?.outcome).toBe("routed");
+		expect(at({ seen: 3, routed: 3 })?.trialId).toBeUndefined();
+		expect(at({ costUsd: 1 })?.outcome).toBe("routed");
+		expect(at({}, Date.parse("2026-11-27T00:00:00.000Z"))?.outcome).toBe("routed");
+		expect(at({}, Date.parse("2026-11-19T23:59:59.000Z"))?.outcome).toBe("routed");
+		expect(decideSpawn(ev("storm-explorer"), s, runtime()).record?.trialId).toBeUndefined();
+	});
+});
+
+describe("decideSpawn: other agents during a run", () => {
+	test("an approved model (effort ignored, trial candidates included) passes untouched and is recorded", () => {
+		const out = decideSpawn(ev("custom", ["anthropic/claude-x:max"]), state(), inRun());
+		expect(out.decision).toBeUndefined();
+		expect(out.record?.outcome).toBe("allowed");
+		const trial = withConfig({ ...config, trials: [baseTrial] });
+		expect(decideSpawn(ev("custom", ["zai/glm-5"]), trial, inRun()).record?.outcome).toBe("allowed");
+	});
+
+	test("an unapproved model gets the fallback role's models; without a usable fallback it is unapproved", () => {
+		const fallback = withConfig({ ...config, fallbackRole: "explorer" });
+		const out = decideSpawn(ev("custom", ["x/unknown"]), fallback, inRun());
+		expect(models(out.decision)).toEqual(["google/gemini-flash"]);
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
+		expect(code(decideSpawn(ev("custom", ["x/unknown"]), state(), inRun()))).toBe("unapproved");
+		expect(code(decideSpawn(ev("custom", []), withConfig({ ...config, fallbackRole: "ghost" }), inRun()))).toBe("unapproved");
+	});
+
+	test("an unapproved config blocks every agent during a run", () => {
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state({ approval: undefined }), inRun()))).toBe("unapproved");
+	});
+
+	test("a built-in agent gets its mapped role's models; unmapped roles fall back", () => {
+		const scout = decideSpawn(ev("scout", ["x/unknown"]), state(), inRun());
+		expect(models(scout.decision)).toEqual(["google/gemini-flash"]);
+		expect(scout.record).toMatchObject({ outcome: "substituted", role: "explorer" });
+		// `task` maps to implementer, which this team does not have.
+		const task = decideSpawn(ev("task", ["x/unknown"]), withConfig({ ...config, fallbackRole: "reviewer" }), inRun());
+		expect(task.record).toMatchObject({ outcome: "substituted", role: "reviewer" });
+	});
+
+	test("a built-in agent mapped to a role counts against that role's cap, whatever model it asked for", () => {
+		const full = inRun({ plan: { ...PLAN, workers: { explorer: 1, reviewer: 2 } }, active: { total: 1, byRole: { explorer: 1 } } });
+		expect(code(decideSpawn(ev("scout", ["x/unknown"]), state(), full))).toBe("role-cap");
+		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"]), state(), full))).toBe("role-cap");
+		// With a slot free it runs, and its record names the role so it takes the slot.
+		const free = inRun({ plan: { ...PLAN, workers: { explorer: 1, reviewer: 2 } }, active: { total: 0, byRole: {} } });
+		expect(decideSpawn(ev("scout", ["google/gemini-flash"]), state(), free).record).toMatchObject({ outcome: "allowed", role: "explorer" });
+		// A role the plan has no lane for cannot spawn through its built-in either.
+		const noLane = inRun({ plan: { ...PLAN, workers: { reviewer: 2 } } });
+		expect(code(decideSpawn(ev("scout", ["x/unknown"]), state(), noLane))).toBe("role-not-in-plan");
+	});
+});
+
+describe("decideSpawn: role states", () => {
+	const team: StormConfig = {
+		...config,
+		roles: {
+			implementer: { agent: "storm-implementer", models: ["a/impl"] },
+			reviewer: { agent: "storm-reviewer", models: ["a/rev"] },
+		},
+		disabledRoles: ["architect"],
+	};
+
+	test("a disabled role is blocked as disabled-role and recorded under its own id", () => {
+		const out = decideSpawn(ev("storm-architect"), withConfig(team), runtime());
+		expect(code(out)).toBe("disabled-role");
+		expect(out.record?.role).toBe("architect");
+	});
+
+	test("a missing role borrows its nearest configured stand-in, never that role's trial", () => {
+		const out = decideSpawn(ev("storm-quick"), withConfig(team), runtime());
+		expect(models(out.decision)).toEqual(["a/impl"]);
+		expect(out.record).toMatchObject({ outcome: "substituted", role: "implementer" });
+		const trial: TrialConfig = { ...baseTrial, role: "implementer", share: 1 };
+		const borrowed = decideSpawn(ev("storm-quick"), withConfig({ ...team, trials: [trial] }), runtime());
+		expect(borrowed.record?.outcome).toBe("substituted");
+		expect(borrowed.record?.trialId).toBeUndefined();
+	});
+
+	test("a stand-in spawn counts against the role it asked for", () => {
+		const plan: RunPlan = { ...PLAN, workers: { quick: 1, implementer: 2 } };
+		const busy = inRun({ plan, active: { total: 1, byRole: { quick: 1 } } });
+		expect(code(decideSpawn(ev("storm-quick"), withConfig({ ...team, parallelism: 4 }), busy))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-implementer"), withConfig({ ...team, parallelism: 4 }), busy))).toBeUndefined();
+	});
+});
+
+describe("decideSpawn: run plan and live caps", () => {
+	test("order of the run checks: budget, then plan, then role, then the team's parallelism", () => {
+		const spent = { costUsd: 9, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
+		const { plan: _plan, ...noPlan } = inRun().run as Run;
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: { ...noPlan, ...spent } })))).toBe("budget");
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: noPlan })))).toBe("no-plan");
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), runtime({ run: noPlan })))).toBe("no-plan");
+		const full = { total: 2, byRole: { reviewer: 2 } };
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ active: full })))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ active: full })))).toBe("parallelism");
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ active: full })))).toBe("parallelism");
+	});
+
+	test("a role absent from the plan cannot spawn; outside a run no plan is needed", () => {
+		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1 } };
+		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan })))).toBe("role-not-in-plan");
+		expect(code(decideSpawn(ev("storm-explorer"), state(), runtime()))).toBeUndefined();
+	});
+
+	test("the role cap is the plan's workers for the role", () => {
+		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1, explorer: 1 } };
+		const wide = withConfig({ ...config, parallelism: 8 });
+		expect(code(decideSpawn(ev("storm-reviewer"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } })))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-reviewer"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } })))).toBeUndefined();
+	});
+});
+
+describe("failClosed", () => {
+	const boom = async (): Promise<SpawnDecision> => {
+		throw new Error("state file unreadable");
+	};
+	const blockCode = (d: SpawnDecision) => (d && "block" in d ? /^\[storm:([a-z-]+)\] /.exec(d.reason)?.[1] : undefined);
+
+	test("a failure while deciding blocks storm-* agents, in a run or not", async () => {
+		expect(blockCode(await failClosed("storm-implementer", () => false, boom))).toBe("internal");
+		expect(blockCode(await failClosed("storm-implementer", () => true, boom))).toBe("internal");
+	});
+
+	test("it blocks any agent during a run and leaves other agents alone outside one", async () => {
+		expect(blockCode(await failClosed("task", () => true, boom))).toBe("internal");
+		expect(await failClosed("task", () => false, boom)).toBeUndefined();
+	});
+
+	test("not knowing whether a run is active counts as a run", async () => {
+		const unknown = () => {
+			throw new Error("no ledger");
+		};
+		expect(blockCode(await failClosed("task", unknown, boom))).toBe("internal");
+	});
+
+	test("a decision that succeeds is returned as is", async () => {
+		const decision: SpawnDecision = { model: ["a/b"], note: "n" };
+		expect(await failClosed("storm-implementer", () => true, async () => decision)).toBe(decision);
+		expect(await failClosed("task", () => true, async () => undefined)).toBeUndefined();
+	});
+
+	test("a decision that outlasts its deadline is blocked like a failed one, and the block is reported once", async () => {
+		// A hung git call or state read: the decision never settles.
+		const hung = () => Promise.withResolvers<SpawnDecision>().promise;
+		const expired = Promise.reject<never>(new Error("deadline"));
+		const blocks: string[] = [];
+		const decision = await failClosed("storm-implementer", () => true, hung, { expired, onBlock: block => blocks.push(block.code) });
+		expect(blockCode(decision)).toBe("internal");
+		expect(blocks).toEqual(["internal"]);
+		// Outside a run another agent stays omp's business, and nothing is reported.
+		expect(await failClosed("task", () => false, hung, { expired, onBlock: block => blocks.push(block.code) })).toBeUndefined();
+		expect(blocks).toHaveLength(1);
+	});
+
+	test("a decision in time wins over the deadline; a throwing report does not lift the block", async () => {
+		const pending = Promise.withResolvers<never>();
+		const decision: SpawnDecision = { model: ["a/b"], note: "n" };
+		expect(await failClosed("storm-implementer", () => true, async () => decision, { expired: pending.promise })).toBe(decision);
+		const failing = () => {
+			throw new Error("ledger gone");
+		};
+		expect(blockCode(await failClosed("storm-implementer", () => true, boom, { onBlock: failing }))).toBe("internal");
+	});
+
+	test("an internal block makes a spawn record with its code, like any other block", async () => {
+		const event: SpawnEvent = { agent: "storm-implementer", invocationKind: "task", patterns: ["a/b:high"], spawnKey: "Impl" };
+		const records: SpawnRecord[] = [];
+		await failClosed("storm-implementer", () => true, boom, { onBlock: block => records.push(blockedSpawn(event, block, NOW)) });
+		expect(records).toMatchObject([
+			{ ts: new Date(NOW).toISOString(), agent: "storm-implementer", invocationKind: "task", requested: ["a/b:high"], outcome: "blocked", code: "internal", spawnKey: "Impl" },
+		]);
+		expect(records[0]?.reason).toContain("state file unreadable");
 	});
 });
 
@@ -173,414 +413,99 @@ describe("selector helpers", () => {
 	});
 });
 
-const baseTrial: TrialConfig = {
-	id: "reviewer-glm",
-	role: "reviewer",
-	model: "zai/glm-5",
-	share: 0.5,
-	maxSpawns: 3,
-	startsAt: "2026-11-20T00:00:00.000Z",
-	endsAt: "2026-11-27T00:00:00.000Z",
-	budgetUsd: 1,
-};
-
-describe("decideSpawn (v0.2 storm agents)", () => {
-	test("records routed spawns with timestamps and requested patterns", () => {
-		const out = decideSpawn(ev("storm-explorer", ["pi/smol"]), state(), runtime());
-		expect(out.record).toEqual({
-			ts: "2026-11-20T12:00:00.000Z",
-			agent: "storm-explorer",
-			invocationKind: "task",
-			requested: ["pi/smol"],
-			outcome: "routed",
-			models: ["google/gemini-flash"],
-			role: "explorer",
-		});
-	});
-
-	test("the caller's spawn key is kept so the record points at the subagent (agent://<key>)", () => {
-		const out = decideSpawn({ ...ev("storm-implementer", ["pi/smol"]), spawnKey: "ResidencyImpl" }, state(), runtime());
-		expect(out.record?.spawnKey).toBe("ResidencyImpl");
-		const blocked = decideSpawn({ ...ev("storm-reviewer"), spawnKey: "Review" }, state({ approval: undefined }), runtime());
-		expect(blocked.record).toMatchObject({ outcome: "blocked", spawnKey: "Review" });
-	});
-
-	test("blocked storm spawns carry the reason in the record", () => {
-		const out = decideSpawn(ev("storm-reviewer"), state({ approval: undefined }), runtime());
-		expect(out.record?.outcome).toBe("blocked");
-		expect(out.record?.reason).toBe("승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.");
-	});
-
-	test("blocks new storm spawns once the run budget is spent", () => {
-		const budget = { perRunUsd: 5, onExceed: "block-spawns" as const };
-		const over = inRun({ run: { runId: "run-1", costUsd: 5.2, budget } });
-		const out = decideSpawn(ev("storm-reviewer"), state(), over);
-		expect(reason(out.decision)).toBe("Storm 실행 예산 $5.00을 넘었습니다(누계 $5.20). 새 스폰을 막습니다.");
-		expect(out.record).toMatchObject({ outcome: "blocked", role: "reviewer" });
-		const small = inRun({ run: { runId: "run-1", costUsd: 0.75, budget: { ...budget, perRunUsd: 0.5 } } });
-		expect(reason(decide(ev("storm-explorer"), state(), small))).toBe(
-			"Storm 실행 예산 $0.5000을 넘었습니다(누계 $0.7500). 새 스폰을 막습니다.",
-		);
-		const under = inRun({ run: { runId: "run-1", costUsd: 4.99, budget, plan: PLAN } });
-		expect(models(decide(ev("storm-explorer"), state(), under))).toEqual(["google/gemini-flash"]);
-	});
-
-	test("quota marks push a role's marked providers back", () => {
-		const marks: QuotaMark[] = [{ provider: "openai", source: "user", markedAt: "2026-11-20T00:00:00Z", until: "2026-11-21T00:00:00Z" }];
-		const d = decide(ev("storm-reviewer"), state(), runtime({ quotaMarks: marks }));
-		expect(d).toEqual({
-			model: ["anthropic/claude-x:low", "openrouter/qwen/qwen3:high", "openai/gpt-5.2:high"],
-			note: "storm: storm-reviewer → anthropic/claude-x:low",
-		});
-	});
-
-	test("trial routing follows the share deterministically and tags every spawn", () => {
-		const s = withConfig({ ...config, trials: [baseTrial] });
-		let counters: TrialState = { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0 };
-		const outcomes: string[] = [];
-		for (let i = 0; i < 4; i++) {
-			const out = decideSpawn(ev("storm-reviewer"), s, runtime({ trials: { [baseTrial.id]: counters } }));
-			expect(out.record?.trialId).toBe(baseTrial.id);
-			outcomes.push(out.record?.outcome ?? "");
-			if (out.record?.outcome === "trial") {
-				expect(models(out.decision)).toEqual([
-					"zai/glm-5:high",
-					"openai/gpt-5.2:high",
-					"anthropic/claude-x:low",
-					"openrouter/qwen/qwen3:high",
-				]);
-			}
-			counters = { ...counters, seen: counters.seen + 1, routed: counters.routed + (out.record?.outcome === "trial" ? 1 : 0) };
-		}
-		expect(outcomes).toEqual(["routed", "trial", "routed", "trial"]);
-	});
-
-	test("trial candidate keeps its own effort and is not listed twice", () => {
-		const trial: TrialConfig = { ...baseTrial, model: "anthropic/claude-x", effort: "medium", share: 1 };
-		const d = decide(ev("storm-reviewer"), withConfig({ ...config, trials: [trial] }));
-		expect(models(d)).toEqual(["anthropic/claude-x:medium", "openai/gpt-5.2:high", "openrouter/qwen/qwen3:high"]);
-	});
-
-	test("trials stop routing at maxSpawns, end time and budget, and wait for start", () => {
-		const s = withConfig({ ...config, trials: [{ ...baseTrial, share: 1 }] });
-		const at = (over: Partial<TrialState>, now = NOW) =>
-			decideSpawn(ev("storm-reviewer"), s, runtime({ now, trials: { [baseTrial.id]: { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0, ...over } } })).record;
-		expect(at({})?.outcome).toBe("trial");
-		expect(at({ seen: 3, routed: 3 })).toMatchObject({ outcome: "routed" });
-		expect(at({ seen: 3, routed: 3 })?.trialId).toBeUndefined();
-		expect(at({ costUsd: 1 })?.outcome).toBe("routed");
-		expect(at({}, Date.parse("2026-11-27T00:00:00.000Z"))?.outcome).toBe("routed");
-		expect(at({}, Date.parse("2026-11-19T23:59:59.000Z"))?.outcome).toBe("routed");
-		// Trials of another role never touch this one.
-		expect(decideSpawn(ev("storm-explorer"), s, runtime()).record?.trialId).toBeUndefined();
-	});
-});
-
-describe("decideSpawn (v0.2 non-Storm agents)", () => {
-	test("stays out with no record outside a run", () => {
-		expect(decideSpawn(ev("task", ["evil/model"]), state(), runtime())).toEqual({ decision: undefined });
-		expect(decideSpawn(ev("scout"), state({ approval: undefined }), runtime())).toEqual({ decision: undefined });
-	});
-
-	test("allows approved models during a run, ignoring effort suffixes", () => {
-		const out = decideSpawn(ev("task", ["openai/gpt-5.2:low"]), state(), inRun());
-		expect(out.decision).toBeUndefined();
-		expect(out.record).toEqual({
-			ts: "2026-11-20T12:00:00.000Z",
-			agent: "task",
-			invocationKind: "task",
-			requested: ["openai/gpt-5.2:low"],
-			outcome: "allowed",
-		});
-	});
-
-	test("allows trial candidates as approved models", () => {
-		const out = decideSpawn(ev("scout", ["zai/glm-5"]), withConfig({ ...config, trials: [baseTrial] }), inRun());
-		expect(out.record?.outcome).toBe("allowed");
-	});
-
-	test("substitutes the fallback role's models for unapproved requests", () => {
-		const marks: QuotaMark[] = [{ provider: "openai", source: "usage", markedAt: "2026-11-20T00:00:00Z", until: "2026-11-21T00:00:00Z" }];
-		const out = decideSpawn(ev("task", ["evil/model:high"]), withConfig({ ...config, fallbackRole: "reviewer" }), inRun({ quotaMarks: marks }));
-		expect(out.decision).toEqual({
-			model: ["anthropic/claude-x:low", "openrouter/qwen/qwen3:high", "openai/gpt-5.2:high"],
-			note: "storm: task → anthropic/claude-x:low",
-		});
-		expect(out.record).toMatchObject({
-			outcome: "substituted",
-			role: "reviewer",
-			reason: "승인 밖 모델 evil/model → reviewer 역할 모델",
-			requested: ["evil/model:high"],
-			models: ["anthropic/claude-x:low", "openrouter/qwen/qwen3:high", "openai/gpt-5.2:high"],
-		});
-	});
-
-	test("blocks unapproved requests without a usable fallback role", () => {
-		const out = decideSpawn(ev("task", ["evil/model"]), state(), inRun());
-		expect(reason(out.decision)).toBe("Storm 실행 중에는 승인된 모델만 쓸 수 있습니다(요청: evil/model). /storm 으로 대체 역할을 정하세요.");
-		expect(out.record).toMatchObject({ outcome: "blocked", requested: ["evil/model"] });
-		const empty = withConfig({ ...config, fallbackRole: "gone" });
-		expect(reason(decide(ev("task"), empty, inRun()))).toBe(
-			"Storm 실행 중에는 승인된 모델만 쓸 수 있습니다(요청: 없음). /storm 으로 대체 역할을 정하세요.",
-		);
-	});
-
-	test("blocks during a run when the config is not approved", () => {
-		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state({ approval: undefined }), inRun()))).toBe(
-			"승인되지 않은 Storm 설정입니다(ab12ab12ab12). /storm 으로 승인하세요.",
-		);
-		expect(reason(decide(ev("task"), state({ config: { status: "missing", path: "x" } }), inRun()))).toBe(
-			"Storm 설정이 없습니다. /storm 으로 팀을 설정하세요.",
-		);
-	});
-
-	test("blocks during a run once the budget is spent, even for approved models", () => {
-		const over = inRun({ run: { runId: "run-1", costUsd: 12.5, budget: { perRunUsd: 10, onExceed: "stop" } } });
-		const out = decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), over);
-		expect(reason(out.decision)).toBe("Storm 실행 예산 $10.00을 넘었습니다(누계 $12.50). 새 스폰을 막습니다.");
-		expect(out.record?.outcome).toBe("blocked");
-	});
-});
-
-describe("decideSpawn (v0.7 role states)", () => {
-	const team: StormConfig = {
-		...config,
-		roles: {
-			implementer: { agent: "storm-implementer", models: ["openai/gpt-5.2"], effort: "medium" },
-			reviewer: config.roles.reviewer!,
-		},
-	};
-
-	test("a disabled role is blocked and points to its first configured stand-in", () => {
-		const out = decideSpawn(ev("storm-explorer"), withConfig({ ...team, disabledRoles: ["explorer"] }), runtime());
-		expect(reason(out.decision)).toBe(
-			"storm-explorer(탐색)는 이 팀에서 쓰지 않습니다(설정에서 사용 안 함). 대신 storm-implementer 를 쓰세요.",
-		);
-		const arch = decideSpawn(ev("storm-architect"), withConfig({ ...team, disabledRoles: ["architect"] }), runtime());
-		expect(reason(arch.decision)).toContain("대신 storm-reviewer 를 쓰세요.");
-	});
-
-	test("a missing role borrows the first configured stand-in, skipping unconfigured ones", () => {
-		// explorer → [quick, implementer]: quick is not configured, so implementer's models carry its effort.
-		const out = decideSpawn(ev("storm-explorer"), withConfig(team), runtime());
-		expect(models(out.decision)).toEqual(["openai/gpt-5.2:medium"]);
-		expect(out.record).toMatchObject({ outcome: "substituted", role: "implementer", reason: "설정에 없는 역할 → implementer 역할 모델" });
-		// A disabled stand-in is skipped too.
-		const withQuick: StormConfig = { ...team, roles: { ...team.roles, quick: { agent: "storm-quick", models: ["google/flash"] } } };
-		expect(models(decide(ev("storm-explorer"), withConfig(withQuick)))).toEqual(["google/flash"]);
-		const quickOff = { ...team, disabledRoles: ["quick"] };
-		expect(models(decide(ev("storm-explorer"), withConfig(quickOff)))).toEqual(["openai/gpt-5.2:medium"]);
-	});
-
-	test("stand-in routing never goes to the stand-in's trial", () => {
-		const s = withConfig({ ...team, trials: [baseTrial] });
-		const counters: TrialState = { id: baseTrial.id, seen: 0, routed: 0, costUsd: 0 };
-		const out = decideSpawn(ev("storm-architect"), s, runtime({ trials: { [baseTrial.id]: counters } }));
-		expect(out.record?.outcome).toBe("substituted");
-		expect(out.record?.trialId).toBeUndefined();
-		expect(models(out.decision)?.some(m => m.startsWith("zai/"))).toBe(false);
-	});
-
-	test("a missing role with no configured stand-in is blocked", () => {
-		const only: StormConfig = { ...config, roles: { reviewer: config.roles.reviewer! } };
-		expect(reason(decide(ev("storm-quick"), withConfig(only)))).toBe("Storm 설정에 storm-quick 역할이 없습니다.");
-	});
-
-	test("stand-in spawns still honor the budget gate", () => {
-		const out = decideSpawn(ev("storm-explorer"), withConfig(team), inRun({ run: { runId: "r", costUsd: 3, budget: { perRunUsd: 2, onExceed: "block-spawns" } } }));
-		expect(out.record?.outcome).toBe("blocked");
-	});
-
-	test("scout in a run gets explorer's models for an unapproved model; approved models pass", () => {
-		const s = withConfig({ ...config, fallbackRole: "reviewer" });
-		const out = decideSpawn(ev("scout", ["x/unknown"]), s, inRun());
-		expect(models(out.decision)).toEqual(["google/gemini-flash"]);
-		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
-		expect(decideSpawn(ev("scout", ["openai/gpt-5.2"]), s, inRun())).toMatchObject({
-			decision: undefined,
-			record: { outcome: "allowed" },
-		});
-	});
-
-	test("a built-in mapped to an unconfigured role falls back to fallbackRole", () => {
-		const out = decideSpawn(ev("task", ["x/unknown"]), withConfig({ ...config, fallbackRole: "explorer" }), inRun());
-		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
-		const blocked = decideSpawn(ev("task", ["x/unknown"]), withConfig(config), inRun());
-		expect(blocked.record?.outcome).toBe("blocked");
-	});
-});
-
-describe("decideSpawn (v0.8 run plan and live caps)", () => {
-	const run = (plan: RunPlan | undefined, active: { total: number; byRole: Record<string, number> } = { total: 0, byRole: {} }) =>
-		runtime({ run: { runId: "run-1", costUsd: 0, ...(plan ? { plan } : {}), active } });
-	const plan = (workers: Record<string, number>): RunPlan => ({ ...PLAN, workers });
-
-	test("during a run every Storm-decided spawn waits for a plan; outside runs nothing changes", () => {
-		const storm = decideSpawn(ev("storm-explorer"), state(), run(undefined));
-		expect(reason(storm.decision)).toContain("storm 도구의 plan 동작");
-		expect(storm.record).toMatchObject({ outcome: "blocked", role: "explorer" });
-		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state(), run(undefined)))).toContain("plan 동작");
-		expect(reason(decide(ev("task", ["evil/model"]), state(), run(undefined)))).toContain("plan 동작");
-		// Outside a run: no plan, no caps.
-		expect(models(decide(ev("storm-explorer"), state(), runtime()))).toEqual(["google/gemini-flash"]);
-		expect(decideSpawn(ev("task", ["evil/model"]), state(), runtime())).toEqual({ decision: undefined });
-	});
-
-	test("a storm role the plan gives no workers is blocked with a resubmit hint", () => {
-		const out = decideSpawn(ev("storm-reviewer"), state(), run(plan({ explorer: 2 })));
-		expect(reason(out.decision)).toContain("reviewer 역할 레인이 없어");
-		expect(reason(out.decision)).toContain("계획을 다시 내세요");
-		expect(reason(decide(ev("storm-reviewer"), state(), run(plan({ reviewer: 0, explorer: 2 }))))).toContain("레인이 없어");
-	});
-
-	test("the role cap is the plan's workers for it; the reason names the cap, the count and the role max", () => {
-		const full = decideSpawn(ev("storm-explorer"), state(), run(plan({ explorer: 2 }), { total: 2, byRole: { explorer: 2 } }));
-		const why = reason(full.decision) ?? "";
-		expect(why).toContain("storm-explorer 2개가 실행 중");
-		expect(why).toContain("상한 2개");
-		expect(why).toContain("재사용");
-		expect(why).toContain("최대 4개");
-		const roomy = { ...config, parallelism: 8 };
-		expect(models(decide(ev("storm-explorer"), withConfig(roomy), run(plan({ explorer: 2 }), { total: 1, byRole: { explorer: 1 } })))).toEqual([
-			"google/gemini-flash",
-		]);
-		// Other roles' agents do not use up this role's cap.
-		expect(models(decide(ev("storm-explorer"), withConfig(roomy), run(plan({ explorer: 1 }), { total: 3, byRole: { reviewer: 3 } })))).toEqual([
-			"google/gemini-flash",
-		]);
-		// The max comes from the role's configured range.
-		const ranged = withConfig({ ...config, roles: { ...config.roles, explorer: { ...config.roles.explorer!, workers: { min: 1, max: 6 } } } });
-		expect(reason(decide(ev("storm-explorer"), ranged, run(plan({ explorer: 1 }), { total: 1, byRole: { explorer: 1 } })))).toContain("최대 6개");
-	});
-
-	test("the team's parallelism caps all live agents, storm and other agents alike", () => {
-		const busy = run(plan({ explorer: 4 }), { total: 2, byRole: { reviewer: 2 } });
-		expect(reason(decide(ev("storm-explorer"), state(), busy))).toContain("팀 동시 상한 2개");
-		expect(reason(decide(ev("task", ["openai/gpt-5.2"]), state(), busy))).toContain("팀 동시 상한 2개");
-		expect(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), run(plan({}), { total: 1, byRole: {} })).record?.outcome).toBe("allowed");
-	});
-
-	test("a stand-in spawn counts against the role it asked for, not the borrowed one", () => {
-		const team = withConfig({
-			...config,
-			parallelism: 8,
-			roles: { implementer: { agent: "storm-implementer", models: ["openai/gpt-5.2"] }, reviewer: config.roles.reviewer! },
-		});
-		const p = plan({ explorer: 1, implementer: 1 });
-		expect(reason(decide(ev("storm-explorer"), team, run(p, { total: 1, byRole: { explorer: 1 } })))).toContain("상한 1개");
-		const out = decideSpawn(ev("storm-explorer"), team, run(p, { total: 1, byRole: { implementer: 1 } }));
-		expect(out.record).toMatchObject({ outcome: "substituted", role: "implementer" });
-		// A plan without the requested role blocks the stand-in even when the borrowed role has room.
-		expect(reason(decide(ev("storm-explorer"), team, run(plan({ implementer: 2 }))))).toContain("explorer 역할 레인이 없어");
-	});
-});
+const ledgerAgent = (over: Partial<AgentEntry> = {}): AgentEntry =>
+	agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", runId: "run-1", startedAt: NOW - 60_000, lastActivityAt: NOW, contextTokens: 10_000, ...over });
 
 describe("activeAgents", () => {
-	const rec = (spawnKey: string | undefined, over: Partial<SpawnRecord> = {}): SpawnRecord => ({
-		ts: new Date(NOW - 10_000).toISOString(),
-		agent: "storm-explorer",
-		invocationKind: "task",
-		requested: [],
-		outcome: "routed",
-		role: "explorer",
-		...(spawnKey === undefined ? {} : { spawnKey }),
-		...over,
-	});
-	const agent = (id: string, state: AgentEntry["state"]): AgentEntry => ({
-		id,
-		name: "storm-explorer",
-		state,
-		startedAt: NOW - 60_000,
-		lastActivityAt: NOW,
-		contextTokens: 0,
-		requests: 0,
-		costUsd: 0,
-		followUps: 0,
-	});
+	const rec = (spawnKey: string | undefined, over: Partial<SpawnRecord> = {}): SpawnRecord => {
+		const { spawnKey: _default, ...record } = spawnRecord({ ts: new Date(NOW - 10_000).toISOString(), agent: "storm-explorer", role: "explorer", ...over });
+		return spawnKey === undefined ? record : { ...record, spawnKey };
+	};
+	const live = (id: string, s: AgentEntry["state"]): AgentEntry => ledgerAgent({ id, name: "storm-explorer", role: "explorer", state: s });
 
-	test("running and just-decided agents count; settled, stale, blocked and unkeyed ones do not", () => {
+	test("running and just-decided agents count; settled, blocked and unkeyed ones do not", () => {
 		const { role: _role, ...task } = rec("Task", { agent: "task", outcome: "allowed" });
 		const spawns = [
 			rec("Running"),
 			rec("Idle"),
 			rec("Parked", { role: "reviewer", agent: "storm-reviewer" }),
 			rec("Pending", { role: "reviewer", agent: "storm-reviewer" }),
-			rec("Stale", { ts: new Date(NOW - 3 * 60_000).toISOString() }),
 			rec("Refused", { outcome: "blocked" }),
 			rec(undefined),
 			task,
 		];
-		const agents = [agent("Running", "running"), agent("Idle", "idle"), agent("Parked", "parked"), agent("Task", "running")];
+		const agents = [live("Running", "running"), live("Idle", "idle"), live("Parked", "parked"), live("Task", "running")];
 		expect(activeAgents(spawns, agents, NOW)).toEqual({ total: 3, byRole: { explorer: 1, reviewer: 1 } });
 	});
 
-	test("a storm stand-in counts under the role it asked for", () => {
+	test("a spawn that never reported holds its slot for the pending window only", () => {
+		expect(PENDING_SPAWN_MS).toBe(30_000);
+		const at = (age: number) => activeAgents([rec("Ghost", { ts: new Date(NOW - age).toISOString() })], [], NOW).total;
+		expect(at(PENDING_SPAWN_MS - 1)).toBe(1);
+		expect(at(PENDING_SPAWN_MS)).toBe(0);
+	});
+
+	test("a storm stand-in counts under the role it asked for; a built-in under the role it got", () => {
 		const standIn = rec("Scout", { outcome: "substituted", role: "implementer" });
 		const builtin = rec("Task", { agent: "task", outcome: "substituted", role: "implementer" });
 		expect(activeAgents([standIn, builtin], [], NOW).byRole).toEqual({ explorer: 1, implementer: 1 });
 	});
 });
 
-describe("followUpBlock", () => {
-	const agent = (over: Partial<AgentEntry> = {}): AgentEntry => ({
-		id: "Impl",
-		name: "storm-implementer",
-		role: "implementer",
-		state: "idle",
-		startedAt: 0,
-		lastActivityAt: 0,
-		contextTokens: 230_000,
-		contextWindow: 1_000_000,
-		requests: 40,
-		costUsd: 3,
-		followUps: 2,
-		...over,
-	});
-	const write = (path: string) => ({ path, content: "다음 단계" });
+describe("follow-ups", () => {
+	const write = (id: string) => ({ path: `agent://${id}`, content: "fix the findings" });
+	const blockOf = (agents: AgentEntry[], c: StormConfig = config, id = "Rev") => followUpBlock("write", write(id), agents, c)?.code;
 
-	test("a follow-up to an agent at or past its cap is blocked with a fresh-agent instruction", () => {
-		const why = followUpBlock("write", write("agent://Impl"), [agent()], config) ?? "";
-		expect(why).toContain("Impl(implementer)");
-		expect(why).toContain("230.0k 토큰(창의 23%)");
-		expect(why).toContain("상한 200.0k 토큰");
-		expect(why).toContain("새 storm-implementer 를 띄워");
-		expect(why).toContain("agent://Impl 의 결과를 읽고 이어서 진행하라");
-		expect(why).toContain("요약해 넘길 필요는 없습니다");
-		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 200_000 })], config)).toBeDefined();
-		// Sub-paths and queries address the same agent.
-		expect(followUpBlock("write", write("agent://Impl/result?x=1"), [agent()], config)).toBeDefined();
+	test("an agent at or past the team cap takes no follow-up; below it one passes", () => {
+		expect(blockOf([ledgerAgent({ contextTokens: 199_999 })])).toBeUndefined();
+		expect(blockOf([ledgerAgent({ contextTokens: 200_000 })])).toBe("followup-cap");
+		expect(blockOf([ledgerAgent({ contextTokens: 60_000 })], { ...config, contextCap: 50_000 })).toBe("followup-cap");
 	});
 
-	test("under the cap, or with a role cap set higher, it passes", () => {
-		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 199_999 })], config)).toBeUndefined();
-		const roomy = { ...config, roles: { ...config.roles, implementer: { agent: "storm-implementer", models: ["a/i"], contextCap: 300_000 } } };
-		expect(followUpBlock("write", write("agent://Impl"), [agent()], roomy)).toBeUndefined();
+	test("the role's cap overrides the team's", () => {
+		const roleCap: StormConfig = { ...config, contextCap: 50_000, roles: { ...config.roles, reviewer: { ...config.roles.reviewer!, contextCap: 300_000 } } };
+		expect(blockOf([ledgerAgent({ contextTokens: 250_000 })], roleCap)).toBeUndefined();
+		expect(blockOf([ledgerAgent({ contextTokens: 300_000 })], roleCap)).toBe("followup-cap");
 	});
 
-	test("70% of the window beats a higher token cap", () => {
-		const high = { ...config, contextCap: 500_000 };
-		const why = followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 150_000, contextWindow: 200_000 })], high) ?? "";
-		expect(why).toContain("상한 140.0k 토큰");
-		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 139_999, contextWindow: 200_000 })], high)).toBeUndefined();
+	test("the cap has no share of the model's window: a small-window agent is allowed far past 70% of it", () => {
+		// 95k of a 100k window was blocked at 70k before; omp compacts such agents itself.
+		expect(blockOf([ledgerAgent({ contextTokens: 95_000, model: "mistral/small-100k" })])).toBeUndefined();
 	});
 
-	test("a follow-up to a cleaned agent is blocked whatever its context, with the same handoff", () => {
-		const cleaned = agent({ contextTokens: 1_000, cleanedAt: 5 });
-		const why = followUpBlock("write", write("agent://Impl"), [cleaned], config) ?? "";
-		expect(why).toContain("omp 기록이 지워져");
-		expect(why).toContain("새 storm-implementer 를 띄워");
-		expect(why).toContain("agent://Impl 의 결과를 읽고");
-		const { role: _role, ...plain } = agent({ id: "X", name: "task", contextTokens: 1_000, cleanedAt: 5 });
-		expect(followUpBlock("write", write("agent://X"), [plain], config)).toContain("새 task 를 띄워");
-		expect(followUpBlock("write", write("agent://Impl"), [agent({ contextTokens: 1_000 })], config)).toBeUndefined();
+	test("the cap covers agents of earlier runs and agents no run started", () => {
+		expect(blockOf([ledgerAgent({ runId: "run-0", contextTokens: 400_000 })])).toBe("followup-cap");
+		const { runId: _runId, ...noRun } = ledgerAgent({ contextTokens: 400_000 });
+		expect(blockOf([noRun])).toBe("followup-cap");
 	});
 
-	test("other tools, other paths and unknown agents pass", () => {
-		expect(followUpBlock("read", write("agent://Impl"), [agent()], config)).toBeUndefined();
-		expect(followUpBlock("write", write("local://notes.md"), [agent()], config)).toBeUndefined();
-		expect(followUpBlock("write", write("src/agent://Impl"), [agent()], config)).toBeUndefined();
-		expect(followUpBlock("write", write("agent://Other"), [agent()], config)).toBeUndefined();
-		expect(followUpBlock("write", { content: "x" }, [agent()], config)).toBeUndefined();
-		expect(followUpBlock("write", null, [agent()], config)).toBeUndefined();
+	test("a cleaned agent takes none, whatever its context", () => {
+		expect(blockOf([ledgerAgent({ contextTokens: 10, cleanedAt: NOW })])).toBe("followup-cleaned");
+		expect(blockOf([ledgerAgent({ contextTokens: 900_000, cleanedAt: NOW })])).toBe("followup-cleaned");
+	});
+
+	test("the reason names the handle a fresh agent reads", () => {
+		const block = followUpBlock("write", write("Rev"), [ledgerAgent({ contextTokens: 200_000 })], config);
+		expect(block?.reason).toContain("agent://Rev");
+		expect(block?.reason).toContain("storm-reviewer");
+	});
+
+	test("other tools, other paths and unknown agents pass; ids match as omp resolves them", () => {
+		const capped = [ledgerAgent({ contextTokens: 900_000 })];
+		expect(followUpBlock("read", write("Rev"), capped, config)).toBeUndefined();
+		expect(followUpBlock("write", { path: "local://notes.md", content: "x" }, capped, config)).toBeUndefined();
+		expect(blockOf(capped, config, "Nobody")).toBeUndefined();
+		expect(blockOf(capped, config, "rev")).toBe("followup-cap");
+		expect(followUpBlock("write", { path: "agent://Rev?progress", content: "x" }, capped, config)?.code).toBe("followup-cap");
+		expect(followUpAgent([ledgerAgent({ id: "rev" }), ledgerAgent({ id: "Rev" })], "Rev")?.id).toBe("Rev");
+	});
+
+	test("a delivered write names its target; failed writes, progress notes and other calls do not count", () => {
+		expect(deliveredFollowUp("write", write("Rev"), false)).toBe("Rev");
+		expect(deliveredFollowUp("write", { path: "agent://Rev/", content: "x" }, false)).toBe("Rev");
+		expect(deliveredFollowUp("write", write("Rev"), true)).toBeUndefined();
+		expect(deliveredFollowUp("write", { path: "agent://Rev?progress", content: "x" }, false)).toBeUndefined();
+		expect(deliveredFollowUp("write", { path: "src/a.ts", content: "x" }, false)).toBeUndefined();
+		expect(deliveredFollowUp("read", { path: "agent://Rev" }, false)).toBeUndefined();
 	});
 });

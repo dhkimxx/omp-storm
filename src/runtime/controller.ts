@@ -1,32 +1,52 @@
 /**
- * Storm run lifecycle for one main session: a run the storm tool queued (from a `/storm <request>`) becomes a
- * keyword handoff; the run ends when the session settles. Spawn decisions arrive from any session in
- * the process (children included), so they are collected per run in module scope.
+ * Storm run lifecycle for one main session. A run starts from `/storm` at once, or from the storm tool once the turn
+ * that queued it settles: team gate, mode preconditions, compaction of a heavy context, omp's goal or loop mode,
+ * then the handoff. Its mode decides when it ends: a vibe run when the session settles, a goal run when omp's goal
+ * ends, a loop run when omp's loop stops. Spawn decisions arrive from any session in the process (children
+ * included), so they are collected per run in module scope.
  */
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import * as path from "node:path";
+import type { ExtensionAPI, ExtensionContext, SessionModeRequest, SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import type { ApprovalStore } from "../approval/store.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
+import { formatUsd, shadowBlock, teamGate } from "../policy/spawn.ts";
 import { tokens } from "../report/agents.ts";
-import { PREFLIGHT_SHARE, PREFLIGHT_TOKENS, ROLES } from "../roles.ts";
+import { PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
 import type { ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
-import type { AgentEntry, RunCheckpoint, RunPlan, RunRecord, RunStatus, SpawnRecord, StormConfig, UiPort } from "../types.ts";
+import type {
+	AgentEntry,
+	RunCheckpoint,
+	RunEndReason,
+	RunPlan,
+	RunRecord,
+	RunSpec,
+	RunStatus,
+	SpawnBlockCode,
+	SpawnRecord,
+	StormConfig,
+	UiPort,
+} from "../types.ts";
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { activeLedgerRun, endLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
+import { END_LABEL, END_STATUS, GOAL_NUDGE, goalEnd, MAX_NUDGES, MODE_LABEL, modeEnd, modeFailureText, modeRequest, modeText, STALL_MS } from "./modes.ts";
 import { reviewLine } from "./review.ts";
-import { buildHandoff, newRunId, pickKeyword, pruneRuns, writeRun } from "./run.ts";
+import { buildHandoff, newRunId, pruneRuns, writeRun } from "./run.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
 const liveWriters = new Map<string, () => void>();
-/** How often an active run's record is rewritten at most, so other processes can follow it. */
+/**
+ * How often an active run's record is rewritten at most. The live record is what remains of a run whose process
+ * dies: the next run's janitor marks it stopped and it shows up as the last run with what it had spent and spawned.
+ */
 const LIVE_FLUSH_MS = 2_000;
 
-/** Asks the owning session to rewrite the run's record soon (spawns, spend, thresholds). */
+/** Asks the owning session to rewrite the run's record soon (spawns, spend). */
 export function touchRun(runId: string): void {
 	liveWriters.get(runId)?.();
 }
@@ -36,9 +56,6 @@ export function runSpawns(runId: string): SpawnRecord[] {
 	return [...(spawnsByRun.get(runId) ?? [])];
 }
 
-const PREFLIGHT_COMPACT = "압축 후 시작 (추천)";
-const PREFLIGHT_AS_IS = "그대로 시작";
-const PREFLIGHT_CANCEL = "취소";
 /** What compaction before a run must keep: the director works from it for the whole run. */
 const PREFLIGHT_INSTRUCTIONS =
 	"곧 Storm 실행을 시작합니다. 작업 계획, 내린 결정과 그 이유, 남은 문제, 관련 파일 경로는 빠짐없이 남기고 나머지는 짧게 줄이세요.";
@@ -51,28 +68,27 @@ export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 	touchRun(runId);
 }
 
-export function money(usd: number): string {
-	return `$${usd >= 1 ? usd.toFixed(2) : usd.toFixed(4)}`;
-}
+/** How much of the request a run record keeps. */
+const TASK_CHARS = 200;
+/**
+ * Ends after which omp's goal or loop must not stay on: those Storm decides itself, and a paused loop, whose next
+ * typed message omp would take as a new loop body and repeat outside any run.
+ */
+const LEAVE_MODE: readonly RunEndReason[] = ["budget", "goal-stalled", "start-failed", "loop-paused"];
 
-/** A natural-language `/storm` request for the main LLM, which answers it through the storm tool. */
-export function buildStormRequest(text: string): string {
-	// The request sits in an XML section so a keyword the user typed cannot start a run by itself.
-	return [
-		"<storm-request>",
-		text,
-		"</storm-request>",
-		"",
-		"위는 /storm 요청입니다. storm 도구로 처리하세요. 상태·쿼터·모델 점검·서브에이전트는 조회 동작을, 설정 변경(우선순위·워커 수·모델 재선정·쿼터 대응·시험 사용·예산)은 해당 동작을 쓰고, 변경은 사용자가 승인 창에서 확정한다고 알리세요. 팀 다시 설정·되돌리기·초기화, 승인 대기 중인 설정·보류 제안의 승인은 도구로 할 수 없으니 /storm 을 입력하라고 안내하세요(승인할 것이 있으면 /storm 이 승인 화면을 띄우고, 나머지는 메뉴에 있습니다). 요청이 review·rollback 같은 예전 명령어 한 단어면 작업으로 실행하지 말고 /storm 을 안내하세요. 작업 요청이면 action \"run\"으로 실행을 예약하고 이 턴에서는 작업하지 말고 바로 응답을 끝내세요.",
-	].join("\n");
+/** Whether a turn ended because it was interrupted: omp closes it with an assistant message marked aborted. */
+export function turnAborted(messages: readonly unknown[] | undefined): boolean {
+	for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+		const message = messages?.[i];
+		if (typeof message === "object" && message !== null && "role" in message && message.role === "assistant") {
+			return "stopReason" in message && message.stopReason === "aborted";
+		}
+	}
+	return false;
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
-
-function unapprovedShadowPath(state: ProjectState): string | undefined {
-	const approved = state.approval?.scope.shadowedAgents ?? [];
-	return state.shadows.find(shadow => !approved.some(seen => seen.agent === shadow.agent && seen.sha256 === shadow.sha256))?.path;
-}
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 function withoutDocFindings(agent: AgentEntry): AgentEntry {
 	if (agent.review?.docFindings === undefined) return agent;
@@ -102,29 +118,62 @@ interface OwnRun {
 	config: StormConfig;
 	/** Approval records of the repo: the run-end janitor keeps them within their limits. */
 	store: ApprovalStore;
-	/** The handoff turn has begun; the next settle ends the run. */
+	/** The handoff turn has begun; settles before it do not count. */
 	turnStarted: boolean;
+	/** A main turn is running: between an `agent_start` and the terminal `agent_end` after it. */
+	inTurn: boolean;
+	/** Why the run is over, decided while a turn was still running: that turn's end finishes it, its last message counted. */
+	ending?: RunEndReason;
+	/** Nudges sent to a stalled goal in a row: a turn the goal started by itself resets the count. */
+	nudges: number;
+	/** The last thing that happened to the session was Storm's nudge: the turn that starts next is its doing. */
+	nudged: boolean;
+	/** The stall watchdog's pending timer. */
+	stall?: unknown;
 }
+
+type Refusal = Extract<RunRequestResult, { ok: false }>;
+const refuse = (reason: string): Refusal => ({ ok: false, reason });
+
+const START = { vibeOff: "omp vibe 끄고 시작", free: "자유 실행으로 시작", cancel: "취소" } as const;
+
+export interface RunTimers {
+	set(run: () => void, ms: number): unknown;
+	clear(handle: unknown): void;
+}
+
+const REAL_TIMERS: RunTimers = {
+	set: (run, ms) => {
+		const timer = setTimeout(run, ms);
+		timer.unref?.();
+		return timer;
+	},
+	clear: handle => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
 
 export interface RunControllerDeps {
 	pi: Pick<ExtensionAPI, "sendUserMessage">;
 	ui(ctx: ExtensionContext): UiPort;
 	loadState(ctx: ExtensionContext): Promise<ProjectState>;
-	/** Which magic keywords would attach their notice in this session. */
-	usableKeywords(ctx: ExtensionContext): Promise<{ workflowz: boolean; orchestrate: boolean }>;
 	now(): number;
-	/** Subagents that started during the run, from the agent ledger. */
+	/** Subagents whose latest turn was during the run, from the agent ledger. */
 	agents?(runId: string): AgentEntry[];
 	/** Every subagent this process has seen (any run): the janitor only cleans those omp has parked. */
 	ledger?(): AgentEntry[];
-	/** omp's sessions dir (`<agentDir>/sessions`): the janitor deletes nothing outside it. Absent → no omp record cleanup. */
-	sessionsRoot?: string;
+	/** omp's agent dir: the janitor deletes omp records only below its `sessions/`. Absent → no omp record cleanup. */
+	agentDir?: string;
 	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
 	flushMs?: number;
+	/** The user's omp `loop.mode` setting; a loop run is refused while it is `reset`. */
+	loopMode?(): Promise<string | undefined>;
+	/** The goal stall watchdog's clock; real timers when absent. */
+	timers?: RunTimers;
 }
 
 export class RunController {
-	#pending: { runId: string; task: string } | undefined;
+	#pending: { runId: string; spec: RunSpec } | undefined;
+	/** A start is between its checks and its handoff (it may be asking, compacting, or entering a mode). */
+	#starting = false;
 	#own: OwnRun | undefined;
 	#flushTimer: ReturnType<typeof setTimeout> | undefined;
 	/** The last live write; the final record waits for it so a late live write never lands on top. */
@@ -132,12 +181,23 @@ export class RunController {
 
 	constructor(private readonly deps: RunControllerDeps) {}
 
-	/** From the storm tool: the run starts once the current turn settles. */
-	request(task: string): RunRequestResult {
-		if (this.#own) return { ok: false, reason: `이미 Storm 실행(${this.#own.record.runId})이 진행 중입니다.` };
-		if (this.#pending) return { ok: false, reason: `이미 예약된 Storm 실행(${this.#pending.runId})이 있습니다.` };
+	/** Why no run can be queued or started now: one run per session, running, queued or starting. */
+	refusal(): string | undefined {
+		if (this.#own) return `이미 Storm 실행(${this.#own.record.runId})이 진행 중입니다.`;
+		if (this.#pending) return `이미 예약된 Storm 실행(${this.#pending.runId})이 있습니다.`;
+		if (this.#starting) return "이미 Storm 실행을 시작하는 중입니다.";
+		return undefined;
+	}
+
+	/**
+	 * From the storm tool: the run starts once the current turn settles. omp refuses a mode change from inside a
+	 * tool call, so every tool-requested run waits for the terminal `agent_end`.
+	 */
+	request(spec: RunSpec): RunRequestResult {
+		const reason = this.refusal();
+		if (reason !== undefined) return refuse(reason);
 		const runId = newRunId(this.deps.now());
-		this.#pending = { runId, task };
+		this.#pending = { runId, spec };
 		return { ok: true, runId };
 	}
 
@@ -156,68 +216,190 @@ export class RunController {
 		};
 	}
 
-	/** Checks the approved team, records the run and sends the handoff. The session must be idle. */
-	async start(ctx: ExtensionContext, task: string, runId = newRunId(this.deps.now())): Promise<RunRequestResult> {
-		if (this.#own) return { ok: false, reason: `이미 Storm 실행(${this.#own.record.runId})이 진행 중입니다.` };
-		const state = await this.deps.loadState(ctx);
-		const load = state.config;
-		if (load.status === "missing") return { ok: false, reason: "Storm 설정이 없습니다. /storm 으로 팀을 설정하세요." };
-		if (load.status === "invalid") return { ok: false, reason: `Storm 설정 오류: ${load.errors[0] ?? "알 수 없는 오류"}` };
-		if (!state.approval || state.approval.configHash !== load.hash) {
-			const short = load.hash.replace(/^jcs-sha256:/, "").slice(0, 12);
-			return { ok: false, reason: `승인되지 않은 Storm 설정입니다(${short}). /storm 으로 승인하세요.` };
+	/**
+	 * Checks the approved team and the mode's preconditions, compacts a heavy main context, enters omp's goal or loop
+	 * mode, records the run and sends the handoff. The session must be idle. It can take as long as a dialog or a
+	 * compaction: callers inside an omp event handler use `launch`.
+	 */
+	async start(ctx: ExtensionContext, spec: RunSpec, runId = newRunId(this.deps.now())): Promise<RunRequestResult> {
+		// A queued run is not in the way of its own start: `onAgentEnd` takes it off the queue first.
+		const reason = this.refusal();
+		if (reason !== undefined) return refuse(reason);
+		this.#starting = true;
+		try {
+			return await this.#begin(ctx, spec, runId);
+		} finally {
+			this.#starting = false;
 		}
-		const shadow = unapprovedShadowPath(state);
-		if (shadow) return { ok: false, reason: `승인되지 않은 역할 정의가 있습니다: ${shadow}. /storm 으로 확인하세요.` };
-		if (activeLedgerRun(state.repo.repoId)) return { ok: false, reason: "이 프로젝트에서 다른 Storm 실행이 진행 중입니다." };
-		const declined = await this.#preflight(ctx);
-		if (declined) return { ok: false, reason: declined };
-		// The dialog and the compaction awaited: another run may have started meanwhile.
-		if (this.#own || activeLedgerRun(state.repo.repoId)) return { ok: false, reason: "이 프로젝트에서 다른 Storm 실행이 진행 중입니다." };
+	}
 
-		const config = load.config;
-		const keyword = pickKeyword(config, await this.deps.usableKeywords(ctx));
+	/**
+	 * Starts a run without making the caller wait for it. omp gives an `agent_end` handler 30 s and a compaction of a
+	 * heavy context takes longer, so the handler returns at once and a refused or failed start is reported by notice.
+	 */
+	launch(ctx: ExtensionContext, spec: RunSpec, runId?: string): void {
+		const ui = this.deps.ui(ctx);
+		this.start(ctx, spec, runId).then(
+			result => {
+				if (!result.ok) ui.notify(`Storm 실행을 시작하지 못했습니다: ${result.reason}`, "warning");
+			},
+			(error: unknown) => ui.notify(`Storm 실행을 시작하지 못했습니다: ${errorText(error)}`, "error"),
+		);
+	}
+
+	async #begin(ctx: ExtensionContext, requested: RunSpec, runId: string): Promise<RunRequestResult> {
+		const state = await this.deps.loadState(ctx);
+		const gate = teamGate(state);
+		if (!gate.ok) return refuse(gate.block.reason);
+		const shadow = shadowBlock(state);
+		if (shadow) return refuse(shadow.reason);
+		const busy = refuse("이 프로젝트에서 다른 Storm 실행이 진행 중입니다.");
+		if (activeLedgerRun(state.repo.repoId)) return busy;
+		const ui = this.deps.ui(ctx);
+		const ready = await this.#readyMode(ctx, ui, requested);
+		if (!ready.ok) return ready;
+		await this.#compactFirst(ctx, ui);
+		// The dialog and the compaction awaited: another session's run may have started meanwhile.
+		if (activeLedgerRun(state.repo.repoId)) return busy;
+		// Nothing of the run exists yet: a mode omp refuses leaves nothing behind.
+		const entered = await this.#enterMode(ctx, ready.spec, runId);
+		if (!entered.ok) return entered;
+
+		const { config, hash } = gate;
+		const { task } = entered;
+		const mode = ready.spec.mode;
 		const record: RunRecord = {
 			schema: "storm.run/v1",
 			runId,
-			configHash: load.hash,
-			approvalId: state.approval.approvalId,
+			configHash: hash,
 			startedAt: iso(this.deps.now()),
 			status: "running",
-			contract: keyword ?? "none",
-			task: task.slice(0, 200),
+			task: task.slice(0, TASK_CHARS),
 			costUsd: 0,
 			costByModel: {},
 			...(config.budget ? { budget: config.budget } : {}),
 			spawns: [],
 			...artifactsOf(ctx),
 			process: processKey(),
+			mode,
+			turns: 0,
+			...entered.fields,
 		};
-		const own: OwnRun = { record, root: state.repo.root, repoId: state.repo.repoId, config, store: state.store, turnStarted: false };
-		startLedgerRun({
-			runId,
-			repoId: own.repoId,
-			configHash: load.hash,
-			...(config.budget ? { budget: config.budget } : {}),
-			onThreshold: (kind, run) => this.#threshold(ctx, own, kind, run),
-		});
+		const own: OwnRun = {
+			record,
+			root: state.repo.root,
+			repoId: state.repo.repoId,
+			config,
+			store: state.store,
+			turnStarted: false,
+			inTurn: false,
+			nudges: 0,
+			nudged: false,
+		};
 		this.#own = own;
-		spawnsByRun.set(runId, []);
-		openRunReads(runId);
-		await writeRun(own.root, record);
+		try {
+			startLedgerRun({
+				runId,
+				repoId: own.repoId,
+				...(config.budget ? { budget: config.budget } : {}),
+				onThreshold: (kind, run) => this.#threshold(ctx, kind, run),
+			});
+			spawnsByRun.set(runId, []);
+			openRunReads(runId);
+			await writeRun(own.root, record);
+		} catch (error) {
+			// omp's mode is on and this session directs, but nothing was handed off: undo both rather than leave a run nobody started.
+			await this.#stop(own, "start-failed", ctx).catch(() => undefined);
+			return refuse(`실행을 기록하지 못해 시작하지 않았습니다: ${errorText(error)}`);
+		}
 		liveWriters.set(runId, () => this.#scheduleFlush(own));
-		const ui = this.deps.ui(ctx);
-		if (!keyword) ui.notify("이 세션에서 workflowz·orchestrate 키워드를 쓸 수 없어 팀 계약만 보냅니다.", "warning");
-		ui.notify(`Storm 실행을 시작합니다(${runId}).`);
-		this.deps.pi.sendUserMessage(buildHandoff({ runId, config, hash: load.hash, task, keyword })).catch((error: unknown) => {
-			ui.notify(`Storm 실행 메시지를 보내지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
-			void this.finish("stopped", ctx);
+		ui.notify(`Storm 실행을 시작합니다(${runId}, ${MODE_LABEL[mode]}).`);
+		this.deps.pi.sendUserMessage(buildHandoff({ runId, config, hash, task, mode })).catch((error: unknown) => {
+			ui.notify(`실행 계약을 보내지 못했습니다: ${errorText(error)}`, "error");
+			void this.#stop(own, "start-failed", ctx);
 		});
 		return { ok: true, runId };
 	}
 
+	/**
+	 * What must hold before a mode is entered, settled while nothing has started. omp's vibe mode replaces the
+	 * director's tools, so the team cannot run inside it. A goal or a loop needs omp's mode control, which only the
+	 * TUI has: elsewhere the user may take a vibe run instead. A loop that resets the session each turn would leave
+	 * the run behind.
+	 */
+	async #readyMode(ctx: ExtensionContext, ui: UiPort, spec: RunSpec): Promise<{ ok: true; spec: RunSpec } | Refusal> {
+		const modes = ctx.sessionModes;
+		if (modes?.getState().vibe.status === "active") {
+			const choice = await ui.select("omp vibe 모드에서는 Storm 팀을 쓸 수 없습니다. vibe 모드를 끄고 시작할까요?", [START.vibeOff, START.cancel]);
+			if (choice !== START.vibeOff) return refuse("omp vibe 모드가 켜져 있어 시작하지 않았습니다.");
+			const left = await modes.set({ mode: "vibe", action: "exit" });
+			if (!left.ok) return refuse(modeFailureText(left));
+		}
+		if (spec.mode === "vibe") return { ok: true, spec };
+		if (!modes) {
+			const unsupported = `이 환경에서는 omp ${MODE_LABEL[spec.mode]} 모드를 쓸 수 없습니다(터미널 UI에서만 됩니다).`;
+			if ("resume" in spec) return refuse(unsupported);
+			const choice = await ui.select(`${unsupported} 자유 실행으로 시작할까요?`, [START.free, START.cancel]);
+			return choice === START.free ? { ok: true, spec: { mode: "vibe", task: spec.task } } : refuse(unsupported);
+		}
+		if (spec.mode === "loop" && (await this.deps.loopMode?.()) === "reset") {
+			return refuse(
+				"omp 설정 loop.mode 가 reset 이라 반복마다 새 세션이 시작되어 Storm 실행이 이어지지 않습니다. `omp config set loop.mode prompt` 로 바꾼 뒤 다시 시도하세요.",
+			);
+		}
+		// omp's resume leaves an active goal as it is: a goal restored with the session can be put under a run too.
+		if ("resume" in spec && modes.getState().goal.status === "inactive") {
+			return refuse("이어갈 목표가 없습니다. /storm goal <목표> 로 시작하세요.");
+		}
+		return { ok: true, spec };
+	}
+
+	/** Enters omp's goal or loop mode for the run. Resolves the task (a resumed goal's objective) and what the record keeps of the mode. */
+	async #enterMode(
+		ctx: ExtensionContext,
+		spec: RunSpec,
+		runId: string,
+	): Promise<{ ok: true; task: string; fields: Pick<RunRecord, "goal" | "loop"> } | Refusal> {
+		if (spec.mode === "vibe") return { ok: true, task: spec.task, fields: {} };
+		const modes = ctx.sessionModes;
+		if (!modes) return refuse("이 환경에서는 omp 모드를 바꿀 수 없습니다.");
+		const result = await modes.set(modeRequest(spec, runId));
+		if (!result.ok) return refuse(modeFailureText(result));
+		if (spec.mode === "loop") {
+			const loop = { ...(spec.limit ? { limit: spec.limit } : {}), ...(spec.condition ? { condition: spec.condition } : {}) };
+			return { ok: true, task: spec.task, fields: { loop } };
+		}
+		const resumed = "resume" in spec;
+		const task = resumed ? (result.state.goal.objective ?? "") : spec.task;
+		const tokenBudget = resumed ? result.state.goal.tokenBudget : spec.tokenBudget;
+		const goal = { objective: task.slice(0, TASK_CHARS), ...(tokenBudget !== undefined ? { tokenBudget } : {}) };
+		return { ok: true, task, fields: { goal } };
+	}
+
+	/**
+	 * A heavy main context is re-sent on every director request, so it is compacted before the handoff. Never asks
+	 * and never stops the start: a failed compaction is reported and the run starts on the context as it is.
+	 */
+	async #compactFirst(ctx: ExtensionContext, ui: UiPort): Promise<void> {
+		const usage = ctx.getContextUsage();
+		if (!usage || !(usage.tokens >= PREFLIGHT_TOKENS || usage.percent >= PREFLIGHT_SHARE * 100)) return;
+		ui.notify(`감독 컨텍스트가 ${tokens(usage.tokens)} 토큰(창의 ${Math.round(usage.percent)}%)이라 실행 전에 먼저 압축합니다.`);
+		try {
+			await ctx.compact(PREFLIGHT_INSTRUCTIONS);
+		} catch (error) {
+			ui.notify(`컨텍스트를 압축하지 못해 그대로 시작합니다: ${errorText(error)}`, "warning");
+		}
+	}
+
 	onAgentStart(): void {
-		if (this.#own) this.#own.turnStarted = true;
+		const own = this.#own;
+		if (!own) return;
+		own.turnStarted = true;
+		own.inTurn = true;
+		// A turn Storm did not nudge into being means the goal moves by itself again.
+		if (!own.nudged) own.nudges = 0;
+		own.nudged = false;
+		this.#disarm(own);
 	}
 
 	/** True while this session runs Storm: the main session directs and does not change files itself. */
@@ -230,48 +412,63 @@ export class RunController {
 		return this.#own?.record.runId;
 	}
 
-	/** Spend of this (main) session while its run is active: what directing costs. */
-	noteMainSpend(usd: number): void {
+	/** Changes this session's run record and schedules its live rewrite; a no-op without a run. */
+	#update(change: (record: RunRecord) => void): void {
 		const own = this.#own;
 		if (!own) return;
-		own.record.mainCostUsd = (own.record.mainCostUsd ?? 0) + usd;
+		change(own.record);
 		this.#scheduleFlush(own);
+	}
+
+	/** Spend of this (main) session while its run is active: what directing costs. */
+	noteMainSpend(usd: number): void {
+		this.#update(record => {
+			record.mainCostUsd = (record.mainCostUsd ?? 0) + usd;
+		});
 	}
 
 	/** A file change the main session tried itself; director mode sent it back to delegation. */
 	noteBlockedEdit(): void {
-		const own = this.#own;
-		if (!own) return;
-		own.record.blockedEdits = (own.record.blockedEdits ?? 0) + 1;
-		this.#scheduleFlush(own);
+		this.#update(record => {
+			record.blockedEdits = (record.blockedEdits ?? 0) + 1;
+		});
 	}
 
-	/** A follow-up to an agent past its context cap that Storm sent back to a fresh agent. */
+	/** A follow-up to an agent past its context cap, or cleaned, that Storm sent back to a fresh agent. */
 	noteBlockedFollowUp(): void {
-		const own = this.#own;
-		if (!own) return;
-		own.record.blockedFollowUps = (own.record.blockedFollowUps ?? 0) + 1;
-		this.#scheduleFlush(own);
+		this.#update(record => {
+			record.blockedFollowUps = (record.blockedFollowUps ?? 0) + 1;
+		});
 	}
 
-	/** A director `read` during the run: counted as one read, of a file a subagent of the run read, and refused. */
-	noteRead(kind: "plain" | "duplicate" | "blocked"): void {
-		const own = this.#own;
-		if (!own) return;
-		const reads = own.record.reads ?? { director: 0, duplicate: 0, blocked: 0 };
-		reads.director += 1;
-		if (kind !== "plain") reads.duplicate += 1;
-		if (kind === "blocked") reads.blocked += 1;
-		own.record.reads = reads;
-		this.#scheduleFlush(own);
+	#reads(record: RunRecord): NonNullable<RunRecord["reads"]> {
+		record.reads ??= { director: 0, directorChars: 0, duplicateChars: 0, blocked: 0 };
+		return record.reads;
+	}
+
+	/** A director `read` of a working file returned `chars` characters; `duplicate` when a subagent of the run read that file too. */
+	noteRead(chars: number, duplicate: boolean): void {
+		this.#update(record => {
+			const reads = this.#reads(record);
+			reads.director += 1;
+			reads.directorChars += chars;
+			if (duplicate) reads.duplicateChars += chars;
+		});
+	}
+
+	/** A director `read` Storm refused. */
+	noteBlockedRead(): void {
+		this.#update(record => {
+			this.#reads(record).blocked += 1;
+		});
 	}
 
 	/** Prompt size of a director request; the run keeps the largest. */
 	noteMainContext(promptTokens: number): void {
-		const own = this.#own;
-		if (!own || promptTokens <= (own.record.maxMainContext ?? 0)) return;
-		own.record.maxMainContext = promptTokens;
-		this.#scheduleFlush(own);
+		if (promptTokens <= (this.#own?.record.maxMainContext ?? 0)) return;
+		this.#update(record => {
+			record.maxMainContext = promptTokens;
+		});
 	}
 
 	/** When this run last started a mid-run compaction (ms since epoch). */
@@ -319,43 +516,164 @@ export class RunController {
 		return { ok: true };
 	}
 
-	/** A heavy main context costs on every director request: offer compaction first. Returns why the run does not start. */
-	async #preflight(ctx: ExtensionContext): Promise<string | undefined> {
-		if (!ctx.hasUI) return undefined;
-		const usage = ctx.getContextUsage();
-		if (!usage || !(usage.tokens >= PREFLIGHT_TOKENS || usage.percent >= PREFLIGHT_SHARE * 100)) return undefined;
-		const choice = await this.deps
-			.ui(ctx)
-			.select("메인 세션 컨텍스트가 큽니다. Storm 실행을 어떻게 시작할까요?", [PREFLIGHT_COMPACT, PREFLIGHT_AS_IS, PREFLIGHT_CANCEL], {
-				title: "메인 세션 컨텍스트",
-				markdown: `- ${tokens(usage.tokens)} 토큰 / 창 ${tokens(usage.contextWindow)} (${Math.round(usage.percent)}%)\n- 감독은 요청마다 이 맥락을 다시 싣습니다. 압축하면 실행 내내 비용이 줄어듭니다.`,
-			});
-		if (choice === PREFLIGHT_AS_IS) return undefined;
-		if (choice !== PREFLIGHT_COMPACT) return "Storm 실행을 취소했습니다.";
-		try {
-			await ctx.compact(PREFLIGHT_INSTRUCTIONS);
-		} catch (error) {
-			return `컨텍스트를 압축하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`;
-		}
-		return undefined;
-	}
-
-	async onAgentEnd(event: { willContinue?: boolean; awaitingAsyncWork?: boolean }, ctx: ExtensionContext): Promise<void> {
-		// Not settled yet: an automatic continuation or background work will resume the session.
+	/**
+	 * The main session's agent loop ended. When it settled (no automatic continuation, no background work that will
+	 * resume it) a turn of the run is over, which ends a vibe run; and a queued run starts, detached from this handler,
+	 * unless the user interrupted the turn that queued it.
+	 */
+	async onAgentEnd(
+		event: { willContinue?: boolean; awaitingAsyncWork?: boolean; messages?: readonly unknown[] },
+		ctx: ExtensionContext,
+	): Promise<void> {
 		if (event.willContinue || event.awaitingAsyncWork) return;
-		if (this.#own?.turnStarted) await this.finish("done", ctx);
+		const own = this.#own;
+		if (own?.turnStarted) await this.#turnSettled(own, ctx);
 		const pending = this.#pending;
 		if (!pending) return;
 		this.#pending = undefined;
-		const result = await this.start(ctx, pending.task, pending.runId);
-		if (!result.ok) this.deps.ui(ctx).notify(`Storm 실행을 시작하지 못했습니다: ${result.reason}`, "warning");
+		if (turnAborted(event.messages)) {
+			this.deps.ui(ctx).notify(`응답을 중단해서 예약한 Storm 실행(${pending.runId})을 시작하지 않았습니다.`);
+			return;
+		}
+		this.launch(ctx, pending.spec, pending.runId);
+	}
+
+	/**
+	 * A turn of the run settled. A vibe run is over. omp continues a goal or a loop by itself, so those end here only
+	 * when the end was already decided during the turn, or when omp's mode is no longer on; a goal that stays active
+	 * is watched for a stall.
+	 */
+	async #turnSettled(own: OwnRun, ctx: ExtensionContext): Promise<void> {
+		if (own.inTurn) {
+			own.inTurn = false;
+			own.record.turns = (own.record.turns ?? 0) + 1;
+			this.#scheduleFlush(own);
+		}
+		const mode = own.record.mode;
+		if (own.ending !== undefined) return this.#stop(own, own.ending, ctx);
+		if (mode !== "goal" && mode !== "loop") return this.#stop(own, "settled", ctx);
+		const state = ctx.sessionModes?.getState();
+		const over = state && modeEnd(mode, state);
+		if (over) await this.#stop(own, over, ctx);
+		else if (mode === "goal") this.#arm(own, ctx);
+	}
+
+	/** omp reported the goal: its token accounting, and whether it is over. */
+	async onGoalUpdated(goal: { status: string; tokensUsed?: number } | null, ctx: ExtensionContext): Promise<void> {
+		const own = this.#own;
+		if (!own || own.record.mode !== "goal") return;
+		if (goal && own.record.goal && goal.tokensUsed !== undefined) {
+			own.record.goal.tokensUsed = goal.tokensUsed;
+			this.#scheduleFlush(own);
+		}
+		// A goal omp no longer has was dropped.
+		const reason = goal ? goalEnd(goal.status) : "goal-dropped";
+		if (reason) await this.#endSoon(own, reason, ctx);
+	}
+
+	/** An omp session mode changed: a goal that is no longer active or a loop that stopped ends the run. */
+	async onModeChanged(state: SessionModeState, ctx: ExtensionContext): Promise<void> {
+		const own = this.#own;
+		const reason = own && modeEnd(own.record.mode, state);
+		if (own && reason) await this.#endSoon(own, reason, ctx);
+	}
+
+	/** The run is over for `reason` (the first reason given stands): now when the session is between turns, else at the turn's end. */
+	async #endSoon(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): Promise<void> {
+		own.ending ??= reason;
+		if (!own.inTurn) await this.#stop(own, own.ending, ctx);
+	}
+
+	/**
+	 * Ends `own` for `reason` unless an earlier reason stands; a run that is no longer this session's (a late failure
+	 * of an older run's handoff) is left alone. After the ends in `LEAVE_MODE` omp's mode is left first.
+	 */
+	async #stop(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext): Promise<void> {
+		if (this.#own !== own) return;
+		own.ending ??= reason;
+		if (LEAVE_MODE.includes(own.ending)) await this.#leaveMode(own, ctx);
+		await this.finish(own.ending, ctx);
+	}
+
+	/**
+	 * Takes omp out of the run's mode so it does not keep the session going without the run: a goal is paused (the
+	 * user can resume it), a loop exits. omp may refuse (it is busy tearing a goal down, or compacting); the user is
+	 * told, since the session may then move again by itself.
+	 */
+	async #leaveMode(own: OwnRun, ctx: ExtensionContext): Promise<void> {
+		const modes = ctx.sessionModes;
+		const mode = own.record.mode;
+		if (!modes || (mode !== "goal" && mode !== "loop")) return;
+		let failure: string | undefined;
+		try {
+			const state = modes.getState();
+			let request: SessionModeRequest | undefined;
+			if (mode === "goal" && state.goal.status === "active") request = { mode: "goal", action: "pause" };
+			if (mode === "loop" && state.loop.status !== "inactive") request = { mode: "loop", action: "exit" };
+			const result = request && (await modes.set(request));
+			if (result && !result.ok) failure = modeFailureText(result);
+		} catch (error) {
+			failure = errorText(error);
+		}
+		if (failure === undefined) return;
+		this.deps.ui(ctx).notify(`omp ${MODE_LABEL[mode]} 모드를 끝내지 못했습니다(${failure}). 세션이 계속 이어지면 직접 멈추세요.`, "warning");
+	}
+
+	#disarm(own: OwnRun): void {
+		if (own.stall === undefined) return;
+		(this.deps.timers ?? REAL_TIMERS).clear(own.stall);
+		delete own.stall;
+	}
+
+	/** Watches a goal that should continue by itself: no new turn within `STALL_MS` is a stall. */
+	#arm(own: OwnRun, ctx: ExtensionContext): void {
+		this.#disarm(own);
+		own.stall = (this.deps.timers ?? REAL_TIMERS).set(() => {
+			delete own.stall;
+			void this.#stalled(own, ctx);
+		}, STALL_MS);
+	}
+
+	/**
+	 * Whether omp is holding the goal's continuation on purpose: the session is busy (a turn, a compaction), a
+	 * submission is queued, plan mode is on, or the user has a draft in the editor. None of that is a stall.
+	 */
+	#held(ctx: ExtensionContext): boolean {
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return true;
+		if (ctx.sessionModes?.getState().plan.status === "active") return true;
+		return ctx.hasUI && ctx.ui.getEditorText().trim() !== "";
+	}
+
+	/**
+	 * omp stops continuing a goal silently after a turn without tool activity. A visible nudge restarts it; after
+	 * `MAX_NUDGES` in a row with no turn of the goal's own in between, the goal is paused and the run ends, so nothing
+	 * waits on a session that will not move. While omp holds the continuation the watch goes on without counting.
+	 */
+	async #stalled(own: OwnRun, ctx: ExtensionContext): Promise<void> {
+		if (this.#own !== own || own.inTurn || own.ending !== undefined) return;
+		if (ctx.sessionModes?.getState().goal.status !== "active") return;
+		if (this.#held(ctx)) return this.#arm(own, ctx);
+		const ui = this.deps.ui(ctx);
+		if (own.nudges < MAX_NUDGES) {
+			own.nudges += 1;
+			own.nudged = true;
+			// Armed again first: a nudge that starts no turn must not be the last thing that happens.
+			this.#arm(own, ctx);
+			this.deps.pi.sendUserMessage(GOAL_NUDGE).catch((error: unknown) => {
+				ui.notify(`목표를 이어가라는 메시지를 보내지 못했습니다: ${errorText(error)}`, "warning");
+			});
+			return;
+		}
+		ui.notify(`목표가 ${MAX_NUDGES}번 재촉한 뒤에도 진행되지 않아 일시 정지하고 Storm 실행을 끝냅니다. /storm goal 로 이어갈 수 있습니다.`, "warning");
+		await this.#stop(own, "goal-stalled", ctx);
 	}
 
 	/** Ends this session's run (if any), writes its record and reports the summary. */
-	async finish(status: RunStatus, ctx?: ExtensionContext): Promise<RunRecord | undefined> {
+	async finish(reason: RunEndReason, ctx?: ExtensionContext): Promise<RunRecord | undefined> {
 		const own = this.#own;
 		if (!own) return undefined;
 		this.#own = undefined;
+		this.#disarm(own);
 		clearTimeout(this.#flushTimer);
 		this.#flushTimer = undefined;
 		liveWriters.delete(own.record.runId);
@@ -369,7 +687,8 @@ export class RunController {
 		const record: RunRecord = {
 			...own.record,
 			endedAt: iso(this.deps.now()),
-			status: ledger?.exceeded ? "budget-exceeded" : status,
+			status: ledger?.exceeded ? "budget-exceeded" : END_STATUS[reason],
+			endReason: reason,
 			costUsd: ledger?.costUsd ?? own.record.costUsd,
 			costByModel: { ...(ledger?.costByModel ?? own.record.costByModel) },
 			spawns,
@@ -401,22 +720,22 @@ export class RunController {
 		try {
 			// Consent and trials come from the approval in force now too: a consent withdrawn mid-run stops deletion.
 			const state = await this.deps.loadState(ctx);
-			const load = state.config;
-			const approved = load.status === "ok" && state.approval?.configHash === load.hash ? { config: load.config, hash: load.hash } : undefined;
-			const sessionsRoot = this.deps.sessionsRoot;
+			const gate = teamGate(state);
+			const agentDir = this.deps.agentDir;
 			const { result, cleaned } = await runJanitor({
 				root: own.root,
 				storeDir: state.store.dir,
-				// Without a known sessions dir nothing of omp's is deleted: the config below then carries no consent.
-				sessionsRoot: sessionsRoot ?? "",
-				config: approved && sessionsRoot ? approved.config : withoutCleanup(approved?.config ?? own.config),
+				// Without a known agent dir nothing of omp's is deleted: the config below then carries no consent.
+				sessionsRoot: agentDir ? path.join(agentDir, "sessions") : "",
+				config: gate.ok && agentDir ? gate.config : withoutCleanup(gate.ok ? gate.config : own.config),
 				startConfig: own.config,
-				configHash: approved?.hash ?? own.record.configHash,
+				configHash: gate.ok ? gate.hash : own.record.configHash,
 				runId: own.record.runId,
 				process: own.record.process ?? processKey(),
 				now: this.deps.now(),
 				ledger: this.deps.ledger?.() ?? agents,
 				approvals: state.store,
+				...(agentDir ? { agentDir } : {}),
 			});
 			if (result.agents || result.stormFiles) record.cleanup = result;
 			return cleaned;
@@ -438,55 +757,95 @@ export class RunController {
 		this.#flushTimer.unref?.();
 	}
 
-	#threshold(ctx: ExtensionContext, own: OwnRun, kind: "warn" | "limit", run: LedgerRun): void {
+	#threshold(ctx: ExtensionContext, kind: "warn" | "limit", run: LedgerRun): void {
 		const ui = this.deps.ui(ctx);
-		const at = iso(this.deps.now());
 		const budget = run.budget;
 		if (kind === "warn") {
-			own.record.warnedAt = at;
-			this.#scheduleFlush(own);
-			ui.notify(`Storm 실행 비용이 경고선 ${money(budget?.warnAtUsd ?? 0)}에 닿았습니다(누계 ${money(run.costUsd)}).`, "warning");
+			ui.notify(`Storm 실행 비용이 경고선 ${formatUsd(budget?.warnAtUsd ?? 0)}에 닿았습니다(누계 ${formatUsd(run.costUsd)}).`, "warning");
 			return;
 		}
-		own.record.exceededAt = at;
-		this.#scheduleFlush(own);
-		ui.notify(`Storm 실행 예산 ${money(budget?.perRunUsd ?? 0)}을 넘었습니다(누계 ${money(run.costUsd)}). 새 스폰을 막습니다.`, "warning");
-		if (budget?.onExceed === "stop") ctx.abort();
+		const stop = budget?.onExceed === "stop";
+		ui.notify(
+			`Storm 실행 예산 ${formatUsd(budget?.perRunUsd ?? 0)}을 넘었습니다(누계 ${formatUsd(run.costUsd)}). ${stop ? "실행을 중단합니다." : "새 스폰을 차단합니다."}`,
+			"warning",
+		);
+		if (!stop) return;
+		const own = this.#own?.record.runId === run.runId ? this.#own : undefined;
+		if (own) own.ending ??= "budget";
+		if (own && !own.inTurn) {
+			// Between turns there is nothing to abort, and no turn's end to wait for: omp would run one more.
+			void this.#stop(own, "budget", ctx).catch((error: unknown) => ui.notify(`Storm 실행을 끝내지 못했습니다: ${errorText(error)}`, "error"));
+			return;
+		}
+		// The aborted turn's end finishes the run, and leaves omp's goal or loop so nothing continues it.
+		ctx.abort();
 	}
+}
+
+const OUTCOME_LABEL: Record<SpawnRecord["outcome"], string> = {
+	routed: "승인 모델",
+	trial: "시험 사용",
+	allowed: "그대로 허용",
+	substituted: "대체 역할로 교체",
+	blocked: "차단",
+};
+
+const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
+	"no-config": "팀 설정 문제",
+	unapproved: "미승인",
+	shadow: "미승인 역할 정의",
+	"disabled-role": "쓰지 않는 역할",
+	"no-plan": "계획 없음",
+	"role-not-in-plan": "계획에 없는 역할",
+	"role-cap": "역할 워커 상한",
+	parallelism: "동시 상한",
+	budget: "예산 초과",
+	internal: "내부 오류",
+};
+
+const STATUS_LABEL: Record<RunStatus, string> = { running: "진행 중", done: "완료", "budget-exceeded": "예산 초과", stopped: "중단" };
+
+function tally<K extends string>(keys: readonly K[], label: (key: K) => string): string {
+	const counts = new Map<K, number>();
+	for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+	return [...counts].map(([key, n]) => `${label(key)} ${n}`).join(" · ");
 }
 
 /** The run's record in the transcript: at most five lines, the one Storm output that stays there. */
 export function summarizeRun(run: RunRecord): string {
-	const counts = new Map<string, number>();
-	for (const spawn of run.spawns) counts.set(spawn.outcome, (counts.get(spawn.outcome) ?? 0) + 1);
-	const label: Record<SpawnRecord["outcome"], string> = {
-		routed: "승인 모델",
-		trial: "시험 사용",
-		allowed: "그대로 허용",
-		substituted: "대체 역할로 교체",
-		blocked: "차단",
-	};
-	const blocked = run.spawns.find(spawn => spawn.outcome === "blocked");
+	const blockCodes = run.spawns.flatMap(spawn => (spawn.outcome === "blocked" && spawn.code ? [spawn.code] : []));
 	const spawnLine = run.spawns.length
-		? [...counts].map(([outcome, n]) => `${label[outcome as SpawnRecord["outcome"]] ?? outcome} ${n}`).join(" · ")
+		? tally(
+				run.spawns.map(spawn => spawn.outcome),
+				outcome => OUTCOME_LABEL[outcome] ?? outcome,
+			)
 		: "없음";
-	const status: Record<RunStatus, string> = { running: "진행 중", done: "완료", "budget-exceeded": "예산 초과", stopped: "중단" };
+	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
+	const end = run.endReason ? ` · ${END_LABEL[run.endReason]}` : "";
+	// Records of 0.9 and earlier have no mode: nothing is shown for them.
+	const mode = run.mode ? ` · ${modeText(run)}${run.turns !== undefined ? ` ${run.turns}턴` : ""}` : "";
 	const lines = [
-		`- 실행: ${run.runId} (${status[run.status]}) · 비용(정가 환산) ${money(run.costUsd)}${run.budget ? ` / 예산 ${money(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
-		`- 스폰: ${spawnLine}${blocked?.reason ? ` · 차단 사유: ${blocked.reason}` : ""}`,
+		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${mode} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
+		`- 스폰: ${spawnLine}${blockLine}`,
 	];
 	const main: string[] = [];
 	if (run.mainCostUsd !== undefined && run.costUsd > 0) {
-		main.push(`비용 ${money(run.mainCostUsd)}(전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%)`);
+		main.push(`비용 ${formatUsd(run.mainCostUsd)}(전체의 ${Math.round((run.mainCostUsd / run.costUsd) * 100)}%)`);
 	}
 	if (run.blockedEdits) main.push(`직접 수정 ${run.blockedEdits}회를 위임으로 돌림`);
-	if (run.blockedFollowUps) main.push(`상한 넘은 후속 지시 ${run.blockedFollowUps}회를 새 에이전트로 돌림`);
-	if (run.reads?.blocked) main.push(`하위가 읽은 파일 통째 읽기 ${run.reads.blocked}회를 막음`);
+	if (run.blockedFollowUps) main.push(`후속 지시 ${run.blockedFollowUps}회를 새 서브에이전트로 돌림`);
+	const reads = run.reads;
+	// Records of 0.9 counted calls, not characters: they have no share to show.
+	if (reads?.directorChars) {
+		main.push(`읽기 ${tokens(reads.directorChars)}자(서브에이전트와 겹침 ${Math.round((reads.duplicateChars / reads.directorChars) * 100)}%)`);
+	}
+	if (reads?.blocked) main.push(`큰 읽기 ${reads.blocked}회를 막음`);
 	if (run.maxMainContext) main.push(`최대 컨텍스트 ${tokens(run.maxMainContext)}`);
+	if (run.goal?.tokensUsed) main.push(`목표 토큰 ${tokens(run.goal.tokensUsed)}`);
 	if (run.checkpoints?.length) main.push(`실행 중 압축 ${run.checkpoints.length}회`);
-	if (main.length) lines.push(`- 메인(감독): ${main.join(" · ")}`);
+	if (main.length) lines.push(`- 감독: ${main.join(" · ")}`);
 	const agents = run.agents ?? [];
-	const cleanup = run.cleanup?.agents ? `정리: 이전 실행 하위 기록 ${run.cleanup.agents}개(${bytesText(run.cleanup.bytes)})` : "";
+	const cleanup = run.cleanup?.agents ? `정리: 이전 실행 서브에이전트 기록 ${run.cleanup.agents}개(${bytesText(run.cleanup.bytes)})` : "";
 	if (agents.length) {
 		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);
 		const reused = agents.filter(agent => agent.followUps > 0).length;
@@ -500,8 +859,9 @@ export function summarizeRun(run: RunRecord): string {
 
 /** `계획 레인 3(구현 2 · 리뷰 1)`: the plan's lanes counted per role, in lane order. */
 function planText(plan: RunPlan): string {
-	const byRole = new Map<string, number>();
-	for (const lane of plan.lanes) byRole.set(lane.role, (byRole.get(lane.role) ?? 0) + 1);
-	const roles = [...byRole].map(([role, n]) => `${ROLES.find(r => r.id === role)?.title ?? role} ${n}`).join(" · ");
+	const roles = tally(
+		plan.lanes.map(lane => lane.role),
+		roleTitle,
+	);
 	return `계획 레인 ${plan.lanes.length}${roles ? `(${roles})` : ""}`;
 }

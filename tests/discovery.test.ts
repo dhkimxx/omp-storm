@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { collectModels, toModelInfo } from "../src/discovery/models.ts";
-import { parseUsageJson, readQuota } from "../src/discovery/quota.ts";
+import { exhaustedLimit, parseUsageJson, readQuota } from "../src/discovery/quota.ts";
 import { parseConfigList, readExplicitSettings } from "../src/discovery/settings.ts";
 import type { Exec } from "../src/types.ts";
 
@@ -27,16 +27,22 @@ function ompModel(overrides: Record<string, unknown> = {}): Record<string, unkno
 }
 
 describe("toModelInfo", () => {
-	test("normalizes a chat model", () => {
-		const m = toModelInfo(ompModel(), true);
-		expect(m?.selector).toBe("anthropic/claude-sonnet-5");
-		expect(m?.identity).toEqual({ class: "claude", family: "sonnet", revision: "5.0.0" });
-		expect(m?.pricingKnown).toBe(true);
-		expect(m?.efforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
-		expect(m?.supportsTools).toBe(true);
-		expect(m?.int).toBe(52.5);
-		expect(m?.tps).toBeNull();
-		expect(m?.available).toBe(true);
+	test("normalizes a chat model to the fields Storm reads", () => {
+		expect(toModelInfo(ompModel(), true)).toEqual({
+			provider: "anthropic",
+			id: "claude-sonnet-5",
+			selector: "anthropic/claude-sonnet-5",
+			name: "Claude Sonnet 5",
+			identity: { class: "claude", revision: "5.0.0" },
+			cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+			pricingKnown: true,
+			contextWindow: 1_000_000,
+			efforts: ["low", "medium", "high", "xhigh", "max"],
+			supportsTools: true,
+			int: 52.5,
+			tps: null,
+			available: true,
+		});
 	});
 
 	test("zero or missing rates mean unknown pricing, not free", () => {
@@ -81,13 +87,14 @@ const SECRET_META = {
 	credentialId: "cred_secret",
 	planType: "pro",
 };
+const RESET = NOW + 3_600_000;
 
-function limit(used: number, opts: Record<string, unknown> = {}): Record<string, unknown> {
+function limit(used: number, opts: Record<string, unknown> = {}, scope: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
 		id: "5h",
 		label: "5 Hour",
-		scope: { provider: "x", accountId: "acct_secret" },
-		window: { id: "5h", label: "5 Hour", resetsAt: NOW + 3_600_000 },
+		scope: { provider: "x", accountId: "acct_secret", ...scope },
+		window: { id: "5h", label: "5 Hour", resetsAt: RESET },
 		amount: { used, limit: 100, unit: "percent", usedFraction: used / 100 },
 		...opts,
 	};
@@ -114,8 +121,8 @@ describe("parseUsageJson", () => {
 	const text = JSON.stringify(payload);
 
 	test("classifies provider quota states", () => {
-		const states = Object.fromEntries(parseUsageJson(text, NOW).map(q => [q.provider, q.state]));
-		expect(states).toEqual({
+		const quota = parseUsageJson(text);
+		expect(Object.fromEntries(quota.map(q => [q.provider, q.state]))).toEqual({
 			ok: "available",
 			busy: "limited",
 			done: "exhausted",
@@ -125,33 +132,77 @@ describe("parseUsageJson", () => {
 			multi: "available",
 			silent: "unknown",
 		});
-		const busy = parseUsageJson(text, NOW).find(q => q.provider === "busy");
+		const busy = quota.find(q => q.provider === "busy");
 		expect(busy?.usedFraction).toBeCloseTo(0.85);
-		expect(busy?.resetsAt).toBe(NOW + 3_600_000);
-		expect(parseUsageJson(text, NOW).find(q => q.provider === "multi")?.usedFraction).toBeCloseTo(0.3);
+		expect(busy?.resetsAt).toBe(RESET);
+		expect(quota.find(q => q.provider === "multi")?.usedFraction).toBeCloseTo(0.3);
+		expect(quota.every(q => q.exhaustedModels === undefined)).toBe(true);
+	});
+
+	test("an exhausted limit scoped to a model tier or one model stops only those models", () => {
+		const scoped = JSON.stringify({
+			reports: [
+				// Anthropic's shape: account-wide windows are `shared`, the weekly Opus counter names a tier.
+				{ provider: "anthropic", limits: [limit(30, {}, { shared: true }), limit(100, {}, { tier: "opus" })] },
+				// A meter that names its model, next to the account's own window.
+				{ provider: "codex", limits: [limit(50, {}, { shared: true }), limit(100, { window: { id: "w" } }, { shared: true, modelId: "GPT-Spark" })] },
+				// Per-model buckets only.
+				{ provider: "gemini", limits: [limit(100, {}, { modelId: "gemini-3-pro" }), limit(10, {}, { modelId: "gemini-3-flash" })] },
+			],
+		});
+		const quota = Object.fromEntries(parseUsageJson(scoped).map(q => [q.provider, q]));
+		expect(quota.anthropic).toEqual({ provider: "anthropic", state: "available", usedFraction: 0.3, resetsAt: null, exhaustedTiers: { opus: RESET } });
+		expect(quota.codex).toEqual({ provider: "codex", state: "available", usedFraction: 0.5, resetsAt: null, exhaustedModels: { "gpt-spark": null } });
+		expect(quota.gemini).toEqual({ provider: "gemini", state: "available", usedFraction: null, resetsAt: null, exhaustedModels: { "gemini-3-pro": RESET } });
+
+		expect(exhaustedLimit(quota.anthropic, "claude-opus-4-8", "opus")).toEqual({ resetsAt: RESET });
+		expect(exhaustedLimit(quota.anthropic, "claude-sonnet-5-5", "sonnet")).toBeUndefined();
+		expect(exhaustedLimit(quota.gemini, "Gemini-3-Pro", "pro")).toEqual({ resetsAt: RESET });
+		expect(exhaustedLimit(quota.gemini, "gemini-3-flash", "flash")).toBeUndefined();
+		expect(exhaustedLimit(quota.codex, "gpt-5.3-codex-spark", "codex-spark")).toBeUndefined();
+		expect(exhaustedLimit(undefined, "any", "-")).toBeUndefined();
+	});
+
+	test("a scope tier that is a plan name does not match a word of a model id", () => {
+		// Plan names ("pro", "max") travel in `scope.tier` too.
+		const quota = parseUsageJson(JSON.stringify({ reports: [{ provider: "p", limits: [limit(30, {}, { shared: true }), limit(100, {}, { tier: "Pro" })] }] }))[0];
+		expect(quota?.exhaustedTiers).toEqual({ pro: RESET });
+		expect(exhaustedLimit(quota, "gpt-6-pro-preview", "terra")).toBeUndefined();
+		expect(exhaustedLimit(quota, "claude-opus-5", "opus")).toBeUndefined();
+		expect(exhaustedLimit(quota, "gemini-3-pro", "pro")).toEqual({ resetsAt: RESET });
+	});
+
+	test("a provider-wide exhausted limit stops every model, with its reset time", () => {
+		const done = parseUsageJson(text).find(q => q.provider === "done");
+		expect(exhaustedLimit(done, "anything", "-")).toEqual({ resetsAt: RESET });
+	});
+
+	test("a tier-scoped limit of a provider that marks no account-wide window still counts provider-wide", () => {
+		const quota = parseUsageJson(JSON.stringify({ reports: [{ provider: "p", limits: [limit(100, {}, { tier: "pro" })] }] }));
+		expect(quota).toEqual([{ provider: "p", state: "exhausted", usedFraction: 1, resetsAt: RESET }]);
 	});
 
 	test("never returns account identifiers", () => {
-		const out = JSON.stringify(parseUsageJson(text, NOW));
+		const out = JSON.stringify(parseUsageJson(text));
 		for (const secret of ["user@example.com", "acct_secret", "org_secret", "Secret Org", "cred_secret"]) {
 			expect(out).not.toContain(secret);
 		}
 	});
 
 	test("bad output and failed commands give no quota", async () => {
-		expect(parseUsageJson("not json", NOW)).toEqual([]);
+		expect(parseUsageJson("not json")).toEqual([]);
 		const failing: Exec = async () => ({ stdout: "", stderr: "boom", code: 1 });
-		expect(await readQuota(failing, "omp", NOW)).toEqual([]);
+		expect(await readQuota(failing, "omp")).toEqual([]);
 		const throwing: Exec = async () => {
 			throw new Error("spawn failed");
 		};
-		expect(await readQuota(throwing, "omp", NOW)).toEqual([]);
+		expect(await readQuota(throwing, "omp")).toEqual([]);
 		let seen: string[] = [];
 		const ok: Exec = async (_cmd, args) => {
 			seen = args;
 			return { stdout: text, stderr: "", code: 0 };
 		};
-		expect((await readQuota(ok, "omp", NOW)).length).toBe(8);
+		expect((await readQuota(ok, "omp")).length).toBe(8);
 		expect(seen).toEqual(["usage", "--json"]);
 	});
 });
@@ -159,49 +210,32 @@ describe("parseUsageJson", () => {
 describe("parseConfigList", () => {
 	const entry = (value: unknown, type = "record") =>
 		value === undefined ? { type, description: "" } : { value, type, description: "" };
-	const config = {
-		"auth.token": entry("sk-secret", "string"),
-		modelRoles: entry({ default: "anthropic/claude-sonnet-5", slow: "openai/gpt-6", bad: 3 }),
-		"task.agentModelOverrides": entry({ explore: "anthropic/claude-haiku-5", task: ["a/b", "c/d"], junk: 1 }),
-		"magicKeywords.enabled": entry(true, "boolean"),
-		"magicKeywords.workflow": entry(false, "boolean"),
-		"magicKeywords.orchestrate": entry(true, "boolean"),
-	};
 
-	test("reads model roles, overrides and keyword toggles", () => {
-		const s = parseConfigList(JSON.stringify(config));
-		expect(s.defaultModel).toBe("anthropic/claude-sonnet-5");
-		expect(s.modelRoles).toEqual({ default: "anthropic/claude-sonnet-5", slow: "openai/gpt-6" });
-		expect(s.agentModelOverrides).toEqual({ explore: "anthropic/claude-haiku-5", task: ["a/b", "c/d"] });
-		expect(s.magicKeywords).toEqual({ enabled: true, workflowz: false, orchestrate: true });
-		expect(JSON.stringify(s)).not.toContain("sk-secret");
-	});
-
-	test("unset settings stay empty and unreadable keywords are undefined", () => {
-		const s = parseConfigList(JSON.stringify({ modelRoles: entry(undefined), "magicKeywords.enabled": entry(true, "boolean") }));
-		expect(s).toEqual({ modelRoles: {}, agentModelOverrides: {} });
-	});
-
-	test("reads the subagent idle TTL and cache retention, ignoring wrong types", () => {
+	test("reads model roles and nothing it has no use for", () => {
 		const s = parseConfigList(
-			JSON.stringify({ "task.agentIdleTtlMs": entry(420_000, "number"), "providers.cacheRetention": entry("long", "enum") }),
+			JSON.stringify({
+				"auth.token": entry("sk-secret", "string"),
+				modelRoles: entry({ default: "anthropic/claude-sonnet-5", slow: "openai/gpt-6", bad: 3 }),
+				"task.agentModelOverrides": entry({ explore: "anthropic/claude-haiku-5" }),
+				"magicKeywords.enabled": entry(true, "boolean"),
+				"task.agentIdleTtlMs": entry(420_000, "number"),
+				"providers.cacheRetention": entry("long", "enum"),
+				"task.showResolvedModelBadge": entry(false, "boolean"),
+			}),
 		);
-		expect(s.agentIdleTtlMs).toBe(420_000);
-		expect(s.cacheRetention).toBe("long");
-		expect(parseConfigList(JSON.stringify({ "task.agentIdleTtlMs": entry(0, "number") })).agentIdleTtlMs).toBe(0);
-		const bad = parseConfigList(
-			JSON.stringify({ "task.agentIdleTtlMs": entry("7m", "number"), "providers.cacheRetention": entry(3, "enum") }),
-		);
-		expect(bad).toEqual({ modelRoles: {}, agentModelOverrides: {} });
-		expect(parseConfigList(JSON.stringify({ "task.agentIdleTtlMs": entry(undefined, "number") })).agentIdleTtlMs).toBeUndefined();
+		expect(s).toEqual({ defaultModel: "anthropic/claude-sonnet-5", modelRoles: { default: "anthropic/claude-sonnet-5", slow: "openai/gpt-6" } });
 	});
 
-	test("reads isolation, concurrency, model badge and retry fallback settings", () => {
+	test("unset settings stay empty", () => {
+		expect(parseConfigList(JSON.stringify({ modelRoles: entry(undefined) }))).toEqual({ modelRoles: {} });
+		expect(parseConfigList("not json")).toEqual({ modelRoles: {} });
+	});
+
+	test("reads isolation, concurrency and retry fallback settings", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry(true, "boolean"),
 				"task.maxConcurrency": entry(4, "number"),
-				"task.showResolvedModelBadge": entry(false, "boolean"),
 				"retry.modelFallback": entry(true, "boolean"),
 				"retry.fallbackChains": entry({
 					"a/x": ["b/y", "c/z"],
@@ -212,30 +246,31 @@ describe("parseConfigList", () => {
 				}),
 			}),
 		);
-		expect(s.isolationEnabled).toBe(true);
-		expect(s.maxConcurrency).toBe(4);
-		expect(s.showResolvedModelBadge).toBe(false);
-		expect(s.modelFallback).toBe(true);
-		expect(s.fallbackChains).toEqual({ "a/x": ["b/y", "c/z"], default: [] });
+		expect(s).toEqual({
+			modelRoles: {},
+			isolationEnabled: true,
+			maxConcurrency: 4,
+			modelFallback: true,
+			fallbackChains: { "a/x": ["b/y", "c/z"], default: [] },
+		});
 	});
 
-	test("new settings ignore wrong types and non-positive concurrency", () => {
+	test("wrong types and a non-positive concurrency are ignored", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry("true", "boolean"),
 				"task.maxConcurrency": entry(0, "number"),
-				"task.showResolvedModelBadge": entry(1, "boolean"),
 				"retry.modelFallback": entry(null, "boolean"),
 				"retry.fallbackChains": entry(["a/x"]),
 			}),
 		);
-		expect(s).toEqual({ modelRoles: {}, agentModelOverrides: {} });
+		expect(s).toEqual({ modelRoles: {} });
 		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(-2, "number") })).maxConcurrency).toBeUndefined();
 		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(undefined, "number") })).maxConcurrency).toBeUndefined();
 	});
 
 	test("command failure gives empty defaults", async () => {
 		const failing: Exec = async () => ({ stdout: "", stderr: "", code: 2 });
-		expect(await readExplicitSettings(failing, "omp")).toEqual({ modelRoles: {}, agentModelOverrides: {} });
+		expect(await readExplicitSettings(failing, "omp")).toEqual({ modelRoles: {} });
 	});
 });

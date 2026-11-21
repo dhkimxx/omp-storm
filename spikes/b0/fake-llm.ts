@@ -92,7 +92,6 @@ function decide(request: ChatRequest): Decision {
 	return { kind: "text", text: "OK" };
 }
 
-const encoder = new TextEncoder();
 const usage = { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 };
 
 function chunk(id: string, model: string, delta: Record<string, unknown>, finish: string | null): string {

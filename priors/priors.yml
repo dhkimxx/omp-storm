@@ -1,7 +1,6 @@
-# OMP Storm priors: name rules, tier order, price-tier bounds, aliases (p0-results Q9-6).
+# OMP Storm priors: name rules, price-tier bounds, aliases (docs/spikes.md, P0 Q9-6).
 # Users may override any key in <agentDir>/storm/priors.yml (default ~/.omp/agent/storm/priors.yml); arrays replace, maps merge.
 schema: 1
-updated: 2026-11-20 # Storm warns when this is more than 90 days old
 
 lineage:
   # Route/billing/quantization/region words: same model, kept as variant.route.
@@ -41,15 +40,6 @@ lineage:
       source: "catalog override deepseek.kdl:20 (deepseek, opencode-go only)"
       expires: 2027-02-01
 
-# Tier order inside a class, low to high; used for newer/higher-tier detection.
-tiers:
-  openai: [luna, terra, sol, astra] # "-pro" suffix is the same tier plus a pro variant
-  anthropic: [haiku, sonnet, opus, fable, mythos] # fable and mythos are peers
-  deepseek: [flash, pro]
-  minimax: [m-flash, m]
-  glm: [flash, "-"]
-  tier_aliases: {} # renamed tiers across generations; confirmed ones only
-
 price_tier:
   # Reference request in tokens (user's 30-day mean, rounded); fixed so tiers stay stable.
   reference_mix: {input: 4000, output: 1000, cache_read: 160000, cache_write: 1000}
@@ -59,5 +49,5 @@ price_tier:
   bounds_usd_per_request: {cheap_below: 0.01, premium_from: 0.06}
 
 # Optional external benchmark values only; never adjusts catalog int.
-# Item: {key, metric, value, source, url, date, harness}
+# Item: {key, metric, value, source}
 quality_priors: []

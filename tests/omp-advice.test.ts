@@ -1,30 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { renderStatus } from "../src/interview/render.ts";
+import { renderStatus } from "../src/view/render.ts";
 import { ompSettingsAdvice, shellQuote, wantedFallbackChains } from "../src/report/omp-settings.ts";
 import { STORM_VERSION } from "../src/roles.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "../src/runtime/quota-auto.ts";
 import { newerInstalledVersion } from "../src/runtime/version.ts";
 import type { ExplicitSettings, StatusView, StormConfig } from "../src/types.ts";
+import { teamOf } from "./fixtures.ts";
 
-const config: StormConfig = {
-	version: 1,
-	priority: "balanced",
-	roles: {
-		explorer: { agent: "storm-explorer", models: ["a/x:low", "b/y:high", "a/x:max"] },
-		implementer: { agent: "storm-implementer", models: ["c/z:high"] },
-	},
-	parallelism: 4,
-	isolation: "shared",
-	contract: "workflowz",
-	runtime: "omp",
-};
+const config: StormConfig = teamOf({ explorer: ["a/x:low", "b/y:high", "a/x:max"], implementer: "c/z:high" }, { contract: "workflowz", runtime: "omp" });
 
 const known = (extra: Partial<ExplicitSettings> = {}): ExplicitSettings => ({
 	modelRoles: {},
-	agentModelOverrides: {},
 	maxConcurrency: 8,
-	showResolvedModelBadge: true,
 	modelFallback: true,
 	fallbackChains: { "a/x": ["b/y"] },
 	...extra,
@@ -39,20 +27,14 @@ describe("ompSettingsAdvice", () => {
 	});
 
 	test("unknown settings give no advice", () => {
-		expect(ompSettingsAdvice(config, { modelRoles: {}, agentModelOverrides: {} })).toEqual([]);
+		expect(ompSettingsAdvice(config, { modelRoles: {} })).toEqual([]);
 	});
 
 	test("maxConcurrency below parallelism asks to raise it", () => {
 		const [advice] = ompSettingsAdvice(config, known({ maxConcurrency: 2 }));
 		expect(advice?.key).toBe("task.maxConcurrency");
 		expect(advice?.command).toBe("omp config set task.maxConcurrency 4");
-		expect(advice?.message).toContain("(2)");
 		expect(keys(known({ maxConcurrency: 4 }))).toEqual([]);
-	});
-
-	test("a hidden model badge asks to turn it on", () => {
-		const [advice] = ompSettingsAdvice(config, known({ showResolvedModelBadge: false }));
-		expect(advice?.command).toBe("omp config set task.showResolvedModelBadge true");
 	});
 
 	test("wanted chains drop efforts, dedupe, skip single-model roles and merge shared primaries", () => {
@@ -95,7 +77,6 @@ describe("ompSettingsAdvice", () => {
 			const [advice] = ompSettingsAdvice(isolated, settings);
 			expect(advice?.key).toBe("task.isolation.enabled");
 			expect(advice?.command).toBe("omp config set task.isolation.enabled true");
-			expect(advice?.message).toContain("같은 작업 트리");
 		}
 		expect(keys(known({ isolationEnabled: true }), isolated)).toEqual([]);
 		expect(keys(known({ isolationEnabled: false }))).toEqual([]);
@@ -112,41 +93,33 @@ describe("shellQuote", () => {
 
 describe("renderStatus omp sections", () => {
 	const base: StatusView = {
-		repo: { repoId: "git-r-1", kind: "dir", root: "/r" },
-		config: { status: "ok", path: "/r/c", config, hash: "jcs-sha256:abcdef0123456789", rawSha256: "x", warnings: [] },
+		config: { status: "ok", path: "/r/c", config, hash: "jcs-sha256:abcdef0123456789", warnings: [] },
 		approval: undefined,
 		shadows: [],
 		quota: [],
 		dataAsOf: null,
 	};
 
-	test("advice renders messages, commands and the no-change note", () => {
-		const md = renderStatus(
-			{
-				...base,
-				ompAdvice: [
-					{ key: "task.maxConcurrency", message: "올리세요.", command: "omp config set task.maxConcurrency 4" },
-					{ key: "x", message: "명령 없음." },
-				],
-			},
-			0,
-		);
-		expect(md).toContain(
-			"### omp 설정 점검\n- 올리세요.\n  - `omp config set task.maxConcurrency 4`\n- 명령 없음.\n- Storm 은 omp 설정을 바꾸지 않습니다.",
-		);
+	test("advice shows each message and its command", () => {
+		const command = "omp config set task.maxConcurrency 4";
+		const md = renderStatus({ ...base, ompAdvice: [{ key: "task.maxConcurrency", message: "ADVICE-ONE", command }, { key: "x", message: "ADVICE-TWO" }] }, 0);
+		expect(md.indexOf("ADVICE-ONE")).toBeGreaterThan(-1);
+		expect(md.indexOf(`\`${command}\``)).toBeGreaterThan(md.indexOf("ADVICE-ONE"));
+		expect(md.indexOf("ADVICE-TWO")).toBeGreaterThan(md.indexOf(command));
 	});
 
-	test("no advice, no section; the first line stays plain without a newer version", () => {
-		for (const view of [base, { ...base, ompAdvice: [] }]) {
-			const md = renderStatus(view, 0);
-			expect(md).not.toContain("### omp 설정 점검");
-			expect(md.split("\n")[0]).toBe(`- Storm ${STORM_VERSION}`);
-		}
+	test("no advice adds nothing to the status", () => {
+		const plain = renderStatus(base, 0);
+		expect(renderStatus({ ...base, ompAdvice: [] }, 0)).toBe(plain);
+		expect(plain.split("\n")[0]).toContain(STORM_VERSION);
+		expect(plain).not.toContain("omp config set");
 	});
 
 	test("a newer installed version shows on the first line", () => {
-		const md = renderStatus({ ...base, newerVersion: "9.9.9" }, 0);
-		expect(md.split("\n")[0]).toBe(`- Storm ${STORM_VERSION} · 새 버전 9.9.9 설치됨 → /restart 로 적용`);
+		const first = renderStatus({ ...base, newerVersion: "9.9.9" }, 0).split("\n")[0];
+		expect(first).toContain(STORM_VERSION);
+		expect(first).toContain("9.9.9");
+		expect(renderStatus(base, 0).split("\n")[0]).not.toContain("9.9.9");
 	});
 });
 
@@ -168,9 +141,12 @@ describe("fallbackQuotaMark", () => {
 	});
 
 	test("notices name the models and the provider", () => {
-		expect(quotaNotice("a/x", "b/y", "a")).toContain("a 를 5시간 동안 쿼터 소진으로 표시");
-		expect(quotaNotice("x", "b/y")).not.toContain("5시간");
-		expect(credentialNotice("openai")).toContain("openai 인증 정보");
+		const marked = quotaNotice("a/x", "b/y", "a");
+		expect(marked).toContain("a/x");
+		expect(marked).toContain("b/y");
+		// Without a provider there is no mark to mention.
+		expect(quotaNotice("x", "b/y")).not.toBe(quotaNotice("x", "b/y", "a"));
+		expect(credentialNotice("openai")).toContain("openai");
 	});
 });
 

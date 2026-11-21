@@ -8,7 +8,6 @@ interface YieldArgs {
 }
 interface FinalPayload {
 	overall_correctness?: unknown;
-	confidence?: unknown;
 	findings?: unknown;
 }
 interface Finding {
@@ -67,7 +66,7 @@ export function tallyFromYield(prev: ReviewTally | undefined, input: unknown): R
 	const verdict = final.overall_correctness;
 	if (verdict !== "correct" && verdict !== "incorrect") return prev;
 	if (Array.isArray(final.findings)) countFindings(counts, final.findings);
-	const next = withCounts(
+	return withCounts(
 		{
 			...base,
 			reviews: base.reviews + 1,
@@ -76,9 +75,22 @@ export function tallyFromYield(prev: ReviewTally | undefined, input: unknown): R
 		},
 		counts,
 	);
-	const confidence = final.confidence;
-	if (typeof confidence === "number" && confidence >= 0 && confidence <= 1) next.lastConfidence = confidence;
-	return next;
+}
+
+/** The agents' review tallies added up; `docFindings` is always a number here. */
+export function reviewTotals(agents: readonly AgentEntry[]): Required<ReviewTally> {
+	const total: Required<ReviewTally> = { reviews: 0, passed: 0, failed: 0, findings: [0, 0, 0, 0], docFindings: 0 };
+	for (const { review } of agents) {
+		if (!review) continue;
+		total.reviews += review.reviews;
+		total.passed += review.passed;
+		total.failed += review.failed;
+		total.docFindings += review.docFindings ?? 0;
+		review.findings.forEach((n, i) => {
+			total.findings[i as 0 | 1 | 2 | 3] += n;
+		});
+	}
+	return total;
 }
 
 /**
@@ -86,22 +98,8 @@ export function tallyFromYield(prev: ReviewTally | undefined, input: unknown): R
  * zero), or `- 리뷰: 없음` before any verdict.
  */
 export function reviewLine(agents: readonly AgentEntry[]): string {
-	let passed = 0;
-	let failed = 0;
-	let docs = 0;
-	const totals = [0, 0, 0, 0];
-	for (const agent of agents) {
-		const review = agent.review;
-		if (!review || review.reviews === 0) continue;
-		passed += review.passed;
-		failed += review.failed;
-		docs += review.docFindings ?? 0;
-		review.findings.forEach((n, i) => {
-			totals[i] = (totals[i] ?? 0) + n;
-		});
-	}
-	const reviews = passed + failed;
-	if (reviews === 0) return "- 리뷰: 없음";
-	const ps = totals.flatMap((n, i) => (n > 0 ? [`P${i} ${n}`] : []));
-	return `- 리뷰 ${reviews}회: 통과 ${passed} · 수정 필요 ${failed}${ps.length ? ` (${ps.join(" · ")})` : ""}${docs > 0 ? ` · 문서 상충 ${docs}건` : ""}`;
+	const total = reviewTotals(agents.filter(agent => (agent.review?.reviews ?? 0) > 0));
+	if (total.reviews === 0) return "- 리뷰: 없음";
+	const ps = total.findings.flatMap((n, i) => (n > 0 ? [`P${i} ${n}`] : []));
+	return `- 리뷰 ${total.reviews}회: 통과 ${total.passed} · 수정 필요 ${total.failed}${ps.length ? ` (${ps.join(" · ")})` : ""}${total.docFindings > 0 ? ` · 문서 상충 ${total.docFindings}건` : ""}`;
 }

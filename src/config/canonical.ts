@@ -202,6 +202,17 @@ class Parser {
 	}
 }
 
+/**
+ * Characters that can forge or hide what a terminal shows: control characters (ESC among them), format controls
+ * (bidi overrides and isolates, zero-width marks, BOM) and line/paragraph separators.
+ */
+const UNSAFE_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+
+/** `text` with each such character as a visible `\u{…}` escape; unchanged when it has none. */
+export function escapeUnsafe(text: string): string {
+	return text.replace(UNSAFE_CHARS, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+}
+
 /** Parses config JSON strictly: one leading BOM stripped, duplicate keys, non-object roots, -0 and unsafe integers rejected. */
 export function parseStrictJson(text: string): StrictJsonResult {
 	const body = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
@@ -212,7 +223,8 @@ export function parseStrictJson(text: string): StrictJsonResult {
 		}
 		return { ok: true, value };
 	} catch (error) {
-		if (error instanceof JsonError) return { ok: false, error: error.message };
+		// The message quotes the file (a key, a character); it is shown to the user, so it must not carry raw controls.
+		if (error instanceof JsonError) return { ok: false, error: escapeUnsafe(error.message) };
 		throw error;
 	}
 }
@@ -278,4 +290,9 @@ export function sha256Hex(data: string | Uint8Array): string {
 /** "jcs-sha256:<hex>" of the canonical JSON; formatting and key order do not change it. */
 export function configHash(value: unknown): string {
 	return `jcs-sha256:${sha256Hex(canonicalJson(value))}`;
+}
+
+/** The first 12 hex characters of a config hash, as shown to the user. */
+export function shortHash(hash: string): string {
+	return hash.replace(/^jcs-sha256:/, "").slice(0, 12);
 }

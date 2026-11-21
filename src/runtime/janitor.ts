@@ -10,9 +10,9 @@
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { pruneProposals } from "../proposals/store.ts";
+import { readJsonl, serialized, writeTextAtomic } from "../fsutil.ts";
 import type { AgentEntry, CleanupResult, RunRecord, StormConfig } from "../types.ts";
-import { readRun, runsDir, writeRun } from "./run.ts";
+import { readRun, runIds, stateDir, writeRun } from "./run.ts";
 import { pruneTrialStates } from "./state-files.ts";
 
 /** Runs whose subagent records stay for result checks and analysis, newest first. */
@@ -41,7 +41,7 @@ export interface TrustedRun {
 }
 
 export interface JanitorInput {
-	/** Project root: Storm's trial counters and proposals, and run records for the display-only `cleanedAt`. */
+	/** Project root: Storm's trial counters and run records (stale `running` ones, and the display-only `cleanedAt`). */
 	root: string;
 	/** `ApprovalStore.dir` of this repo: holds the trusted run list. */
 	storeDir: string;
@@ -51,7 +51,7 @@ export interface JanitorInput {
 	config: StormConfig;
 	/** The config the ended run started with. omp records go only when both have `cleanup: true`. */
 	startConfig: StormConfig;
-	/** The approved hash in force; its snapshot, evidence and record always stay. */
+	/** The approved hash in force; its snapshot and record always stay. */
 	configHash: string | null;
 	/** The run that just ended; never cleaned. */
 	runId: string;
@@ -61,6 +61,10 @@ export interface JanitorInput {
 	/** This process's agent ledger (`listAgents()`): agents in it that are not parked are live and never cleaned. */
 	ledger: readonly AgentEntry[];
 	approvals?: ApprovalPrunePort;
+	/** omp's agent dir: Storm's retired usage archive below it is removed. Absent → left alone. */
+	agentDir?: string;
+	/** Whether the omp process of a `processKey()` may still run; defaults to a signal-0 probe of its pid. */
+	alive?: (key: string) => boolean;
 }
 
 export interface JanitorOutput {
@@ -127,52 +131,16 @@ function isTrustedRun(value: unknown): value is TrustedRun {
 }
 
 /** Trusted runs, oldest first; torn or foreign lines are skipped. */
-export async function readTrustedRuns(storeDir: string): Promise<TrustedRun[]> {
-	let text: string;
-	try {
-		text = await fs.readFile(trustedRunsFile(storeDir), "utf8");
-	} catch {
-		return [];
-	}
-	const out: TrustedRun[] = [];
-	for (const line of text.split("\n")) {
-		if (line.trim() === "") continue;
-		try {
-			const value: unknown = JSON.parse(line);
-			if (isTrustedRun(value)) out.push(value);
-		} catch {
-			// torn line
-		}
-	}
-	return out;
+export function readTrustedRuns(storeDir: string): Promise<TrustedRun[]> {
+	return readJsonl(trustedRunsFile(storeDir), isTrustedRun);
 }
-
-// Read-modify-write of the list; a per-file chain keeps two updates in one process from losing each other.
-const chains = new Map<string, Promise<void>>();
 
 function updateTrustedRuns(storeDir: string, update: (runs: TrustedRun[]) => TrustedRun[]): Promise<void> {
 	const file = path.resolve(trustedRunsFile(storeDir));
-	const step = (chains.get(file) ?? Promise.resolve()).then(async () => {
+	return serialized(file, async () => {
 		const next = update(await readTrustedRuns(storeDir)).slice(-TRUSTED_RUNS_MAX);
-		await fs.mkdir(path.dirname(file), { recursive: true });
-		const tmp = path.join(path.dirname(file), `.runs.jsonl.${process.pid}.${crypto.randomUUID()}.tmp`);
-		try {
-			await fs.writeFile(tmp, next.map(r => `${JSON.stringify(r)}\n`).join(""));
-			await fs.rename(tmp, file);
-		} catch (error) {
-			await fs.rm(tmp, { force: true });
-			throw error;
-		}
+		await writeTextAtomic(file, next.map(r => `${JSON.stringify(r)}\n`).join(""));
 	});
-	const tail = step.then(
-		() => undefined,
-		() => undefined,
-	);
-	chains.set(file, tail);
-	void tail.then(() => {
-		if (chains.get(file) === tail) chains.delete(file);
-	});
-	return step;
 }
 
 /**
@@ -260,18 +228,44 @@ export async function agentRecordFiles(artifactsDir: string, id: string): Promis
 
 // ── Janitor ───────────────────────────────────────────────────────────────────
 
+/** Removes a directory an earlier Storm version wrote and nothing reads any more; 1 when it existed. */
+async function removeLegacyDir(dir: string): Promise<number> {
+	if (!(await lstatOrUndefined(dir))?.isDirectory()) return 0;
+	await fs.rm(dir, { recursive: true, force: true });
+	return 1;
+}
+
 /**
- * Runs once at each run end, after the run is recorded (`recordTrustedRun`, `writeRun`, index, `pruneRuns`).
+ * Run records still `running` whose process is gone (a crash, a kill) become `stopped`, ended at their last live
+ * write: they then count as the project's last run instead of staying invisible.
+ */
+async function stopDeadRuns(input: JanitorInput, alive: (key: string) => boolean): Promise<void> {
+	for (const id of await runIds(input.root)) {
+		if (id === input.runId) continue;
+		const record = await readRun(input.root, id);
+		if (record?.status !== "running") continue;
+		// This process has one run per project, and it is `input.runId`: any other record of it is stale too.
+		if (record.process !== undefined && record.process !== input.process && alive(record.process)) continue;
+		await writeRun(input.root, { ...record, status: "stopped", endedAt: record.updatedAt ?? record.startedAt });
+	}
+}
+
+/**
+ * Runs once at each run end: after the run joined the trusted list (`recordTrustedRun`), before its final record,
+ * its index line and `pruneRuns` (the record carries this cleanup's result).
  * Storm limits always apply; omp records go only when the run's start config and the config in force both have
  * `cleanup: true`, and only for agents of trusted runs older than the newest `KEEP_RECENT_RUNS`.
  */
 export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 	const result: CleanupResult = { agents: 0, files: 0, bytes: 0, stormFiles: 0 };
 	const cleaned: string[] = [];
+	const alive = input.alive ?? processAlive;
 	if (input.approvals) result.stormFiles += await input.approvals.prune(input.configHash);
 	const trialIds = [...(input.config.trials ?? []), ...(input.startConfig.trials ?? [])].map(t => t.id);
 	result.stormFiles += await pruneTrialStates(input.root, trialIds);
-	result.stormFiles += await pruneProposals(input.root, input.now);
+	result.stormFiles += await removeLegacyDir(path.join(stateDir(input.root), "proposals"));
+	if (input.agentDir) result.stormFiles += await removeLegacyDir(path.join(input.agentDir, "storm", "usage"));
+	await stopDeadRuns(input, alive);
 	if (input.config.cleanup !== true || input.startConfig.cleanup !== true) return { result, cleaned };
 
 	// Same-process agents absent from the ledger were parked long ago (the ledger only drops parked entries).
@@ -284,7 +278,7 @@ export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 	for (const run of older) {
 		const sameProcess = run.process === input.process;
 		// Another omp process that still runs may hold its agents in memory; B0 showed deleting those loses data.
-		if (!sameProcess && processAlive(run.process)) continue;
+		if (!sameProcess && alive(run.process)) continue;
 		const dir = await acceptedArtifactsDir(run.artifactsDir, input.sessionsRoot);
 		if (dir === undefined) continue;
 		const already = new Set(run.cleaned ?? []);
@@ -351,18 +345,7 @@ async function treeBytes(dir: string): Promise<number> {
 
 /** Newest repo run record carrying a cleanup result; display only. */
 async function lastCleanupRecord(root: string): Promise<RunRecord | undefined> {
-	let names: string[];
-	try {
-		names = await fs.readdir(runsDir(root));
-	} catch {
-		return undefined;
-	}
-	const ids = names
-		.filter(n => /^run-[0-9A-Za-z-]+\.json$/.test(n))
-		.map(n => n.slice(0, -5))
-		.sort()
-		.reverse();
-	for (const id of ids) {
+	for (const id of (await runIds(root)).reverse()) {
 		const run = await readRun(root, id);
 		if (run?.cleanup) return run;
 	}

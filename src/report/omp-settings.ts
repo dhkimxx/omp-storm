@@ -29,13 +29,6 @@ export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSetting
 			command: `omp config set task.maxConcurrency ${config.parallelism}`,
 		});
 	}
-	if (settings.showResolvedModelBadge === false) {
-		advice.push({
-			key: "task.showResolvedModelBadge",
-			message: "작업 위젯에 서브에이전트가 실제로 쓰는 모델이 보이지 않습니다. 켜면 Storm 이 고른 모델을 바로 확인할 수 있습니다.",
-			command: "omp config set task.showResolvedModelBadge true",
-		});
-	}
 	const wanted = wantedFallbackChains(config);
 	const primaries = Object.keys(wanted);
 	if (primaries.length > 0) {
@@ -63,7 +56,7 @@ export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSetting
 	if (config.isolation === "isolated" && settings.isolationEnabled !== true) {
 		advice.push({
 			key: "task.isolation.enabled",
-			message: "Storm 설정은 격리 실행인데 omp 격리가 꺼져 있어, 켜기 전까지 서브에이전트가 같은 작업 트리에서 일합니다.",
+			message: "팀 설정은 격리인데 omp 격리가 꺼져 있어, 켜기 전까지 서브에이전트가 공유 작업 트리에서 일합니다.",
 			command: "omp config set task.isolation.enabled true",
 		});
 	}

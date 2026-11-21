@@ -14,3 +14,51 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm rebuild bun --ignore-scripts=false
       - run: npm run verify
+
+  # The real plugin inside the pinned omp against a scripted fake LLM: no secrets, no paid calls.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild bun --ignore-scripts=false
+      - name: Versions
+        run: |
+          uname -a
+          echo "node $(node --version) · npm $(npm --version) · $(git --version)"
+          echo "bun $(node_modules/.bin/bun --version)"
+          PATH="$PWD/node_modules/.bin:$PATH" omp --version
+          ls node_modules/@oh-my-pi | tr '\n' ' '
+      # The harness keeps its work dir (omp stderr, RPC frames, screens, model requests) when a check fails.
+      - name: E2E (RPC and print)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e" npm run e2e
+      # omp's goal and loop modes exist only in its TUI, which the harness drives on a pty.
+      - name: Can this runner open a pty?
+        id: pty
+        if: ${{ !cancelled() }}
+        run: |
+          if node_modules/.bin/bun -e 'const p = Bun.spawn(["sh", "-c", "test -t 0 && echo tty"], { terminal: { cols: 80, rows: 24, data(_t, d) { process.stdout.write(d); } } }); await p.exited;' | grep -q tty; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No pty on this runner: the TUI scenarios (goal and loop runs, setup forms) did not run."
+          fi
+      - name: E2E (TUI)
+        if: ${{ !cancelled() && steps.pty.outputs.ok == 'true' }}
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-tui" npm run e2e:tui
+      - name: Upload the work dirs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storm-e2e-work
+          include-hidden-files: true
+          if-no-files-found: ignore
+          # The linked plugin is a symlink to the checkout: the artifact needs the logs, not the repo again.
+          path: |
+            ${{ runner.temp }}/storm-e2e*/
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/plugins/**
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/natives/**

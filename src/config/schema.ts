@@ -1,6 +1,7 @@
 import { MAX_WORKERS, REQUIRED_ROLES, ROLES } from "../roles.ts";
-import { EFFORTS, PRIORITIES } from "../types.ts";
-import type { StormConfig } from "../types.ts";
+import { EFFORTS } from "../types.ts";
+import type { Priority, StoredPriority, StormConfig } from "../types.ts";
+import { escapeUnsafe } from "./canonical.ts";
 
 export interface ConfigValidation {
 	config?: StormConfig;
@@ -8,6 +9,15 @@ export interface ConfigValidation {
 	warnings: string[];
 }
 
+/** Every priority a config file may carry; the last two are no longer offered. */
+const STORED_PRIORITIES: readonly StoredPriority[] = ["balanced", "quality", "cost", "speed", "quota"];
+
+/** The priority a config asks for: "speed" and "quota" changed nothing on real data and are read as "balanced". */
+export function teamPriority(config: StormConfig): Priority {
+	return config.priority === "speed" || config.priority === "quota" ? "balanced" : config.priority;
+}
+
+// `contract` and `runtime` are deprecated: accepted without a warning and ignored.
 const TOP_KEYS = [
 	"version",
 	"priority",
@@ -25,12 +35,12 @@ const TOP_KEYS = [
 	"docs",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
-const MAX_CONTEXT_CAP = 10_000_000;
+/** Highest `contextCap` a config may set (team or role), in tokens. */
+export const MAX_CONTEXT_CAP = 10_000_000;
 const BUDGET_KEYS = ["perRunUsd", "warnAtUsd", "onExceed"];
 const TRIAL_KEYS = ["id", "role", "model", "effort", "share", "maxSpawns", "startsAt", "endsAt", "budgetUsd"];
 // Full timestamps with an explicit zone; date-only or zone-less strings parse differently across hosts.
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
-const AGENT_RE = /^storm-[a-z0-9-]+$/;
 // "provider/id" with an optional ":<suffix>"; the id may contain more '/' (aggregator routes).
 const MODEL_RE = /^[^\s/:]+\/[^\s]*[^\s/:]$/;
 
@@ -42,9 +52,42 @@ function oneOf(v: unknown, allowed: readonly string[]): boolean {
 	return typeof v === "string" && allowed.includes(v);
 }
 
-function warnUnknown(obj: Record<string, unknown>, known: readonly string[], path: string, warnings: string[]): void {
-	for (const key of Object.keys(obj)) {
-		if (!known.includes(key)) warnings.push(`${path ? `${path}.` : ""}${key}: 알 수 없는 필드입니다`);
+/** `path` extended by an object key; a key that is not a plain name is quoted, with unsafe characters escaped. */
+function keyPath(path: string, key: string): string {
+	if (/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)) return path ? `${path}.${key}` : key;
+	return `${path}[${escapeUnsafe(JSON.stringify(key))}]`;
+}
+
+/** Fields Storm does not know, as "path" plus value: they do nothing, yet they are part of the hash the user approves. */
+export function unknownFields(value: unknown): Array<{ path: string; value: unknown }> {
+	const out: Array<{ path: string; value: unknown }> = [];
+	const scan = (obj: unknown, known: readonly string[], path: string): void => {
+		if (!isRecord(obj)) return;
+		for (const [key, v] of Object.entries(obj)) if (!known.includes(key)) out.push({ path: keyPath(path, key), value: v });
+	};
+	if (!isRecord(value)) return out;
+	scan(value, TOP_KEYS, "");
+	if (isRecord(value.roles)) for (const [id, role] of Object.entries(value.roles)) scan(role, ROLE_KEYS, keyPath("roles", id));
+	scan(value.budget, BUDGET_KEYS, "budget");
+	if (Array.isArray(value.trials)) value.trials.forEach((t: unknown, i) => scan(t, TRIAL_KEYS, `trials[${i}]`));
+	return out;
+}
+
+/**
+ * Every string and every key of the config, unknown fields included, must be free of characters that can forge or
+ * hide rows where the config is shown: the approval dialog guards a file that may come from a cloned repo.
+ */
+function unsafeText(value: unknown, path: string, errors: string[]): void {
+	if (typeof value === "string") {
+		if (escapeUnsafe(value) !== value) errors.push(`${path}: 제어 문자나 방향 제어 문자는 쓸 수 없습니다`);
+	} else if (Array.isArray(value)) {
+		value.forEach((item: unknown, i) => unsafeText(item, `${path}[${i}]`, errors));
+	} else if (isRecord(value)) {
+		for (const [key, item] of Object.entries(value)) {
+			const at = keyPath(path, key);
+			if (escapeUnsafe(key) !== key) errors.push(`${at}: 필드 이름에 제어 문자나 방향 제어 문자는 쓸 수 없습니다`);
+			unsafeText(item, at, errors);
+		}
 	}
 }
 
@@ -72,7 +115,7 @@ function isoTime(v: unknown): number | undefined {
 	return Number.isFinite(t) ? t : undefined;
 }
 
-function validateTrials(trials: unknown, roleKeys: string[] | undefined, errors: string[], warnings: string[]): void {
+function validateTrials(trials: unknown, roleKeys: string[] | undefined, errors: string[]): void {
 	if (!Array.isArray(trials)) {
 		errors.push("trials: 배열이어야 합니다");
 		return;
@@ -102,7 +145,6 @@ function validateTrials(trials: unknown, roleKeys: string[] | undefined, errors:
 		if (end === undefined) errors.push(`${path}.endsAt: 시간대가 있는 ISO 8601 시각이어야 합니다`);
 		else if (start !== undefined && end <= start) errors.push(`${path}.endsAt: startsAt보다 뒤여야 합니다`);
 		if (!isPositiveNumber(t.budgetUsd)) errors.push(`${path}.budgetUsd: 0보다 큰 숫자여야 합니다`);
-		warnUnknown(t, TRIAL_KEYS, path, warnings);
 	});
 }
 
@@ -122,28 +164,37 @@ function validateDisabled(disabled: unknown, roleKeys: string[] | undefined, err
 	});
 }
 
-/** Checks a parsed config against schema version 1. Unknown fields only warn; they still count toward the hash. */
+/**
+ * Checks a parsed config against schema version 1. Unknown fields only warn; they still count toward the hash.
+ * Fields earlier versions wrote (`contract`, `runtime`, the priorities "speed" and "quota", `workers: n`) stay valid.
+ * No message carries a raw unsafe character: what a message quotes from the config is escaped.
+ */
 export function validateConfig(value: unknown): ConfigValidation {
 	const errors: string[] = [];
-	const warnings: string[] = [];
-	if (!isRecord(value)) return { errors: ["설정은 JSON 객체여야 합니다"], warnings };
+	if (!isRecord(value)) return { errors: ["설정은 JSON 객체여야 합니다"], warnings: [] };
+	const warnings = unknownFields(value).map((f) => `${f.path}: 알 수 없는 필드입니다`);
+	unsafeText(value, "", errors);
 
 	if (value.version !== 1) errors.push("version: 1이어야 합니다");
-	if (!oneOf(value.priority, PRIORITIES)) errors.push(`priority: ${PRIORITIES.join("|")} 중 하나여야 합니다`);
+	if (!oneOf(value.priority, STORED_PRIORITIES)) errors.push("priority: balanced|quality|cost 중 하나여야 합니다");
 
 	const roles = value.roles;
 	if (!isRecord(roles) || Object.keys(roles).length === 0) {
 		errors.push("roles: 역할이 하나 이상 있는 객체여야 합니다");
 	} else {
+		for (const id of REQUIRED_ROLES) if (!Object.hasOwn(roles, id)) errors.push(`roles.${id}: 꼭 있어야 하는 역할입니다`);
 		for (const [id, role] of Object.entries(roles)) {
-			const path = `roles.${id}`;
+			const path = keyPath("roles", id);
+			const spec = ROLES.find((r) => r.id === id);
+			if (!spec) {
+				errors.push(`${path}: Storm 역할(${ROLES.map((r) => r.id).join("|")})이 아닙니다`);
+				continue;
+			}
 			if (!isRecord(role)) {
 				errors.push(`${path}: 객체여야 합니다`);
 				continue;
 			}
-			if (typeof role.agent !== "string" || !AGENT_RE.test(role.agent)) {
-				errors.push(`${path}.agent: storm-<이름> 형식이어야 합니다`);
-			}
+			if (role.agent !== spec.agent) errors.push(`${path}.agent: ${spec.agent}여야 합니다`);
 			if (!Array.isArray(role.models) || role.models.length === 0) {
 				errors.push(`${path}.models: 모델이 하나 이상 있어야 합니다`);
 			} else {
@@ -160,7 +211,6 @@ export function validateConfig(value: unknown): ConfigValidation {
 			if (role.contextCap !== undefined && !isIntIn(role.contextCap, 1, MAX_CONTEXT_CAP)) {
 				errors.push(`${path}.contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
 			}
-			warnUnknown(role, ROLE_KEYS, path, warnings);
 		}
 	}
 
@@ -174,10 +224,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 	if (value.cleanup !== undefined && typeof value.cleanup !== "boolean") errors.push("cleanup: true|false여야 합니다");
 	if (value.docs !== undefined && typeof value.docs !== "boolean") errors.push("docs: true|false여야 합니다");
 	if (!oneOf(value.isolation, ["isolated", "shared"])) errors.push("isolation: isolated|shared 중 하나여야 합니다");
-	if (!oneOf(value.contract, ["workflowz", "orchestrate"])) {
-		errors.push("contract: workflowz|orchestrate 중 하나여야 합니다");
-	}
-	if (value.runtime !== "omp") errors.push("runtime: omp여야 합니다");
+	// Ignored, but covered by the hash and shown in the approval dialog: it must at least be printable text.
+	if (value.contract !== undefined && typeof value.contract !== "string") errors.push("contract: 문자열이어야 합니다");
+	if (value.runtime !== undefined && value.runtime !== "omp") errors.push("runtime: omp여야 합니다");
 
 	const budget = value.budget;
 	if (budget !== undefined) {
@@ -194,7 +243,6 @@ export function validateConfig(value: unknown): ConfigValidation {
 			if (!oneOf(budget.onExceed, ["block-spawns", "stop"])) {
 				errors.push("budget.onExceed: block-spawns|stop 중 하나여야 합니다");
 			}
-			warnUnknown(budget, BUDGET_KEYS, "budget", warnings);
 		}
 	}
 
@@ -205,11 +253,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 			errors.push("fallbackRole: roles에 있는 역할이어야 합니다");
 		}
 	}
-	if (value.trials !== undefined) validateTrials(value.trials, roleKeys, errors, warnings);
+	if (value.trials !== undefined) validateTrials(value.trials, roleKeys, errors);
 	if (value.disabledRoles !== undefined) validateDisabled(value.disabledRoles, roleKeys, errors);
 
-	warnUnknown(value, TOP_KEYS, "", warnings);
-
-	if (errors.length > 0) return { errors, warnings };
+	if (errors.length > 0) return { errors: errors.map(escapeUnsafe), warnings };
 	return { config: value as unknown as StormConfig, errors, warnings };
 }

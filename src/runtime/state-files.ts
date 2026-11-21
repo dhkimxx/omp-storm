@@ -1,25 +1,14 @@
 import * as path from "node:path";
+import { readJson, serialized, writeJsonAtomic } from "../fsutil.ts";
 import type { QuotaMark, TrialState } from "../types.ts";
-import { readJson, stateDir, writeJsonAtomic } from "./run.ts";
+import { stateDir } from "./run.ts";
 
 const quotaFile = (root: string): string => path.join(stateDir(root), "quota-marks.json");
 const trialsFile = (root: string): string => path.join(stateDir(root), "trials.json");
 
-// Parallel spawns bump trial counters at once; a per-root chain turns each read-modify-write into one step.
-const chains = new Map<string, Promise<void>>();
-
-function serialized<T>(root: string, fn: () => Promise<T>): Promise<T> {
-	const key = path.resolve(root);
-	const result = (chains.get(key) ?? Promise.resolve()).then(fn);
-	const tail = result.then(
-		() => undefined,
-		() => undefined,
-	);
-	chains.set(key, tail);
-	void tail.then(() => {
-		if (chains.get(key) === tail) chains.delete(key);
-	});
-	return result;
+/** Parallel spawns bump trial counters at once; one chain per state dir turns each read-modify-write into one step. */
+function update<T>(root: string, step: () => Promise<T>): Promise<T> {
+	return serialized(path.resolve(stateDir(root)), step);
 }
 
 function isQuotaMark(value: unknown): value is QuotaMark {
@@ -37,12 +26,7 @@ function isQuotaMark(value: unknown): value is QuotaMark {
 function isTrialState(value: unknown): value is TrialState {
 	if (typeof value !== "object" || value === null) return false;
 	const v = value as Record<string, unknown>;
-	return (
-		typeof v.id === "string" &&
-		Number.isFinite(v.seen) &&
-		Number.isFinite(v.routed) &&
-		Number.isFinite(v.costUsd)
-	);
+	return typeof v.id === "string" && Number.isFinite(v.seen) && Number.isFinite(v.routed) && Number.isFinite(v.costUsd);
 }
 
 async function readAllMarks(root: string): Promise<QuotaMark[]> {
@@ -57,7 +41,7 @@ export async function readQuotaMarks(root: string, now: number): Promise<QuotaMa
 
 /** Replaces the provider's previous mark and drops marks that expired by the new mark's time. */
 export function addQuotaMark(root: string, mark: QuotaMark): Promise<void> {
-	return serialized(root, async () => {
+	return update(root, async () => {
 		const at = Date.parse(mark.markedAt);
 		const now = Number.isFinite(at) ? at : Date.now();
 		const kept = (await readAllMarks(root)).filter(m => m.provider !== mark.provider && Date.parse(m.until) > now);
@@ -74,14 +58,10 @@ export async function readTrialStates(root: string): Promise<Record<string, Tria
 	return out;
 }
 
-export function updateTrialState(
-	root: string,
-	id: string,
-	update: (current: TrialState) => TrialState,
-): Promise<TrialState> {
-	return serialized(root, async () => {
+export function updateTrialState(root: string, id: string, change: (current: TrialState) => TrialState): Promise<TrialState> {
+	return update(root, async () => {
 		const all = await readTrialStates(root);
-		const next = update(all[id] ?? { id, seen: 0, routed: 0, costUsd: 0 });
+		const next = change(all[id] ?? { id, seen: 0, routed: 0, costUsd: 0 });
 		all[id] = next;
 		await writeJsonAtomic(trialsFile(root), { schema: "storm.trials/v1", trials: all });
 		return next;
@@ -90,7 +70,7 @@ export function updateTrialState(
 
 /** Storm limits: drops counters of trials no longer in the config. Returns how many it dropped. */
 export function pruneTrialStates(root: string, keepIds: readonly string[]): Promise<number> {
-	return serialized(root, async () => {
+	return update(root, async () => {
 		const all = await readTrialStates(root);
 		const stale = Object.keys(all).filter(id => !keepIds.includes(id));
 		if (stale.length === 0) return 0;

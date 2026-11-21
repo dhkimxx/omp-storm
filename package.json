@@ -1,19 +1,20 @@
 {
   "name": "omp-storm",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "private": true,
   "description": "OMP Storm: one /storm command to pick, approve, and enforce your multi-agent team's models in omp",
   "type": "module",
   "author": "dhkimxx",
   "repository": { "type": "git", "url": "git+https://github.com/dhkimxx/omp-storm.git" },
   "keywords": ["omp-plugin", "oh-my-pi", "omp", "multi-agent", "orchestration"],
-  "files": ["src", "agents", "skills", "priors", "README.md"],
+  "files": ["src", "agents", "priors", "README.md"],
   "omp": { "extensions": ["./src/extension.ts"] },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test tests",
     "verify": "npm run check && npm test",
-    "e2e": "bun scripts/e2e/run.ts"
+    "e2e": "bun scripts/e2e/run.ts",
+    "e2e:tui": "bun scripts/e2e/tui.ts"
   },
   "devDependencies": {
     "@oh-my-pi/pi-ai": "19.0.1",

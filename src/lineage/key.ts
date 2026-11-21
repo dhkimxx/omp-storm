@@ -1,7 +1,10 @@
 import type { Lineage, LineageFn, LineageVariant, ModelIdentityInfo, ModelInfo } from "../types.ts";
 import type { Priors } from "./priors.ts";
 
-const EFFORT_SUFFIX = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "none"]);
+/** Effort words that never name a model: as an id tail (`-high`) or suffix (`:high`) they are a variant of the same lineage. */
+const EFFORT_ONLY = new Set(["minimal", "low", "high", "xhigh", "none"]);
+/** Effort words that also name models ("mistral-medium", "codex-max"): an id tail counts as an effort only with proof. */
+const EFFORT_OR_NAME = new Set(["medium", "max"]);
 const DATE_TOKEN = /^(\d{4}|\d{6}|\d{8})$/;
 const HEAD = /^([a-z]*)(\d{1,2})$/;
 
@@ -10,56 +13,108 @@ interface Norm {
 	variant: LineageVariant;
 }
 
-function normalize(wireId: string, route: Set<string>, vendor: Set<string>): Norm {
+/**
+ * What the catalog proves about `-medium` / `-max` tails. Such a tail is an effort when
+ * - the stem is `proven`: listed with two or more tails that can only be efforts ("kimi-k3-high", "kimi-k3-low"), or
+ * - it is `-medium` and the catalog lists the `bare` stem itself ("gpt-oss-120b" next to "gpt-oss-120b-medium"),
+ * and never when the id with the tail is `named`: itself listed with an effort tail ("gpt-5.1-codex-max-high"
+ * makes "gpt-5.1-codex-max" a model).
+ */
+interface EffortProof {
+	proven: ReadonlySet<string>;
+	named: ReadonlySet<string>;
+	bare: ReadonlySet<string>;
+}
+
+/** Tokens joined without leading vendor words: the form stems are compared in. */
+function stemKey(toks: readonly string[], vendor: Set<string>): string {
+	let start = 0;
+	while (toks.length - start >= 2 && vendor.has(toks[start] ?? "")) start++;
+	return toks.slice(start).join("-");
+}
+
+/** The id's name tokens before any tail is removed; `:suffix` and `@route` parts are already sorted out. */
+function nameTokens(wireId: string, route: Set<string>, vendor: Set<string>): Norm {
 	const variant: LineageVariant = {};
-	const setRoute = (r: string) => {
-		variant.route ??= r;
-	};
 	let s = wireId.replace(/\[[^\]]*\]/g, "").toLowerCase();
-	s = s.slice(s.lastIndexOf("/") + 1).replace(/^~+/, "");
+	s = s.slice(s.lastIndexOf("/") + 1);
 	const at = s.indexOf("@");
 	if (at > 0) {
-		setRoute(s.slice(at + 1));
+		variant.route = s.slice(at + 1);
 		s = s.slice(0, at);
 	}
 	const parts = s.split(":");
 	s = parts[0] ?? "";
 	const extra: string[] = [];
 	for (const suf of parts.slice(1)) {
-		if (suf === "thinking") variant.think = true;
-		else if (route.has(suf)) setRoute(suf);
-		else if (EFFORT_SUFFIX.has(suf)) variant.effort = suf;
-		else if (DATE_TOKEN.test(suf)) variant.snapshot = suf;
-		else if (/^\d+$/.test(suf) || suf === "peft" || suf === "") continue;
+		if (route.has(suf)) variant.route ??= suf;
+		// Thinking toggles, efforts, snapshots and counters are the same model.
+		else if (suf === "thinking" || EFFORT_ONLY.has(suf) || EFFORT_OR_NAME.has(suf) || /^\d*$/.test(suf) || suf === "peft") continue;
 		else extra.push(suf);
 	}
 	for (let m = /^([a-z]+)\.(.+)$/.exec(s); m && vendor.has(m[1] ?? ""); m = /^([a-z]+)\.(.+)$/.exec(s)) {
 		s = m[2] ?? "";
 	}
-	const toks = s.split(/[-._ ]+/).filter(Boolean).concat(extra);
-	// Tail: route words and dates are variants, not identity.
+	return { toks: s.split(/[-._ ]+/).filter(Boolean).concat(extra), variant };
+}
+
+/** `proof` undefined leaves every effort tail in place (used to collect the proof itself). */
+function normalize(wireId: string, route: Set<string>, vendor: Set<string>, proof: EffortProof | undefined): Norm {
+	const { toks, variant } = nameTokens(wireId, route, vendor);
+	// Tail: route words, dates and efforts are variants, not identity.
 	while (toks.length > 1) {
 		const n = toks.length;
 		const last = toks[n - 1] ?? "";
 		if (route.has(last)) {
-			setRoute(last);
+			variant.route ??= last;
 			toks.pop();
 		} else if (n >= 4 && /^\d{4}$/.test(toks[n - 3] ?? "") && /^\d{2}$/.test(toks[n - 2] ?? "") && /^\d{2}$/.test(last)) {
-			variant.snapshot ??= toks.splice(n - 3, 3).join("-");
+			toks.splice(n - 3, 3);
 		} else if (DATE_TOKEN.test(last)) {
-			variant.snapshot ??= last;
+			toks.pop();
+		} else if (proof !== undefined && isEffortTail(toks, vendor, proof)) {
 			toks.pop();
 		} else break;
 	}
 	for (let i = toks.length - 1; i >= 1; i--) {
 		const t = toks[i] ?? "";
-		if (DATE_TOKEN.test(t)) variant.snapshot ??= t;
-		else if (route.has(t)) setRoute(t);
-		else continue;
+		if (route.has(t)) variant.route ??= t;
+		else if (!DATE_TOKEN.test(t)) continue;
 		toks.splice(i, 1);
 	}
 	while (toks.length >= 2 && vendor.has(toks[0] ?? "")) toks.shift();
 	return { toks, variant };
+}
+
+function isEffortTail(toks: readonly string[], vendor: Set<string>, proof: EffortProof): boolean {
+	const last = toks[toks.length - 1] ?? "";
+	if (EFFORT_ONLY.has(last)) return true;
+	if (!EFFORT_OR_NAME.has(last) || proof.named.has(stemKey(toks, vendor))) return false;
+	const stem = stemKey(toks.slice(0, -1), vendor);
+	return proof.proven.has(stem) || (last === "medium" && proof.bare.has(stem));
+}
+
+function effortProofOf(catalog: ModelInfo[], route: Set<string>, vendor: Set<string>): EffortProof {
+	const tails = new Map<string, Set<string>>();
+	const bare = new Set<string>();
+	for (const m of catalog) {
+		// A `:suffix` form ("devstral:24b") is not the bare model listed under its own name.
+		if (!m.id.includes(":")) bare.add(stemKey(nameTokens(m.id, route, vendor).toks, vendor));
+		const { toks } = normalize(m.id, route, vendor, undefined);
+		const last = toks[toks.length - 1] ?? "";
+		if (toks.length < 2 || !(EFFORT_ONLY.has(last) || EFFORT_OR_NAME.has(last))) continue;
+		const stem = toks.slice(0, -1).join("-");
+		let set = tails.get(stem);
+		if (!set) tails.set(stem, (set = new Set()));
+		set.add(last);
+	}
+	const proven = new Set<string>();
+	for (const [stem, set] of tails) {
+		let certain = 0;
+		for (const tail of set) if (EFFORT_ONLY.has(tail)) certain++;
+		if (certain >= 2) proven.add(stem);
+	}
+	return { proven, named: new Set(tails.keys()), bare };
 }
 
 function padRev(parts: string[]): string {
@@ -98,7 +153,6 @@ function aliasLineage(key: string, variant: LineageVariant): Lineage {
 		tier: lineKey.slice(slash + 1),
 		revision,
 		revisionSource: null,
-		classSource: "identity",
 		suspect: false,
 		variant,
 	};
@@ -108,19 +162,20 @@ function aliasLineage(key: string, variant: LineageVariant): Lineage {
 export function createLineage(catalog: ModelInfo[], priors: Priors): LineageFn {
 	const route = new Set(priors.lineage.routeTokens);
 	const vendor = new Set(priors.lineage.vendorPrefixes);
+	const efforts = effortProofOf(catalog, route, vendor);
 
 	// Stem → class, only when every classified row with that stem agrees.
 	const stemClasses = new Map<string, Set<string>>();
 	for (const m of catalog) {
 		if (!m.identity.class || m.identity.class === "unknown") continue;
-		const stem = normalize(m.id, route, vendor).toks.join("-");
+		const stem = normalize(m.id, route, vendor, efforts).toks.join("-");
 		let set = stemClasses.get(stem);
 		if (!set) stemClasses.set(stem, (set = new Set()));
 		set.add(m.identity.class);
 	}
 
 	const compute = (provider: string, wireId: string, identity: ModelIdentityInfo | undefined, known: Map<string, Set<string>> | null): Lineage => {
-		const { toks, variant } = normalize(wireId, route, vendor);
+		const { toks, variant } = normalize(wireId, route, vendor, efforts);
 		const base = wireId.toLowerCase().slice(wireId.lastIndexOf("/") + 1);
 		const alias = priors.lineage.aliases.find(
 			(a) => (a.match.provider === "*" || a.match.provider === provider) && a.match.id === base,
@@ -128,13 +183,9 @@ export function createLineage(catalog: ModelInfo[], priors: Priors): LineageFn {
 		if (alias) return aliasLineage(alias.key, variant);
 
 		let cls = identity?.class ?? "unknown";
-		let classSource: Lineage["classSource"] = "identity";
 		if (cls === "unknown" || !cls) {
 			const set = stemClasses.get(toks.join("-"));
-			if (set && set.size === 1) {
-				cls = [...set][0] ?? "unknown";
-				classSource = "stem";
-			} else cls = "unknown";
+			cls = set && set.size === 1 ? ([...set][0] ?? "unknown") : "unknown";
 		}
 		if (cls === "unknown") {
 			const tier = toks.join("-") || "-";
@@ -145,7 +196,6 @@ export function createLineage(catalog: ModelInfo[], priors: Priors): LineageFn {
 				tier,
 				revision: null,
 				revisionSource: null,
-				classSource: "unknown",
 				suspect: false,
 				variant,
 			};
@@ -195,7 +245,6 @@ export function createLineage(catalog: ModelInfo[], priors: Priors): LineageFn {
 			tier,
 			revision,
 			revisionSource,
-			classSource,
 			suspect,
 			variant,
 		};

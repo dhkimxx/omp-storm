@@ -24,17 +24,15 @@ export function noteAgentStart(input: {
 	role?: string;
 	runId?: string;
 	now: number;
-	revive: boolean;
 }): void {
 	const e = agents.get(input.id);
 	if (e) {
-		// A turn after the agent settled (or was parked) is a follow-up: a message, a wake or a revive.
-		if (e.state !== "running" || input.revive) e.followUps++;
 		e.state = "running";
 		e.lastActivityAt = input.now;
 		if (input.parentId !== undefined) e.parentId = input.parentId;
 		if (input.role !== undefined) e.role = input.role;
-		if (input.runId !== undefined && e.runId === undefined) e.runId = input.runId;
+		// A turn during a later run (a follow-up or a revive) makes it that run's agent: its spend and reads count there.
+		if (input.runId !== undefined) e.runId = input.runId;
 		return;
 	}
 	prune(input.now);
@@ -47,8 +45,7 @@ export function noteAgentStart(input: {
 		contextTokens: 0,
 		requests: 0,
 		costUsd: 0,
-		// A revive of an agent this process never saw start still had earlier turns.
-		followUps: input.revive ? 1 : 0,
+		followUps: 0,
 	};
 	if (input.parentId !== undefined) entry.parentId = input.parentId;
 	if (input.role !== undefined) entry.role = input.role;
@@ -56,24 +53,20 @@ export function noteAgentStart(input: {
 	agents.set(input.id, entry);
 }
 
-export function noteAgentUsage(input: {
-	id: string;
-	model: string;
-	promptTokens: number;
-	cacheReadTokens: number;
-	costUsd: number;
-	contextWindow?: number;
-	now: number;
-}): void {
+export function noteAgentUsage(input: { id: string; model: string; promptTokens: number; costUsd: number; now: number }): void {
 	const e = agents.get(input.id);
 	if (!e) return;
 	e.model = input.model;
 	e.contextTokens = input.promptTokens;
-	if (input.promptTokens > 0) e.lastCacheReadShare = input.cacheReadTokens / input.promptTokens;
 	e.requests++;
 	e.costUsd += input.costUsd;
 	e.lastActivityAt = input.now;
-	if (input.contextWindow !== undefined) e.contextWindow = input.contextWindow;
+}
+
+/** A `write agent://<id>` the director sent was delivered: one more follow-up for that agent. */
+export function noteAgentFollowUp(id: string): void {
+	const e = agents.get(id);
+	if (e) e.followUps++;
 }
 
 export function noteAgentEnd(input: { id: string; now: number; settled: boolean }): void {

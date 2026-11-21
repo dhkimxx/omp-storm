@@ -2,24 +2,26 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { canonicalJson, configHash, parseStrictJson } from "../src/config/canonical.ts";
-import { validateConfig } from "../src/config/schema.ts";
+import { canonicalJson, configHash, escapeUnsafe, parseStrictJson } from "../src/config/canonical.ts";
+import { teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
 import { configPath, loadConfig, serializeConfig, writeConfig } from "../src/config/store.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
+import { teamOf } from "./fixtures.ts";
+import { TEAM_08, TEAM_08_HASH } from "./team-08.ts";
 
-const base: StormConfig = {
-	version: 1,
-	priority: "balanced",
-	roles: {
-		reviewer: { agent: "storm-reviewer", models: ["openai/gpt-5.2", "anthropic/claude-sonnet-4-5:high"], effort: "high" },
-		explorer: { agent: "storm-explorer", models: ["openrouter/deepseek/deepseek-v4"] },
+const base: StormConfig = teamOf(
+	{
+		reviewer: { models: ["openai/gpt-5.2", "anthropic/claude-sonnet-4-5:high"], effort: "high" },
+		explorer: "openrouter/deepseek/deepseek-v4",
+		implementer: "openai/gpt-5.2:medium",
 	},
-	parallelism: 4,
-	isolation: "isolated",
-	contract: "workflowz",
-	runtime: "omp",
-	budget: { perRunUsd: 2.5, warnAtUsd: 2, onExceed: "block-spawns" },
-};
+	{ isolation: "isolated", budget: { perRunUsd: 2.5, warnAtUsd: 2, onExceed: "block-spawns" } },
+);
+
+/** The field path of each validation message ("roles.reviewer.agent"), which is what the tests pin. */
+function paths(messages: string[]): string[] {
+	return messages.map(m => m.slice(0, m.indexOf(":")));
+}
 
 function clone(): Record<string, any> {
 	return structuredClone(base) as Record<string, any>;
@@ -116,10 +118,50 @@ describe("validateConfig", () => {
 		const v = clone();
 		v.extra = 1;
 		v.roles.reviewer.fallback = "x";
+		v.budget.note = true;
 		const r = validateConfig(v);
 		expect(r.errors).toEqual([]);
 		expect(r.config).toBeDefined();
-		expect(r.warnings).toEqual(["roles.reviewer.fallback: 알 수 없는 필드입니다", "extra: 알 수 없는 필드입니다"]);
+		expect(paths(r.warnings)).toEqual(["extra", "roles.reviewer.fallback", "budget.note"]);
+		expect(unknownFields(v)).toEqual([
+			{ path: "extra", value: 1 },
+			{ path: "roles.reviewer.fallback", value: "x" },
+			{ path: "budget.note", value: true },
+		]);
+	});
+
+	test("the 0.8 team validates without errors or warnings and keeps its hash", () => {
+		const r = validateConfig(parsed(TEAM_08));
+		expect(r.errors).toEqual([]);
+		expect(r.warnings).toEqual([]);
+		expect(Object.keys(r.config?.roles ?? {})).toHaveLength(5);
+		// The hash covers the file's own content, deprecated fields included: an approval given by 0.8 still matches it.
+		expect(configHash(parsed(TEAM_08))).toBe(TEAM_08_HASH);
+		const { contract: _contract, ...withoutContract } = JSON.parse(TEAM_08);
+		expect(configHash(withoutContract)).not.toBe(TEAM_08_HASH);
+	});
+
+	test("deprecated fields are accepted silently: contract, runtime, old priorities, numeric workers", () => {
+		for (const mutate of [
+			(c: Record<string, any>) => (c.contract = "orchestrate"),
+			(c: Record<string, any>) => (c.contract = "anything"),
+			(c: Record<string, any>) => (c.runtime = "omp"),
+			(c: Record<string, any>) => (c.priority = "speed"),
+			(c: Record<string, any>) => (c.priority = "quota"),
+			(c: Record<string, any>) => (c.roles.reviewer.workers = 3),
+		]) {
+			const c = clone();
+			mutate(c);
+			const r = validateConfig(c);
+			expect(r.errors).toEqual([]);
+			expect(r.warnings).toEqual([]);
+		}
+	});
+
+	test("old priorities are read as balanced", () => {
+		expect(teamPriority({ ...base, priority: "speed" })).toBe("balanced");
+		expect(teamPriority({ ...base, priority: "quota" })).toBe("balanced");
+		expect(teamPriority({ ...base, priority: "cost" })).toBe("cost");
 	});
 
 	const cases: Array<[string, (c: Record<string, any>) => void, string]> = [
@@ -129,8 +171,11 @@ describe("validateConfig", () => {
 		["roles array", c => (c.roles = []), "roles:"],
 		["agent prefix", c => (c.roles.reviewer.agent = "reviewer"), "roles.reviewer.agent:"],
 		["agent case", c => (c.roles.reviewer.agent = "storm-Reviewer"), "roles.reviewer.agent:"],
+		["agent of another role", c => (c.roles.reviewer.agent = "storm-explorer"), "roles.reviewer.agent:"],
+		["unknown role key", c => (c.roles.ghost = { agent: "storm-ghost", models: ["a/b"] }), "roles.ghost:"],
+		["no implementer", c => delete c.roles.implementer, "roles.implementer:"],
 		["empty models", c => (c.roles.reviewer.models = []), "roles.reviewer.models:"],
-		["model no slash", c => (c.roles.reviewer.models = ["gpt-5"]), "roles.reviewer.models[0]: provider/id 형식이 아닙니다"],
+		["model no slash", c => (c.roles.reviewer.models = ["gpt-5"]), "roles.reviewer.models[0]:"],
 		["model whitespace", c => (c.roles.explorer.models = ["a/b", "a/ b"]), "roles.explorer.models[1]:"],
 		["model empty id", c => (c.roles.explorer.models = ["a/"]), "roles.explorer.models[0]:"],
 		["model non-string", c => (c.roles.explorer.models = [1]), "roles.explorer.models[0]:"],
@@ -139,8 +184,9 @@ describe("validateConfig", () => {
 		["parallelism 17", c => (c.parallelism = 17), "parallelism:"],
 		["parallelism fraction", c => (c.parallelism = 1.5), "parallelism:"],
 		["isolation", c => (c.isolation = "none"), "isolation:"],
-		["contract", c => (c.contract = "swarm"), "contract:"],
 		["runtime", c => (c.runtime = "orca"), "runtime:"],
+		["contract object", c => (c.contract = { toString: 1 }), "contract:"],
+		["contract number", c => (c.contract = 3), "contract:"],
 		["budget zero", c => (c.budget.perRunUsd = 0), "budget.perRunUsd:"],
 		["warn above limit", c => (c.budget.warnAtUsd = 3), "budget.warnAtUsd:"],
 		["warn zero", c => (c.budget.warnAtUsd = 0), "budget.warnAtUsd:"],
@@ -156,15 +202,15 @@ describe("validateConfig", () => {
 		["team contextCap zero", c => (c.contextCap = 0), "contextCap:"],
 		["team contextCap fraction", c => (c.contextCap = 1.5), "contextCap:"],
 		["role contextCap too big", c => (c.roles.reviewer.contextCap = 10_000_001), "roles.reviewer.contextCap:"],
-		["fallbackRole unknown", c => (c.fallbackRole = "implementer"), "fallbackRole: roles에 있는 역할이어야 합니다"],
+		["fallbackRole unknown", c => (c.fallbackRole = "architect"), "fallbackRole:"],
 		["fallbackRole non-string", c => (c.fallbackRole = 1), "fallbackRole:"],
 		["fallbackRole prototype key", c => (c.fallbackRole = "toString"), "fallbackRole:"],
-		["trials object", c => (c.trials = {}), "trials: 배열이어야 합니다"],
-		["trial item", c => (c.trials = [1]), "trials[0]: 객체여야 합니다"],
+		["trials object", c => (c.trials = {}), "trials:"],
+		["trial item", c => (c.trials = [1]), "trials[0]:"],
 		["trial empty id", c => withTrial(c, { id: " " }), "trials[0].id:"],
-		["trial duplicate id", c => (c.trials = [trial, { ...trial }]), "trials[1].id: 중복된 id입니다"],
-		["trial role", c => withTrial(c, { role: "implementer" }), "trials[0].role:"],
-		["trial model", c => withTrial(c, { model: "gpt-6" }), "trials[0].model: provider/id 형식이 아닙니다"],
+		["trial duplicate id", c => (c.trials = [trial, { ...trial }]), "trials[1].id:"],
+		["trial role", c => withTrial(c, { role: "architect" }), "trials[0].role:"],
+		["trial model", c => withTrial(c, { model: "gpt-6" }), "trials[0].model:"],
 		["trial effort", c => withTrial(c, { effort: "huge" }), "trials[0].effort:"],
 		["trial share zero", c => withTrial(c, { share: 0 }), "trials[0].share:"],
 		["trial share above one", c => withTrial(c, { share: 1.2 }), "trials[0].share:"],
@@ -174,7 +220,7 @@ describe("validateConfig", () => {
 		["trial startsAt garbage", c => withTrial(c, { startsAt: "tomorrow" }), "trials[0].startsAt:"],
 		["trial startsAt without zone", c => withTrial(c, { startsAt: "2026-11-20T00:00:00" }), "trials[0].startsAt:"],
 		["trial endsAt invalid date", c => withTrial(c, { endsAt: "2026-13-45T00:00:00Z" }), "trials[0].endsAt:"],
-		["trial endsAt not after", c => withTrial(c, { endsAt: trial.startsAt }), "trials[0].endsAt: startsAt보다 뒤여야 합니다"],
+		["trial endsAt not after", c => withTrial(c, { endsAt: trial.startsAt }), "trials[0].endsAt:"],
 		["trial budget zero", c => withTrial(c, { budgetUsd: 0 }), "trials[0].budgetUsd:"],
 		["trial budget missing", c => withTrial(c, { budgetUsd: undefined }), "trials[0].budgetUsd:"],
 	];
@@ -206,7 +252,7 @@ describe("validateConfig", () => {
 		const r = validateConfig(c);
 		expect(r.errors).toEqual([]);
 		expect(r.config?.trials).toHaveLength(2);
-		expect(r.warnings).toEqual(["trials[1].note: 알 수 없는 필드입니다"]);
+		expect(paths(r.warnings)).toEqual(["trials[1].note"]);
 	});
 });
 
@@ -220,7 +266,6 @@ describe("config store", () => {
 		if (loaded.status !== "ok") return;
 		expect(loaded.hash).toBe(written.hash);
 		expect(loaded.hash).toBe(configHash(base));
-		expect(loaded.rawSha256).toBe(written.rawSha256);
 		expect(loaded.config).toEqual(base);
 		expect(await Bun.file(path.join(root, ".omp/storm/.gitignore")).text()).toBe("/state/\n");
 		expect(await Bun.file(path.join(root, ".gitignore")).exists()).toBe(false);
@@ -257,7 +302,7 @@ describe("config store", () => {
 		expect(extra.status).toBe("ok");
 		if (extra.status !== "ok") return;
 		expect(extra.hash).not.toBe(hash);
-		expect(extra.warnings).toEqual(["note: 알 수 없는 필드입니다"]);
+		expect(paths(extra.warnings)).toEqual(["note"]);
 	});
 
 	test("missing and invalid files", async () => {
@@ -269,13 +314,13 @@ describe("config store", () => {
 		const dup = await loadConfig(root);
 		expect(dup.status).toBe("invalid");
 		if (dup.status === "invalid") {
-			expect(dup.errors[0]).toContain("JSON 오류");
+			expect(dup.errors).toHaveLength(1);
 			expect(dup.rawSha256).toMatch(/^[0-9a-f]{64}$/);
 		}
 
 		await fs.writeFile(configPath(root), JSON.stringify({ ...base, parallelism: 99 }));
 		const bad = await loadConfig(root);
-		expect(bad.status === "invalid" && bad.errors).toEqual(["parallelism: 1~16 사이 정수여야 합니다"]);
+		expect(bad.status === "invalid" && paths(bad.errors)).toEqual(["parallelism"]);
 
 		await fs.writeFile(configPath(root), new Uint8Array([0x7b, 0xff, 0x7d]));
 		expect((await loadConfig(root)).status).toBe("invalid");
@@ -295,11 +340,95 @@ describe("disabledRoles", () => {
 		expect(v.config?.disabledRoles).toEqual(["quick", "architect"]);
 	});
 	test("rejects non-arrays, unknown ids, duplicates, implementer and configured roles", () => {
-		expect(check("quick").errors).toEqual(["disabledRoles: 배열이어야 합니다"]);
-		expect(check(["ghost"]).errors).toEqual(["disabledRoles[0]: Storm 역할 id여야 합니다"]);
-		expect(check([3]).errors).toEqual(["disabledRoles[0]: Storm 역할 id여야 합니다"]);
-		expect(check(["quick", "quick"]).errors).toEqual(["disabledRoles[1]: 중복된 역할입니다 (quick)"]);
-		expect(check(["implementer"]).errors).toEqual(["disabledRoles[0]: implementer 역할은 끌 수 없습니다"]);
-		expect(check(["reviewer"]).errors).toEqual(["disabledRoles[0]: roles에 있는 역할은 끌 수 없습니다 (reviewer)"]);
+		expect(paths(check("quick").errors)).toEqual(["disabledRoles"]);
+		expect(paths(check(["ghost"]).errors)).toEqual(["disabledRoles[0]"]);
+		expect(paths(check([3]).errors)).toEqual(["disabledRoles[0]"]);
+		expect(paths(check(["quick", "quick"]).errors)).toEqual(["disabledRoles[1]"]);
+		expect(paths(check(["implementer"]).errors)).toEqual(["disabledRoles[0]"]);
+		expect(paths(check(["reviewer"]).errors)).toEqual(["disabledRoles[0]"]);
+	});
+});
+
+describe("text that could forge or hide rows in the approval dialog", () => {
+	// ESC, newline, DEL, a C1 control, zero-width space, right-to-left override, an isolate, BOM, line separator.
+	const HOSTILE = ["\u001b[2K", "a\nb", "\u007f", "\u009b", "\u200b", "\u202e", "\u2066", "\ufeff", "\u2028"];
+	const fields: Array<[string, (c: Record<string, any>, bad: string) => void, string]> = [
+		["model entry", (c, bad) => (c.roles.reviewer.models = [`openai/gpt${bad}`]), "roles.reviewer.models[0]"],
+		["role agent", (c, bad) => (c.roles.reviewer.agent = `storm-reviewer${bad}`), "roles.reviewer.agent"],
+		["role effort", (c, bad) => (c.roles.reviewer.effort = `high${bad}`), "roles.reviewer.effort"],
+		["priority", (c, bad) => (c.priority = `balanced${bad}`), "priority"],
+		["isolation", (c, bad) => (c.isolation = `shared${bad}`), "isolation"],
+		["contract", (c, bad) => (c.contract = `workflowz${bad}`), "contract"],
+		["fallbackRole", (c, bad) => (c.fallbackRole = `reviewer${bad}`), "fallbackRole"],
+		["disabled role", (c, bad) => (c.disabledRoles = [`quick${bad}`]), "disabledRoles[0]"],
+		["budget action", (c, bad) => (c.budget.onExceed = `stop${bad}`), "budget.onExceed"],
+		["trial id", (c, bad) => withTrial(c, { id: `t${bad}` }), "trials[0].id"],
+		["trial model", (c, bad) => withTrial(c, { model: `openai/gpt${bad}` }), "trials[0].model"],
+		["trial role", (c, bad) => withTrial(c, { role: `reviewer${bad}` }), "trials[0].role"],
+		["unknown field value", (c, bad) => (c.note = `x${bad}`), "note"],
+		["unknown nested value", (c, bad) => (c.extra = { list: [1, { deep: `x${bad}` }] }), "extra.list[1].deep"],
+		["unknown role field value", (c, bad) => (c.roles.reviewer.note = bad), "roles.reviewer.note"],
+	];
+	/** No message may carry a raw unsafe character: the invalid-config dialog prints them. */
+	const clean = (messages: string[]) => messages.every(m => escapeUnsafe(m) === m);
+
+	for (const [name, mutate, at] of fields) {
+		test(`rejects a hostile ${name}`, () => {
+			for (const bad of HOSTILE) {
+				const c = clone();
+				mutate(c, bad);
+				const r = validateConfig(c);
+				expect(r.config).toBeUndefined();
+				expect(paths(r.errors)).toContain(at);
+				expect(clean([...r.errors, ...r.warnings])).toBe(true);
+			}
+		});
+	}
+
+	test("rejects hostile keys (a role id, an unknown field name) and reports them escaped", () => {
+		for (const bad of HOSTILE) {
+			for (const mutate of [
+				(c: Record<string, any>) => (c.roles[`reviewer${bad}`] = c.roles.reviewer),
+				(c: Record<string, any>) => (c[`note${bad}`] = 1),
+				(c: Record<string, any>) => (c.roles.reviewer[`x${bad}`] = 1),
+				(c: Record<string, any>) => (c.budget[`x${bad}`] = 1),
+				(c: Record<string, any>) => withTrial(c, { [`x${bad}`]: 1 }),
+			]) {
+				const c = clone();
+				mutate(c);
+				const r = validateConfig(c);
+				expect(r.config).toBeUndefined();
+				expect(clean([...r.errors, ...r.warnings])).toBe(true);
+				expect(clean(unknownFields(c).map(f => f.path))).toBe(true);
+			}
+		}
+	});
+
+	test("a key that is not a plain name is quoted in paths; ordinary text, Korean included, stays valid", () => {
+		const c = clone();
+		c["a, 병렬도: 1"] = true;
+		c.contract = "실행 계약 v2 — workflowz";
+		const r = validateConfig(c);
+		expect(r.errors).toEqual([]);
+		expect(unknownFields(c)).toEqual([{ path: '["a, 병렬도: 1"]', value: true }]);
+		expect(escapeUnsafe("가나다 abc — ✓ 🌀")).toBe("가나다 abc — ✓ 🌀");
+		expect(escapeUnsafe("a\u202eb\u001b")).toBe("a\\u{202e}b\\u{1b}");
+	});
+
+	test("a config file with escaped controls loads as invalid, and JSON errors quote the file escaped", async () => {
+		const root = await tempRoot();
+		await fs.mkdir(path.dirname(configPath(root)), { recursive: true });
+		// Valid JSON whose strings decode to ESC and a right-to-left override.
+		await fs.writeFile(configPath(root), JSON.stringify({ ...base, contract: "x" }).replace('"x"', '"\\u001b[2Kok\\u202e"'));
+		const hostile = await loadConfig(root);
+		expect(hostile.status).toBe("invalid");
+		expect(hostile.status === "invalid" && paths(hostile.errors)).toEqual(["contract"]);
+
+		for (const text of ['{"a\u202e":1,"a\u202e":2}', "{\u202e}"]) {
+			await fs.writeFile(configPath(root), text);
+			const broken = await loadConfig(root);
+			expect(broken.status).toBe("invalid");
+			expect(broken.status === "invalid" && clean(broken.errors)).toBe(true);
+		}
 	});
 });

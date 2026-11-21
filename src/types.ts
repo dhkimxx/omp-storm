@@ -1,9 +1,9 @@
 /**
- * Shared contracts between OMP Storm modules (v0.1).
+ * Shared contracts between OMP Storm modules.
  *
  * Modules depend on each other only through these types and injected functions, so each can be
  * built and tested on its own. Semantics that every module must keep:
- * - A missing metric is `value: null` with a `missingReason`, never 0.
+ * - A missing metric is `value: null`, never 0.
  * - Account identifiers (email, accountId, orgId, orgName, identityKey, credentialId) and tokens
  *   are never stored, logged, rendered, or sent to a model.
  * - Nothing is approved unless the user picked the approve option in a dialog.
@@ -14,31 +14,26 @@
 export type Effort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export const EFFORTS: readonly Effort[] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-export type Priority = "balanced" | "quality" | "cost" | "speed" | "quota";
-export const PRIORITIES: readonly Priority[] = ["balanced", "quality", "cost", "speed", "quota"];
+/** What a recommendation optimizes. `speed` and `quota` changed no team on real data and are no longer offered. */
+export type Priority = "balanced" | "quality" | "cost";
+export const PRIORITIES: readonly Priority[] = ["balanced", "quality", "cost"];
 
-/** Price tier by reference request cost (plan 9.2): cheap < $0.01 ≤ general < $0.06 ≤ premium. */
+/** Price tier by reference request cost: cheap < $0.01 ≤ general < $0.06 ≤ premium. */
 export type Tier = "cheap" | "general" | "premium";
 export const TIERS: readonly Tier[] = ["cheap", "general", "premium"];
 
 /** Where a request ran: the user's main session or a spawned subagent (stats.db `agent_type`). */
 export type Seat = "main" | "subagent";
 
-export type Confidence = "high" | "medium" | "low";
-
 /** A metric with provenance. `value: null` means missing and must not be treated as 0. */
 export interface MetricValue {
 	value: number | null;
-	/** "catalog", "catalog:sibling(<n providers>)", "measured", "prior:<id>", or "none". */
+	/** "catalog", "catalog:sibling", "lineage", "measured", "prior:<id>", or "none". */
 	source: string;
-	confidence: Confidence;
-	sampleSize?: number;
-	/** ms since epoch. */
-	observedAt?: number;
-	/** Sibling routes disagreed; `value` is the chosen one. */
-	conflict?: boolean;
-	/** Set when `value` is null: "catalog_no_score", "unmeasured", "no_pricing", ... */
-	missingReason?: string;
+	/** Not the route's own figure, or the lineage's routes disagree: shown with "≈". */
+	approx?: boolean;
+	/** Quality only: max − min across the lineage's routes; widens the "same quality" tolerance (src/lineage/metrics.ts). */
+	spread?: number;
 }
 
 // ── Ports (injected so modules stay testable outside omp) ───────────────────────────────────
@@ -57,37 +52,39 @@ export type Exec = (
 	options?: { cwd?: string; timeout?: number },
 ) => Promise<ExecResult>;
 
-export type UiSelectItem = string | { label: string; description?: string };
-
 /** Shown with a choice while it is open (TUI: a panel above the selector, gone once it closes); other hosts get a transcript message. */
 export interface UiContext {
 	title: string;
 	markdown: string;
+	/**
+	 * The options that accept what `markdown` shows (approve, roll back, delete). While part of it is hidden they are
+	 * not offered: the user opens the whole content first, so nothing is accepted that was never displayed.
+	 */
+	consent?: readonly string[];
 }
+
+/** Answers of a form by control name: text, a number for number inputs, or a group's checked values. */
+export type FormData = Record<string, string | number | string[]>;
 
 /** The subset of omp's `ctx.ui` Storm uses, plus Storm's own views. */
 export interface UiPort {
 	/** Resolves to the chosen label, or undefined when cancelled or when no UI can answer. */
-	select(title: string, options: UiSelectItem[], context?: UiContext): Promise<string | undefined>;
-	/** Resolves to false when declined, cancelled, or when no UI can answer. */
-	confirm(title: string, message: string): Promise<boolean>;
-	input(title: string, placeholder?: string): Promise<string | undefined>;
+	select(title: string, options: string[], context?: UiContext): Promise<string | undefined>;
+	/** An outcome notice. TUI: omp's notification line; other hosts: a transcript message (never sent to the model). */
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 	/** A view to read and close. TUI: a scrollable overlay that leaves nothing in the transcript; other hosts: a transcript message. Resolves once closed. */
 	report(title: string, markdown: string): Promise<void>;
 	/** Kept in the transcript, never sent to the model: run results and other records. Keep it to a few lines. */
 	record(title: string, markdown: string): void;
+	/** Draws an HTML `<form>` and resolves to its answers, or undefined when cancelled or timed out. Absent when the host has no form surface. */
+	form?(html: string): Promise<FormData | undefined>;
 }
 
 // ── Catalog ─────────────────────────────────────────────────────────────────────────────────
 
 export interface ModelIdentityInfo {
 	class: string;
-	family?: string;
 	revision?: string;
-	effort?: string;
-	thinkingVariant?: boolean;
-	logicalId?: string;
 }
 
 /** USD per 1M tokens. */
@@ -111,8 +108,6 @@ export interface ModelInfo {
 	/** False when the catalog has no price (all rates 0 or pricing unknown). */
 	pricingKnown: boolean;
 	contextWindow: number | null;
-	maxTokens: number | null;
-	reasoning: boolean;
 	/** Supported thinking efforts, least to most; [] when the model has no effort control. */
 	efforts: Effort[];
 	supportsTools: boolean;
@@ -127,15 +122,9 @@ export interface ModelInfo {
 export interface LineageVariant {
 	/** Route variant: fast, ultrafast, highspeed, preview, free, contributor, ... */
 	route?: string;
-	/** Dated snapshot suffix such as "1017". */
-	snapshot?: string;
-	/** `:thinking` mode toggle. */
-	think?: boolean;
-	/** `:low`-style effort suffix. */
-	effort?: string;
 }
 
-/** Model lineage key (plan 9.2, p0-results Q9): `class/tier@revision`. */
+/** Model lineage key (docs/spikes.md, P0 Q9): `class/tier@revision`. */
 export interface Lineage {
 	/** "class/tier@revision"; revision is "?" when unknown. Unit for merging usage across hosts. */
 	modelKey: string;
@@ -147,7 +136,6 @@ export interface Lineage {
 	/** "major.minor.patch" or null. */
 	revision: string | null;
 	revisionSource: "identity" | "name" | null;
-	classSource: "identity" | "stem" | "unknown";
 	/** Revision looked compressed or odd ("56.0.0"); excluded from newer-version detection. */
 	suspect: boolean;
 	variant: LineageVariant;
@@ -160,10 +148,6 @@ export interface PriceTierInfo {
 	tier: Tier | null;
 	/** Reference request cost in USD (4 rates × reference token mix); null without pricing. */
 	referenceUsd: number | null;
-	/** cacheRead price was missing and estimated from the input price. */
-	estimated: boolean;
-	/** Selector of the route the tier was taken from. */
-	basis: string | null;
 }
 
 // ── Usage history (implemented in src/history) ──────────────────────────────────────────────
@@ -176,8 +160,6 @@ export interface UsageRow {
 	requests: number;
 	/** stop_reason = 'error' (omp's definition). */
 	errors: number;
-	/** stop_reason = 'aborted'. */
-	aborted: number;
 	inputTokens: number;
 	outputTokens: number;
 	cacheReadTokens: number;
@@ -189,28 +171,18 @@ export interface UsageRow {
 	ompTps: number | null;
 	/** Generation tok/s: sum(output_tokens)*1000 / sum(duration-ttft) over rows with duration>ttft. */
 	decodeTps: number | null;
+	/** Rows that fed `decodeTps`. */
+	decodeSamples: number;
 	ttftP50: number | null;
-	ttftP90: number | null;
-	ttftSamples: number;
-	durationP50: number | null;
-	durationP90: number | null;
-	durationSamples: number;
-	/** ms since epoch. */
-	firstTs: number;
-	lastTs: number;
-	/** Local date "YYYY-MM-DD" → requests / errors. */
+	/** Local date "YYYY-MM-DD" → requests. */
 	daily: Record<string, number>;
-	dailyErrors: Record<string, number>;
 }
 
 export interface UsageSnapshot {
 	status: "ok" | "missing-db" | "unsupported-schema" | "error";
 	/** Missing column names or an error message; never user data. */
 	detail?: string;
-	dbPath: string;
 	windowDays: number;
-	/** ms since epoch the window ends at. */
-	now: number;
 	/** MAX(timestamp) in the DB; null when empty. */
 	dataAsOf: number | null;
 	rows: UsageRow[];
@@ -218,35 +190,30 @@ export interface UsageSnapshot {
 
 // ── Quota and explicit settings (implemented in src/discovery) ──────────────────────────────
 
-export type QuotaState = "available" | "limited" | "exhausted" | "unknown" | "unavailable";
+export type QuotaState = "available" | "limited" | "exhausted" | "unknown";
 
 export interface QuotaStatus {
 	provider: string;
+	/** From the limits that cover the whole provider; a limit scoped to one model never sets it. */
 	state: QuotaState;
-	/** Highest used fraction across the provider's limits, 0..1; null when unknown. */
+	/** Highest used fraction across the provider-wide limits, 0..1; null when unknown. */
 	usedFraction: number | null;
-	/** Earliest reset among exhausted/limited windows, ms since epoch. */
+	/** Earliest reset among exhausted/limited provider-wide windows, ms since epoch. */
 	resetsAt: number | null;
-	observedAt: number;
+	/** Models with an exhausted limit of their own: model id (lowercase) → reset time (ms since epoch) or null. */
+	exhaustedModels?: Record<string, number | null>;
+	/** Exhausted limits scoped to a model tier ("opus"): tier (lowercase) → reset time or null. Matched against the lineage tier. */
+	exhaustedTiers?: Record<string, number | null>;
 }
 
 /** Explicit model preferences from omp settings (`omp config list --json`). */
 export interface ExplicitSettings {
 	defaultModel?: string;
 	modelRoles: Record<string, string>;
-	agentModelOverrides: Record<string, string | string[]>;
-	/** `magicKeywords.*` toggles; undefined when the settings could not be read. */
-	magicKeywords?: { enabled: boolean; workflowz: boolean; orchestrate: boolean };
-	/** `task.agentIdleTtlMs`: how long a finished subagent stays live before omp parks it (0 = never); undefined when unreadable. */
-	agentIdleTtlMs?: number;
-	/** `providers.cacheRetention` (`auto|short|long|none`); undefined when unreadable. */
-	cacheRetention?: string;
 	/** `task.isolation.enabled`: whether the task tool accepts `isolated: true`. */
 	isolationEnabled?: boolean;
 	/** `task.maxConcurrency`: subagents omp runs at once. */
 	maxConcurrency?: number;
-	/** `task.showResolvedModelBadge`: the task widget shows each subagent's actual model. */
-	showResolvedModelBadge?: boolean;
 	/** `retry.modelFallback`: omp may switch to `retry.fallbackChains` models after provider errors. */
 	modelFallback?: boolean;
 	/** `retry.fallbackChains`: model role, selector or `provider/*` → ordered fallback selectors. */
@@ -257,75 +224,27 @@ export interface ExplicitSettings {
 
 export interface RouteStats {
 	selector: string;
-	provider: string;
-	id: string;
 	requests: number;
-	errors: number;
-	lastTs: number;
-	ompTps: number | null;
-	decodeTps: number | null;
 	ttftP50: number | null;
-	ttftP90: number | null;
-	/** costTotal / requests on this route (list-price estimate). */
-	costPerRequest: number | null;
-	available: boolean;
-	variant: LineageVariant;
 }
 
 /** Usage of one lineage in one seat. Shares are within that seat. */
 export interface LineageUsage {
 	modelKey: string;
-	lineKey: string;
-	/** Display label, e.g. "DeepSeek V4.1 Flash". */
-	label: string;
-	tier: Tier | null;
-	seat: Seat;
 	requests: number;
 	/** Share of the seat's requests over the whole window. */
 	share: number;
 	/** Share weighted by recency (7-day half-life). */
 	shareRecent: number;
 	errorRate: number;
-	lastTs: number;
+	/** Most requests first. */
 	routes: RouteStats[];
 }
 
-export interface NewerVersion {
-	/** modelKey in use. */
-	from: string;
-	/** Newer modelKey on the same lineKey. */
-	to: string;
-	/** Available selectors of the newer key. */
-	selectors: string[];
-	/** Revision from the name, suspect, or preview-only: show as "확인 필요". */
-	needsCheck: boolean;
-	int: MetricValue;
-}
-
-export interface Alternative {
-	selector: string;
-	modelKey: string;
-	label: string;
-	tier: Tier | null;
-	/** better: higher quality at ≤ cost; cheaper: same quality, lower cost; faster: same quality and cost band, faster;
-	 *  validated: heavily used with a low error rate but no catalog score; upgrade: higher quality in a pricier tier. */
-	kind: "better" | "cheaper" | "faster" | "validated" | "upgrade";
-	int: MetricValue;
-	speed: MetricValue;
-	/** Candidate cost / base cost on the base lineage's own token mix; null without pricing. */
-	costRatio: number | null;
-	why: string;
-}
-
 export interface Analysis {
-	status: UsageSnapshot["status"];
 	windowDays: number;
-	dataAsOf: number | null;
-	/** Preferences per seat and tier, each list sorted by share desc. */
-	preferences: Record<Seat, Record<Tier | "unknown", LineageUsage[]>>;
-	newer: NewerVersion[];
-	/** Keyed by the base lineage's modelKey. */
-	alternatives: Record<string, Alternative[]>;
+	/** Lineages per seat, sorted by share desc. */
+	preferences: Record<Seat, LineageUsage[]>;
 	warnings: string[];
 }
 
@@ -357,10 +276,10 @@ export interface Candidate {
 	int: MetricValue;
 	speed: MetricValue;
 	referenceUsd: number | null;
-	/** Estimated cost per request on the user's own token mix for subagent work; null without data. */
-	userMixUsd: number | null;
+	/** `exhausted` also when only this model's own limit is; such a candidate ranks after equal ones that can run now. */
 	quota: QuotaState;
-	confidence: Confidence;
+	/** When an exhausted limit resets, ms since epoch; absent when unknown or not exhausted. */
+	quotaResetsAt?: number;
 	/** Heavily used by this user with a low error rate. */
 	validated: boolean;
 	why: string[];
@@ -368,12 +287,42 @@ export interface Candidate {
 	whyNot: string[];
 }
 
+/** A newer revision of a model line ("class/tier") than the one in use. */
+export interface NewerVersion {
+	label: string;
+	int: MetricValue;
+	/** Routes usable now. */
+	selectors: string[];
+	/** Providers that list it but are not logged in; filled only when no route is usable now. */
+	loginProviders: string[];
+	/** The revision was read from a name, or every route is a preview: shown as "확인 필요". */
+	needsCheck: boolean;
+}
+
+/** Where a role's current primary model stands in the ranking. */
+export interface CurrentRank {
+	/** Set when the model is not a candidate: not usable now, or dropped by the constraint filter. */
+	excluded?: string;
+	/** Candidates ranked above it, best first, each with the first ranking key it wins on. Empty for an excluded model. */
+	above: Array<{ candidate: Candidate; reason: string }>;
+	/** Newer revisions of its model line in the catalog, newest first. */
+	newer: NewerVersion[];
+}
+
 export interface RoleRecommendation {
 	role: RoleSpec;
-	/** Ranked best first, at most 5. Empty when nothing passes the constraint filter. */
+	/** Ranked best first, one per lineage, at most 5. Empty when nothing passes the constraint filter. */
 	candidates: Candidate[];
 	/** Index into candidates of the default pick; -1 when candidates is empty. */
 	chosenIndex: number;
+	/**
+	 * What the role falls back to when the chosen model fails: a route of another lineage on another provider that can
+	 * run now, searched in the whole ranking (it may lie beyond `candidates`). Proven routes come first: one the user
+	 * ran on a validated lineage, then one with any requests of its own, then the best-ranked one.
+	 */
+	fallback?: Candidate;
+	/** Present when the caller named the role's current primary model. */
+	current?: CurrentRank;
 	/** Models dropped by the constraint filter, with the reason. */
 	excluded: Array<{ selector: string; reason: string }>;
 }
@@ -384,7 +333,7 @@ export interface RoleConfig {
 	agent: string;
 	/** Attempt order. Each entry is "provider/id" with an optional ":<effort>" suffix (omp pattern syntax); see src/selector.ts. */
 	models: string[];
-	/** Default effort for entries without their own suffix. The interview writes a suffix per model and leaves this unset. */
+	/** Default effort for entries without their own suffix. Storm writes a suffix per model and leaves this unset. */
 	effort?: Effort;
 	/**
 	 * Workers of this role in one Storm run. `min` is the count a run plan gets when it sets none for a role it uses;
@@ -401,9 +350,9 @@ export interface WorkerRange {
 	max: number;
 }
 
-/** A bounded trial of a candidate model for one role (plan 9.3). Part of the hashed config, so approving the config approves the trial. */
+/** A bounded trial of a candidate model for one role. Part of the hashed config, so approving the config approves the trial. */
 export interface TrialConfig {
-	/** Unique within the config, e.g. "implementer-gpt-6-2-sol-20261120". */
+	/** Unique within the config and per start, e.g. "implementer-gpt-6-2-sol-20261120T093000Z" (`trialId`). */
 	id: string;
 	/** Key into `roles`. */
 	role: string;
@@ -427,15 +376,20 @@ export interface BudgetConfig {
 	onExceed: "block-spawns" | "stop";
 }
 
+/** A config's stored priority: "speed" and "quota" were choices before 0.10 and are read as "balanced" (`teamPriority`). */
+export type StoredPriority = Priority | "speed" | "quota";
+
 /** `.omp/storm/config.json` (schema version 1). Unknown fields are kept and hashed. */
 export interface StormConfig {
 	version: 1;
-	priority: Priority;
+	priority: StoredPriority;
 	roles: Record<string, RoleConfig>;
 	parallelism: number;
 	isolation: "isolated" | "shared";
-	contract: "workflowz" | "orchestrate";
-	runtime: "omp";
+	/** Deprecated since 0.10: accepted and ignored; Storm no longer writes it. */
+	contract?: string;
+	/** Deprecated since 0.10: accepted (only "omp"); Storm no longer writes it. */
+	runtime?: "omp";
 	budget?: BudgetConfig;
 	/** Key into `roles`. During a Storm run, a non-Storm agent asking for an unapproved model gets this role's models; absent → blocked. */
 	fallbackRole?: string;
@@ -446,8 +400,8 @@ export interface StormConfig {
 	 */
 	disabledRoles?: string[];
 	/**
-	 * Context ceiling in tokens for subagents (default `DEFAULT_CONTEXT_CAP`). An agent at or past
-	 * min(this, 70% of its window) takes no follow-ups during a run: the director starts a fresh one with a summary.
+	 * Context ceiling in tokens (default `DEFAULT_CONTEXT_CAP`): a subagent at or past it takes no follow-ups during
+	 * a run (`followUpCap`), and the director is compacted at it or at 70% of its window (`directorCap`).
 	 */
 	contextCap?: number;
 	trials?: TrialConfig[];
@@ -459,6 +413,7 @@ export interface StormConfig {
 
 export type ConfigLoad =
 	| { status: "missing"; path: string }
+	/** `rawSha256`: of the file's bytes when it could be read; tells one invalid file from another (`movedSince`). */
 	| { status: "invalid"; path: string; errors: string[]; rawSha256?: string }
 	| {
 			status: "ok";
@@ -466,7 +421,6 @@ export type ConfigLoad =
 			config: StormConfig;
 			/** "jcs-sha256:<hex>" of the canonical JSON. */
 			hash: string;
-			rawSha256: string;
 			warnings: string[];
 	  };
 
@@ -478,10 +432,6 @@ export interface RepoIdentity {
 	kind: "git-common-dir" | "dir";
 	/** Worktree top level (or cwd outside git); `.omp/storm/` lives here. */
 	root: string;
-	commonDir?: string;
-	/** Normalized remotes with credentials stripped (hints only, never the key). */
-	remotes?: Record<string, string>;
-	rootCommits?: string[];
 }
 
 /** A `storm-*` agent definition outside the plugin that would shadow the plugin's definition. */
@@ -492,40 +442,24 @@ export interface ShadowInfo {
 	sha256: string;
 }
 
+/** What an approval covers besides the config itself. Records written before 0.10 carry more fields here; they are ignored. */
 export interface ApprovalScope {
-	providers: string[];
-	roles: Record<string, RoleConfig>;
-	budget?: BudgetConfig;
-	runtime: "omp";
 	/** Shadowing definitions the user saw and approved. */
 	shadowedAgents: ShadowInfo[];
-	fallbackRole?: string;
-	disabledRoles?: string[];
-	trials?: TrialConfig[];
 }
 
+/** `approved/<hex>.json`: the user approved the config with this hash. The config itself is the snapshot beside it. */
 export interface ApprovalRecord {
 	schema: "storm.approval/v1";
-	approvalId: string;
-	status: "active" | "revoked";
-	repoId: string;
+	status: "active";
+	/** Only on records written before 0.10; never read. */
+	repoId?: string;
 	configHash: string;
-	rawSha256: string;
 	/** ISO 8601. */
 	approvedAt: string;
-	approvedVia: { mode: string };
-	versions: { omp: string; storm: string; configSchema: 1 };
 	scope: ApprovalScope;
-	supersedes: string | null;
-	expiresAt: string | null;
-}
-
-export interface ApprovalLogEntry {
-	ts: string;
-	event: "approved" | "revoked" | "rolled_back" | "inherited";
-	approvalId: string;
-	configHash: string;
-	prevHash?: string | null;
+	/** Only on records written before 0.10; never written. */
+	approvalId?: string;
 }
 
 // ── Spawn policy (implemented in src/policy) ────────────────────────────────────────────────
@@ -546,7 +480,29 @@ export interface SpawnState {
 	shadows: ShadowInfo[];
 }
 
-/** undefined = leave the spawn alone. */
+/** Why Storm refused a spawn; stable across versions (records and tests key on it). */
+export type SpawnBlockCode =
+	| "no-config"
+	| "unapproved"
+	| "shadow"
+	| "disabled-role"
+	| "no-plan"
+	| "role-not-in-plan"
+	| "role-cap"
+	| "parallelism"
+	| "budget"
+	| "internal";
+
+/** Why Storm refused a director's tool call during a run. */
+export type ToolBlockCode = "director-edit" | "read-large" | "followup-cap" | "followup-cleaned";
+
+/** A refusal: the stable code and the sentence that teaches the model what to do instead. */
+export interface Block<Code extends string = SpawnBlockCode | ToolBlockCode> {
+	code: Code;
+	reason: string;
+}
+
+/** undefined = leave the spawn alone. A block's `reason` starts with `[storm:<code>] `. */
 export type SpawnDecision = undefined | { block: true; reason: string } | { model: string[]; note: string };
 
 // ── Setup detection (implemented in src/context.ts) ─────────────────────────────────────────
@@ -554,24 +510,22 @@ export type SpawnDecision = undefined | { block: true; reason: string } | { mode
 export interface DetectionSummary {
 	providers: Array<{ provider: string; models: number; quota: QuotaState }>;
 	tools: { task: boolean; eval: boolean };
-	keywords: { workflowz: boolean; orchestrate: boolean };
-	/** Model preferences written in omp settings, shown next to actual usage. */
-	explicit?: ExplicitSettings;
-	/** Usage data age relative to now; null when there is no data. */
-	dataAsOf: number | null;
-	stale: boolean;
 	warnings: string[];
 }
 
-/** Everything the Storm status report shows. v0.2 runtime fields are optional; absent ones render as nothing. */
+/** Everything the Storm status report shows. Absent optional fields render as nothing. */
 export interface StatusView {
-	repo: RepoIdentity;
 	config: ConfigLoad;
 	/** Active approval for the current config hash, if any. */
 	approval: ApprovalRecord | undefined;
+	/** Shadowing definitions; a project one's `path` is relative to the project root here. */
 	shadows: ShadowInfo[];
-	quota: QuotaStatus[];
-	dataAsOf: number | null;
+	/** Provider quota, when it was read (it takes about a second); absent → no quota section. */
+	quota?: QuotaStatus[];
+	/** Newest usage row (null: no rows), when the usage DB could be read; absent → no usage section. */
+	dataAsOf?: number | null;
+	/** The storage line (`formatStorage`), when storage was measured. */
+	storage?: string;
 	/** The Storm run active in this process for this project. */
 	run?: RunRecord;
 	/** The most recent finished run. */
@@ -579,12 +533,8 @@ export interface StatusView {
 	trials?: TrialView[];
 	/** Active quota marks only. */
 	quotaMarks?: QuotaMark[];
-	/** Proposals still waiting for approval (built on the current config). */
-	pending?: Proposal[];
-	/** Subagents of this session with lifecycle advice. */
-	agents?: Array<{ entry: AgentEntry; advice: AgentAdvice }>;
-	/** omp settings that decide what reusing a subagent costs; drives lifecycle warnings. */
-	lifecycle?: LifecycleSettings;
+	/** Subagents of this session. */
+	agents?: AgentEntry[];
 	/** omp settings that do not fit the approved team; shown, never changed. */
 	ompAdvice?: OmpAdvice[];
 	/** A newer Storm installed on disk than the one this process runs (`/restart` loads it). */
@@ -611,6 +561,39 @@ export interface RollbackOption {
 
 export type RunStatus = "running" | "done" | "budget-exceeded" | "stopped";
 
+/** How long a run lasts: until the session settles, until omp's goal ends, or while omp's loop repeats the task. */
+export type RunMode = "vibe" | "goal" | "loop";
+
+/** Why a run ended. `start-failed`: the handoff could not be sent. */
+export type RunEndReason =
+	| "settled"
+	| "goal-complete"
+	| "goal-dropped"
+	| "goal-paused"
+	| "goal-budget"
+	| "goal-stalled"
+	| "loop-ended"
+	| "loop-paused"
+	| "shutdown"
+	| "budget"
+	| "start-failed";
+
+/** A loop run's bound: main turns in total (the first one included), or wall time. */
+export type LoopLimit = { kind: "turns"; turns: number } | { kind: "duration"; durationMs: number };
+
+/** A shell command checked before each repeat: `until` repeats while it fails, otherwise while it succeeds. */
+export interface LoopCondition {
+	command: string;
+	until: boolean;
+}
+
+/** A run as requested: the task verbatim and what its mode needs. `resume` continues omp's paused goal. */
+export type RunSpec =
+	| { mode: "vibe"; task: string }
+	| { mode: "goal"; task: string; tokenBudget?: number }
+	| { mode: "goal"; resume: true }
+	| { mode: "loop"; task: string; limit?: LoopLimit; condition?: LoopCondition };
+
 /** One spawn Storm decided: every storm-* spawn, and non-Storm spawns during a run. */
 export interface SpawnRecord {
 	/** ISO 8601. */
@@ -623,15 +606,18 @@ export interface SpawnRecord {
 	 * routed: storm-* agent got its approved models · trial: routed to a trial candidate ·
 	 * allowed: non-Storm agent kept its (approved) model · substituted: the agent got another role's models
 	 * (`fallbackRole`, the role an omp built-in agent maps to, or a missing role's stand-in; `role` names it) ·
-	 * blocked: spawn refused (`reason`).
+	 * blocked: spawn refused (`code`, `reason`).
 	 */
 	outcome: "routed" | "trial" | "allowed" | "substituted" | "blocked";
 	/** Models returned to omp, in attempt order (with effort suffix). */
 	models?: string[];
+	/** Blocked spawns only. */
+	code?: SpawnBlockCode;
+	/** What a block told the model, or how a substitution was chosen. */
 	reason?: string;
 	/** Role key (storm-* agents and substitutions). */
 	role?: string;
-	/** Set when a trial was active for the role, whether or not this spawn was routed to it. */
+	/** Set when a trial was active for the role; `outcome: "trial"` says this spawn was routed to it. */
 	trialId?: string;
 	/** The caller's per-spawn key (task item name or eval label); omp names the subagent and its transcript after it. */
 	spawnKey?: string;
@@ -642,13 +628,14 @@ export interface RunRecord {
 	schema: "storm.run/v1";
 	runId: string;
 	configHash: string;
-	approvalId: string;
+	/** Written by 0.8/0.9; ignored. */
+	approvalId?: string;
 	/** ISO 8601. */
 	startedAt: string;
 	endedAt?: string;
 	status: RunStatus;
-	/** Keyword the handoff carried; "none" when neither keyword was usable. */
-	contract: StormConfig["contract"] | "none";
+	/** Written by 0.8/0.9 (the keyword the handoff carried); ignored. */
+	contract?: string;
 	/** The request, truncated to 200 characters. */
 	task: string;
 	/** List-price spend of every assistant message in this process while the run was active. */
@@ -656,8 +643,6 @@ export interface RunRecord {
 	/** Spend by "provider/model". */
 	costByModel: Record<string, number>;
 	budget?: BudgetConfig;
-	warnedAt?: string;
-	exceededAt?: string;
 	spawns: SpawnRecord[];
 	/** Subagents seen during the run, from the agent ledger. */
 	agents?: AgentEntry[];
@@ -667,15 +652,15 @@ export interface RunRecord {
 	blockedEdits?: number;
 	/** The run plan in force when the run ended (the last one the director submitted). */
 	plan?: RunPlan;
-	/** Follow-ups to agents past their context ceiling that Storm sent back to a fresh agent. */
+	/** Follow-ups to agents past their context cap, or cleaned, that Storm sent back to a fresh agent. */
 	blockedFollowUps?: number;
-	/** ISO 8601 of the last write while the run was active. */
+	/** ISO 8601 of the last write while the run was active: the end time of a run whose process died. */
 	updatedAt?: string;
 	/** Artifacts dir of the main session that ran it (`<session>/`): where its subagents' records live. */
 	artifactsDir?: string;
 	/** "<pid>:<process start ms>" of the omp process that ran it; agents of another process are not live here. */
 	process?: string;
-	/** Director `read` calls during the run: all, those of a file a subagent of the run had read, and the ones Storm refused. */
+	/** What the director read during the run and how much of it a subagent of the run had read too. */
 	reads?: RunReads;
 	/** Largest prompt (tokens) of a director request during the run. */
 	maxMainContext?: number;
@@ -683,11 +668,25 @@ export interface RunRecord {
 	checkpoints?: RunCheckpoint[];
 	/** What the run-end janitor removed. */
 	cleanup?: CleanupResult;
+	/** Absent in records of 0.9 and earlier: those were vibe runs. */
+	mode?: RunMode;
+	/** Main-session turns that settled during the run. */
+	turns?: number;
+	endReason?: RunEndReason;
+	/** Goal runs: omp's goal as last reported (`tokensUsed` counts the main session only). */
+	goal?: { objective: string; tokenBudget?: number; tokensUsed?: number };
+	/** Loop runs: the bound and condition omp's loop was entered with. */
+	loop?: { limit?: LoopLimit; condition?: LoopCondition };
 }
 
 export interface RunReads {
+	/** Director `read` calls of working files that returned. */
 	director: number;
-	duplicate: number;
+	/** Characters those reads returned. */
+	directorChars: number;
+	/** Of those, characters from files a subagent of the run also read. */
+	duplicateChars: number;
+	/** Reads Storm refused (`read-large`). */
 	blocked: number;
 }
 
@@ -729,6 +728,9 @@ export interface RunSummary {
 	reads?: RunReads;
 	checkpoints?: number;
 	cleanup?: CleanupResult;
+	mode?: RunMode;
+	turns?: number;
+	endReason?: RunEndReason;
 }
 
 /** Kinds of work a run plan's lanes do; each defaults to a role (`LANE_ROLES`). */
@@ -774,11 +776,10 @@ export interface TrialState {
 	seen: number;
 	/** Of those, routed to the candidate. */
 	routed: number;
-	/** Candidate's list-price spend while the trial was active. */
+	/** List-price spend of the subagents routed to the candidate, on the candidate model. */
 	costUsd: number;
-	/** ISO 8601, set once the trial stops routing. */
-	endedAt?: string;
-	endReason?: "time" | "spawns" | "budget";
+	/** ISO 8601 of the moment the trial first reached its spawn cap or budget; its comparison ends there. Absent while it routes, and in counters written before 0.10. */
+	stoppedAt?: string;
 }
 
 /** Measured comparison of a trial candidate with the role's primary model since the trial started (stats DB, subagent seat). */
@@ -803,6 +804,8 @@ export interface TrialView {
 	state: TrialState | undefined;
 	/** "pending" before startsAt, "active" while it may still route, "ended" once time, spawns or budget ran out. */
 	phase: "pending" | "active" | "ended";
+	/** What ended it, for ended trials. */
+	endReason?: "time" | "spawns" | "budget";
 	comparison?: TrialComparison;
 }
 
@@ -831,70 +834,30 @@ export interface SpawnOutcome {
 	record?: SpawnRecord;
 }
 
-// ── Proposals and evidence (implemented in src/proposals) ─────────────────────────────────────
+// ── Proposals (implemented in src/proposals) ──────────────────────────────────────────────────
 
 export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "settings" | "setup" | "plan";
 
-/** Why the approved models were chosen, stored per config hash next to the approval. */
-export interface EvidenceRecord {
-	schema: "storm.evidence/v1";
-	/** ISO 8601. */
-	createdAt: string;
-	source: "setup" | ProposalKind;
-	priority: Priority;
-	dataAsOf: number | null;
-	roles: Record<
-		string,
-		{
-			chosen: string | null;
-			candidates: Array<{
-				selector: string;
-				label: string;
-				validated: boolean;
-				int: number | null;
-				speed: number | null;
-				referenceUsd: number | null;
-				why: string[];
-				whyNot: string[];
-			}>;
-		}
-	>;
-	/** Why this team, as the session LLM explained it when it proposed a setup. */
-	rationale?: string;
-}
-
-/** A config change the storm tool proposed; nothing changes until the user approves it. */
+/** A config change waiting for the user's answer in the approval dialog; it lives in memory only. */
 export interface Proposal {
-	schema: "storm.proposal/v1";
-	id: string;
 	kind: ProposalKind;
-	/** ISO 8601. */
-	createdAt: string;
-	/** One line for lists. */
+	/** One line above the diff. */
 	summary: string;
-	/** Hash of the config the proposal was built on; stale once the config moves on. */
-	baseHash: string;
 	config: StormConfig;
-	evidence?: EvidenceRecord;
 }
 
 // ── Shared analysis context (implemented in src/context.ts) ──────────────────────────────────
 
-/** Catalog, quota, usage and analysis read once; recommendations re-rank without re-reading. */
+/** Catalog, settings, usage and analysis read once; recommendations re-rank without re-reading. */
 export interface AnalysisContext {
 	now: number;
 	catalog: ModelInfo[];
 	available: ModelInfo[];
-	quota: QuotaStatus[];
 	explicit: ExplicitSettings;
 	usage: UsageSnapshot;
 	analysis: Analysis;
-	lineage: LineageFn;
-	/** Keyed by modelKey. */
-	tiers: Map<string, PriceTierInfo>;
-	/** Priors and data warnings. */
-	warnings: string[];
-	recommend(priority: Priority): RoleRecommendation[];
+	/** `current`: role id → that role's primary selector now; fills `RoleRecommendation.current`. */
+	recommend(priority: Priority, current?: Readonly<Record<string, string>>): RoleRecommendation[];
 	/** Validates a selector the user named against the available catalog. */
 	checkModel: (selector: string) => { ok: true; label: string; efforts: Effort[] } | { ok: false; reason: string };
 	detection(activeTools: string[], extraWarnings?: string[]): DetectionSummary;
@@ -902,20 +865,7 @@ export interface AnalysisContext {
 
 // ── storm tool (implemented in src/tool) ────────────────────────────────────────────────────
 
-export type StormToolAction =
-	| "status"
-	| "models"
-	| "priority"
-	| "workers"
-	| "reselect"
-	| "quota"
-	| "trial"
-	| "budget"
-	| "settings"
-	| "run"
-	| "plan"
-	| "agents"
-	| "propose";
+export type StormToolAction = "run" | "plan" | "status" | "agents";
 
 /** A run plan as the director sends it; `validatePlan` checks it and resolves roles and workers. */
 export interface PlanRequest {
@@ -933,40 +883,20 @@ export interface PlanRequest {
 /** Arguments the LLM passes; each action reads only its own fields. */
 export interface StormToolParams {
 	action: StormToolAction;
-	/** priority */
-	priority?: Priority;
-	/** workers, reselect, trial */
-	role?: RoleId;
-	/** workers: the role's new worker range (either bound may be left out) */
-	min?: number;
-	max?: number;
 	/** plan: the run plan */
 	plan?: PlanRequest;
-	/** reselect: the model the user named; trial: the candidate */
-	model?: string;
-	/** quota */
-	provider?: string;
-	/** trial */
-	share?: number;
-	maxSpawns?: number;
-	days?: number;
-	/** trial budget, or budget.perRunUsd */
-	budgetUsd?: number;
-	/** budget */
-	warnAtUsd?: number;
-	onExceed?: BudgetConfig["onExceed"];
-	/** settings: "실행이 끝나면 정리" and "문서 정합" switches */
-	cleanup?: boolean;
-	docs?: boolean;
-	/** run */
+	/** run: the user's request, verbatim */
 	task?: string;
-	/** propose: the whole team as a Storm config object (version, priority, roles, parallelism, isolation, contract, …). */
-	config?: unknown;
-	/** propose: why this team, in the user's language; stored with the evidence. */
-	rationale?: string;
+	/** run: how long the run lasts (default vibe) */
+	mode?: RunMode;
+	/** run, loop: total turns, or minutes of wall time; a loop asked for through the tool needs one of them */
+	iterations?: number;
+	minutes?: number;
+	/** run, goal: main-session token budget */
+	tokenBudget?: number;
 }
 
-// ── Agent ledger and lifecycle advice (implemented in src/runtime/agents.ts, src/report/agents.ts) ─
+// ── Agent ledger (implemented in src/runtime/agents.ts, src/report/agents.ts) ────────────────
 
 export type AgentLiveState = "running" | "idle" | "parked";
 
@@ -979,7 +909,7 @@ export interface AgentEntry {
 	parentId?: string;
 	/** Storm role key for storm-* agents. */
 	role?: string;
-	/** The Storm run active when the agent started. */
+	/** The Storm run active during its latest turn: an agent revived in a later run belongs to that run. */
 	runId?: string;
 	/** "provider/model" of its last assistant message. */
 	model?: string;
@@ -989,14 +919,11 @@ export interface AgentEntry {
 	lastActivityAt: number;
 	/** Prompt tokens of its last request (input + cache read + cache write): roughly what a follow-up carries. */
 	contextTokens: number;
-	contextWindow?: number;
 	requests: number;
 	/** List-price spend. */
 	costUsd: number;
-	/** Turns after its first one: follow-ups by message, wake or revive. */
+	/** Messages the director delivered to it with `write agent://<id>`. */
 	followUps: number;
-	/** Cache-read share of the last request's prompt, 0..1. */
-	lastCacheReadShare?: number;
 	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
 	review?: ReviewTally;
 	/** ms since epoch: the run-end janitor removed its omp records; its `agent://` output stays. */
@@ -1013,21 +940,4 @@ export interface ReviewTally {
 	findings: [number, number, number, number];
 	/** Findings about docs (kind doc_conflict or doc_copy); also counted in `findings`. */
 	docFindings?: number;
-	/** 0..1, from the latest verdict. */
-	lastConfidence?: number;
-}
-
-export interface AgentAdvice {
-	id: string;
-	/** reuse: send follow-ups to it · fresh: give new work to a new agent with a summary · cleanup: nothing left to gain from keeping it. */
-	action: "reuse" | "fresh" | "cleanup" | "busy";
-	reason: string;
-	/** "agent://<id>" when reuse is advised. */
-	handle?: string;
-}
-
-/** The omp settings that decide what reusing a subagent costs. Storm only reads them. */
-export interface LifecycleSettings {
-	agentIdleTtlMs?: number;
-	cacheRetention?: string;
 }

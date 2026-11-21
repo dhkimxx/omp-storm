@@ -2,26 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { planChange } from "../src/plan/change.ts";
 import { validatePlan } from "../src/plan/validate.ts";
 import { ROLES } from "../src/roles.ts";
-import type { Candidate, MetricValue, RoleRecommendation, StormConfig } from "../src/types.ts";
+import type { Candidate, RoleRecommendation, StormConfig } from "../src/types.ts";
+import { teamOf } from "./fixtures.ts";
+import { cand as candidate } from "./support.ts";
 
 const NOW = Date.parse("2026-11-21T00:00:00Z");
-const config: StormConfig = {
-	version: 1,
-	priority: "balanced",
-	roles: {
-		implementer: { agent: "storm-implementer", models: ["a/i"], workers: { min: 1, max: 3 } },
-		reviewer: { agent: "storm-reviewer", models: ["b/r"] },
-		quick: { agent: "storm-quick", models: ["a/q"], workers: 2 },
-	},
-	parallelism: 4,
-	isolation: "shared",
-	contract: "workflowz",
-	runtime: "omp",
-	disabledRoles: ["architect"],
-};
+const config: StormConfig = teamOf(
+	{ implementer: { models: ["a/i"], workers: { min: 1, max: 3 } }, reviewer: "b/r", quick: { models: ["a/q"], workers: 2 } },
+	{ disabledRoles: ["architect"] },
+);
 
 describe("validatePlan", () => {
-	test("roles resolve from kind along the stand-ins; workers default to each role's min", () => {
+	test("roles resolve from kind along the stand-ins; a role's default workers are its lanes, clamped to its range", () => {
 		const r = validatePlan(
 			config,
 			{
@@ -39,8 +31,28 @@ describe("validatePlan", () => {
 		expect(r.outOfBounds).toEqual([]);
 		// explorer missing → quick; architect disabled → reviewer.
 		expect(r.plan!.lanes.map((l) => l.role)).toEqual(["implementer", "quick", "reviewer", "quick", "reviewer"]);
-		expect(r.plan!.workers).toEqual({ implementer: 1, quick: 2, reviewer: 1 });
-		expect(r.plan!.submittedAt).toBe("2026-11-21T00:00:00.000Z");
+		// implementer 1 lane in 1..3 → 1; quick 2 lanes in 2..2 → 2; reviewer 2 lanes in 1..2 → 2.
+		expect(r.plan!.workers).toEqual({ implementer: 1, quick: 2, reviewer: 2 });
+	});
+
+	test("default workers follow the lane count up to the role's max and never go below its min", () => {
+		const lanes = (n: number, kind: string) => Array.from({ length: n }, (_, i) => ({ name: `${kind}${i}`, kind }));
+		const workers = (input: unknown) => validatePlan(config, input, NOW).plan?.workers;
+		expect(workers({ lanes: lanes(2, "code") })).toEqual({ implementer: 2 });
+		expect(workers({ lanes: lanes(5, "code") })).toEqual({ implementer: 3 });
+		expect(workers({ lanes: lanes(1, "run") })).toEqual({ quick: 2 });
+		// An explicit count wins over the default.
+		expect(workers({ lanes: lanes(3, "code"), workers: { implementer: 1 } })).toEqual({ implementer: 1 });
+		expect(validatePlan(config, { lanes: lanes(5, "code") }, NOW).outOfBounds).toEqual([]);
+	});
+
+	test("workers for a role without lanes, or for no role at all, are ignored with a warning; that role gets no workers", () => {
+		const r = validatePlan(config, { lanes: [{ name: "a", kind: "code" }], workers: { implementer: 2, reviewer: 1, boss: 3 } }, NOW);
+		expect(r.errors).toEqual([]);
+		expect(r.plan?.workers).toEqual({ implementer: 2 });
+		expect(r.warnings).toHaveLength(2);
+		expect(r.warnings.some((w) => w.includes("reviewer"))).toBe(true);
+		expect(r.warnings.some((w) => w.includes("boss"))).toBe(true);
 	});
 
 	test("workers past max and explicit disabled/missing roles are gaps, the plan still returns", () => {
@@ -65,7 +77,7 @@ describe("validatePlan", () => {
 		expect(r.plan?.workers).toEqual({ implementer: 4, architect: 1, explorer: 2 });
 	});
 
-	test("errors: lane count, names, kind, files, role id, workers values and roles without lanes", () => {
+	test("errors: lane count, names, kind, files, role id and worker values", () => {
 		const bad = (input: unknown) => validatePlan(config, input, NOW);
 		expect(bad({ lanes: [] }).errors).toHaveLength(1);
 		expect(bad({ lanes: Array.from({ length: 51 }, (_, i) => ({ name: `l${i}`, kind: "code" })) }).errors).toHaveLength(1);
@@ -81,7 +93,7 @@ describe("validatePlan", () => {
 			workers: { implementer: 0, reviewer: 1 },
 		});
 		expect(r.plan).toBeUndefined();
-		expect(r.errors).toHaveLength(7);
+		expect(r.errors).toHaveLength(6);
 		expect(bad({ lanes: [{ name: "a", kind: "code" }], workers: { implementer: 1.5 } }).errors).toHaveLength(1);
 	});
 
@@ -108,27 +120,16 @@ describe("validatePlan", () => {
 	});
 });
 
-const mv = (value: number): MetricValue => ({ value, source: "catalog", confidence: "medium" });
-const cand = (selector: string): Candidate => ({
-	selector,
-	modelKey: selector,
-	label: selector,
-	effort: "medium",
-	tier: "general",
-	int: mv(50),
-	speed: mv(100),
-	referenceUsd: 0.02,
-	userMixUsd: null,
-	quota: "available",
-	confidence: "medium",
-	validated: false,
-	why: [],
-	whyNot: [],
-});
+const cand = (selector: string): Candidate => candidate(selector, { label: selector });
 
 describe("planChange", () => {
-	const recs: RoleRecommendation[] = ROLES.map((role) => ({ role, candidates: [cand(`a/${role.id}`), cand(`b/${role.id}`)], chosenIndex: 0, excluded: [] }));
-	const efforts = () => ["low", "medium", "high"] as const;
+	const recs: RoleRecommendation[] = ROLES.map((role) => ({
+		role,
+		candidates: [cand(`a/${role.id}`), cand(`b/${role.id}`)],
+		chosenIndex: 0,
+		fallback: cand(`b/${role.id}`),
+		excluded: [],
+	}));
 
 	test("raises max keeping min, and adds a disabled role with recommended models and default range", () => {
 		const r = planChange(
@@ -138,12 +139,14 @@ describe("planChange", () => {
 				{ kind: "workers", role: "implementer", want: 5, max: 3 },
 				{ kind: "workers", role: "quick", want: 4, max: 2 },
 			],
-			{ recs, efforts },
+			{ recs },
 		);
 		if ("error" in r) throw new Error(r.error);
 		expect(r.config.roles.implementer!.workers).toEqual({ min: 1, max: 5 });
 		expect(r.config.roles.quick!.workers).toEqual({ min: 2, max: 4 });
-		expect(r.config.roles.architect).toEqual({ agent: "storm-architect", models: ["a/architect:high", "b/architect:high"], workers: { min: 1, max: 1 } });
+		// The role is built the way setup builds it: the recommendation's pick, then its fallback, the default worker range.
+		expect(r.config.roles.architect).toMatchObject({ agent: "storm-architect", workers: { min: 1, max: 1 } });
+		expect(r.config.roles.architect?.models.map((m) => m.split(":")[0])).toEqual(["a/architect", "b/architect"]);
 		expect(r.config.disabledRoles).toBeUndefined();
 	});
 

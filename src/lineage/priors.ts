@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 export interface PriorAlias {
 	match: { provider: string; id: string };
 	key: string;
-	source: string;
 	expires?: string;
 }
 
@@ -13,24 +12,14 @@ export interface QualityPrior {
 	metric: string;
 	value: number;
 	source: string;
-	url?: string;
-	date?: string;
-	harness?: string;
 }
 
 export interface Priors {
-	schema: number;
-	updated: string;
 	lineage: {
 		routeTokens: string[];
 		vendorPrefixes: string[];
 		genericBrand: Record<string, string[]>;
 		aliases: PriorAlias[];
-	};
-	tiers: {
-		/** Tier order per class, low to high. */
-		order: Record<string, string[]>;
-		tierAliases: Record<string, string>;
 	};
 	priceTier: {
 		referenceMix: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -41,7 +30,6 @@ export interface Priors {
 }
 
 const DEFAULT_PATH = fileURLToPath(new URL("../../priors/priors.yml", import.meta.url));
-const STALE_MS = 90 * 86_400_000;
 
 type Raw = Record<string, unknown>;
 
@@ -78,6 +66,7 @@ function obj(v: unknown, what: string): Raw {
 /** Throws on any shape error so the caller can fall back. */
 function toPriors(raw: unknown): Priors {
 	const r = obj(raw, "root");
+	if (r.schema !== 1) throw new Error("schema");
 	const lin = obj(r.lineage, "lineage");
 	const gb = obj(lin.generic_brand, "generic_brand");
 	const genericBrand: Record<string, string[]> = {};
@@ -93,20 +82,10 @@ function toPriors(raw: unknown): Priors {
 		const alias: PriorAlias = {
 			match: { provider: typeof m.provider === "string" ? m.provider : "*", id: m.id.toLowerCase() },
 			key: o.key,
-			source: typeof o.source === "string" ? o.source : "",
 		};
 		if (o.expires !== undefined) alias.expires = dateStr(o.expires);
 		return alias;
 	});
-	const t = obj(r.tiers ?? {}, "tiers");
-	const order: Record<string, string[]> = {};
-	let tierAliases: Record<string, string> = {};
-	for (const [k, v] of Object.entries(t)) {
-		if (k === "tier_aliases") {
-			const ta = obj(v ?? {}, "tier_aliases");
-			tierAliases = Object.fromEntries(Object.entries(ta).map(([a, b]) => [a, String(b)]));
-		} else order[k] = strArr(v, `tiers.${k}`);
-	}
 	const pt = obj(r.price_tier, "price_tier");
 	const mix = obj(pt.reference_mix, "reference_mix");
 	const bounds = obj(pt.bounds_usd_per_request, "bounds_usd_per_request");
@@ -120,22 +99,15 @@ function toPriors(raw: unknown): Priors {
 		if (typeof o.key !== "string" || typeof o.metric !== "string" || typeof o.source !== "string") {
 			throw new Error("quality_prior");
 		}
-		const p: QualityPrior = { key: o.key, metric: o.metric, value: num(o.value, "value"), source: o.source };
-		if (typeof o.url === "string") p.url = o.url;
-		if (o.date !== undefined) p.date = dateStr(o.date);
-		if (typeof o.harness === "string") p.harness = o.harness;
-		return p;
+		return { key: o.key, metric: o.metric, value: num(o.value, "value"), source: o.source };
 	});
 	return {
-		schema: num(r.schema, "schema"),
-		updated: dateStr(r.updated),
 		lineage: {
 			routeTokens: strArr(lin.route_tokens, "route_tokens"),
 			vendorPrefixes: strArr(lin.vendor_prefixes, "vendor_prefixes"),
 			genericBrand,
 			aliases,
 		},
-		tiers: { order, tierAliases },
 		priceTier: {
 			referenceMix: {
 				input: num(mix.input, "input"),
@@ -163,11 +135,7 @@ export function loadPriors(opts: { userPath?: string; now?: number } = {}): { pr
 			warnings.push(`사전값 파일 형식 오류로 기본값을 씁니다(${opts.userPath})`);
 		}
 	}
-	const now = opts.now ?? Date.now();
-	if (now - Date.parse(`${priors.updated}T00:00:00Z`) > STALE_MS) {
-		warnings.push(`사전값이 오래됐습니다(${priors.updated})`);
-	}
-	const today = new Date(now).toISOString().slice(0, 10);
+	const today = new Date(opts.now ?? Date.now()).toISOString().slice(0, 10);
 	const live = priors.lineage.aliases.filter((a) => !a.expires || a.expires >= today);
 	if (live.length < priors.lineage.aliases.length) {
 		warnings.push(`만료된 별칭 ${priors.lineage.aliases.length - live.length}개를 무시합니다`);

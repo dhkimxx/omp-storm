@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { writeTextAtomic } from "../fsutil.ts";
 import type { ConfigLoad, StormConfig } from "../types.ts";
 import { configHash, formatJson, parseStrictJson, sha256Hex } from "./canonical.ts";
 import { validateConfig } from "./schema.ts";
@@ -38,7 +39,6 @@ export async function loadConfig(root: string): Promise<ConfigLoad> {
 		path: file,
 		config: checked.config,
 		hash: configHash(parsed.value),
-		rawSha256,
 		warnings: checked.warnings,
 	};
 }
@@ -48,30 +48,14 @@ export function serializeConfig(config: StormConfig): string {
 	return `${formatJson(config, "  ")}\n`;
 }
 
-async function writeAtomic(file: string, data: string): Promise<void> {
-	const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
-	try {
-		await fs.writeFile(tmp, data);
-		await fs.rename(tmp, file);
-	} catch (error) {
-		await fs.rm(tmp, { force: true });
-		throw error;
-	}
-}
-
-export async function writeConfig(
-	root: string,
-	config: StormConfig,
-): Promise<{ path: string; hash: string; rawSha256: string }> {
+/** Saves a team Storm built. Never used to migrate a file the user wrote: that one is only ever read. */
+export async function writeConfig(root: string, config: StormConfig): Promise<{ path: string; hash: string }> {
 	const file = configPath(root);
-	const dir = path.dirname(file);
-	await fs.mkdir(dir, { recursive: true });
+	await writeTextAtomic(file, serializeConfig(config));
 	try {
-		await fs.writeFile(path.join(dir, ".gitignore"), "/state/\n", { flag: "wx" });
+		await fs.writeFile(path.join(path.dirname(file), ".gitignore"), "/state/\n", { flag: "wx" });
 	} catch (error) {
 		if (errorCode(error) !== "EEXIST") throw error;
 	}
-	const text = serializeConfig(config);
-	await writeAtomic(file, text);
-	return { path: file, hash: configHash(config), rawSha256: sha256Hex(text) };
+	return { path: file, hash: configHash(config) };
 }

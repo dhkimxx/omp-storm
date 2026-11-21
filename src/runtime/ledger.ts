@@ -4,7 +4,6 @@ import type { BudgetConfig, RunPlan } from "../types.ts";
 export interface LedgerRun {
 	runId: string;
 	repoId: string;
-	configHash: string;
 	budget?: BudgetConfig;
 	costUsd: number;
 	costByModel: Record<string, number>;
@@ -22,7 +21,6 @@ const runs = new Map<string, LedgerRun>();
 export function startLedgerRun(init: {
 	runId: string;
 	repoId: string;
-	configHash: string;
 	budget?: BudgetConfig;
 	onThreshold?: LedgerRun["onThreshold"];
 }): LedgerRun {
@@ -31,7 +29,6 @@ export function startLedgerRun(init: {
 	const run: LedgerRun = {
 		runId: init.runId,
 		repoId: init.repoId,
-		configHash: init.configHash,
 		costUsd: 0,
 		costByModel: {},
 		warned: false,
@@ -45,6 +42,11 @@ export function startLedgerRun(init: {
 
 export function activeLedgerRun(repoId: string): LedgerRun | undefined {
 	return runs.get(repoId);
+}
+
+/** Whether any Storm run is active in this process, whichever project it belongs to. */
+export function anyLedgerRun(): boolean {
+	return runs.size > 0;
 }
 
 /** Stores the plan on the active run with this id; false when no such run is active. */

@@ -4,7 +4,9 @@
  * ledger of the run, so lanes and each agent's `agent://` handle survive it.
  */
 import { tokens } from "../report/agents.ts";
+import { roleTitle } from "../roles.ts";
 import type { AgentEntry, AgentLiveState, RunRecord } from "../types.ts";
+import { reviewTotals } from "./review.ts";
 
 /** Least time between two checkpoints of one director. */
 export const CHECKPOINT_MIN_GAP_MS = 10 * 60_000;
@@ -31,7 +33,7 @@ export function shouldCheckpoint(input: { tokens: number; cap: number; lastAt?: 
 	return input.now - input.lastAt >= (input.minGapMs ?? CHECKPOINT_MIN_GAP_MS);
 }
 
-const STATE_LABEL: Record<AgentLiveState, string> = { running: "실행 중", idle: "유휴", parked: "보관됨" };
+const STATE_LABEL: Record<AgentLiveState, string> = { running: "실행 중", idle: "유휴", parked: "보관" };
 
 /**
  * Storm's ledger of a run for a compaction of its directing session: plan lanes, the run's agents with their
@@ -47,22 +49,22 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 		out.push(`계획 레인 ${lanes.length}개:`);
 		for (const l of lanes.slice(0, MAX_LANES)) {
 			const name = l.name.length > MAX_NAME ? `${l.name.slice(0, MAX_NAME - 1)}…` : l.name;
-			out.push(`- ${name} (${l.kind}, ${l.role})`);
+			out.push(`- ${name} (${l.kind}, ${roleTitle(l.role)})`);
 		}
 		if (lanes.length > MAX_LANES) out.push(`- 외 ${lanes.length - MAX_LANES}개`);
 	}
 
 	const mine = agents.filter(a => a.runId === run.runId);
-	if (mine.length === 0) out.push("에이전트: 없음");
+	if (mine.length === 0) out.push("서브에이전트: 없음");
 	else {
 		// Running first, then the most recently active.
 		const order = (a: AgentEntry) => (a.state === "running" ? 0 : 1);
 		const sorted = [...mine].sort((a, b) => order(a) - order(b) || b.lastActivityAt - a.lastActivityAt);
-		out.push(`에이전트 ${mine.length}개 (결과는 agent://<id> 로 다시 읽기):`);
+		out.push(`서브에이전트 ${mine.length}개 (결과는 agent://<id> 로 다시 읽기):`);
 		for (const a of sorted.slice(0, MAX_AGENTS)) {
-			const cleaned = a.cleanedAt === undefined ? "" : ", 기록 정리됨(결과만 읽기, 후속 지시 불가)";
+			const cleaned = a.cleanedAt === undefined ? "" : ", 정리됨(결과만 읽기, 후속 지시 불가)";
 			out.push(
-				`- agent://${a.id} — ${a.role ?? a.name}, ${STATE_LABEL[a.state]}, 컨텍스트 ${tokens(a.contextTokens)} 토큰${cleaned}`,
+				`- agent://${a.id} — ${a.role === undefined ? a.name : roleTitle(a.role)}, ${STATE_LABEL[a.state]}, 컨텍스트 ${tokens(a.contextTokens)} 토큰${cleaned}`,
 			);
 		}
 		const rest = sorted.slice(MAX_AGENTS);
@@ -76,25 +78,11 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 		}
 	}
 
-	let reviews = 0;
-	let passed = 0;
-	let failed = 0;
-	let docs = 0;
-	const findings = [0, 0, 0, 0];
-	for (const a of mine) {
-		if (!a.review) continue;
-		reviews += a.review.reviews;
-		passed += a.review.passed;
-		failed += a.review.failed;
-		docs += a.review.docFindings ?? 0;
-		a.review.findings.forEach((n, i) => {
-			findings[i] = (findings[i] ?? 0) + n;
-		});
-	}
-	if (reviews > 0) {
-		const doc = docs > 0 ? `, 문서 지적 ${docs}` : "";
+	const review = reviewTotals(mine);
+	if (review.reviews > 0) {
+		const doc = review.docFindings > 0 ? `, 문서 지적 ${review.docFindings}` : "";
 		out.push(
-			`리뷰 ${reviews}회: 통과 ${passed}, 실패 ${failed}; 지적 ${findings.map((n, i) => `P${i} ${n}`).join(" · ")}${doc}`,
+			`리뷰 ${review.reviews}회: 통과 ${review.passed}, 실패 ${review.failed}; 지적 ${review.findings.map((n, i) => `P${i} ${n}`).join(" · ")}${doc}`,
 		);
 	}
 

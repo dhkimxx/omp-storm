@@ -1,38 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
 import type { AgentEntry, RunRecord } from "../src/types.ts";
+import { agentEntry, runRecord } from "./fixtures.ts";
 
 const MIN = 60_000;
+const TASK = "refactor the payment module";
 
-const run = (over: Partial<RunRecord> = {}): RunRecord => ({
-	schema: "storm.run/v1",
-	runId: "r1",
-	configHash: "h",
-	approvalId: "a",
-	startedAt: "2026-11-21T00:00:00.000Z",
-	status: "running",
-	contract: "orchestrate",
-	task: "결제 모듈 리팩터",
-	costUsd: 0,
-	costByModel: {},
-	spawns: [],
-	...over,
-});
-
-const agent = (over: Partial<AgentEntry> = {}): AgentEntry => ({
-	id: "Impl",
-	name: "storm-implementer",
-	role: "implementer",
-	runId: "r1",
-	state: "idle",
-	startedAt: 0,
-	lastActivityAt: 10,
-	contextTokens: 45_000,
-	requests: 3,
-	costUsd: 1,
-	followUps: 0,
-	...over,
-});
+const run = (over: Partial<RunRecord> = {}): RunRecord => runRecord({ runId: "r1", status: "running", task: TASK, ...over });
+const agent = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ runId: "r1", lastActivityAt: 10, contextTokens: 45_000, ...over });
 
 describe("shouldCheckpoint", () => {
 	test("fires at or past the cap, never below it", () => {
@@ -49,10 +24,8 @@ describe("shouldCheckpoint", () => {
 	});
 });
 
-test("checkpoint instructions keep decisions and evidence locations and drop raw contents", () => {
-	for (const s of ["결정", "이유", "바뀐 파일", "근거 위치", "남은 문제", "다음 행동", "원문"]) {
-		expect(CHECKPOINT_INSTRUCTIONS).toContain(s);
-	}
+test("the checkpoint instructions stay small: they ride on every mid-run compaction", () => {
+	expect(CHECKPOINT_INSTRUCTIONS.length).toBeLessThan(400);
 });
 
 describe("workingState", () => {
@@ -61,15 +34,15 @@ describe("workingState", () => {
 			run({
 				plan: {
 					lanes: [
-						{ name: "결제 API 탐색", kind: "explore", role: "explorer" },
-						{ name: "환불 경로 수정", kind: "code", role: "implementer" },
+						{ name: "explore the payment API", kind: "explore", role: "explorer" },
+						{ name: "fix the refund path", kind: "code", role: "implementer" },
 					],
 					workers: {},
 					submittedAt: "2026-11-21T00:00:00.000Z",
 				},
 				blockedEdits: 2,
 				blockedFollowUps: 1,
-				reads: { director: 9, duplicate: 3, blocked: 4 },
+				reads: { director: 9, directorChars: 9000, duplicateChars: 3000, blocked: 4 },
 			}),
 			[
 				agent({ cleanedAt: 5 }),
@@ -85,38 +58,40 @@ describe("workingState", () => {
 			],
 		);
 		const text = lines.join("\n");
-		expect(text).toContain("결제 모듈 리팩터");
-		expect(text).toContain("- 결제 API 탐색 (explore, explorer)");
-		expect(text).toContain("- 환불 경로 수정 (code, implementer)");
-		expect(text).toContain("에이전트 2개");
-		// Running agents come first.
-		expect(lines.findIndex(l => l.includes("agent://Rev"))).toBeLessThan(lines.findIndex(l => l.includes("agent://Impl")));
-		expect(text).toContain("agent://Rev — reviewer, 실행 중, 컨텍스트 12.3k 토큰");
-		expect(text).toMatch(/agent:\/\/Impl — implementer, 유휴, 컨텍스트 45\.0k 토큰, 기록 정리됨/);
+		expect(text).toContain(TASK);
+		// One line per lane, naming it.
+		expect(lines.filter(l => l.includes("explore the payment API") || l.includes("fix the refund path"))).toHaveLength(2);
+		// Only this run's agents, each with its handle; running agents come first.
+		const handles = lines.flatMap(l => /agent:\/\/(\w+) /.exec(l)?.[1] ?? []);
+		expect(handles).toEqual(["Rev", "Impl"]);
 		expect(text).not.toContain("Elsewhere");
-		expect(text).toContain("리뷰 2회: 통과 1, 실패 1; 지적 P0 0 · P1 2 · P2 1 · P3 0, 문서 지적 1");
-		expect(text).toContain("파일 수정 2, 후속 지시 1, 읽기 4");
+		expect(lines.find(l => l.includes("agent://Rev"))).toContain("12.3k");
+		// The cleaned agent's line says more than a live one's: it cannot take follow-ups.
+		const implLine = lines.find(l => l.includes("agent://Impl")) ?? "";
+		expect(implLine.split(", ").length).toBeGreaterThan((lines.find(l => l.includes("agent://Rev")) ?? "").split(", ").length);
+		// Review totals and block counts appear as numbers.
+		expect(lines.some(l => /2.*1.*1.*P0 0 · P1 2 · P2 1 · P3 0.*1/.test(l))).toBe(true);
+		expect(lines.at(-1)).toMatch(/2\D+1\D+4$/);
 	});
 
-	test("without a plan, agents or reviews it says so and still reports blocks", () => {
-		const text = workingState(run(), []).join("\n");
-		expect(text).toContain("계획: 아직 없음");
-		expect(text).toContain("에이전트: 없음");
-		expect(text).not.toContain("리뷰");
-		expect(text).toContain("파일 수정 0, 후속 지시 0, 읽기 0");
+	test("without a plan, agents or reviews it still reports the blocks, as zeros", () => {
+		const lines = workingState(run(), []);
+		expect(lines).toHaveLength(4);
+		expect(lines.join("\n")).not.toContain("agent://");
+		expect(lines.at(-1)).toMatch(/0\D+0\D+0$/);
 	});
 
 	test("stays bounded for many lanes and agents", () => {
-		const lanes = Array.from({ length: 50 }, (_, i) => ({ name: `레인 ${i} ${"x".repeat(200)}`, kind: "code" as const, role: "implementer" }));
+		const lanes = Array.from({ length: 50 }, (_, i) => ({ name: `lane ${i} ${"x".repeat(200)}`, kind: "code" as const, role: "implementer" }));
 		const agents = Array.from({ length: 200 }, (_, i) => agent({ id: `A${i}`, lastActivityAt: i, state: i % 2 ? "parked" : "idle" }));
 		const lines = workingState(run({ plan: { lanes, workers: {}, submittedAt: "x" } }), agents);
 		expect(lines.length).toBeLessThan(60);
 		expect(lines.every(l => l.length < 300)).toBe(true);
 		const text = lines.join("\n");
-		expect(text).toContain("에이전트 200개");
 		expect(text).toContain("agent://A199"); // most recent first
 		expect(text).not.toContain("agent://A0 ");
-		expect(text).toContain("- 외 30개");
-		expect(text).toMatch(/- 외 176개 \(유휴 \d+, 보관됨 \d+\)/);
+		// The cut lanes and agents are counted: 50 − 20 lanes, 200 − 24 agents.
+		expect(lines.some(l => /\b30\D/.test(l) && !l.includes("agent://"))).toBe(true);
+		expect(lines.some(l => /\b176\D/.test(l) && !l.includes("agent://"))).toBe(true);
 	});
 });
