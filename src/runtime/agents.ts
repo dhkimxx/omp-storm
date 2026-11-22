@@ -4,10 +4,13 @@
  * in the one map the parent reads.
  */
 import type { AgentEntry } from "../types.ts";
-import { tallyFromYield, verdictOf } from "./review.ts";
+import { reviewPart, tallyFromYield, type ReviewEvidenceEntry } from "./review.ts";
 
 /** Parked entries older than this are dropped when a new agent is added. */
 const PARKED_KEEP_MS = 24 * 3_600_000;
+
+/** Reviews kept per agent. A run is bounded by its rounds; the cap only keeps a pathological reviewer finite. */
+const REVIEW_LOG_MAX = 64;
 
 const agents = new Map<string, AgentEntry>();
 
@@ -19,7 +22,7 @@ function prune(now: number): void {
 
 /**
  * Makes an entry one of `runId`'s agents. A turn during a later run (a follow-up or a revive) counts there: its spend
- * and reads belong to that run, and the change and verdict fields start over. Already there: a no-op.
+ * and reads belong to that run, and the change, verdict and review evidence start over. Already there: a no-op.
  */
 export function noteAgentRun(id: string, runId: string): void {
 	const e = agents.get(id);
@@ -27,6 +30,11 @@ export function noteAgentRun(id: string, runId: string): void {
 	delete e.changes;
 	delete e.lastChangeAt;
 	delete e.lastVerdict;
+	delete e.lastWorkFailed;
+	// A review belongs to the run it was given in: its tally and structured evidence are proof for that run only.
+	delete e.review;
+	delete (e as ReviewEvidenceEntry).reviewLog;
+	delete (e as ReviewEvidenceEntry).reviewLogOverflow;
 	e.runId = runId;
 }
 
@@ -81,10 +89,14 @@ export function noteAgentFollowUp(id: string): void {
 	if (e) e.followUps++;
 }
 
-export function noteAgentEnd(input: { id: string; now: number; settled: boolean }): void {
+export function noteAgentEnd(input: { id: string; now: number; settled: boolean; failed?: boolean | undefined }): void {
 	const e = agents.get(input.id);
 	if (!e) return;
-	if (input.settled) e.state = "idle";
+	if (input.settled) {
+		e.state = "idle";
+		if (input.failed === true) e.lastWorkFailed = true;
+		else delete e.lastWorkFailed;
+	}
 	e.lastActivityAt = input.now;
 }
 
@@ -94,14 +106,40 @@ export function noteAgentParked(id: string): void {
 	if (e) e.state = "parked";
 }
 
-/** Folds a `yield` call's args into the agent's review tally (one review per verdict) and keeps its latest verdict; input that is no review leaves it alone. */
+/**
+ * Folds a `yield` call's args into the agent's review tally (one review per verdict) and keeps its latest verdict and
+ * structured review evidence; input that is no review leaves it alone.
+ */
 export function noteAgentReview(id: string, input: unknown, now: number): void {
 	const e = agents.get(id);
 	if (!e) return;
 	const review = tallyFromYield(e.review, input);
 	if (review) e.review = review;
-	const correct = verdictOf(input);
-	if (correct !== undefined) e.lastVerdict = { at: now, correct };
+	const part = reviewPart(input);
+	if (!part) return;
+	const entry = e as ReviewEvidenceEntry;
+	const log = entry.reviewLog ?? [];
+	if (part.kind === "findings") {
+		// Provisional until a verdict: an unfinished review's P0 must still be able to block a pass. Consecutive
+		// findings belong to the same cycle, so keep one record and its first time.
+		const provisional = log.at(-1);
+		if (provisional && provisional.correct === undefined) provisional.findings.push(...part.findings);
+		else log.push({ at: now, findings: part.findings });
+	} else {
+		// Findings yielded before this verdict are this review's; the verdict's tree then binds them.
+		const carried = log.filter(record => record.correct === undefined).flatMap(record => record.findings);
+		const kept = log.filter(record => record.correct !== undefined);
+		kept.push({ at: now, correct: part.correct, findings: [...carried, ...part.findings] });
+		log.length = 0;
+		log.push(...kept);
+		e.lastVerdict = { at: now, correct: part.correct };
+	}
+	while (log.length > REVIEW_LOG_MAX) {
+		const dropped = log.shift();
+		// A dropped P0 is evidence the proof can no longer rule out: fail closed instead of forgetting it.
+		if (dropped?.findings.some(finding => finding.priority === 0)) entry.reviewLogOverflow = true;
+	}
+	entry.reviewLog = log;
 }
 
 /** Ties the tree a verdict was given against to that verdict; a later verdict keeps its own tree. */
@@ -109,6 +147,8 @@ export function noteVerdictTree(id: string, at: number, tree: string): void {
 	const e = agents.get(id);
 	if (!e || e.lastVerdict?.at !== at) return;
 	e.lastVerdict.tree = tree;
+	const record = (e as ReviewEvidenceEntry).reviewLog?.findLast(entry => entry.correct !== undefined && entry.at === at);
+	if (record) record.tree = tree;
 }
 
 /** One more successful file-changing tool result inside the agent; unknown ids are ignored. */

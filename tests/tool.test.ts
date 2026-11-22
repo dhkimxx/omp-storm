@@ -3,9 +3,9 @@ import * as zod from "@oh-my-pi/omptype/zod";
 import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
-import type { StormToolHost } from "../src/tool/host.ts";
+import type { RunRequestResult, StormToolHost } from "../src/tool/host.ts";
 import { createStormTool, runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
-import type { AgentEntry } from "../src/types.ts";
+import type { AgentEntry, RunPlan, RunSpec } from "../src/types.ts";
 import { fakeHost, NOW, STATUS_TEXT } from "./fake-host.ts";
 import { agentEntry as ledgerEntry } from "./fixtures.ts";
 import { TEAM as base } from "./support.ts";
@@ -168,5 +168,76 @@ describe("run", () => {
 		expect(f.runs).toEqual([]);
 		const g = fakeHost({ run: { ok: false, reason: "refusal-reason" } });
 		expect(await run(g, { action: "run", task: "x" })).toEqual({ outcome: "rejected", text: "refusal-reason" });
+	});
+});
+
+describe("automatic delegation", () => {
+	interface AutoStart {
+		spec: RunSpec;
+		plan: RunPlan;
+		hash: string | undefined;
+	}
+
+	function autoHost(opts: { task?: string; active?: boolean; start?: RunRequestResult } = {}) {
+		const f = fakeHost({ ...(opts.active !== undefined ? { runActive: opts.active } : {}) });
+		const starts: AutoStart[] = [];
+		const host: StormToolHost = {
+			...f.host,
+			auto: () => ({ enabled: true, ...(opts.task !== undefined ? { task: opts.task } : {}) }),
+			runtime: {
+				...f.host.runtime,
+				runActive: () => opts.active ?? false,
+				startWithPlan: async (spec: RunSpec, plan: RunPlan, hash?: string) => {
+					starts.push({ spec, plan, hash });
+					return opts.start ?? { ok: true, runId: "run-auto" };
+				},
+			},
+		};
+		return { f, host, starts };
+	}
+
+	test("run is refused: the first plan is the only way into a run", async () => {
+		const { f, host, starts } = autoHost({ task: "fix it" });
+		const r = await run({ host }, { action: "run", task: "fix it" });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("plan");
+		expect(f.runs).toEqual([]);
+		expect(starts).toEqual([]);
+	});
+
+	test("a plan opens the run with this turn's request and the validated plan already bound", async () => {
+		const { f, host, starts } = autoHost({ task: "  fix the login bug " });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		expect(r.outcome).toBe("ok");
+		expect(r.text).toContain("run-auto");
+		expect(starts).toHaveLength(1);
+		expect(starts[0]!.spec).toEqual({ task: "fix the login bug" });
+		expect(starts[0]!.hash).toMatch(/^jcs-sha256:/);
+		expect(starts[0]!.plan).toMatchObject({ lanes: [{ name: "core", kind: "code", role: "implementer" }], workers: { implementer: 1 } });
+		expect(f.plans).toEqual([]);
+	});
+
+	test("without a captured user request it refuses instead of writing a plan", async () => {
+		const { f, host, starts } = autoHost();
+		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("사용자 요청");
+		expect(starts).toEqual([]);
+		expect(f.plans).toEqual([]);
+	});
+
+	test("an automatic start refusal is passed back unchanged", async () => {
+		const { host, starts } = autoHost({ task: "fix it", start: { ok: false, reason: "team approval is stale" } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		expect(r).toEqual({ outcome: "rejected", text: "team approval is stale" });
+		expect(starts).toHaveLength(1);
+	});
+
+	test("an active run keeps the existing setRunPlan path, not a second start", async () => {
+		const { f, host, starts } = autoHost({ task: "fix it", active: true });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		expect(r.outcome).toBe("ok");
+		expect(f.plans).toHaveLength(1);
+		expect(starts).toEqual([]);
 	});
 });

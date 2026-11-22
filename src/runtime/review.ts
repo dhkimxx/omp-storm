@@ -27,18 +27,79 @@ interface Counts {
 	docs: number;
 }
 
+/** A priority the reviewer output schema allows. */
+export type ReviewPriority = 0 | 1 | 2 | 3;
+
+/** A kind the reviewer output schema allows; only doc kinds count as doc findings. */
+export type ReviewKind = "code" | "doc_conflict" | "doc_copy";
+
+/**
+ * A finding as the proof uses it: priority and kind only. The proof never keeps titles, bodies, command output or log
+ * text; those stay in the reviewer's own yield and record.
+ */
+export interface ReviewFinding {
+	priority: ReviewPriority;
+	kind?: ReviewKind;
+}
+
+/**
+ * One review event: a findings yield before a verdict, or a final verdict. A verdict's `tree` is the exact
+ * `<diff>:<files>` fingerprint Storm read when the verdict was given; without it the review is not proof.
+ */
+export interface ReviewEvidence {
+	/** ms since epoch of the yield. */
+	at: number;
+	/** Present only for a final verdict; absent for findings that have not ended in one. */
+	correct?: boolean;
+	findings: ReviewFinding[];
+	/** The exact tree the verdict was given against; absent when it could not be read then. */
+	tree?: string;
+}
+
+/**
+ * The runtime fields the ledger adds to an agent entry. These are the additive `src/types.ts` fields: `AgentEntry`
+ * gains `reviewLog?: ReviewEvidence[]` and `reviewLogOverflow?: true`.
+ */
+export interface ReviewEvidenceEntry extends AgentEntry {
+	reviewLog?: ReviewEvidence[];
+	/** A P0-bearing entry fell out of the bounded log: unresolved findings cannot be ruled out. */
+	reviewLogOverflow?: true;
+}
+
+/** The structured part of one `yield`: either findings before a verdict or the verdict itself. */
+export type ParsedReview =
+	| { kind: "findings"; findings: ReviewFinding[] }
+	| { kind: "verdict"; findings: ReviewFinding[]; correct: boolean };
+
+/** One structured finding, or undefined for an item the schema does not allow. */
+function findingOf(value: unknown): ReviewFinding | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const { priority: p, kind } = value as Finding;
+	if (typeof p !== "number" || !Number.isInteger(p) || p < 0 || p > 3) return undefined;
+	const finding: ReviewFinding = { priority: p as ReviewPriority };
+	if (kind === "code" || kind === "doc_conflict" || kind === "doc_copy") finding.kind = kind;
+	return finding;
+}
+
+/** Every valid finding in a single finding or a list of them; invalid items are not findings at all. */
+function findingsIn(list: unknown): ReviewFinding[] {
+	const out: ReviewFinding[] = [];
+	for (const value of Array.isArray(list) ? list : [list]) {
+		const finding = findingOf(value);
+		if (finding) out.push(finding);
+	}
+	return out;
+}
+
 /**
  * Counts findings with an integer priority 0..3 into `counts.findings`, and those of kind `doc_conflict` or
  * `doc_copy` also into `counts.docs`; returns how many counted.
  */
 function countFindings(counts: Counts, list: unknown): number {
 	let counted = 0;
-	for (const f of Array.isArray(list) ? list : [list]) {
-		if (typeof f !== "object" || f === null) continue;
-		const { priority: p, kind } = f as Finding;
-		if (typeof p !== "number" || !Number.isInteger(p) || p < 0 || p > 3) continue;
-		counts.findings[p as 0 | 1 | 2 | 3]++;
-		if (kind === "doc_conflict" || kind === "doc_copy") counts.docs++;
+	for (const finding of findingsIn(list)) {
+		counts.findings[finding.priority]++;
+		if (finding.kind === "doc_conflict" || finding.kind === "doc_copy") counts.docs++;
 		counted++;
 	}
 	return counted;
@@ -61,6 +122,23 @@ function verdictPayload(input: unknown): Verdict | undefined {
 /** Whether a `yield` input is a review verdict, and whether it passed; undefined for a findings section and other inputs. */
 export function verdictOf(input: unknown): boolean | undefined {
 	return verdictPayload(input)?.correct;
+}
+
+/**
+ * The structured review a `yield` carries: a findings section, or a final verdict with its payload findings.
+ * Undefined for unrelated input and for a findings section with no valid finding.
+ */
+export function reviewPart(input: unknown): ParsedReview | undefined {
+	if (typeof input !== "object" || input === null) return undefined;
+	const { data, type } = input as YieldArgs;
+	if (Array.isArray(type) && type.includes("findings")) {
+		const findings = findingsIn(data);
+		return findings.length === 0 ? undefined : { kind: "findings", findings };
+	}
+	const verdict = verdictPayload(input);
+	if (!verdict) return undefined;
+	const findings = Array.isArray(verdict.payload.findings) ? findingsIn(verdict.payload.findings) : [];
+	return { kind: "verdict", findings, correct: verdict.correct };
 }
 
 /** `base` with new finding counts; `docFindings` appears once a doc finding was counted. */
@@ -123,4 +201,50 @@ export function reviewLine(agents: readonly AgentEntry[]): string {
 	if (total.reviews === 0) return "- 리뷰: 없음";
 	const ps = total.findings.flatMap((n, i) => (n > 0 ? [`P${i} ${n}`] : []));
 	return `- 리뷰 ${total.reviews}회: 통과 ${total.passed} · 수정 필요 ${total.failed}${ps.length ? ` (${ps.join(" · ")})` : ""}${total.docFindings > 0 ? ` · 문서 상충 ${total.docFindings}건` : ""}`;
+}
+
+/** Bounds on evidence read from a record: a persisted or malformed array must not make the gate loop unbounded. */
+const REVIEW_EVIDENCE_MAX = 256;
+const REVIEW_FINDINGS_MAX = 1024;
+
+/** The review evidence an agent carries, validated; `complete: false` means no pass can be proven from it. */
+export interface ReviewLedger {
+	records: ReviewEvidence[];
+	/** False when the field is malformed or a P0-bearing entry was dropped from the bounded log. */
+	complete: boolean;
+}
+
+/**
+ * The structured review history the ledger keeps on an agent, oldest first. An absent field is a record written
+ * before the structured proof existed: readable, but it cannot clear a P0 or stand in for live evidence.
+ */
+export function reviewEvidenceOf(agent: AgentEntry): ReviewLedger {
+	const entry = agent as ReviewEvidenceEntry;
+	if (entry.reviewLogOverflow === true) return { records: [], complete: false };
+	const raw = entry.reviewLog;
+	if (raw === undefined) return { records: [], complete: true };
+	if (!Array.isArray(raw) || raw.length > REVIEW_EVIDENCE_MAX) return { records: [], complete: false };
+	const records: ReviewEvidence[] = [];
+	for (const value of raw) {
+		if (typeof value !== "object" || value === null) return { records: [], complete: false };
+		const { at, correct, findings, tree } = value as ReviewEvidence;
+		if (typeof at !== "number" || !Number.isFinite(at)) return { records: [], complete: false };
+		if (correct !== undefined && typeof correct !== "boolean") return { records: [], complete: false };
+		if (tree !== undefined && (typeof tree !== "string" || tree === "")) return { records: [], complete: false };
+		if (!Array.isArray(findings) || findings.length > REVIEW_FINDINGS_MAX) return { records: [], complete: false };
+		const parsed: ReviewFinding[] = [];
+		for (const item of findings) {
+			const finding = findingOf(item);
+			// A malformed stored finding is not silently dropped: the log is not proof then.
+			if (!finding) return { records: [], complete: false };
+			parsed.push(finding);
+		}
+		records.push({
+			at,
+			findings: parsed,
+			...(correct !== undefined ? { correct } : {}),
+			...(tree !== undefined ? { tree } : {}),
+		});
+	}
+	return { records, complete: true };
 }

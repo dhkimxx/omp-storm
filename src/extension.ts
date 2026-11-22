@@ -7,7 +7,8 @@
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
 import { loadConfig } from "./config/store.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
@@ -16,6 +17,7 @@ import { readExplicitSettings } from "./discovery/settings.ts";
 import {
 	agentsFlow,
 	approveAndSave,
+	autoDelegationFlow,
 	type FlowEnv,
 	hubFlow,
 	modelsFlow,
@@ -31,7 +33,8 @@ import { changesFiles, pathOf } from "./policy/director.ts";
 import { docPromptFor } from "./policy/docs.ts";
 import { deliveredFollowUp, followUpAgent } from "./policy/followup.ts";
 import { directorRead, noteChildRead } from "./policy/reads.ts";
-import { activeAgents, blockedSpawn, blockText, deadline, decideSpawn, failClosed, SPAWN_DECISION_MS } from "./policy/spawn.ts";
+import { activeAgents, blockedSpawn, blockText, deadline, decideSpawn, failClosed, SPAWN_DECISION_MS, usableRole } from "./policy/spawn.ts";
+import { supervisorToolBlock } from "./policy/supervisor.ts";
 import { decideToolCall } from "./policy/toolcall.ts";
 import { directorCap, PACKAGE_JSON, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import {
@@ -48,22 +51,32 @@ import {
 } from "./runtime/agents.ts";
 import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
-import { activeLedgerRun, anyLedgerRun, recordCost } from "./runtime/ledger.ts";
+import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
-import { lastRun } from "./runtime/run.ts";
-import { resumeCandidate } from "./runtime/resume.ts";
-import { treeAgainst } from "./runtime/tree.ts";
+import { findResumeCandidate } from "./runtime/resume.ts";
+import { treeAgainst, type TreeReading } from "./runtime/tree.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
 import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
-import type { ConfigLoad, ExplicitSettings, RepoIdentity, RunRecord, RunSpec, UiPort } from "./types.ts";
+import type {
+	ConfigLoad,
+	ExplicitSettings,
+	Exec,
+	RepoIdentity,
+	RunPlan,
+	RunRecord,
+	RunSpec,
+	SpawnDecision,
+	StormConfig,
+	UiPort,
+} from "./types.ts";
 import { createUiPort, registerReportRenderer } from "./ui.ts";
 import { LiveStatus } from "./view/live.ts";
 import { runStatusText } from "./view/render.ts";
@@ -78,15 +91,185 @@ const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 const SHORTCUTS = [
 	{ value: "status", label: "status", description: "현황만 보기(메뉴 없음)" },
 	{ value: "models", label: "models", description: "모델 점검" },
+	{ value: "auto", label: "auto", description: "자동 위임 켜기/끄기(이 프로필·저장소)" },
 	{ value: "setup", label: "setup", description: "팀 다시 설정" },
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
 const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.value);
 const CONFIG_TTL_MS = 5_000;
 
+/** The session's personal automatic-delegation policy, refreshed from the approval store. */
+interface AutoStatus {
+	/** The consent file said enabled at the last successful read; a later failure keeps this value. */
+	enabled: boolean;
+	/** Why an automatic run cannot start now: team config/approval or an omp session mode. */
+	problem: string | undefined;
+}
+
+/**
+ * The stable automatic-delegation instruction appended to the director's system prompt. It carries no live state,
+ * so it does not invalidate the prompt cache between turns; refusals carry the exact fix when a call is blocked.
+ */
+const AUTO_INSTRUCTION = `<storm-auto>
+This session delegates project work automatically.
+- General conversation needs no tools: answer directly.
+- Keep the scope tiny: one lane and one worker for a quick mechanical edit or a read-only lookup. When the request is uncertain, submit an explore-only plan first instead of guessing implementation lanes.
+- Any repository inspection, verification, or file change belongs to the approved Storm team. First submit a plan with the \`storm\` tool (action "plan"); it opens a run for this turn's user request. Then spawn the plan's approved workers with \`task\`.
+- You own replanning: change the plan only when cross-lane evidence changes an assumption. Name each task item after its planned lane so the worker can be matched to it.
+- Do not call read, grep, glob, bash, edit, ast_edit, eval, or any other file, shell, or unknown tool yourself; for \`write\`, only the two forms below are allowed. Do not spawn an agent before the plan opens the run. Storm blocks those calls.
+- Direct writes are limited to \`write local://<name>.md\` notes and \`write agent://<id>\` messages; read worker results with \`read agent://<id>\` and bounded line ranges.
+- Follow up on the same worker with \`write agent://<id>\`; when Storm blocks it, start a fresh worker that reads \`agent://<id>\`.
+- Keep each worker result to about 1500 characters with evidence locations and links; do not paste raw logs. Send those ranges to workers or the reviewer; do not read repository files yourself.
+- When you need the user, use the native \`ask\` tool within this turn; never end by pretending no lane was work.
+- Spawn only the plan's approved roles and worker counts; Storm refuses anything outside the plan.
+- When the team has a reviewer, the run ends verified only after that reviewer accepts the tree as it is after the last change.
+- A refusal names the fix (usually /storm). Relay it to the user; never work around it with a direct tool.
+- Keep going until the plan's lanes are done or blocked.
+</storm-auto>`;
+
+/** Said when an automatic session tries to spawn outside the run its plan opens. */
+const AUTO_SPAWN_REASON =
+	"실행이 없는 동안에는 작업을 직접 스폰할 수 없습니다. 이번 사용자 요청의 계획을 storm plan으로 먼저 내세요.";
+
+/** The team config/approval side of why automatic delegation cannot run now. */
+function teamProblem(state: ProjectState): string | undefined {
+	if (state.config.status === "missing") return "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.";
+	if (state.config.status === "invalid") return "팀 설정에 오류가 있습니다. /storm 으로 확인하고 고치세요.";
+	if (!isApproved(state)) return "팀 설정이 승인되지 않았거나 승인 뒤에 바뀌었습니다. /storm 에서 확인하고 승인하세요.";
+	return undefined;
+}
+
+/** The omp session-mode side of why automatic delegation cannot run now (absent in non-interactive hosts). */
+function modeProblem(ctx: ExtensionContext): string | undefined {
+	const modes = ctx.sessionModes;
+	if (!modes) return undefined;
+	let state: SessionModeState;
+	try {
+		state = modes.getState();
+	} catch {
+		return "omp 세션 모드를 확인하지 못했습니다. 모드를 확인한 뒤 다시 요청하세요.";
+	}
+	if (state.goal.status === "active") {
+		return "omp 목표 모드가 켜져 있어 자동 실행을 열 수 없습니다. 목표를 끝내거나 일시 정지한 뒤 다시 요청하세요.";
+	}
+	if (state.loop.status !== "inactive") return "omp 반복 모드가 켜져 있어 자동 실행을 열 수 없습니다. 반복을 끈 뒤 다시 요청하세요.";
+	if (state.plan.status === "active") return "omp 계획 모드가 켜져 있어 자동 실행을 열지 않습니다. 계획 모드를 끝낸 뒤 다시 요청하세요.";
+	if (state.vibe.status === "active") return "omp vibe 모드에서는 Storm 팀을 쓸 수 없습니다. vibe 모드를 끈 뒤 다시 요청하세요.";
+	return undefined;
+}
+
+/** What a blocked direct call tells the model: why it is blocked, the one way forward, and the tool's own rule. */
+function autoRefusal(problem: string | undefined, detail: string | undefined): string {
+	const reason = problem === undefined ? "" : ` ${problem}`;
+	const rule = detail === undefined ? "" : ` ${detail}`;
+	return `[storm:auto] 자동 위임이 켜져 있어 메인 세션이 프로젝트 도구를 직접 쓰지 않습니다.${reason} 작업은 storm plan으로 이번 사용자 요청의 실행을 연 뒤 승인된 팀에 맡기세요.${rule}`;
+}
+
+/** The same refusal during an active automatic run: the run is already open, so the work belongs to its workers. */
+function autoRunRefusal(detail: string | undefined): string {
+	const rule = detail === undefined ? "" : ` ${detail}`;
+	return `[storm:auto] 자동 위임 실행 중이라 메인 세션은 프로젝트 도구를 직접 쓰지 않습니다. 필요한 작업은 계획 범위의 승인된 팀 워커에 맡기고, 결과는 read agent://<id>로 확인하세요.${rule}`;
+}
+
+/**
+ * The host's terminal stop reason for a settled child turn: error, abort and output length are failures; stop and
+ * tool use are not. No assistant message or no stop reason is unknown, never success.
+ */
+function terminalWorkFailed(messages: readonly unknown[] | undefined): boolean | undefined {
+	if (!Array.isArray(messages)) return undefined;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (typeof message !== "object" || message === null || !("role" in message) || message.role !== "assistant") continue;
+		if (!("stopReason" in message) || typeof message.stopReason !== "string") return undefined;
+		const reason = message.stopReason;
+		return reason === "error" || reason === "aborted" || reason === "length";
+	}
+	return undefined;
+}
+
+/** The host artifact root shared by a parent session and its task children, isolated worktrees included. */
+function artifactsOf(ctx: ExtensionContext): string | undefined {
+	return ctx.sessionManager.getArtifactsDir() ?? undefined;
+}
+
+/** A subagent's run, only through the binding its parent recorded before the spawn was admitted. */
+function childLedger(ctx: ExtensionContext): LedgerRun | undefined {
+	return ledgerRunForChild(ctx.agent.id, ctx.agent.parentId, artifactsOf(ctx));
+}
+
+/** The approved reviewer agent of a run's team; a disabled or modelless reviewer is not authority. */
+function approvedReviewer(config: StormConfig | undefined): string | undefined {
+	return config === undefined ? undefined : usableRole(config, "reviewer")?.agent;
+}
+
+interface ReviewerBaseline {
+	runId: string;
+	root: string;
+	base: string;
+	tree: string;
+}
+
+/** Reviewer starts per child session, keyed by the artifact root and the id its parent admitted. */
+const reviewerBaselines = new Map<string, ReviewerBaseline>();
+/** A snapshot that outlasts this is no snapshot: the proof must not wait on a hung git read. */
+const REVIEW_SNAPSHOT_MS = 12_000;
+
+function reviewerBaselineKey(artifacts: string | undefined, id: string): string {
+	return `${artifacts ?? ""}\0${id}`;
+}
+
+function fingerprintOf(reading: TreeReading): string {
+	return `${reading.state.diff}:${reading.state.files}`;
+}
+
+/** A tree read bounded by a timer, so a reviewer's first turn or verdict cannot hang on git. */
+async function boundedTree(exec: Exec, root: string, base?: string): Promise<TreeReading | undefined> {
+	const timeout = Promise.withResolvers<undefined>();
+	const handle = setTimeout(() => timeout.resolve(undefined), REVIEW_SNAPSHOT_MS);
+	handle.unref?.();
+	try {
+		const reading = await Promise.race([treeAgainst(exec, root, base), timeout.promise]);
+		return reading;
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(handle);
+	}
+}
+
+/** Records the run's main tree when reviewer work starts; an unreadable tree removes any older baseline. */
+async function recordReviewerBaseline(exec: Exec, artifacts: string | undefined, id: string, run: LedgerRun): Promise<void> {
+	const key = reviewerBaselineKey(artifacts, id);
+	if (getLedgerRun(run.runId) !== run || run.closing) {
+		reviewerBaselines.delete(key);
+		return;
+	}
+	const reading = await boundedTree(exec, run.root, run.base);
+	if (!reading) {
+		reviewerBaselines.delete(key);
+		return;
+	}
+	reviewerBaselines.set(key, { runId: run.runId, root: run.root, base: reading.base, tree: fingerprintOf(reading) });
+}
+
+/**
+ * Binds a reviewer verdict only when the run is still the admitted one and its main tree is exactly the baseline read
+ * before reviewer work started. A mismatch, a disappeared run or an unreadable tree consumes the baseline without
+ * proof, so the gate cannot accept work the reviewer did not see.
+ */
+async function bindReviewerVerdict(exec: Exec, ctx: ExtensionContext, run: LedgerRun, at: number): Promise<void> {
+	const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
+	const baseline = reviewerBaselines.get(key);
+	if (!baseline || baseline.runId !== run.runId) return;
+	reviewerBaselines.delete(key);
+	const current = getLedgerRun(baseline.runId);
+	if (!current || current.closing || current.root !== baseline.root) return;
+	const fresh = await boundedTree(exec, baseline.root, baseline.base);
+	if (!fresh || fingerprintOf(fresh) !== baseline.tree) return;
+	noteVerdictTree(ctx.agent.id, at, baseline.tree);
+}
+
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
-/** Repos already resolved, for code that must not wait (recording a spawn decision that timed out). */
-const resolvedRepos = new Map<string, RepoIdentity>();
 const configByRoot = new Map<string, { at: number; load: Promise<ConfigLoad> }>();
 
 function cachedConfig(root: string): Promise<ConfigLoad> {
@@ -136,10 +319,11 @@ function newerVersion(): string | undefined {
 }
 
 /** The idle label. A resumable last run is worth a hint only for a team that may actually run. */
-function statusLabel(state: ProjectState, resumable: boolean): string | undefined {
-	if (state.config.status === "missing") return undefined;
+function statusLabel(state: ProjectState, resumable: boolean, auto: AutoStatus): string | undefined {
+	if (state.config.status === "missing") return auto.enabled ? "storm: 설정 없음 · 자동 위임 막힘" : undefined;
 	const base = state.config.status === "invalid" ? "storm: 설정 오류" : state.approval ? "storm ✓" : "storm: 승인 필요";
 	const parts = [base];
+	if (auto.enabled) parts.push(auto.problem === undefined ? "자동 위임" : "자동 위임 막힘");
 	if (resumable && isApproved(state)) parts.push("이어 갈 실행 있음");
 	const newer = newerVersion();
 	if (newer) parts.push(`새 버전 ${newer} → /restart`);
@@ -161,44 +345,46 @@ export default function storm(pi: ExtensionAPI): void {
 		agentDir: pi.pi.getAgentDir(),
 		pluginAgentsDir: PLUGIN_AGENTS_DIR,
 	});
+	/** A subagent in an isolated worktree still runs under the main worktree's approved config. */
+	const runEnv = (ctx: ExtensionContext, root: string): ProjectEnv => ({ ...projectEnv(ctx), cwd: root });
+	/**
+	 * This session's personal automatic-delegation policy. Consent is loaded at session start and refreshed on a
+	 * user turn, a session switch and every command; a failed refresh keeps the last enabled guard rather than
+	 * unfencing direct tools. The request text is the host's already-normalized prompt for this turn.
+	 */
+	const auto: AutoStatus & { task: string | undefined } = { enabled: false, problem: undefined, task: undefined };
+	const refreshAuto = async (ctx: ExtensionContext, load?: () => Promise<ProjectState>): Promise<void> => {
+		let state: ProjectState;
+		try {
+			state = await (load ? load() : loadProjectState(projectEnv(ctx)));
+		} catch {
+			// A failed load cannot prove the user withdrew consent: keep the last enabled guard.
+			if (auto.enabled) auto.problem = "팀 설정을 확인하지 못했습니다. /storm 으로 확인하세요.";
+			return;
+		}
+		auto.problem = teamProblem(state) ?? modeProblem(ctx);
+		try {
+			auto.enabled = await readAutoDelegation(state.store.dir);
+		} catch {
+			// An unreadable consent file is not an opt-out. Keep the last enabled guard.
+		}
+	};
 	const repoFor = (ctx: ExtensionContext): Promise<RepoIdentity> => {
 		const hit = repoByCwd.get(ctx.cwd);
 		if (hit) return hit;
 		const repo = resolveRepo(ctx.cwd, exec);
 		repoByCwd.set(ctx.cwd, repo);
-		repo.then(
-			identity => resolvedRepos.set(ctx.cwd, identity),
-			() => repoByCwd.delete(ctx.cwd),
-		);
+		repo.catch(() => repoByCwd.delete(ctx.cwd));
 		return repo;
 	};
 
 	/** Read on every use: these settings may change during a session, and only status and setup ask. */
 	const ompSettings = (): Promise<ExplicitSettings> => readExplicitSettings(exec, ompBinary());
-	/** Rewrites the project's active run record soon: the live record is what survives a crash. */
-	const touchActiveRun = async (ctx: ExtensionContext): Promise<void> => {
-		const run = activeLedgerRun((await repoFor(ctx)).repoId);
-		if (run) touchRun(run.runId);
-	};
-	/**
-	 * The project's active run, when its repo is already resolved: a subagent's tool events must not wait on a git
-	 * lookup (and one that times out would block the call). The start of a run records the repo.
-	 */
-	const activeLedgerFor = (ctx: ExtensionContext) => {
-		const repo = resolvedRepos.get(ctx.cwd);
-		return repo && activeLedgerRun(repo.repoId);
-	};
-	const activeRunFor = (ctx: ExtensionContext): string | undefined => activeLedgerFor(ctx)?.runId;
 
 	const runs = new RunController({
 		pi,
 		ui: ctx => createUiPort(pi, ctx),
-		loadState: async ctx => {
-			const state = await loadProjectState(projectEnv(ctx));
-			// Every run starts through here, so a session that directs one has its repo known without waiting.
-			resolvedRepos.set(ctx.cwd, state.repo);
-			return state;
-		},
+		loadState: async ctx => loadProjectState(projectEnv(ctx)),
 		now: Date.now,
 		agents: runId => listAgents({ runId }),
 		tree: (root, base) => treeAgainst(exec, root, base),
@@ -270,9 +456,29 @@ export default function storm(pi: ExtensionAPI): void {
 			prepare,
 			approveAndSave: save,
 			statusText: opts => statusText(flowEnv(ctx), opts),
+			auto: () => ({
+				enabled: auto.enabled,
+				...(auto.problem !== undefined ? { blocked: auto.problem } : {}),
+				...(auto.task !== undefined ? { task: auto.task } : {}),
+			}),
 			runtime: {
 				requestRun: spec => runs.request(spec),
 				setRunPlan: plan => runs.setPlan(plan),
+				runActive: () => runs.runId() !== undefined,
+				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) => {
+					// Public plan mode means the user is still planning; an automatic run may not start there.
+					const modes = ctx.sessionModes;
+					if (modes !== undefined) {
+						try {
+							if (modes.getState().plan.status === "active") {
+								return { ok: false, reason: "omp 계획 모드가 켜져 있어 자동 실행을 열지 않았습니다. 계획 모드를 끝낸 뒤 다시 요청하세요." };
+							}
+						} catch {
+							return { ok: false, reason: "omp 계획 모드를 확인하지 못해 자동 실행을 열지 않았습니다. 다시 요청하세요." };
+						}
+					}
+					return runs.startWithPlan(ctx, spec, plan, validatedHash);
+				},
 				agents: () => listAgents({ ancestorId: ctx.agent.id }),
 			},
 		};
@@ -288,6 +494,7 @@ export default function storm(pi: ExtensionAPI): void {
 		const turn = ctx.runEphemeralTurn;
 		if (!turn) return undefined;
 		return async promptText => {
+			const runId = runs.runId();
 			const result = await turn.call(ctx, {
 				promptText,
 				// The side turn bypasses run preflight and replays the live context. Bound the input before inference,
@@ -297,20 +504,15 @@ export default function storm(pi: ExtensionAPI): void {
 				dedupeReply: false,
 				minimizeEffort: true,
 				purpose: "storm",
-				...(runs.runId() === undefined
+				...(runId === undefined
 					? {}
 					: {
 							onUsage: message => {
 								const usage = assistantUsage(message);
 								if (!usage || usage.usd <= 0) return;
-								runs.noteMainSpend(usage.usd);
-								void repoFor(ctx).then(
-									repo => {
-										const run = recordCost(repo.repoId, usage.selector, usage.usd);
-										if (run) touchRun(run.runId);
-									},
-									() => undefined,
-								);
+								if (runs.runId() === runId) runs.noteMainSpend(usage.usd);
+								const run = recordCost(runId, usage.selector, usage.usd);
+								if (run) touchRun(run.runId);
 							},
 						}),
 			});
@@ -321,16 +523,60 @@ export default function storm(pi: ExtensionAPI): void {
 	// A decision that fails or outlasts omp's handler budget blocks storm-* agents and any agent during a run: omp
 	// would otherwise run the spawn on its own model, unrecorded and uncounted.
 	pi.on("before_subagent_spawn", (event, ctx) => {
+		// Automatic delegation never lets the main session spawn its way around the plan: before the first plan
+		// opens a run, every spawn is refused. This is checked before any state read, so it also holds when the
+		// team config or approval cannot be read; subagent sessions are not fenced by this session's policy.
+		if (ctx.agent.kind === "main" && auto.enabled && runs.runId() === undefined) {
+			return { block: true, reason: autoRefusal(auto.problem, AUTO_SPAWN_REASON) };
+		}
 		const limit = deadline(SPAWN_DECISION_MS);
-		const decide = async () => {
-			// Outside a Storm run only storm-* agents are Storm's business.
-			if (!event.agent.startsWith(ROLE_AGENT_PREFIX) && !activeLedgerRun((await repoFor(ctx)).repoId)) return undefined;
-			const state = await stateCache.get(projectEnv(ctx));
+		let timedOut = false;
+		void limit.expired.catch(() => {
+			timedOut = true;
+		});
+		const artifacts = artifactsOf(ctx);
+		// The admitted run is fixed for this spawn: a later start in the same tree must not receive its record.
+		const captured = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
+		const capturedRunId = captured?.runId;
+		// A child that once worked in a run but has no current binding is scope-uncertain: its nested spawn must not
+		// attach to whatever run happens to be active in the same tree.
+		if (ctx.agent.kind === "sub" && captured === undefined && listAgents().some(agent => agent.id === ctx.agent.id && agent.runId !== undefined)) {
+			return {
+				block: true,
+				reason: blockText({ code: "internal", reason: "이 서브에이전트의 실행 소속을 확인하지 못해 새 스폰을 막았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." }),
+			};
+		}
+		const closed = (): SpawnDecision => ({
+			block: true,
+			reason: blockText({ code: "internal", reason: "Storm 실행 원장이 끝났거나 닫혀 이 스폰을 허용하지 않았습니다. 실행 상태를 다시 확인하세요." }),
+		});
+		const ledgerBlock = (reason: string, run: LedgerRun, now: number): SpawnDecision => {
+			const block = { code: "internal" as const, reason };
+			if (getLedgerRun(run.runId) === run) noteRunSpawn(run.runId, blockedSpawn(event, block, now));
+			return { block: true, reason: blockText(block) };
+		};
+		// A controller run whose ledger disappeared is a scope we cannot admit into.
+		if (ctx.agent.kind === "main" && runs.runId() !== undefined && captured === undefined) return closed();
+		const decide = async (): Promise<SpawnDecision> => {
+			// Recheck the captured run rather than a repo or cwd match; a close or a new run is not this spawn's owner.
+			const run = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
+			if (capturedRunId !== undefined && (run === undefined || run.closing)) return closed();
+			if (ctx.agent.kind === "main" && auto.enabled && runs.runId() === undefined) {
+				return { block: true, reason: autoRefusal(auto.problem, AUTO_SPAWN_REASON) };
+			}
+			// Outside a run only storm-* agents are Storm's business.
+			if (!event.agent.startsWith(ROLE_AGENT_PREFIX) && capturedRunId === undefined) return undefined;
+			// An isolated child still routes by the main worktree's approved team.
+			const state = await stateCache.get(run ? runEnv(ctx, run.root) : projectEnv(ctx));
+			if (timedOut) return closed();
+			if (run !== undefined && state.repo.root !== run.root) return closed();
 			const root = state.repo.root;
 			// One decision at a time per project, so parallel spawns never read the same trial counters or live counts.
 			return serialized(`spawn:${root}`, async () => {
+				if (timedOut) return closed();
 				const now = Date.now();
-				const run = activeLedgerRun(state.repo.repoId);
+				const current = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
+				if (capturedRunId !== undefined && (current === undefined || current.closing)) return closed();
 				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(root, now), readTrialStates(root)]);
 				const outcome = decideSpawn(
 					event,
@@ -339,41 +585,73 @@ export default function storm(pi: ExtensionAPI): void {
 						now,
 						quotaMarks,
 						trials,
-						// The plan and live counts come from the process-wide ledger, so nested sessions see the same run.
-						...(run
+						...(current
 							? {
 									run: {
-										runId: run.runId,
-										costUsd: run.costUsd,
-										...(run.budget ? { budget: run.budget } : {}),
-										...(run.plan ? { plan: run.plan } : {}),
-										active: activeAgents(runSpawns(run.runId), listAgents({ runId: run.runId }), now),
+										runId: current.runId,
+										costUsd: current.costUsd,
+										...(current.budget ? { budget: current.budget } : {}),
+										...(current.plan ? { plan: current.plan } : {}),
+										active: activeAgents(runSpawns(current.runId), listAgents({ runId: current.runId }), now),
 									},
 								}
 							: {}),
 					},
 				);
 				const record = outcome.record;
+				const allowed = outcome.decision === undefined || !("block" in outcome.decision);
+				if (timedOut) return closed();
+				if (!allowed) {
+					if (record?.trialId) {
+						const trialId = record.trialId;
+						const routed = record.outcome === "trial" ? 1 : 0;
+						if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId);
+						const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
+						// The decision stands even when the counter file cannot be written.
+						await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
+					}
+					if (record && current) noteRunSpawn(current.runId, record);
+					return outcome.decision;
+				}
+				if (timedOut) return closed();
+				if (current !== undefined) {
+					const config = state.config.status === "ok" ? state.config.config : undefined;
+					const plan = current.plan;
+					// The director's task call was rewritten to a reserved lane before the host allocated this spawn.
+					if (ctx.agent.kind === "main" && plan !== undefined && config !== undefined) {
+						if (record === undefined) {
+							if (auto.enabled) return ledgerBlock("스폰 기록을 만들지 못해 자동 위임 레인을 확인할 수 없습니다. 다시 스폰하세요.", current, now);
+						} else {
+							const lane = runs.runLanes()?.admit(record, auto.enabled ? undefined : { plan, config });
+							if (lane !== undefined) record.lane = lane;
+							else if (auto.enabled) return ledgerBlock("자동 위임에서 레인 배정을 확인하지 못해 스폰을 막았습니다. plan을 다시 제출하고 레인의 역할과 이름을 맞추세요.", current, now);
+						}
+					}
+					const spawnKey = event.spawnKey;
+					if (spawnKey === undefined) {
+						return ledgerBlock("호스트가 스폰 키를 주지 않아 자식 실행을 결속하지 못했습니다. 다시 스폰하세요.", current, now);
+					}
+					if (!bindLedgerChild(current.runId, spawnKey, ctx.agent.id, artifacts)) {
+						return ledgerBlock("자식 실행을 원장에 결속하지 못했습니다. 실행 상태를 확인한 뒤 다시 스폰하세요.", current, now);
+					}
+				}
+				if (timedOut) return closed();
 				if (record?.trialId) {
 					const trialId = record.trialId;
 					const routed = record.outcome === "trial" ? 1 : 0;
 					if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId);
 					const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
-					// The decision stands even when the counter file cannot be written.
-					await updateTrialState(root, trialId, current =>
-						markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now),
-					).catch(() => undefined);
+					await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
 				}
-				if (record && run) noteRunSpawn(run.runId, record);
+				if (record && current) noteRunSpawn(current.runId, record);
 				return outcome.decision;
 			});
 		};
-		return failClosed(event.agent, anyLedgerRun, decide, {
+		return failClosed(event.agent, () => capturedRunId !== undefined || auto.enabled || anyLedgerRun(), decide, {
 			expired: limit.expired,
 			onBlock: block => {
-				// Nothing is awaited here: the repo lookup may be what hung.
-				const repo = resolvedRepos.get(ctx.cwd);
-				const run = repo && activeLedgerRun(repo.repoId);
+				// Only the run captured at entry may receive the blocked record: never a fresh run in the same tree.
+				const run = getLedgerRun(capturedRunId);
 				if (run) noteRunSpawn(run.runId, blockedSpawn(event, block, Date.now()));
 			},
 		}).finally(limit.cancel);
@@ -382,6 +660,8 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("message_end", async (event, ctx) => {
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
+		const ledger = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
+		if (ctx.agent.kind === "sub" && ledger) noteAgentRun(ctx.agent.id, ledger.runId);
 		if (ctx.agent.kind === "main" && usage.promptTokens > 0) runs.noteMainContext(usage.promptTokens);
 		if (ctx.agent.kind === "sub" && usage.promptTokens > 0) {
 			noteAgentUsage({
@@ -394,23 +674,45 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		if (usage.usd <= 0) return;
 		if (ctx.agent.kind === "main") runs.noteMainSpend(usage.usd);
-		const repo = await repoFor(ctx);
-		const run = recordCost(repo.repoId, usage.selector, usage.usd);
+		const run = ledger === undefined ? undefined : recordCost(ledger.runId, usage.selector, usage.usd);
 		if (run) touchRun(run.runId);
 		// A trial's budget counts what the subagents routed to its candidate spend on that candidate.
 		if (ctx.agent.kind !== "sub") return;
-		const load = await cachedConfig(repo.root);
+		const repo = await repoFor(ctx);
+		const root = ledger?.root ?? repo.root;
+		const load = await cachedConfig(root);
 		const trialId = load.status === "ok" ? trialCharge(ctx.agent.id, usage.selector, load.config) : undefined;
 		if (trialId === undefined) return;
 		const trial = load.status === "ok" ? load.config.trials?.find(t => t.id === trialId) : undefined;
-		await updateTrialState(repo.root, trialId, current => markTrialStop(trial, { ...current, costUsd: current.costUsd + usage.usd }, Date.now()));
+		await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, costUsd: current.costUsd + usage.usd }, Date.now()));
 	});
 
 	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (ctx.agent.kind !== "sub") return undefined;
+		if (ctx.agent.kind === "main") {
+			// Only an ordinary prompt carries a user request. A revive has no prompt, and Storm's own run messages
+			// are generated continuations: neither may capture or replace the task a plan opens.
+			if (event.reason !== "prompt") return undefined;
+			const prompt = typeof event.prompt === "string" ? event.prompt : "";
+			if (prompt.trim() === "") {
+				// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
+				if (runs.runId() === undefined) auto.task = undefined;
+				return undefined;
+			}
+			const runMessage = prompt.trimStart().startsWith("<storm-run ");
+			if (!runMessage) {
+				// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
+				// reminders and steers must not replace it; a prompt while this session directs is run context.
+				if (runs.runId() === undefined && auto.task === undefined) auto.task = prompt;
+				await refreshAuto(ctx, () => stateCache.get(projectEnv(ctx)));
+			}
+			if (!auto.enabled || event.systemPrompt.includes(AUTO_INSTRUCTION)) return undefined;
+			// Append only: the prompt itself is the host's, and this block is stable between turns.
+			return { systemPrompt: [...event.systemPrompt, AUTO_INSTRUCTION] };
+		}
 		const { id, name, parentId } = ctx.agent;
-		const runId = activeLedgerRun((await repoFor(ctx)).repoId)?.runId;
+		const ledger = childLedger(ctx);
+		const runId = ledger?.runId;
 		noteAgentStart({
 			id,
 			name,
@@ -420,33 +722,80 @@ export default function storm(pi: ExtensionAPI): void {
 			now: Date.now(),
 		});
 		if (runId) touchRun(runId);
+		const roleChild = name.startsWith(ROLE_AGENT_PREFIX);
+		// Outside a run, only Storm roles need the team (docs); a child in a run may also be the approved reviewer.
+		if (!ledger && !roleChild) return undefined;
+		// An isolated child still reads the main worktree's approved team for docs and reviewer identity.
+		const state = await stateCache.get(ledger ? runEnv(ctx, ledger.root) : projectEnv(ctx));
+		const approvedConfig = state.config.status === "ok" && isApproved(state) ? state.config.config : undefined;
+		if (ledger && name === approvedReviewer(approvedConfig)) {
+			// Snapshot before the reviewer's first provider request, so a later tree change cannot inherit its verdict.
+			await recordReviewerBaseline(exec, artifactsOf(ctx), id, ledger);
+		}
 		// Doc rules ride on a Storm role's system prompt (first turn and revive) while the team keeps docs on.
-		if (!name.startsWith(ROLE_AGENT_PREFIX)) return undefined;
-		const state = await stateCache.get(projectEnv(ctx));
+		if (!roleChild) return undefined;
 		const section = state.config.status === "ok" ? docPromptFor(name, state.config.config) : undefined;
 		return section && !event.systemPrompt.includes(section) ? { systemPrompt: [...event.systemPrompt, section] } : undefined;
 	});
 
 	// Director mode: blocking the call instead of swapping the tool list keeps the main session's prompt cache intact.
-	pi.on("tool_call", (event, ctx) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
-			// A subagent's reads are indexed under the run it is working in; a reused live agent has no before_agent_start.
+			// A subagent's reads are indexed under the run its parent admitted; no cwd or repo match is trusted.
 			if (event.toolName !== "read") return undefined;
-			const runId = activeRunFor(ctx);
-			if (runId !== undefined) noteAgentRun(ctx.agent.id, runId);
-			const readRun = runId ?? listAgents().find(agent => agent.id === ctx.agent.id)?.runId;
-			if (readRun) noteChildRead(readRun, ctx.agent.id, pathOf(event.input), ctx.cwd);
+			const ledger = childLedger(ctx);
+			if (!ledger) return undefined;
+			const runId = ledger.runId;
+			noteAgentRun(ctx.agent.id, runId);
+			noteChildRead(runId, ctx.agent.id, pathOf(event.input), ctx.cwd);
 			return undefined;
 		}
 		const runId = runs.runId();
+		if (runId === undefined) {
+			// Automatic delegation: the main session may orchestrate and inspect worker results, but every repository
+			// tool and every direct spawn is refused until the first plan opens this turn's run.
+			if (!auto.enabled || event.toolName === "storm") return undefined;
+			const detail =
+				event.toolName === "task" ? AUTO_SPAWN_REASON : supervisorToolBlock(event.toolName, event.input);
+			if (detail === undefined) return undefined;
+			return { block: true, reason: autoRefusal(auto.problem, detail) };
+		}
+		// Automatic delegation keeps the strict supervisor gate during the run too: bash, eval, unknown tools and
+		// every repository file read stay refused, while task and published worker results remain reachable. The
+		// legacy director checks (follow-up caps, wide re-reads, edits) still run after this narrower gate.
+		if (auto.enabled) {
+			const strict = supervisorToolBlock(event.toolName, event.input);
+			if (strict !== undefined) return { block: true, reason: autoRunRefusal(strict) };
+		}
 		const config = runs.runConfig();
-		if (!runId || !config) return undefined;
+		if (!config) return undefined;
 		const block = decideToolCall({ toolName: event.toolName, input: event.input, cwd: ctx.cwd, runId, config, agents: listAgents() });
-		if (!block) return undefined;
-		if (block.code === "director-edit") runs.noteBlockedEdit();
-		else if (block.code === "read-large") runs.noteBlockedRead();
-		else runs.noteBlockedFollowUp();
-		return { block: true, reason: blockText(block) };
+		if (block) {
+			if (block.code === "director-edit") runs.noteBlockedEdit();
+			else if (block.code === "read-large") runs.noteBlockedRead();
+			else runs.noteBlockedFollowUp();
+			return { block: true, reason: blockText(block) };
+		}
+		// Automatic delegation binds each task to a lane before the host allocates its spawn id, so the admitted
+		// spawn can prove which lane it finished. Ambiguous or unbounded task shapes are refused, never guessed.
+		if (auto.enabled && event.toolName === "task") {
+			const plan = getLedgerRun(runId)?.plan ?? runs.active()?.plan;
+			const lanes = runs.runLanes();
+			if (plan === undefined || lanes === undefined) {
+				return { block: true, reason: "[storm:auto] 계획이나 레인 배정을 확인하지 못해 task를 막았습니다. plan을 다시 제출하세요." };
+			}
+			const assigned = lanes.assign(event.input, plan, config);
+			if (!assigned.ok) return { block: true, reason: `[storm:auto] ${assigned.reason}` };
+			return { input: assigned.input };
+		}
+		// A follow-up to a reused reviewer starts new work: take its tree baseline before the write executes.
+		const followTarget = deliveredFollowUp(event.toolName, event.input, false);
+		const followAgent = followTarget === undefined ? undefined : followUpAgent(listAgents(), followTarget);
+		if (followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
+			const run = getLedgerRun(runId);
+			if (run !== undefined) await recordReviewerBaseline(exec, artifactsOf(ctx), followAgent.id, run);
+		}
+		return undefined;
 	});
 
 	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run.
@@ -455,24 +804,17 @@ export default function storm(pi: ExtensionAPI): void {
 		return run ? { context: workingState(run, listAgents()) } : undefined;
 	});
 
-	pi.on("tool_result", (event, ctx) => {
+	pi.on("tool_result", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
-			// omp emits no before_agent_start for a follow-up to a live idle agent, so the run it works in is taken here.
-			const ledger = activeLedgerFor(ctx);
-			const runId = ledger?.runId;
-			if (runId !== undefined) noteAgentRun(ctx.agent.id, runId);
+			// The parent admitted this id before the spawn returned: no cwd or repo match is trusted here.
+			const ledger = childLedger(ctx);
+			if (ledger) noteAgentRun(ctx.agent.id, ledger.runId);
 			// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
 			const now = Date.now();
 			if (event.toolName === "yield" && !event.isError) {
 				noteAgentReview(ctx.agent.id, event.input, now);
-				// The verdict is about the run's main tree, seen against the run's start commit, not the subagent's own cwd.
-				if (ledger !== undefined && verdictOf(event.input) !== undefined) {
-					void treeAgainst(exec, ledger.root, ledger.base)
-						.then(reading => {
-							if (reading) noteVerdictTree(ctx.agent.id, now, `${reading.state.diff}:${reading.state.files}`);
-						})
-						.catch(() => undefined);
-				}
+				// Await the bounded snapshot before the turn can settle: the gate never reads a tree this verdict forgot.
+				if (ledger !== undefined && verdictOf(event.input) !== undefined) await bindReviewerVerdict(exec, ctx, ledger, now);
 			}
 			// The review gate reads what the team changed; a file-changing call that failed changed nothing.
 			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now);
@@ -487,10 +829,13 @@ export default function storm(pi: ExtensionAPI): void {
 			if (read) runs.noteRead(chars, read.indexed);
 			return undefined;
 		}
-		// A follow-up counts when its write was delivered, for the agent omp resolved it to.
+		// A follow-up counts when its write was delivered, for the agent omp resolved it to. That delivery also admits
+		// a reused live agent into this run, and gives a reused reviewer a fresh baseline before its next turn.
 		const target = deliveredFollowUp(event.toolName, event.input, event.isError);
 		const agent = target === undefined ? undefined : followUpAgent(listAgents(), target);
-		if (agent) noteAgentFollowUp(agent.id);
+		if (!agent) return undefined;
+		noteAgentFollowUp(agent.id);
+		bindLedgerChild(runId, agent.id, agent.parentId ?? ctx.agent.id, artifactsOf(ctx));
 		return undefined;
 	});
 
@@ -500,16 +845,33 @@ export default function storm(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
-			noteAgentEnd({ id: ctx.agent.id, now: Date.now(), settled: !(event.willContinue || event.awaitingAsyncWork) });
-			await touchActiveRun(ctx);
+			const ledger = childLedger(ctx);
+			if (ledger) {
+				noteAgentRun(ctx.agent.id, ledger.runId);
+				touchRun(ledger.runId);
+			}
+			const settled = !(event.willContinue || event.awaitingAsyncWork);
+			const failed = settled ? terminalWorkFailed(event.messages) ?? listAgents().find(agent => agent.id === ctx.agent.id)?.lastWorkFailed : undefined;
+			noteAgentEnd({
+				id: ctx.agent.id,
+				now: Date.now(),
+				settled,
+				...(settled && failed !== undefined ? { failed } : {}),
+			});
 			return;
 		}
 		// Paused on async subagents: the moment to shed context before their results arrive.
 		if (event.awaitingAsyncWork) checkpointDirector(ctx);
 		// Ends the run when the session settles; a queued run starts detached from this handler.
 		await runs.onAgentEnd(event, ctx);
-		// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
-		if (!event.willContinue && !event.awaitingAsyncWork) await syncSession(ctx).catch(() => undefined);
+		if (!event.willContinue) {
+			// The user turn is over, including a paused async wait: the next prompt must supply its own task.
+			auto.task = undefined;
+		}
+		if (!event.willContinue && !event.awaitingAsyncWork) {
+			// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
+			await syncSession(ctx).catch(() => undefined);
+		}
 	});
 
 	// omp itself left a model after provider errors: its provider goes behind the approved fallbacks for a while.
@@ -529,7 +891,10 @@ export default function storm(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
-		if (ctx.agent.kind === "sub") noteAgentParked(ctx.agent.id);
+		if (ctx.agent.kind === "sub") {
+			noteAgentParked(ctx.agent.id);
+			reviewerBaselines.delete(reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id));
+		}
 		// No status load or widget from before the shutdown may land after it.
 		liveStatus.beginSession();
 		await runs.finish("shutdown");
@@ -539,7 +904,10 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("session_switch", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		liveStatus.beginSession();
+		auto.task = undefined;
 		await runs.finish("shutdown", ctx);
+		// The same profile and repository keep the policy, but a fresh conversation gets the durable consent file.
+		await syncSession(ctx).catch(() => undefined);
 	});
 
 	const tool = createStormTool(pi.zod, ctx => toolHost(ctx));
@@ -555,8 +923,13 @@ export default function storm(pi: ExtensionAPI): void {
 	const syncSession = async (ctx: ExtensionContext, loaded?: ProjectState): Promise<void> => {
 		const epoch = liveStatus.epoch();
 		const state = loaded ?? (await loadProjectState(projectEnv(ctx)));
+		// The durable consent file is read on every session refresh: a session switch or a command sees an external
+		// change at once, and a failed read keeps the last enabled guard instead of unfencing direct tools.
+		await refreshAuto(ctx, async () => state);
 		if (!liveStatus.isCurrent(epoch)) return;
-		if (state.config.status !== "missing") await activateTool();
+		// A missing config needs no tool normally; under automatic delegation the plan must be reachable to report
+		// the missing team as an actionable refusal instead of leaving the main session to direct tools.
+		if (state.config.status !== "missing" || auto.enabled) await activateTool();
 		if (!liveStatus.isCurrent(epoch)) return;
 		if (!ctx.hasUI) {
 			liveStatus.clear();
@@ -568,7 +941,7 @@ export default function storm(pi: ExtensionAPI): void {
 			showRunStatus(ctx, run);
 			return;
 		}
-		const resumable = isApproved(state) && (await resumeCandidate(state.store.dir, state.repo.root, await lastRun(state.repo.root))) !== undefined;
+		const resumable = isApproved(state) && (await findResumeCandidate(state.store.dir, state.repo.root)) !== undefined;
 		// The await above may have outlasted a switch, or a queued run may have started meanwhile.
 		if (!liveStatus.isCurrent(epoch)) return;
 		const started = runs.active();
@@ -577,7 +950,7 @@ export default function storm(pi: ExtensionAPI): void {
 			return;
 		}
 		liveStatus.clear();
-		ctx.ui.setStatus("storm", statusLabel(state, resumable));
+		ctx.ui.setStatus("storm", statusLabel(state, resumable, auto));
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -630,6 +1003,7 @@ export default function storm(pi: ExtensionAPI): void {
 				if (input === "") await menu();
 				else if (input === "status") await statusFlow(env, ui);
 				else if (input === "models") await modelsFlow(env, ui);
+				else if (input === "auto") await autoDelegationFlow(env, ui);
 				else if (SHORTCUT_NAMES.includes(input)) {
 					if (!ctx.hasUI) ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm 으로 현황은 볼 수 있습니다.", "warning");
 					else if (input === "setup") await setupFlow(env, ui);

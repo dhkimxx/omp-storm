@@ -36,6 +36,8 @@ jobs:
       # The harness keeps its work dir (omp stderr, RPC frames, screens, model requests) when a check fails.
       - name: E2E (RPC and print)
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e" npm run e2e
+      - name: E2E (automatic delegation and worktree ownership)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-auto" npm run e2e:auto
       # omp's goal and loop modes exist only in its TUI, which the harness drives on a pty.
       - name: Can this runner open a pty?
         id: pty

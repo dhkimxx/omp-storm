@@ -52,8 +52,18 @@ export function newRunId(now: number): string {
 // Run ids become file names; anything else could escape runs/.
 const RUN_ID = /^run-[0-9A-Za-z-]+$/;
 
+/** Whether a string is a run id this module stores as a file name. */
+export function isRunId(value: string): boolean {
+	return RUN_ID.test(value);
+}
+
+/** The repository-relative run record path, for text that must point at a record without copying it. */
+export function runRecordRef(runId: string): string | undefined {
+	return isRunId(runId) ? `.omp/storm/state/runs/${runId}.json` : undefined;
+}
+
 function runFile(root: string, runId: string): string | undefined {
-	return RUN_ID.test(runId) ? path.join(runsDir(root), `${runId}.json`) : undefined;
+	return isRunId(runId) ? path.join(runsDir(root), `${runId}.json`) : undefined;
 }
 
 const RUN_STATUSES: readonly string[] = ["running", "done", "ended", "budget-exceeded", "stopped"];
@@ -112,10 +122,27 @@ export async function lastRun(root: string): Promise<RunRecord | undefined> {
 	return best;
 }
 
-/** Keeps the newest `keep` run files. */
-export async function pruneRuns(root: string, keep = 50): Promise<void> {
+/** Run files retention keeps by default; the resume pointer collection is bounded by the same number. */
+export const RUN_KEEP = 50;
+
+/**
+ * Keeps the newest `keep` run files. A record still marked running is never deleted by retention, and neither is an id
+ * the caller protects: a run-end caller with the approval store passes `protectedResumeRunIds(storeDir, root)` from
+ * `resume.ts` so trusted unfinished runs stay. Only `run-*.json` files are candidates: other files in `runs/` are left
+ * alone.
+ */
+export async function pruneRuns(root: string, keep = RUN_KEEP, protect: readonly string[] = []): Promise<void> {
 	const ids = (await runIds(root)).reverse();
-	await Promise.all(ids.slice(Math.max(0, keep)).map(id => fs.rm(path.join(runsDir(root), `${id}.json`), { force: true })));
+	const guarded = new Set(protect);
+	await Promise.all(
+		ids.slice(Math.max(0, keep)).map(async id => {
+			if (guarded.has(id)) return;
+			// A run whose process is still alive cannot be known to be finished here: keep its record until it stops.
+			const run = await readRun(root, id);
+			if (run?.status === "running") return;
+			await fs.rm(path.join(runsDir(root), `${id}.json`), { force: true });
+		}),
+	);
 }
 
 /** How much of a request a run record keeps for a later run to resume from. */

@@ -134,7 +134,7 @@ describe("treeAgainst", () => {
 		expect(deleted.state.files).toBe(clean.state.files);
 	});
 
-	test("a file over the size bound moves files when its size changes", async () => {
+	test("a file over the size bound detects growth without attesting to its contents", async () => {
 		await gitRepo(root);
 		const big = path.join(root, "artifact.bin");
 		await writeFile(big, Buffer.alloc(2 * 1024 * 1024 + 1));
@@ -143,6 +143,8 @@ describe("treeAgainst", () => {
 		const grown = (await state())!;
 		expect(grown.state.diff).toBe(first.state.diff);
 		expect(grown.state.files).not.toBe(first.state.files);
+		expect(first.state.incomplete).toBe(true);
+		expect(grown.state.incomplete).toBe(true);
 	});
 
 	test("a directory outside a git work tree has no tree", async () => {

@@ -92,6 +92,15 @@ export function createStormTool(
 
 const rejected = (text: string): StormToolReply => ({ outcome: "rejected", text });
 
+/**
+ * Automatic delegation has one way to open a run: the first plan, in the same user turn, using the prompt the host
+ * reported. `run` would queue a second handoff instead of binding the plan before the turn's first spawn.
+ */
+const AUTO_RUN_REJECTED =
+	"자동 위임에서는 run으로 실행을 예약하지 않습니다. 이번 사용자 요청의 계획을 plan으로 제출하세요. 계획이 같은 턴에서 실행을 열고, 그 범위 안에서 승인된 워커를 스폰할 수 있습니다.";
+const AUTO_NO_TASK =
+	"자동 위임에서 실행을 열 사용자 요청을 찾지 못했습니다. 계획을 저장하지 않았습니다. 사용자에게 요청을 새로 입력해 달라고 안내하세요. 사진이나 첨부만 있고 글이 없는 요청은 실행으로 열 수 없습니다.";
+
 interface Current {
 	state: ProjectState;
 	config: StormConfig;
@@ -114,6 +123,7 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 			return { outcome: "ok", text: renderAgentRows(rows, host.now()) };
 		}
 		case "run": {
+			if (host.auto?.().enabled === true) return rejected(AUTO_RUN_REJECTED);
 			const spec = runSpec(params.task ?? "");
 			if (!spec.ok) return rejected(spec.error);
 			// A run can only start once this turn is over, so it is queued for the turn's end.
@@ -159,6 +169,7 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 	const cur = await loadCurrent(host);
 	if ("outcome" in cur) return cur;
 	let config = cur.config;
+	let validatedHash = cur.state.config.status === "ok" ? cur.state.config.hash : undefined;
 	let check = validatePlan(config, raw, host.now());
 	if (check.errors.length) return rejected(`계획이 올바르지 않습니다. 고쳐서 다시 제출하세요.\n${check.errors.map((e) => `- ${e}`).join("\n")}`);
 	const head: string[] = [];
@@ -187,15 +198,32 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 		const fresh = await loadCurrent(host);
 		if ("outcome" in fresh) return fresh;
 		config = fresh.config;
+		validatedHash = fresh.state.config.status === "ok" ? fresh.state.config.hash : validatedHash;
 		check = validatePlan(config, raw, host.now());
 		if (check.errors.length || check.outOfBounds.length) {
 			return rejected(`${head.join("\n")}\n저장한 팀 설정으로도 계획이 범위를 넘습니다. 다시 제출하세요.\n${[...check.errors.map((e) => `- ${e}`), ...gapLines(check.outOfBounds)].join("\n")}`);
 		}
 	}
 	const plan = check.plan!;
-	const set = host.runtime.setRunPlan(plan);
 	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(config, plan)];
 	if (check.warnings.length) body.push("경고:", ...check.warnings.map((w) => `- ${w}`));
+	const auto = host.auto?.();
+	if (auto?.enabled === true && host.runtime.runActive?.() === false) {
+		// Automatic delegation: this turn's user request is the task, and the plan must be bound before the first spawn.
+		const start = host.runtime.startWithPlan;
+		if (start === undefined) return rejected("이 호스트에서는 자동 위임 실행을 열 수 없습니다. /storm auto를 끄거나 호스트를 업데이트하세요.");
+		const task = auto.task;
+		if (task === undefined || task.trim() === "") return rejected(AUTO_NO_TASK);
+		const spec = runSpec(task);
+		if (!spec.ok) return rejected(spec.error);
+		const started = await start(spec.spec, plan, validatedHash);
+		if (!started.ok) return rejected(started.reason);
+		return {
+			outcome: head.length ? "approved" : "ok",
+			text: [...head, `자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 이 계획 범위 안에서 승인된 팀 워커를 스폰하세요.`, ...body].join("\n"),
+		};
+	}
+	const set = host.runtime.setRunPlan(plan);
 	if (!set.ok) {
 		const saved = head.length ? " 승인한 범위 변경은 저장했습니다." : "";
 		return { outcome: head.length ? "approved" : "ok", text: [...head, `실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다).${saved} ${set.reason}`, ...body].join("\n") };

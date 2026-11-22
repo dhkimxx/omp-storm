@@ -220,6 +220,18 @@ describe("answers to config", () => {
 		}
 	});
 
+	test("requiredChecks survives a recommended or manual model change, in order", () => {
+		const requiredChecks = [
+			{ name: "unit", argv: ["bun", "test"] },
+			{ name: "types", argv: ["bunx", "tsc", "--noEmit"] },
+		];
+		const current: StormConfig = { ...TEAM, requiredChecks };
+		expect(recommendedConfig(recs(), "balanced", current).requiredChecks).toEqual(requiredChecks);
+		const built = configOf(submit(input(current), { primary_explorer: "a/y" }));
+		expect(built.requiredChecks).toEqual(requiredChecks);
+		expect(validateConfig(built).warnings).toEqual([]);
+	});
+
 	test("rounds opens on the value in force and is written only when it differs from the default", () => {
 		expect(configOf(submit(input()))).not.toHaveProperty("rounds");
 		expect(configOf(submit(input(), { rounds: 0 })).rounds).toBe(0);

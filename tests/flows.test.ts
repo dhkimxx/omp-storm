@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmodSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
@@ -7,7 +8,8 @@ import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
-import { agentsFlow, approveAndSave, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { agentsFlow, approveAndSave, autoDelegationFlow, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation } from "../src/approval/auto.ts";
 import { ROLES, roleTitle } from "../src/roles.ts";
 import { writeRun } from "../src/runtime/run.ts";
 import { noteResumePointer, resumeCandidate, resumePointerFile } from "../src/runtime/resume.ts";
@@ -19,7 +21,7 @@ import type { RunRequestResult } from "../src/tool/host.ts";
 import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
-import { makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { git, gitRepo, makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
@@ -30,10 +32,17 @@ const NOW = Date.parse("2026-11-20T09:30:00Z");
 const FIRST = pick(0);
 const SECOND = pick(1);
 const THIRD = pick(2);
+const FOURTH = pick(3);
 const LAST = pick(-1);
 const PICK_BY_ROLE = "역할별로 고르기";
 const PRIMARY = "주 모델";
 const FALLBACK = "폴백";
+/** The old toggle labels are still the explicit-switch contract; the first approval default is separate. */
+const AUTO = { enable: "자동 위임 켜기", disable: "자동 위임 끄기" } as const;
+const AUTO_MENU = { on: "자동 위임 · 켜짐", off: "자동 위임 · 꺼짐" } as const;
+const AUTO_DISCLOSURE = "승인하면 자동 위임이 켜집니다";
+const AUTO_MIGRATION = { switch: "자동 위임으로 전환", stay: "직접 작업 유지" } as const;
+const AUTO_MIGRATION_DISCLOSURE = "메인 세션이 이 저장소의 작업을 직접 하지 않습니다";
 
 /** An omp catalog row; the real recommender ranks these. */
 const row = (provider: string, id: string, input: number, int: number, efforts = ["low", "medium", "high"]) => ({
@@ -114,6 +123,13 @@ function defaultPages(team: StormConfig): string[] {
 
 const load = () => loadProjectState(env);
 const approve = async (config: StormConfig) => approveAndSave(await load(), config, { shadowedAgents: [] });
+/** The saved choice as the rest of Storm reads it, from this profile's store for this repository. */
+const autoChoice = async () => readAutoDelegationChoice((await load()).store.dir);
+/** Seed a decided choice for tests about later flows; only an absent path can be initialized. */
+const settleAuto = async (enabled: boolean): Promise<void> => {
+	const state = await load();
+	expect(await initializeAutoDelegation(state.store.dir, enabled)).toBe(true);
+};
 /** A teammate's (or a hand) edit: the file changes, nobody approves it on this machine. */
 const editByHand = async (text: string) => {
 	await mkdir(path.dirname(configPath(project.root)), { recursive: true });
@@ -135,6 +151,7 @@ describe("/storm without an approved team", () => {
 		const state = await load();
 		expect(state.config.status).toBe("missing");
 		expect(await state.store.list()).toEqual([]);
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("invalid config: every error in one dialog, and setup starts only when chosen", async () => {
@@ -150,9 +167,11 @@ describe("/storm without an approved team", () => {
 		const g = scriptedUi([FIRST, APPROVE]);
 		await hubFlow(env, g.ui);
 		expect(g.selects[1]?.options).toEqual([APPROVE, CANCEL]);
+		expect(g.selects).toHaveLength(2);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual(await recommended());
 		expect(isApproved(state)).toBe(true);
+		expect(await autoChoice()).toBe("on");
 	});
 
 	test("invalid config with an earlier approval: rolling back restores the approved team", async () => {
@@ -202,15 +221,18 @@ describe("/storm without an approved team", () => {
 		expect(damaged.selects[0]?.options).toHaveLength(intact.selects[0]!.options.length - 1);
 	});
 
-	test("approving approves the file as it is, without rewriting it", async () => {
+	test("approving an imported valid config approves the file as it is and is a first approval for auto", async () => {
 		const text = `${JSON.stringify(TEAM, null, "\t")}\n\n`;
 		await editByHand(text);
 		const f = scriptedUi([APPROVE]);
 		await hubFlow(env, f.ui);
-		// No earlier approval: nothing to roll back to.
+		// No earlier approval: nothing to roll back to, and the first-approval disclosure opens the panel.
 		expect(f.selects[0]?.options).toHaveLength(3);
 		expect(f.selects[0]?.options[0]).toBe(APPROVE);
+		expect(f.selects[0]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		expect(f.selects[0]?.markdown).toContain("/storm auto");
 		expect(isApproved(await load())).toBe(true);
+		expect(await autoChoice()).toBe("on");
 		expect(await fileText()).toBe(text);
 	});
 
@@ -236,6 +258,7 @@ describe("/storm without an approved team", () => {
 		const state = await load();
 		expect(isApproved(state)).toBe(false);
 		expect(await state.store.list()).toEqual([]);
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("rolling back from an unapproved config needs no new approval", async () => {
@@ -253,10 +276,12 @@ describe("/storm without an approved team", () => {
 		await editByHand(TEAM_08);
 		const before = await load();
 		await writeStore08(before.store.dir, before.repo.repoId);
+		// The 0.8 approval predates the choice; this test is about opening the menu, not the migration prompt.
+		await initializeAutoDelegation(before.store.dir, false);
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		expect(f.selects).toHaveLength(1);
-		expect(f.selects[0]?.options).toHaveLength(4);
+		expect(f.selects[0]?.options).toHaveLength(5);
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		expect(f.selects[0]?.markdown).toContain(shortHash(TEAM_08_HASH));
 		expect(await fileText()).toBe(TEAM_08);
@@ -264,23 +289,29 @@ describe("/storm without an approved team", () => {
 });
 
 describe("setup", () => {
-	test("first setup, approved: the recommended team is saved and approved through one dialog", async () => {
+	test("first setup, approved: the recommended team is saved and automatic delegation is on by default", async () => {
 		const expected = await recommended();
 		expect(validateConfig(expected).errors).toEqual([]);
 		const f = scriptedUi([APPROVE]);
 		await setupFlow(env, f.ui);
+		// No separate consent screen: one approval dialog, with the disclosure before the ordinary content.
 		expect(f.selects).toHaveLength(1);
-		// The whole team is in the panel.
 		for (const role of Object.values(expected.roles)) expect(f.selects[0]?.markdown).toContain(role.models.join(", "));
+		expect(f.selects[0]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		for (const part of ["이 프로필과 이 저장소", "프로젝트 도구를 직접 쓰지 않", "작은 수정도", "일반 대화", "/storm auto"]) {
+			expect(f.selects[0]?.markdown).toContain(part);
+		}
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual(expected);
 		expect(isApproved(state)).toBe(true);
+		expect(await autoChoice()).toBe("on");
 		expect(f.reports).toEqual([]);
 	});
 
 	test("an unanswered dialog saves nothing", async () => {
 		await setupFlow(env, scriptedUi([undefined]).ui);
 		expect((await load()).config.status).toBe("missing");
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("picking role by role is offered only where forms can be drawn", async () => {
@@ -319,12 +350,18 @@ describe("setup", () => {
 		// The models are the recommendation's, from this catalog.
 		expect(saved?.roles.implementer?.models[0]).toStartWith("p");
 		expect(isApproved(state)).toBe(true);
+		// An approval already existed, so this is not a first approval: no disclosure and no choice.
+		expect(f.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("a first setup opens on what approval switches on beyond the models; a team that already has it is not told again", async () => {
 		const first = scriptedUi([CANCEL]);
 		await setupFlow(env, first.ui);
-		const lead = first.selects[0]!.markdown!.split("\n")[0]!;
+		const markdown = first.selects[0]!.markdown!;
+		expect(markdown.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		const lead = markdown.split("\n").find(line => line.includes("실행이 끝나면 정리"))!;
+		expect(lead).toBeDefined();
 		expect(lead).not.toMatch(/^(#|\*\*|- |$)/);
 
 		await approve({ ...TEAM, cleanup: true });
@@ -352,8 +389,10 @@ describe("setup", () => {
 		expect(forms.map(page)).toEqual(defaultPages(team));
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		expect(f.selects[1]?.options).toEqual([APPROVE, CANCEL]);
+		expect(f.selects[1]?.markdown).not.toContain(AUTO_DISCLOSURE);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual({ ...team, parallelism: 2 });
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("picking role by role groups the controls and then asks about settings and approval", async () => {
@@ -380,6 +419,9 @@ describe("setup", () => {
 			}
 		}
 		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
+		expect(f.selects[1]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		// The role-by-role first approval turns automatic delegation on after the team is saved.
+		expect(await autoChoice()).toBe("on");
 		const state = await load();
 		const saved = state.config.status === "ok" ? state.config.config : undefined;
 		expect(isApproved(state)).toBe(true);
@@ -451,6 +493,7 @@ describe("setup", () => {
 			...expected.slice(nextRole),
 		]);
 		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
+		expect(f.selects[1]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config.roles[roleId]).toMatchObject({
 			models: [`${primary.selector}:minimal`, `${fallback.selector}:xhigh`],
@@ -510,6 +553,317 @@ describe("setup", () => {
 		expect(f.selects).toEqual([]);
 		expect(f.notes).toHaveLength(1);
 		expect((await load()).config.status).toBe("missing");
+	});
+});
+
+describe("automatic delegation", () => {
+	test("a first approval initializes it only after the team is saved, with the disclosure first", async () => {
+		const f = scriptedUi([APPROVE]);
+		await setupFlow(env, f.ui);
+		expect(f.selects).toHaveLength(1);
+		expect(f.selects[0]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		// The ordinary approval notice comes before the activation notice, which is the proof of the order.
+		expect(f.notices.map(n => n.text)).toEqual([
+			expect.stringContaining("팀 설정을 승인하고 저장했습니다"),
+			expect.stringContaining("자동 위임을 켰습니다"),
+		]);
+		expect(await autoChoice()).toBe("on");
+		expect(isApproved(await load())).toBe(true);
+	});
+
+	test("cancelled or unanswered approvals save nothing and leave the choice unset", async () => {
+		for (const answer of [CANCEL, undefined]) {
+			const f = scriptedUi([answer]);
+			await setupFlow(env, f.ui);
+			expect(await autoChoice()).toBe("unset");
+			expect((await load()).config.status).toBe("missing");
+		}
+		// An imported valid config: cancelling its approval is not an approval either.
+		await editByHand(serializeConfig(TEAM));
+		const g = scriptedUi([CANCEL]);
+		await hubFlow(env, g.ui);
+		expect(g.selects[0]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		expect(await autoChoice()).toBe("unset");
+		expect(isApproved(await load())).toBe(false);
+	});
+
+	test("the role interview's final approval is a first approval", async () => {
+		const f = scriptedUi([PICK_BY_ROLE, APPROVE]);
+		const forms = withForms(f);
+		await setupFlow(env, f.ui);
+		expect(forms.length).toBeGreaterThan(1);
+		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
+		expect(f.selects[1]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		expect(await autoChoice()).toBe("on");
+	});
+
+	test("no recommended team can be built, so the fresh interview's final approval still defaults on", async () => {
+		// No candidate clears the roles' context floor, so there is no recommended team to approve: only the interview.
+		const small = { ...row("pz", "tiny", 0.1, 30), contextWindow: 64_000 };
+		const tiny = { ...env, registry: { getAll: () => [small], getAvailable: () => [small] } };
+		const g = scriptedUi([PICK_BY_ROLE, APPROVE]);
+		withForms(g);
+		g.ui.pickModel = async () => model("pz/tiny", { contextWindow: 64_000 });
+		await setupFlow(tiny, g.ui);
+		expect(g.selects[0]?.options).toEqual([PICK_BY_ROLE, CANCEL]);
+		expect(g.selects[1]?.options).toEqual([APPROVE, CANCEL]);
+		expect(g.selects[1]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		expect(await autoChoice()).toBe("on");
+		expect(isApproved(await load())).toBe(true);
+	});
+
+	test("an activation write failure keeps the approved team and says auto is not confirmed", async () => {
+		const state = await load();
+		const base = scriptedUi([APPROVE]);
+		let denied = false;
+		const ui: typeof base.ui = {
+			...base.ui,
+			notify(message, level) {
+				base.ui.notify(message, level);
+				if (!denied && message.includes("승인하고 저장했습니다")) {
+					denied = true;
+					chmodSync(state.store.dir, 0o500);
+				}
+			},
+		};
+		try {
+			await setupFlow(env, ui);
+		} finally {
+			chmodSync(state.store.dir, 0o700);
+		}
+		expect(denied).toBe(true);
+		expect(isApproved(await load())).toBe(true);
+		expect(await autoChoice()).toBe("unset");
+		expect(base.notices.at(-1)?.level).toBe("warning");
+		expect(base.notices.at(-1)?.text).toContain("팀 설정은 저장했지만");
+		expect(base.notices.at(-1)?.text).toContain("자동 위임");
+	});
+
+	test("an explicit off survives re-setup, reapproval and a deleted config", async () => {
+		await setupFlow(env, scriptedUi([APPROVE]).ui);
+		expect(await autoChoice()).toBe("on");
+		await autoDelegationFlow(env, scriptedUi([AUTO.disable]).ui);
+		expect(await autoChoice()).toBe("off");
+
+		const again = scriptedUi([APPROVE]);
+		await setupFlow(env, again.ui);
+		expect(again.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("off");
+
+		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		const reapproved = scriptedUi([APPROVE]);
+		await hubFlow(env, reapproved.ui);
+		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("off");
+
+		await rm(path.dirname(configPath(project.root)), { recursive: true, force: true });
+		const recreated = scriptedUi([APPROVE]);
+		await setupFlow(env, recreated.ui);
+		expect(recreated.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("off");
+		expect(isApproved(await load())).toBe(true);
+	});
+
+	test("an on choice survives re-setup, reapproval and a deleted config", async () => {
+		await setupFlow(env, scriptedUi([APPROVE]).ui);
+		expect(await autoChoice()).toBe("on");
+		const again = scriptedUi([APPROVE]);
+		await setupFlow(env, again.ui);
+		expect(again.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("on");
+
+		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		const reapproved = scriptedUi([APPROVE]);
+		await hubFlow(env, reapproved.ui);
+		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("on");
+
+		await rm(path.dirname(configPath(project.root)), { recursive: true, force: true });
+		const recreated = scriptedUi([APPROVE]);
+		await setupFlow(env, recreated.ui);
+		expect(recreated.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
+		expect(await autoChoice()).toBe("on");
+		expect(isApproved(await load())).toBe(true);
+	});
+
+	test("an existing approved team with an unset choice stays off; bare /storm offers both migration actions beside normal ones", async () => {
+		await approve(TEAM);
+		const f = scriptedUi(["닫기"]);
+		await hubFlow(env, f.ui);
+		expect(await autoChoice()).toBe("unset");
+		const options = f.selects[0]!.options;
+		expect(options).toEqual(expect.arrayContaining(["팀 다시 설정", "모델 점검", AUTO_MIGRATION.switch, AUTO_MIGRATION.stay, "닫기"]));
+		expect(f.selects[0]?.markdown).toContain(AUTO_MIGRATION_DISCLOSURE);
+		expect(f.selects[0]?.markdown).toContain("작은 수정도");
+		expect(f.selects[0]?.markdown).toContain("결정하면 다시 묻지 않습니다");
+		// The status still says off; no action other than the two exact ones writes.
+		const status = scriptedUi();
+		await statusFlow(env, status.ui);
+		expect(status.selects).toEqual([]);
+		expect(status.reports[0]?.markdown).toContain("자동 위임: 꺼짐");
+		expect(await autoChoice()).toBe("unset");
+
+		const on = scriptedUi([AUTO_MIGRATION.switch]);
+		await hubFlow(env, on.ui);
+		expect(await autoChoice()).toBe("on");
+		expect(on.notices.at(-1)?.text).toContain("전환했습니다");
+
+		const next = scriptedUi(["닫기"]);
+		await hubFlow(env, next.ui);
+		expect(next.selects[0]?.options).not.toContain(AUTO_MIGRATION.switch);
+		expect(next.selects[0]?.markdown).not.toContain(AUTO_MIGRATION_DISCLOSURE);
+	});
+
+	test("the exact keep action stores an explicit off and removes the prompt", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([AUTO_MIGRATION.stay]);
+		await hubFlow(env, f.ui);
+		expect(await autoChoice()).toBe("off");
+		expect(f.notices.at(-1)?.text).toContain("직접 작업");
+
+		const next = scriptedUi(["닫기"]);
+		await hubFlow(env, next.ui);
+		expect(next.selects[0]?.options).not.toContain(AUTO_MIGRATION.stay);
+		expect(next.selects[0]?.markdown).not.toContain(AUTO_MIGRATION_DISCLOSURE);
+	});
+
+	test("a concurrent choice wins for both migration actions", async () => {
+		await approve(TEAM);
+		let dir = (await load()).store.dir;
+		const switched = scriptedUi([async () => {
+			await writeAutoDelegation(dir, false);
+			return AUTO_MIGRATION.switch;
+		}]);
+		await hubFlow(env, switched.ui);
+		expect(await autoChoice()).toBe("off");
+		expect(switched.notices.at(-1)?.text).toContain("다른 선택");
+
+		await rm(path.join(dir, "auto-delegation.json"), { force: true });
+		dir = (await load()).store.dir;
+		const kept = scriptedUi([async () => {
+			await writeAutoDelegation(dir, true);
+			return AUTO_MIGRATION.stay;
+		}]);
+		await hubFlow(env, kept.ui);
+		expect(await autoChoice()).toBe("on");
+		expect(kept.notices.at(-1)?.text).toContain("다른 선택");
+	});
+
+	test("migration checks the exact approved team again before switching on", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([async () => {
+			await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+			return AUTO_MIGRATION.switch;
+		}]);
+		await hubFlow(env, f.ui);
+		expect(await autoChoice()).toBe("unset");
+		expect(f.notices.at(-1)?.level).toBe("warning");
+		expect(f.notices.at(-1)?.text).toContain("바뀌어");
+	});
+
+	test("an invalid saved auto file is untouched by setup or migration; explicit /storm auto repairs it", async () => {
+		const state = await load();
+		await mkdir(state.store.dir, { recursive: true });
+		const file = path.join(state.store.dir, "auto-delegation.json");
+		const invalid = "{ not json";
+		await writeFile(file, invalid);
+
+		const setup = scriptedUi([APPROVE]);
+		await setupFlow(env, setup.ui);
+		expect(setup.selects[0]?.markdown).not.toContain(AUTO_DISCLOSURE);
+		expect(await readFile(file, "utf8")).toBe(invalid);
+		expect(await autoChoice()).toBe("invalid");
+
+		const hub = scriptedUi(["닫기"]);
+		await hubFlow(env, hub.ui);
+		expect(hub.selects[0]?.options).not.toContain(AUTO_MIGRATION.switch);
+		expect(await readFile(file, "utf8")).toBe(invalid);
+
+		const repair = scriptedUi([AUTO.enable]);
+		await autoDelegationFlow(env, repair.ui);
+		expect(await autoChoice()).toBe("on");
+		expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ enabled: true });
+	});
+
+	test("the old toggle labels still work and enable rechecks an approved team", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([AUTO.enable]);
+		await autoDelegationFlow(env, f.ui);
+		expect(f.selects[0]?.options).toEqual([AUTO.enable, CANCEL]);
+		expect(await autoChoice()).toBe("on");
+		// The team approval is unchanged: the choice is a separate record, not a new config approval.
+		expect((await load()).approval?.configHash).toBe(configHash(TEAM));
+
+		const off = scriptedUi([AUTO.disable]);
+		await autoDelegationFlow(env, off.ui);
+		expect(off.selects[0]?.options).toEqual([AUTO.disable, CANCEL]);
+		expect(await autoChoice()).toBe("off");
+
+		await rm(path.join((await load()).store.dir, "auto-delegation.json"), { force: true });
+		const stale = scriptedUi([async () => {
+			await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+			return AUTO.enable;
+		}]);
+		await autoDelegationFlow(env, stale.ui);
+		expect(await autoChoice()).toBe("unset");
+		expect(stale.notices.at(-1)?.level).toBe("warning");
+		expect(stale.notices.at(-1)?.text).toContain("바뀌어");
+	});
+
+	test("a stale team cannot enable it, but an existing on choice can always be turned off", async () => {
+		await approve(TEAM);
+		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		const no = scriptedUi();
+		await autoDelegationFlow(env, no.ui);
+		expect(no.selects).toEqual([]);
+		expect(no.reports).toHaveLength(1);
+		expect(no.notices.at(-1)?.level).toBe("warning");
+		expect(await autoChoice()).toBe("unset");
+
+		for (const stale of [serializeConfig({ ...TEAM, parallelism: 9 }), "{ not json"]) {
+			await approve(TEAM);
+			await autoDelegationFlow(env, scriptedUi([AUTO.enable]).ui);
+			expect(await autoChoice()).toBe("on");
+			await editByHand(stale);
+			const off = scriptedUi([AUTO.disable]);
+			await autoDelegationFlow(env, off.ui);
+			expect(off.selects[0]?.options).toEqual([AUTO.disable, CANCEL]);
+			expect(await autoChoice()).toBe("off");
+		}
+	});
+
+	test("the hub entry says whether it is on or off and opens the same consent", async () => {
+		await approve(TEAM);
+		await settleAuto(false);
+		const f = scriptedUi([THIRD, AUTO.enable]);
+		await hubFlow(env, f.ui);
+		expect(f.selects[0]?.options).toContain(AUTO_MENU.off);
+		expect(f.selects[1]?.options).toEqual([AUTO.enable, CANCEL]);
+		expect(await autoChoice()).toBe("on");
+
+		const g = scriptedUi([THIRD, AUTO.disable]);
+		await hubFlow(env, g.ui);
+		expect(g.selects[0]?.options).toContain(AUTO_MENU.on);
+		expect(g.selects[1]?.options).toEqual([AUTO.disable, CANCEL]);
+		expect(await autoChoice()).toBe("off");
+	});
+
+	test("linked worktrees share the choice while each worktree keeps its own team approval", async () => {
+		await gitRepo(project.root);
+		const other = path.join(project.tmp, "other-worktree");
+		await git(project.root, "worktree", "add", "-b", "other", other);
+		const otherEnv: FlowEnv = { ...env, cwd: other };
+		await approve(TEAM);
+		const f = scriptedUi([AUTO.enable]);
+		await autoDelegationFlow(env, f.ui);
+		const otherState = await loadProjectState(otherEnv);
+		expect(otherState.store.dir).toBe((await load()).store.dir);
+		expect(await readAutoDelegationChoice(otherState.store.dir)).toBe("on");
+		// No config in the other worktree: no approved team, but the shared choice can still be turned off.
+		expect(otherState.config.status).toBe("missing");
+		const off = scriptedUi([AUTO.disable]);
+		await autoDelegationFlow(otherEnv, off.ui);
+		expect(await autoChoice()).toBe("off");
 	});
 });
 
@@ -582,26 +936,28 @@ describe("status and agents", () => {
 describe("/storm menu", () => {
 	test("an approved team: the status panel and the menu, with rollback only when an earlier approval exists", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		const f = scriptedUi([LAST]);
 		expect(await hubFlow(env, f.ui)).toBe(false);
-		expect(f.selects[0]?.options).toHaveLength(4);
+		expect(f.selects[0]?.options).toHaveLength(5);
 		expect(f.selects[0]?.markdown).toContain(shortHash(configHash(TEAM)));
 
 		await approve({ ...TEAM, parallelism: 2 });
 		const g = scriptedUi([LAST]);
 		await hubFlow(env, g.ui);
-		expect(g.selects[0]?.options).toHaveLength(5);
+		expect(g.selects[0]?.options).toHaveLength(6);
 		// The subagents table joins the menu while the session has subagents.
 		const h = scriptedUi([THIRD]);
 		await hubFlow({ ...env, agents: () => [agentEntry()] }, h.ui);
-		expect(h.selects[0]?.options).toHaveLength(6);
+		expect(h.selects[0]?.options).toHaveLength(7);
 		expect(h.reports).toHaveLength(1);
 	});
 
 	test("rollback from the menu puts the earlier approved team back", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		await approve({ ...TEAM, parallelism: 2 });
-		const f = scriptedUi([THIRD, FIRST, FIRST]);
+		const f = scriptedUi([FOURTH, FIRST, FIRST]);
 		await hubFlow(env, f.ui);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config.parallelism).toBe(4);
@@ -610,21 +966,23 @@ describe("/storm menu", () => {
 
 	test("an earlier approval whose stored copy no longer matches its hash is not offered: it would restore what nobody approved", async () => {
 		const hash = await approve(TEAM);
+		await settleAuto(false);
 		await approve({ ...TEAM, parallelism: 2 });
 		const store = (await load()).store;
 		await writeFile(path.join(store.dir, "snapshots", `${hash.slice(hash.indexOf(":") + 1)}.json`), serializeConfig({ ...TEAM, parallelism: 7 }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		// The menu without the way back.
-		expect(f.selects[0]?.options).toHaveLength(4);
+		expect(f.selects[0]?.options).toHaveLength(5);
 	});
 
 	test("a file changed while the rollback dialogs are open is not overwritten", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		await approve({ ...TEAM, parallelism: 2 });
 		const pulled = serializeConfig({ ...TEAM, parallelism: 9 });
 		const f = scriptedUi([
-			THIRD,
+			FOURTH,
 			FIRST,
 			async options => {
 				await editByHand(pulled);
@@ -651,10 +1009,11 @@ describe("ended trials", () => {
 
 	test("keeping the current model removes the trial and saves at once: one dialog, then the menu with the new config", async () => {
 		await approve(withTrial);
+		await settleAuto(false);
 		const f = scriptedUi([SECOND, LAST]);
 		await hubFlow(env, f.ui);
 		// Adopt, keep or later; then the menu, where the trial's config is now an earlier approval to go back to.
-		expect(f.selects.map(s => s.options.length)).toEqual([3, 5]);
+		expect(f.selects.map(s => s.options.length)).toEqual([3, 6]);
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual(TEAM);
@@ -745,13 +1104,14 @@ describe("resuming the last run", () => {
 
 	test("a resumable last run is the menu's first option, with one panel line about it", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		const run = resumable();
 		await plant(run);
 		const started: RunSpec[] = [];
 		const f = scriptedUi([FIRST]);
 		await hubFlow({ ...env, startRun: starter(started) }, f.ui);
 		// One option more than the menu without a resumable run, and it comes first.
-		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(f.selects[0]?.options).toHaveLength(6);
 		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
 		const about = f.selects[0]?.markdown?.split("\n").filter(line => line.includes("resume-unique-request")) ?? [];
 		expect(about).toHaveLength(1);
@@ -760,6 +1120,7 @@ describe("resuming the last run", () => {
 
 	test("a start refusal from the menu is a warning", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		await plant(resumable());
 		const f = scriptedUi([FIRST]);
 		await hubFlow({ ...env, startRun: starter([], { ok: false, reason: "run-active" }) }, f.ui);
@@ -770,6 +1131,7 @@ describe("resuming the last run", () => {
 
 	test("a last run that ended, or no way to start one, leaves the menu as it was", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		for (const [runId, over] of [
 			["run-20261119-100000-aaaa", { status: "done", endReason: "verified" }],
 			["run-20261119-100001-aaaa", { status: "ended", endReason: "no-changes" }],
@@ -778,18 +1140,19 @@ describe("resuming the last run", () => {
 			const started: RunSpec[] = [];
 			const f = scriptedUi([LAST]);
 			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
-			expect(f.selects[0]?.options).toHaveLength(4);
+			expect(f.selects[0]?.options).toHaveLength(5);
 			expect(started).toEqual([]);
 		}
 		// A resumable run, but this caller cannot start one.
 		await writeRun(project.root, resumable({ runId: "run-20261119-110000-aaaa" }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
-		expect(f.selects[0]?.options).toHaveLength(4);
+		expect(f.selects[0]?.options).toHaveLength(5);
 	});
 
 	test("a planted record without a pointer, a pointer for another run, or an edited request is not offered", async () => {
 		await approve(TEAM);
+		await settleAuto(false);
 		const run = resumable();
 		await writeRun(project.root, run);
 		/** Neither the menu nor the classifier path starts anything. */
@@ -797,7 +1160,7 @@ describe("resuming the last run", () => {
 			const started: RunSpec[] = [];
 			const f = scriptedUi([LAST]);
 			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
-			expect(f.selects[0]?.options).toHaveLength(4);
+			expect(f.selects[0]?.options).toHaveLength(5);
 			expect(started).toEqual([]);
 			const g = scriptedUi();
 			await resumeFlow({ ...env, startRun: starter(started) }, g.ui);

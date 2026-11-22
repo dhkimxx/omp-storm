@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -9,15 +10,15 @@ import { directorRead, noteChildRead } from "../src/policy/reads.ts";
 import { listAgents, noteAgentParked, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
 import { noteRunSpawn, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
-import { activeLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
-import { HOLD_MS, ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
+import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
+import { HOLD_MS, ROUND_DELAY_MS, treeFingerprint } from "../src/runtime/rounds.ts";
 import { lastRun, readRun, runIds, runsDir, writeRun } from "../src/runtime/run.ts";
 import { trustedResume } from "../src/runtime/resume.ts";
 import { readRunIndex } from "../src/runtime/run-index.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { ProjectState } from "../src/state.ts";
-import type { AgentEntry, RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
-import { fakeModes, fakeSession, SESSION_TEAM, type SessionOptions, until } from "./fake-session.ts";
+import type { AgentEntry, RunPlan, RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
+import { fakeModes, fakeSession, SESSION_TEAM, type FakeSession, type SessionOptions, until } from "./fake-session.ts";
 import { agentEntry, approvedState, DEAD_PROCESS, runRecord, spawnRecord, treeOf } from "./fixtures.ts";
 
 const spawn = spawnRecord();
@@ -40,9 +41,44 @@ const session = (opts: Omit<SessionOptions, "root"> = {}) => fakeSession({ root,
 const ask = (task: string): RunSpec => ({ task });
 const usage = (tokens: number, percent: number, contextWindow = 400_000) => ({ tokens, contextWindow, percent });
 const T0 = Date.parse("2026-11-20T09:00:00Z");
+const TREE_BASE = "base-0";
+const TREE0 = treeOf("d0", "f0");
+const F0 = treeFingerprint(TREE0);
+const treeAt = (state: TreeState = TREE0, base = TREE_BASE): TreeReading => ({ base, state });
 const writer = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ changes: 1, lastChangeAt: T0, ...over });
-const verdict = (at: number, correct: boolean): AgentEntry =>
-	agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at, correct } });
+interface StructuredReviewAgent extends AgentEntry {
+	reviewLog: Array<{ at: number; correct: boolean; findings: never[]; tree?: string }>;
+}
+/**
+ * A reviewer verdict with both the legacy latest verdict and the structured proof the current gate reads. Without a
+ * tree fingerprint the verdict is readable history but cannot bind to the tree, which is what the gate should reject.
+ */
+const verdict = (at: number, correct: boolean, tree?: string, over: Partial<AgentEntry> = {}): StructuredReviewAgent => ({
+	...agentEntry({
+		id: "Rev",
+		name: "storm-reviewer",
+		role: "reviewer",
+		review: { reviews: 1, passed: correct ? 1 : 0, failed: correct ? 0 : 1, findings: [0, 0, 0, 0] },
+		lastVerdict: { at, correct, ...(tree !== undefined ? { tree } : {}) },
+		...over,
+	}),
+	reviewLog: [{ at, correct, findings: [], ...(tree !== undefined ? { tree } : {}) }],
+});
+
+/** Admits the plan's first lane and settles a successful worker for it, as the extension does on a real spawn. */
+function completeLane(h: FakeSession, plan: RunPlan, agents: AgentEntry[], at = T0 + 1): void {
+	const lane = plan.lanes[0];
+	if (lane === undefined) return;
+	const lanes = h.controller.runLanes();
+	if (lanes === undefined) throw new Error("the run has no lane matcher");
+	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
+	const bound = lanes.assign({ name: lane.name, agent }, plan, h.config);
+	if (!bound.ok) throw new Error(bound.reason);
+	const name = (bound.input as Record<string, unknown>).name;
+	if (typeof name !== "string") throw new Error("the lane binding has no task name");
+	lanes.admit({ spawnKey: name, agent, outcome: "routed" });
+	agents.push(agentEntry({ id: name, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: at }));
+}
 
 describe("live run record", () => {
 	// The live rewrite is debounced on a real timer: these two drive it with fake timers and wait only for the file.
@@ -53,7 +89,7 @@ describe("live run record", () => {
 
 		vi.useFakeTimers();
 		noteRunSpawn(runId, spawn);
-		recordCost(h.repo.repoId, "a/i", 1.25);
+		recordCost(runId, "a/i", 1.25);
 		touchRun(runId);
 		vi.runAllTimers();
 		await until(async () => (await readRun(root, runId))?.updatedAt !== undefined);
@@ -85,14 +121,14 @@ describe("live status line", () => {
 	test("the run is reported at its start, when a round is sent, and undefined once at its verified end", async () => {
 		const calls: Array<RunRecord | undefined> = [];
 		const agents = [writer()];
-		const h = session({ agents, live: (_ctx, run) => calls.push(run) });
+		const h = session({ agents, tree: () => treeAt(), live: (_ctx, run) => calls.push(run) });
 		const runId = await h.start();
 		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 0, maxRounds: 4 });
 		await h.turn();
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 1, maxRounds: 4 });
-		agents.push(verdict(T0 + 1, true));
+		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
 		expect(calls.at(-1)).toBeUndefined();
@@ -132,7 +168,7 @@ describe("live status line", () => {
 		});
 		const runId = await h.start();
 		await h.turn();
-		recordCost(h.repo.repoId, "a/i", 2);
+		recordCost(runId, "a/i", 2);
 		await until(() => calls.some(run => run === undefined));
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
 		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget" });
@@ -191,7 +227,7 @@ describe("run start", () => {
 		if (!result.ok) throw new Error(result.reason);
 		expect(h.controller.directing()).toBe(true);
 		expect(h.controller.runId()).toBe(result.runId);
-		expect(activeLedgerRun(h.repo.repoId)?.runId).toBe(result.runId);
+		expect(activeLedgerRun(h.repo.root)?.runId).toBe(result.runId);
 		const record = await readRun(root, result.runId);
 		expect(record).toMatchObject({ status: "running", configHash: configHash(SESSION_TEAM), task, process: processKey(), turns: 0 });
 		expect(record?.limits).toBeUndefined();
@@ -401,7 +437,7 @@ describe("run start", () => {
 			expect(result.ok).toBe(false);
 			if (!result.ok) reasons.add(result.reason);
 			expect(h.controller.directing()).toBe(false);
-			expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+			expect(activeLedgerRun(h.repo.root)).toBeUndefined();
 			expect(h.sent).toEqual([]);
 			// The refusal is not sticky: nothing is left starting or queued.
 			expect(h.controller.refusal()).toBeUndefined();
@@ -583,9 +619,325 @@ describe("run start", () => {
 		await until(async () => (await readRun(root, runId))?.endReason === "start-failed");
 		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", turns: 0 });
 		expect(h.controller.directing()).toBe(false);
-		expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
 		// The detached stop also appends the index line and prunes: let it finish before the directory goes.
 		await until(async () => (await readRunIndex(root)).length === 1);
+	});
+});
+
+describe("start with plan", () => {
+	const plan: RunPlan = {
+		lanes: [{ name: "probe", kind: "code", role: "implementer" }],
+		workers: { implementer: 1 },
+		submittedAt: "2026-11-20T09:00:00.000Z",
+	};
+
+	test("starts in the running turn without idle wait, compaction or a handoff, and binds the first plan", async () => {
+		const h = session({ hold: { idle: false }, usage: usage(300_000, 75) });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash(h.config));
+		if (!result.ok) throw new Error(result.reason);
+		expect(h.controller.directing()).toBe(true);
+		expect(h.sent).toEqual([]);
+		expect(h.events).toEqual([]);
+		expect(h.ui.selects).toEqual([]);
+		// Bound before admission returned: a spawn decided now reads this plan from the ledger.
+		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(plan);
+		expect(h.controller.active()?.plan).toEqual(plan);
+		expect(await readRun(root, result.runId)).toMatchObject({ status: "running", turns: 0, plan });
+		await h.controller.finish("no-changes");
+	});
+
+	test("the in-flight turn is round one; a reported continuation adds no phantom round or start", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		if (!result.ok) throw new Error(result.reason);
+		// omp reports the tool call's continuation before the turn is over: no round is counted or sent yet.
+		await h.controller.onAgentEnd({ willContinue: true }, h.ctx);
+		expect(h.controller.directing()).toBe(true);
+		expect(h.sent).toEqual([]);
+		expect(h.timers.pending()).toBe(0);
+		h.controller.onAgentStart();
+		completeLane(h, plan, agents);
+		await h.controller.onAgentEnd({}, h.ctx);
+		expect(h.controller.directing()).toBe(false);
+		expect(await readRun(root, result.runId)).toMatchObject({ turns: 1, endReason: "no-changes" });
+		expect(h.sent).toEqual([]);
+		expect(h.timers.pending()).toBe(0);
+		// A routine automatic end uses the live status line only, not a transcript summary.
+		expect(h.summaries()).toBe(0);
+	});
+
+	test("a refused admission leaves no run, record or ledger entry", async () => {
+		const h = session({ state: s => ({ ...s, approval: undefined }) });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		expect(result.ok).toBe(false);
+		expect(h.controller.directing()).toBe(false);
+		expect(h.controller.refusal()).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(await runIds(root)).toEqual([]);
+		expect(h.sent).toEqual([]);
+	});
+
+	test("automatic admission refuses active modes instead of changing them from a tool call", async () => {
+		for (const modes of [fakeModes({ vibe: true }), fakeModes({ goal: "active" }), fakeModes({ loop: "active" })]) {
+			const before = modes.snapshot();
+			const h = session({ modes, answers: [options => options[0]] });
+			const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+			expect(result.ok).toBe(false);
+			expect(h.ui.selects).toEqual([]);
+			expect(modes.requests).toEqual([]);
+			expect(modes.state).toEqual(before);
+			expect(h.sent).toEqual([]);
+		}
+	});
+
+	test("a team change after the plan was checked refuses instead of using the new authority", async () => {
+		const first = approvedState(root, SESSION_TEAM);
+		const changed = approvedState(root, { ...SESSION_TEAM, parallelism: 3 });
+		let loads = 0;
+		const h = session({ loadState: async () => (++loads === 1 ? first : changed) });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		expect(result.ok).toBe(false);
+		expect(loads).toBe(2);
+		expect(h.leases.acquired).toHaveLength(1);
+		expect(h.leases.released).toHaveLength(1);
+		expect(h.controller.directing()).toBe(false);
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(await runIds(root)).toEqual([]);
+	});
+
+	test("a shutdown while admission waits leaves nothing for the next session", async () => {
+		const waiting = Promise.withResolvers<void>();
+		const state = approvedState(root, SESSION_TEAM);
+		let loads = 0;
+		const h = session({
+			loadState: async () => {
+				loads++;
+				if (loads === 1) await waiting.promise;
+				return state;
+			},
+		});
+		const start = h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		await until(() => loads === 1);
+		await h.controller.finish("shutdown");
+		waiting.resolve();
+		expect(await start).toMatchObject({ ok: false });
+		expect(h.controller.directing()).toBe(false);
+		expect(h.controller.refusal()).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(await runIds(root)).toEqual([]);
+	});
+
+	test("a routine automatic end stays out of the transcript, but a blocked spawn is reported", async () => {
+		const quietAgents: AgentEntry[] = [];
+		const quiet = session({ agents: quietAgents });
+		await quiet.controller.startWithPlan(quiet.ctx, ask("probe"), plan);
+		completeLane(quiet, plan, quietAgents);
+		await quiet.controller.onAgentEnd({}, quiet.ctx);
+		expect(quiet.summaries()).toBe(0);
+
+		const loudAgents: AgentEntry[] = [];
+		const loud = session({ agents: loudAgents });
+		const started = await loud.controller.startWithPlan(loud.ctx, ask("probe"), plan);
+		if (!started.ok) throw new Error(started.reason);
+		completeLane(loud, plan, loudAgents);
+		noteRunSpawn(started.runId, { ...spawn, outcome: "blocked", code: "budget", reason: "no budget" });
+		await loud.controller.onAgentEnd({}, loud.ctx);
+		expect(loud.summaries()).toBe(1);
+	});
+});
+
+describe("lease, drain and required checks", () => {
+	const plan: RunPlan = {
+		lanes: [{ name: "probe", kind: "code", role: "implementer" }],
+		workers: { implementer: 1 },
+		submittedAt: "2026-11-20T09:00:00.000Z",
+	};
+	const checkTeam = (): StormConfig => ({
+		...SESSION_TEAM,
+		requiredChecks: [{ name: "unit", argv: ["/bin/sh", "-c", "echo x >> check-count"] }],
+	});
+
+	test("a start takes the lease after compaction and releases it only at finalization", async () => {
+		const h = session({ usage: usage(200_000, 50) });
+		const runId = await h.start();
+		expect(h.leases.acquired).toEqual([runId]);
+		expect(h.leases.released).toEqual([]);
+		expect(h.events).toContain("compact");
+		await h.controller.finish("no-changes");
+		expect(h.leases.released).toEqual([runId]);
+	});
+
+	test("a failed lease acquisition refuses the start and leaves no run", async () => {
+		const h = session({ lease: async () => ({ ok: false, reason: "다른 실행이 이 작업 트리를 쓰고 있습니다." }) });
+		const result = await h.controller.start(h.ctx, ask("task"));
+		expect(result).toMatchObject({ ok: false, reason: "다른 실행이 이 작업 트리를 쓰고 있습니다." });
+		expect(h.controller.directing()).toBe(false);
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(await runIds(root)).toEqual([]);
+	});
+
+	test("a plan hash other than the approved team refuses before taking the lease", async () => {
+		const h = session();
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash({ ...h.config, parallelism: 3 }));
+		expect(result.ok).toBe(false);
+		expect(h.leases.acquired).toEqual([]);
+		expect(h.controller.directing()).toBe(false);
+		expect(await runIds(root)).toEqual([]);
+	});
+
+	test("a no-change round with an open planned lane continues once, then ends no-progress", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		if (!result.ok) throw new Error(result.reason);
+		await h.controller.onAgentEnd({}, h.ctx);
+		expect(h.controller.directing()).toBe(true);
+		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
+		h.timers.fire();
+		await until(() => h.sent.length === 1);
+		expect(h.sent[0]).toContain('round="2/4"');
+		await h.turn();
+		expect(await readRun(root, result.runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+	});
+
+	test("stopping with a running owned worker keeps scope, lease and record until it settles", async () => {
+		const agents = [agentEntry({ id: "Impl", role: "implementer", state: "running" })];
+		const h = session({ agents });
+		const runId = await h.start();
+		expect(await h.controller.finish("no-changes")).toBeUndefined();
+		expect(getLedgerRun(runId)?.closing).toBe(true);
+		expect(h.leases.released).toEqual([]);
+		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		expect(h.timers.pending()).toBeGreaterThan(0);
+		agents[0]!.state = "idle";
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.status === "ended");
+		await until(() => h.leases.released.length === 1);
+		expect(h.leases.released).toEqual([runId]);
+		expect(getLedgerRun(runId)).toBeUndefined();
+	});
+
+	test("a running async job owned by the run also defers finalization", async () => {
+		let running: AsyncJobSnapshot["running"] = [
+			{ id: "job", type: "task", status: "running", label: "job", startTime: 0, ownerId: "Impl" },
+		];
+		const h = session({
+			agents: [agentEntry({ id: "Impl", role: "implementer" })],
+			asyncJobs: () => ({ running, recent: [], delivery: {} as AsyncJobSnapshot["delivery"] }),
+		});
+		const runId = await h.start();
+		expect(await h.controller.finish("shutdown")).toBeUndefined();
+		expect(h.leases.released).toEqual([]);
+		running = [];
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.status === "stopped");
+		await until(() => h.leases.released.length === 1);
+		expect(h.leases.released).toEqual([runId]);
+	});
+
+	test("a verified run that had to drain rechecks its proof before keeping the label", async () => {
+		const agents: AgentEntry[] = [writer(), verdict(T0 + 1, true, "d1:f0"), agentEntry({ id: "Slow", role: "explorer", state: "running" })];
+		let tree = treeOf("d0", "f0");
+		const h = session({ agents, tree: () => treeAt(tree) });
+		const runId = await h.start();
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		// The gate passed, but an owned worker was still running: finalization waits instead of recording verified.
+		expect(getLedgerRun(runId)?.closing).toBe(true);
+		expect(h.leases.released).toEqual([]);
+		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		tree = treeOf("d2", "f0");
+		agents[2]!.state = "idle";
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.status !== "running");
+		expect(await readRun(root, runId)).toMatchObject({ endReason: "no-progress" });
+		await until(() => h.leases.released.length === 1);
+		expect(h.leases.released).toEqual([runId]);
+	});
+
+	test("a lane round is sent even when the team has no reviewer role", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ config: { ...SESSION_TEAM, disabledRoles: ["reviewer"] }, agents });
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
+		if (!result.ok) throw new Error(result.reason);
+		await h.controller.onAgentEnd({}, h.ctx);
+		h.timers.fire();
+		await until(() => h.sent.length === 1);
+		expect(h.sent[0]).toContain('round="2/4"');
+		await h.controller.finish("shutdown");
+	});
+
+	test("a last-round review with a pending check verifies from the timer without another model round", async () => {
+		const agents: AgentEntry[] = [writer(), verdict(T0 + 1, true, "d1:f0")];
+		let tree = treeOf("d0", "f0");
+		const h = session({ config: checkTeam(), agents, tree: () => treeAt(tree) });
+		const runId = await h.start({ task: "probe", rounds: 1 });
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers.pending()).toBe(1);
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		expect(h.sent).toHaveLength(1);
+		expect((await readRun(root, runId))?.checks).toEqual([{ name: "unit", status: "passed", exitCode: 0, tree: "d1:f0" }]);
+	});
+
+	test("a failed verification-only check ends the last round honestly and does not retry", async () => {
+		const agents: AgentEntry[] = [writer(), verdict(T0 + 1, true, "d1:f0")];
+		let tree = treeOf("d0", "f0");
+		const config: StormConfig = { ...SESSION_TEAM, requiredChecks: [{ name: "unit", argv: ["/bin/sh", "-c", "echo x >> check-count; exit 1"] }] };
+		const h = session({ config, agents, tree: () => treeAt(tree) });
+		const runId = await h.start({ task: "probe", rounds: 1 });
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.status !== "running");
+		expect(await readRun(root, runId)).toMatchObject({ endReason: "round-limit", turns: 1 });
+		expect(h.sent).toHaveLength(1);
+		expect(readFileSync(path.join(root, "check-count"), "utf8")).toBe("x\n");
+	});
+
+	test("required checks run once for a changed tree and their compact evidence is recorded", async () => {
+		const agents: AgentEntry[] = [writer()];
+		let tree = treeOf("d0", "f0");
+		const h = session({ config: checkTeam(), agents, tree: () => treeAt(tree) });
+		const runId = await h.start();
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		agents.push(verdict(T0 + 1, true, "d1:f0"));
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		expect(readFileSync(path.join(root, "check-count"), "utf8")).toBe("x\n");
+		expect(((await readRun(root, runId)) as RunRecord).checks).toEqual([
+			{ name: "unit", status: "passed", exitCode: 0, tree: "d1:f0" },
+		]);
+	});
+
+	test("required checks do not run for a round that changed nothing", async () => {
+		const h = session({ config: checkTeam() });
+		const runId = await h.start();
+		await h.turn();
+		expect(existsSync(path.join(root, "check-count"))).toBe(false);
+		expect(await readRun(root, runId)).toMatchObject({ endReason: "no-changes" });
+	});
+
+	test("a withdrawn approval withholds the pass without executing checks", async () => {
+		let state = approvedState(root, checkTeam());
+		const agents: AgentEntry[] = [writer()];
+		let tree = treeOf("d0", "f0");
+		const h = session({ config: checkTeam(), agents, tree: () => treeAt(tree), loadState: async () => state });
+		const runId = await h.start();
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		state = { ...state, approval: undefined };
+		agents.push(verdict(T0 + 1, true, "d1:f0"));
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(existsSync(path.join(root, "check-count"))).toBe(false);
+		expect((await readRun(root, runId))?.endReason).toBeUndefined();
+		await h.controller.finish("shutdown");
 	});
 });
 
@@ -615,7 +967,7 @@ describe("run end", () => {
 		await h.turn();
 		expect(h.summaries()).toBe(1);
 		expect(h.ui.records[0]?.markdown).toBe(summarizeRun((await readRun(root, runId)) as RunRecord));
-		expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
 		const ended = (await readRun(root, runId))?.endedAt;
 
 		await h.turn();
@@ -673,10 +1025,10 @@ describe("run end", () => {
 		const h = session({ config: { ...SESSION_TEAM, budget: { perRunUsd: 1, onExceed: "block-spawns" } } });
 		const runId = await h.start();
 		expect((await readRun(root, runId))?.budget).toEqual({ perRunUsd: 1, onExceed: "block-spawns" });
-		recordCost(h.repo.repoId, "a/i", 0.5);
-		expect(activeLedgerRun(h.repo.repoId)?.exceeded).toBe(false);
-		recordCost(h.repo.repoId, "a/i", 0.5);
-		expect(activeLedgerRun(h.repo.repoId)?.exceeded).toBe(true);
+		recordCost(runId, "a/i", 0.5);
+		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(false);
+		recordCost(runId, "a/i", 0.5);
+		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(true);
 		expect(await h.controller.finish("no-changes")).toMatchObject({ status: "budget-exceeded", endReason: "no-changes", costUsd: 1 });
 	});
 
@@ -703,7 +1055,7 @@ describe("round loop", () => {
 
 	test("a writer with no verdict gets round 2; a correct verdict after the change then verifies it", async () => {
 		const agents = [writer()];
-		const h = session({ agents });
+		const h = session({ agents, tree: () => treeAt() });
 		const runId = await h.start();
 		await h.turn();
 		expect(h.controller.directing()).toBe(true);
@@ -713,7 +1065,7 @@ describe("round loop", () => {
 		await until(() => h.sent.length === 2);
 		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
 
-		agents.push(verdict(T0 + 1, true));
+		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
 		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
@@ -821,11 +1173,11 @@ describe("round loop", () => {
 
 	test("a verdict that arrives before the timer fires is used: the run verifies, nothing is sent", async () => {
 		const agents = [writer()];
-		const h = session({ agents });
+		const h = session({ agents, tree: () => treeAt() });
 		const runId = await h.start();
 		await h.turn();
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
-		agents.push(verdict(T0 + 1, true));
+		agents.push(verdict(T0 + 1, true, F0));
 		h.timers.fire();
 		await until(async () => (await readRun(root, runId))?.endReason === "verified");
 		expect(h.sent).toHaveLength(1);
@@ -834,17 +1186,17 @@ describe("round loop", () => {
 
 	test("a turn that starts before the timer fires clears it, and its end decides again", async () => {
 		const agents = [writer()];
-		const h = session({ agents });
+		const h = session({ agents, tree: () => treeAt() });
 		const runId = await h.start();
 		await h.turn();
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.controller.onAgentStart();
 		expect(h.timers.pending()).toBe(0);
-		// The user's own turn ends: a round, decided from fresh evidence.
-		agents.push(verdict(T0 + 1, true));
+		// The user's own turn can verify the work, but it does not spend another scheduled verification round.
+		agents.push(verdict(T0 + 1, true, F0));
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
 	});
 
 	test("a round message that cannot be sent ends the run no-progress with a warning", async () => {
@@ -891,6 +1243,7 @@ describe("round loop", () => {
 		const agents = [writer()];
 		const h = session({
 			agents,
+			tree: () => treeAt(),
 			send: async text => {
 				if (text.includes('round="2/4"')) await pending.promise;
 			},
@@ -900,7 +1253,7 @@ describe("round loop", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		// The next turn starts and settles while that send is still pending.
-		agents.push(verdict(T0 + 1, true));
+		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
 		await until(async () => (await readRun(root, runId))?.endReason === "verified");
 		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
@@ -921,8 +1274,8 @@ describe("round loop", () => {
 			agents: [writer()],
 		});
 		const runId = await h.start();
-		recordCost(h.repo.repoId, "a/i", 2);
-		expect(activeLedgerRun(h.repo.repoId)?.exceeded).toBe(true);
+		recordCost(runId, "a/i", 2);
+		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(true);
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
 		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
@@ -968,7 +1321,7 @@ describe("round loop", () => {
 			const runId = await h.start();
 			await h.turn();
 			expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
-			if (end === "budget") recordCost(h.repo.repoId, "a/i", 2);
+			if (end === "budget") recordCost(runId, "a/i", 2);
 			else await h.controller.finish("shutdown");
 			expect(h.controller.directing()).toBe(false);
 			expect(h.timers.pending()).toBe(0);
@@ -1004,7 +1357,7 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 2);
 		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
 
-		agents.push(agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at: T0 + 1, correct: true, tree: "d1:f0" } }));
+		agents.push(verdict(T0 + 1, true, "d1:f0"));
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
 		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
@@ -1022,25 +1375,27 @@ describe("changes seen through the work tree", () => {
 		});
 		await h.start();
 		expect(calls).toEqual([{ root }]);
-		expect(activeLedgerRun(h.repo.repoId)?.base).toBe(BASE);
+		expect(activeLedgerRun(h.repo.root)?.base).toBe(BASE);
 		tree = treeOf("d1", "f0");
 		await h.turn();
 		expect(calls.at(-1)).toEqual({ root, base: BASE });
 		await h.controller.finish("shutdown");
 	});
 
-	test("a tree that changes after every verdict gets one re-review, then the run ends verified", async () => {
+	test("a tree that changes after every verdict gets one re-review, then stops no-progress", async () => {
 		let now = T0;
 		let tree = treeOf("d0", "f0");
 		const agents: AgentEntry[] = [implementer];
-		const review = (at: number, treeHash: string): AgentEntry =>
-			agentEntry({
+		const review = (at: number, treeHash: string): StructuredReviewAgent => ({
+			...agentEntry({
 				id: `Rev${at}`,
 				name: "storm-reviewer",
 				role: "reviewer",
 				review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] },
 				lastVerdict: { at, correct: true, tree: treeHash },
-			});
+			}),
+			reviewLog: [{ at, correct: true, findings: [], tree: treeHash }],
+		});
 		const h = session({ agents: () => agents, tree: () => reading(tree), now: () => now });
 		const runId = await h.start();
 		tree = treeOf("d1", "f0");
@@ -1058,12 +1413,12 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 3);
 		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3/4">`);
 
-		// After the one asked-for tree review, a later verdict is honoured even though the tree moved again.
+		// After the one asked-for tree review, another moved tree is exhausted proof, not a pass.
 		agents.push(review(T0 + 200, "d2:f0"));
 		tree = treeOf("d3", "f0");
 		await h.turn();
 		expect(h.sent).toHaveLength(3);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 3 });
+		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
 	});
 
 	test("a team change after the re-review's verdict is not excused and gets another round", async () => {
@@ -1071,14 +1426,16 @@ describe("changes seen through the work tree", () => {
 		let tree = treeOf("d0", "f0");
 		const impl = agentEntry({ id: "Impl", role: "implementer", changes: 0 });
 		const agents: AgentEntry[] = [impl];
-		const review = (at: number, pair: string): AgentEntry =>
-			agentEntry({
+		const review = (at: number, pair: string): StructuredReviewAgent => ({
+			...agentEntry({
 				id: `Rev${at}`,
 				name: "storm-reviewer",
 				role: "reviewer",
 				review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] },
 				lastVerdict: { at, correct: true, tree: pair },
-			});
+			}),
+			reviewLog: [{ at, correct: true, findings: [], tree: pair }],
+		});
 		const h = session({ agents: () => agents, tree: () => reading(tree), now: () => now });
 		const runId = await h.start();
 		tree = treeOf("d1", "f0");
@@ -1147,7 +1504,7 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 2);
 
 		// Round 2: a passing verdict against d1, then the tree moves again before the turn ends.
-		agents.push(agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at: T0 + 1, correct: true, tree: "d1:f0" } }));
+		agents.push(verdict(T0 + 1, true, "d1:f0"));
 		tree = treeOf("d2", "f0");
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
@@ -1156,7 +1513,7 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 3);
 		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3/4">`);
 
-		agents.push(agentEntry({ id: "Rev2", name: "storm-reviewer", role: "reviewer", lastVerdict: { at: T0 + 2, correct: true, tree: "d2:f0" } }));
+		agents.push(verdict(T0 + 2, true, "d2:f0", { id: "Rev2" }));
 		await h.turn();
 		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 3 });
 	});
@@ -1190,7 +1547,7 @@ describe("changes seen through the work tree", () => {
 		await h.controller.finish("shutdown");
 	});
 
-	test("without a tree dep the tool counts alone decide, as before", async () => {
+	test("without a tree dep a positive verdict cannot bind, so the run stays unverified", async () => {
 		const agents: AgentEntry[] = [writer()];
 		const h = session({ agents });
 		const runId = await h.start();
@@ -1200,7 +1557,9 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 2);
 		agents.push(verdict(T0 + 1, true));
 		await h.turn();
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		expect(h.controller.active()).toMatchObject({ status: "running", turns: 2 });
+		expect((await readRun(root, runId))?.endReason).toBeUndefined();
+		await h.controller.finish("shutdown");
 	});
 
 	test("a decision that resolves after a turn started is dropped", async () => {
@@ -1370,13 +1729,14 @@ describe("run failures behind a timer", () => {
 
 	test("a look that cannot end the run reports the failure instead of leaving a rejected promise", async () => {
 		const agents = [writer()];
-		const h = session({ agents });
-		await h.start();
+		const h = session({ agents, tree: () => treeAt() });
+		const runId = await h.start();
 		await h.turn();
-		agents.push(verdict(T0 + 1, true));
+		agents.push(verdict(T0 + 1, true, F0));
 		await breakRecords();
 		h.timers.fire();
 		await until(() => h.notices.some(n => n.level === "error"));
+		await until(() => h.leases.released.includes(runId));
 		expect(h.controller.directing()).toBe(false);
 	});
 
@@ -1403,14 +1763,14 @@ describe("budget", () => {
 		const h = session({ config: budget("stop") });
 		const runId = await h.start();
 		h.controller.onAgentStart();
-		recordCost(h.repo.repoId, "a/i", 1);
+		recordCost(runId, "a/i", 1);
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(1);
 		expect(h.aborts()).toBe(0);
-		recordCost(h.repo.repoId, "a/i", 1);
+		recordCost(runId, "a/i", 1);
 		expect(h.aborts()).toBe(1);
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(2);
 		// More spend while the aborted turn winds down does not abort again.
-		recordCost(h.repo.repoId, "a/i", 1);
+		recordCost(runId, "a/i", 1);
 		expect(h.aborts()).toBe(1);
 		expect(h.controller.directing()).toBe(true);
 		await h.controller.onAgentEnd({}, h.ctx);
@@ -1423,7 +1783,7 @@ describe("budget", () => {
 		const h = session({ config: budget("block-spawns") });
 		const runId = await h.start();
 		h.controller.onAgentStart();
-		recordCost(h.repo.repoId, "a/i", 5);
+		recordCost(runId, "a/i", 5);
 		expect(h.aborts()).toBe(0);
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(2);
 		expect(h.controller.directing()).toBe(true);
@@ -1435,7 +1795,7 @@ describe("budget", () => {
 		const h = session({ config: budget("stop"), agents: [writer()] });
 		const runId = await h.start();
 		h.controller.onAgentStart();
-		recordCost(h.repo.repoId, "a/i", 2);
+		recordCost(runId, "a/i", 2);
 		expect(h.aborts()).toBe(1);
 		// omp marks the aborted turn's last assistant message; without the end decided earlier it would read interrupted.
 		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
@@ -1448,7 +1808,7 @@ describe("budget", () => {
 		const runId = await h.start();
 		await h.turn();
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
-		recordCost(h.repo.repoId, "a/i", 2);
+		recordCost(runId, "a/i", 2);
 		expect(h.aborts()).toBe(0);
 		expect(h.controller.directing()).toBe(false);
 		expect(h.timers.pending()).toBe(0);
@@ -1458,8 +1818,8 @@ describe("budget", () => {
 
 	test("without a budget no spend warns or aborts", async () => {
 		const h = session();
-		await h.start();
-		recordCost(h.repo.repoId, "a/i", 1_000);
+		const runId = await h.start();
+		recordCost(runId, "a/i", 1_000);
 		expect(h.aborts()).toBe(0);
 		expect(h.notices.some(n => n.level !== "info")).toBe(false);
 		expect((await h.controller.finish("verified"))?.status).toBe("done");
@@ -1607,7 +1967,7 @@ describe("director counters", () => {
 		h.controller.noteMainContext(999_999);
 		expect(h.controller.directing()).toBe(false);
 
-		await h.start();
+		const runId = await h.start();
 		h.controller.noteMainSpend(1.5);
 		h.controller.noteMainSpend(0.5);
 		h.controller.noteBlockedEdit();
@@ -1616,7 +1976,7 @@ describe("director counters", () => {
 		h.controller.noteMainContext(80_000);
 		h.controller.noteMainContext(120_000);
 		h.controller.noteMainContext(90_000);
-		recordCost(h.repo.repoId, "a/i", 4);
+		recordCost(runId, "a/i", 4);
 		const record = await h.controller.finish("no-changes");
 		expect(record).toMatchObject({ mainCostUsd: 2, blockedEdits: 1, blockedFollowUps: 2, costUsd: 4, maxMainContext: 120_000 });
 		expect(record?.reads).toBeUndefined();
@@ -1758,14 +2118,14 @@ describe("run plan", () => {
 		const h = session();
 		expect(h.controller.setPlan(plan)).toMatchObject({ ok: false });
 		const runId = await h.start();
-		expect(activeLedgerRun(h.repo.repoId)?.plan).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)?.plan).toBeUndefined();
 		expect(h.controller.setPlan(plan)).toEqual({ ok: true });
-		expect(activeLedgerRun(h.repo.repoId)?.plan).toEqual(plan);
+		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(plan);
 		expect(h.controller.active()?.plan).toEqual(plan);
 		noteRunSpawn(runId, spawn);
 		expect(runSpawns(runId)).toEqual([spawn]);
 		const record = await h.controller.finish("no-changes");
 		expect(record).toMatchObject({ plan });
-		expect(activeLedgerRun(h.repo.repoId)).toBeUndefined();
+		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
 	});
 });

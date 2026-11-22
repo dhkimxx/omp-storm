@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { reviewLine, reviewTotals, tallyFromYield } from "../src/runtime/review.ts";
+import { reviewEvidenceOf, reviewLine, reviewPart, reviewTotals, tallyFromYield } from "../src/runtime/review.ts";
 import type { AgentEntry, ReviewTally } from "../src/types.ts";
 import { agentEntry } from "./fixtures.ts";
 
@@ -88,5 +88,59 @@ describe("review totals", () => {
 		]);
 		expect(withDocs).toEqual([2, 1, 1, 1, 2, 2, 1, 3]);
 		expect(numbers([a({ reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0], docFindings: 0 })])).toEqual([1, 1, 0]);
+	});
+});
+
+describe("structured review evidence", () => {
+	const withLog = (log: unknown, overflow = false): AgentEntry => {
+		const entry = agentEntry();
+		const evidence = entry as unknown as { reviewLog?: unknown; reviewLogOverflow?: true };
+		evidence.reviewLog = log;
+		if (overflow) evidence.reviewLogOverflow = true;
+		return entry;
+	};
+
+	test("reviewPart separates an incremental findings section from a verdict", () => {
+		expect(reviewPart({ type: ["findings"], data: { priority: 0, kind: "doc_conflict" } })).toEqual({
+			kind: "findings",
+			findings: [{ priority: 0, kind: "doc_conflict" }],
+		});
+		expect(reviewPart({ data: { overall_correctness: "incorrect", findings: [{ priority: 2 }, { priority: 9 }] } })).toEqual({
+			kind: "verdict",
+			correct: false,
+			findings: [{ priority: 2 }],
+		});
+		expect(reviewPart({ type: ["findings"], data: [{ priority: 4 }] })).toBeUndefined();
+		expect(reviewPart({ data: { summary: "done" } })).toBeUndefined();
+		expect(reviewPart({ error: "x" })).toBeUndefined();
+	});
+
+	test("the proof keeps only structured priority and kind, never bodies or raw logs", () => {
+		const entry = withLog([
+			{
+				at: 7,
+				correct: true,
+				tree: "d:f",
+				body: "raw command output",
+				output: "line 1\nline 2",
+				findings: [{ priority: 0, kind: "code", title: "x", body: "raw", file_path: "a.ts" }],
+			},
+		]);
+		expect(reviewEvidenceOf(entry)).toEqual({
+			complete: true,
+			records: [{ at: 7, correct: true, tree: "d:f", findings: [{ priority: 0, kind: "code" }] }],
+		});
+	});
+
+	test("an absent log is readable history with no records", () => {
+		expect(reviewEvidenceOf(agentEntry())).toEqual({ records: [], complete: true });
+	});
+
+	test("a malformed or truncated log is not proof", () => {
+		expect(reviewEvidenceOf(withLog("not a log"))).toEqual({ records: [], complete: false });
+		expect(reviewEvidenceOf(withLog([{ at: 1, correct: true, findings: [{ priority: 9 }] }]))).toEqual({ records: [], complete: false });
+		expect(reviewEvidenceOf(withLog([{ at: "1", correct: true, findings: [] }]))).toEqual({ records: [], complete: false });
+		expect(reviewEvidenceOf(withLog([{ at: 1, correct: "yes", findings: [] }]))).toEqual({ records: [], complete: false });
+		expect(reviewEvidenceOf(withLog([], true))).toEqual({ records: [], complete: false });
 	});
 });

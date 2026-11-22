@@ -8,6 +8,7 @@ import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
+import { readAutoDelegation } from "../src/approval/auto.ts";
 import { serializeConfig } from "../src/config/store.ts";
 import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../src/flows.ts";
 import { APPROVE } from "../src/proposals/present.ts";
@@ -466,15 +467,15 @@ describe("accepting on a small terminal", () => {
 		context: UiContext;
 	}
 
-	/** A port that records every dialog with its context and answers from `answers` (by position; none left → no answer). */
-	function recordingUi(answers: number[] = []): { ui: UiPort; dialogs: Dialog[] } {
+	/** Records dialogs and answers each by exact label or position; none left means no answer. */
+	function recordingUi(answers: Array<number | string> = []): { ui: UiPort; dialogs: Dialog[] } {
 		const dialogs: Dialog[] = [];
 		const queue = [...answers];
 		const ui: UiPort = {
 			async select(title, options, context) {
 				if (context) dialogs.push({ title, options: [...options], context });
 				const at = queue.shift();
-				return at === undefined ? undefined : options.at(at);
+				return typeof at === "number" ? options.at(at) : at !== undefined && options.includes(at) ? at : undefined;
 			},
 			notify() {},
 			async report() {},
@@ -546,16 +547,16 @@ describe("accepting on a small terminal", () => {
 		expect(host.overlays).toBe(0);
 	});
 
-	test("on 30 rows the panel still shows what approval switches on: the cleanup notice and the shadowing definition", async () => {
+	test("on 30 rows the approval starts with the auto default; clipped details still require the full view", async () => {
 		const dialog = await setupDialog();
 		const host = fakeHost({ mode: "tui", hasUI: true, rows: 30, answers: [undefined] });
 		await createUiPort(host.pi, host.ctx).select(dialog.title, dialog.options, dialog.context);
 		const panel = host.selects[0]!.panel!;
 		expect(panel.length).toBeLessThanOrEqual(30 - dialog.options.length);
-		// The notice is the dialog's first line; the shadow row names the file.
-		const lead = dialog.context.markdown.split("\n")[0]!;
-		expect(panel.join("\n")).toContain(lead.slice(0, 12));
-		expect(panel.some(line => line.includes("/repo/.omp/agents/shadow-file.md"))).toBe(true);
+		expect(panel.join("\n")).toContain("승인하면 자동 위임이 켜집니다");
+		expect(dialog.context.markdown).toContain("실행이 끝나면 정리");
+		expect(dialog.context.markdown).toContain("/repo/.omp/agents/shadow-file.md");
+		expect(host.selects[0]?.options).not.toContain(APPROVE);
 	});
 
 	test("the whole role interview on 24 rows: approval only after the full view", async () => {
@@ -600,7 +601,9 @@ describe("accepting on a small terminal", () => {
 		expect(saved?.cleanup).toBe(true);
 		expect(saved?.parallelism).toBe(3);
 		expect(host.overlays).toBe(1);
-		expect(host.notified).toHaveLength(1);
+		expect(host.selects).toHaveLength(3);
+		expect(host.selects.at(-1)?.options).toContain(APPROVE);
+		expect(await readAutoDelegation(state.store.dir)).toBe(true);
 	});
 
 	test("every dialog that approves, restores or deletes names the options that do", async () => {
@@ -610,14 +613,14 @@ describe("accepting on a small terminal", () => {
 		await hubFlow(env, unapproved.ui);
 		expect(unapproved.dialogs[0]?.context.consent).toEqual([APPROVE]);
 
-		// Rollback: the confirmation, not the menu before it.
+		// The legacy hub marks switching on as consent. Its ordinary rollback item needs consent on the next screen.
 		const state = await loadProjectState(env);
 		await approveAndSave(state, TEAM, { shadowedAgents: state.shadows });
 		await approveAndSave(await loadProjectState(env), { ...TEAM, parallelism: 2 }, { shadowedAgents: state.shadows });
-		const rollback = recordingUi([2, 0]);
+		const rollback = recordingUi(["이전 승인으로 되돌리기", 0]);
 		await hubFlow(env, rollback.ui);
 		const [menu, confirm] = rollback.dialogs;
-		expect(menu?.context.consent).toBeUndefined();
+		expect(menu?.context.consent).toEqual(["자동 위임으로 전환"]);
 		expect(confirm?.context.consent).toEqual([confirm!.options[0]!]);
 
 		// Reset: everything but the cancel deletes.

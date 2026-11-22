@@ -8,7 +8,9 @@ import { ROLES, STORM_VERSION } from "../src/roles.ts";
 import { summarizeRun } from "../src/runtime/controller.ts";
 import {
 	activeLedgerRun,
+	bindLedgerChild,
 	endLedgerRun,
+	ledgerRunForChild,
 	type LedgerRun,
 	recordCost,
 	resetLedger,
@@ -49,16 +51,16 @@ describe("ledger", () => {
 				throw new Error("listener failed");
 			},
 		});
-		recordCost("repo", "openai/gpt-5.2", 0.3);
-		recordCost("repo", "openai/gpt-5.2", 0.3);
-		recordCost("repo", "google/gemini-flash", 0.2);
-		recordCost("repo", "google/gemini-flash", 0.5);
-		recordCost("repo", "google/gemini-flash", 0.5);
+		recordCost("run-a", "openai/gpt-5.2", 0.3);
+		recordCost("run-a", "openai/gpt-5.2", 0.3);
+		recordCost("run-a", "google/gemini-flash", 0.2);
+		recordCost("run-a", "google/gemini-flash", 0.5);
+		recordCost("run-a", "google/gemini-flash", 0.5);
 		expect(seen.map(s => s.slice(0, 3))).toEqual([
 			["warn", true, false],
 			["limit", true, true],
 		]);
-		const run = activeLedgerRun("repo");
+		const run = activeLedgerRun(root);
 		expect(run?.costUsd).toBeCloseTo(1.8);
 		expect(run?.costByModel["openai/gpt-5.2"]).toBeCloseTo(0.6);
 		expect(run?.costByModel["google/gemini-flash"]).toBeCloseTo(1.2);
@@ -73,7 +75,7 @@ describe("ledger", () => {
 			budget: { perRunUsd: 1, onExceed: "stop" },
 			onThreshold: kind => kinds.push(kind),
 		});
-		recordCost("repo", "m", 2);
+		recordCost("run-a", "m", 2);
 		expect(kinds).toEqual(["limit"]);
 		endLedgerRun("run-a");
 		const both: string[] = [];
@@ -84,25 +86,35 @@ describe("ledger", () => {
 			budget: { perRunUsd: 1, warnAtUsd: 0.5, onExceed: "stop" },
 			onThreshold: kind => both.push(kind),
 		});
-		recordCost("repo", "m", 3);
+		recordCost("run-b", "m", 3);
 		expect(both).toEqual(["warn", "limit"]);
 	});
 
-	test("one run per repo; costs without a run or with bad values are ignored", () => {
-		expect(recordCost("repo", "m", 1)).toBeUndefined();
+	test("linked worktrees can own independent runs and costs without sharing the approval key", () => {
+		expect(recordCost("unknown", "m", 1)).toBeUndefined();
 		const run: LedgerRun = startLedgerRun({ runId: "run-a", repoId: "repo", root });
 		expect(() => startLedgerRun({ runId: "run-b", repoId: "repo", root })).toThrow();
-		startLedgerRun({ runId: "run-c", repoId: "other", root });
-		recordCost("repo", "m", Number.NaN);
-		recordCost("repo", "m", -1);
-		recordCost("repo", "m", Number.POSITIVE_INFINITY);
+		const linked = path.join(root, "linked");
+		const other = startLedgerRun({ runId: "run-c", repoId: "repo", root: linked });
+		recordCost("run-a", "m", Number.NaN);
+		expect(bindLedgerChild("run-a", "Worker", "Main", "/session/a")).toBe(true);
+		expect(bindLedgerChild("run-c", "Worker", "Main", "/session/b")).toBe(true);
+		expect(bindLedgerChild("run-c", "Worker", "Main", "/session/a")).toBe(false);
+		expect(ledgerRunForChild("Worker", "Main", "/session/a")).toBe(run);
+		expect(ledgerRunForChild("Worker", "Main", "/session/b")).toBe(other);
+		expect(ledgerRunForChild("Worker", "OtherParent", "/session/a")).toBeUndefined();
+		recordCost("run-a", "m", -1);
+		recordCost("run-a", "m", Number.POSITIVE_INFINITY);
 		expect(run.costUsd).toBe(0);
 		expect(run.costByModel).toEqual({});
-		recordCost("repo", "m", 0.25);
+		recordCost("run-a", "m", 0.25);
 		expect(run.costUsd).toBe(0.25);
+		expect(other.costUsd).toBe(0);
 		expect(endLedgerRun("run-a")).toBe(run);
-		expect(activeLedgerRun("repo")).toBeUndefined();
-		expect(activeLedgerRun("other")?.runId).toBe("run-c");
+		expect(activeLedgerRun(root)).toBeUndefined();
+		expect(ledgerRunForChild("Worker", "Main", "/session/a")).toBeUndefined();
+		expect(ledgerRunForChild("Worker", "Main", "/session/b")).toBe(other);
+		expect(activeLedgerRun(linked)).toBe(other);
 		expect(endLedgerRun("run-a")).toBeUndefined();
 		startLedgerRun({ runId: "run-d", repoId: "repo", root });
 	});

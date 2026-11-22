@@ -9,6 +9,8 @@
  * - Nothing is approved unless the user picked the approve option in a dialog.
  */
 
+import type { ReviewEvidence } from "./runtime/review.ts";
+
 // ── Primitives ─────────────────────────────────────────────────────────────────────────────
 
 export type Effort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -397,6 +399,17 @@ export interface BudgetConfig {
 /** A config's stored priority: "speed" and "quota" were choices before 0.10 and are read as "balanced" (`teamPriority`). */
 export type StoredPriority = Priority | "speed" | "quota";
 
+/**
+ * One verification command an approved config obliges a run to pass. `argv` is executed directly, first element as
+ * the executable and the rest as its arguments: no shell, interpolation or generated script.
+ */
+export interface RequiredCheck {
+	/** Unique, non-blank label; shown with the exact command in the approval dialog and in run evidence. */
+	name: string;
+	/** Executable first, then its arguments, in order. */
+	argv: string[];
+}
+
 /** `.omp/storm/config.json` (schema version 1). Unknown fields are kept and hashed. */
 export interface StormConfig {
 	version: 1;
@@ -429,6 +442,11 @@ export interface StormConfig {
 	docs?: boolean;
 	/** Extra rounds Storm may send a run back for when its changes are unverified (0..10); 3 when absent. */
 	rounds?: number;
+	/**
+	 * Verification commands the approved config obliges a run to pass, in order, in the run's target tree. Run only
+	 * under an approved config whose hash the user approved; absent → no checks and the config hash is unchanged.
+	 */
+	requiredChecks?: RequiredCheck[];
 }
 
 export type ConfigLoad =
@@ -538,6 +556,8 @@ export interface StatusView {
 	config: ConfigLoad;
 	/** Active approval for the current config hash, if any. */
 	approval: ApprovalRecord | undefined;
+	/** Personal consent, separate from approval of the team's configuration. */
+	autoDelegation?: "off" | "on" | "blocked";
 	/** Shadowing definitions; a project one's `path` is relative to the project root here. */
 	shadows: ShadowInfo[];
 	/** Provider quota, when it was read (it takes about a second); absent → no quota section. */
@@ -656,6 +676,16 @@ export interface SpawnRecord {
 	trialId?: string;
 	/** The caller's per-spawn key (task item name or eval label); omp names the subagent and its transcript after it. */
 	spawnKey?: string;
+	/** Director plan lane this admitted spawn was assigned to, when it came through the task tool. */
+	lane?: string;
+}
+
+/** Execution evidence for one approved command: raw output is not part of the run record. */
+export interface RunCheckEvidence {
+	name: string;
+	status: string;
+	exitCode: number | null;
+	tree: string;
 }
 
 /** `<root>/.omp/storm/state/runs/<runId>.json`: what one Storm run did and under which approval. */
@@ -682,6 +712,7 @@ export interface RunRecord {
 	/** Spend by "provider/model". */
 	costByModel: Record<string, number>;
 	budget?: BudgetConfig;
+	checks?: RunCheckEvidence[];
 	spawns: SpawnRecord[];
 	/** Subagents seen during the run, from the agent ledger. */
 	agents?: AgentEntry[];
@@ -943,6 +974,8 @@ export interface AgentEntry {
 	/** "provider/model" of its last assistant message. */
 	model?: string;
 	state: AgentLiveState;
+	/** The host's most recent settled turn reported an error, abort, or output limit. */
+	lastWorkFailed?: true;
 	/** ms since epoch. */
 	startedAt: number;
 	lastActivityAt: number;
@@ -955,6 +988,10 @@ export interface AgentEntry {
 	followUps: number;
 	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
 	review?: ReviewTally;
+	/** Bounded structured evidence, not the reviewer's commentary or raw output. */
+	reviewLog?: ReviewEvidence[];
+	/** Evidence may no longer rule out an open P0 because a record was dropped. */
+	reviewLogOverflow?: true;
 	/** Successful file-changing tool results in this subagent. */
 	changes?: number;
 	/** ms since epoch of the last file-changing tool result. */

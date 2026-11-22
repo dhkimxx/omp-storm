@@ -11,6 +11,7 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { docPromptFor } from "../../src/policy/docs.ts";
 import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
@@ -52,7 +53,11 @@ const LABEL = {
 	reset: "초기화",
 	rollback: "이전 승인으로 되돌리기",
 	keepModel: "지금 모델 유지",
+	autoOff: "자동 위임 끄기",
 } as const;
+
+/** The disclosure the first team approval panel must carry. */
+const AUTO_DISCLOSURE = "승인하면 자동 위임이 켜집니다";
 
 const env = prepare("storm-e2e", 18556);
 const suite = new Suite("E2E (rpc)", env);
@@ -173,13 +178,33 @@ async function main(): Promise<void> {
 			check("the dialog offers exactly approve and cancel (no forms in RPC)", same(rpc.dialogs.at(-1)?.options, [APPROVE, CANCEL]), JSON.stringify(rpc.dialogs));
 			check("cancel saves nothing", !existsSync(files.configFile) && files.approvals().length === 0);
 			rpc.answer = choose(APPROVE);
-			await rpc.prompt("/storm");
+			const frames = await rpc.prompt("/storm");
 			check("approve saves the config", existsSync(files.configFile));
 			check("approve writes one approval record", files.approvals().length === 1, `approvals=${files.approvals().length}`);
+			const store = files.storeDir();
+			check(
+				"the single default approval persists automatic delegation on",
+				store !== undefined && (await readAutoDelegationChoice(store)) === "on",
+				store === undefined ? "no store" : await readAutoDelegationChoice(store),
+			);
+			check(
+				"the approval asked once, with no separate automatic-delegation prompt",
+				rpc.dialogs.length === 2 && rpc.dialogs.every(dialog => !dialog.options.includes("자동 위임 켜기")),
+				JSON.stringify(rpc.dialogs),
+			);
+			check(
+				"the approval panel discloses that approval turns automatic delegation on",
+				reports(frames).some(report => report.includes(AUTO_DISCLOSURE)),
+				reports(frames).map(report => report.slice(0, 300)).join(" | "),
+			);
 			check("state stays out of git (.gitignore)", existsSync(join(env.project, ".omp", "storm", ".gitignore")));
 			check("no model request during setup", llm.all().length === 0, `requests=${llm.all().length}`);
 			const roles = Object.keys(existsSync(files.configFile) ? files.config().roles : {}).sort();
 			check("the recommended team has all five roles", same(roles, ["architect", "explorer", "implementer", "quick", "reviewer"]), roles.join(","));
+			// This file's later manual scenarios exercise the legacy direct-tool path, so opt out through the real command.
+			rpc.answer = choose(LABEL.autoOff);
+			await rpc.prompt("/storm auto");
+			check("the explicit switch turns automatic delegation off", store !== undefined && (await readAutoDelegationChoice(store)) === "off", store === undefined ? "no store" : await readAutoDelegationChoice(store));
 			await rpc.turn("hello");
 			const [first] = mains(llm.all());
 			check(
@@ -188,6 +213,9 @@ async function main(): Promise<void> {
 				`messages=${first?.messageCount} user=${first?.lastUser.slice(-80)}`,
 			);
 			check("the main session has the storm tool now", first?.stormTool !== null);
+			await rpc.turn(`E2E-STEPS ${JSON.stringify([{ edit: "e2e-auto-off-direct.txt" }])}`);
+			check("with automatic delegation off the main session writes directly", existsSync(join(env.project, "e2e-auto-off-direct.txt")));
+			rmSync(join(env.project, "e2e-auto-off-direct.txt"), { force: true });
 		});
 	});
 
@@ -550,7 +578,7 @@ async function main(): Promise<void> {
 		});
 	});
 
-	await suite.step("a verified run is not sent back forever", async () => {
+	await suite.step("a second outside change stops unverified instead of sending rounds forever", async () => {
 		const reviewed = join(env.project, REVIEW_FILE);
 		const llm = new LlmCursor(env);
 		const change = `printf '%s\\n' storm-director-change >> ${REVIEW_FILE}`;
@@ -586,14 +614,14 @@ async function main(): Promise<void> {
 					`content=${JSON.stringify(content)}`,
 				);
 				check(
-					"the second verdict stands after a later change",
-					run.status === "done" && run.endReason === "verified" && run.turns === 3,
+					"the second verdict cannot verify a later change",
+					run.status === "stopped" && run.endReason === "no-progress" && run.turns === 3,
 					`${run.status} ${run.endReason} turns=${run.turns}`,
 				);
 				const lines = files.index().filter(line => line.runId === run.runId);
 				check(
 					"the index line agrees, once",
-					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 3,
+					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 3,
 					JSON.stringify(lines),
 				);
 				check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
@@ -720,7 +748,7 @@ async function main(): Promise<void> {
 				const menu = rpc.dialogs.at(-1)?.options ?? [];
 				check(
 					"the hub offers the stopped run first, as one more option",
-					menu[0] === LABEL.resume && same(menu.slice(1), hubWithoutResume),
+					menu[0] === LABEL.resume && same(menu.slice(1), hubWithoutResume.filter(option => option !== LABEL.resume)),
 					`menu=${JSON.stringify(menu)} without=${JSON.stringify(hubWithoutResume)}`,
 				);
 				const before = files.runIds();
@@ -782,17 +810,18 @@ async function main(): Promise<void> {
 				await rpc.prompt("/storm");
 				const menu = rpc.dialogs.at(-1)?.options ?? [];
 				check(
-					"a record only the repository holds is not offered for resume",
-					menu[0] !== LABEL.resume && !menu.includes(LABEL.resume) && files.runs().at(-1)?.runId === plantedId,
+					"a planted record does not displace a trusted earlier candidate",
+					menu[0] === LABEL.resume && files.runs().at(-1)?.runId === plantedId,
 					`menu=${JSON.stringify(menu)} last=${files.runs().at(-1)?.runId}`,
 				);
-				const runs = files.runs().length;
+				const before = files.runIds();
 				const dialogs = rpc.dialogs.length;
 				await rpc.prompt(route({ action: "resume" }, "continue the run that stopped"));
+				const resumed = await files.finishedRun(before);
 				check(
-					"a classified resume of a planted record starts nothing",
-					files.runs().length === runs && rpc.dialogs.length === dialogs,
-					`runs=${files.runs().length}/${runs} dialogs=${rpc.dialogs.length}/${dialogs}`,
+					"classified resume replays the trusted candidate, not the planted request",
+					resumed.resumeOf !== undefined && resumed.resumeOf !== plantedId && resumed.request !== record.request && rpc.dialogs.length === dialogs,
+					`resumed=${resumed.resumeOf} dialogs=${rpc.dialogs.length}/${dialogs}`,
 				);
 			});
 		} finally {
@@ -1238,7 +1267,7 @@ async function main(): Promise<void> {
 			cancelAll,
 			async rpc => {
 				await rpc.turn("hello");
-				const run = await runOf(rpc, CHEAP_RUN);
+				const run = await runOf(rpc, startRun([plan([{ name: "impl", kind: "code" }]), { task: ["storm-implementer"], as: "Impl" }]));
 				const compactions = llm.of("compaction").length;
 				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "ended" && run.endReason === "no-changes" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} ${run.endReason} compactions=${compactions}`);
 			},
@@ -1270,6 +1299,8 @@ async function main(): Promise<void> {
 		const bytes = files.configBytes();
 		const approvals = files.approvals().length;
 		const runs = files.runs().length;
+		const autoStore = files.storeDir();
+		const autoBefore = autoStore === undefined ? "unset" : await readAutoDelegationChoice(autoStore);
 		const llm = new LlmCursor(env);
 		const codes = ["/storm setup", "/storm reset", "/storm", "/storm status"].map(command => {
 			const args = [env.omp, "-p", "--profile", env.profile, "--no-session", "--no-title", "--auto-approve", "--model", MAIN, command];
@@ -1277,6 +1308,8 @@ async function main(): Promise<void> {
 		});
 		check("every command exits 0", codes.every(code => code === 0), `exit=${codes.join(",")}`);
 		check("config, approvals and runs are untouched", files.configBytes() === bytes && files.approvals().length === approvals && files.runs().length === runs);
+		const autoAfter = autoStore === undefined ? "unset" : await readAutoDelegationChoice(autoStore);
+		check("the explicit off survives print-mode commands that cannot approve", autoBefore === "off" && autoAfter === "off", `${autoBefore} -> ${autoAfter}`);
 		check("no model request", llm.all().length === 0, `requests=${llm.all().length}`);
 	});
 

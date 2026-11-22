@@ -35,10 +35,18 @@ const TOP_KEYS = [
 	"cleanup",
 	"docs",
 	"rounds",
+	"requiredChecks",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
+const CHECK_KEYS = ["name", "argv"];
 /** Highest `contextCap` a config may set (team or role), in tokens. */
 export const MAX_CONTEXT_CAP = 10_000_000;
+/** Bounds on `requiredChecks`: an approval row must stay readable and a run's obligations enumerable. */
+export const MAX_REQUIRED_CHECKS = 8;
+export const MAX_CHECK_NAME_LENGTH = 80;
+export const MAX_CHECK_ARGS = 32;
+export const MAX_CHECK_ARG_LENGTH = 1024;
+export const MAX_CHECK_ARGV_LENGTH = 4096;
 const BUDGET_KEYS = ["perRunUsd", "warnAtUsd", "onExceed"];
 const TRIAL_KEYS = ["id", "role", "model", "effort", "share", "maxSpawns", "startsAt", "endsAt", "budgetUsd"];
 // Full timestamps with an explicit zone; date-only or zone-less strings parse differently across hosts.
@@ -72,6 +80,9 @@ export function unknownFields(value: unknown): Array<{ path: string; value: unkn
 	if (isRecord(value.roles)) for (const [id, role] of Object.entries(value.roles)) scan(role, ROLE_KEYS, keyPath("roles", id));
 	scan(value.budget, BUDGET_KEYS, "budget");
 	if (Array.isArray(value.trials)) value.trials.forEach((t: unknown, i) => scan(t, TRIAL_KEYS, `trials[${i}]`));
+	if (Array.isArray(value.requiredChecks)) {
+		value.requiredChecks.forEach((check: unknown, i) => scan(check, CHECK_KEYS, `requiredChecks[${i}]`));
+	}
 	return out;
 }
 
@@ -163,6 +174,73 @@ function validateDisabled(disabled: unknown, roleKeys: string[] | undefined, err
 		else if ((REQUIRED_ROLES as readonly string[]).includes(id)) errors.push(`${path}: ${id} 역할은 끌 수 없습니다`);
 		else if (roleKeys?.includes(id)) errors.push(`${path}: roles에 있는 역할은 끌 수 없습니다 (${id})`);
 		if (typeof id === "string") seen.add(id);
+	});
+}
+
+/**
+ * `requiredChecks`: bounded ordered commands with unique names and unique argv. Each argv is run directly, so no
+ * element may carry a control character (the whole config's strings are already checked by `unsafeText`).
+ */
+function validateRequiredChecks(checks: unknown, errors: string[]): void {
+	if (!Array.isArray(checks)) {
+		errors.push("requiredChecks: 배열이어야 합니다");
+		return;
+	}
+	if (checks.length > MAX_REQUIRED_CHECKS) {
+		errors.push(`requiredChecks: 최대 ${MAX_REQUIRED_CHECKS}개까지 둘 수 있습니다`);
+	}
+	const names = new Set<string>();
+	const commands = new Set<string>();
+	checks.forEach((check: unknown, i) => {
+		const path = `requiredChecks[${i}]`;
+		if (!isRecord(check)) {
+			errors.push(`${path}: 객체여야 합니다`);
+			return;
+		}
+		const name = check.name;
+		if (typeof name !== "string" || name.trim() === "") {
+			errors.push(`${path}.name: 비어 있지 않은 문자열이어야 합니다`);
+		} else if (name !== name.trim() || name.length > MAX_CHECK_NAME_LENGTH) {
+			errors.push(`${path}.name: 앞뒤 공백 없이 ${MAX_CHECK_NAME_LENGTH}자 이하여야 합니다`);
+		} else if (names.has(name)) {
+			errors.push(`${path}.name: 중복된 이름입니다 (${name})`);
+		} else {
+			names.add(name);
+		}
+		const argv = check.argv;
+		if (!Array.isArray(argv) || argv.length === 0) {
+			errors.push(`${path}.argv: 실행 파일과 인자를 담은 배열이어야 합니다`);
+			return;
+		}
+		if (argv.length > MAX_CHECK_ARGS) {
+			errors.push(`${path}.argv: 실행 파일과 인자를 합쳐 최대 ${MAX_CHECK_ARGS}개까지 둘 수 있습니다`);
+		}
+		let valid = true;
+		let total = 0;
+		argv.forEach((arg: unknown, j) => {
+			if (typeof arg !== "string") {
+				errors.push(`${path}.argv[${j}]: 문자열이어야 합니다`);
+				valid = false;
+				return;
+			}
+			if (j === 0 && arg.trim() === "") {
+				errors.push(`${path}.argv[0]: 실행 파일이 비어 있습니다`);
+				valid = false;
+			}
+			if (arg.length > MAX_CHECK_ARG_LENGTH) {
+				errors.push(`${path}.argv[${j}]: ${MAX_CHECK_ARG_LENGTH}자 이하여야 합니다`);
+				valid = false;
+			}
+			total += arg.length;
+		});
+		if (total > MAX_CHECK_ARGV_LENGTH) {
+			errors.push(`${path}.argv: 실행 파일과 인자를 합쳐 ${MAX_CHECK_ARGV_LENGTH}자 이하여야 합니다`);
+			valid = false;
+		}
+		if (!valid) return;
+		const command = JSON.stringify(argv);
+		if (commands.has(command)) errors.push(`${path}.argv: 중복된 명령입니다`);
+		else commands.add(command);
 	});
 }
 
@@ -260,6 +338,7 @@ export function validateConfig(value: unknown): ConfigValidation {
 	}
 	if (value.trials !== undefined) validateTrials(value.trials, roleKeys, errors);
 	if (value.disabledRoles !== undefined) validateDisabled(value.disabledRoles, roleKeys, errors);
+	if (value.requiredChecks !== undefined) validateRequiredChecks(value.requiredChecks, errors);
 
 	if (errors.length > 0) return { errors: errors.map(escapeUnsafe), warnings };
 	return { config: value as unknown as StormConfig, errors, warnings };

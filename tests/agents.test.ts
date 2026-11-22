@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { agentRows, duration, renderAgentRows, tokens } from "../src/report/agents.ts";
+import { reviewEvidenceOf } from "../src/runtime/review.ts";
 import {
 	listAgents,
 	markAgentsCleaned,
@@ -93,6 +94,7 @@ describe("agent ledger", () => {
 		expect(listAgents()[0]?.changes).toBeUndefined();
 		expect(listAgents()[0]?.lastChangeAt).toBeUndefined();
 		expect(listAgents()[0]?.lastVerdict).toBeUndefined();
+		expect(listAgents()[0]?.review).toBeUndefined();
 		noteAgentRun("X", "r2");
 		expect(listAgents()).toHaveLength(1);
 	});
@@ -258,6 +260,55 @@ describe("noteAgentReview", () => {
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 2_000, correct: false });
 		noteVerdictTree("Ghost", T0 + 2_000, "tree-3");
 		expect(listAgents()).toHaveLength(1);
+	});
+});
+
+describe("structured review evidence", () => {
+	beforeEach(() => resetAgents());
+
+	test("an incremental findings cycle and its verdict become one review, without body or log text", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0, title: "x", body: "raw output" } }, T0 + 1_000);
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 1, kind: "code" }] } }, T0 + 2_000);
+		const [rev] = listAgents();
+		expect(reviewEvidenceOf(rev!)).toEqual({
+			complete: true,
+			records: [{ at: T0 + 2_000, correct: false, findings: [{ priority: 0 }, { priority: 1, kind: "code" }] }],
+		});
+	});
+
+	test("a verdict's tree binds the review, and a later verdict keeps its own tree", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		noteVerdictTree("Rev", T0 + 1_000, "d1:f1");
+		expect(reviewEvidenceOf(listAgents()[0]!)).toMatchObject({
+			records: [{ at: T0 + 1_000, correct: true, tree: "d1:f1" }],
+		});
+		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
+		noteVerdictTree("Rev", T0 + 2_000, "d2:f2");
+		expect(reviewEvidenceOf(listAgents()[0]!).records.map(record => record.tree)).toEqual(["d1:f1", "d2:f2"]);
+		// An older time does not take the new verdict's tree.
+		noteVerdictTree("Rev", T0 + 1_000, "d3:f3");
+		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 2_000, correct: false, tree: "d2:f2" });
+	});
+
+	test("a new run clears the review evidence with the run-scoped fields", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", runId: "r1", now: T0 });
+		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		noteVerdictTree("Rev", T0 + 1_000, "d1:f1");
+		expect(reviewEvidenceOf(listAgents()[0]!).records).toHaveLength(1);
+		noteAgentRun("Rev", "r2");
+		expect(reviewEvidenceOf(listAgents()[0]!)).toEqual({ records: [], complete: true });
+	});
+
+	test("a bounded log drops no P0 silently: overflow makes the evidence incomplete", () => {
+		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		for (let i = 0; i < 70; i++) {
+			noteAgentReview("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 0 }] } }, T0 + i);
+		}
+		const ledger = reviewEvidenceOf(listAgents()[0]!);
+		expect(ledger.records.length).toBeLessThanOrEqual(64);
+		expect(ledger.complete).toBe(false);
 	});
 });
 

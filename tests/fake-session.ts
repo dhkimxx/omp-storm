@@ -1,7 +1,8 @@
 /** A main session as the run controller sees it: omp's session modes, a scripted UI and a fake ctx. */
-import type { ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import type { AsyncJobSnapshot, ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import type { RunTimers } from "../src/runtime/controller.ts";
 import { RunController } from "../src/runtime/controller.ts";
+import type { AcquireRunLeaseResult, RunLease } from "../src/runtime/lease.ts";
 import type { TreeReading } from "../src/runtime/tree.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RunRecord, RunSpec, StormConfig } from "../src/types.ts";
@@ -113,6 +114,19 @@ export function fakeTimers(): FakeTimers {
 	};
 }
 
+/** An in-memory execution lease for controller tests: no lock file, but the release path is observable. */
+function fakeLease(root: string, runId: string, onRelease: () => void): RunLease {
+	const owner = { token: `fake-${runId}`, pid: 1, host: "test", processStart: 0 };
+	return {
+		runId,
+		root,
+		path: `fake-lease-${runId}.lock`,
+		owner,
+		record: { schema: "storm.lease/v1", worktree: root, root, runId, owner, acquiredAt: new Date(0).toISOString() },
+		release: async () => onRelease(),
+	};
+}
+
 /** The team a session runs unless the test gives its own. */
 export const SESSION_TEAM: StormConfig = teamOf({ explorer: "a/x", implementer: "a/i", reviewer: "a/r" });
 
@@ -149,6 +163,10 @@ export interface SessionOptions {
 	artifactsDir?: string;
 	/** Receives the live status record: the run while it is on, `undefined` at its end. */
 	live?: (ctx: ExtensionContext, run: RunRecord | undefined) => void;
+	/** Lease acquisition. Defaults to an in-memory lease: tests never touch the real lock directory. */
+	lease?: (root: string, runId: string) => Promise<AcquireRunLeaseResult>;
+	/** What the fake main session reports as its running and recent async jobs. */
+	asyncJobs?: () => AsyncJobSnapshot | null;
 	now?: () => number;
 }
 
@@ -170,6 +188,8 @@ export interface FakeSession {
 	timers: FakeTimers;
 	/** What the session saw, in order: "select", "compact", "set:<mode>:<action>", "send". Notices and records are in `ui.events`. */
 	readonly events: string[];
+	/** Lease acquisitions and releases the controller requested, in order. */
+	leases: { acquired: string[]; released: string[] };
 	/** One main turn: it starts, and settles. */
 	turn(): Promise<void>;
 	/** Starts a run or fails the test with the refusal. */
@@ -189,6 +209,25 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 	const hold: SessionHold = { idle: opts.hold?.idle ?? true, pending: opts.hold?.pending ?? false, editor: opts.hold?.editor ?? "" };
 	const timers = fakeTimers();
 	let aborts = 0;
+	const leases: { acquired: string[]; released: string[] } = { acquired: [], released: [] };
+	const lease = async (root: string, runId: string): Promise<AcquireRunLeaseResult> => {
+		const acquired = opts.lease
+			? await opts.lease(root, runId)
+			: { ok: true as const, lease: fakeLease(root, runId, () => undefined) };
+		if (!acquired.ok) return acquired;
+		leases.acquired.push(runId);
+		const release = acquired.lease.release.bind(acquired.lease);
+		return {
+			ok: true,
+			lease: {
+				...acquired.lease,
+				release: async () => {
+					leases.released.push(runId);
+					await release();
+				},
+			},
+		};
+	};
 	const controller = new RunController({
 		pi: {
 			sendUserMessage: async message => {
@@ -204,6 +243,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		agents: () => (typeof opts.agents === "function" ? opts.agents() : (opts.agents ?? [])),
 		...(opts.tree ? { tree: async (root: string, base?: string) => opts.tree!(root, base) } : {}),
 		timers: timers.api,
+		lease,
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
 		...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
 		...(opts.live ? { live: opts.live } : {}),
@@ -216,6 +256,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		hasPendingMessages: () => hold.pending,
 		ui: { getEditorText: () => hold.editor },
 		getContextUsage: () => opts.usage,
+		...(!opts.asyncJobs ? {} : { getAsyncJobSnapshot: opts.asyncJobs }),
 		compact: async (instructions: string) => {
 			ui.events.push("compact");
 			await opts.compact?.(instructions);
@@ -248,6 +289,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		notices: ui.notices,
 		hold,
 		timers,
+		leases,
 		get events(): string[] {
 			return ui.events.filter(event => !event.startsWith("notify:") && event !== "record" && event !== "report");
 		},

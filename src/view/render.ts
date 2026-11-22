@@ -12,6 +12,7 @@ import type {
 	InfoTone,
 	MetricValue,
 	QuotaState,
+	RequiredCheck,
 	RoleConfig,
 	RunRecord,
 	RunPlan,
@@ -174,6 +175,39 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 		else if (a !== b) rows.push({ field, text: `- ${field}: ${a ?? DASH} → ${b}`, ...(info ? { info: info() } : {}) });
 	};
 	line("우선순위", prev && priorityLabel(prev.priority), priorityLabel(next.priority));
+	// An obligation the run must meet: every exact executable and argument, as approved, one row per check. Early in
+	// the diff so a small terminal cannot cut the added obligation off the end.
+	if (prev?.requiredChecks !== undefined || next.requiredChecks !== undefined) {
+		const before = prev?.requiredChecks ?? [];
+		const after = next.requiredChecks ?? [];
+		const beforeByName = new Map(before.map((check) => [check.name, check]));
+		const afterByName = new Map(after.map((check) => [check.name, check]));
+		const names = [...before.map((check) => check.name), ...after.map((check) => check.name).filter((name) => !beforeByName.has(name))];
+		for (const name of names) {
+			const a = beforeByName.get(name);
+			const b = afterByName.get(name);
+			const field = `필수 검사 ${name}`;
+			const aText = a === undefined ? undefined : JSON.stringify(a.argv);
+			const bText = b === undefined ? undefined : JSON.stringify(b.argv);
+			if (prev === undefined) {
+				if (b !== undefined) rows.push({ field, text: `- ${field}: ${bText}` });
+			} else if (a === undefined) rows.push({ field, text: `- ${field} 추가: ${bText}` });
+			else if (b === undefined) rows.push({ field, text: `- ${field} 삭제: ${aText}` });
+			else if (aText !== bText) rows.push({ field, text: `- ${field}: ${aText} → ${bText}` });
+		}
+		const beforeOrder = before.map((check) => check.name);
+		const afterOrder = after.map((check) => check.name);
+		const sameNames =
+			beforeOrder.length === afterOrder.length &&
+			beforeOrder.every((name) => afterByName.has(name)) &&
+			afterOrder.every((name) => beforeByName.has(name));
+		if (sameNames && beforeOrder.some((name, i) => name !== afterOrder[i])) {
+			line("필수 검사 순서", beforeOrder.join(" → "), afterOrder.join(" → "));
+		}
+		if (!before.length && !after.length) {
+			line("필수 검사", prev?.requiredChecks !== undefined ? "없음" : undefined, next.requiredChecks !== undefined ? "없음" : DASH);
+		}
+	}
 	const ids = new Set([...Object.keys(prev?.roles ?? {}), ...Object.keys(next.roles)]);
 	for (const id of ids) {
 		const a = prev?.roles[id];
@@ -289,6 +323,11 @@ function roleLine(id: string, r: RoleConfig): string {
 	return visible(`- ${roleTitle(id)}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""} · 워커 ${workerText(id, r)}${cap}`);
 }
 
+/** A required check with its exact executable and arguments: the obligation the user approves, never a shell string. */
+export function checkText(check: RequiredCheck): string {
+	return visible(`${check.name}: ${JSON.stringify(check.argv)}`);
+}
+
 function versionLine(newer: string | undefined): string {
 	return newer ? `- Storm ${STORM_VERSION} · 새 버전 ${visible(newer)} 설치됨 → /restart 로 적용` : `- Storm ${STORM_VERSION}`;
 }
@@ -340,6 +379,14 @@ export function renderStatus(
 	if (view.approval) styled([{ text: "- 승인됨", tone: "success" }, { text: ` · ${isoText(view.approval.approvedAt)}` }]);
 	else if (c.status === "ok") styled([{ text: "- 미승인", tone: "warning" }, { text: " — /storm 으로 승인하세요" }]);
 	else styled([{ text: "- 미승인", tone: "warning" }]);
+	if (view.autoDelegation !== undefined) {
+		const auto = view.autoDelegation;
+		styled([
+			{ text: "- 자동 위임: " },
+			{ text: auto === "on" ? "켜짐" : auto === "blocked" ? "켜짐 · 팀 승인 대기" : "꺼짐", tone: auto === "on" ? "success" : auto === "blocked" ? "warning" : "muted" },
+			{ text: " · /storm auto" },
+		]);
+	}
 	if (c.status === "ok") {
 		const team = c.config;
 		out.push("");
@@ -355,6 +402,7 @@ export function renderStatus(
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,
 			`- 실행 중 다른 에이전트: ${visible(fallbackText(team.fallbackRole))}`,
 			`- 실행이 끝나면 정리: ${team.cleanup === true ? "켬" : "끔"} · 문서 정합: ${team.docs === false ? "끔" : "켬"}`,
+			`- 필수 검사: ${team.requiredChecks?.length ? team.requiredChecks.map(checkText).join(" · ") : "없음"}`,
 		);
 	}
 	if (view.run) {
@@ -586,6 +634,13 @@ function lastRunLines(run: RunRecord): string[] {
 	if (blocked?.reason) out.push(`- 첫 차단: ${visible(blocked.agent)} · ${visible(blocked.reason)}`);
 	if (run.plan) out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
 	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
+	if (Array.isArray(run.checks) && run.checks.length) {
+		const checks = run.checks
+			.slice(0, 16)
+			.filter(check => check && typeof check.name === "string" && typeof check.status === "string")
+			.map(check => `${visible(check.name)}: ${check.status === "passed" ? "통과" : visible(check.status)}${typeof check.exitCode === "number" ? ` (exit ${check.exitCode})` : ""}`);
+		if (checks.length) out.push(`- 검사 결과: ${checks.join(" · ")}`);
+	}
 	return out;
 }
 

@@ -94,4 +94,58 @@ describe("workingState", () => {
 		expect(lines.some(l => /\b30\D/.test(l) && !l.includes("agent://"))).toBe(true);
 		expect(lines.some(l => /\b176\D/.test(l) && !l.includes("agent://"))).toBe(true);
 	});
+
+	test("keeps constraints past the 200-character banner, lane goals and remaining decisions", () => {
+		const banner = "b".repeat(200);
+		const request = `${banner}\nCONSTRAINT: do not touch billing\n${"x".repeat(3_000)}\nFINAL: keep the public API stable`;
+		const id = "run-20261120-100000-abcd";
+		const lines = workingState(
+			run({
+				runId: id,
+				task: banner,
+				request,
+				plan: {
+					lanes: [{ name: "login", kind: "code", role: "implementer", goal: "only the login form" }],
+					workers: { implementer: 1 },
+					submittedAt: "x",
+					note: "남은 결정: 세션 저장소를 유지한다",
+				},
+			}),
+			[],
+		);
+		const text = lines.join("\n");
+		expect(text).toContain("CONSTRAINT: do not touch billing");
+		expect(text).toContain("FINAL: keep the public API stable");
+		expect(text).toContain("only the login form");
+		expect(text).toContain("남은 결정: 세션 저장소를 유지한다");
+		// A cut request points at the stable run record instead of replaying the whole request.
+		expect(text).toContain(".omp/storm/state/runs/run-20261120-100000-abcd.json");
+		expect(text.length).toBeLessThanOrEqual(6_000);
+	});
+
+	test("hard-caps a pathological request and plan instead of replaying context", () => {
+		const request = `START ${"Z".repeat(19_000)}`;
+		const lanes = Array.from({ length: 50 }, (_, i) => ({
+			name: `lane ${i}`,
+			kind: "code" as const,
+			role: "implementer",
+			goal: "g".repeat(500),
+		}));
+		const agents = Array.from({ length: 200 }, (_, i) => agent({ id: `A${i}`, lastActivityAt: i, cleanedAt: 1 }));
+		const lines = workingState(
+			run({
+				runId: "run-20261120-120000-abcd",
+				task: request.slice(0, 200),
+				request,
+				plan: { lanes, workers: {}, submittedAt: "x" },
+			}),
+			agents,
+		);
+		const text = lines.join("\n");
+		expect(text.length).toBeLessThan(6_500);
+		expect(text).toContain("START");
+		expect(text).toContain("압축 한도");
+		expect(text).not.toContain("Z".repeat(3_000));
+		expect(text).not.toContain("g".repeat(500));
+	});
 });

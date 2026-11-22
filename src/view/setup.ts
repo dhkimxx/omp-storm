@@ -51,6 +51,7 @@ export function recommendedConfig(recs: RoleRecommendation[], priority: Priority
 	if (current?.rounds !== undefined) config.rounds = current.rounds;
 	if (current ? current.cleanup === true : true) config.cleanup = true;
 	if (current?.docs === false) config.docs = false;
+	if (current?.requiredChecks !== undefined) config.requiredChecks = structuredClone(current.requiredChecks);
 	if (disabled.length) config.disabledRoles = [...disabled];
 	// Without a current team other agents borrow the implementer's models; an absent fallbackRole in one is a deliberate block.
 	const fallback = current ? current.fallbackRole : "implementer";

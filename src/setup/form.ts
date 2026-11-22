@@ -117,6 +117,7 @@ function baseConfig(input: SetupFormInput): StormConfig {
 		roles: { ...proposed.roles, ...current.roles },
 		...(current.fallbackRole !== undefined ? { fallbackRole: current.fallbackRole } : {}),
 		...(current.trials !== undefined ? { trials: current.trials } : {}),
+		...(current.requiredChecks !== undefined ? { requiredChecks: structuredClone(current.requiredChecks) } : {}),
 	} : proposed;
 }
 

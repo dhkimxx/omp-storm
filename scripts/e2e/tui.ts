@@ -13,6 +13,7 @@
  */
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
 import { ROLES } from "../../src/roles.ts";
 import { parseModelEntry } from "../../src/selector.ts";
@@ -24,6 +25,9 @@ const PICK_BY_ROLE = "역할별로 고르기";
 const FULL_VIEW = "전체 내용 보기";
 /** Key hints of Storm's report overlay, which Enter closes. */
 const OVERLAY_HINT = "PgDn";
+/** The disclosure a first team approval carries, and the setup-time question this change removed. */
+const TURNS_AUTO_ON = "승인하면 자동 위임이 켜집니다";
+const OLD_PROMPT = "자동 위임을 켤까요?";
 /** The head of omp's form panel (answered and total fields) and the label of its last stop. */
 const FORM_HEAD = /Ask · (\d+) of (\d+) answered/g;
 const FORM_SUBMIT = "Submit";
@@ -123,9 +127,21 @@ async function main(): Promise<void> {
 				const offered = await tui.selector(typed);
 				check("the dialog is up and nothing is saved yet", offered.includes(PICK_BY_ROLE) && !existsSync(files.configFile), JSON.stringify(offered));
 				if (offered.includes(FULL_VIEW)) check("a clipped proposal withholds approval", !offered.includes(APPROVE));
-				await answer(tui, typed, APPROVE);
-				// Storm writes the approval, then the config.
+				// `answer` opens the full view when the panel is cut, so the disclosure is on screen either way.
+				const approved = await answer(tui, typed, APPROVE);
+				check("the approval panel discloses that approval turns automatic delegation on", tui.text(typed).includes(TURNS_AUTO_ON), tui.text(typed).slice(-400));
+				// Storm writes the approval and the config, then the personal choice the approval now implies.
 				await suite.eventually("approve saves the config and one approval", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
+				const store = files.storeDir();
+				if (store === undefined) throw new Error("the approval store is missing");
+				const deadline = Date.now() + 15_000;
+				while (Date.now() < deadline && (await readAutoDelegationChoice(store)) !== "on") await Bun.sleep(50);
+				check("the single team approval persisted automatic delegation on", (await readAutoDelegationChoice(store)) === "on", await readAutoDelegationChoice(store));
+				check("no separate automatic-delegation prompt followed approval", !tui.text(approved).includes(OLD_PROMPT), tui.text(approved).slice(-400));
+				// The composer answers rather than a hidden prompt taking the keys.
+				const status = await tui.submit("/storm status");
+				await tui.shows(OVERLAY_HINT, status);
+				tui.send(KEY.enter);
 				check("no model request during setup", llm.all().filter(entry => entry.who !== "side").length === 0, `requests=${llm.all().length}`);
 			});
 		},
@@ -166,6 +182,12 @@ async function main(): Promise<void> {
 					return role?.models[0] === `fake/${OUTSIDE}:low` && typeof role.workers === "object" && role.workers.max === 3 && files.approvals().length === approvals + 1;
 				});
 				check("the other roles keep their models", primary(files.config(), "implementer") === primary(before, "implementer"));
+				const choiceStore = files.storeDir();
+				check(
+					"re-setup neither asks the automatic-delegation question nor turns it off",
+					choiceStore !== undefined && (await readAutoDelegationChoice(choiceStore)) === "on" && !tui.text(settings).includes(OLD_PROMPT),
+					choiceStore === undefined ? "no store" : await readAutoDelegationChoice(choiceStore),
+				);
 				check("setup made no model request", llm.all().filter(entry => entry.who !== "side").length === 0);
 				const ordinary = new LlmCursor(env);
 				await tui.submit("hello after the model picker");

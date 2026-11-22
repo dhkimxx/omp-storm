@@ -263,6 +263,65 @@ describe("validateConfig", () => {
 		expect(validateConfig(c).errors).toEqual([]);
 	});
 
+	test("requiredChecks is a known ordered field; absent keeps the hash, present joins it", () => {
+		const absent = validateConfig(clone());
+		expect(absent.config).not.toHaveProperty("requiredChecks");
+		expect(configHash(absent.config!)).toBe(configHash(base));
+
+		const c = clone();
+		c.requiredChecks = [
+			{ name: "unit", argv: ["bun", "test"] },
+			{ name: "types", argv: ["bunx", "tsc", "--noEmit"] },
+		];
+		const r = validateConfig(c);
+		expect(r.errors).toEqual([]);
+		expect(r.warnings).toEqual([]);
+		expect(r.config?.requiredChecks).toEqual(c.requiredChecks);
+		expect(configHash(r.config!)).not.toBe(configHash(base));
+		expect(c.requiredChecks.map((check: { name: string }) => check.name)).toEqual(["unit", "types"]);
+
+		// An empty list is a chosen (hash-covered) no-op, not an error.
+		const empty = validateConfig({ ...clone(), requiredChecks: [] });
+		expect(empty.errors).toEqual([]);
+		expect(configHash(empty.config!)).not.toBe(configHash(base));
+	});
+
+	test("requiredChecks is bounded and unique", () => {
+		const c = (requiredChecks: unknown) => ({ ...clone(), requiredChecks });
+		const errorsOf = (requiredChecks: unknown) => validateConfig(c(requiredChecks)).errors;
+
+		expect(paths(errorsOf({}))).toEqual(["requiredChecks"]);
+		expect(paths(errorsOf([1]))).toEqual(["requiredChecks[0]"]);
+		expect(paths(errorsOf([{ name: "", argv: ["x"] }]))).toEqual(["requiredChecks[0].name"]);
+		expect(paths(errorsOf([{ name: " ", argv: ["x"] }]))).toEqual(["requiredChecks[0].name"]);
+		expect(paths(errorsOf([{ name: " x", argv: ["x"] }]))).toEqual(["requiredChecks[0].name"]);
+		expect(paths(errorsOf([{ name: "x".repeat(81), argv: ["x"] }]))).toEqual(["requiredChecks[0].name"]);
+		expect(paths(errorsOf([{ name: "ok" }]))).toEqual(["requiredChecks[0].argv"]);
+		expect(paths(errorsOf([{ name: "ok", argv: [] }]))).toEqual(["requiredChecks[0].argv"]);
+		expect(paths(errorsOf([{ name: "ok", argv: [1] }]))).toEqual(["requiredChecks[0].argv[0]"]);
+		expect(paths(errorsOf([{ name: "ok", argv: [""] }]))).toEqual(["requiredChecks[0].argv[0]"]);
+		expect(paths(errorsOf([{ name: "ok", argv: [" "] }]))).toEqual(["requiredChecks[0].argv[0]"]);
+		expect(paths(errorsOf([{ name: "ok", argv: ["x".repeat(1025)] }]))).toEqual(["requiredChecks[0].argv[0]"]);
+		expect(paths(errorsOf([{ name: "ok", argv: Array.from({ length: 33 }, (_, i) => `a${i}`) }]))).toEqual(["requiredChecks[0].argv"]);
+		expect(paths(errorsOf([{ name: "ok", argv: Array.from({ length: 5 }, () => "x".repeat(1020)) }]))).toEqual(["requiredChecks[0].argv"]);
+
+		expect(paths(errorsOf([{ name: "a", argv: ["x"] }, { name: "a", argv: ["y"] }]))).toEqual(["requiredChecks[1].name"]);
+		expect(paths(errorsOf([{ name: "a", argv: ["x"] }, { name: "b", argv: ["x"] }]))).toEqual(["requiredChecks[1].argv"]);
+		expect(paths(errorsOf(Array.from({ length: 9 }, (_, i) => ({ name: `c${i}`, argv: [`v${i}`] }))))).toEqual(["requiredChecks"]);
+
+		const valid = validateConfig(
+			c([
+				{ name: "unit", argv: ["bun", "test", "--", "some test"] },
+				{ name: "lint", argv: ["bunx", "eslint", "."], note: true },
+			]),
+		);
+		expect(valid.errors).toEqual([]);
+		expect(paths(valid.warnings)).toEqual(["requiredChecks[1].note"]);
+		expect(unknownFields(c([{ name: "unit", argv: ["bun"], extra: 1 }]))).toEqual([
+			{ path: "requiredChecks[0].extra", value: 1 },
+		]);
+	});
+
 	test("accepts workers, fallbackRole and trials, and warns on unknown trial fields", () => {
 		const c = clone();
 		c.roles.reviewer.workers = 16;
@@ -293,6 +352,25 @@ describe("config store", () => {
 		expect(await Bun.file(path.join(root, ".gitignore")).exists()).toBe(false);
 		const leftovers = (await fs.readdir(path.join(root, ".omp/storm"))).filter(f => f.endsWith(".tmp"));
 		expect(leftovers).toEqual([]);
+	});
+
+	test("requiredChecks round-trips in order with the same hash, ready for snapshots and rollback", async () => {
+		const root = await tempRoot();
+		const config: StormConfig = {
+			...base,
+			requiredChecks: [
+				{ name: "unit", argv: ["bun", "test", "--", "some test"] },
+				{ name: "types", argv: ["bunx", "tsc", "--noEmit"] },
+			],
+		};
+		const written = await writeConfig(root, config);
+		expect(written.hash).toBe(configHash(config));
+		const loaded = await loadConfig(root);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") return;
+		expect(loaded.hash).toBe(written.hash);
+		expect(loaded.config.requiredChecks).toEqual(config.requiredChecks);
+		expect(serializeConfig(loaded.config)).toBe(serializeConfig(config));
 	});
 
 	test("does not overwrite an existing storm .gitignore", async () => {
@@ -387,6 +465,8 @@ describe("text that could forge or hide rows in the approval dialog", () => {
 		["trial id", (c, bad) => withTrial(c, { id: `t${bad}` }), "trials[0].id"],
 		["trial model", (c, bad) => withTrial(c, { model: `openai/gpt${bad}` }), "trials[0].model"],
 		["trial role", (c, bad) => withTrial(c, { role: `reviewer${bad}` }), "trials[0].role"],
+		["check name", (c, bad) => (c.requiredChecks = [{ name: `x${bad}`, argv: ["x"] }]), "requiredChecks[0].name"],
+		["check argument", (c, bad) => (c.requiredChecks = [{ name: "x", argv: ["x", bad] }]), "requiredChecks[0].argv[1]"],
 		["unknown field value", (c, bad) => (c.note = `x${bad}`), "note"],
 		["unknown nested value", (c, bad) => (c.extra = { list: [1, { deep: `x${bad}` }] }), "extra.list[1].deep"],
 		["unknown role field value", (c, bad) => (c.roles.reviewer.note = bad), "roles.reviewer.note"],

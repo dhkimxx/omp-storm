@@ -16,6 +16,8 @@ import type { Exec } from "../types.ts";
 export interface TreeState {
 	diff: string;
 	files: string;
+	/** The fingerprint can detect some changes, but cannot attest to these file contents. */
+	incomplete?: true;
 }
 
 /** A tree read and the commit it was compared with; later reads continue against the same commit. */
@@ -54,21 +56,26 @@ function paths(text: string): string[] {
 }
 
 /** One hash over every path's content, or its size and mtime when it is too large to read on every round. */
-async function filesHash(root: string, names: string[]): Promise<string> {
-	if (names.length > MANY_FILES) return hash(names.join("\n"));
+async function filesHash(root: string, names: string[]): Promise<Pick<TreeState, "files" | "incomplete">> {
+	if (names.length > MANY_FILES) return { files: hash(names.join("\n")), incomplete: true };
 	const lines: string[] = [];
+	let incomplete = false;
 	for (const name of names) {
 		let part: string;
 		try {
 			const file = path.join(root, name);
 			const info = await stat(file);
-			part = info.size > BIG_FILE ? `big:${info.size}:${info.mtimeMs}` : hash(await readFile(file));
+			if (!info.isFile() || info.size > BIG_FILE) {
+				part = `metadata:${info.size}:${info.mtimeMs}`;
+				incomplete = true;
+			} else part = hash(await readFile(file));
 		} catch {
+			incomplete = true;
 			part = "unreadable";
 		}
 		lines.push(`${name}\0${part}`);
 	}
-	return hash(lines.join("\n"));
+	return { files: hash(lines.join("\n")), ...(incomplete ? { incomplete: true } : {}) };
 }
 
 /**
@@ -88,6 +95,5 @@ export async function treeAgainst(exec: Exec, root: string, base?: string): Prom
 	]);
 	if (diff === undefined || added === undefined || untracked === undefined) return undefined;
 	const names = [...new Set([...paths(added), ...paths(untracked)])].sort();
-	const files = await filesHash(root, names);
-	return { base: commit, state: { diff: hash(diff), files } };
+	return { base: commit, state: { diff: hash(diff), ...(await filesHash(root, names)) } };
 }
