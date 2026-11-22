@@ -3,10 +3,15 @@ import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Component } from "@oh-my-pi/pi-tui";
+import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
+import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
+import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
 import { serializeConfig } from "../src/config/store.ts";
 import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../src/flows.ts";
 import { APPROVE } from "../src/proposals/present.ts";
+import { ROLES } from "../src/roles.ts";
+import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
 import type { UiContext, UiPort } from "../src/types.ts";
 import { createUiPort } from "../src/ui.ts";
@@ -14,6 +19,8 @@ import { makeProject, TEAM, type TestProject } from "./support.ts";
 
 // Storm's frames are omp components; they draw with omp's theme.
 ensureThemeSync();
+
+const PICK_BY_ROLE = "역할별로 고르기";
 
 interface FormAnswer {
 	data: Record<string, string | number | string[]>;
@@ -45,6 +52,8 @@ function fakeHost(opts: {
 	rows?: number;
 	answers?: Array<string | undefined | ((options: string[]) => string | undefined)>;
 	formDialog?: (html: string) => Promise<FormAnswer | undefined>;
+	models?: Array<Record<string, unknown>>;
+	driveOverlay?: (view: Component, rows: readonly string[]) => void;
 }): FakeHost {
 	const answers = [...(opts.answers ?? [])];
 	const tui = { terminal: { rows: opts.rows ?? 50, columns: 100 }, requestRender() {} };
@@ -63,6 +72,10 @@ function fakeHost(opts: {
 		ctx: {
 			mode: opts.mode,
 			hasUI: opts.hasUI,
+			modelRegistry: {
+				getError: () => undefined,
+				getAvailable: (kind: string) => opts.models?.filter(model => model.kind === kind) ?? [],
+			},
 			ui: {
 				async select(_title: string, options: string[]) {
 					host.selects.push({ options: [...options], panel: widget?.render(tui.terminal.columns) });
@@ -76,13 +89,14 @@ function fakeHost(opts: {
 				setWidget(_key: string, factory: ((t: typeof tui) => Component) | undefined) {
 					widget = factory?.(tui);
 				},
-				async custom(factory: (t: typeof tui, theme: unknown, keys: unknown, done: () => void) => Component) {
+				async custom<T>(factory: (t: typeof tui, theme: unknown, keys: unknown, done: (result: T) => void) => Component): Promise<T> {
 					host.overlays++;
-					const { promise, resolve } = Promise.withResolvers<void>();
+					const { promise, resolve } = Promise.withResolvers<T>();
 					const view = factory(tui, undefined, undefined, resolve);
-					view.render(tui.terminal.columns);
-					view.handleInput?.("q");
-					await promise;
+					const rows = view.render(tui.terminal.columns);
+					if (opts.driveOverlay) opts.driveOverlay(view, rows);
+					else view.handleInput?.("q");
+					return promise;
 				},
 				...(opts.formDialog ? { formDialog: opts.formDialog } : {}),
 			},
@@ -119,6 +133,40 @@ describe("form surface per host", () => {
 });
 
 describe("TUI", () => {
+	test("the native picker exposes available chat models without switching the host session", async () => {
+		const picked = {
+			provider: "example",
+			id: "outside",
+			name: "Outside recommendation",
+			kind: "chat",
+			input: ["text"],
+			contextWindow: 64_000,
+			thinking: { efforts: ["low", "high"] },
+			supportsTools: true,
+		};
+		for (const key of ["\r", "\x1b"]) {
+			const host = fakeHost({
+				mode: "tui",
+				hasUI: true,
+				models: [picked, { ...picked, id: "no-tools", name: "No tools", supportsTools: false }],
+				driveOverlay(view, rows) {
+					expect(view).toBeInstanceOf(ModelPickerComponent);
+					const rendered = rows.join("\n");
+					expect(rendered).toContain("탐색 · 주 모델");
+					expect(rendered).toContain(picked.name);
+					expect(rendered).not.toContain("No tools");
+					view.handleInput?.(key);
+				},
+			});
+			const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델");
+			if (key === "\r") expect(result).toMatchObject({ selector: "example/outside", efforts: ["low", "high"] });
+			else expect(result).toBeUndefined();
+			expect(host.overlays).toBe(1);
+			expect(host.selects).toEqual([]);
+			expect(host.sent).toEqual([]);
+		}
+	});
+
 	test("a choice's context is a panel above the selector that leaves nothing behind", async () => {
 		const host = fakeHost({ mode: "tui", hasUI: true, answers: ["b"] });
 		const ui = createUiPort(host.pi, host.ctx);
@@ -290,17 +338,47 @@ describe("accepting on a small terminal", () => {
 		expect(panel.some(line => line.includes("/repo/.omp/agents/shadow-file.md"))).toBe(true);
 	});
 
-	test("the whole setup on 24 rows: approval only after the full view, and then the five-role team is saved", async () => {
-		const refused = fakeHost({ mode: "tui", hasUI: true, rows: 24, answers: [options => (options.includes(APPROVE) ? APPROVE : undefined)], formDialog: async () => undefined });
+	test("the whole role interview on 24 rows: approval only after the full view", async () => {
+		const forms: HtmlForm[] = [];
+		const formDialog = async (html: string): Promise<FormAnswer> => {
+			const form = parseHtmlForm(html);
+			forms.push(form);
+			const data = defaultFormData(form);
+			if (Object.hasOwn(data, FIELD.parallelism)) data[FIELD.parallelism] = 3;
+			return { data };
+		};
+		const refused = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			answers: [PICK_BY_ROLE, options => (options.includes(APPROVE) ? APPROVE : undefined)],
+			formDialog,
+		});
 		await setupFlow(env, createUiPort(refused.pi, refused.ctx));
+		expect(refused.selects).toHaveLength(2);
+		expect(refused.selects[1]?.options).not.toContain(APPROVE);
 		expect((await loadProjectState(env)).config.status).toBe("missing");
 
-		const host = fakeHost({ mode: "tui", hasUI: true, rows: 24, answers: [options => options[0], APPROVE], formDialog: async () => undefined });
+		forms.length = 0;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			answers: [PICK_BY_ROLE, options => options[0], APPROVE],
+			formDialog,
+		});
 		await setupFlow(env, createUiPort(host.pi, host.ctx));
+		const names = forms.map(form => form.fields.map(field => field.name));
+		expect(names.flatMap(fields => fields.filter(name => ROLES.some(role => name === FIELD.primary(role.id))))).toEqual(
+			ROLES.map(role => FIELD.primary(role.id)),
+		);
+		expect(names.some(fields => fields.includes(FIELD.effort))).toBe(true);
+		expect(names.at(-1)).toContain(FIELD.parallelism);
 		const state = await loadProjectState(env);
 		const saved = state.config.status === "ok" ? state.config.config : undefined;
 		expect(Object.keys(saved?.roles ?? {})).toHaveLength(5);
 		expect(saved?.cleanup).toBe(true);
+		expect(saved?.parallelism).toBe(3);
 		expect(host.overlays).toBe(1);
 		expect(host.notified).toHaveLength(1);
 	});

@@ -78,6 +78,8 @@ export interface UiPort {
 	record(title: string, markdown: string): void;
 	/** Draws an HTML `<form>` and resolves to its answers, or undefined when cancelled or timed out. Absent when the host has no form surface. */
 	form?(html: string): Promise<FormData | undefined>;
+	/** Selects an available tool-capable chat model for a Storm role, without changing the session. TUI only; Esc cancels. */
+	pickModel?(title: string): Promise<ModelInfo | undefined>;
 }
 
 // ── Catalog ─────────────────────────────────────────────────────────────────────────────────

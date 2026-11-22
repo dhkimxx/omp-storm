@@ -11,7 +11,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
-import type { RunSummary, RunRecord, StormConfig } from "../../src/types.ts";
+import type { Effort, RunSummary, RunRecord, StormConfig } from "../../src/types.ts";
 import type { LlmEntry, Step } from "./fake-llm.ts";
 
 export type { LlmEntry, Step };
@@ -46,6 +46,8 @@ export interface ModelSpec {
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	/** Context window; 200k when absent. */
 	context?: number;
+	/** A custom reasoning ladder for this model; absent uses the fake provider's defaults. */
+	efforts?: readonly Effort[];
 }
 
 export interface E2eEnv {
@@ -122,8 +124,9 @@ export function modelsYml(port: number, providers: Record<string, readonly Model
 	const lines = ["providers:"];
 	for (const [provider, models] of Object.entries(providers)) {
 		lines.push(`  ${provider}:`, `    baseUrl: http://127.0.0.1:${port}/v1`, "    apiKey: storm-e2e-dummy", "    api: openai-completions", "    models:");
-		for (const { id, cost, context } of models) {
+		for (const { id, cost, context, efforts } of models) {
 			lines.push(`      - id: ${id}`, `        contextWindow: ${context ?? 200_000}`, "        maxTokens: 8192");
+			if (efforts) lines.push("        reasoning: true", `        thinking: { mode: effort, efforts: [${efforts.join(", ")}] }`);
 			lines.push(`        cost: { input: ${cost.input}, output: ${cost.output}, cacheRead: ${cost.cacheRead}, cacheWrite: ${cost.cacheWrite} }`);
 		}
 	}

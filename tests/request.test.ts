@@ -340,6 +340,17 @@ describe("route: execution", () => {
 		}
 	});
 
+	test("a provider token-limit rejection points to a new session without showing the request dump path", async () => {
+		const r = router({
+			reply: new Error('400 {"error":{"message":"prompt is too long: 7503601 tokens > 1000000"}} raw-http-request=/private/request.json'),
+			answers: [FALLBACK.cancel],
+		});
+		await r.route("fix the bug");
+		expect(r.ui.selects[0]?.title).toContain("/new");
+		expect(r.ui.selects[0]?.title).not.toContain("raw-http-request");
+		expect(r.calls).toEqual([]);
+	});
+
 	test("without a valid team the menu opens and no model is asked", async () => {
 		const r = router({ reply: '{"action":"run"}', host: { config: null } });
 		await r.route("fix the bug");

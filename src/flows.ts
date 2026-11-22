@@ -1,5 +1,5 @@
 /**
- * /storm flows: setup (Storm's own dialogs: the recommended team, or two forms to pick role by role), status,
+ * /storm flows: setup (the recommended team or the role-by-role interview), status,
  * approval of a config changed by hand, rollback, trial decisions, reset. None of them calls a model or sends a
  * message. A config is approved only by the exact "승인" in Storm's dialog; reset deletes only after the single
  * exact "초기화" choice.
@@ -29,10 +29,10 @@ import { formatStorage, readStorage } from "./runtime/janitor.ts";
 import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
-import { type FormRetry, modelsForm, readModelPicks, recommendationNotes, type SetupFormInput, settingsForm, setupConfig, subagentShares } from "./setup/form.ts";
+import { BROWSE, commonSettingsForm, effortForm, FIELD, type FormRetry, interviewRoles, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, setupConfig, subagentShares } from "./setup/form.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult } from "./tool/host.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, ModelInfo, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -71,7 +71,7 @@ function decideHost(env: FlowEnv, ui: UiPort): DecideHost {
 const MOVED = "창이 열려 있는 사이 팀 설정이나 가림 정의가 바뀌어 저장하지 않았습니다. /storm 으로 다시 확인하세요.";
 
 const PICK_BY_ROLE = "역할별로 고르기";
-/** Times the settings form opens before setup gives up on a host that keeps sending answers that do not validate. */
+/** Number of invalid submissions allowed per page; cancelling the native picker is not a validation error. */
 const FORM_TRIES = 5;
 
 function notifySetup(ui: UiPort, decision: Exclude<Decision, { outcome: "extra" }>): void {
@@ -81,7 +81,9 @@ function notifySetup(ui: UiPort, decision: Exclude<Decision, { outcome: "extra" 
 	else ui.notify("팀을 설정하지 않았습니다. 바뀐 것이 없습니다.");
 }
 
-/** "역할별로 고르기": the models form, then the settings form (reopened with the errors while its answers do not validate), then the approval dialog. */
+const INVALID_FORM = "폼의 값이 계속 올바르지 않아 팀을 설정하지 않았습니다. 바뀐 것이 없습니다.";
+
+/** The role form, then an effort page per chosen model, repeated before common settings and approval. */
 async function pickByRole(
 	env: FlowEnv,
 	ui: UiPort,
@@ -90,32 +92,80 @@ async function pickByRole(
 	ctx: AnalysisContext,
 	input: SetupFormInput,
 ): Promise<void> {
-	const models = await form(modelsForm(input));
-	if (!models) return notifySetup(ui, { outcome: "cancelled" });
-	const picks = readModelPicks(input, models);
+	const pickModel = ui.pickModel?.bind(ui);
+	const browse = pickModel !== undefined;
+	const roles = interviewRoles(input, browse);
+	const selected: RoleAnswers = {};
+	const cancelled = (): void => notifySetup(ui, { outcome: "cancelled" });
+	const chooseEffort = async (id: RoleId, slot: "주 모델" | "폴백", selector: string, model?: ModelInfo) => {
+		const page = effortForm(input, id, slot, selector, model);
+		let effort: FormData[string] | undefined;
+		if (page) {
+			const answers = await form(page);
+			if (!answers) return undefined;
+			effort = answers[FIELD.effort];
+		}
+		return pickedEntry(input, id, selector, effort, model);
+	};
+	for (const [index, id] of roles.entries()) {
+		const title = roleTitle(id);
+		let retry: FormRetry | undefined;
+		let invalid = 0;
+		while (true) {
+			const answers = await form(roleForm(input, id, browse, index + 1, roles.length, retry));
+			if (!answers) return cancelled();
+			const choices = readRoleChoices(input, id, browse, answers);
+			if ("errors" in choices) {
+				if (++invalid >= FORM_TRIES) return ui.notify(INVALID_FORM, "warning");
+				retry = { answers, errors: choices.errors };
+				continue;
+			}
+			if ("disabled" in choices) {
+				selected[id] = choices;
+				break;
+			}
+			retry = { answers, errors: [] };
+			const primaryModel = choices.primary === BROWSE ? await pickModel?.(`${title} · 주 모델`) : undefined;
+			if (choices.primary === BROWSE && !primaryModel) continue;
+			const primary = await chooseEffort(id, "주 모델", primaryModel?.selector ?? choices.primary, primaryModel);
+			if (!primary) return cancelled();
+			let fallback;
+			if (choices.fallback !== undefined) {
+				const fallbackModel = choices.fallback === BROWSE ? await pickModel?.(`${title} · 폴백`) : undefined;
+				if (choices.fallback === BROWSE && !fallbackModel) continue;
+				const selector = fallbackModel?.selector ?? choices.fallback;
+				if (selector !== primary.selector) {
+					fallback = await chooseEffort(id, "폴백", selector, fallbackModel);
+					if (!fallback) return cancelled();
+				}
+			}
+			selected[id] = { primary, ...(fallback ? { fallback } : {}), workers: choices.workers };
+			break;
+		}
+	}
 	let retry: FormRetry | undefined;
 	for (let attempt = 0; attempt < FORM_TRIES; attempt++) {
-		const answers = await form(settingsForm(input, picks, retry));
-		if (!answers) return notifySetup(ui, { outcome: "cancelled" });
-		const built = setupConfig(input, picks, answers);
+		const answers = await form(commonSettingsForm(input, retry));
+		if (!answers) return cancelled();
+		const built = setupConfig(input, selected, answers);
 		if ("errors" in built) {
 			retry = { answers, errors: built.errors };
 			continue;
 		}
 		const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary: "역할별로 고른 팀", config: built.config }, {
-			warnings: [...built.warnings, ...modelWarnings(built.config, ctx)],
+			warnings: [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...built.warnings, ...modelWarnings(built.config, ctx)],
 		});
 		// No extra option was offered.
 		if (decision.outcome !== "extra") notifySetup(ui, decision);
 		return;
 	}
-	ui.notify("폼의 값이 계속 올바르지 않아 팀을 설정하지 않았습니다. 바뀐 것이 없습니다.", "warning");
+	ui.notify(INVALID_FORM, "warning");
 }
 
 /**
  * Setup and re-setup, without the model: Storm computes the recommended team (what the user chose before carries
  * over) and shows it in the approval dialog. "승인" saves it; where the host draws forms, "역할별로 고르기" opens the
- * two setup forms instead. Nothing reaches the main session.
+ * interview instead. Nothing reaches the main session.
  */
 export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
@@ -124,12 +174,27 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const priority = current ? teamPriority(current) : "balanced";
 	const recs = ctx.recommend(priority);
 	const proposed = recommendedConfig(recs, priority, current);
+	const form = ui.form?.bind(ui);
+	const input: SetupFormInput = {
+		recs,
+		proposed,
+		...(current ? { current } : {}),
+		models: ctx.available,
+		usage: subagentShares(ctx.analysis),
+	};
 	const checked = validateConfig(proposed);
 	if (!checked.config) {
-		ui.notify(`지금 쓸 수 있는 모델로는 팀을 추천할 수 없습니다(${checked.errors.join("; ")}). omp에서 Provider에 로그인한 뒤 다시 /storm 을 실행하세요.`, "warning");
+		if (form && ui.pickModel && ctx.available.some((model) => model.available && model.supportsTools)) {
+			const choice = await ui.select("Storm 추천 팀을 만들 수 없습니다", [PICK_BY_ROLE, CANCEL], {
+				title: "Storm 팀 제안",
+				markdown: checked.errors.map((error) => `- ${error}`).join("\n"),
+			});
+			if (choice === PICK_BY_ROLE) await pickByRole(env, ui, form, state, ctx, input);
+		} else {
+			ui.notify(`지금 쓸 수 있는 모델로는 팀을 추천할 수 없습니다(${checked.errors.join("; ")}). omp에서 Provider에 로그인한 뒤 다시 /storm 을 실행하세요.`, "warning");
+		}
 		return;
 	}
-	const form = ui.form?.bind(ui);
 	// What "승인" switches on beyond the models comes first: a small terminal cuts the panel from the end.
 	const cleanupNotice =
 		proposed.cleanup === true && current?.cleanup !== true
@@ -156,13 +221,7 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", [PICK_BY_ROLE, MENU.close], { title: "Storm 팀 제안", markdown: notes });
 		if (choice !== PICK_BY_ROLE) return;
 	} else if (decision.outcome !== "extra") return notifySetup(ui, decision);
-	await pickByRole(env, ui, form, state, ctx, {
-		recs,
-		proposed,
-		...(current ? { current } : {}),
-		models: ctx.available,
-		usage: subagentShares(ctx.analysis),
-	});
+	await pickByRole(env, ui, form, state, ctx, input);
 }
 
 /**

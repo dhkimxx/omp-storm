@@ -244,6 +244,45 @@ async function main(): Promise<void> {
 		});
 	});
 
+	await suite.step("request routing: oversized session history", async () => {
+		const path = join(env.work, "oversized-route.jsonl");
+		const timestamp = new Date().toISOString();
+		// Load a long transcript without making main model calls that could compact the test input.
+		const header = { type: "session", version: 3, id: crypto.randomUUID(), timestamp, cwd: env.project };
+		const entry = {
+			type: "message", id: "afe10000", parentId: null, timestamp,
+			message: { role: "user", content: [{ type: "text", text: "historical output\n".repeat(300_000) }], timestamp: Date.now() },
+		};
+		writeFileSync(path, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+		try {
+			await session(choose(FALLBACK.cancel), async rpc => {
+				const request = route({ action: "answer", text: "E2E-ROUTE-OK" }, "who reviews?");
+				const fresh = new LlmCursor(env);
+				const frames = await rpc.prompt(request);
+				check("the short request routes in a fresh session", fresh.of("route").length === 1 && reports(frames).some(report => report.includes("E2E-ROUTE-OK")));
+
+				const id = rpc.send({ type: "switch_session", sessionPath: path });
+				const response = await until(() => rpc.frames.find(frame => frame.type === "response" && frame.id === id), 20_000, "load the long session");
+				if (response.success !== true || (response.data as { cancelled?: boolean }).cancelled !== false) {
+					throw new Error(`could not load the long session: ${text(response)}`);
+				}
+
+				const llm = new LlmCursor(env);
+				const runs = files.runIds().size;
+				await rpc.prompt(request);
+				const dialog = rpc.dialogs.at(-1);
+				check("oversized routing offers run, menu or cancel", same(dialog?.options, [FALLBACK.run, FALLBACK.menu, FALLBACK.cancel]));
+				const title = dialog?.title ?? "";
+				check("the fallback suggests a new session instead of exposing a raw error", title.includes("/new") && !/byte limit|raw-http-request/i.test(title), title);
+				const requests = llm.all();
+				check("oversized routing makes no provider request", requests.length === 0, `requests=${requests.map(entry => entry.who).join(",")}`);
+				check("cancelling oversized routing creates no run", files.runIds().size === runs);
+			}, { persist: true });
+		} finally {
+			rmSync(path, { force: true });
+		}
+	});
+
 	await suite.step("request routing: work becomes a run", async () => {
 		const llm = new LlmCursor(env);
 		const steps: Step[] = [

@@ -2,21 +2,24 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
-import { parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
+import { type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
 import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
 import { agentsFlow, approveAndSave, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { ROLES, roleTitle } from "../src/roles.ts";
 import { writeRun } from "../src/runtime/run.ts";
 import { noteResumePointer, resumeCandidate, resumePointerFile } from "../src/runtime/resume.ts";
+import { parseModelEntry } from "../src/selector.ts";
+import { BROWSE, FIELD, MODEL_DEFAULT, NONE } from "../src/setup/form.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { isApproved, loadProjectState } from "../src/state.ts";
 import type { RunRequestResult } from "../src/tool/host.ts";
 import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
-import { makeProject, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
@@ -28,6 +31,9 @@ const FIRST = pick(0);
 const SECOND = pick(1);
 const THIRD = pick(2);
 const LAST = pick(-1);
+const PICK_BY_ROLE = "역할별로 고르기";
+const PRIMARY = "주 모델";
+const FALLBACK = "폴백";
 
 /** An omp catalog row; the real recommender ranks these. */
 const row = (provider: string, id: string, input: number, int: number, efforts = ["low", "medium", "high"]) => ({
@@ -60,17 +66,50 @@ async function recommended(current?: StormConfig): Promise<StormConfig> {
 	return recommendedConfig(ctx.recommend("balanced"), "balanced", current);
 }
 
-/** Gives the UI a form surface: each form is answered as it opens, with the next `overrides` entry on top (undefined cancels it). */
-function withForms(f: ScriptedUi, overrides: Array<FormData | undefined>): { htmls: string[] } {
-	const htmls: string[] = [];
-	const queue = [...overrides];
+/** Answer each page by its fields or legend; unspecified answers keep the controls' defaults. */
+function withForms(f: ScriptedUi, answer: (form: HtmlForm) => FormData | undefined = () => ({})): HtmlForm[] {
+	const forms: HtmlForm[] = [];
 	f.ui.form = async html => {
-		htmls.push(html);
-		if (!queue.length) throw new Error("no scripted answer for form");
-		const over = queue.shift();
-		return over && { ...defaultFormData(parseHtmlForm(html)), ...over };
+		const form = parseHtmlForm(html);
+		forms.push(form);
+		const over = answer(form);
+		return over && { ...defaultFormData(form), ...over };
 	};
-	return { htmls };
+	return forms;
+}
+
+const hasField = (form: HtmlForm, name: string) => form.fields.some(field => field.name === name);
+const legend = (form: HtmlForm) => form.sections.map(section => spansText(section.title)).filter(Boolean).join(" ");
+
+function choice(form: HtmlForm, name: string) {
+	const field = form.fields.find(field => field.name === name);
+	if (field?.kind !== "choice") throw new Error(`missing choice field: ${name}`);
+	return field;
+}
+
+/** Identify a page without depending on the number of effort pages that came before it. */
+function page(form: HtmlForm): string {
+	if (hasField(form, FIELD.parallelism)) return "settings";
+	if (hasField(form, FIELD.effort)) {
+		const title = legend(form);
+		const model = CATALOG.find(row => title.includes(`${row.provider}/${row.id}`));
+		const slot = title.includes(PRIMARY) ? PRIMARY : title.includes(FALLBACK) ? FALLBACK : undefined;
+		if (model && slot) return `${slot} ${model.provider}/${model.id}`;
+	}
+	const roles = ROLES.filter(role => hasField(form, FIELD.primary(role.id)));
+	if (roles.length === 1) return roles[0]!.id;
+	throw new Error(`unrecognized interview page: ${legend(form)}`);
+}
+
+function defaultPages(team: StormConfig): string[] {
+	return [...ROLES.flatMap(({ id }) => {
+		const entries = team.roles[id]?.models.slice(0, 2) ?? [];
+		return [id, ...entries.flatMap((entry, index) => {
+			const { selector } = parseModelEntry(entry);
+			const row = CATALOG.find(row => `${row.provider}/${row.id}` === selector);
+			return row?.thinking.efforts.length ? [`${index === 0 ? PRIMARY : FALLBACK} ${selector}`] : [];
+		})];
+	}), "settings"];
 }
 
 const load = () => loadProjectState(env);
@@ -81,6 +120,11 @@ const editByHand = async (text: string) => {
 	await writeFile(configPath(project.root), text);
 };
 const fileText = () => readFile(configPath(project.root), "utf8");
+async function expectEmptySetup(): Promise<void> {
+	const state = await load();
+	expect(state.config.status).toBe("missing");
+	expect(await state.store.list()).toEqual([]);
+}
 
 describe("/storm without an approved team", () => {
 	test("no config: the recommended team is offered at once, and cancelling saves nothing", async () => {
@@ -246,11 +290,12 @@ describe("setup", () => {
 		expect(without.selects[0]?.markdown).toContain("/storm <");
 
 		const withForm = scriptedUi([CANCEL]);
-		withForms(withForm, []);
+		const forms = withForms(withForm);
 		await setupFlow(env, withForm.ui);
 		expect(withForm.selects[0]?.options).toHaveLength(3);
 		expect([withForm.selects[0]?.options.at(0), withForm.selects[0]?.options.at(-1)]).toEqual([APPROVE, CANCEL]);
 		expect(withForm.selects[0]?.markdown).not.toContain("/storm <");
+		expect(forms).toEqual([]);
 	});
 
 	test("re-setup keeps the docs, cleanup, budget and worker choices in the proposed team", async () => {
@@ -301,25 +346,40 @@ describe("setup", () => {
 		await setupFlow(env, plain.ui);
 		expect(plain.selects).toEqual([]);
 
-		const f = scriptedUi([FIRST, APPROVE]);
-		const forms = withForms(f, [{}, { parallelism: 2 }]);
+		const f = scriptedUi([PICK_BY_ROLE, APPROVE]);
+		const forms = withForms(f, form => hasField(form, FIELD.parallelism) ? { [FIELD.parallelism]: 2 } : {});
 		await setupFlow(env, f.ui);
-		expect(forms.htmls).toHaveLength(2);
+		expect(forms.map(page)).toEqual(defaultPages(team));
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		expect(f.selects[1]?.options).toEqual([APPROVE, CANCEL]);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual({ ...team, parallelism: 2 });
 	});
 
-	test("picking role by role: two forms, then the approval dialog saves the picked team", async () => {
+	test("picking role by role groups the controls and then asks about settings and approval", async () => {
 		const base = await recommended();
-		const f = scriptedUi([SECOND, APPROVE]);
-		const forms = withForms(f, [{ primary_reviewer: "none", fallback_implementer: "none" }, { budget_usd: 3, cleanup: "off" }]);
+		const f = scriptedUi([PICK_BY_ROLE, APPROVE]);
+		const forms = withForms(f, form => {
+			if (hasField(form, FIELD.primary("reviewer"))) return { [FIELD.primary("reviewer")]: NONE };
+			if (hasField(form, FIELD.fallback("implementer"))) return { [FIELD.fallback("implementer")]: NONE };
+			if (hasField(form, FIELD.parallelism)) return { [FIELD.budget]: 3, [FIELD.cleanup]: "off" };
+			return {};
+		});
 		await setupFlow(env, f.ui);
-		expect(forms.htmls).toHaveLength(2);
-		expect(parseHtmlForm(forms.htmls[1]!).fields.some(field => field.name === "workers_min_reviewer")).toBe(false);
-		expect(f.selects.map(s => s.options.length)).toEqual([3, 2]);
-		expect(f.selects[1]?.options).toEqual([APPROVE, CANCEL]);
+		const picked = structuredClone(base);
+		picked.roles.implementer!.models.length = 1;
+		delete picked.roles.reviewer;
+		expect(forms.map(page)).toEqual(defaultPages(picked));
+		for (const { id } of ROLES) {
+			const role = forms.find(form => hasField(form, FIELD.primary(id)))!;
+			expect(role.fields.map(field => field.name).sort()).toEqual(
+				[FIELD.primary(id), FIELD.fallback(id), FIELD.workersMin(id), FIELD.workersMax(id)].sort(),
+			);
+			for (const name of [FIELD.primary(id), FIELD.fallback(id)]) {
+				expect(choice(role, name).options.some(option => option.value === BROWSE)).toBe(false);
+			}
+		}
+		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
 		const state = await load();
 		const saved = state.config.status === "ok" ? state.config.config : undefined;
 		expect(isApproved(state)).toBe(true);
@@ -331,22 +391,116 @@ describe("setup", () => {
 		expect(saved?.roles.explorer).toEqual(base.roles.explorer!);
 	});
 
-	test("settings that do not validate reopen the form with the errors; a cancelled form or dialog saves nothing", async () => {
-		const f = scriptedUi([SECOND, CANCEL]);
-		const forms = withForms(f, [{}, { parallelism: 99 }, { parallelism: 3 }]);
-		await setupFlow(env, f.ui);
-		expect(forms.htmls).toHaveLength(3);
-		const reopened = parseHtmlForm(forms.htmls[2]!);
-		expect(reopened.sections.some(s => s.blocks.some(b => b.kind === "list"))).toBe(true);
-		expect(defaultFormData(reopened).parallelism).toBe(99);
-		expect((await load()).config.status).toBe("missing");
+	test("models outside the recommendations get their own primary and fallback effort pages before approval", async () => {
+		const primary = model("pd/outside-primary", { efforts: ["minimal", "low"], contextWindow: 64_000 });
+		const fallback = model("pe/outside-fallback", { efforts: ["high", "xhigh"], contextWindow: 64_000 });
+		const catalog = [...CATALOG, ...[primary, fallback].map(m => ({
+			...row(m.provider, m.id, 1, 50, m.efforts),
+			contextWindow: m.contextWindow,
+		}))];
+		const withOutsideModels = { ...env, registry: { getAll: () => catalog, getAvailable: () => catalog } };
+		const f = scriptedUi([PICK_BY_ROLE, async () => {
+			await expectEmptySetup();
+			return APPROVE;
+		}]);
+		const roleId = "explorer";
+		const title = roleTitle(roleId);
+		const steps: string[] = [];
+		f.ui.pickModel = async slotTitle => {
+			steps.push(`picker ${slotTitle}`);
+			return slotTitle.endsWith(FALLBACK) ? fallback : primary;
+		};
+		withForms(f, form => {
+			if (hasField(form, FIELD.primary(roleId))) {
+				steps.push(roleId);
+				for (const name of [FIELD.primary(roleId), FIELD.fallback(roleId)]) {
+					const options = choice(form, name).options;
+					expect(options.some(option => option.value === BROWSE && spansText(option.label) === "OMP에서 다른 모델 선택")).toBe(true);
+					expect(options.map(option => option.value)).not.toContain(primary.selector);
+					expect(options.map(option => option.value)).not.toContain(fallback.selector);
+				}
+				return {
+					[FIELD.primary(roleId)]: BROWSE,
+					[FIELD.fallback(roleId)]: BROWSE,
+					[FIELD.workersMin(roleId)]: 2,
+					[FIELD.workersMax(roleId)]: 3,
+				};
+			}
+			for (const [slot, picked, initial, effort] of [[PRIMARY, primary, "low", "minimal"], [FALLBACK, fallback, "high", "xhigh"]] as const) {
+				if (!hasField(form, FIELD.effort) || !legend(form).includes(picked.selector)) continue;
+				expect(legend(form)).toContain(slot);
+				steps.push(`${slot} ${picked.selector}`);
+				const field = choice(form, FIELD.effort);
+				expect(spansText(field.label)).toBe(FIELD.effort);
+				expect(field.options.map(option => option.value)).toEqual([MODEL_DEFAULT, ...picked.efforts]);
+				expect(defaultFormData(form)[FIELD.effort]).toBe(initial);
+				return { [FIELD.effort]: effort };
+			}
+			steps.push(page(form));
+			return {};
+		});
+		await setupFlow(withOutsideModels, f.ui);
+		const expected = defaultPages(await recommended());
+		const nextRole = expected.indexOf("implementer");
+		expect(steps).toEqual([
+			roleId,
+			`picker ${title} · ${PRIMARY}`,
+			`${PRIMARY} ${primary.selector}`,
+			`picker ${title} · ${FALLBACK}`,
+			`${FALLBACK} ${fallback.selector}`,
+			...expected.slice(nextRole),
+		]);
+		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
+		const state = await load();
+		expect(state.config.status === "ok" && state.config.config.roles[roleId]).toMatchObject({
+			models: [`${primary.selector}:minimal`, `${fallback.selector}:xhigh`],
+			workers: { min: 2, max: 3 },
+		});
+		expect(isApproved(state)).toBe(true);
+	});
 
-		for (const answers of [[undefined], [{}, undefined]]) {
-			const g = scriptedUi([SECOND]);
-			withForms(g, answers);
+	test("Esc from the model picker returns to the same role without saving anything", async () => {
+		const f = scriptedUi([PICK_BY_ROLE]);
+		let picks = 0;
+		f.ui.pickModel = async () => {
+			picks++;
+			await expectEmptySetup();
+			return undefined;
+		};
+		const basePages = defaultPages(await recommended());
+		let visits = 0;
+		const forms = withForms(f, form => {
+			if (!hasField(form, FIELD.primary("implementer"))) return {};
+			if (++visits > 1) return undefined;
+			return { [FIELD.primary("implementer")]: BROWSE };
+		});
+		await setupFlow(env, f.ui);
+		expect(forms.map(page)).toEqual([...basePages.slice(0, basePages.indexOf("implementer")), "implementer", "implementer"]);
+		expect(picks).toBe(1);
+		expect(f.selects).toHaveLength(1);
+		await expectEmptySetup();
+	});
+
+	test("only invalid settings reopen with the errors; cancelling a page or approval saves nothing", async () => {
+		const f = scriptedUi([PICK_BY_ROLE, CANCEL]);
+		let attempts = 0;
+		const forms = withForms(f, form => hasField(form, FIELD.parallelism) ? { [FIELD.parallelism]: ++attempts === 1 ? 99 : 3 } : {});
+		await setupFlow(env, f.ui);
+		const expected = defaultPages(await recommended());
+		expect(forms.map(page)).toEqual([...expected, "settings"]);
+		const reopened = forms.at(-1)!;
+		expect(reopened.sections.some(s => s.blocks.some(b => b.kind === "list"))).toBe(true);
+		expect(defaultFormData(reopened)[FIELD.parallelism]).toBe(99);
+		expect(f.selects.at(-1)?.options).toEqual([APPROVE, CANCEL]);
+		await expectEmptySetup();
+
+		for (const toCancel of ["explorer", expected.find(p => p.startsWith(PRIMARY) || p.startsWith(FALLBACK))!, "settings"]) {
+			const g = scriptedUi([PICK_BY_ROLE]);
+			const pages = withForms(g, form => page(form) === toCancel ? undefined : {});
 			await setupFlow(env, g.ui);
+			expect(pages.map(page)).toEqual(expected.slice(0, expected.indexOf(toCancel) + 1));
 			expect(g.selects).toHaveLength(1);
-			expect((await load()).config.status).toBe("missing");
+			await expectEmptySetup();
 		}
 	});
 

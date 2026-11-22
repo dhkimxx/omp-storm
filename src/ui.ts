@@ -1,7 +1,14 @@
+import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type Component, matchesKey, ScrollView, type TUI, theme } from "@oh-my-pi/pi-tui";
-import { FramedMessageComponent } from "@oh-my-pi/pi-tui/chrome";
-import type { UiPort } from "./types.ts";
+import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
+import { editorKeys, FramedMessageComponent, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
+import { text } from "@oh-my-pi/pi-tui/native/describe";
+import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type { ModelBrowserSource } from "@oh-my-pi/pi-tui/overlays/model-browser";
+import { type ModelPickerRegistry, ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
+import { toModelInfo } from "./discovery/models.ts";
+import type { ModelInfo, UiPort } from "./types.ts";
 
 const REPORT_TYPE = "storm-report";
 /**
@@ -121,6 +128,111 @@ class ReportView implements Component {
 	}
 }
 
+const STORM_PICKER_STATUS = "이 Storm 역할에만 적용 · 현재 세션 모델은 변경하지 않음";
+const STORM_PICKER_SOURCE: ModelBrowserSource = {
+	revision: 0,
+	defaultThinkingLevel: "off",
+	modelProviderOrder: [],
+	knownRoleIds: [],
+	mruOrder: [],
+	modelPerf: new Map(),
+	getModelRole: () => undefined,
+	getRoleInfo: role => ({ name: role, section: "chat", accepts: () => false }),
+	defaultRoleChain: () => [],
+	resolveRoleValue: () => ({ model: undefined, explicitThinkingLevel: false }),
+};
+
+/** The host picker owns the search, provider scopes, list and preview; replace only the session-switch chrome. */
+class StormModelPicker extends ModelPickerComponent {
+	#description: { source: NativeNode; node: NativeNode } | undefined;
+	readonly #catalogError: boolean;
+
+	constructor(
+		tui: TUI,
+		private readonly title: string,
+		registry: ModelPickerRegistry,
+		private readonly cancel: () => void,
+		pick: (model: ModelInfo | undefined) => void,
+	) {
+		super(tui, STORM_PICKER_SOURCE, registry, [], {
+			onPick: raw => pick(toModelInfo(raw, true)),
+			onCancel: cancel,
+		});
+		this.#catalogError = Boolean(registry.getError());
+	}
+
+	#hints(): string {
+		const move = editorKeys("tui.select.up", "tui.select.down");
+		return `${move} 이동 · ${formatKeyHint("enter")} 선택 · ${formatKeyHint("tab")} 공급자 · ${formatKeyHint("escape")} 취소`;
+	}
+
+	override handleInput(data: string): void {
+		// Leave the interview step, rather than clearing the search on the first Esc as Alt+P does.
+		if (matchesKey(data, "escape")) this.cancel();
+		else super.handleInput(data);
+	}
+
+	override handleNativeEvent(event: NativeUiEvent): void {
+		if (event.type === "action" && event.key === "" && event.act === "close") this.cancel();
+		else super.handleNativeEvent(event);
+	}
+
+	override render(width: number): string[] {
+		const rows = super.render(width).slice();
+		rows[0] = topBorder(width, this.title);
+		if (!this.#catalogError) rows[1] = row(theme.fg("muted", STORM_PICKER_STATUS), width);
+		rows[rows.length - 2] = row(theme.fg("dim", this.#hints()), width);
+		return rows;
+	}
+
+	override describe(cx?: DescribeContext): NativeNode {
+		const source = super.describe(cx);
+		if (this.#description?.source === source) return this.#description.node;
+		let node = source;
+		if (source.k === "picker") {
+			node = {
+				...source,
+				p: {
+					...source.p,
+					search: "head",
+					title: this.title,
+					subtitle: source.p?.subtitle ?? STORM_PICKER_STATUS,
+					placeholder: "모델 검색…",
+				},
+			};
+		} else if (source.k === "card" && source.c?.[0]) {
+			node = {
+				...source,
+				p: { ...source.p, head: this.title },
+				c: [
+					this.#catalogError ? source.c[0] : text(STORM_PICKER_STATUS),
+					...source.c.slice(1, -1),
+					text(this.#hints()),
+				],
+			};
+		}
+		this.#description = { source, node };
+		return node;
+	}
+}
+
+function modelPickerRegistry(registry: ExtensionContext["modelRegistry"]): ModelPickerRegistry {
+	let error: unknown = registry.getError();
+	let models: Model[] = [];
+	try {
+		models = registry.getAvailable("chat").filter(model => model.supportsTools !== false);
+	} catch (cause) {
+		error = cause;
+	}
+	return {
+		getError: () => error,
+		getAvailable: () => models,
+		getAll: () => models,
+		// The picker gets a read-only snapshot, not OMP's live registry.
+		refreshIfStale: async () => false,
+	};
+}
+
 /**
  * Adapts omp's ctx.ui. In the TUI, views and contexts are overlays and panels that leave nothing in the transcript;
  * other hosts cannot draw components, so they get transcript messages (never sent to the model).
@@ -184,6 +296,22 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 		notify: (message, level = "info") => (drawsComponents ? ctx.ui.notify(message, level) : transcript(NOTICE_TITLE[level], message)),
 		report,
 		record: transcript,
+		...(drawsComponents
+			? {
+					pickModel: (title: string) =>
+						ctx.ui.custom<ModelInfo | undefined>(
+							(tui, _theme, _keys, done) =>
+								new StormModelPicker(
+									tui,
+									`Storm 모델 선택 · ${title}`,
+									modelPickerRegistry(ctx.modelRegistry),
+									() => done(undefined),
+									done,
+								),
+							{ overlay: true },
+						),
+				}
+			: {}),
 		...(formDialog
 			? {
 					form: async (html: string) => {

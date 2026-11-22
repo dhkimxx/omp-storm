@@ -2,9 +2,9 @@
  * `/storm <text>`: decides what a request is without putting it in the main session. Fixed prefixes are decided here;
  * anything else costs one side turn in which the session model only classifies, as one JSON object Storm validates
  * and executes itself. Queries open an overlay, changes go through the approval dialog, and only work reaches the
- * session, as a run whose task is the user's text verbatim. The classifier reads the whole conversation, injected
- * text included, so what it may choose is bounded: no shell command, and the user confirms what a wrong choice would
- * cost (a quota mark that reorders models).
+ * session, as a run whose task is the user's text verbatim. The classifier uses the conversation only if it fits the
+ * side turn's size limit. The conversation can contain injected text, so what the classifier may choose is bounded:
+ * no shell command, and the user confirms what a wrong choice would cost (a quota mark that reorders models).
  */
 import { isRecord, teamPriority } from "../config/schema.ts";
 import { docsEnabled } from "../policy/docs.ts";
@@ -210,7 +210,10 @@ export async function routeRequest(text: string, deps: RouteDeps): Promise<void>
 			routed = parseRouteReply(await deps.sideTurn(buildRoutePrompt(text.trim(), teamBrief(state))), text.trim());
 			problem = "요청을 분류한 답을 읽지 못했습니다.";
 		} catch (error) {
-			problem = `요청을 분류하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`;
+			const message = error instanceof Error ? error.message : String(error);
+			problem = /^Ephemeral turn context exceeds the configured \d+-byte limit\.$|prompt (?:is )?too long|context_length_exceeded/i.test(message)
+				? "분류에 보낼 대화가 너무 깁니다. 작업을 다시 요청하려면 새 세션(/new)을, 팀을 관리하려면 메뉴를 여세요."
+				: `요청을 분류하지 못했습니다: ${message}`;
 		}
 	}
 	if (routed) {

@@ -282,6 +282,9 @@ export default function storm(pi: ExtensionAPI): void {
 		return async promptText => {
 			const result = await turn.call(ctx, {
 				promptText,
+				// The side turn bypasses run preflight and replays the live context. Bound the input before inference,
+				// even when omp's last token estimate is stale. Its byte count also includes the host tool catalog.
+				maxContextBytes: 4 * 1024 * 1024,
 				// `tools: false` throws on some transports and drops the prompt cache: tool calls are discarded anyway.
 				dedupeReply: false,
 				minimizeEffort: true,

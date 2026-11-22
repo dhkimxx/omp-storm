@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * OMP Storm end-to-end check in omp's interactive TUI, on a pty: what only that host has. Setup through Storm's
- * dialog and its two forms, a plain request, and a run Storm sends back until its changes are reviewed. Same
+ * approval, role interviews, a plain request, and a run Storm sends back until its changes are reviewed. Same
  * isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
  *
  * Usage: npm run e2e:tui   (env: see harness.ts)
@@ -14,8 +14,10 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
+import { ROLES } from "../../src/roles.ts";
+import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
-import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, PROFILE_CONFIG, prepare, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
+import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, price, PROFILE_CONFIG, prepare, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
 const PICK_BY_ROLE = "역할별로 고르기";
@@ -35,6 +37,7 @@ const b64 = (value: unknown): string => `b64:${Buffer.from(JSON.stringify(value)
 const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "main");
 const plan = (name: string, kind: string): Step => ({ storm: { action: "plan", plan: { lanes: [{ name, kind }] } } });
 const primary = (config: StormConfig | undefined, role: string): string | undefined => modelId(config?.roles[role]?.models[0]);
+const OUTSIDE = "interview-outside";
 
 async function session<T>(body: (tui: Tui) => Promise<T>): Promise<T> {
 	const tui = new Tui(env, { model: "fake/general-b" });
@@ -81,33 +84,19 @@ interface Edit {
 /** `[answered, total]` of every form head in `text`. */
 const heads = (text: string): Array<[number, number]> => [...text.matchAll(FORM_HEAD)].map(head => [Number(head[1]), Number(head[2])]);
 
-/** Steps a dropdown to its next option: the row then shows the second position. */
-const NEXT_OPTION: Edit = { key: KEY.right, what: "step to its next option", effect: text => /›\s+2\/\d+/.test(text) };
+/** Uses omp's native type-ahead while the field is focused. */
+const option = (key: string, label: string): Edit => ({ key, what: `select ${label}`, effect: text => text.includes(`‹ ${label} ›`) });
 /** Empties a text or number field (the cursor starts at its front): the head then counts one answer less. */
 const CLEAR: Edit = { key: KEY.killLine, what: "become empty", effect: text => heads(text).some(([answered, total]) => answered === total - 1) };
 /** Types `value` into an empty field: its row then shows exactly that. */
 const type = (value: string): Edit => ({ key: value, what: `show ${value}`, effect: text => text.split("\n").some(row => row.replace(/[│█\s]/g, "") === value) });
 
 /**
- * Fills and submits the form omp opens after raw offset `from` (one with another number of fields than `previous`,
- * the form before it). One Tab per field moves the focus to Submit and Enter sends it; `edits` are typed while the
- * field of that index (in Tab order) has the focus. Each key waits for its repaint: the row that got the focus for
- * a Tab, the changed value for an edit. Returns the raw offset at the Enter: the caller waits for what the form
- * leads to.
+ * Fills the form that draws `heading` after `from`. Adjacent pages can have the same field count. One Tab per
+ * field moves the focus to Submit. Each key waits for its repaint before the next one is sent.
  */
-async function submitForm(tui: Tui, from: number, previous: number | undefined, edits: Readonly<Record<number, readonly Edit[]>> = {}): Promise<{ fields: number; mark: number }> {
-	// The form is up once its head and, below it, its first field with the focus are drawn.
-	const { fields, first } = await tui.seen(
-		from,
-		text => {
-			const head = [...text.matchAll(FORM_HEAD)].findLast(match => Number(match[2]) !== previous);
-			const label = head && focused(text.slice(head.index));
-			return head && label !== undefined ? { fields: Number(head[2]), first: label } : undefined;
-		},
-		"a form with its first field focused",
-		90_000,
-	);
-	let label = first;
+async function submitForm(tui: Tui, from: number, heading: string, fields: number, edits: Readonly<Record<number, readonly Edit[]>> = {}): Promise<number> {
+	let label = await tui.seen(from, text => text.includes(heading) ? focused(text) : undefined, `the form for ${heading}`);
 	for (let field = 1; field <= fields; field++) {
 		const where = `field ${field} of ${fields} («${label}»)`;
 		for (const edit of edits[field - 1] ?? []) await tui.press(edit.key, edit.effect, `${where} to ${edit.what}`);
@@ -115,16 +104,15 @@ async function submitForm(tui: Tui, from: number, previous: number | undefined, 
 		label = focused(tui.text(tab)) ?? "";
 		if ((label === FORM_SUBMIT) !== (field === fields)) throw new Error(`Tab ${field} of ${fields} put the focus on «${label}»`);
 	}
-	return { fields, mark: tui.send(KEY.enter) };
+	return tui.send(KEY.enter);
 }
 
 async function main(): Promise<void> {
-	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
+	const outside = { id: OUTSIDE, cost: price(2, 8), context: 110_000, efforts: ["low", "high"] } as const;
+	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, { ...TEAM_PROVIDERS, fake: [...TEAM_PROVIDERS.fake, outside] }));
 	writeFileSync(join(env.agentDir, "config.yml"), PROFILE_CONFIG);
 	for (const [name, content] of Object.entries({ "note.txt": "e2e note\n", "note2.txt": "e2e second note\n", "note3.txt": "e2e third note\n" })) writeFileSync(join(env.project, name), content);
 	linkPlugin(env);
-	/** The recommended team as approved in the first step. */
-	let recommended: StormConfig | undefined;
 
 	await suite.step(
 		"setup: the dialog, approve",
@@ -139,57 +127,49 @@ async function main(): Promise<void> {
 				await suite.eventually("approve saves the config and one approval", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
 				check("no model request during setup", llm.all().filter(entry => entry.who !== "side").length === 0, `requests=${llm.all().length}`);
 			});
-			recommended = existsSync(files.configFile) ? files.config() : undefined;
 		},
 		180_000,
 	);
 
 	await suite.step(
-		"setup: pick by role in the two forms",
-		async () => {
-			// A project without a team again: the forms start from the recommendation and their result needs approval.
-			rmSync(join(env.project, ".omp"), { recursive: true, force: true });
-			rmSync(join(env.agentDir, "storm"), { recursive: true, force: true });
-			const llm = new LlmCursor(env);
-			await session(async tui => {
-				const opened = await answer(tui, await tui.submit("/storm"), PICK_BY_ROLE);
-				const models = await submitForm(tui, opened, undefined);
-				const settings = await submitForm(tui, models.mark, models.fields);
-				check("two forms: models, then settings", models.fields > 0 && settings.fields > 0, `fields=${models.fields},${settings.fields}`);
-				// The approval dialog is what the settings form leads to; nothing is written before its answer.
-				const asked = await tui.selector(settings.mark);
-				check("nothing is saved before the approval", asked.length > 0 && !existsSync(files.configFile) && files.approvals().length === 0, JSON.stringify(asked));
-				await answer(tui, settings.mark, APPROVE);
-				await suite.eventually("the forms' team is saved and approved", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
-				const picked = existsSync(files.configFile) ? files.config() : undefined;
-				const primaries = (config: StormConfig | undefined) => Object.keys(config?.roles ?? {}).map(id => `${id}=${primary(config, id)}`).sort().join(" ");
-				check("left as prefilled, the forms give the recommended models", primaries(picked) === primaries(recommended) && primaries(picked) !== "", primaries(picked));
-				check("no model request", llm.all().filter(entry => entry.who !== "side").length === 0);
-			});
-		},
-		240_000,
-	);
-
-	await suite.step(
-		"setup: change a model and a number in the forms",
+		"setup: role pages with the native model picker and effort",
 		async () => {
 			const before = files.config();
 			const approvals = files.approvals().length;
-			const most = (config: StormConfig) => (typeof config.roles.explorer?.workers === "object" ? config.roles.explorer.workers.max : undefined);
+			const llm = new LlmCursor(env);
 			await session(async tui => {
-				// The recommendation equals the approved team, so the only way on is the forms.
-				const opened = await answer(tui, await tui.submit("/storm setup"), PICK_BY_ROLE);
-				// Models form, field 1: the explorer's primary, a dropdown on its first candidate. Settings form, field
-				// 3: the explorer's most workers, a number.
-				const models = await submitForm(tui, opened, undefined, { 0: [NEXT_OPTION] });
-				const settings = await submitForm(tui, models.mark, models.fields, { 2: [CLEAR, type("3")] });
-				await answer(tui, settings.mark, APPROVE);
-				// The approval is written first, the config after it.
-				await until(() => (files.approvals().length === approvals + 1 && primary(files.config(), "explorer") !== primary(before, "explorer") ? true : undefined), 60_000, "the changed team to be approved and saved");
-				const after = files.config();
-				check("the picked model is saved", primary(after, "explorer") !== undefined && primary(after, "explorer") !== primary(before, "explorer"), `${primary(before, "explorer")} → ${primary(after, "explorer")}`);
-				check("the typed number is saved", most(after) === 3 && most(before) !== 3, `${most(before)} → ${most(after)}`);
-				check("the other roles keep their models", primary(after, "implementer") === primary(before, "implementer"));
+				let mark = await answer(tui, await tui.submit("/storm setup"), PICK_BY_ROLE);
+				const browse = option("O", "OMP에서 다른 모델 선택");
+				for (const { id, agent } of ROLES) {
+					const explorer = id === "explorer";
+					mark = await submitForm(tui, mark, agent, 4, explorer ? { 0: [browse], 3: [CLEAR, type("3")] } : {});
+					const models = before.roles[id]?.models.slice(0, 2).map(parseModelEntry) ?? [];
+					if (explorer) {
+						await tui.shows("Storm 모델 선택", mark);
+						mark = await submitForm(tui, tui.send("\x1b"), agent, 4);
+						await tui.shows("Storm 모델 선택", mark);
+						await tui.press(OUTSIDE, text => text.includes(OUTSIDE), "the native picker to find the outside model");
+						mark = await submitForm(tui, tui.send(KEY.enter), `fake/${OUTSIDE}`, 1, { 0: [option("l", "low")] });
+					}
+					for (const [index, model] of models.entries()) {
+						if ((explorer && index === 0) || model.effort === undefined) continue;
+						mark = await submitForm(tui, mark, model.selector, 1);
+					}
+				}
+				const settings = await submitForm(tui, mark, "예산", 8);
+				await tui.selector(settings);
+				check("role and effort pages don't save without approval", files.approvals().length === approvals && JSON.stringify(files.config()) === JSON.stringify(before));
+				await answer(tui, settings, APPROVE);
+				await suite.eventually("the selected model, its effort and worker limit are saved", () => {
+					const role = files.config().roles.explorer;
+					return role?.models[0] === `fake/${OUTSIDE}:low` && typeof role.workers === "object" && role.workers.max === 3 && files.approvals().length === approvals + 1;
+				});
+				check("the other roles keep their models", primary(files.config(), "implementer") === primary(before, "implementer"));
+				check("setup made no model request", llm.all().filter(entry => entry.who !== "side").length === 0);
+				const ordinary = new LlmCursor(env);
+				await tui.submit("hello after the model picker");
+				await until(() => mains(ordinary.all())[0], 15_000, "the first main request after the interview");
+				check("the native picker did not switch the session model", mains(ordinary.all())[0]?.model === "general-b");
 			});
 		},
 		240_000,
