@@ -50,7 +50,7 @@ import {
 	noteVerdictTree,
 } from "./runtime/agents.ts";
 import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
-import { noteRunSpawn, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
+import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
@@ -69,6 +69,7 @@ import type {
 	ConfigLoad,
 	ExplicitSettings,
 	Exec,
+	InfoTone,
 	RepoIdentity,
 	RunPlan,
 	RunRecord,
@@ -78,7 +79,8 @@ import type {
 	UiPort,
 } from "./types.ts";
 import { createUiPort, registerReportRenderer } from "./ui.ts";
-import { LiveStatus } from "./view/live.ts";
+import { isLiveTui, LiveStatus } from "./view/live.ts";
+import { idleAppearance, RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./view/appearance.ts";
 import { runStatusText } from "./view/render.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
@@ -185,6 +187,19 @@ function terminalWorkFailed(messages: readonly unknown[] | undefined): boolean |
 		return reason === "error" || reason === "aborted" || reason === "length";
 	}
 	return undefined;
+}
+
+/**
+ * Only a real ask form is a user wait. The host's only public form-open hook is the ask tool's own execution, so its
+ * arguments are checked here too: the current `html` form, the older bare string and `questions` list are the
+ * documented shapes. A headless or invalid ask finishes at once and its execution end clears the mark.
+ */
+function askWaits(args: unknown): boolean {
+	if (typeof args === "string") return args.trim() !== "";
+	if (typeof args !== "object" || args === null) return false;
+	const form = args as { html?: unknown; questions?: unknown };
+	if (typeof form.html === "string" && form.html.trim() !== "") return true;
+	return Array.isArray(form.questions) && form.questions.length > 0;
 }
 
 /** The host artifact root shared by a parent session and its task children, isolated worktrees included. */
@@ -318,25 +333,66 @@ function newerVersion(): string | undefined {
 	return newerInstalledVersion(STORM_VERSION, text);
 }
 
-/** The idle label. A resumable last run is worth a hint only for a team that may actually run. */
-function statusLabel(state: ProjectState, resumable: boolean, auto: AutoStatus): string | undefined {
-	if (state.config.status === "missing") return auto.enabled ? "storm: 설정 없음 · 자동 위임 막힘" : undefined;
-	const base = state.config.status === "invalid" ? "storm: 설정 오류" : state.approval ? "storm ✓" : "storm: 승인 필요";
-	const parts = [base];
-	if (auto.enabled) parts.push(auto.problem === undefined ? "자동 위임" : "자동 위임 막힘");
-	if (resumable && isApproved(state)) parts.push("이어 갈 실행 있음");
+/**
+ * The idle footer/status line. It speaks for an existing team only: a missing config with no automatic consent gets
+ * nothing. On a real TUI each part carries a semantic theme tone; RPC and print hosts get the same words with no
+ * ANSI. A live run replaces it with the editor widget, so the idle line never duplicates the live one.
+ */
+function idleStatusText(
+	ctx: ExtensionContext,
+	state: ProjectState,
+	resumable: boolean,
+	auto: AutoStatus,
+): string | undefined {
+	const team =
+		state.config.status === "missing"
+			? "missing"
+			: state.config.status === "invalid"
+				? "invalid"
+				: isApproved(state)
+					? "approved"
+					: "unapproved";
+	if (team === "missing" && !auto.enabled) return undefined;
+	const look = idleAppearance({
+		team,
+		auto: auto.enabled ? (auto.problem === undefined ? "on" : "blocked") : "off",
+		resume: resumable && team === "approved",
+	});
+	const paint = (text: string, tone: InfoTone): string => (isLiveTui(ctx) ? ctx.ui.theme.fg(tone, text) : text);
+	const parts = [`${paint(STORM_MARK, "accent")} · ${paint(look.label, look.tone)}`];
+	if (look.action !== undefined) parts.push(paint(look.action.replaceAll("`", ""), "muted"));
+	if (auto.enabled) {
+		const line = auto.problem?.split(/\r?\n/, 1)[0]?.trim() ?? "";
+		const blocked = line.length > 160 ? `${line.slice(0, 159)}…` : line;
+		if (blocked === "") parts.push(paint("자동 위임 켜짐", "accent"));
+		else if (look.label === "자동 위임 막힘") parts.push(paint(blocked, "warning"));
+		else parts.push(paint(`자동 위임 막힘: ${blocked}`, "warning"));
+	}
+	// Another status outranks resume in the shared idle label; the hint still belongs on the line.
+	if (resumable && team === "approved" && look.label !== "이어가기 가능") parts.push(paint("이어가기 가능", "warning"));
 	const newer = newerVersion();
-	if (newer) parts.push(`새 버전 ${newer} → /restart`);
+	if (newer !== undefined) parts.push(paint(`새 버전 ${newer} → /restart`, "accent"));
 	return parts.join(" · ");
 }
 
 export default function storm(pi: ExtensionAPI): void {
 	const exec = execPort(pi);
 	const liveStatus = new LiveStatus();
-	/** One live run: the editor widget in a true TUI, the plain status line everywhere else. */
-	const showRunStatus = (ctx: ExtensionContext, run: RunRecord): void => {
-		if (liveStatus.show(ctx, run)) return;
-		if (ctx.hasUI) ctx.ui.setStatus("storm", runStatusText(run, Date.now()));
+	/**
+	 * The run each open ask/tool-approval belongs to, captured when it opened. Its end event closes that run's key,
+	 * never one of whichever run this session directs by then.
+	 */
+	const openWaits = new Map<string, { runId: string; key: string }>();
+	/**
+	 * One live run: the editor widget in a true TUI, the plain status line everywhere else. The phase is view-only
+	 * evidence from the controller; `working` is the safe default for a host that cannot say.
+	 */
+	const showRunStatus = (ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working"): void => {
+		if (liveStatus.show(ctx, run, phase)) return;
+		if (!ctx.hasUI) return;
+		const look = RUN_APPEARANCE[phase];
+		const label = isLiveTui(ctx) ? ctx.ui.theme.fg(look.tone, look.label) : look.label;
+		ctx.ui.setStatus("storm", `${runStatusText(run, Date.now())} · ${label}`);
 	};
 	const stateCache = createStateCache();
 	const projectEnv = (ctx: ExtensionContext): ProjectEnv => ({
@@ -392,13 +448,59 @@ export default function storm(pi: ExtensionAPI): void {
 		agentDir: pi.pi.getAgentDir(),
 		live: (ctx, run) => {
 			if (run) {
-				showRunStatus(ctx, run);
+				showRunStatus(ctx, run, runs.phase());
 				return;
 			}
 			liveStatus.clear();
+			// Finalization already dropped the controller's keys; the session's records only existed to close them.
+			openWaits.clear();
 			void syncSession(ctx).catch(() => undefined);
 		},
 	});
+
+	/**
+	 * The run a session's dialog blocks. A main-session dialog belongs to the run it directs; a child's belongs to the
+	 * run its parent admitted it into. An unbound dialog is no run's wait.
+	 */
+	const waitRun = (ctx: ExtensionContext): string | undefined =>
+		ctx.agent.kind === "main" ? runs.runId() : childLedger(ctx)?.runId;
+	/**
+	 * One session's tool call is one wait. Parallel children can carry the same provider tool-call id, so the key is
+	 * the agent's kind and id plus the call id; an end can then never close a sibling's wait.
+	 */
+	const waitKey = (ctx: ExtensionContext, kind: "ask" | "approval", toolCallId: string): string =>
+		`${ctx.agent.kind}:${ctx.agent.id}\0${kind}:${toolCallId}`;
+	const openWait = (ctx: ExtensionContext, kind: "ask" | "approval", toolCallId: string): void => {
+		const runId = waitRun(ctx);
+		if (runId === undefined) return;
+		const key = waitKey(ctx, kind, toolCallId);
+		openWaits.set(key, { runId, key });
+		noteRunUserWait(runId, key, true);
+	};
+	const closeWait = (ctx: ExtensionContext, kind: "ask" | "approval", toolCallId: string): void => {
+		const key = waitKey(ctx, kind, toolCallId);
+		const held = openWaits.get(key);
+		if (held === undefined) return;
+		openWaits.delete(key);
+		noteRunUserWait(held.runId, held.key, false);
+	};
+
+	// The host's ask tool is the one real form-open signal a host emits: execution starts before the form waits and
+	// ends when it is answered, cancelled or fails. A host with no UI cannot show the form, so it claims no wait.
+	pi.on("tool_execution_start", (event, ctx) => {
+		if (!ctx.hasUI || event.toolName !== "ask" || !askWaits(event.args)) return;
+		openWait(ctx, "ask", event.toolCallId);
+	});
+	pi.on("tool_execution_end", (event, ctx) => {
+		if (event.toolName !== "ask") return;
+		closeWait(ctx, "ask", event.toolCallId);
+	});
+	// A tool approval is emitted only when a prompt is required; a no-UI host cannot answer one and claims no wait.
+	pi.on("tool_approval_requested", (event, ctx) => {
+		if (!ctx.hasUI) return;
+		openWait(ctx, "approval", event.toolCallId);
+	});
+	pi.on("tool_approval_resolved", (event, ctx) => closeWait(ctx, "approval", event.toolCallId));
 
 	/** Compacts the director while it waits on subagents, once its context reaches the director cap. */
 	const checkpointDirector = (ctx: ExtensionContext): void => {
@@ -423,6 +525,8 @@ export default function storm(pi: ExtensionAPI): void {
 		activeTools: pi.getActiveTools(),
 		now: Date.now,
 		activeRun: () => runs.active(),
+		activePhase: () => runs.phase(),
+		autoModeProblem: () => modeProblem(ctx),
 		agents: () => listAgents({ ancestorId: ctx.agent.id }),
 		ompSettings,
 		newerVersion,
@@ -447,8 +551,38 @@ export default function storm(pi: ExtensionAPI): void {
 		quota: () => readQuota(exec, ompBinary()),
 	});
 
+	/** One counter for Storm's own tool dialogs; the key only has to differ while a dialog waits. */
+	let toolDialogs = 0;
+	/**
+	 * Storm's `storm` tool can open its own approval dialogs mid-run. This observes that port only: every call is the
+	 * original one, and a call made during a run marks a user wait until it settles. It never answers or replaces a
+	 * prompt; the host's ask and tool-approval events are tracked separately.
+	 */
+	const observingUi = (ctx: ExtensionContext, ui: UiPort): UiPort => {
+		const around = <T>(call: () => Promise<T>): Promise<T> => {
+			const runId = runs.runId();
+			if (!ctx.hasUI || runId === undefined) return call();
+			const key = `storm-ui:${++toolDialogs}`;
+			noteRunUserWait(runId, key, true);
+			try {
+				return Promise.resolve(call()).finally(() => noteRunUserWait(runId, key, false));
+			} catch (error) {
+				noteRunUserWait(runId, key, false);
+				throw error;
+			}
+		};
+		const form = ui.form;
+		const pickModel = ui.pickModel;
+		return {
+			...ui,
+			select: (title, options, context) => around(() => ui.select(title, options, context)),
+			...(form === undefined ? {} : { form: (html: string) => around(() => form(html)) }),
+			...(pickModel === undefined ? {} : { pickModel: (title: string) => around(() => pickModel(title)) }),
+		};
+	};
+
 	const toolHost = (ctx: ExtensionContext): StormToolHost => {
-		const { ui, now, loadState, prepare, approveAndSave: save } = actionHost(ctx, createUiPort(pi, ctx));
+		const { ui, now, loadState, prepare, approveAndSave: save } = actionHost(ctx, observingUi(ctx, createUiPort(pi, ctx)));
 		return {
 			ui,
 			now,
@@ -846,10 +980,7 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("agent_end", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
-			if (ledger) {
-				noteAgentRun(ctx.agent.id, ledger.runId);
-				touchRun(ledger.runId);
-			}
+			if (ledger) noteAgentRun(ctx.agent.id, ledger.runId);
 			const settled = !(event.willContinue || event.awaitingAsyncWork);
 			const failed = settled ? terminalWorkFailed(event.messages) ?? listAgents().find(agent => agent.id === ctx.agent.id)?.lastWorkFailed : undefined;
 			noteAgentEnd({
@@ -858,6 +989,9 @@ export default function storm(pi: ExtensionAPI): void {
 				settled,
 				...(settled && failed !== undefined ? { failed } : {}),
 			});
+			// After the ledger says settled: the run's phase reads it, so touching the run before the update would
+			// leave the last worker or reviewer looking active until another event.
+			if (ledger) touchRun(ledger.runId);
 			return;
 		}
 		// Paused on async subagents: the moment to shed context before their results arrive.
@@ -897,6 +1031,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		// No status load or widget from before the shutdown may land after it.
 		liveStatus.beginSession();
+		openWaits.clear();
 		await runs.finish("shutdown");
 	});
 
@@ -904,6 +1039,7 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("session_switch", async (_event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
 		liveStatus.beginSession();
+		openWaits.clear();
 		auto.task = undefined;
 		await runs.finish("shutdown", ctx);
 		// The same profile and repository keep the policy, but a fresh conversation gets the durable consent file.
@@ -938,7 +1074,7 @@ export default function storm(pi: ExtensionAPI): void {
 		// A status refresh during a run must not put the idle label over the live one.
 		const run = runs.active();
 		if (run) {
-			showRunStatus(ctx, run);
+			showRunStatus(ctx, run, runs.phase());
 			return;
 		}
 		const resumable = isApproved(state) && (await findResumeCandidate(state.store.dir, state.repo.root)) !== undefined;
@@ -946,11 +1082,11 @@ export default function storm(pi: ExtensionAPI): void {
 		if (!liveStatus.isCurrent(epoch)) return;
 		const started = runs.active();
 		if (started) {
-			showRunStatus(ctx, started);
+			showRunStatus(ctx, started, runs.phase());
 			return;
 		}
 		liveStatus.clear();
-		ctx.ui.setStatus("storm", statusLabel(state, resumable, auto));
+		ctx.ui.setStatus("storm", idleStatusText(ctx, state, resumable, auto));
 	};
 
 	pi.on("session_start", async (_event, ctx) => {

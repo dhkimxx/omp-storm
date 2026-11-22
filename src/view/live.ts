@@ -1,10 +1,11 @@
 /**
- * The live Storm run's one widget under the editor: a short shimmering label followed by the run's plain counters.
+ * The live Storm run's one widget under the editor: a themed wind marker and the run's phase, followed by the
+ * run's plain counters.
  *
- * The counters are `runStatusText` without its own `storm ▶` label, so the widget shows the same round, agents,
- * spend and minutes a status line would, from the controller's snapshots. Only the label moves: an ANSI repaint
- * asks the host to render this component alone at the shimmer cadence, and a Tern terminal clocks the described
- * sheen itself. `dispose()` and `LiveStatus.clear()` stop the timer; no per-run counter or timer lives here.
+ * Only the header moves: an ANSI repaint asks the host to render this component alone at the shimmer cadence,
+ * and a Tern terminal clocks the described sheen itself. Waiting, between rounds, stopping, an off OMP motion
+ * choice, a disabled shimmer setting, reduced motion and a native surface all snap the header still and stop
+ * the timer at once. `dispose()` and `LiveStatus.clear()` stop it too; no per-run counter or timer lives here.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -12,9 +13,11 @@ import {
 	type DescribeContext,
 	Ellipsis,
 	type NativeNode,
+	type ShimmerPalette,
 	describeShimmer,
 	isNativeRendering,
 	motionEffectsEnabled,
+	node,
 	onMotionEffectsChange,
 	onNativeRenderingChange,
 	row,
@@ -25,36 +28,52 @@ import {
 	truncateToWidth,
 	type Theme,
 	type TUI,
+	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { RunRecord } from "../types.ts";
-import { runStatusText } from "./render.ts";
+import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
+import { runStatusCounters } from "./render.ts";
 
 /** The widget's key in the host; unique to Storm's run and cleared when the run ends. */
 export const LIVE_WIDGET_KEY = "storm-live";
-/** The only animated text: one short label, not the counters. */
-export const LIVE_LABEL = "Storm 실행 중";
-/** `runStatusText`'s own label, split off so the widget can shimmer its label instead. */
-const STATUS_LABEL = "storm ▶ ";
 /** omp's splash/loader cadence for terminal-driven shimmer. */
 const SHIMMER_TICK_MS = 33;
 
 /**
- * `runStatusText`'s counters without its `storm ▶` label: the round in progress, its agents, authoritative spend
- * against the budget and whole minutes. Unchanged formatter, so the widget and the plain status line agree.
+ * The one animated span: a short, blue-ish sweep from theme tokens, so every theme keeps its own palette.
+ * No raw ANSI or RGB: a Tern terminal receives the token names and applies its own theme.
  */
-export function liveCounters(run: RunRecord, now: number): string {
-	const status = runStatusText(run, now);
-	return status.startsWith(STATUS_LABEL) ? status.slice(STATUS_LABEL.length) : status;
-}
+const STORM_PALETTE = {
+	low: "dim",
+	mid: "borderAccent",
+	high: "mdLink",
+	bold: true,
+} satisfies ShimmerPalette;
 
-/** The widget's one line without ANSI styling; this is what an E2E terminal sees after stripping colours. */
-export function liveLine(run: RunRecord, now: number): string {
-	return `${LIVE_LABEL} · ${liveCounters(run, now)}`;
+/** The header text without styling: the wind marker, then the phase a reader can name. */
+function liveHeader(phase: RunPhase): string {
+	return `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
 }
 
 /** A true interactive TUI session: RPC, print and subagent sessions keep the plain status line. */
 export function isLiveTui(ctx: ExtensionContext): boolean {
 	return ctx.mode === "tui" && ctx.hasUI && ctx.agent.kind === "main";
+}
+
+/**
+ * The one row, clipped from the end: the phase header stays whole while the expendable counters give way first.
+ * Below the header's own width there is nothing left to protect, so the header truncates last.
+ */
+function fitLine(header: string, counters: string, columns: number): string {
+	const headerWidth = visibleWidth(header);
+	if (columns <= headerWidth) return truncateToWidth(header, columns, Ellipsis.Unicode);
+	return `${header}${truncateToWidth(` · ${counters}`, columns - headerWidth, Ellipsis.Unicode)}`;
+}
+
+/** `describeShimmer` takes no layout props; copy its node so a narrow native row gives the counters way first. */
+function pinnedHeader(described: NativeNode): NativeNode {
+	if (described.k !== "shimmer") return described;
+	return node("shimmer", { ...described.p, shrink: 0 }, described.c, described.key);
 }
 
 /**
@@ -90,10 +109,12 @@ export class LiveStatus {
 	}
 
 	/**
-	 * Shows `run` in the editor widget when this host can draw one. Returns false for every other host, whose
-	 * caller keeps the plain `setStatus` text. Updates reuse the installed component and request only its redraw.
+	 * Shows `run` in the editor widget when this host can draw one. The phase is view-only evidence from the
+	 * controller and defaults to `working`, so existing callers keep the old behavior. Returns false for every
+	 * other host, whose caller keeps the plain `setStatus` text. Updates reuse the installed component and
+	 * request only its redraw.
 	 */
-	show(ctx: ExtensionContext, run: RunRecord): boolean {
+	show(ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working"): boolean {
 		if (!isLiveTui(ctx)) return false;
 		const ui = ctx.ui;
 		if (this.#ui !== undefined && this.#ui !== ui) {
@@ -109,9 +130,9 @@ export class LiveStatus {
 		}
 		const now = this.#now();
 		if (this.#widget === undefined) {
-			if (!this.#install(ui, run, now)) return false;
+			if (!this.#install(ui, run, now, phase)) return false;
 		} else {
-			this.#widget.update(run, now);
+			this.#widget.update(run, now, phase);
 		}
 		this.#ui = ui;
 		// The run's label moved into the widget: the status line must not keep a second live copy.
@@ -138,13 +159,13 @@ export class LiveStatus {
 		}
 	}
 
-	#install(ui: ExtensionContext["ui"], run: RunRecord, now: number): boolean {
+	#install(ui: ExtensionContext["ui"], run: RunRecord, now: number, phase: RunPhase): boolean {
 		let created: LiveRunWidget | undefined;
 		try {
 			ui.setWidget(
 				LIVE_WIDGET_KEY,
 				(tui, hostTheme) => {
-					const widget = new LiveRunWidget(tui, () => ui.theme ?? hostTheme, run, now, {
+					const widget = new LiveRunWidget(tui, () => ui.theme ?? hostTheme, run, now, phase, {
 						onDisposed: () => {
 							if (this.#widget !== widget) return;
 							this.#widget = undefined;
@@ -177,7 +198,8 @@ type ComponentTui = Omit<TUI, "requestComponentRender"> & {
 class LiveRunWidget implements Component {
 	#tui: ComponentTui;
 	#theme: () => Theme;
-	/** `runStatusText`'s counters for this snapshot; recomputed only when the controller sends a new record. */
+	#phase: RunPhase;
+	/** Formatted only when the controller supplies a new snapshot, not during animation ticks. */
 	#counters: string;
 	#onDisposed: (() => void) | undefined;
 	#offMotion: () => void;
@@ -195,11 +217,13 @@ class LiveRunWidget implements Component {
 		theme: () => Theme,
 		run: RunRecord,
 		now: number,
+		phase: RunPhase,
 		options: { onDisposed?: () => void } = {},
 	) {
 		this.#tui = tui;
 		this.#theme = theme;
-		this.#counters = liveCounters(run, now);
+		this.#phase = phase;
+		this.#counters = runStatusCounters(run, now);
 		this.#onDisposed = options.onDisposed;
 		this.#offMotion = onMotionEffectsChange(() => this.#settingsChanged());
 		this.#offNative = onNativeRenderingChange(() => this.#settingsChanged());
@@ -209,12 +233,14 @@ class LiveRunWidget implements Component {
 		return this.#disposed;
 	}
 
-	/** The controller's live record changed: repaint, but keep the one installed component. */
-	update(run: RunRecord, now: number): void {
+	/** The controller's live record or phase changed: repaint, but keep the one installed component. */
+	update(run: RunRecord, now: number, phase: RunPhase): void {
 		if (this.#disposed) return;
-		this.#counters = liveCounters(run, now);
+		this.#counters = runStatusCounters(run, now);
+		this.#phase = phase;
+		// A still phase must stop at once and drop the old frame; the request below repaints the snap-to-still row.
 		this.#forget();
-		this.#ensureTimer();
+		this.#syncTimer();
 		this.#requestRender();
 	}
 
@@ -223,16 +249,17 @@ class LiveRunWidget implements Component {
 		const columns = Math.max(0, Math.floor(width));
 		if (columns === 0) return [];
 		const animated = this.#animated() && !isNativeRendering();
-		if (!isNativeRendering()) this.#ensureTimer();
-		else this.#stopTimer();
+		this.#syncTimer();
 		const counters = this.#counters;
 		const activeTheme = this.#theme();
-		const label = animated ? shimmerText(LIVE_LABEL, activeTheme) : activeTheme.fg("muted", LIVE_LABEL);
-		const line = `${label} · ${counters}`;
-		const key = `${counters}\u0000${animated}\u0000${columns}`;
-		// A terminal-clocked label changes every frame; only a static line may reuse its rows by reference.
+		const look = RUN_APPEARANCE[this.#phase];
+		const header = animated
+			? shimmerText(liveHeader(this.#phase), activeTheme, STORM_PALETTE)
+			: `${activeTheme.fg("accent", STORM_MARK)} · ${activeTheme.fg(look.tone, look.label)}`;
+		const key = `${this.#phase}\u0000${counters}\u0000${animated}\u0000${columns}`;
+		// A terminal-clocked header changes every frame; only a still line may reuse its rows by reference.
 		if (!animated && this.#lastLines !== undefined && this.#lastKey === key && this.#lastTheme === activeTheme) return this.#lastLines;
-		const lines = [truncateToWidth(line, columns, Ellipsis.Unicode)];
+		const lines = [fitLine(header, counters, columns)];
 		this.#lastKey = key;
 		this.#lastLines = lines;
 		this.#lastTheme = activeTheme;
@@ -245,13 +272,14 @@ class LiveRunWidget implements Component {
 		this.#stopTimer();
 		const counters = this.#counters;
 		const shimmer = this.#animated() && cx?.reduceMotion !== true && (cx?.supports("shimmer") ?? true);
-		const key = `${counters}\u0000${shimmer}`;
+		const key = `${this.#phase}\u0000${counters}\u0000${shimmer}`;
 		if (this.#nativeNode !== null && this.#nativeKey === key) return this.#nativeNode;
-		const label = shimmer
-			? describeShimmer([{ text: LIVE_LABEL }], "label")
-			: text([span(LIVE_LABEL, "muted")], { wrap: "none", truncate: "end" });
-		const tail = text([span(" · ", "dim"), span(counters)], { wrap: "none", truncate: "end" });
-		const described = row([label, tail], { align: "baseline", gap: "none" });
+		const look = RUN_APPEARANCE[this.#phase];
+		const header = shimmer
+			? pinnedHeader(describeShimmer([{ text: liveHeader(this.#phase), palette: STORM_PALETTE }], "header"))
+			: text([span(STORM_MARK, "accent"), span(` · ${look.label}`, look.tone)], { wrap: "none", truncate: "end", shrink: 0 });
+		const tail = text([span(" · ", "dim"), span(counters)], { wrap: "none", truncate: "end", grow: 1, min: { w: "0ch" } });
+		const described = row([header, tail], { align: "baseline", gap: "none" });
 		this.#nativeKey = key;
 		this.#nativeNode = described;
 		return described;
@@ -273,11 +301,17 @@ class LiveRunWidget implements Component {
 	}
 
 	#animated(): boolean {
-		return !this.#disposed && motionEffectsEnabled() && shimmerEnabled();
+		return !this.#disposed && RUN_APPEARANCE[this.#phase].motion && motionEffectsEnabled() && shimmerEnabled();
+	}
+
+	/** The only timer path: one interval while an active phase may shimmer here, none otherwise. */
+	#syncTimer(): void {
+		if (this.#disposed || !this.#animated() || isNativeRendering()) this.#stopTimer();
+		else this.#ensureTimer();
 	}
 
 	#ensureTimer(): void {
-		if (this.#timer !== undefined || !this.#animated() || isNativeRendering()) return;
+		if (this.#timer !== undefined || this.#disposed || isNativeRendering() || !this.#animated()) return;
 		const timer = setInterval(() => {
 			if (this.#timer !== timer) return;
 			if (this.#disposed || isNativeRendering() || !this.#animated()) {
@@ -301,8 +335,7 @@ class LiveRunWidget implements Component {
 	#settingsChanged(): void {
 		if (this.#disposed) return;
 		this.#forget();
-		if (this.#animated() && !isNativeRendering()) this.#ensureTimer();
-		else this.#stopTimer();
+		this.#syncTimer();
 		this.#requestRender();
 	}
 

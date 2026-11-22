@@ -5,6 +5,7 @@ import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
+import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import type {
 	BudgetConfig,
 	InfoLine,
@@ -332,14 +333,101 @@ function versionLine(newer: string | undefined): string {
 	return newer ? `- Storm ${STORM_VERSION} · 새 버전 ${visible(newer)} 설치됨 → /restart 로 적용` : `- Storm ${STORM_VERSION}`;
 }
 
+interface StatusState {
+	label: string;
+	tone: InfoTone;
+	action?: string;
+}
+
+/** The team and consent state an idle status reports; a run's live phase takes precedence over both. */
+function statusState(view: StatusView, resume: boolean): StatusState {
+	if (view.run) {
+		const phase = view.runPhase ? RUN_APPEARANCE[view.runPhase] : undefined;
+		// Without a phase the record's status is all that is known; a phase name is never invented.
+		return phase ? { label: phase.label, tone: phase.tone } : { label: "실행 중", tone: runTone(view.run) };
+	}
+	const team = view.config.status === "missing" ? "missing" : view.config.status === "invalid" ? "invalid" : view.approval ? "approved" : "unapproved";
+	const auto = view.autoDelegation === "on" ? "on" : view.autoDelegation === "blocked" ? "blocked" : "off";
+	const state = idleAppearance({ team, auto, resume });
+	return team === "approved" && auto === "blocked" && view.autoModeProblem !== undefined
+		? { ...state, action: visible(view.autoModeProblem) }
+		: state;
+}
+
+/**
+ * `≋ STORM · state · version` opens both the full status and the hub, so the present state and the version's
+ * action are the first thing seen. The line's rich form uses the state's theme tone; nothing here animates.
+ */
+function pushStatusHead(out: string[], info: InfoLine[] | undefined, state: StatusState, newer: string | undefined): void {
+	const version = newer ? `v${STORM_VERSION} · 새 버전 ${visible(newer)} → /restart` : `v${STORM_VERSION}`;
+	const index = out.length;
+	out.push(`${STORM_MARK} · ${state.label} · ${version}`);
+	if (info) {
+		info.push({
+			index,
+			spans: [
+				{ text: STORM_MARK, tone: "accent" },
+				{ text: ` · ${state.label}`, tone: state.tone },
+				{ text: ` · ${version}`, tone: "muted" },
+			],
+		});
+	}
+	if (state.action !== undefined) {
+		// Markdown keeps the command in code formatting; the rich line colors the same words without backticks.
+		const actionIndex = out.length;
+		out.push(`- 다음: ${state.action}`);
+		if (info) {
+			info.push({
+				index: actionIndex,
+				spans: [
+					{ text: "- 다음: " },
+					{ text: state.action.replaceAll("`", ""), tone: "accent" },
+				],
+			});
+		}
+	}
+}
+
+function runRoundText(run: RunRecord): string {
+	const turns = run.turns ?? 0;
+	return run.maxRounds === undefined ? `${turns + 1}라운드` : `${Math.min(turns + 1, run.maxRounds)}/${run.maxRounds}라운드`;
+}
+
+function runAgentsText(run: RunRecord): string | undefined {
+	const agents = run.agents ?? [];
+	if (!agents.length) return undefined;
+	const running = agents.filter(agent => agent.state === "running").length;
+	return `서브에이전트 ${agents.length}${running ? `(실행 중 ${running})` : ""}`;
+}
+
+/** `runStatusText`'s counters in their established order: round, agents, spend, minutes. */
+function runStatusParts(run: RunRecord, now: number): string[] {
+	const parts = runProgressParts(run, now);
+	const minutes = parts.pop()!;
+	parts.push(run.budget ? `${formatUsd(run.costUsd)}/${formatUsd(run.budget.perRunUsd)}` : formatUsd(run.costUsd));
+	parts.push(minutes);
+	return parts;
+}
+
+/** The round/agents/minutes part of the run details; spend has its own authoritative line and meter. */
+function runProgressParts(run: RunRecord, now: number): string[] {
+	const parts = [runRoundText(run)];
+	const agents = runAgentsText(run);
+	if (agents) parts.push(agents);
+	const minutes = Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
+	parts.push(`${minutes}분`);
+	return parts;
+}
+
 /** The config file as the user finds it from the project root; the status never shows where that root is. */
 const CONFIG_FILE = ".omp/storm/config.json";
 
 /**
- * The whole status. For the user it is everything, with the commands that fix what it points out. For the model
- * (the storm tool) it is the same facts without advice the director could act on (omp commands, /restart, cost
- * flags) and without file paths. `info` only adds the TUI's semantic spans for the same Markdown lines; every plain
- * caller ignores it and gets byte-for-byte the same text.
+ * The whole status. For the user it leads with present state, version and a real next action, then the active and
+ * last run, then everything else with the commands that fix what it points out. For the model (the storm tool) it is
+ * the same facts without advice the director could act on (omp commands, /restart, cost flags) and without file
+ * paths. `info` only adds the TUI's semantic spans for the same Markdown lines; every plain caller ignores it and
+ * gets byte-for-byte the same text.
  */
 export function renderStatus(
 	view: StatusView,
@@ -347,7 +435,12 @@ export function renderStatus(
 	audience: "user" | "model" = "user",
 	info?: InfoLine[],
 ): string {
-	const out = [versionLine(audience === "user" ? view.newerVersion : undefined)];
+	const model = audience === "model";
+	const out: string[] = [];
+	// The user's panel leads with present state, version and a genuinely actionable next step. The model view keeps
+	// its old version-first payload: no user advice or decorative head enters what the director reads.
+	if (model) out.push(versionLine(undefined));
+	else pushStatusHead(out, info, statusState(view, false), view.newerVersion);
 	/** A section title: the Markdown keeps `### …`; the rich line carries only the visible title. */
 	const heading = (title: string): void => {
 		const index = out.length;
@@ -361,6 +454,49 @@ export function renderStatus(
 		out.push(safe.map((span) => span.text).join(""));
 		if (info) info.push({ index, spans: safe, ...(meter ? { meter } : {}) });
 	};
+	/** Present-state details for the active run: the authoritative spend line, progress, then review totals. */
+	const runSection = (): void => {
+		const run = view.run;
+		if (!run) return;
+		out.push("");
+		heading("실행 중");
+		styled(runLineSpans(run), runMeter(run));
+		const progress = runProgressParts(run, now);
+		const index = out.length;
+		out.push(`- ${progress.join(" · ")}`);
+		if (info) {
+			info.push({
+				index,
+				spans: [
+					{ text: "- " },
+					{ text: progress[0]!, tone: "accent" },
+					{ text: ` · ${progress.slice(1).join(" · ")}` },
+				],
+			});
+		}
+		const agents = run.agents;
+		if (agents !== undefined && agents.some(agent => (agent.review?.reviews ?? 0) > 0)) out.push(reviewLine(agents));
+	};
+	/** The last finished run is read after the active one and before the team setting. */
+	const lastRunSection = (): void => {
+		const run = view.lastRun;
+		if (!run) return;
+		out.push("");
+		heading("마지막 실행");
+		const lines = lastRunLines(run);
+		const index = out.length;
+		out.push(...lines);
+		if (info) {
+			const meter = runMeter(run);
+			info.push({ index, spans: lastRunLineSpans(run), ...(meter ? { meter } : {}) });
+		}
+	};
+	// The active run and the last result are present state, so they come before the team setting; the model keeps
+	// its established section order.
+	if (!model) {
+		runSection();
+		lastRunSection();
+	}
 	const c = view.config;
 	out.push("");
 	heading("팀 설정");
@@ -383,7 +519,7 @@ export function renderStatus(
 		const auto = view.autoDelegation;
 		styled([
 			{ text: "- 자동 위임: " },
-			{ text: auto === "on" ? "켜짐" : auto === "blocked" ? "켜짐 · 팀 승인 대기" : "꺼짐", tone: auto === "on" ? "success" : auto === "blocked" ? "warning" : "muted" },
+			{ text: auto === "on" ? "켜짐" : auto === "blocked" ? (view.autoModeProblem === undefined ? "켜짐 · 팀 승인 대기" : "켜짐 · 실행 차단") : "꺼짐", tone: auto === "on" ? "success" : auto === "blocked" ? "warning" : "muted" },
 			{ text: " · /storm auto" },
 		]);
 	}
@@ -405,22 +541,9 @@ export function renderStatus(
 			`- 필수 검사: ${team.requiredChecks?.length ? team.requiredChecks.map(checkText).join(" · ") : "없음"}`,
 		);
 	}
-	if (view.run) {
-		out.push("");
-		heading("실행 중");
-		styled(runLineSpans(view.run), runMeter(view.run));
-	}
-	if (view.lastRun) {
-		const run = view.lastRun;
-		out.push("");
-		heading("마지막 실행");
-		const lines = lastRunLines(run);
-		const index = out.length;
-		out.push(...lines);
-		if (info) {
-			const meter = runMeter(run);
-			info.push({ index, spans: lastRunLineSpans(run), ...(meter ? { meter } : {}) });
-		}
+	if (model) {
+		runSection();
+		lastRunSection();
 	}
 	if (view.trials?.length) {
 		out.push("");
@@ -496,20 +619,59 @@ export function renderStatus(
 	return out.join("\n");
 }
 
-/** The status in a few lines, for the panel above the /storm menu; `/storm status` shows the whole team setting and every section. */
-export function renderStatusBrief(view: StatusView, now: number): string {
-	const out = [versionLine(view.newerVersion)];
+/**
+ * The status in a few lines, for the panel above the /storm menu; `/storm status` shows the whole team setting and
+ * every section. `info` indexes this same Markdown, and `resume` is the caller's trusted resume candidate.
+ */
+export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine[], resume = false): string {
+	const out: string[] = [];
+	// The hub has the same first line as the full user report: present state, then the next action when there is one.
+	pushStatusHead(out, info, statusState(view, resume), view.newerVersion);
 	const c = view.config;
+	out.push("");
+	if (view.run) {
+		const run = view.run;
+		const spend = spendText(run.costUsd, run.budget);
+		const index = out.length;
+		out.push(`- 실행 중: ${run.runId} · ${spend}`);
+		if (info) {
+			const tone = spendTone(run);
+			const meter = runMeter(run);
+			info.push({
+				index,
+				spans: [
+					{ text: "- 실행 중: " },
+					{ text: visible(run.runId), tone: "accent" },
+					{ text: ` · ${spend}`, ...(tone ? { tone } : {}) },
+				],
+				...(meter ? { meter } : {}),
+			});
+		}
+		const progress = runProgressParts(run, now);
+		const progressIndex = out.length;
+		out.push(`- ${progress.join(" · ")}`);
+		if (info) {
+			info.push({
+				index: progressIndex,
+				spans: [
+					{ text: "- " },
+					{ text: progress[0]!, tone: "accent" },
+					{ text: ` · ${progress.slice(1).join(" · ")}` },
+				],
+			});
+		}
+		const agents = run.agents;
+		if (agents !== undefined && agents.some(agent => (agent.review?.reviews ?? 0) > 0)) out.push(reviewLine(agents));
+	} else if (view.lastRun) {
+		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${STATUS_LABEL[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
+	}
 	if (c.status === "ok") {
+		if (view.run) out.push("");
 		out.push(`- 팀 설정 ${shortHash(c.hash)} · ${view.approval ? "승인됨" : "미승인"} · 우선순위 ${priorityLabel(c.config.priority)}`);
 		for (const [id, r] of Object.entries(c.config.roles)) out.push(roleLine(id, r));
 		out.push(`- 컨텍스트 상한 ${int(c.config.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`);
 		if (c.config.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(c.config)}`);
 	} else out.push(c.status === "missing" ? "- 팀 설정 없음" : "- 팀 설정 오류");
-	if (view.run) out.push(`- 실행 중: ${view.run.runId} · ${spendText(view.run.costUsd, view.run.budget)}`);
-	else if (view.lastRun) {
-		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${STATUS_LABEL[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
-	}
 	const notes: string[] = [];
 	if (view.trials?.length) notes.push(`시험 사용 ${view.trials.length}건`);
 	if (view.quotaMarks?.length) notes.push(`쿼터 소진 표시 ${view.quotaMarks.map((m) => m.provider).join(", ")}`);
@@ -594,20 +756,14 @@ function lastRunLineSpans(run: RunRecord): InfoSpan[] {
 	];
 }
 
+/** The live widget and panels share the plain counters; the status line adds only its own ASCII prefix. */
+export function runStatusCounters(run: RunRecord, now: number): string {
+	return runStatusParts(run, now).join(" · ");
+}
+
 /** The status line while a run is on: the round in progress, its agents, spend against the budget, and whole minutes. */
 export function runStatusText(run: RunRecord, now: number): string {
-	const turns = run.turns ?? 0;
-	const round = run.maxRounds === undefined ? `${turns + 1}라운드` : `${Math.min(turns + 1, run.maxRounds)}/${run.maxRounds}라운드`;
-	const parts = [round];
-	const agents = run.agents ?? [];
-	if (agents.length) {
-		const running = agents.filter(agent => agent.state === "running").length;
-		parts.push(`서브에이전트 ${agents.length}${running ? `(실행 중 ${running})` : ""}`);
-	}
-	parts.push(run.budget ? `${formatUsd(run.costUsd)}/${formatUsd(run.budget.perRunUsd)}` : formatUsd(run.costUsd));
-	const minutes = Math.max(0, Math.floor((now - Date.parse(run.startedAt)) / 60_000));
-	parts.push(`${minutes}분`);
-	return `storm ▶ ${parts.join(" · ")}`;
+	return `storm ▶ ${runStatusCounters(run, now)}`;
 }
 
 /** The head of the stored request (what resuming will send), why it stopped, its rounds and when. */

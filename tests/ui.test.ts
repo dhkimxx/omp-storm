@@ -13,6 +13,7 @@ import { serializeConfig } from "../src/config/store.ts";
 import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../src/flows.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { ROLES } from "../src/roles.ts";
+import { STORM_MARK } from "../src/view/appearance.ts";
 import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
 import type { InfoLine, UiContext, UiPort } from "../src/types.ts";
@@ -556,6 +557,12 @@ describe("accepting on a small terminal", () => {
 		expect(panel.join("\n")).toContain("승인하면 자동 위임이 켜집니다");
 		expect(dialog.context.markdown).toContain("실행이 끝나면 정리");
 		expect(dialog.context.markdown).toContain("/repo/.omp/agents/shadow-file.md");
+		// One brand heading, after the first-approval default and the shadow warning; the narrow consent is unchanged.
+		const markAt = dialog.context.markdown.indexOf(STORM_MARK);
+		expect(dialog.context.markdown.split(STORM_MARK)).toHaveLength(2);
+		expect(markAt).toBeGreaterThan(dialog.context.markdown.indexOf("승인하면 자동 위임이 켜집니다"));
+		expect(markAt).toBeGreaterThan(dialog.context.markdown.indexOf("가림 정의"));
+		expect(dialog.context.consent).toEqual([APPROVE]);
 		expect(host.selects[0]?.options).not.toContain(APPROVE);
 	});
 

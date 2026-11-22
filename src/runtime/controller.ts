@@ -31,7 +31,7 @@ import type {
 } from "../types.ts";
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
-import { runRequiredChecks, type CheckReport } from "./checks.ts";
+import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
 import { RunLanes } from "./lanes.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
@@ -57,11 +57,22 @@ import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, RUN_KEEP, wr
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 import { noteResumePointer, protectedResumeRunIds } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
+import type { RunPhase } from "../view/appearance.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
 const liveWriters = new Map<string, () => void>();
+/**
+ * Immediate phase listeners of the controlling session, keyed by run id. A child session reports its start, settle
+ * and approvals through these: the main session draws, the child never does. View-only, like the phases themselves.
+ */
+const phaseWatchers = new Map<string, () => void>();
+/**
+ * View-only keys of the host dialogs this process's live run is waiting on. A key exists only while its run has a
+ * phase watcher, so an event that outlives its run cannot mark the next one as waiting.
+ */
+const userWaits = new Map<string, Set<string>>();
 /**
  * How often an active run's record is rewritten at most. The live record is what remains of a run whose process
  * dies: the next run's janitor marks it stopped and it shows up as the last run with what it had spent and spawned.
@@ -72,9 +83,36 @@ const DRAIN_POLL_MS = 1_000;
 /** How long a stopping run keeps its scope, lease and accounting while owned work settles. */
 const DRAIN_MAX_MS = 30_000;
 
-/** Asks the owning session to rewrite the run's record soon (spawns, spend). */
+/** Asks the owning session to rewrite the run's record soon (spawns, spend) and to re-check its live phase at once. */
 export function touchRun(runId: string): void {
 	liveWriters.get(runId)?.();
+	phaseWatchers.get(runId)?.();
+}
+
+/**
+ * Records or clears one host dialog (`ask`, a tool approval, a Storm tool prompt) the run is waiting on and asks its
+ * controller for an immediate live update. `runId` names the run-bound session that saw the event; without a live
+ * controller for that exact run this is a no-op, so a late event from a settled, switched or finished run never
+ * marks another run as waiting. The keys and the phases are presentation-only and never reach a record.
+ */
+export function noteRunUserWait(runId: string | undefined, key: string, waiting: boolean): void {
+	if (runId === undefined) return;
+	const watcher = phaseWatchers.get(runId);
+	if (watcher === undefined) return;
+	let keys = userWaits.get(runId);
+	if (waiting) {
+		if (keys === undefined) {
+			keys = new Set();
+			userWaits.set(runId, keys);
+		} else if (keys.has(key)) {
+			return;
+		}
+		keys.add(key);
+	} else {
+		if (keys?.delete(key) !== true) return;
+		if (keys.size === 0) userWaits.delete(runId);
+	}
+	watcher();
 }
 
 /** The spawns decided so far in a run, from whichever session decided them (a copy). */
@@ -198,6 +236,10 @@ interface OwnRun {
 	hold?: unknown;
 	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
 	awaitingAsync: boolean;
+	/** View-only: the phase last handed to the live callback. Never written to the record or read by a decision. */
+	shownPhase?: RunPhase;
+	/** View-only: a required-check runner is inside `runRequiredChecks` now, not merely being prepared. */
+	checksRunning?: boolean;
 }
 
 type Refusal = Extract<RunRequestResult, { ok: false }>;
@@ -295,6 +337,16 @@ export class RunController {
 		};
 		if (own.checkEvidence?.length) record.checks = own.checkEvidence;
 		return record;
+	}
+
+	/**
+	 * The live, view-only phase of this session's run, for the status widget and status views; `undefined` when this
+	 * session directs no run. It is derived from the run's own turn/agent/check state and the dialogs its sessions
+	 * are waiting on, never from the plan: no persisted field and no round, budget or tool decision reads it.
+	 */
+	phase(): RunPhase | undefined {
+		const own = this.#own;
+		return own === undefined ? undefined : this.#phaseOf(own);
 	}
 
 	/**
@@ -501,6 +553,9 @@ export class RunController {
 			own.lease = lease;
 			lease = undefined;
 			this.#own = own;
+			// From here a child's start, settle or approval can refresh the phase immediately; finalization removes it.
+			userWaits.delete(runId);
+			phaseWatchers.set(runId, () => this.#emitPhase(own));
 			try {
 				startLedgerRun({
 					runId,
@@ -534,6 +589,7 @@ export class RunController {
 				return refuse(`실행을 기록하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 			}
 			liveWriters.set(runId, () => this.#scheduleFlush(own));
+			own.shownPhase = this.#phaseOf(own);
 			this.#liveStatus(own.ctx, this.active());
 			if (handoff !== undefined) {
 				ui.notify(`Storm 실행을 시작합니다(${runId}).`);
@@ -607,6 +663,7 @@ export class RunController {
 		}
 		own.turnStarted = true;
 		own.inTurn = true;
+		this.#emitPhase(own);
 	}
 
 	/** True while this session runs Storm: the main session directs and does not change files itself. */
@@ -744,13 +801,20 @@ export class RunController {
 		const own = this.#own;
 		if (event.awaitingAsyncWork) {
 			// Only a new turn resumes this run, so a terminal end with no turn in between stopped the wait.
-			if (own) own.awaitingAsync = true;
+			if (own) {
+				own.awaitingAsync = true;
+				this.#emitPhase(own);
+			}
 			return;
 		}
 		if (event.willContinue) return;
 		// Esc while paused on async work ends the run without an aborted message and without a new agent_start.
 		const stoppedWait = own?.awaitingAsync === true;
-		if (own) own.awaitingAsync = false;
+		if (own) {
+			own.awaitingAsync = false;
+			// A settled turn cannot still be waiting on one of that turn's dialogs.
+			this.#clearUserWaits(own);
+		}
 		if (own?.turnStarted) await this.#turnSettled(own, ctx, stoppedWait || turnAborted(event.messages));
 		const pending = this.#pending;
 		if (!pending) return;
@@ -788,6 +852,8 @@ export class RunController {
 	 */
 	async #decide(own: OwnRun, ctx: ExtensionContext, aborted: boolean): Promise<void> {
 		const turns = own.record.turns ?? 0;
+		// The turn settled: the live line moves to the round decision before any tree read or check starts.
+		this.#emitPhase(own);
 		const decision = await this.#roundDecision(own, aborted, false);
 		// The tree read may have outlasted the round: a new turn or an end decided meanwhile owns the run now.
 		if (!this.#live(own, turns)) return;
@@ -966,13 +1032,22 @@ export class RunController {
 				own.checks.set(fingerprint, "skipped");
 				return now;
 			}
-			const report = await runRequiredChecks({
-				config: state.config,
-				approval: currentGate.approval,
-				cwd: own.root,
-				fingerprint,
-				signal: own.abort.signal,
-			});
+			// Verification begins only with the actual runner: preparing or loading state is not "verifying".
+			own.checksRunning = true;
+			this.#emitPhase(own);
+			let report: RequiredChecksResult;
+			try {
+				report = await runRequiredChecks({
+					config: state.config,
+					approval: currentGate.approval,
+					cwd: own.root,
+					fingerprint,
+					signal: own.abort.signal,
+				});
+			} finally {
+				delete own.checksRunning;
+				this.#emitPhase(own);
+			}
 			if (this.#own !== own) return now;
 			if (report.status === "skipped") {
 				own.checks.set(fingerprint, "skipped");
@@ -1047,6 +1122,8 @@ export class RunController {
 				this.deps.ui(ctx).notify(`Storm 실행을 이어가지 못했습니다: ${errorText(error)}`, "error"),
 			);
 		}, ms);
+		// A scheduled look is a round wait, not a question to the user.
+		this.#emitPhase(own);
 	}
 
 	#disarm(own: OwnRun): void {
@@ -1077,6 +1154,7 @@ export class RunController {
 		ui.notify(`검증되지 않은 변경이 있어 ${round}라운드를 시작합니다(최대 ${own.maxRounds}라운드).`);
 		this.#liveStatus(ctx, this.active());
 		own.awaitingRound = round;
+		this.#emitPhase(own);
 		this.deps.pi.sendUserMessage(
 			buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, ...(reviewer !== undefined ? { reviewer } : {}) }),
 		).catch((error: unknown) => {
@@ -1113,6 +1191,9 @@ export class RunController {
 		if (ctx !== undefined) own.finishCtx ??= ctx;
 		own.abort.abort();
 		this.#disarm(own);
+		// A stopping run is no longer waiting on a dialog: the host either answered it or dropped it.
+		this.#clearUserWaits(own);
+		this.#emitPhase(own);
 		const ledger = getLedgerRun(own.record.runId);
 		if (ledger) ledger.closing = true;
 		// Never throw away scope, lease or accounting while owned work is alive. The stopped run keeps them and a
@@ -1211,14 +1292,16 @@ export class RunController {
 		return "no-progress";
 	}
 
-	/** Whether this run still owns live work: a running agent, a running check, or a job bound to its agents/spawns. */
-	#hasLiveWork(own: OwnRun): boolean {
-		if (own.checking !== undefined) return true;
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
-		if (agents.some(agent => agent.state === "running")) return true;
+	/** Forgets every dialog key of `own`: a settled, aborted, switched or finished run must not keep claiming a wait. */
+	#clearUserWaits(own: OwnRun): void {
+		userWaits.delete(own.record.runId);
+	}
+
+	/** A host-owned async job bound to this run's agents or admitted spawns: not any other session's global job. */
+	#boundAsyncRunning(own: OwnRun): boolean {
 		const snapshot = this.#asyncSnapshot(own.ctx);
 		if (!snapshot) return false;
-		const bound = new Set(agents.map(agent => agent.id));
+		const bound = new Set((this.deps.agents?.(own.record.runId) ?? []).map(agent => agent.id));
 		for (const spawn of spawnsByRun.get(own.record.runId) ?? []) if (spawn.spawnKey !== undefined) bound.add(spawn.spawnKey);
 		return [...snapshot.running].some(
 			job =>
@@ -1227,10 +1310,49 @@ export class RunController {
 		);
 	}
 
+	/**
+	 * The phase a reader should see now. Stopping outranks everything; a real dialog is next; verification needs an
+	 * actual check runner or the approved reviewer running; workers come from the run's own agents or bound async
+	 * jobs. A turn or a round waiting for its host is work; a settled turn waiting for the next look is between
+	 * rounds, never "waiting for the user" (async waiting included).
+	 */
+	#phaseOf(own: OwnRun): RunPhase {
+		if (own.ending !== undefined || own.abort.signal.aborted) return "stopping";
+		if ((userWaits.get(own.record.runId)?.size ?? 0) > 0) return "waiting-user";
+		if (own.checksRunning === true) return "verifying";
+		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const reviewer = usableRole(own.config, "reviewer")?.agent;
+		if (reviewer !== undefined && agents.some(agent => agent.state === "running" && agent.name === reviewer)) return "verifying";
+		if (agents.some(agent => agent.state === "running")) return "workers";
+		if (this.#boundAsyncRunning(own)) return "workers";
+		if (own.awaitingAsync) return "between-rounds";
+		if (own.inTurn || own.awaitingRound !== undefined || !own.turnStarted) return "working";
+		return "between-rounds";
+	}
+
+	/** Hands the live callback a new record only when the view-only phase actually changed; never writes a record. */
+	#emitPhase(own: OwnRun): void {
+		if (this.#own !== own) return;
+		const phase = this.#phaseOf(own);
+		if (own.shownPhase === phase) return;
+		own.shownPhase = phase;
+		this.#liveStatus(own.ctx, this.active());
+	}
+
+	/** Whether this run still owns live work: a running agent, a running check, or a job bound to its agents/spawns. */
+	#hasLiveWork(own: OwnRun): boolean {
+		if (own.checking !== undefined) return true;
+		if ((this.deps.agents?.(own.record.runId) ?? []).some(agent => agent.state === "running")) return true;
+		return this.#boundAsyncRunning(own);
+	}
+
 	/** Writes the final record and releases the lease; only runs after owned work has settled. */
 	async #finalize(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext | undefined): Promise<RunRecord | undefined> {
 		if (this.#own !== own) return undefined;
 		this.#own = undefined;
+		// A late child event or dialog answer now finds no watcher for this run, so it cannot mark the next one.
+		phaseWatchers.delete(own.record.runId);
+		this.#clearUserWaits(own);
 		delete own.awaitingRound;
 		delete own.roundInFlight;
 		delete own.checksOnlyEnd;
@@ -1369,7 +1491,11 @@ export class RunController {
 		);
 		if (!stop) return;
 		const own = this.#own?.record.runId === run.runId ? this.#own : undefined;
-		if (own) own.ending ??= "budget";
+		if (own) {
+			own.ending ??= "budget";
+			this.#clearUserWaits(own);
+			this.#emitPhase(own);
+		}
 		if (own && !own.inTurn) {
 			// Between turns there is nothing to abort, and no turn's end to wait for: omp would run one more.
 			void this.#stop(own, "budget", ctx).catch((error: unknown) => ui.notify(`Storm 실행을 끝내지 못했습니다: ${errorText(error)}`, "error"));

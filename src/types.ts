@@ -10,6 +10,7 @@
  */
 
 import type { ReviewEvidence } from "./runtime/review.ts";
+import type { RunPhase } from "./view/appearance.ts";
 
 // ── Primitives ─────────────────────────────────────────────────────────────────────────────
 
@@ -558,6 +559,8 @@ export interface StatusView {
 	approval: ApprovalRecord | undefined;
 	/** Personal consent, separate from approval of the team's configuration. */
 	autoDelegation?: "off" | "on" | "blocked";
+	/** OMP session mode preventing a new automatic run despite team approval; user views only. */
+	autoModeProblem?: string;
 	/** Shadowing definitions; a project one's `path` is relative to the project root here. */
 	shadows: ShadowInfo[];
 	/** Provider quota, when it was read (it takes about a second); absent → no quota section. */
@@ -568,6 +571,8 @@ export interface StatusView {
 	storage?: string;
 	/** The Storm run active in this process for this project. */
 	run?: RunRecord;
+	/** Live phase of `run`, view-only; absent when the controller cannot say, so no phase is claimed. */
+	runPhase?: RunPhase;
 	/** The most recent finished run. */
 	lastRun?: RunRecord;
 	trials?: TrialView[];

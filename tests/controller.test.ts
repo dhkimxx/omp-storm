@@ -8,7 +8,7 @@ import { configHash } from "../src/config/canonical.ts";
 import { tokens } from "../src/report/agents.ts";
 import { directorRead, noteChildRead } from "../src/policy/reads.ts";
 import { listAgents, noteAgentParked, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
-import { noteRunSpawn, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
+import { noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
 import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
 import { HOLD_MS, ROUND_DELAY_MS, treeFingerprint } from "../src/runtime/rounds.ts";
@@ -16,6 +16,7 @@ import { lastRun, readRun, runIds, runsDir, writeRun } from "../src/runtime/run.
 import { trustedResume } from "../src/runtime/resume.ts";
 import { readRunIndex } from "../src/runtime/run-index.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
+import type { RunPhase } from "../src/view/appearance.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RunPlan, RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
 import { fakeModes, fakeSession, SESSION_TEAM, type FakeSession, type SessionOptions, until } from "./fake-session.ts";
@@ -216,6 +217,140 @@ describe("live status line", () => {
 		await h.turn();
 		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress" });
 		expect(h.summaries()).toBe(1);
+	});
+});
+
+describe("live phase", () => {
+	test("no run claims no phase; a run starts working, stops explicitly and clears", async () => {
+		const phases: Array<RunPhase | undefined> = [];
+		let h!: FakeSession;
+		h = session({
+			live: (_ctx, run) => {
+				phases.push(run === undefined ? undefined : h.controller.phase());
+			},
+		});
+		expect(h.controller.phase()).toBeUndefined();
+		await h.start();
+		expect(h.controller.phase()).toBe("working");
+		await h.controller.finish("no-changes", h.ctx);
+		expect(h.controller.phase()).toBeUndefined();
+		// The live callback saw the working start, the stopping edge and the final clear, in that order.
+		expect(phases.filter(phase => phase !== undefined)).toEqual(["working", "stopping"]);
+		expect(phases.at(-1)).toBeUndefined();
+	});
+
+	test("real dialogs are waiting-user; resolving, settling or finishing clears them", async () => {
+		const h = session();
+		const runId = await h.start();
+		noteRunUserWait(runId, "ask:1", true);
+		expect(h.controller.phase()).toBe("waiting-user");
+		noteRunUserWait(runId, "approval:2", true);
+		expect(h.controller.phase()).toBe("waiting-user");
+		noteRunUserWait(runId, "ask:1", false);
+		expect(h.controller.phase()).toBe("waiting-user");
+		noteRunUserWait(runId, "approval:2", false);
+		expect(h.controller.phase()).toBe("working");
+
+		// A settled turn drops a key its dialog never closed (an aborted prompt has no matching end event).
+		noteRunUserWait(runId, "ask:aborted", true);
+		await h.turn();
+		expect(await readRun(root, runId)).toMatchObject({ status: "ended" });
+		expect(h.controller.phase()).toBeUndefined();
+	});
+
+	test("a late dialog from a finished run cannot mark the next run as waiting", async () => {
+		const first = session();
+		const firstId = await first.start();
+		noteRunUserWait(firstId, "ask:old", true);
+		expect(first.controller.phase()).toBe("waiting-user");
+		await first.controller.finish("no-changes");
+
+		const second = session();
+		const secondId = await second.start();
+		noteRunUserWait(firstId, "ask:old-end", false);
+		noteRunUserWait(firstId, "ask:late", true);
+		expect(second.controller.phase()).toBe("working");
+		// A key of the live run still works, and its own end clears only itself.
+		noteRunUserWait(secondId, "ask:new", true);
+		expect(second.controller.phase()).toBe("waiting-user");
+		noteRunUserWait(secondId, "ask:new", false);
+		expect(second.controller.phase()).toBe("working");
+		await second.controller.finish("no-changes");
+	});
+
+	test("workers and verifying come from run-bound agents, never from a plan or another session's jobs", async () => {
+		const agents: AgentEntry[] = [];
+		let running: AsyncJobSnapshot["running"] = [
+			{ id: "foreign", type: "task", status: "running", label: "other session", startTime: 0, ownerId: "Other" },
+		];
+		const h = session({
+			agents,
+			asyncJobs: () => ({ running, recent: [], delivery: {} as AsyncJobSnapshot["delivery"] }),
+		});
+		const runId = await h.start();
+		h.controller.onAgentStart();
+		expect(h.controller.phase()).toBe("working");
+		// A global job that belongs to no run agent is not this run's worker.
+		touchRun(runId);
+		expect(h.controller.phase()).toBe("working");
+
+		agents.push(agentEntry({ id: "Impl", name: "storm-implementer", role: "implementer", state: "running" }));
+		touchRun(runId);
+		expect(h.controller.phase()).toBe("workers");
+
+		agents[0]!.state = "idle";
+		agents.push(agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", state: "running" }));
+		touchRun(runId);
+		expect(h.controller.phase()).toBe("verifying");
+
+		// Settling the reviewer returns to the director's own turn, not a leftover verifying claim.
+		agents[1]!.state = "idle";
+		touchRun(runId);
+		expect(h.controller.phase()).toBe("working");
+
+		// A host async job is evidence only when bound to an agent of this run.
+		running = [{ id: "job", type: "task", status: "running", label: "run job", startTime: 0, agentId: "Impl" }];
+		touchRun(runId);
+		expect(h.controller.phase()).toBe("workers");
+
+		running = [];
+		// Async waiting is a round wait, never a question to the user.
+		await h.controller.onAgentEnd({ awaitingAsyncWork: true }, h.ctx);
+		expect(h.controller.phase()).toBe("between-rounds");
+		h.controller.onAgentStart();
+		expect(h.controller.phase()).toBe("working");
+		await h.controller.finish("no-changes");
+	});
+
+	test("a stopping run keeps the stopping phase while it drains, then reports none", async () => {
+		const agents = [agentEntry({ id: "Impl", role: "implementer", state: "running" })];
+		const h = session({ agents });
+		const runId = await h.start();
+		expect(await h.controller.finish("no-changes")).toBeUndefined();
+		expect(h.controller.phase()).toBe("stopping");
+		agents[0]!.state = "idle";
+		h.timers.fire();
+		await until(async () => (await readRun(root, runId))?.status !== "running");
+		expect(h.controller.phase()).toBeUndefined();
+	});
+
+	test("verifying is claimed only while runRequiredChecks is actually running", async () => {
+		const agents: AgentEntry[] = [writer(), verdict(T0 + 1, true, "d1:f0")];
+		let tree = treeOf("d0", "f0");
+		const config: StormConfig = {
+			...SESSION_TEAM,
+			requiredChecks: [{ name: "slow", argv: ["/bin/sh", "-c", "sleep 0.2"] }],
+		};
+		const h = session({ config, agents, tree: () => treeAt(tree) });
+		const runId = await h.start({ task: "probe", rounds: 1 });
+		tree = treeOf("d1", "f0");
+		await h.turn();
+		// The round is over and the check look is pending: a round wait, not verification yet.
+		expect(h.controller.phase()).toBe("between-rounds");
+		h.timers.fire();
+		await until(() => h.controller.phase() === "verifying");
+		await until(async () => (await readRun(root, runId))?.status !== "running");
+		expect(h.controller.phase()).toBeUndefined();
 	});
 });
 

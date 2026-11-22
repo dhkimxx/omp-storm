@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import type { Effort, RunSummary, RunRecord, StormConfig } from "../../src/types.ts";
+import { STORM_MARK } from "../../src/view/appearance.ts";
 import type { LlmEntry, Step } from "./fake-llm.ts";
 
 export type { LlmEntry, Step };
@@ -342,6 +343,12 @@ export interface SessionOptions {
 	flags?: string[];
 	/** Keep the session on disk (omp gives it an artifacts dir); in memory otherwise. */
 	persist?: boolean;
+	/** PTY columns; only the interactive driver reads it. */
+	columns?: number;
+	/** PTY rows; only the interactive driver reads it. */
+	rows?: number;
+	/** Terminal background the PTY reports in its OSC 11 reply; default dark, as the harness always did. */
+	background?: "dark" | "light";
 }
 
 const isSettled = (frame: Frame): boolean => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true);
@@ -494,17 +501,27 @@ export function focused(text: string): string | undefined {
 }
 
 /**
- * What the status row says now: the last write that placed the row, which clears it (`EL`) and then prints the whole
- * line. Only Storm's own component is written there in these sessions.
+ * The most recent Storm row written after erase-to-end-of-line (`EL`). OMP draws both absolute cursor-addressed
+ * and sequential rows, so it need not emit a cursor address immediately before `EL`. Ignore report headings:
+ * opening a report doesn't restore the footer.
  */
 export function statusLine(raw: string): string | undefined {
-	const writes = [...raw.matchAll(/\x1b\[[0-9;]*H(?:\x1b\[[0-9;]*m)*\x1b\[K(storm[^\x1b\r\n]*)/g)];
-	return writes.at(-1)?.[1]?.trimEnd();
+	const writes = raw.matchAll(/\x1b\[K((?:\x1b\[[0-9:;]*m|[^\x1b\r\n])*)/g);
+	let status: string | undefined;
+	for (const write of writes) {
+		const line = (write[1] ?? "").replace(ANSI, "").trim();
+		if (line.startsWith("storm") || (line.startsWith(STORM_MARK) && !/ · v\d+\.\d+\.\d+/.test(line))) status = line;
+	}
+	return status;
 }
 
 /** The interactive TUI on a pty. Answers the terminal queries (DA1, OSC 11) the TUI waits for before it renders. */
 export class Tui {
 	raw = "";
+	readonly columns: number;
+	readonly rows: number;
+	/** The background this PTY reports over OSC 11; omp maps it to its light or dark theme. */
+	readonly background: "dark" | "light";
 	readonly #proc: Subprocess;
 	readonly #log: string;
 	readonly #model: string;
@@ -513,6 +530,9 @@ export class Tui {
 		const tag = `tui-${String(++launches).padStart(3, "0")}`;
 		this.#log = join(env.logs, `${tag}.screen.log`);
 		this.#model = options.model.slice(options.model.indexOf("/") + 1);
+		this.columns = options.columns ?? 160;
+		this.rows = options.rows ?? 50;
+		this.background = options.background ?? "dark";
 		const decoder = new TextDecoder();
 		const args = [env.omp, ...sessionArgs(env, options)];
 		appendFileSync(join(env.logs, "launches.log"), `${tag} ${args.slice(1).join(" ")}\n`);
@@ -520,14 +540,14 @@ export class Tui {
 			cwd: env.project,
 			env: env.childEnv,
 			terminal: {
-				cols: 160,
-				rows: 50,
+				cols: this.columns,
+				rows: this.rows,
 				data: (terminal, data) => {
 					const text = decoder.decode(data, { stream: true });
 					this.raw += text;
 					appendFileSync(this.#log, text);
 					if (text.includes("\x1b[c")) terminal.write("\x1b[?62;22c");
-					if (text.includes("\x1b]11;?")) terminal.write("\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\");
+					if (text.includes("\x1b]11;?")) terminal.write(`\x1b]11;${this.background === "light" ? "rgb:ffff/ffff/ffff" : "rgb:1e1e/1e1e/1e1e"}\x1b\\`);
 				},
 			},
 		});

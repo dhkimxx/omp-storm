@@ -24,6 +24,7 @@ import { readTrialStates } from "../src/runtime/state-files.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
 import { treeAgainst } from "../src/runtime/tree.ts";
 import { loadProjectState } from "../src/state.ts";
+import { STORM_MARK } from "../src/view/appearance.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
 import { until } from "./fake-session.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
@@ -314,6 +315,200 @@ describe("a run through the hooks", () => {
 		expect(omp.statuses.at(-1)).toBe(idle);
 	});
 
+	test("an idle TUI footer carries the shared mark and theme tones; RPC stays plain, and a live widget is not duplicated", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const plain = omp.statuses.at(-1);
+		expect(plain?.startsWith(STORM_MARK)).toBe(true);
+		expect(plain).toContain("대기");
+		expect(plain).not.toContain("\x1b[");
+
+		const themed: Array<string | undefined> = [];
+		const widgetKeys: string[] = [];
+		const tui = {
+			...main,
+			mode: "tui",
+			ui: {
+				...(main.ui as unknown as Record<string, unknown>),
+				theme: { fg: (_tone: string, text: string) => `\x1b[1;35m${text}\x1b[0m` },
+				setStatus: (_key: string, text: string | undefined) => themed.push(text),
+				setWidget: (key: string, content: unknown) => {
+					if (content === undefined) return;
+					widgetKeys.push(key);
+					// LiveStatus installs a component factory; the fake host only needs to build the component.
+					(content as (tui: unknown, theme: unknown) => unknown)(
+						{ requestComponentRender: () => undefined, requestRender: () => undefined },
+						{ fg: (_tone: string, text: string) => text },
+					);
+				},
+			},
+		} as unknown as ExtensionContext;
+		await omp.emit("session_start", {}, tui);
+		const framed = themed.at(-1) ?? "";
+		expect(framed).toContain("\x1b[");
+		expect(framed).toContain(STORM_MARK);
+		expect(framed).toContain("대기");
+
+		// During a run the editor widget owns the live line: the themed footer is cleared, not duplicated beside it.
+		await omp.command("fix it", tui);
+		expect(widgetKeys).toContain("storm-live");
+		expect(themed.at(-1)).toBeUndefined();
+		await omp.emit("agent_start", {}, tui);
+		await omp.emit("agent_end", {}, tui);
+		await until(() => themed.at(-1)?.startsWith("\x1b[") === true);
+	});
+
+	test("a project with no Storm config and no automatic consent gets no footer at all", async () => {
+		const omp = fakeOmp(project);
+		await omp.emit("session_start", {}, omp.ctx(MAIN));
+		expect(omp.statuses.at(-1)).toBeUndefined();
+	});
+
+	test("a session switch drops a pending ask wait with the run it belonged to", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("fix it", main);
+		await omp.emit("tool_execution_start", { toolCallId: "switch-ask", toolName: "ask", args: { html: "<form>" } }, main);
+		expect(omp.statuses.at(-1)).toContain("응답 대기");
+		await omp.emit("session_switch", {}, main);
+		await until(() => omp.statuses.at(-1)?.startsWith(STORM_MARK) === true);
+		expect(omp.statuses.at(-1)).not.toContain("응답 대기");
+		// The old run's late execution end finds no live run and changes nothing.
+		await omp.emit("tool_execution_end", { toolCallId: "switch-ask", toolName: "ask", result: {}, isError: false }, main);
+		expect(omp.statuses.at(-1)).not.toContain("응답 대기");
+	});
+
+	test("two parallel children may carry the same provider tool-call id without closing each other's wait", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const first = child.ctx(sub("Impl"));
+		const second = child.ctx(sub("Impl2"));
+		await omp.emit("session_start", {}, main);
+		await omp.command("fix it", main);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId;
+		admitChild(runId, "Impl");
+		admitChild(runId, "Impl2");
+		const question = { toolCallId: "same-call", toolName: "ask", args: { html: "<form><input name=\"x\"></form>" } };
+		await child.emit("tool_execution_start", question, first);
+		expect(omp.statuses.at(-1)).toContain("응답 대기");
+		await child.emit("tool_execution_start", question, second);
+		expect(omp.statuses.at(-1)).toContain("응답 대기");
+		const end = { toolCallId: "same-call", toolName: "ask", result: {}, isError: false };
+		await child.emit("tool_execution_end", end, first);
+		// The second child is still waiting even though its sibling closed the same provider call id.
+		expect(omp.statuses.at(-1)).toContain("응답 대기");
+		await child.emit("tool_execution_end", end, second);
+		expect(omp.statuses.at(-1)).not.toContain("응답 대기");
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+	});
+
+	test("a no-UI host's ask or approval event claims no user wait", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("fix it", main);
+		const noUi = { ...main, hasUI: false } as ExtensionContext;
+		const before = omp.statuses.at(-1);
+		await omp.emit("tool_execution_start", { toolCallId: "headless-ask", toolName: "ask", args: { html: "<form>" } }, noUi);
+		await omp.emit(
+			"tool_approval_requested",
+			{ sessionId: "s", toolCallId: "headless-approval", toolName: "bash", approvalMode: "always-ask" },
+			noUi,
+		);
+		expect(omp.statuses.at(-1)).toBe(before);
+		expect(omp.statuses.at(-1)).not.toContain("응답 대기");
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+	});
+
+	test("the status line follows real asks, approvals and child phases; a late dialog cannot mark the idle line", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const impl = child.ctx(sub("Impl"));
+		const rev = child.ctx(sub("Rev", "storm-reviewer"));
+		await omp.emit("session_start", {}, main);
+		await omp.command("fix it", main);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId;
+		admitChild(runId, "Impl");
+		admitChild(runId, "Rev");
+		const seen = () => omp.statuses.at(-1) ?? "";
+		expect(seen()).toContain("진행 중");
+
+		// Only a real ask form is a wait; its execution end clears it.
+		await omp.emit(
+			"tool_execution_start",
+			{ toolCallId: "ask-1", toolName: "ask", args: { html: "<form><input name=\"x\"></form>" } },
+			main,
+		);
+		expect(seen()).toContain("응답 대기");
+		await omp.emit("tool_execution_end", { toolCallId: "ask-1", toolName: "ask", result: {}, isError: false }, main);
+		expect(seen()).toContain("진행 중");
+		await omp.emit("tool_execution_start", { toolCallId: "ask-2", toolName: "ask", args: {} }, main);
+		expect(seen()).not.toContain("응답 대기");
+		await omp.emit("tool_execution_end", { toolCallId: "ask-2", toolName: "ask", result: {}, isError: true }, main);
+
+		// A tool approval is requested only when it truly blocks; resolving it returns to work.
+		await omp.emit(
+			"tool_approval_requested",
+			{ sessionId: "s", toolCallId: "appr-1", toolName: "bash", approvalMode: "always-ask" },
+			main,
+		);
+		expect(seen()).toContain("응답 대기");
+		await omp.emit(
+			"tool_approval_resolved",
+			{ sessionId: "s", toolCallId: "appr-1", toolName: "bash", approved: true },
+			main,
+		);
+		expect(seen()).toContain("진행 중");
+
+		// A run-bound child's own start/approval/settle keeps the same phase signal accurate.
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		expect(seen()).toContain("워커 작업 중");
+		await child.emit(
+			"tool_approval_requested",
+			{ sessionId: "s", toolCallId: "appr-child", toolName: "edit", approvalMode: "always-ask" },
+			impl,
+		);
+		expect(seen()).toContain("응답 대기");
+		await child.emit(
+			"tool_approval_resolved",
+			{ sessionId: "s", toolCallId: "appr-child", toolName: "edit", approved: true },
+			impl,
+		);
+		expect(seen()).toContain("워커 작업 중");
+		await child.emit("agent_end", {}, impl);
+		expect(seen()).toContain("진행 중");
+
+		// An active reviewer is verifying; settling it is not.
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		expect(seen()).toContain("검증 중");
+		await child.emit("agent_end", {}, rev);
+		expect(seen()).toContain("진행 중");
+
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		await until(() => omp.statuses.at(-1)?.startsWith(STORM_MARK) === true);
+		const idle = omp.statuses.at(-1);
+		// An ask or approval that outlives its run does not put a wait on the idle line.
+		await omp.emit("tool_execution_start", { toolCallId: "late", toolName: "ask", args: { html: "<form>" } }, main);
+		await omp.emit(
+			"tool_approval_requested",
+			{ sessionId: "s", toolCallId: "late", toolName: "bash", approvalMode: "always-ask" },
+			main,
+		);
+		expect(omp.statuses.at(-1)).toBe(idle);
+	});
+
 	test("an interrupted run leaves a resume hint; the menu's first option resumes it; a verified end clears the hint", async () => {
 		await gitRepo(project.root);
 		await approve(TEAM);
@@ -338,7 +533,8 @@ describe("a run through the hooks", () => {
 		// The idle label now says a run can be continued; it said nothing of the sort before.
 		const hinted = omp.statuses.at(-1);
 		expect(hinted).not.toBe(idle);
-		expect(hinted?.startsWith("storm ✓")).toBe(true);
+		expect(hinted?.startsWith(STORM_MARK)).toBe(true);
+		expect(hinted).toContain("이어가기 가능");
 
 		// The menu's first option resumes the old request under a new run record.
 		omp.answers.push(options => options[0]);
@@ -425,11 +621,15 @@ describe("a run through the hooks", () => {
 		await noteResumePointer((await loadProjectState(project.env)).store.dir, project.root, run);
 		await omp.emit("session_start", {}, main);
 		expect(omp.statuses.at(-1)).not.toBe(idle);
-		// The approval is still there, but it does not cover this definition.
+		// The approval is still there, but it does not cover this definition: the team is not approved, so the
+		// resume hint is not offered and the status says what the user must do.
 		await mkdir(path.join(project.root, ".omp", "agents"), { recursive: true });
 		await writeFile(path.join(project.root, ".omp", "agents", "storm-reviewer.md"), "---\nname: storm-reviewer\n---\nbody\n");
 		await omp.emit("session_start", {}, main);
-		expect(omp.statuses.at(-1)).toBe(idle);
+		const shadowed = omp.statuses.at(-1);
+		expect(shadowed).not.toBe(idle);
+		expect(shadowed).toContain("승인 필요");
+		expect(shadowed).not.toContain("이어가기 가능");
 	});
 
 	test("the idle hint needs an approved team, without its approval", async () => {

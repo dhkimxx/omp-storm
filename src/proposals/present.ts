@@ -2,6 +2,7 @@
  * The approval dialog: everything the config hash covers, then exactly "승인" or "취소" (plus options the caller adds).
  * Only the exact label "승인" approves; a host that cannot answer (print mode, --no-ui, form-less ACP) gets a cancel.
  */
+import { STORM_MARK } from "../view/appearance.ts";
 import { renderConfigDiff, shadowLines, visible } from "../view/render.ts";
 import type { InfoLine, InfoSpan, Proposal, ShadowInfo, StormConfig, UiPort } from "../types.ts";
 
@@ -23,8 +24,9 @@ export interface ApprovalView {
 
 /**
  * What "승인" covers, most consequential first, because a small terminal cuts the panel from the end: the caller's
- * context, the shadowing definitions (files that replace an agent's prompt and tools), the warnings, then the summary
- * with the diff against `current` (the whole team when there is none), then background notes.
+ * context, the shadowing definitions (files that replace an agent's prompt and tools), the warnings, then the mark
+ * heading naming the summary with the diff against `current` (the whole team when there is none), then background
+ * notes. The mark cannot precede the disclosures or warnings.
  *
  * `info` collects one semantic replacement per Markdown logical line the caller can style; its indexes are into
  * `markdown.split("\n")`. The Markdown itself is identical whether or not a collector is given.
@@ -70,11 +72,12 @@ export function renderApproval(
 		}
 		push("");
 	}
-	if (summary) {
-		annotate([{ text: summary, tone: "accent" }]);
-		push(`**${summary}**`);
-		push("");
-	}
+	// The mark is the heading of what is being approved, so it follows every disclosure and warning above and adds
+	// no row of its own: a small terminal cuts from the end, never from these disclosures.
+	const title = summary ? `${STORM_MARK} · ${summary}` : STORM_MARK;
+	annotate([{ text: title, tone: "accent" }]);
+	push(`### ${title}`);
+	push("");
 	const diffInfo: InfoLine[] = [];
 	const diff = renderConfigDiff(current, next, info ? diffInfo : undefined);
 	annotate([{ text: current ? "변경" : "팀 설정", tone: "accent" }]);

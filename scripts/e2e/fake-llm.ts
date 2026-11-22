@@ -23,6 +23,8 @@
  *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
+ *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
+ *                           observed deterministically while the child really runs
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
  *                           answered), so the parent's turn ends and is compacted while the child still runs
  *   E2E-CHILD-HOLD-ONCE <key>
@@ -60,8 +62,9 @@ interface Message {
 /**
  * One step of a scripted main turn: a storm tool call, a task batch (`as` prefixes the children's names, `say` is
  * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a shell command, a follow-up to a
- * subagent, a read, or `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the
- * last task call has made its first request, so the turn ends with that child known to be running.
+ * subagent, a read, a native `ask` form (`ask` is one HTML `<form>`), or `awaitChild`: a text reply (it ends the
+ * turn, so it belongs last) held until a child of the last task call has made its first request, so the turn ends
+ * with that child known to be running.
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
@@ -73,6 +76,7 @@ export type Step = (
 	| { bash: string }
 	| { followUp: string }
 	| { read: string }
+	| { ask: string }
 	| { awaitChild: true }
 ) & {
 	after?: string;
@@ -294,6 +298,14 @@ function holdsOnce(who: Who, messages: Message[]): boolean {
 	return true;
 }
 
+/** A child's first reply can be held for a bounded time, so a caller can watch the phase while the child runs. */
+function childDelayMs(who: Who, messages: Message[]): number {
+	if (who !== "child" || messages.some(m => m.role === "assistant")) return 0;
+	const raw = /E2E-CHILD-DELAY[ \t]+(\d+)/.exec(userText(messages))?.[1];
+	if (raw === undefined) return 0;
+	return Math.min(Number(raw), HOLD_MAX_MS);
+}
+
 /** Waits until `open` holds, for `HOLD_MAX_MS` at most. */
 async function hold(open: () => boolean): Promise<void> {
 	const deadline = Date.now() + HOLD_MAX_MS;
@@ -307,6 +319,7 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
 	if ("bash" in step) return bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, "follow-up");
+	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
 
@@ -485,6 +498,8 @@ Bun.serve({
 		const decision = decide(request, who);
 		record(request, who, decision);
 		if (decision.kind === "tool" && decision.name === "task") seen.childrenAtTask = seen.children;
+		const delay = childDelayMs(who, request.messages);
+		if (delay > 0) await Bun.sleep(delay);
 		if (decision.kind === "text" && decision.awaitChild) await hold(() => seen.children > seen.childrenAtTask);
 		if (holdsForCompaction(who, request.messages) || holdsOnce(who, request.messages)) await hold(() => seen.compactions > compactionsBefore);
 		if (who === "compaction") seen.compactions++;

@@ -14,6 +14,7 @@ import { configPath, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
+import { STORM_MARK, type RunPhase } from "./view/appearance.ts";
 import { renderStatus, renderStatusBrief, renderTrial, resumeRunLine, visible } from "./view/render.ts";
 import { runRollback } from "./view/review.ts";
 import { recommendedConfig } from "./view/setup.ts";
@@ -46,6 +47,10 @@ export interface FlowEnv extends ProjectEnv {
 	now: () => number;
 	/** The Storm run active in this session, for status. */
 	activeRun?: () => RunRecord | undefined;
+	/** The live phase of that run, for views; undefined when the controller cannot say. Never persisted. */
+	activePhase?: () => RunPhase | undefined;
+	/** The current OMP mode that prevents automatic delegation, for the user's status only. */
+	autoModeProblem?: () => string | undefined;
 	/** Subagents under this session, for status. */
 	agents?: () => AgentEntry[];
 	/** omp settings as configured (concurrency, fallbacks, isolation); fields are undefined when unreadable. */
@@ -305,7 +310,7 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	if (!checked.config) {
 		if (form && ui.pickModel && ctx.available.some((model) => model.available && model.supportsTools)) {
 			const choice = await ui.select("Storm 추천 팀을 만들 수 없습니다", [PICK_BY_ROLE, CANCEL], {
-				title: "Storm 팀 제안",
+				title: `${STORM_MARK} · 팀 제안`,
 				markdown: checked.errors.map((error) => `- ${error}`).join("\n"),
 			});
 			if (choice === PICK_BY_ROLE && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
@@ -347,7 +352,7 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	if (decision.outcome === "unchanged") {
 		// The recommendation is the approved team, so there is nothing to approve; picking role by role is still open.
 		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", [PICK_BY_ROLE, MENU.close], {
-			title: "Storm 팀 제안",
+			title: `${STORM_MARK} · 팀 제안`,
 			markdown: notes,
 			info: notesInfo,
 		});
@@ -436,20 +441,25 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 	]);
 	const usage = readUsage({ dbPath: env.statsDb ?? statsDbPath(), windowDays: 1, now });
 	const run = env.activeRun?.();
+	/** Only an active run has a phase; an absent callback or undefined means no phase is claimed. */
+	const runPhase = run ? env.activePhase?.() : undefined;
 	const agents = env.agents?.() ?? [];
 	const ompAdvice = config && settings ? ompSettingsAdvice(config, settings) : [];
 	const newerVersion = opts.user ? env.newerVersion?.() : undefined;
+	const autoModeProblem = autoChoice === "on" && isApproved(state) ? env.autoModeProblem?.() : undefined;
 	return {
 		config: state.config,
 		approval: state.approval,
 		// An unset choice is off: an existing approved team gets no retroactive consent from this status.
-		...(autoChoice !== undefined ? { autoDelegation: autoChoice === "on" ? (isApproved(state) && config ? "on" : "blocked") : "off" } : {}),
+		...(autoChoice !== undefined ? { autoDelegation: autoChoice === "on" ? (isApproved(state) && autoModeProblem === undefined ? "on" : "blocked") : "off" } : {}),
+		...(autoModeProblem !== undefined ? { autoModeProblem } : {}),
 		// The status never says where the project is.
 		shadows: state.shadows.map(shadow => (shadow.scope === "project" ? { ...shadow, path: relative(root, shadow.path) } : shadow)),
 		...(usage.status === "ok" ? { dataAsOf: usage.dataAsOf } : {}),
 		...(storage ? { storage: formatStorage(storage, config?.cleanup === true) } : {}),
 		...(quota ? { quota } : {}),
 		...(run ? { run } : {}),
+		...(runPhase ? { runPhase } : {}),
 		...(last ? { lastRun: last } : {}),
 		...(trials.length ? { trials } : {}),
 		...(quotaMarks.length ? { quotaMarks } : {}),
@@ -593,7 +603,7 @@ async function invalidFlow(env: FlowEnv, ui: UiPort, state: ProjectState, errors
 	// The errors quote the file (keys, values), so each one is shown as a single line.
 	const markdown = [`\`${path}\``, "", ...errors.map(error => `- ${visible(error)}`), "", "파일을 직접 고쳐도 됩니다. 고칠 때까지 Storm 스폰은 막힙니다."].join("\n");
 	const choice = await ui.select("팀 설정 파일에 오류가 있습니다", [...(rollbacks.length ? [MENU.rollback] : []), MENU.setup, CANCEL], {
-		title: "팀 설정 오류",
+		title: `${STORM_MARK} · 팀 설정 오류`,
 		markdown,
 	});
 	if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
@@ -707,14 +717,19 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	/** An approved team from before the default: offer the transition once, beside every normal action. */
 	const migrate = autoChoice === "unset";
 	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, MENU.models];
-	if (env.agents?.().length) options.push(MENU.agents);
+	// The status view already read this session's agents; do not query the same trusted list again.
+	if (view.agents?.length) options.push(MENU.agents);
 	options.push(autoChoice === "on" ? AUTO_MENU.on : AUTO_MENU.off);
 	if (migrate) options.push(AUTO_MIGRATION.switch, AUTO_MIGRATION.stay);
 	if (rollbacks.length) options.push(MENU.rollback);
 	options.push(MENU.reset, MENU.close);
+	// The trusted candidate from above, not a second lookup, decides whether the state says "resume".
+	const info: InfoLine[] = [];
+	const brief = renderStatusBrief(view, env.now(), info, resume !== undefined);
 	const choice = await ui.select("Storm 메뉴", options, {
 		title: "Storm 현황",
-		markdown: [migrate ? AUTO_MIGRATION_NOTICE : undefined, renderStatusBrief(view, env.now()), resume ? resumeRunLine(resume) : undefined, view.storage].filter(Boolean).join("\n\n"),
+		markdown: [brief, migrate ? AUTO_MIGRATION_NOTICE : undefined, resume ? resumeRunLine(resume) : undefined, view.storage].filter(Boolean).join("\n\n"),
+		...(info.length ? { info } : {}),
 		// Only the switch accepts the migration notice; every normal action and "직접 작업 유지" stay available when it is cut.
 		...(migrate ? { consent: [AUTO_MIGRATION.switch] } : {}),
 	});

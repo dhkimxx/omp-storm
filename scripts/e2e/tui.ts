@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 /**
  * OMP Storm end-to-end check in omp's interactive TUI, on a pty: what only that host has. Setup through Storm's
- * approval, role interviews, a plain request, and a run Storm sends back until its changes are reviewed. Same
- * isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
+ * approval, role interviews, a plain request, a run Storm sends back until its changes are reviewed, a native ask
+ * that holds and then resumes the same run, shutdown while it waits, and narrow motion-off runs in dark and light.
+ * Same isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
  *
  * Usage: npm run e2e:tui   (env: see harness.ts)
  *
@@ -15,9 +16,11 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
-import { ROLES } from "../../src/roles.ts";
+import { ROLES, STORM_VERSION } from "../../src/roles.ts";
 import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
+import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
+import { priorityLabel } from "../../src/view/render.ts";
 import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, price, PROFILE_CONFIG, prepare, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
@@ -42,6 +45,38 @@ const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry
 const plan = (name: string, kind: string): Step => ({ storm: { action: "plan", plan: { lanes: [{ name, kind }] } } });
 const primary = (config: StormConfig | undefined, role: string): string | undefined => modelId(config?.roles[role]?.models[0]);
 const OUTSIDE = "interview-outside";
+/** The calm footer an approved team with automatic delegation shows when no run is live. */
+const IDLE = idleAppearance({ team: "approved", auto: "on", resume: false });
+/** The same footer while a stopped run can be continued. */
+const RESUME = idleAppearance({ team: "approved", auto: "on", resume: true });
+/** A native ask form with a named text control: its label becomes the question, its placeholder is visible. */
+const ASK_FORM = '<form><fieldset><legend>E2E 확인</legend><label>E2E-QUESTION <input name="e2e-answer" placeholder="E2E-ANSWER"></label></fieldset></form>';
+const ASK_ANSWER = "resume-ok";
+
+/** The widget's static header text: the shared mark, then the shared phase label. */
+const phaseHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
+
+/** The last rendered row carrying a live phase header, without surrounding box edges or padding. */
+function phaseRow(text: string, phase: RunPhase): string | undefined {
+	const header = phaseHeader(phase);
+	return text
+		.split("\n")
+		.map(row => row.trim())
+		.filter(row => row.includes(header))
+		.at(-1);
+}
+
+/**
+ * Whether the footer names the approved team's idle state, calm or resumable. The head must be exact: a live
+ * widget's `≋ STORM · 다음 라운드 대기 …` also contains "대기" and must not pass for a restored idle footer.
+ */
+function idleFooter(line: string | undefined): boolean {
+	if (line === undefined) return false;
+	return [IDLE.label, RESUME.label].some(label => {
+		const head = `${STORM_MARK} · ${label}`;
+		return line === head || line.startsWith(`${head} · `);
+	});
+}
 
 async function session<T>(body: (tui: Tui) => Promise<T>): Promise<T> {
 	const tui = new Tui(env, { model: "fake/general-b" });
@@ -111,6 +146,48 @@ async function submitForm(tui: Tui, from: number, heading: string, fields: numbe
 	return tui.send(KEY.enter);
 }
 
+/** The narrow, motion-off run in one terminal appearance; the light variant proves no theme assumption. */
+async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
+	const columns = 60;
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, background });
+	const named = (name: string): string => `${background}: ${name}`;
+	try {
+		await tui.ready();
+		await tui.seen(0, () => (idleFooter(statusLine(tui.raw)) ? true : undefined), named("narrow idle footer"), 30_000);
+		const idle = statusLine(tui.raw);
+		check(named("the narrow footer uses the shared mark and an idle state"), idleFooter(idle), idle ?? "no status line");
+		check(named("the narrow footer fits the terminal"), Bun.stringWidth(idle ?? "") <= columns, `${Bun.stringWidth(idle ?? "")} > ${columns}: ${idle}`);
+		const before = files.runIds();
+		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-DELAY 3000" }, { awaitChild: true }];
+		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+		await tui.seen(started, text => (phaseRow(text, "workers") !== undefined ? true : undefined), named("workers phase"), 30_000);
+		// Let the child's request land and its spend repaint once; then the still row is what motion off should hold.
+		let first = phaseRow(tui.text(started), "workers");
+		let stableSince = Date.now();
+		while (Date.now() - stableSince < 700) {
+			await Bun.sleep(50);
+			const row = phaseRow(tui.text(started), "workers");
+			if (row !== first) {
+				first = row;
+				stableSince = Date.now();
+			}
+		}
+		check(
+			named("the narrow live status keeps its phase header and fits"),
+			first !== undefined && first.includes("/4라운드") && Bun.stringWidth(first) <= columns,
+			`${Bun.stringWidth(first ?? "")} > ${columns}: ${first}`,
+		);
+		await Bun.sleep(800);
+		const second = phaseRow(tui.text(started), "workers");
+		check(named("motion off leaves the narrow live status still"), first !== undefined && second === first, `${first} → ${second}`);
+		const run = await files.finishedRun(before, 120_000);
+		check(named("the narrow run ends on its own"), run.endReason === "no-changes" && run.status === "ended", `${run.status} ${run.endReason}`);
+		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+	} finally {
+		await tui.close();
+	}
+}
+
 async function main(): Promise<void> {
 	const outside = { id: OUTSIDE, cost: price(2, 8), context: 110_000, efforts: ["low", "high"] } as const;
 	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, { ...TEAM_PROVIDERS, fake: [...TEAM_PROVIDERS.fake, outside] }));
@@ -141,7 +218,24 @@ async function main(): Promise<void> {
 				// The composer answers rather than a hidden prompt taking the keys.
 				const status = await tui.submit("/storm status");
 				await tui.shows(OVERLAY_HINT, status);
+				const report = tui.text(status);
+				const heading = `${STORM_MARK} · ${IDLE.label} · v${STORM_VERSION}`;
+				const head = report.indexOf(heading);
+				check(
+					"/storm status leads with the shared Storm mark and the approved team's idle state",
+					head >= 0 && report.slice(head).includes("팀 설정"),
+					report.slice(Math.max(0, head), Math.max(0, head) + 300),
+				);
+				check(
+					"the status heading keeps the team's priority beside its setting",
+					head >= 0 && report.slice(head).includes(`우선순위 ${priorityLabel(files.config().priority)}`),
+					`priority=${files.config().priority}`,
+				);
 				tui.send(KEY.enter);
+				await suite.eventually("the calm idle footer names the approved team", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line");
+				const calm = statusLine(tui.raw);
+				await Bun.sleep(500);
+				check("the idle footer stays still", statusLine(tui.raw) === calm, `${calm} → ${statusLine(tui.raw)}`);
 				check("no model request during setup", llm.all().filter(entry => entry.who !== "side").length === 0, `requests=${llm.all().length}`);
 			});
 		},
@@ -209,9 +303,86 @@ async function main(): Promise<void> {
 				check("one turn, ended with no changes", run.turns === 1 && run.endReason === "no-changes" && run.status === "ended", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
 				check("it ended once", files.index().filter(line => line.runId === run.runId).length === 1);
+				await suite.eventually("the footer returns to its idle state after the run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 			});
 		},
 		240_000,
+	);
+
+	await suite.step(
+		"a native ask pauses the run and its answer resumes it",
+		async () => {
+			const llm = new LlmCursor(env);
+			await session(async tui => {
+				const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { task: ["storm-explorer"], as: "Scan", say: "E2E-CHILD-DELAY 1200" }, { awaitChild: true }];
+				const before = files.runIds();
+				const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+				await tui.seen(
+					started,
+					text =>
+						text.includes(phaseHeader("waiting-user")) &&
+						text.includes("E2E-QUESTION") &&
+						text.includes("E2E-ANSWER") &&
+						text.includes("Submit")
+							? true
+							: undefined,
+					"the native ask while the run waits",
+					60_000,
+				);
+				const shown = tui.text(started);
+				const askAt = shown.lastIndexOf("E2E 확인");
+				const askPanel = askAt >= 0 ? shown.slice(askAt) : shown;
+				check("the live widget shows the waiting phase", shown.includes(phaseHeader("waiting-user")), shown.slice(-500));
+				check(
+					"the ask is omp's native form with a named control",
+					shown.includes("Ask") && askPanel.includes("E2E-QUESTION") && askPanel.includes("E2E-ANSWER"),
+					askPanel.slice(-600),
+				);
+				check("the native ask offers Submit", askPanel.includes("Submit"), askPanel.slice(-600));
+				const live = await until(() => files.runs().find(run => !before.has(run.runId) && run.status === "running"), 20_000, "the asked run to be active");
+				await tui.press(ASK_ANSWER, text => text.includes(ASK_ANSWER), "the ask control to show the answer");
+				/** The exact answer as the fake provider saw it, not merely text left in the form. */
+				const answerArrived = (): boolean =>
+					mains(llm.all()).some(entry => entry.lastTool.includes("e2e-answer") && entry.lastTool.includes(ASK_ANSWER));
+				/** The Ask result card the host adds once the answer was submitted (check glyph differs by version). */
+				const answerResult = (text: string): boolean => text.includes(`✔ ${ASK_ANSWER}`) || text.includes(`✓ ${ASK_ANSWER}`);
+				// One host focuses Submit on the first Enter; another submits on it. Wait for whichever actually happened,
+				// then send the second Enter only when the form still shows Submit focused.
+				const first = tui.send(KEY.enter);
+				const outcome = await until(
+					() => {
+						const text = tui.text(first);
+						if (answerArrived() || answerResult(text)) return "submitted" as const;
+						if (focused(text) === "Submit") return "focus" as const;
+						return undefined;
+					},
+					60_000,
+					"the ask to focus Submit or submit",
+				);
+				if (outcome === "focus") {
+					// Give the submit-on-first-Enter path one local provider round before pressing again.
+					const grace = Date.now() + 1_500;
+					let submitted = false;
+					while (!submitted && Date.now() < grace) {
+						await Bun.sleep(50);
+						submitted = answerArrived() || answerResult(tui.text(first));
+					}
+					if (!submitted) tui.send(KEY.enter);
+				}
+				await tui.seen(
+					first,
+					text => (text.includes(phaseHeader("workers")) || text.includes(phaseHeader("working")) ? true : undefined),
+					"the answered run to continue into work",
+					60_000,
+				);
+				await until(answerArrived, 30_000, "the named answer to reach the director");
+				const run = await files.finishedRun(before, 150_000);
+				check("the answer resumed the same run", run.runId === live.runId && run.status !== "running", `${run.runId} vs ${live.runId} ${run.status}`);
+				check("the answered run ends normally after one round", run.endReason === "no-changes" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
+				await suite.eventually("the footer returns after the answered run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+			});
+		},
+		180_000,
 	);
 
 	await suite.step(
@@ -219,13 +390,21 @@ async function main(): Promise<void> {
 		async () => {
 			const changed = join(env.project, "e2e-rounded.txt");
 			const llm = new LlmCursor(env);
+			const approvals = files.approvals().length;
 			files.editConfig(config => {
 				config.budget = { perRunUsd: 0.01, onExceed: "block-spawns" };
+				// A real required check, not a test hook: it holds the verifying phase long enough to see it.
+				config.requiredChecks = [{ name: "e2e-verify-hold", argv: [process.execPath, "-e", "setTimeout(() => process.exit(0), 4000)"] }];
 			});
 			try {
 				await session(async tui => {
 					await answer(tui, await tui.submit("/storm"), APPROVE);
-					await tui.seen(0, () => statusLine(tui.raw)?.startsWith("storm ✓") ? true : undefined, "budget approval");
+					await suite.eventually(
+						"the budget and the required check are approved",
+						() => files.approvals().length === approvals + 1,
+						() => `approvals=${files.approvals().length}`,
+						30_000,
+					);
 					const steps: Step[] = [
 						{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code" }, { name: "review", kind: "review" }] } } },
 						{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
@@ -234,15 +413,25 @@ async function main(): Promise<void> {
 					const before = files.runIds();
 					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 					await suite.eventually(
-						"the live widget shows the round and budget",
-						() => /Storm 실행 중[^\r\n]*\/4라운드[^\r\n]*\$0\.01/.test(tui.text(started)),
+						"the live widget shows an active phase header with the round and budget",
+						() =>
+							(["working", "workers", "verifying"] as const).some(phase => {
+								const row = phaseRow(tui.text(started), phase);
+								return row !== undefined && row.includes("/4라운드") && row.includes("$0.01");
+							}),
 						() => "",
 						30_000,
+					);
+					await tui.seen(
+						started,
+						text => (phaseRow(text, "verifying") !== undefined ? true : undefined),
+						"the verifying phase while the real required check runs",
+						120_000,
 					);
 					const run = await files.finishedRun(before, 240_000);
 					await suite.eventually(
 						"the status line returns to idle after the run",
-						() => statusLine(tui.raw)?.startsWith("storm ✓") ?? false,
+						() => idleFooter(statusLine(tui.raw)),
 						() => statusLine(tui.raw) ?? "no status line",
 						60_000,
 					);
@@ -257,6 +446,11 @@ async function main(): Promise<void> {
 					const reviewer = run.agents?.find(agent => agent.role === "reviewer");
 					check("round 1's file change is counted", implementer?.changes === 1 && existsSync(changed), `changes=${implementer?.changes} file=${existsSync(changed)}`);
 					check("round 2's verdict passes", reviewer?.lastVerdict?.correct === true, JSON.stringify(reviewer?.lastVerdict));
+					check(
+						"the real required check ran and passed under the verifying phase",
+						run.checks?.some(evidence => evidence.name === "e2e-verify-hold" && evidence.status === "passed") === true,
+						JSON.stringify(run.checks),
+					);
 					check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
 					const lines = files.index().filter(line => line.runId === run.runId);
 					check(
@@ -268,15 +462,111 @@ async function main(): Promise<void> {
 					await tui.shows(OVERLAY_HINT, status);
 					await tui.shows(/완료|리뷰 통과/, status);
 					const top = tui.text(status);
+					const heading = `${STORM_MARK} · ${IDLE.label} · v${STORM_VERSION}`;
+					const head = top.indexOf(heading);
 					check("the TUI renders the approved team's status", top.includes("승인됨") && top.includes("마지막 실행"));
+					check(
+						"/storm status leads with the shared Storm mark and the idle state",
+						head >= 0 && top.slice(head).includes("팀 설정"),
+						top.slice(Math.max(0, head), Math.max(0, head) + 300),
+					);
+					const teamAt = top.indexOf("팀 설정", Math.max(0, head));
+					const approvalAt = top.indexOf("승인", Math.max(0, head));
+					check(
+						"the heading keeps the team setting, its priority, before the approval section",
+						teamAt > head && teamAt < approvalAt && top.slice(teamAt, approvalAt).includes(`우선순위 ${priorityLabel(files.config().priority)}`),
+						`head=${head} team=${teamAt} approval=${approvalAt} priority=${files.config().priority}`,
+					);
 					check("the budget amount and partially filled meter are visible together", top.includes("$0.01") && top.includes(run.runId) && /█+░+/.test(top));
 					tui.send(KEY.enter);
+					await suite.eventually("the footer returns to idle after the status report", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 				});
 			} finally {
 				rmSync(changed, { force: true });
 			}
 		},
 		300_000,
+	);
+
+	await suite.step(
+		"a narrow terminal with motion off keeps the live status still in both backgrounds",
+		async () => {
+			await narrowMotionOff("dark");
+			await narrowMotionOff("light");
+		},
+		300_000,
+	);
+
+	await suite.step("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
+		await session(async tui => {
+			const before = files.runIds();
+			const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { awaitChild: true }];
+			const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+			await tui.seen(
+				started,
+				text => (text.includes(phaseHeader("waiting-user")) && text.includes("E2E-QUESTION") && text.includes("Submit") ? true : undefined),
+				"the cancellable native ask",
+				30_000,
+			);
+			// In a terminal form, the first Escape releases focus back to the composer; the second interrupts the turn.
+			await tui.press("\x1b", text => text.includes("answer the questions above, or type here to skip them"), "Escape to return focus to the composer", 10_000);
+			const cancelled = tui.send("\x1b");
+			const run = await files.finishedRun(before, 30_000);
+			check("Escape interrupts the waiting run", run.status === "stopped" && run.endReason === "interrupted", `${run.status} ${run.endReason}`);
+			await tui.seen(
+				cancelled,
+				() => (statusLine(tui.raw.slice(cancelled))?.startsWith(`${STORM_MARK} · ${RESUME.label}`) ? true : undefined),
+				"the resumable footer after cancelling",
+				30_000,
+			);
+		});
+	}, 90_000);
+
+	await suite.step(
+		"shutdown while an ask waits ends the run and leaves it resumable",
+		async () => {
+			const before = files.runIds();
+			const tui = new Tui(env, { model: "fake/general-b" });
+			let runId: string | undefined;
+			try {
+				await tui.ready();
+				const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { awaitChild: true }];
+				const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+				await tui.seen(
+					started,
+					text => (text.includes(phaseHeader("waiting-user")) && text.includes("E2E-QUESTION") ? true : undefined),
+					"the ask waiting at shutdown",
+					60_000,
+				);
+				const live = await until(() => files.runs().find(run => !before.has(run.runId) && run.status === "running"), 20_000, "the waiting run to be active");
+				runId = live.runId;
+			} finally {
+				await tui.close();
+			}
+			if (runId === undefined) throw new Error("the waiting run never appeared on disk");
+			const ended = await until(
+				() => {
+					const run = files.run(runId!);
+					return run !== undefined && run.status !== "running" && run.endedAt !== undefined ? run : undefined;
+				},
+				30_000,
+				"the waiting run to end at shutdown",
+			);
+			check("shutdown ends the waiting run", ended.endReason === "shutdown", `${ended.status} ${ended.endReason}`);
+			check("the ended run is indexed once", files.index().filter(line => line.runId === runId).length === 1);
+			await session(async next => {
+				await suite.eventually(
+					"the shutdown run is offered as resumable in the shared footer",
+					() => {
+						const line = statusLine(next.raw);
+						return line !== undefined && line.includes(STORM_MARK) && line.includes(RESUME.label);
+					},
+					() => statusLine(next.raw) ?? "no status line",
+					30_000,
+				);
+			});
+		},
+		180_000,
 	);
 }
 

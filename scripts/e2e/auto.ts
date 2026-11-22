@@ -45,6 +45,9 @@ const OLD_PROMPT = "자동 위임을 켤까요?";
 const CHOICE_FILE = "auto-delegation.json";
 
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+/** RPC UI capable hosts can additionally offer the role interview in the same approval. */
+const setupOptions = (options: readonly string[] | undefined): boolean =>
+	same(options, [APPROVE, CANCEL]) || same(options, [APPROVE, "역할별로 고르기", CANCEL]);
 const reports = (frames: readonly Frame[]): string[] => frames.filter(frame => customMessage(frame) === "storm-report").map(frame => JSON.stringify(frame));
 
 async function session(answer: Answer, exercise: (rpc: Rpc) => Promise<void>): Promise<void> {
@@ -115,7 +118,7 @@ try {
 			await rpc.prompt("/storm setup");
 			suite.check(
 				"the new setup asks for the team, with nothing else",
-				rpc.dialogs.length === dialogs + 1 && same(rpc.dialogs.at(-1)?.options, [APPROVE, CANCEL]),
+				rpc.dialogs.length === dialogs + 1 && setupOptions(rpc.dialogs.at(-1)?.options),
 				JSON.stringify(rpc.dialogs.slice(dialogs)),
 			);
 			suite.check("declining saves no config and no approval", !existsSync(files.configFile) && files.approvals().length === 0);
@@ -136,7 +139,7 @@ try {
 			suite.check(
 				"one approval is the only dialog: no separate automatic-delegation prompt",
 				rpc.dialogs.length === 1 &&
-					same(rpc.dialogs.at(-1)?.options, [APPROVE, CANCEL]) &&
+					setupOptions(rpc.dialogs.at(-1)?.options) &&
 					rpc.dialogs.every(dialog => !dialog.title.includes(OLD_PROMPT) && !dialog.options.includes(AUTO.on)),
 				JSON.stringify(rpc.dialogs),
 			);
@@ -320,6 +323,7 @@ try {
 
 			const frames = await rpc.prompt("/storm status");
 			suite.check("/storm status reports without a dialog", rpc.dialogs.length === 0 && reports(frames).length === 1, `dialogs=${rpc.dialogs.length} reports=${reports(frames).length}`);
+			suite.check("the status report keeps the Storm state in plain text", reports(frames).some(report => report.includes("≋ STORM · 대기") && !report.includes("\\u001b")));
 			const afterStatus = await rpc.turn(scripted({ read: TRACKED_FILE }, { edit: "legacy-after-status.txt" }));
 			suite.check(
 				"/storm status leaves stock reads and writes unfenced",

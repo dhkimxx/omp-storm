@@ -13,6 +13,7 @@ import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation
 import { ROLES, roleTitle } from "../src/roles.ts";
 import { writeRun } from "../src/runtime/run.ts";
 import { noteResumePointer, resumeCandidate, resumePointerFile } from "../src/runtime/resume.ts";
+import { RUN_APPEARANCE, STORM_MARK } from "../src/view/appearance.ts";
 import { parseModelEntry } from "../src/selector.ts";
 import { BROWSE, FIELD, MODEL_DEFAULT, NONE } from "../src/setup/form.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
@@ -298,6 +299,9 @@ describe("setup", () => {
 		expect(f.selects).toHaveLength(1);
 		for (const role of Object.values(expected.roles)) expect(f.selects[0]?.markdown).toContain(role.models.join(", "));
 		expect(f.selects[0]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		// One brand heading, after the first-approval disclosure, replaces the summary row rather than pushing it down.
+		expect(f.selects[0]?.markdown?.split(STORM_MARK)).toHaveLength(2);
+		expect(f.selects[0]!.markdown!.indexOf(STORM_MARK)).toBeGreaterThan(f.selects[0]!.markdown!.indexOf(AUTO_DISCLOSURE));
 		for (const part of ["이 프로필과 이 저장소", "프로젝트 도구를 직접 쓰지 않", "작은 수정도", "일반 대화", "/storm auto"]) {
 			expect(f.selects[0]?.markdown).toContain(part);
 		}
@@ -923,6 +927,71 @@ describe("status and agents", () => {
 		expect(full.split("\n").filter(line => line.startsWith("### "))).toEqual(expect.arrayContaining(text.split("\n").filter(line => line.startsWith("### "))));
 	});
 
+	test("the user status puts the active run's state and details before the team, and claims no phase that was not given", async () => {
+		const run = runRecord({
+			status: "running",
+			turns: 1,
+			maxRounds: 4,
+			costUsd: 1.25,
+			budget: { perRunUsd: 5, onExceed: "stop" },
+			agents: [agentEntry({ state: "running", review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] } })],
+		});
+		const text = await statusText({ ...env, activeRun: () => run }, { quota: true });
+		const lines = text.split("\n");
+		expect(lines[0]).toStartWith(STORM_MARK);
+		expect(lines[0]).toContain("실행 중");
+		expect(text.split(STORM_MARK)).toHaveLength(2);
+		expect(text.indexOf("### 실행 중")).toBeLessThan(text.indexOf("### 팀 설정"));
+		expect(text).toContain("2/4라운드");
+		expect(text).toContain("지출 $1.2500 / 예산 $5");
+		expect(text).toContain("리뷰 1회");
+		// Without the controller's live phase no phase name is invented.
+		expect(text).not.toContain(RUN_APPEARANCE.verifying.label);
+		expect(text).not.toContain(RUN_APPEARANCE.workers.label);
+
+		const phased = await statusText({ ...env, activeRun: () => run, activePhase: () => "verifying" }, { quota: true });
+		expect(phased.split("\n")[0]).toContain(RUN_APPEARANCE.verifying.label);
+
+		// A planned review lane is not evidence of a review, and a plan never becomes a check result.
+		const planned = {
+			...run,
+			agents: [],
+			plan: { lanes: [{ name: "review", kind: "review" as const, role: "reviewer" }], workers: { reviewer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" },
+		};
+		const unproven = await statusText({ ...env, activeRun: () => planned }, { quota: true });
+		expect(unproven).not.toContain("- 리뷰: 없음");
+		expect(unproven).not.toContain("리뷰 1회");
+		expect(unproven).not.toContain("검사 결과");
+	});
+
+	test("a current OMP mode explains why an approved team's automatic delegation is blocked", async () => {
+		await approve(TEAM);
+		await writeAutoDelegation((await load()).store.dir, true);
+		const reason = "omp 계획 모드가 켜져 있습니다. 계획 모드를 끝낸 뒤 다시 요청하세요.";
+		const blocked = { ...env, autoModeProblem: () => reason };
+		const full = await statusText(blocked, { quota: true });
+		expect(full.split("\n").slice(0, 2)).toEqual([
+			expect.stringContaining("자동 위임 막힘"),
+			`- 다음: ${reason}`,
+		]);
+		expect(full).toContain("켜짐 · 실행 차단");
+		const model = await statusText(blocked, { quota: false });
+		expect(model).not.toContain(reason);
+		const hub = scriptedUi(["닫기"]);
+		await hubFlow(blocked, hub.ui);
+		expect(hub.selects[0]?.markdown).toContain(`- 다음: ${reason}`);
+	});
+
+	test("an idle status puts the present state and its real next action before the team sections", async () => {
+		const text = await statusText(env, { quota: true });
+		const lines = text.split("\n");
+		expect(lines[0]).toStartWith(STORM_MARK);
+		expect(lines[0]).toContain("설정 없음");
+		expect(text.split(STORM_MARK)).toHaveLength(2);
+		expect(lines[1]).toBe("- 다음: `/storm`에서 팀 설정");
+		expect(text.indexOf("- 다음:")).toBeLessThan(text.indexOf("### 팀 설정"));
+	});
+
 	test("agentsFlow reports the subagents table and asks nothing", async () => {
 		await approve(TEAM);
 		const f = scriptedUi();
@@ -941,6 +1010,9 @@ describe("/storm menu", () => {
 		expect(await hubFlow(env, f.ui)).toBe(false);
 		expect(f.selects[0]?.options).toHaveLength(5);
 		expect(f.selects[0]?.markdown).toContain(shortHash(configHash(TEAM)));
+		// No resume pointer: the hub does not claim a resumable run.
+		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
+		expect(f.selects[0]?.markdown).not.toContain("이어가기 가능");
 
 		await approve({ ...TEAM, parallelism: 2 });
 		const g = scriptedUi([LAST]);
@@ -1115,6 +1187,10 @@ describe("resuming the last run", () => {
 		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
 		const about = f.selects[0]?.markdown?.split("\n").filter(line => line.includes("resume-unique-request")) ?? [];
 		expect(about).toHaveLength(1);
+		// The trusted resume candidate is the hub's present state; no second lookup invents it.
+		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
+		expect(f.selects[0]?.markdown).toContain("이어가기 가능");
+		expect(f.selects[0]?.markdown).toContain("- 다음: `/storm`에서 이어가기");
 		expect(f.notices).toEqual([]);
 	});
 
