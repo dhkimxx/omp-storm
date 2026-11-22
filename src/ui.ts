@@ -157,7 +157,17 @@ class ReportView implements Component {
 		private readonly close: () => void,
 	) {
 		this.#rich = info !== undefined && info.length > 0 ? new RichFrame(`Storm · ${title}`, markdown, info, REPORT_ICON) : undefined;
-		this.#scroll = new ScrollView(this.#rich ?? frame(title, markdown), { height: this.#height() });
+		this.#scroll = new ScrollView(this.#rich ?? frame(title, markdown), {
+			height: this.#height(),
+			// Track and thumb share one ASCII stroke. A line next to full blocks
+			// changes silhouette at the thumb, and both default glyphs are ambiguous-width.
+			trackChar: "|",
+			thumbChar: "|",
+			theme: {
+				track: rail => theme.fg("dim", rail),
+				thumb: rail => theme.bold(theme.fg("accent", rail)),
+			},
+		});
 	}
 
 	#height(): number {

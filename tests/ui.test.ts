@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type Component, stripTerminalSequences, theme } from "@oh-my-pi/pi-tui";
+import { type Component, stripTerminalSequences, theme, visibleWidth } from "@oh-my-pi/pi-tui";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
@@ -234,6 +234,34 @@ describe("TUI", () => {
 		expect(host.selects[0]?.panel?.join("\n")).toContain("two");
 		expect(host.panelSet()).toBe(false);
 		expect(host.sent).toEqual([]);
+	});
+
+	test("a long report's scrollbar stays in one column as the thumb moves", async () => {
+		const lines = Array.from({ length: 50 }, (_, i) => `- 기록 ${i}: ${"비용 ".repeat(i % 6)}`);
+		const thumb = theme.bold(theme.fg("accent", "|"));
+		const track = theme.fg("dim", "|");
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			driveOverlay(view, top) {
+				view.handleInput?.("\x1b[F"); // End
+				const bottom = view.render(100);
+				for (const frame of [top, bottom]) {
+					const rail = frame.slice(0, -1);
+					expect(rail.every(row => stripTerminalSequences(row).endsWith("|") && visibleWidth(row) === 100)).toBe(true);
+					expect(rail.some(row => row.endsWith(thumb))).toBe(true);
+					expect(rail.some(row => row.endsWith(track))).toBe(true);
+				}
+				expect(top.findIndex(row => row.endsWith(thumb))).toBe(0);
+				expect(bottom.findIndex(row => row.endsWith(thumb))).toBeGreaterThan(0);
+				expect(stripTerminalSequences(bottom.join("\n"))).toContain("기록 49");
+				view.handleInput?.("q");
+			},
+		});
+		await createUiPort(host.pi, host.ctx).report("스크롤 검증", lines.join("\n"), [
+			{ index: 0, spans: [{ text: "• 기록 0", tone: "accent" }] },
+		]);
 	});
 
 	test("a context that does not fit adds one option that opens it whole, then the selector comes back", async () => {

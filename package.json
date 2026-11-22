@@ -1,6 +1,6 @@
 {
   "name": "omp-storm",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "private": true,
   "description": "OMP Storm: one /storm command to pick, approve, and enforce your multi-agent team's models in omp",
   "type": "module",
