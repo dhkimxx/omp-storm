@@ -3,7 +3,7 @@
  * Only the exact label "승인" approves; a host that cannot answer (print mode, --no-ui, form-less ACP) gets a cancel.
  */
 import { renderConfigDiff, shadowLines, visible } from "../view/render.ts";
-import type { Proposal, ShadowInfo, StormConfig, UiPort } from "../types.ts";
+import type { InfoLine, InfoSpan, Proposal, ShadowInfo, StormConfig, UiPort } from "../types.ts";
 
 export const APPROVE = "승인";
 export const CANCEL = "취소";
@@ -17,23 +17,77 @@ export interface ApprovalView {
 	context?: string;
 	/** Background shown after the diff (why these models): the first thing a small terminal cuts. */
 	notes?: string;
+	/** `notes` line offsets, relative to `notes`; shifted onto the approval panel. */
+	notesInfo?: readonly InfoLine[];
 }
 
 /**
  * What "승인" covers, most consequential first, because a small terminal cuts the panel from the end: the caller's
  * context, the shadowing definitions (files that replace an agent's prompt and tools), the warnings, then the summary
  * with the diff against `current` (the whole team when there is none), then background notes.
+ *
+ * `info` collects one semantic replacement per Markdown logical line the caller can style; its indexes are into
+ * `markdown.split("\n")`. The Markdown itself is identical whether or not a collector is given.
  */
-export function renderApproval(summary: string | undefined, current: StormConfig | undefined, next: StormConfig, view: ApprovalView = {}): string {
+export function renderApproval(
+	summary: string | undefined,
+	current: StormConfig | undefined,
+	next: StormConfig,
+	view: ApprovalView = {},
+	info?: InfoLine[],
+): string {
 	const out: string[] = [];
-	if (view.context) out.push(view.context, "");
+	/** Index of the next logical Markdown line; chunks may contain newlines. */
+	let line = 0;
+	const push = (chunk: string): void => {
+		out.push(chunk);
+		line += chunk.split("\n").length;
+	};
+	const annotate = (spans: readonly InfoSpan[]): void => {
+		info?.push({ index: line, spans });
+	};
+	if (view.context) {
+		push(view.context);
+		push("");
+	}
 	const shadows = shadowLines(view.shadows ?? []);
-	if (shadows.length) out.push(...shadows, "");
+	if (shadows.length) {
+		shadows.forEach((text, at) => {
+			// The section heading names what approval covers; each definition is a warning row.
+			annotate([{ text: at === 0 ? text.replace(/^#{1,6} /, "") : text, tone: "warning" }]);
+			push(text);
+		});
+		push("");
+	}
 	// Warnings quote the config (unknown field names, model ids), so they are shown as single lines too.
-	if (view.warnings?.length) out.push("### 경고", ...view.warnings.map((w) => `- ${visible(w)}`), "");
-	if (summary) out.push(`**${summary}**`, "");
-	out.push(current ? "### 변경" : "### 팀 설정", renderConfigDiff(current, next));
-	if (view.notes) out.push("", view.notes);
+	if (view.warnings?.length) {
+		annotate([{ text: "경고", tone: "warning" }]);
+		push("### 경고");
+		for (const warning of view.warnings) {
+			const text = `- ${visible(warning)}`;
+			annotate([{ text, tone: "warning" }]);
+			push(text);
+		}
+		push("");
+	}
+	if (summary) {
+		annotate([{ text: summary, tone: "accent" }]);
+		push(`**${summary}**`);
+		push("");
+	}
+	const diffInfo: InfoLine[] = [];
+	const diff = renderConfigDiff(current, next, info ? diffInfo : undefined);
+	annotate([{ text: current ? "변경" : "팀 설정", tone: "accent" }]);
+	push(current ? "### 변경" : "### 팀 설정");
+	const diffLine = line;
+	push(diff);
+	for (const item of diffInfo) info?.push({ ...item, index: diffLine + item.index });
+	if (view.notes) {
+		push("");
+		const notesLine = line;
+		push(view.notes);
+		for (const item of view.notesInfo ?? []) info?.push({ ...item, index: notesLine + item.index });
+	}
 	return out.join("\n");
 }
 
@@ -47,10 +101,13 @@ export async function presentProposal(
 	opts: ApprovalView & { extraOptions?: readonly string[] } = {},
 ): Promise<"approved" | "cancelled" | { extra: string }> {
 	const extras = opts.extraOptions ?? [];
+	const info: InfoLine[] = [];
+	const markdown = renderApproval(proposal.summary, current, proposal.config, opts, info);
 	const answer = await ui.select("이 변경을 승인할까요?", [APPROVE, ...extras, CANCEL], {
 		title: TITLE[proposal.kind] ?? "Storm 변경 제안",
 		consent: [APPROVE],
-		markdown: renderApproval(proposal.summary, current, proposal.config, opts),
+		markdown,
+		...(info.length ? { info } : {}),
 	});
 	if (answer === APPROVE) return "approved";
 	return answer !== undefined && extras.includes(answer) ? { extra: answer } : "cancelled";

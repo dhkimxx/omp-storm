@@ -63,8 +63,9 @@ import { routeRequest } from "./request/route.ts";
 import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
-import type { ConfigLoad, ExplicitSettings, RepoIdentity, RunSpec, UiPort } from "./types.ts";
+import type { ConfigLoad, ExplicitSettings, RepoIdentity, RunRecord, RunSpec, UiPort } from "./types.ts";
 import { createUiPort, registerReportRenderer } from "./ui.ts";
+import { LiveStatus } from "./view/live.ts";
 import { runStatusText } from "./view/render.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
@@ -147,6 +148,12 @@ function statusLabel(state: ProjectState, resumable: boolean): string | undefine
 
 export default function storm(pi: ExtensionAPI): void {
 	const exec = execPort(pi);
+	const liveStatus = new LiveStatus();
+	/** One live run: the editor widget in a true TUI, the plain status line everywhere else. */
+	const showRunStatus = (ctx: ExtensionContext, run: RunRecord): void => {
+		if (liveStatus.show(ctx, run)) return;
+		if (ctx.hasUI) ctx.ui.setStatus("storm", runStatusText(run, Date.now()));
+	};
 	const stateCache = createStateCache();
 	const projectEnv = (ctx: ExtensionContext): ProjectEnv => ({
 		cwd: ctx.cwd,
@@ -199,9 +206,10 @@ export default function storm(pi: ExtensionAPI): void {
 		agentDir: pi.pi.getAgentDir(),
 		live: (ctx, run) => {
 			if (run) {
-				if (ctx.hasUI) ctx.ui.setStatus("storm", runStatusText(run, Date.now()));
+				showRunStatus(ctx, run);
 				return;
 			}
+			liveStatus.clear();
 			void syncSession(ctx).catch(() => undefined);
 		},
 	});
@@ -522,12 +530,16 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
 		if (ctx.agent.kind === "sub") noteAgentParked(ctx.agent.id);
+		// No status load or widget from before the shutdown may land after it.
+		liveStatus.beginSession();
 		await runs.finish("shutdown");
 	});
 
 	// /new, /resume or a fork puts another conversation in this session: the run's handoff is not in it.
 	pi.on("session_switch", async (_event, ctx) => {
-		if (ctx.agent.kind === "main") await runs.finish("shutdown", ctx);
+		if (ctx.agent.kind !== "main") return;
+		liveStatus.beginSession();
+		await runs.finish("shutdown", ctx);
 	});
 
 	const tool = createStormTool(pi.zod, ctx => toolHost(ctx));
@@ -541,22 +553,42 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
 	const syncSession = async (ctx: ExtensionContext, loaded?: ProjectState): Promise<void> => {
+		const epoch = liveStatus.epoch();
 		const state = loaded ?? (await loadProjectState(projectEnv(ctx)));
+		if (!liveStatus.isCurrent(epoch)) return;
 		if (state.config.status !== "missing") await activateTool();
-		if (!ctx.hasUI) return;
+		if (!liveStatus.isCurrent(epoch)) return;
+		if (!ctx.hasUI) {
+			liveStatus.clear();
+			return;
+		}
 		// A status refresh during a run must not put the idle label over the live one.
 		const run = runs.active();
-		const resumable = !run && isApproved(state) && (await resumeCandidate(state.store.dir, state.repo.root, await lastRun(state.repo.root))) !== undefined;
-		ctx.ui.setStatus("storm", run ? runStatusText(run, Date.now()) : statusLabel(state, resumable));
+		if (run) {
+			showRunStatus(ctx, run);
+			return;
+		}
+		const resumable = isApproved(state) && (await resumeCandidate(state.store.dir, state.repo.root, await lastRun(state.repo.root))) !== undefined;
+		// The await above may have outlasted a switch, or a queued run may have started meanwhile.
+		if (!liveStatus.isCurrent(epoch)) return;
+		const started = runs.active();
+		if (started) {
+			showRunStatus(ctx, started);
+			return;
+		}
+		liveStatus.clear();
+		ctx.ui.setStatus("storm", statusLabel(state, resumable));
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Subagents never manage the team: no tool, no status line.
 		if (ctx.agent.kind !== "main") return;
+		const epoch = liveStatus.beginSession();
 		try {
 			const state = await loadProjectState(projectEnv(ctx));
 			// A run whose process died stays `running` until a later run ends; here it becomes the last run and resumable.
 			await stopDeadRuns({ root: state.repo.root });
+			if (!liveStatus.isCurrent(epoch)) return;
 			await syncSession(ctx, state);
 		} catch {
 			// The status line and the tool are conveniences; /storm reports the actual error.

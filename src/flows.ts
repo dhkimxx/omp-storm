@@ -32,7 +32,7 @@ import { trialViews } from "./runtime/views.ts";
 import { BROWSE, commonSettingsForm, effortForm, FIELD, type FormRetry, interviewRoles, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, setupConfig, subagentShares } from "./setup/form.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult } from "./tool/host.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, ModelInfo, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -207,18 +207,24 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	]
 		.filter(Boolean)
 		.join("\n\n");
-	const notes = recommendationNotes(recs, proposed);
+	const notesInfo: InfoLine[] = [];
+	const notes = recommendationNotes(recs, proposed, notesInfo);
 	const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary: current ? "Storm 추천 팀으로 다시 설정" : "Storm 추천 팀", config: proposed }, {
 		warnings: [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...modelWarnings(proposed, ctx)],
 		context,
 		notes,
+		notesInfo,
 		...(form ? { extraOptions: [PICK_BY_ROLE] } : {}),
 	});
 	// "역할별로 고르기" is offered only with a form.
 	if (!form) return notifySetup(ui, decision.outcome === "extra" ? { outcome: "cancelled" } : decision);
 	if (decision.outcome === "unchanged") {
 		// The recommendation is the approved team, so there is nothing to approve; picking role by role is still open.
-		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", [PICK_BY_ROLE, MENU.close], { title: "Storm 팀 제안", markdown: notes });
+		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", [PICK_BY_ROLE, MENU.close], {
+			title: "Storm 팀 제안",
+			markdown: notes,
+			info: notesInfo,
+		});
 		if (choice !== PICK_BY_ROLE) return;
 	} else if (decision.outcome !== "extra") return notifySetup(ui, decision);
 	await pickByRole(env, ui, form, state, ctx, input);
@@ -265,18 +271,29 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 }
 
 /**
+ * The status as text from one project read. `info` collects the TUI's semantic spans for the same Markdown; the
+ * storm tool's model view still passes none, so its payload is unchanged.
+ */
+async function statusMarkdown(env: FlowEnv, opts: { quota: boolean }, info?: InfoLine[]): Promise<string> {
+	const state = await loadProjectState(env);
+	const view = await statusView(env, state, { quota: opts.quota, user: opts.quota });
+	return renderStatus(view, env.now(), opts.quota ? "user" : "model", info);
+}
+
+/**
  * The status as text. `quota: true` is the user's full report (`/storm status`): every section, quota included, with
  * the commands that fix what it points out. `quota: false` is the storm tool's: the same facts for the model, with no
  * extra CLI call, no advice to act on and no file paths.
  */
 export async function statusText(env: FlowEnv, opts: { quota: boolean }): Promise<string> {
-	const state = await loadProjectState(env);
-	return renderStatus(await statusView(env, state, { quota: opts.quota, user: opts.quota }), env.now(), opts.quota ? "user" : "model");
+	return statusMarkdown(env, opts);
 }
 
 /** `/storm status`: the whole status to read and close. It never asks anything. */
 export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
-	await ui.report("Storm 현황", await statusText(env, { quota: true }));
+	const info: InfoLine[] = [];
+	const markdown = await statusMarkdown(env, { quota: true }, info);
+	await ui.report("Storm 현황", markdown, info);
 }
 
 /** The subagents of this session with their context and follow-up state. */
@@ -400,11 +417,13 @@ async function unapprovedFlow(env: FlowEnv, ui: UiPort, state: OkState): Promise
 	const [records, rollbacks, ctx] = await Promise.all([state.store.list(), rollbackOptions(state), prepareAnalysis(env, ui)]);
 	// A snapshot that no longer validates is not diffed against: the whole team is shown instead.
 	const previous = records[0] ? await approvedSnapshot(state, records[0].configHash) : undefined;
-	const markdown = renderApproval(undefined, previous, config, { warnings: [...warnings, ...modelWarnings(config, ctx)], shadows: state.shadows });
+	const info: InfoLine[] = [];
+	const markdown = renderApproval(undefined, previous, config, { warnings: [...warnings, ...modelWarnings(config, ctx)], shadows: state.shadows }, info);
 	const choice = await ui.select("이 팀 설정을 승인할까요?", [APPROVE, ...(rollbacks.length ? [MENU.rollback] : []), MENU.setup, CANCEL], {
 		title: `승인할 팀 설정 · ${shortHash(hash)}`,
 		consent: [APPROVE],
 		markdown,
+		info,
 	});
 	if (choice === MENU.rollback) return rollbackFlow(env, ui, state, rollbacks);
 	if (choice === MENU.setup) return setupFlow(env, ui);

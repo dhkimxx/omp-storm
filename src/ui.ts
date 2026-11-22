@@ -3,12 +3,14 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type Component, matchesKey, ScrollView, type TUI, theme } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { editorKeys, FramedMessageComponent, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
-import { text } from "@oh-my-pi/pi-tui/native/describe";
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import { col, node, span, text } from "@oh-my-pi/pi-tui/native/describe";
+import { estimateRows } from "@oh-my-pi/pi-tui/native/measure";
+import type { DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import type { ModelBrowserSource } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { type ModelPickerRegistry, ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { toModelInfo } from "./discovery/models.ts";
-import type { ModelInfo, UiPort } from "./types.ts";
+import type { InfoLine, ModelInfo, UiPort } from "./types.ts";
+import { RichFrame } from "./view/info.ts";
 
 const REPORT_TYPE = "storm-report";
 /**
@@ -24,6 +26,11 @@ const FULL_VIEW = "전체 내용 보기";
 /** Share of the terminal a report overlay may take. */
 const OVERLAY_SHARE = 0.85;
 const NOTICE_TITLE = { info: "알림", warning: "경고", error: "오류" } as const;
+const SCROLL_HINT = "↑↓ PgUp PgDn 스크롤 · Esc·Enter·q 닫기";
+/** Rows of native card chrome the row estimator does not count. */
+const NATIVE_SLACK = 3;
+/** A stable context for describing rich nodes; none of them consult it. */
+const NATIVE_CX: DescribeContext = { cols: 80, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
 
 /** Draws Storm's transcript records in omp's own frame, headed by Storm's mark and name instead of a package glyph and the raw type. */
 export function registerReportRenderer(pi: ExtensionAPI): void {
@@ -33,17 +40,25 @@ export function registerReportRenderer(pi: ExtensionAPI): void {
 	);
 }
 
-function frame(title: string, markdown: string): Component {
+function frame(title: string, markdown: string, info?: readonly InfoLine[]): Component {
+	const tag = `Storm · ${title}`;
+	if (info !== undefined && info.length > 0) return new RichFrame(tag, markdown, info, REPORT_ICON);
 	return new FramedMessageComponent({
-		message: { customType: `Storm · ${title}`, content: markdown },
+		message: { customType: tag, content: markdown },
 		icon: REPORT_ICON,
 		role: "omp.custom",
 	});
 }
 
+interface PanelLayout {
+	readonly rows: readonly string[];
+	readonly cut: boolean;
+	readonly native: NativeNode | undefined;
+}
+
 /** A choice's context above the selector, cut to the rows the selector leaves free. */
 class PanelView implements Component {
-	#cache: { width: number; budget: number; rows: readonly string[]; cut: boolean } | undefined;
+	#cache: { width: number; budget: number; native: boolean; layout: PanelLayout } | undefined;
 
 	constructor(
 		private readonly tui: TUI,
@@ -51,6 +66,7 @@ class PanelView implements Component {
 		private readonly markdown: string,
 		/** Rows to leave for the selector below. */
 		private readonly reserve: number,
+		private readonly info?: readonly InfoLine[],
 	) {}
 
 	/** Whether the context is cut at the terminal's current size. */
@@ -62,30 +78,63 @@ class PanelView implements Component {
 		return this.#layout(width).rows;
 	}
 
-	#layout(width: number): { rows: readonly string[]; cut: boolean } {
+	/** The native panel: the same cut head, styled spans and meters, capped to the layout budget. */
+	describe(cx: DescribeContext): NativeNode | null {
+		if (this.info === undefined || this.info.length === 0) return null;
+		return this.#layout(Math.max(1, cx.cols)).native ?? null;
+	}
+
+	#layout(width: number): PanelLayout {
 		const budget = Math.max(6, this.tui.terminal.rows - this.reserve);
-		if (this.#cache?.width === width && this.#cache.budget === budget) return this.#cache;
-		let rows = frame(this.title, this.markdown).render(width);
-		const cut = rows.length > budget;
+		const nativeRendering = this.tui.nativeRendering;
+		if (this.#cache?.width === width && this.#cache.budget === budget && this.#cache.native === nativeRendering) return this.#cache.layout;
+		const lines = this.markdown.split("\n");
+		const rich = this.info !== undefined && this.info.length > 0;
+		const tag = `Storm · ${this.title}`;
+		/** ANSI rows, plus on Tern a conservative native row count (terminal chrome included). */
+		const evaluate = (markdown: string, info: readonly InfoLine[] | undefined) => {
+			const component = rich ? new RichFrame(tag, markdown, info, REPORT_ICON) : frame(this.title, markdown);
+			const rows = component.render(width);
+			if (!rich) return { rows, native: undefined, fits: rows.length <= budget };
+			const described = (component as RichFrame).describe(NATIVE_CX);
+			// Estimate before capping: the cap makes the terminal scroll rather than shrink its content.
+			const estimated = estimateRows(described, Math.max(1, width - 6), budget + 1, () => undefined) + NATIVE_SLACK;
+			return {
+				rows,
+				native: col([described], { max: { h: `${budget}lines` } }),
+				// On ANSI the rows above are the real budget; only Tern pays for the native estimate.
+				fits: rows.length <= budget && (!nativeRendering || estimated <= budget),
+			};
+		};
+		const full = evaluate(this.markdown, this.info);
+		let rows = full.rows;
+		let native = full.native;
+		const cut = !full.fits;
 		if (cut) {
 			// Keep the longest head of the source whose frame still fits, and say how much is left out.
-			const lines = this.markdown.split("\n");
-			const head = (keep: number) =>
-				frame(this.title, `${lines.slice(0, keep).join("\n")}\n\n… ${lines.length - keep}줄 생략 · 아래 「${FULL_VIEW}」`).render(width);
+			const head = (keep: number) => ({
+				markdown: `${lines.slice(0, keep).join("\n")}\n\n… ${lines.length - keep}줄 생략 · 아래 「${FULL_VIEW}」`,
+				info: this.info?.filter(line => line.index < keep),
+			});
 			let lo = 0;
 			let hi = lines.length - 1;
-			rows = head(0);
+			const first = head(0);
+			let best = evaluate(first.markdown, first.info);
 			while (lo < hi) {
 				const mid = Math.ceil((lo + hi) / 2);
-				const tried = head(mid);
-				if (tried.length <= budget) {
+				const candidate = head(mid);
+				const tried = evaluate(candidate.markdown, candidate.info);
+				if (tried.fits) {
 					lo = mid;
-					rows = tried;
+					best = tried;
 				} else hi = mid - 1;
 			}
+			rows = best.rows;
+			native = best.native;
 		}
-		this.#cache = { width, budget, rows, cut };
-		return this.#cache;
+		const layout: PanelLayout = { rows, cut, native };
+		this.#cache = { width, budget, native: nativeRendering, layout };
+		return layout;
 	}
 
 	invalidate(): void {
@@ -93,17 +142,22 @@ class PanelView implements Component {
 	}
 }
 
-/** A report to read and close: scrolls with the arrow and page keys, closes with Esc, Enter or q. */
+/** A report to read and close: scrolls with the arrow, page, Home and End keys, closes with Esc, Enter or q. */
 class ReportView implements Component {
 	readonly #scroll: ScrollView;
+	readonly #rich: RichFrame | undefined;
+	#nativeScroll: NativeScroll | undefined;
+	#native: { inner: NativeNode; height: number; scroll: NativeScroll | undefined; node: NativeNode } | undefined;
 
 	constructor(
 		private readonly tui: TUI,
 		title: string,
 		markdown: string,
+		info: readonly InfoLine[] | undefined,
 		private readonly close: () => void,
 	) {
-		this.#scroll = new ScrollView(frame(title, markdown), { height: this.#height() });
+		this.#rich = info !== undefined && info.length > 0 ? new RichFrame(`Storm · ${title}`, markdown, info, REPORT_ICON) : undefined;
+		this.#scroll = new ScrollView(this.#rich ?? frame(title, markdown), { height: this.#height() });
 	}
 
 	#height(): number {
@@ -112,11 +166,49 @@ class ReportView implements Component {
 
 	render(width: number): readonly string[] {
 		this.#scroll.setHeight(this.#height());
-		return [...this.#scroll.render(width), theme.fg("dim", " ↑↓ PgUp PgDn 스크롤 · Esc·Enter·q 닫기")];
+		return [...this.#scroll.render(width), theme.fg("dim", ` ${SCROLL_HINT}`)];
+	}
+
+	/** The full rich body in a native capped scroller; null keeps plain reports on their rendered rows. */
+	describe(cx: DescribeContext): NativeNode | null {
+		const rich = this.#rich;
+		if (rich === undefined) return null;
+		const height = Math.max(1, this.#height());
+		const inner = rich.describe(cx);
+		const scroll = this.#nativeScroll;
+		if (this.#native?.inner === inner && this.#native.height === height && this.#native.scroll === scroll) return this.#native.node;
+		// The terminal scrolls this keyed body for each new nonce; the cache keeps a node until one arrives.
+		const body = {
+			k: "col" as const,
+			p: { role: "omp.report.body", max: { h: `${height}lines` as `${number}lines` } },
+			c: [inner],
+			key: "body",
+			...(scroll === undefined ? {} : { scroll }),
+		} satisfies Extract<NativeNode, { k: "col" }>;
+		const hint = text([span(SCROLL_HINT, "dim")], { wrap: "word" });
+		const view = node("col", undefined, [body, hint], "view");
+		this.#native = { inner, height, scroll, node: view };
+		return view;
 	}
 
 	handleInput(data: string): void {
+		// Natively the key becomes a scroll request on the described body; ANSI keeps scrolling the ScrollView.
+		const by: NativeScroll["by"] | undefined =
+			matchesKey(data, "shift+up") || matchesKey(data, "up")
+				? "line-up"
+				: matchesKey(data, "shift+down") || matchesKey(data, "down")
+					? "line-down"
+					: matchesKey(data, "pageUp")
+						? "page-up"
+						: matchesKey(data, "pageDown")
+							? "page-down"
+							: matchesKey(data, "home")
+								? "start"
+								: matchesKey(data, "end")
+									? "end"
+									: undefined;
 		if (this.#scroll.handleScrollKey(data)) {
+			if (by !== undefined) this.#nativeScroll = { by, n: (this.#nativeScroll?.n ?? 0) + 1 };
 			this.tui.requestRender();
 			return;
 		}
@@ -125,6 +217,7 @@ class ReportView implements Component {
 
 	invalidate(): void {
 		this.#scroll.invalidate();
+		this.#native = undefined;
 	}
 }
 
@@ -245,12 +338,12 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 		);
 	};
 	const drawsComponents = ctx.mode === "tui" && ctx.hasUI;
-	const report = async (title: string, markdown: string): Promise<void> => {
+	const report = async (title: string, markdown: string, info?: readonly InfoLine[]): Promise<void> => {
 		if (!drawsComponents) {
 			transcript(title, markdown);
 			return;
 		}
-		await ctx.ui.custom<void>((tui, _theme, _keys, done) => new ReportView(tui, title, markdown, () => done()), {
+		await ctx.ui.custom<void>((tui, _theme, _keys, done) => new ReportView(tui, title, markdown, info, () => done()), {
 			overlay: true,
 			overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" },
 		});
@@ -271,7 +364,7 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 				// omp builds the widget right away, so the panel can say whether it was cut before the selector opens.
 				let panel: PanelView | undefined;
 				ctx.ui.setWidget(PANEL_KEY, tui => {
-					panel = new PanelView(tui, context.title, context.markdown, options.length + SELECTOR_ROWS);
+					panel = new PanelView(tui, context.title, context.markdown, options.length + SELECTOR_ROWS, context.info);
 					return panel;
 				});
 				let offered = options;
@@ -288,7 +381,7 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 					ctx.ui.setWidget(PANEL_KEY, undefined);
 				}
 				if (answer !== FULL_VIEW) return answer;
-				await report(context.title, context.markdown);
+				await report(context.title, context.markdown, context.info);
 				seen = true;
 			}
 		},

@@ -7,6 +7,9 @@ import { reviewLine } from "../runtime/review.ts";
 import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import type {
 	BudgetConfig,
+	InfoLine,
+	InfoSpan,
+	InfoTone,
 	MetricValue,
 	QuotaState,
 	RoleConfig,
@@ -59,6 +62,13 @@ const QUOTA: Record<QuotaState, string> = {
 	limited: "제한",
 	exhausted: "소진",
 	unknown: "알 수 없음",
+};
+/** Only an exhausted quota is an error; a limited one still routes, so it is a warning. */
+const QUOTA_TONE: Record<QuotaState, InfoTone> = {
+	available: "accent",
+	limited: "warning",
+	exhausted: "error",
+	unknown: "muted",
 };
 /** A candidate's quota state, with the reset time of an exhausted one when it is known. */
 export function quotaText(state: QuotaState, resetsAt?: number): string {
@@ -119,6 +129,34 @@ interface DiffRow {
 	/** What changed, e.g. "구현 모델"; rollback labels list these. */
 	field: string;
 	text: string;
+	/** The rich form of a model row; other rows stay Markdown. */
+	info?: readonly InfoSpan[];
+}
+
+/** Old model values muted, the new primary accented, new fallbacks muted: all text stays exactly as the row's. */
+function modelRowSpans(
+	field: string,
+	oldModels: readonly string[] | undefined,
+	newModels: readonly string[] | undefined,
+	whole: boolean,
+): InfoSpan[] {
+	const models = (list: readonly string[], toneOf: (index: number) => InfoTone): InfoSpan[] => {
+		const out: InfoSpan[] = [];
+		for (const [index, model] of list.entries()) {
+			if (index > 0) out.push({ text: ", " });
+			out.push({ text: visible(model), tone: toneOf(index) });
+		}
+		return out;
+	};
+	const next = newModels === undefined ? [{ text: "(삭제)" }] : models(newModels, (index) => (index === 0 ? "accent" : "muted"));
+	const spans: InfoSpan[] = [{ text: `- ${visible(field)}: ` }];
+	if (whole) {
+		spans.push(...next);
+		return spans;
+	}
+	spans.push(...(oldModels === undefined ? [{ text: DASH, tone: "muted" as const }] : models(oldModels, () => "muted")));
+	spans.push({ text: " → " }, ...next);
+	return spans;
 }
 
 /** Fields Storm does not know, with their values: they do nothing, but the hash covers them. */
@@ -129,11 +167,11 @@ function unknownText(config: StormConfig): string {
 }
 
 /** Every difference the config hash covers, one row each; with no `prev`, every set field of `next`. */
-function diffRows(prev: StormConfig | undefined, next: StormConfig): DiffRow[] {
+function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false): DiffRow[] {
 	const rows: DiffRow[] = [];
-	const line = (field: string, a: string | undefined, b: string) => {
-		if (prev === undefined) rows.push({ field, text: `- ${field}: ${b}` });
-		else if (a !== b) rows.push({ field, text: `- ${field}: ${a ?? DASH} → ${b}` });
+	const line = (field: string, a: string | undefined, b: string, info?: () => readonly InfoSpan[]) => {
+		if (prev === undefined) rows.push({ field, text: `- ${field}: ${b}`, ...(info ? { info: info() } : {}) });
+		else if (a !== b) rows.push({ field, text: `- ${field}: ${a ?? DASH} → ${b}`, ...(info ? { info: info() } : {}) });
 	};
 	line("우선순위", prev && priorityLabel(prev.priority), priorityLabel(next.priority));
 	const ids = new Set([...Object.keys(prev?.roles ?? {}), ...Object.keys(next.roles)]);
@@ -142,7 +180,8 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig): DiffRow[] {
 		const b = next.roles[id];
 		const title = roleTitle(id);
 		// Comma-joined here: in a diff "→" already means old → new, so it cannot also mean attempt order.
-		line(`${title} 모델`, a && a.models.join(", "), b ? b.models.join(", ") : "(삭제)");
+		const modelField = `${title} 모델`;
+		line(modelField, a && a.models.join(", "), b ? b.models.join(", ") : "(삭제)", rich ? () => modelRowSpans(modelField, a?.models, b?.models, prev === undefined) : undefined);
 		// The agent definition decides the role's prompt and tools; only a non-standard one is worth a line.
 		const standard = `${ROLE_AGENT_PREFIX}${id}`;
 		if ((a && a.agent !== standard) || (b && b.agent !== standard)) line(`${title} 에이전트 정의`, a?.agent, b?.agent ?? DASH);
@@ -184,13 +223,28 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig): DiffRow[] {
 	const unknownNext = unknownText(next);
 	if (unknownPrev || unknownNext) line("알 수 없는 필드", unknownPrev || "없음", unknownNext || "없음");
 	// Every row is one line whatever the config holds: its strings (models, agent names, old and unknown fields) are a teammate's.
-	return rows.map((row) => ({ field: visible(row.field), text: visible(row.text) }));
+	return rows.map((row) => ({ field: visible(row.field), text: visible(row.text), ...(row.info ? { info: row.info } : {}) }));
 }
 
-export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfig): string {
-	const rows = diffRows(prev, next);
+/**
+ * The diff as Markdown. `info` (TUI only) adds semantic spans for role-model rows, with indexes local to the returned
+ * Markdown and the exact same visible text; the plain parameter keeps every existing caller's output.
+ */
+export function renderConfigDiff(prev: StormConfig | undefined, next: StormConfig, info?: InfoLine[]): string {
+	const rows = diffRows(prev, next, info !== undefined);
 	if (!rows.length) return "변경 없음";
-	return (prev === undefined ? "새 설정\n" : "") + rows.map((row) => row.text).join("\n");
+	const out: string[] = [];
+	if (prev === undefined) {
+		const index = out.length;
+		out.push("새 설정");
+		if (info) info.push({ index, spans: [{ text: "새 설정", tone: "accent" }] });
+	}
+	for (const row of rows) {
+		const index = out.length;
+		out.push(row.text);
+		if (info && row.info) info.push({ index, spans: row.info });
+	}
+	return out.join("\n");
 }
 
 /** Names of what differs between two configs ("구현 모델", "예산", ...), in diff order without repeats. */
@@ -236,7 +290,7 @@ function roleLine(id: string, r: RoleConfig): string {
 }
 
 function versionLine(newer: string | undefined): string {
-	return newer ? `- Storm ${STORM_VERSION} · 새 버전 ${newer} 설치됨 → /restart 로 적용` : `- Storm ${STORM_VERSION}`;
+	return newer ? `- Storm ${STORM_VERSION} · 새 버전 ${visible(newer)} 설치됨 → /restart 로 적용` : `- Storm ${STORM_VERSION}`;
 }
 
 /** The config file as the user finds it from the project root; the status never shows where that root is. */
@@ -245,26 +299,56 @@ const CONFIG_FILE = ".omp/storm/config.json";
 /**
  * The whole status. For the user it is everything, with the commands that fix what it points out. For the model
  * (the storm tool) it is the same facts without advice the director could act on (omp commands, /restart, cost
- * flags) and without file paths.
+ * flags) and without file paths. `info` only adds the TUI's semantic spans for the same Markdown lines; every plain
+ * caller ignores it and gets byte-for-byte the same text.
  */
-export function renderStatus(view: StatusView, now: number, audience: "user" | "model" = "user"): string {
-	const out = [versionLine(audience === "user" ? view.newerVersion : undefined), "", "### 팀 설정"];
+export function renderStatus(
+	view: StatusView,
+	now: number,
+	audience: "user" | "model" = "user",
+	info?: InfoLine[],
+): string {
+	const out = [versionLine(audience === "user" ? view.newerVersion : undefined)];
+	/** A section title: the Markdown keeps `### …`; the rich line carries only the visible title. */
+	const heading = (title: string): void => {
+		const index = out.length;
+		out.push(`### ${title}`);
+		if (info) info.push({ index, spans: [{ text: visible(title), tone: "accent" }] });
+	};
+	/** A list line built from `spans`, so its Markdown and rich text cannot drift apart. */
+	const styled = (spans: readonly InfoSpan[], meter?: InfoLine["meter"]): void => {
+		const safe = spans.map((span) => (span.tone ? { text: visible(span.text), tone: span.tone } : { text: visible(span.text) }));
+		const index = out.length;
+		out.push(safe.map((span) => span.text).join(""));
+		if (info) info.push({ index, spans: safe, ...(meter ? { meter } : {}) });
+	};
 	const c = view.config;
-	if (c.status === "missing") out.push("- 없음 — /storm 으로 만드세요");
-	else if (c.status === "invalid") out.push(`- 오류 (\`${CONFIG_FILE}\`)`, ...c.errors.map((e) => `  - ${visible(e)}`));
-	else out.push(`- 정상 · ${shortHash(c.hash)} · 우선순위 ${priorityLabel(c.config.priority)}`);
-	out.push("", "### 승인");
-	if (view.approval) out.push(`- 승인됨 · ${isoText(view.approval.approvedAt)}`);
-	else if (c.status === "ok") out.push("- 미승인 — /storm 으로 승인하세요");
-	else out.push("- 미승인");
+	out.push("");
+	heading("팀 설정");
+	if (c.status === "missing") styled([{ text: "- 없음 — /storm 으로 만드세요", tone: "warning" }]);
+	else if (c.status === "invalid") {
+		styled([{ text: `- 오류 (\`${CONFIG_FILE}\`)`, tone: "error" }]);
+		for (const e of c.errors) styled([{ text: `  - ${visible(e)}`, tone: "error" }]);
+	} else {
+		styled([
+			{ text: "- 정상", tone: "accent" },
+			{ text: ` · ${shortHash(c.hash)} · 우선순위 ${priorityLabel(c.config.priority)}` },
+		]);
+	}
+	out.push("");
+	heading("승인");
+	if (view.approval) styled([{ text: "- 승인됨", tone: "success" }, { text: ` · ${isoText(view.approval.approvedAt)}` }]);
+	else if (c.status === "ok") styled([{ text: "- 미승인", tone: "warning" }, { text: " — /storm 으로 승인하세요" }]);
+	else styled([{ text: "- 미승인", tone: "warning" }]);
 	if (c.status === "ok") {
 		const team = c.config;
-		out.push("", "### 역할별 모델");
+		out.push("");
+		heading("역할별 모델");
 		for (const [id, r] of Object.entries(team.roles)) out.push(roleLine(id, r));
 		if (team.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(team)}`);
+		out.push("");
+		heading("실행 설정");
 		out.push(
-			"",
-			"### 실행 설정",
 			`- 병렬도: ${team.parallelism} · ${ISOLATION[team.isolation]}`,
 			`- 추가 라운드: ${team.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
 			`- 컨텍스트 상한: ${int(team.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`,
@@ -274,49 +358,93 @@ export function renderStatus(view: StatusView, now: number, audience: "user" | "
 		);
 	}
 	if (view.run) {
-		const r = view.run;
-		out.push("", "### 실행 중", `- ${r.runId} · 시작 ${isoText(r.startedAt)} · ${spendText(r.costUsd, r.budget)}`);
+		out.push("");
+		heading("실행 중");
+		styled(runLineSpans(view.run), runMeter(view.run));
 	}
-	if (view.lastRun) out.push("", "### 마지막 실행", ...lastRunLines(view.lastRun));
+	if (view.lastRun) {
+		const run = view.lastRun;
+		out.push("");
+		heading("마지막 실행");
+		const lines = lastRunLines(run);
+		const index = out.length;
+		out.push(...lines);
+		if (info) {
+			const meter = runMeter(run);
+			info.push({ index, spans: lastRunLineSpans(run), ...(meter ? { meter } : {}) });
+		}
+	}
 	if (view.trials?.length) {
-		out.push("", "### 시험 사용");
+		out.push("");
+		heading("시험 사용");
 		for (const t of view.trials) out.push(...trialViewLines(t));
 	}
 	if (view.quotaMarks?.length) {
-		out.push("", "### 쿼터 소진 표시");
-		for (const m of view.quotaMarks) out.push(`- ${m.provider}: ${isoText(m.until)}까지 다른 Provider 우선`);
+		out.push("");
+		heading("쿼터 소진 표시");
+		for (const m of view.quotaMarks) {
+			styled([
+				{ text: "- ", tone: "muted" },
+				{ text: visible(m.provider), tone: "warning" },
+				{ text: `: ${isoText(m.until)}까지 다른 Provider 우선`, tone: "warning" },
+			]);
+		}
 	}
 	if (view.agents?.length) {
-		out.push("", "### 서브에이전트", renderAgentRows(agentRows(view.agents, c.status === "ok" ? c.config : undefined), now));
+		out.push("");
+		heading("서브에이전트");
+		out.push(...renderAgentRows(agentRows(view.agents, c.status === "ok" ? c.config : undefined), now).split("\n"));
 	}
 	if (audience === "user" && view.ompAdvice?.length) {
-		out.push("", "### omp 설정 점검");
-		for (const a of view.ompAdvice) out.push(`- ${a.message}`, ...(a.command ? [`  - \`${a.command}\``] : []));
+		out.push("");
+		heading("omp 설정 점검");
+		for (const a of view.ompAdvice) out.push(`- ${visible(a.message)}`, ...(a.command ? [`  - \`${visible(a.command)}\``] : []));
 		out.push("- Storm 은 omp 설정을 바꾸지 않습니다. 필요하면 위 명령을 직접 실행하세요.");
 	}
 	if (view.quota) {
-		out.push("", "### 쿼터");
+		out.push("");
+		heading("쿼터");
 		if (!view.quota.length) out.push(`- ${DASH}`);
 		for (const q of view.quota) {
-			out.push(
-				`- ${q.provider}: ${QUOTA[q.state]} · 사용 ${pct(q.usedFraction)}${q.resetsAt != null ? ` · 재설정 ${time(q.resetsAt)}` : ""}`,
-			);
+			styled([
+				{ text: "- " },
+				{ text: visible(q.provider) },
+				{ text: ": " },
+				{ text: QUOTA[q.state], tone: QUOTA_TONE[q.state] },
+				{ text: ` · 사용 ${pct(q.usedFraction)}${q.resetsAt != null ? ` · 재설정 ${time(q.resetsAt)}` : ""}` },
+			]);
 		}
 	}
-	if (view.dataAsOf !== undefined) out.push("", `### 사용 데이터\n- 기준 시각: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)})`);
-	if (view.storage !== undefined) out.push("", "### 저장 공간", `- ${view.storage}`);
+	if (view.dataAsOf !== undefined) {
+		out.push("");
+		heading("사용 데이터");
+		styled([{ text: `- 기준 시각: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)})`, tone: "muted" }]);
+	}
+	if (view.storage !== undefined) {
+		out.push("");
+		heading("저장 공간");
+		styled([{ text: `- ${view.storage}`, tone: "muted" }]);
+	}
 	if (audience === "user") {
 		const b = c.status === "ok" ? c.config.budget : undefined;
+		out.push("");
+		heading("하드 예산 상한");
 		out.push(
-			"",
-			"### 하드 예산 상한",
 			b
 				? `- Storm 예산은 새 스폰만 막습니다. 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
 				: "- 하드 상한은 `omp --max-cost <USD>` 또는 `session.maxCost`로 거세요.",
 		);
 	}
 	const shadows = shadowLines(view.shadows, audience === "user");
-	if (shadows.length) out.push("", ...shadows);
+	if (shadows.length) {
+		out.push("");
+		const index = out.length;
+		out.push(...shadows);
+		if (info) {
+			info.push({ index, spans: [{ text: shadows[0]!.replace(/^### /, ""), tone: "warning" }] });
+			for (let i = 1; i < shadows.length; i++) info.push({ index: index + i, spans: [{ text: shadows[i]!, tone: "warning" }] });
+		}
+	}
 	return out.join("\n");
 }
 
@@ -367,6 +495,57 @@ function spendText(cost: number, budget: BudgetConfig | undefined): string {
 	return `지출 ${usd(cost)}${budget ? ` / 예산 $${budget.perRunUsd}` : ""}`;
 }
 
+/** At or past the warning threshold, or over the hard run budget: only then is spend colored. */
+function spendTone(run: RunRecord): InfoTone | undefined {
+	const budget = run.budget;
+	if (!budget || !Number.isFinite(run.costUsd) || !Number.isFinite(budget.perRunUsd) || budget.perRunUsd <= 0) return undefined;
+	if (run.costUsd > budget.perRunUsd) return "error";
+	const warnAt = budget.warnAtUsd;
+	if (warnAt != null && Number.isFinite(warnAt) && warnAt > 0 && run.costUsd >= warnAt) return "warning";
+	return undefined;
+}
+
+/** Spend over the recorded run budget; never a meter for no (or zero) budget, and never a fraction outside 0..1. */
+function runMeter(run: RunRecord): InfoLine["meter"] {
+	const budget = run.budget;
+	if (!budget || !Number.isFinite(run.costUsd) || run.costUsd < 0) return undefined;
+	if (!Number.isFinite(budget.perRunUsd) || budget.perRunUsd <= 0) return undefined;
+	const fraction = Math.min(1, Math.max(0, run.costUsd / budget.perRunUsd));
+	return { fraction, tone: spendTone(run) ?? "accent" };
+}
+
+/** Success only where a review verified the changes; an ended run (no changes, quick-only, no reviewer) is muted. */
+function runTone(run: RunRecord): InfoTone {
+	if (run.status === "done" && (run.endReason === undefined || run.endReason === "verified")) return "success";
+	if (run.status === "budget-exceeded") return "error";
+	if (run.status === "running") return "accent";
+	return "muted";
+}
+
+/** The run line's Markdown, as spans: run id, start time, then spend colored by threshold/overage. */
+function runLineSpans(run: RunRecord): InfoSpan[] {
+	const tone = spendTone(run);
+	return [
+		{ text: "- " },
+		{ text: visible(run.runId), tone: "accent" },
+		{ text: ` · 시작 ${isoText(run.startedAt)} · ` },
+		{ text: spendText(run.costUsd, run.budget), ...(tone ? { tone } : {}) },
+	];
+}
+
+/** The first line of `lastRunLines`, with the result badge in its verified/unverified tone. */
+function lastRunLineSpans(run: RunRecord): InfoSpan[] {
+	const tone = spendTone(run);
+	return [
+		{ text: "- " },
+		{ text: visible(run.runId), tone: "accent" },
+		{ text: " · " },
+		{ text: STATUS_LABEL[run.status], tone: runTone(run) },
+		{ text: " · " },
+		{ text: spendText(run.costUsd, run.budget), ...(tone ? { tone } : {}) },
+	];
+}
+
 /** The status line while a run is on: the round in progress, its agents, spend against the budget, and whole minutes. */
 export function runStatusText(run: RunRecord, now: number): string {
 	const turns = run.turns ?? 0;
@@ -402,9 +581,9 @@ function lastRunLines(run: RunRecord): string[] {
 				.map((o) => `${OUTCOME[o]} ${counts.get(o)}`)
 				.join(", ")
 		: "없음";
-	const out = [`- ${run.runId} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
+	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
-	if (blocked?.reason) out.push(`- 첫 차단: ${blocked.agent} · ${blocked.reason}`);
+	if (blocked?.reason) out.push(`- 첫 차단: ${visible(blocked.agent)} · ${visible(blocked.reason)}`);
 	if (run.plan) out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
 	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
 	return out;

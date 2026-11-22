@@ -5,7 +5,7 @@
 import { configHash } from "../config/canonical.ts";
 import { validateConfig } from "../config/schema.ts";
 import { isApproved, type ProjectState } from "../state.ts";
-import type { ApprovalScope, Proposal, StormConfig, UiPort } from "../types.ts";
+import type { ApprovalScope, InfoLine, Proposal, StormConfig, UiPort } from "../types.ts";
 import { presentProposal } from "./present.ts";
 
 export interface DecideHost {
@@ -48,7 +48,7 @@ export async function decideProposal(
 	host: DecideHost,
 	state: ProjectState,
 	proposal: Proposal,
-	opts: { warnings?: readonly string[]; context?: string; notes?: string; extraOptions?: readonly string[] } = {},
+	opts: { warnings?: readonly string[]; context?: string; notes?: string; notesInfo?: readonly InfoLine[]; extraOptions?: readonly string[] } = {},
 ): Promise<Decision> {
 	const approved = isApproved(state);
 	// A change is shown as a diff against the current config, so that config must be one the user approved:
@@ -64,6 +64,7 @@ export async function decideProposal(
 		warnings: [...checked.warnings, ...(opts.warnings ?? [])],
 		...(opts.context ? { context: opts.context } : {}),
 		...(opts.notes ? { notes: opts.notes } : {}),
+		...(opts.notesInfo ? { notesInfo: opts.notesInfo } : {}),
 		...(opts.extraOptions ? { extraOptions: opts.extraOptions } : {}),
 	});
 	if (answer === "cancelled") return { outcome: "cancelled" };

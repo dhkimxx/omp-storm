@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { Component } from "@oh-my-pi/pi-tui";
+import { type Component, stripTerminalSequences, theme } from "@oh-my-pi/pi-tui";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
+import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
 import { serializeConfig } from "../src/config/store.ts";
@@ -13,7 +14,7 @@ import { APPROVE } from "../src/proposals/present.ts";
 import { ROLES } from "../src/roles.ts";
 import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
-import type { UiContext, UiPort } from "../src/types.ts";
+import type { InfoLine, UiContext, UiPort } from "../src/types.ts";
 import { createUiPort } from "../src/ui.ts";
 import { makeProject, TEAM, type TestProject } from "./support.ts";
 
@@ -31,7 +32,7 @@ interface FakeHost {
 	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	/** Options of every selector omp was asked to open, with the panel rows above it at that moment. */
-	selects: Array<{ options: string[]; panel: readonly string[] | undefined }>;
+	selects: Array<{ options: string[]; panel: readonly string[] | undefined; panelNative: NativeNode | null | undefined }>;
 	/** omp's own notifications. */
 	notified: string[];
 	/** Messages put in the transcript. */
@@ -40,6 +41,61 @@ interface FakeHost {
 	overlays: number;
 	/** Whether a panel widget is still set. */
 	panelSet(): boolean;
+}
+
+/** The describe inputs our components read; the terminal-specific fields are inert here. */
+function describeContext(cols: number) {
+	return { cols, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
+}
+
+/** Visit a native tree, following component children through their own describe. */
+function walkNative(node: NativeNode, visit: (node: NativeNode) => void): void {
+	visit(node);
+	for (const child of node.c ?? []) {
+		if ("k" in child) walkNative(child, visit);
+		else {
+			const described = child.describe?.(describeContext(80));
+			if (described) walkNative(described, visit);
+		}
+	}
+}
+
+function nativeSpans(root: NativeNode | null | undefined): Array<{ t: string; s: string | undefined }> {
+	const out: Array<{ t: string; s: string | undefined }> = [];
+	if (!root) return out;
+	walkNative(root, node => {
+		if (node.k === "text") for (const run of node.p?.spans ?? []) out.push({ t: run.t, s: run.s });
+	});
+	return out;
+}
+
+function nativeTexts(root: NativeNode | null | undefined): string[] {
+	const out: string[] = [];
+	if (!root) return out;
+	walkNative(root, node => {
+		if (node.k === "text" && node.p?.text !== undefined) out.push(node.p.text);
+		if (node.k === "md" && node.p?.text !== undefined) out.push(node.p.text);
+	});
+	for (const run of nativeSpans(root)) out.push(run.t);
+	return out;
+}
+
+function nativeMds(root: NativeNode | null | undefined): string[] {
+	const out: string[] = [];
+	if (!root) return out;
+	walkNative(root, node => {
+		if (node.k === "md" && node.p?.text !== undefined) out.push(node.p.text);
+	});
+	return out;
+}
+
+function nativeProgress(root: NativeNode | null | undefined): Array<{ value: number | null; tone: string | undefined }> {
+	const out: Array<{ value: number | null; tone: string | undefined }> = [];
+	if (!root) return out;
+	walkNative(root, node => {
+		if (node.k === "progress") out.push({ value: node.p?.value ?? null, tone: node.p?.tone });
+	});
+	return out;
 }
 
 /**
@@ -78,7 +134,9 @@ function fakeHost(opts: {
 			},
 			ui: {
 				async select(_title: string, options: string[]) {
-					host.selects.push({ options: [...options], panel: widget?.render(tui.terminal.columns) });
+					const panel = widget?.render(tui.terminal.columns);
+					const panelNative = widget?.describe?.(describeContext(tui.terminal.columns));
+					host.selects.push({ options: [...options], panel, panelNative });
 					if (!answers.length) throw new Error("no scripted answer");
 					const answer = answers.shift();
 					return typeof answer === "function" ? answer(options) : answer;
@@ -204,6 +262,105 @@ describe("TUI", () => {
 	});
 });
 
+describe("rich metadata", () => {
+	const MARKDOWN = ["### 요약", "- 대기 중: 3개", "", "- 지출: $0.42 (예산 $5.00)", "일반 문단 **강조**"].join("\n");
+	const INFO: InfoLine[] = [
+		{ index: 0, spans: [{ text: "요약", tone: "muted" }] },
+		{
+			index: 1,
+			spans: [
+				{ text: "• ", tone: "muted" },
+				{ text: "대기 중: ", tone: "accent" },
+				{ text: "3개", tone: "warning" },
+			],
+		},
+		{
+			index: 3,
+			spans: [
+				{ text: "• ", tone: "muted" },
+				{ text: "지출: ", tone: "accent" },
+				{ text: "$0.42", tone: "success" },
+				{ text: " (예산 $5.00)", tone: "muted" },
+			],
+			meter: { fraction: 0.42, tone: "success" },
+		},
+	];
+
+	test("ANSI and native show the same visible content with theme tones and a static meter", async () => {
+		let rendered = "";
+		let native: NativeNode | null | undefined;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 40,
+			driveOverlay(view, rows) {
+				rendered = rows.join("\n");
+				native = view.describe?.(describeContext(100));
+				view.handleInput?.("q");
+			},
+		});
+		await createUiPort(host.pi, host.ctx).report("회계", MARKDOWN, INFO);
+		const visible = stripTerminalSequences(rendered);
+		expect(visible).toContain("대기 중: 3개");
+		expect(visible).toContain("$0.42");
+		expect(visible).toContain("일반 문단");
+		expect(rendered).toContain(theme.fg("accent", "대기 중: "));
+		expect(rendered).toContain(theme.fg("warning", "3개"));
+		expect(rendered).toContain(theme.fg("success", "$0.42"));
+		// A static track, never shimmered text.
+		expect(visible).toContain("█");
+		expect(visible).toContain("░");
+		expect(native).not.toBeNull();
+		expect(native).not.toBeUndefined();
+		const spans = nativeSpans(native);
+		expect(spans).toContainEqual({ t: "$0.42", s: "success" });
+		expect(spans).toContainEqual({ t: "3개", s: "warning" });
+		expect(spans.every(run => !run.t.includes("\x1b"))).toBe(true);
+		expect(nativeProgress(native)).toEqual([{ value: 0.42, tone: "success" }]);
+		expect(nativeTexts(native).join("\n")).toContain("$0.42");
+		// Unannotated prose still goes through the existing Markdown path.
+		expect(nativeMds(native)).toContain("일반 문단 **강조**");
+	});
+
+	test("a cut rich panel withholds consent until the full rich report was shown", async () => {
+		const lines = ["### 승인 요약", ...Array.from({ length: 60 }, (_, i) => `- 항목 ${i}`), "- 승인 대상: 마지막 줄"];
+		const markdown = lines.join("\n");
+		const info: InfoLine[] = lines.map((line, index) => {
+			const spans: InfoLine["spans"] =
+				index === 0
+					? [{ text: "승인 요약", tone: "accent" }]
+					: [{ text: line.replace(/^- /, "• "), tone: index === lines.length - 1 ? "warning" : "muted" }];
+			return { index, spans };
+		});
+		let reportNative: NativeNode | null | undefined;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 30,
+			answers: [options => options[0], APPROVE],
+			driveOverlay(view) {
+				reportNative = view.describe?.(describeContext(100));
+				view.handleInput?.("q");
+			},
+		});
+		const ui = createUiPort(host.pi, host.ctx);
+		expect(await ui.select("승인할까요", [APPROVE, "취소"], { title: "승인", markdown, info, consent: [APPROVE] })).toBe(APPROVE);
+		const [first, second] = host.selects;
+		expect(first!.options).not.toContain(APPROVE);
+		const panel = first!.panel!.join("\n");
+		expect(panel).toContain(theme.fg("accent", "승인 요약"));
+		expect(panel).not.toContain("마지막 줄");
+		const clipped = nativeTexts(first!.panelNative).join("\n");
+		expect(clipped).toContain("승인 요약");
+		expect(clipped).not.toContain("마지막 줄");
+		expect(second!.options).toContain(APPROVE);
+		expect(second!.options).toHaveLength(3);
+		expect(host.overlays).toBe(1);
+		const full = nativeTexts(reportNative).join("\n");
+		expect(full).toContain("마지막 줄");
+	});
+});
+
 describe("hosts that draw no components", () => {
 	test("context, reports, records and notices are transcript messages kept out of the model's context, without a turn", async () => {
 		const host = fakeHost({ mode: "rpc", hasUI: true, answers: ["a"] });
@@ -223,6 +380,27 @@ describe("hosts that draw no components", () => {
 		for (const [i, part] of ["two", "report-body", "record-body", "notice-text"].entries()) expect(text[i]).toContain(part);
 		// ACP only logs a notification, so the notice must not depend on it.
 		expect(host.notified).toEqual([]);
+		expect(host.overlays).toBe(0);
+	});
+
+	test("rich metadata never reaches the transcript as ANSI and never hides a consent option", async () => {
+		const markdown = "### 승인\n\n- 승인 대상: 마지막 줄";
+		const info: InfoLine[] = [
+			{ index: 0, spans: [{ text: "승인", tone: "accent" }] },
+			{ index: 2, spans: [{ text: "• 승인 대상: 마지막 줄", tone: "warning" }] },
+		];
+		const host = fakeHost({ mode: "rpc", hasUI: true, answers: [APPROVE] });
+		const ui = createUiPort(host.pi, host.ctx);
+		expect(await ui.select("승인할까요", [APPROVE, "취소"], { title: "승인", markdown, info, consent: [APPROVE] })).toBe(APPROVE);
+		// The whole context is in the transcript, so nothing is withheld here.
+		expect(host.selects[0]!.options).toEqual([APPROVE, "취소"]);
+		await ui.report("보고서", markdown, info);
+		expect(host.sent).toHaveLength(2);
+		for (const { message } of host.sent) {
+			const content = String(message.content);
+			expect(content).toContain("마지막 줄");
+			expect(content).not.toContain("\x1b");
+		}
 		expect(host.overlays).toBe(0);
 	});
 });
@@ -286,7 +464,21 @@ describe("accepting on a small terminal", () => {
 		const recorded = recordingUi();
 		await setupFlow(env, recorded.ui);
 		const dialog = recorded.dialogs[0]!;
-		return { ...dialog, context: { ...dialog.context, markdown: dialog.context.markdown.replaceAll(project.root, "/repo") } };
+		const info = dialog.context.info?.map((line): InfoLine => ({
+			...line,
+			spans: line.spans.map(span => {
+				const text = span.text.replaceAll(project.root, "/repo");
+				return span.tone === undefined ? { text } : { text, tone: span.tone };
+			}),
+		}));
+		return {
+			...dialog,
+			context: {
+				...dialog.context,
+				markdown: dialog.context.markdown.replaceAll(project.root, "/repo"),
+				...(info === undefined ? {} : { info }),
+			},
+		};
 	}
 
 	test("a cut panel holds the approval back until the whole content was opened", async () => {

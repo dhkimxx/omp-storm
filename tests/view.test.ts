@@ -7,7 +7,7 @@ import { rollbackLabels, runRollback } from "../src/view/review.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
 import { DEFAULT_WORKERS, roleTitle } from "../src/roles.ts";
-import type { RollbackOption, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
+import type { InfoLine, RollbackOption, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
 import { agentEntry, approvalRecord, runRecord } from "./fixtures.ts";
 import { cand, pick, rec, recs, scriptedUi, TEAM } from "./support.ts";
 import { TEAM_08 } from "./team-08.ts";
@@ -172,6 +172,34 @@ describe("config diff", () => {
 		expect(new Set(fields).size).toBe(4);
 		for (const [i, id] of ["explorer", "implementer", "reviewer"].entries()) expect(fields[i]).toStartWith(roleTitle(id));
 		for (const id of ["reviewer", "implementer"]) expect(md).not.toContain(id);
+	});
+
+	test("rich model rows mark old values, the new primary and fallbacks without changing the diff", () => {
+		const next = changed(c => (c.roles.explorer.models = ["c/j", "d/k"]));
+		const plain = renderConfigDiff(TEAM, next);
+		const info: InfoLine[] = [];
+		expect(renderConfigDiff(TEAM, next, info)).toBe(plain);
+		const lines = plain.split("\n");
+		const row = info.find(entry => lines[entry.index]!.startsWith("- 탐색 모델:"))!;
+		expect(row).toBeDefined();
+		expect(row.spans.map(span => span.text).join("")).toBe(lines[row.index]);
+		expect(lines[row.index]).toContain("a/x, b/z → c/j, d/k");
+		const tone = (text: string) => row.spans.filter(span => span.text === text).map(span => span.tone);
+		for (const old of ["a/x", "b/z"]) expect(tone(old)).toEqual(["muted"]);
+		expect(tone("c/j")).toEqual(["accent"]);
+		expect(tone("d/k")).toEqual(["muted"]);
+
+		// A whole-team diff keeps its "새 설정" title and indexes local to its own Markdown.
+		const whole: InfoLine[] = [];
+		const wholeMd = renderConfigDiff(undefined, TEAM, whole);
+		const wholeLines = wholeMd.split("\n");
+		expect(wholeLines[0]).toBe("새 설정");
+		expect(whole[0]).toEqual({ index: 0, spans: [{ text: "새 설정", tone: "accent" }] });
+		const explorer = whole.find(entry => wholeLines[entry.index]!.startsWith("- 탐색 모델:"))!;
+		expect(explorer.index).toBe(2);
+		expect(explorer.spans.map(span => span.text).join("")).toBe(wholeLines[2]);
+		expect(explorer.spans.filter(span => span.text === "a/x").map(span => span.tone)).toEqual(["accent"]);
+		expect(explorer.spans.filter(span => span.text === "b/z").map(span => span.tone)).toEqual(["muted"]);
 	});
 
 	test("a role's own agent definition is not listed", () => {
@@ -431,6 +459,83 @@ describe("status", () => {
 		expect(brief).not.toContain("prov-q");
 		expect(brief.split("\n").length).toBeLessThan(renderStatus(full, NOW).split("\n").length / 2);
 		expect(brief).not.toMatch(ISO_UTC);
+	});
+
+	test("rich info marks approval and only a verified run as success", () => {
+		const rich = (over: Partial<StatusView> = {}) => {
+			const info: InfoLine[] = [];
+			const md = renderStatus(view(over), NOW, "user", info);
+			return { md, info };
+		};
+		const tones = (info: InfoLine[], text: string) =>
+			info.flatMap(entry => entry.spans).filter(span => span.text === text).map(span => span.tone);
+
+		const unapproved = rich({ approval: undefined });
+		expect(tones(unapproved.info, "- 미승인")).toEqual(["warning"]);
+		expect(tones(rich().info, "- 승인됨")).toEqual(["success"]);
+
+		for (const endReason of [undefined, "verified"] as const) {
+			const verified = rich({ approval: undefined, lastRun: runRecord({ status: "done", ...(endReason ? { endReason } : {}) }) });
+			expect(tones(verified.info, "완료")).toEqual(["success"]);
+		}
+		for (const endReason of ["no-changes", "unreviewed", "no-reviewer"] as const) {
+			const ended = rich({ approval: undefined, lastRun: runRecord({ status: "ended", endReason }) });
+			expect(tones(ended.info, "끝남")).toEqual(["muted"]);
+			expect(ended.info.flatMap(entry => entry.spans).some(span => span.tone === "success")).toBe(false);
+		}
+		expect(tones(rich({ approval: undefined, lastRun: runRecord({ status: "budget-exceeded" }) }).info, "예산 초과")).toEqual(["error"]);
+	});
+
+	test("only a recorded positive budget gets a clamped meter that marks warn and overage", () => {
+		const meterOf = (costUsd: number, budget?: RunRecord["budget"]) => {
+			const info: InfoLine[] = [];
+			renderStatus(view({ lastRun: runRecord({ status: "running", costUsd, ...(budget ? { budget } : {}) }) }), NOW, "user", info);
+			return info.find(entry => entry.meter);
+		};
+		expect(meterOf(1.25, { perRunUsd: 5, warnAtUsd: 1, onExceed: "stop" })?.meter).toEqual({ fraction: 0.25, tone: "warning" });
+		expect(meterOf(1, { perRunUsd: 4, onExceed: "stop" })?.meter).toEqual({ fraction: 0.25, tone: "accent" });
+		expect(meterOf(6, { perRunUsd: 5, onExceed: "stop" })?.meter).toEqual({ fraction: 1, tone: "error" });
+		for (const budget of [undefined, { perRunUsd: 0, onExceed: "stop" as const }]) expect(meterOf(1, budget)).toBeUndefined();
+		expect(meterOf(Number.NaN, { perRunUsd: 5, onExceed: "stop" })).toBeUndefined();
+
+		const info: InfoLine[] = [];
+		const md = renderStatus(view({ lastRun: runRecord({ status: "running", costUsd: 6, budget: { perRunUsd: 5, onExceed: "stop" } }) }), NOW, "user", info);
+		const entry = info.find(line => line.meter)!;
+		expect(entry.spans.map(span => span.text).join("")).toBe(md.split("\n")[entry.index]);
+		expect(entry.spans.some(span => span.text.includes("$6.0000") && span.tone === "error")).toBe(true);
+		expect(md.split("\n")[entry.index]).toContain("지출 $6.0000 / 예산 $5");
+	});
+
+	test("rich status spans replace exactly their Markdown line and keep every value", () => {
+		const full = view({
+			run: { ...run, budget: { perRunUsd: 5, onExceed: "stop" } },
+			lastRun: runRecord({ runId: "run-0", status: "done", endReason: "verified", costUsd: 6, budget: { perRunUsd: 5, onExceed: "stop", warnAtUsd: 4 } }),
+			quota: [
+				{ provider: "prov-q", state: "exhausted", usedFraction: 0.99, resetsAt: NOW },
+				{ provider: "prov-l", state: "limited", usedFraction: 0.42, resetsAt: null },
+			],
+			quotaMarks: [{ provider: "prov-m", source: "user", markedAt: new Date(NOW).toISOString(), until: new Date(NOW + 3_600_000).toISOString() }],
+			dataAsOf: NOW,
+			storage: "storage-line",
+		});
+		const plain = renderStatus(full, NOW);
+		expect(renderStatus(full, NOW, "model")).toBe(renderStatus(full, NOW, "model", []));
+		const info: InfoLine[] = [];
+		expect(renderStatus(full, NOW, "user", info)).toBe(plain);
+		const lines = plain.split("\n");
+		for (const entry of info) {
+			expect(entry.index).toBeGreaterThanOrEqual(0);
+			expect(entry.index).toBeLessThan(lines.length);
+			expect(lines[entry.index]).toContain(entry.spans.map(span => span.text).join(""));
+		}
+		const spend = info.find(entry => entry.spans.some(span => span.text.includes("$1.2500")))!;
+		expect(lines[spend.index]).toContain("지출 $1.2500 / 예산 $5");
+		const quota = info.find(entry => entry.spans.some(span => span.text === "소진"))!;
+		expect(lines[quota.index]).toContain("prov-q");
+		expect(lines[quota.index]).toContain("99%");
+		expect(quota.spans.find(span => span.text === "소진")?.tone).toBe("error");
+		const limited = info.find(entry => entry.spans.some(span => span.text === "제한"))!;
+		expect(limited.spans.find(span => span.text === "제한")?.tone).toBe("warning");
 	});
 });
 

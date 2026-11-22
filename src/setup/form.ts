@@ -1,13 +1,13 @@
 /** Pure forms and answer mapping for the role-by-role setup interview. */
 import { MAX_CONTEXT_CAP, validateConfig } from "../config/schema.ts";
-import { ON_EXCEED, pct, quotaText, speedText, tierLabel, usd } from "../view/render.ts";
+import { ON_EXCEED, pct, quotaText, speedText, tierLabel, usd, visible } from "../view/render.ts";
 import { scoreText } from "../lineage/metrics.ts";
 import { dropAdoptedTrials, providerOf } from "../proposals/build.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
 import { DEFAULT_CONTEXT_CAP, MAX_WORKERS, REQUIRED_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
 import { DEFAULT_EXTRA_ROUNDS, MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { entryEffort, formatModelEntry, type ModelEntry, parseModelEntry } from "../selector.ts";
-import { type Analysis, type BudgetConfig, type Candidate, EFFORTS, type Effort, type FormData, type ModelInfo, type RoleConfig, type RoleId, type RoleRecommendation, type StormConfig, type WorkerRange } from "../types.ts";
+import { type Analysis, type BudgetConfig, type Candidate, EFFORTS, type Effort, type FormData, type InfoLine, type InfoSpan, type ModelInfo, type RoleConfig, type RoleId, type RoleRecommendation, type StormConfig, type WorkerRange } from "../types.ts";
 
 /** The team the setup forms describe with warnings for the approval dialog, or what is wrong with the answers. */
 export type SetupResult = { config: StormConfig; warnings: string[] } | { errors: string[] };
@@ -76,16 +76,33 @@ export function subagentShares(analysis: Analysis): Map<string, number> {
 	return new Map(analysis.preferences.subagent.map((usage) => [usage.modelKey, usage.shareRecent]));
 }
 
-/** Why Storm recommends each role's primary model, for the approval dialog of the recommended team. */
-export function recommendationNotes(recs: readonly RoleRecommendation[], config: StormConfig): string {
+/**
+ * Why Storm recommends each role's primary model, for the approval dialog of the recommended team.
+ * One line per chosen role of the proposed team, with the role and model marked as the recommendation in `info`.
+ */
+export function recommendationNotes(recs: readonly RoleRecommendation[], config: StormConfig, info?: InfoLine[]): string {
 	const lines: string[] = [];
+	const rich: InfoSpan[][] = [];
 	for (const rec of recs) {
 		const chosen = rec.candidates[rec.chosenIndex];
 		if (!chosen || !Object.hasOwn(config.roles, rec.role.id)) continue;
+		const role = visible(rec.role.title);
+		const label = visible(chosen.label);
+		const why = chosen.why[0] ? ` — ${visible(chosen.why[0])}` : "";
 		const facts = [tierLabel(chosen.tier), `참조 비용 ${usd(chosen.referenceUsd)}`, speedText(chosen.speed), `점수 ${scoreText(chosen.int)}`];
-		lines.push(`- ${rec.role.title}: ${chosen.label} · ${facts.join(" · ")}${chosen.why[0] ? ` — ${chosen.why[0]}` : ""}`);
+		lines.push(`- ${role}: ${label} · ${facts.join(" · ")}${why}`);
+		rich.push([
+			{ text: "• ", tone: "muted" },
+			{ text: `${role}: `, tone: "accent" },
+			{ text: "★ 추천 ", tone: "success" },
+			{ text: label, tone: "accent" },
+			{ text: ` · ${facts.join(" · ")}${why}`, tone: "muted" },
+		]);
 	}
-	return lines.length ? ["### 추천 근거", ...lines].join("\n") : "";
+	if (!lines.length) return "";
+	info?.push({ index: 0, spans: [{ text: "추천 근거", tone: "muted" }] });
+	rich.forEach((spans, i) => info?.push({ index: i + 1, spans }));
+	return ["### 추천 근거", ...lines].join("\n");
 }
 
 function esc(text: string): string {

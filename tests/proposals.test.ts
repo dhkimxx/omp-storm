@@ -22,8 +22,9 @@ import {
 } from "../src/proposals/build.ts";
 import { type DecideHost, decideProposal, NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE, CANCEL, presentProposal, renderApproval } from "../src/proposals/present.ts";
+import { recommendationNotes } from "../src/setup/form.ts";
 import { isApproved, loadProjectState } from "../src/state.ts";
-import type { Effort, Proposal, ShadowInfo, StormConfig } from "../src/types.ts";
+import type { Effort, InfoLine, Proposal, ShadowInfo, StormConfig, UiContext, UiPort } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
 import { type Answer, cand, fakeCtx, makeProject, rec, recs, scriptedUi, type TestProject } from "./support.ts";
 
@@ -75,6 +76,90 @@ describe("presentProposal", () => {
 		// Without a current config the whole team is shown.
 		const whole = renderApproval(undefined, undefined, change.config);
 		for (const model of ["a/x, b/z", "c/j, a/i", "b/r"]) expect(whole).toContain(model);
+	});
+});
+
+describe("approval rich lines", () => {
+	/** A port that records the dialog context and answers with one label. */
+	const capture = (answer: string | undefined): { ui: UiPort; contexts: UiContext[] } => {
+		const contexts: UiContext[] = [];
+		const ui: UiPort = {
+			async select(_title, _options, context) {
+				if (context) contexts.push(context);
+				return answer;
+			},
+			notify() {},
+			async report() {},
+			record() {},
+		};
+		return { ui, contexts };
+	};
+
+	test("warnings, the diff and notes land on their own lines despite multi-line context", () => {
+		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/repo/.agents/storm-reviewer.md", scope: "project", sha256: "ab" };
+		const notesInfo: InfoLine[] = [];
+		const notes = recommendationNotes([rec("implementer", [cand("c/j", { label: "J", why: ["measured faster"] })])], change.config, notesInfo);
+		const info: InfoLine[] = [];
+		const context = "첫 줄\n둘째 줄\n\n넷째 줄";
+		const md = renderApproval(change.summary, base, change.config, { context, shadows: [shadow], warnings: ["warning-one", "warning-two"], notes, notesInfo }, info);
+		const lines = md.split("\n");
+
+		// A collector replaces lines the renderer can style, never the same line twice, always inside the Markdown.
+		expect(new Set(info.map(line => line.index)).size).toBe(info.length);
+		for (const line of info) {
+			expect(line.index).toBeGreaterThanOrEqual(0);
+			expect(line.index).toBeLessThan(lines.length);
+			expect(line.spans.map(span => span.text).join("")).not.toBe("");
+		}
+
+		// Four context lines shift every later offset; each section still points at the line it annotates.
+		const shadowsAt = lines.findIndex(line => line.startsWith("### 경고: 가림 정의"));
+		expect(shadowsAt).toBeGreaterThan(context.split("\n").length);
+		expect(info.find(line => line.index === shadowsAt)?.spans[0]?.tone).toBe("warning");
+		expect(info.find(line => line.index === shadowsAt)?.spans[0]?.text).toBe(lines[shadowsAt]!.replace(/^#{1,6} /, ""));
+		const warningsAt = lines.indexOf("### 경고");
+		expect(info.find(line => line.index === warningsAt)?.spans).toEqual([{ text: "경고", tone: "warning" }]);
+		for (const warning of ["- warning-one", "- warning-two"]) {
+			const at = lines.indexOf(warning);
+			expect(at).toBeGreaterThan(warningsAt);
+			expect(info.find(line => line.index === at)?.spans[0]?.tone).toBe("warning");
+		}
+
+		// Diff lines are annotated between their heading and the notes, not on either boundary.
+		const notesAt = lines.indexOf("### 추천 근거");
+		const diff = info.filter(line => line.index > lines.indexOf("### 변경") && line.index < notesAt);
+		expect(diff.length).toBeGreaterThan(0);
+		for (const line of diff) expect(lines[line.index]).toMatch(/^- /);
+
+		// The note's Markdown stays authoritative; its rich line adds only the recommendation badge.
+		const annotated = info.filter(line => line.index > notesAt);
+		expect(annotated).toHaveLength(1);
+		const rich = annotated[0]!.spans.map(span => span.text).join("");
+		expect(annotated[0]!.spans.some(span => span.text.includes("★ 추천"))).toBe(true);
+		expect(rich.replace("★ 추천 ", "").replace(/^[•-] /, "")).toBe(lines[annotated[0]!.index]!.replace(/^[•-] /, ""));
+		expect(lines[annotated[0]!.index]).toContain("J");
+	});
+
+	test("rich lines change neither the Markdown nor what approval accepts", async () => {
+		const notesInfo: InfoLine[] = [];
+		const notes = recommendationNotes(recs(), change.config, notesInfo);
+		const view = { context: "context\nsecond line", warnings: ["warning-text"], notes, notesInfo };
+		const plain = renderApproval(change.summary, base, change.config, view);
+		const collected: InfoLine[] = [];
+		expect(renderApproval(change.summary, base, change.config, view, collected)).toBe(plain);
+		expect(collected.length).toBeGreaterThan(0);
+
+		const approved = capture(APPROVE);
+		expect(await presentProposal(approved.ui, change, base, view)).toBe("approved");
+		expect(approved.contexts).toHaveLength(1);
+		expect(approved.contexts[0]?.markdown).toBe(plain);
+		expect(approved.contexts[0]?.info).toEqual(collected);
+		expect(approved.contexts[0]?.consent).toEqual([APPROVE]);
+
+		const cancelled = capture(CANCEL);
+		expect(await presentProposal(cancelled.ui, change, base, view)).toBe("cancelled");
+		const unanswered = capture(undefined);
+		expect(await presentProposal(unanswered.ui, change, base, view)).toBe("cancelled");
 	});
 });
 

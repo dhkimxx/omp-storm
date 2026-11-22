@@ -52,10 +52,26 @@ export type Exec = (
 	options?: { cwd?: string; timeout?: number },
 ) => Promise<ExecResult>;
 
+/** A semantic highlight rendered with the active OMP theme, never as embedded ANSI in Markdown. */
+export type InfoTone = "accent" | "success" | "warning" | "error" | "muted";
+export interface InfoSpan {
+	text: string;
+	tone?: InfoTone;
+}
+
+/** A standalone Markdown line's richer TUI equivalent. Offsets count logical lines, not wrapped terminal rows. */
+export interface InfoLine {
+	index: number;
+	spans: readonly InfoSpan[];
+	/** Optional determinate meter; the spans always include the authoritative numeric value. */
+	meter?: { fraction: number; tone: InfoTone };
+}
+
 /** Shown with a choice while it is open (TUI: a panel above the selector, gone once it closes); other hosts get a transcript message. */
 export interface UiContext {
 	title: string;
 	markdown: string;
+	info?: readonly InfoLine[];
 	/**
 	 * The options that accept what `markdown` shows (approve, roll back, delete). While part of it is hidden they are
 	 * not offered: the user opens the whole content first, so nothing is accepted that was never displayed.
@@ -73,7 +89,7 @@ export interface UiPort {
 	/** An outcome notice. TUI: omp's notification line; other hosts: a transcript message (never sent to the model). */
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 	/** A view to read and close. TUI: a scrollable overlay that leaves nothing in the transcript; other hosts: a transcript message. Resolves once closed. */
-	report(title: string, markdown: string): Promise<void>;
+	report(title: string, markdown: string, info?: readonly InfoLine[]): Promise<void>;
 	/** Kept in the transcript, never sent to the model: run results and other records. Keep it to a few lines. */
 	record(title: string, markdown: string): void;
 	/** Draws an HTML `<form>` and resolves to its answers, or undefined when cancelled or timed out. Absent when the host has no form surface. */

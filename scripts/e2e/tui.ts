@@ -122,6 +122,7 @@ async function main(): Promise<void> {
 				const typed = await tui.submit("/storm");
 				const offered = await tui.selector(typed);
 				check("the dialog is up and nothing is saved yet", offered.includes(PICK_BY_ROLE) && !existsSync(files.configFile), JSON.stringify(offered));
+				if (offered.includes(FULL_VIEW)) check("a clipped proposal withholds approval", !offered.includes(APPROVE));
 				await answer(tui, typed, APPROVE);
 				// Storm writes the approval, then the config.
 				await suite.eventually("approve saves the config and one approval", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
@@ -196,20 +197,24 @@ async function main(): Promise<void> {
 		async () => {
 			const changed = join(env.project, "e2e-rounded.txt");
 			const llm = new LlmCursor(env);
+			files.editConfig(config => {
+				config.budget = { perRunUsd: 0.01, onExceed: "block-spawns" };
+			});
 			try {
 				await session(async tui => {
+					await answer(tui, await tui.submit("/storm"), APPROVE);
+					await tui.seen(0, () => statusLine(tui.raw)?.startsWith("storm ✓") ? true : undefined, "budget approval");
 					const steps: Step[] = [
 						{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code" }, { name: "review", kind: "review" }] } } },
 						{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
 						{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
 					];
 					const before = files.runIds();
-					await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
-					// The run is on from here until its record ends; the status row is where the live label is shown.
+					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 					await suite.eventually(
-						"the status line shows the live run while it is active",
-						() => statusLine(tui.raw)?.startsWith("storm ▶") ?? false,
-						() => statusLine(tui.raw) ?? "no status line",
+						"the live widget shows the round and budget",
+						() => /Storm 실행 중[^\r\n]*\/4라운드[^\r\n]*\$0\.01/.test(tui.text(started)),
+						() => "",
 						30_000,
 					);
 					const run = await files.finishedRun(before, 240_000);
@@ -219,8 +224,6 @@ async function main(): Promise<void> {
 						() => statusLine(tui.raw) ?? "no status line",
 						60_000,
 					);
-					const idle = statusLine(tui.raw) ?? "";
-					check("the live status line is gone once the run ended", idle.startsWith("storm ✓") && !idle.includes("▶"), idle);
 					const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
 					const stormMessages = [...new Set(mains(llm.all()).map(entry => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "")))].filter(user => user.startsWith("<storm-run"));
 					check(
@@ -239,6 +242,13 @@ async function main(): Promise<void> {
 						lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 2,
 						JSON.stringify(lines),
 					);
+					const status = await tui.submit("/storm status");
+					await tui.shows(OVERLAY_HINT, status);
+					await tui.shows(/완료|리뷰 통과/, status);
+					const top = tui.text(status);
+					check("the TUI renders the approved team's status", top.includes("승인됨") && top.includes("마지막 실행"));
+					check("the budget amount and partially filled meter are visible together", top.includes("$0.01") && top.includes(run.runId) && /█+░+/.test(top));
+					tui.send(KEY.enter);
 				});
 			} finally {
 				rmSync(changed, { force: true });
