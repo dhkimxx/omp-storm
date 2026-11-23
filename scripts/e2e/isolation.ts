@@ -369,12 +369,13 @@ async function main(): Promise<void> {
 					report,
 					"E2E-PARENT-DIRTY",
 				);
-				// The plugin must ask the host for placement, not create a raw git worktree of its own.
-				const worktrees = Bun.spawnSync(["git", "-C", env.project, "worktree", "list", "--porcelain"]).stdout.toString();
+				// Git may keep an empty .git/worktrees after host cleanup; count registered checkouts instead.
+				const listing = Bun.spawnSync(["git", "-C", env.project, "worktree", "list", "--porcelain", "-z"]);
+				const roots = listing.stdout.toString().split("\0").filter(field => field.startsWith("worktree ")).map(field => field.slice("worktree ".length));
 				check(
-					"manual mixed lanes: native placement added no raw git worktree to the parent repo",
-					worktrees.split("\n\n").filter(Boolean).length === 1 && !existsSync(join(env.project, ".git", "worktrees")),
-					worktrees.trim(),
+					"manual mixed lanes: only the original checkout remains registered",
+					listing.exitCode === 0 && roots.length === 1 && real(roots[0]!) === real(env.project),
+					JSON.stringify({ roots, stderr: listing.stderr.toString() }),
 				);
 				const planText = frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "storm").map(resultText).join("\n");
 				check("manual mixed lanes: the plan response names the exceptional lane and its reason", planText.includes("experiment") && planText.includes(REASON), planText.slice(0, 600));
