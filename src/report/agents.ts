@@ -3,7 +3,7 @@
  * a follow-up would pass. The cap rule here is the one Storm enforces (`src/policy/followup.ts` reads these rows).
  */
 import { followUpCap, roleTitle } from "../roles.ts";
-import type { AgentEntry, AgentLiveState, StormConfig } from "../types.ts";
+import type { AgentEntry, AgentLiveState, InfoSpan, StormConfig } from "../types.ts";
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -54,4 +54,20 @@ export function renderAgentRows(rows: readonly AgentRow[], now: number): string 
 		);
 	}
 	return out.join("\n");
+}
+
+/** Stacked rows for the interactive status report; long IDs and model names wrap independently. */
+export function agentStatusSpans({ entry, cap, followUp }: AgentRow, now: number): readonly (readonly InfoSpan[])[] {
+	const role = entry.role === undefined ? entry.name : roleTitle(entry.role);
+	const state = entry.state === "running" ? STATE_LABEL[entry.state]
+		: entry.state === "idle" ? `유휴 ${duration(now - entry.lastActivityAt)}`
+		: `보관 · 유휴 ${duration(now - entry.lastActivityAt)}`;
+	return [
+		[
+			{ text: `- ${entry.id}`, tone: "accent" },
+			{ text: ` · ${role} · ${state}`, tone: entry.state === "running" ? "success" : "muted" },
+		],
+		[{ text: `  ${entry.model ?? "—"} · 컨텍스트 ${tokens(entry.contextTokens)}/${tokens(cap)}`, tone: "muted" }],
+		[{ text: `  후속 지시 ${entry.followUps}회 · ${FOLLOW_UP_LABEL[followUp]}`, tone: followUp === "cap" ? "warning" : "muted" }],
+	];
 }

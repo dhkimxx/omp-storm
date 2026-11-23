@@ -1,11 +1,7 @@
 /**
- * The live Storm run's one widget under the editor: a themed wind marker and the run's phase, followed by the
- * run's plain counters.
- *
- * Only the header moves: an ANSI repaint asks the host to render this component alone at the shimmer cadence,
- * and a Tern terminal clocks the described sheen itself. Waiting, between rounds, stopping, an off OMP motion
- * choice, a disabled shimmer setting, reduced motion and a native surface all snap the header still and stop
- * the timer at once. `dispose()` and `LiveStatus.clear()` stop it too; no per-run counter or timer lives here.
+ * Storm's live instrument below the editor. The radar moves; the phase and counters do not. Compact
+ * terminals get a static single row. Tern clocks its own sheen, and still phases or OMP motion settings
+ * stop the only local repaint timer immediately.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -14,15 +10,15 @@ import {
 	Ellipsis,
 	type NativeNode,
 	type ShimmerPalette,
+	col,
 	describeShimmer,
+	getThemeEpoch,
 	isNativeRendering,
 	motionEffectsEnabled,
-	node,
 	onMotionEffectsChange,
 	onNativeRenderingChange,
 	row,
 	shimmerEnabled,
-	shimmerText,
 	span,
 	text,
 	truncateToWidth,
@@ -32,27 +28,94 @@ import {
 } from "@oh-my-pi/pi-tui";
 import type { RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
-import { runStatusCounters } from "./render.ts";
+import {
+	type LiveMetricChip,
+	type LiveMetricFacts,
+	type LiveMetricForm,
+	LIVE_STATE_LABEL,
+	liveMetricFacts,
+} from "./live-metrics.ts";
 
 /** The widget's key in the host; unique to Storm's run and cleared when the run ends. */
 export const LIVE_WIDGET_KEY = "storm-live";
-/** omp's splash/loader cadence for terminal-driven shimmer. */
-const SHIMMER_TICK_MS = 33;
+const RADAR_TICK_MS = 85;
+const RADAR_COLUMNS = 52;
+/** The ASCII preset keeps Storm's identity without a glyph the terminal cannot render. */
+const ASCII_MARK = "~ STORM";
+const RADAR_PALETTES = {
+	working: { low: "dim", mid: "accent", high: "mdLink", bold: true },
+	workers: { low: "dim", mid: "borderAccent", high: "mdLink", bold: true },
+	verifying: { low: "dim", mid: "borderAccent", high: "success", bold: true },
+} as const satisfies Record<"working" | "workers" | "verifying", ShimmerPalette>;
 
-/**
- * The one animated span: a short, blue-ish sweep from theme tokens, so every theme keeps its own palette.
- * No raw ANSI or RGB: a Tern terminal receives the token names and applies its own theme.
- */
-const STORM_PALETTE = {
-	low: "dim",
-	mid: "borderAccent",
-	high: "mdLink",
-	bold: true,
-} satisfies ShimmerPalette;
+// Single-cell braille gives the instrument a direction and texture without emoji presentation or ambiguous-width blocks.
+const RADAR = {
+	working: "⠁⠈⠐⡀⣀⠤⠒⠉⠐⡀⣀⠤⠒⠉⠈⠂⠄⡀",
+	workers: "⠠⠠⠤⠤⠤⠶⠶⠤⠤⠈⠈⠉⠉⠛⠛⠉⠉⠈",
+	verifying: "⠈⠐⠠⢀⡀⠄⠂⠁⠁⠂⠄⡀⢀⠠⠐⠈⠈⠁",
+	"waiting-user": "⠂⠂⠂⠂⠂⠂⠂⠂⣶⣶⠂⠂⠂⠂⠂⠂⠂⠂",
+	"between-rounds": "⠂⠂⠂⠂⠂⠂⠂⠂⠤⠤⠂⠂⠂⠂⠂⠂⠂⠂",
+	stopping: "⠤⠤⠤⠒⠒⠂⠂⠂⠂⠂⠂⠂⠂⠂⠂⠂⠂⠂",
+} as const satisfies Record<RunPhase, string>;
 
-/** The header text without styling: the wind marker, then the phase a reader can name. */
-function liveHeader(phase: RunPhase): string {
-	return `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
+// The ASCII preset keeps the same phase distinction without braille or other non-ASCII chrome.
+const RADAR_ASCII = {
+	working: "~-~-~-~-~-~-~-~-~-",
+	workers: "->->->->->->->->->",
+	verifying: "<===>-----<===>---",
+	"waiting-user": "= = = = = = = = = ",
+	"between-rounds": ".-.-.-.-.-.-.-.-.-",
+	stopping: "|/|/|/|/|/|/|/|/|/",
+} as const satisfies Record<RunPhase, string>;
+
+function radarFrame(phase: RunPhase, frame: number, theme: Theme, track: string): string {
+	if (!(phase in RADAR_PALETTES)) return theme.fg(RUN_APPEARANCE[phase].tone, track);
+	const motion = phase as keyof typeof RADAR_PALETTES;
+	const { low, mid, high } = RADAR_PALETTES[motion];
+	const length = track.length;
+	// The wind rolls, workers move in one direction, and verification sweeps back and forth.
+	const half = length / 2;
+	const shift = frame % half;
+	let field = track as string;
+	if (shift !== 0 && motion === "working") field = track.slice(shift * 2) + track.slice(0, shift * 2);
+	if (shift !== 0 && motion === "workers") field = track.slice(shift, half) + track.slice(0, shift) + track.slice(half + shift) + track.slice(half, half + shift);
+	const sweep = frame % (motion === "verifying" ? 2 * (length - 1) : length);
+	const head = motion === "verifying" && sweep >= length ? 2 * (length - 1) - sweep : sweep;
+	const left = Math.max(0, head - 3);
+	const right = Math.min(length, head + (motion === "verifying" ? 3 : 2));
+	return (left ? theme.fg(low, field.slice(0, left)) : "") +
+		theme.fg(mid, field.slice(left, head)) + theme.bold(theme.fg(high, field[head]!)) +
+		theme.fg(mid, field.slice(head + 1, right)) +
+		(right < length ? theme.fg(low, field.slice(right)) : "");
+}
+
+interface RadarLayout {
+	columns: number;
+	theme: Theme;
+	epoch: number;
+	preset: "unicode" | "nerd" | "ascii";
+	prefix: string;
+	metrics: string;
+	track: string;
+	still: readonly string[];
+	frames: Array<readonly string[] | undefined>;
+}
+
+interface FittedChip {
+	chip: LiveMetricChip;
+	form: LiveMetricForm;
+	formIndex: number;
+}
+
+/** The text-span shape native `text` nodes take; kept concrete here instead of publishing an opaque helper type. */
+interface Span {
+	t: string;
+	s?: string;
+}
+
+/** The wind marker's ASCII form exists only in this widget; the footer keeps its own branding. */
+function markFor(theme: Theme): string {
+	return theme.getSymbolPreset() === "ascii" ? ASCII_MARK : STORM_MARK;
 }
 
 /** A true interactive TUI session: RPC, print and subagent sessions keep the plain status line. */
@@ -60,20 +123,215 @@ export function isLiveTui(ctx: ExtensionContext): boolean {
 	return ctx.mode === "tui" && ctx.hasUI && ctx.agent.kind === "main";
 }
 
-/**
- * The one row, clipped from the end: the phase header stays whole while the expendable counters give way first.
- * Below the header's own width there is nothing left to protect, so the header truncates last.
- */
-function fitLine(header: string, counters: string, columns: number): string {
-	const headerWidth = visibleWidth(header);
-	if (columns <= headerWidth) return truncateToWidth(header, columns, Ellipsis.Unicode);
-	return `${header}${truncateToWidth(` · ${counters}`, columns - headerWidth, Ellipsis.Unicode)}`;
+/** The visible icon prefix; ASCII's cost glyph is itself "$", so the value's own dollar is the whole mark. */
+function chipIcon(chip: LiveMetricChip, theme: Theme): string {
+	const icon = theme.symbol(chip.icon);
+	return chip.key === "cost" && icon === "$" ? "" : icon;
 }
 
-/** `describeShimmer` takes no layout props; copy its node so a narrow native row gives the counters way first. */
-function pinnedHeader(described: NativeNode): NativeNode {
-	if (described.k !== "shimmer") return described;
-	return node("shimmer", { ...described.p, shrink: 0 }, described.c, described.key);
+/** The plain width of a chip's visible text, so emoji and preset glyphs are measured where the terminal will draw them. */
+function chipWidth(chip: LiveMetricChip, form: LiveMetricForm, theme: Theme): number {
+	const icon = chipIcon(chip, theme);
+	const lead = icon === "" ? "" : `${icon} `;
+	const state = chip.state === undefined ? "" : ` ${LIVE_STATE_LABEL[chip.state]}`;
+	return visibleWidth(`${lead}${form.value}${form.suffix ?? ""}${state}`);
+}
+
+/**
+ * Pick one whole form per chip for a prefix of the priority order. Primary counters win first, then the other
+ * non-elapsed chips, then the longer form. Elapsed is the last chip and only breaks an otherwise exact tie, so it
+ * can never displace the mark, a counter, or an intact cost/limit format.
+ */
+function fitChips(chips: readonly LiveMetricChip[], available: number, theme: Theme): FittedChip[] {
+	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
+	let best: FittedChip[] = [];
+	let bestPrimary = 0;
+	let bestValue = 0;
+	let bestRichness = 0;
+	const visit = (index: number, used: number, chosen: FittedChip[]): void => {
+		let primary = 0;
+		let value = 0;
+		let richness = 0;
+		for (const entry of chosen) {
+			if (entry.chip.key === "round" || entry.chip.key === "workers") primary++;
+			if (entry.chip.key !== "time") {
+				value++;
+				richness += entry.formIndex;
+			}
+		}
+		const wins =
+			primary > bestPrimary ||
+			(primary === bestPrimary &&
+				(value > bestValue ||
+					(value === bestValue &&
+						(richness < bestRichness || (richness === bestRichness && chosen.length > best.length)))));
+		if (wins) {
+			best = [...chosen];
+			bestPrimary = primary;
+			bestValue = value;
+			bestRichness = richness;
+		}
+		if (index >= chips.length) return;
+		const chip = chips[index]!;
+		const gap = chosen.length === 0 ? 0 : sepWidth;
+		for (let formIndex = 0; formIndex < chip.forms.length; formIndex++) {
+			const form = chip.forms[formIndex]!;
+			const width = chipWidth(chip, form, theme);
+			if (used + gap + width > available) continue;
+			chosen.push({ chip, form, formIndex });
+			visit(index + 1, used + gap + width, chosen);
+			chosen.pop();
+		}
+	};
+	visit(0, 0, []);
+	return best;
+}
+
+interface LiveLine {
+	fullHeader: boolean;
+	chips: FittedChip[];
+}
+
+/**
+ * The single-row choice: keep the full mark while it does not cost a counter, otherwise trade the mark for
+ * `phase word + more counters`, and finally truncate the phase word itself. Phase is never dropped for a chip.
+ */
+function chooseLine(facts: LiveMetricFacts, columns: number, theme: Theme): LiveLine | undefined {
+	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
+	const phaseWidth = visibleWidth(facts.phase.label);
+	const fullWidth = visibleWidth(markFor(theme)) + sepWidth + phaseWidth;
+	const candidates: LiveLine[] = [];
+	if (columns >= fullWidth) {
+		candidates.push({ fullHeader: true, chips: fitChips(facts.chips, columns - fullWidth - sepWidth, theme) });
+	}
+	if (columns >= phaseWidth) {
+		candidates.push({ fullHeader: false, chips: fitChips(facts.chips, columns - phaseWidth - sepWidth, theme) });
+	}
+	let best: LiveLine | undefined;
+	let bestPrimary = 0;
+	let bestValue = 0;
+	let bestRichness = 0;
+	for (const candidate of candidates) {
+		let primary = 0;
+		let value = 0;
+		let richness = 0;
+		for (const entry of candidate.chips) {
+			if (entry.chip.key === "round" || entry.chip.key === "workers") primary++;
+			if (entry.chip.key !== "time") {
+				value++;
+				richness += entry.formIndex;
+			}
+		}
+		const wins =
+			best === undefined ||
+			primary > bestPrimary ||
+			(primary === bestPrimary &&
+				(candidate.fullHeader !== best.fullHeader
+					? candidate.fullHeader
+					: value > bestValue ||
+						(value === bestValue &&
+							(richness < bestRichness || (richness === bestRichness && candidate.chips.length > best.chips.length)))));
+		if (wins) {
+			best = candidate;
+			bestPrimary = primary;
+			bestValue = value;
+			bestRichness = richness;
+		}
+	}
+	return best;
+}
+
+/** ANSI chip chrome is muted; numbers carry the tone, and only spend can carry warning/error. */
+function ansiChip(entry: FittedChip, theme: Theme): string {
+	const { chip, form } = entry;
+	const icon = chipIcon(chip, theme);
+	const prefix = icon === "" ? "" : theme.fg("dim", `${icon} `);
+	if (chip.key === "time") return `${prefix}${theme.fg("dim", form.value)}`;
+	const state = chip.state === undefined ? "" : ` ${theme.fg(chip.tone, LIVE_STATE_LABEL[chip.state])}`;
+	return `${prefix}${theme.bold(theme.fg(chip.tone, form.value))}${form.suffix === undefined ? "" : theme.fg("dim", form.suffix)}${state}`;
+}
+
+/** One whole ANSI row of chips; separators exist only between included chips. */
+function ansiMetrics(chips: readonly LiveMetricChip[], columns: number, theme: Theme): string {
+	const lead = theme.getSymbolPreset() === "ascii" ? "> " : "› ";
+	const fitted = fitChips(chips, columns - visibleWidth(lead), theme);
+	if (fitted.length === 0) return "";
+	const sep = theme.fg("dim", theme.symbol("sep.dot"));
+	return `${theme.fg("dim", lead)}${fitted.map(entry => ansiChip(entry, theme)).join(sep)}`;
+}
+
+function singleRow(facts: LiveMetricFacts, columns: number, theme: Theme): readonly string[] {
+	const chosen = chooseLine(facts, columns, theme);
+	if (chosen === undefined) {
+		const ellipsis = theme.getSymbolPreset() === "ascii" ? Ellipsis.Ascii : Ellipsis.Unicode;
+		return [truncateToWidth(theme.fg(facts.phase.tone, facts.phase.label), columns, ellipsis)];
+	}
+	const header = chosen.fullHeader
+		? `${theme.bold(theme.fg("accent", markFor(theme)))}${theme.fg("dim", theme.symbol("sep.dot"))}${theme.fg(facts.phase.tone, facts.phase.label)}`
+		: theme.fg(facts.phase.tone, facts.phase.label);
+	if (chosen.chips.length === 0) return [header];
+	const sep = theme.fg("dim", theme.symbol("sep.dot"));
+	return [`${header}${sep}${chosen.chips.map(entry => ansiChip(entry, theme)).join(sep)}`];
+}
+
+/** The same chip chrome as ANSI, as spans: dim icon/word, toned number, state word only when spend has one. */
+function chipSpans(entry: FittedChip, theme: Theme): Span[] {
+	const { chip, form } = entry;
+	const icon = chipIcon(chip, theme);
+	const spans: Span[] = icon === "" ? [] : [span(icon, "dim"), span(" ", "dim")];
+	if (chip.key === "time") {
+		spans.push(span(form.value, "dim"));
+		return spans;
+	}
+	spans.push(span(form.value, `${chip.tone} strong`));
+	if (form.suffix !== undefined) spans.push(span(form.suffix, "dim"));
+	if (chip.state !== undefined) spans.push(span(" ", "dim"), span(LIVE_STATE_LABEL[chip.state], chip.tone));
+	return spans;
+}
+
+/** A whole chip text node with its full accessible sentence; the layout only includes forms that fit. */
+function nativeChip(entry: FittedChip, theme: Theme): NativeNode {
+	return text(chipSpans(entry, theme), {
+		wrap: "none",
+		truncate: "end",
+		shrink: 0,
+		role: `omp.storm.live.${entry.chip.key}`,
+		aria: entry.chip.aria,
+	});
+}
+
+function nativeMetricsRow(chips: readonly LiveMetricChip[], columns: number, theme: Theme): NativeNode {
+	const lead = theme.getSymbolPreset() === "ascii" ? "> " : "› ";
+	const fitted = fitChips(chips, columns - visibleWidth(lead), theme);
+	const children: NativeNode[] = [text([span(lead, "dim")], { wrap: "none", shrink: 0 })];
+	for (const entry of fitted) {
+		if (children.length > 1) children.push(text([span(theme.symbol("sep.dot"), "dim")], { wrap: "none", shrink: 0 }));
+		children.push(nativeChip(entry, theme));
+	}
+	return row(children, { align: "baseline", gap: "none", role: "omp.storm.live.metrics" });
+}
+
+/** A narrow native host gets the same compact line as ANSI, with one overall accessible sentence. */
+function nativeCompactLine(facts: LiveMetricFacts, columns: number, theme: Theme): NativeNode {
+	const chosen = chooseLine(facts, columns, theme);
+	if (chosen === undefined) {
+		return text([span(facts.phase.label, facts.phase.tone)], {
+			wrap: "none",
+			truncate: "end",
+			shrink: 0,
+			role: "omp.storm.live",
+			aria: facts.phase.label,
+		});
+	}
+	const spans: Span[] = chosen.fullHeader
+		? [span(markFor(theme), "accent"), span(theme.symbol("sep.dot"), "dim"), span(facts.phase.label, facts.phase.tone)]
+		: [span(facts.phase.label, facts.phase.tone)];
+	for (const entry of chosen.chips) {
+		spans.push(span(theme.symbol("sep.dot"), "dim"), ...chipSpans(entry, theme));
+	}
+	const header = chosen.fullHeader ? `${markFor(theme)}${theme.symbol("sep.dot")}${facts.phase.label}` : facts.phase.label;
+	const aria = chosen.chips.length === 0 ? header : `${header}: ${chosen.chips.map(entry => entry.chip.aria).join(" · ")}`;
+	return text(spans, { wrap: "none", truncate: "end", shrink: 0, role: "omp.storm.live", aria });
 }
 
 /**
@@ -191,26 +449,22 @@ type ComponentTui = Omit<TUI, "requestComponentRender"> & {
 	requestComponentRender?: (component: Component) => void;
 };
 
-/**
- * The widget's actual component. `render(width)` handles plain terminal rows; `describe()` hands a Tern terminal a
- * shimmer node, which clocks the sheen itself. Both carry the counters as static text.
- */
+/** A terminal-clocked radar or its equivalent native, host-clocked sheen. */
 class LiveRunWidget implements Component {
 	#tui: ComponentTui;
 	#theme: () => Theme;
 	#phase: RunPhase;
-	/** Formatted only when the controller supplies a new snapshot, not during animation ticks. */
-	#counters: string;
+	/** Shaped only when the controller supplies a new snapshot, not during animation ticks. */
+	#facts: LiveMetricFacts;
 	#onDisposed: (() => void) | undefined;
 	#offMotion: () => void;
 	#offNative: () => void;
 	#timer: NodeJS.Timeout | undefined;
 	#disposed = false;
-	#lastKey = "";
-	#lastLines: readonly string[] | undefined;
-	#lastTheme: Theme | undefined;
-	#nativeKey = "";
-	#nativeNode: NativeNode | null = null;
+	#columns = 0;
+	#frame = 0;
+	#layout: RadarLayout | undefined;
+	#native: { theme: Theme; key: string; node: NativeNode } | undefined;
 
 	constructor(
 		tui: TUI,
@@ -223,7 +477,7 @@ class LiveRunWidget implements Component {
 		this.#tui = tui;
 		this.#theme = theme;
 		this.#phase = phase;
-		this.#counters = runStatusCounters(run, now);
+		this.#facts = liveMetricFacts(run, phase, now);
 		this.#onDisposed = options.onDisposed;
 		this.#offMotion = onMotionEffectsChange(() => this.#settingsChanged());
 		this.#offNative = onNativeRenderingChange(() => this.#settingsChanged());
@@ -236,10 +490,12 @@ class LiveRunWidget implements Component {
 	/** The controller's live record or phase changed: repaint, but keep the one installed component. */
 	update(run: RunRecord, now: number, phase: RunPhase): void {
 		if (this.#disposed) return;
-		this.#counters = runStatusCounters(run, now);
+		const facts = liveMetricFacts(run, phase, now);
+		if (this.#phase === phase && this.#facts.key === facts.key) return;
+		if (this.#phase !== phase) this.#frame = 0;
+		this.#facts = facts;
 		this.#phase = phase;
-		// A still phase must stop at once and drop the old frame; the request below repaints the snap-to-still row.
-		this.#forget();
+		this.invalidate();
 		this.#syncTimer();
 		this.#requestRender();
 	}
@@ -247,41 +503,72 @@ class LiveRunWidget implements Component {
 	render(width: number): readonly string[] {
 		if (this.#disposed) return [];
 		const columns = Math.max(0, Math.floor(width));
-		if (columns === 0) return [];
-		const animated = this.#animated() && !isNativeRendering();
+		this.#columns = columns;
 		this.#syncTimer();
-		const counters = this.#counters;
-		const activeTheme = this.#theme();
-		const look = RUN_APPEARANCE[this.#phase];
-		const header = animated
-			? shimmerText(liveHeader(this.#phase), activeTheme, STORM_PALETTE)
-			: `${activeTheme.fg("accent", STORM_MARK)} · ${activeTheme.fg(look.tone, look.label)}`;
-		const key = `${this.#phase}\u0000${counters}\u0000${animated}\u0000${columns}`;
-		// A terminal-clocked header changes every frame; only a still line may reuse its rows by reference.
-		if (!animated && this.#lastLines !== undefined && this.#lastKey === key && this.#lastTheme === activeTheme) return this.#lastLines;
-		const lines = [fitLine(header, counters, columns)];
-		this.#lastKey = key;
-		this.#lastLines = lines;
-		this.#lastTheme = activeTheme;
-		return lines;
+		if (columns === 0) return [];
+		const theme = this.#theme();
+		const epoch = getThemeEpoch();
+		const preset = theme.getSymbolPreset();
+		const layout = this.#layout?.columns === columns && this.#layout.theme === theme &&
+			this.#layout.epoch === epoch && this.#layout.preset === preset
+			? this.#layout : (this.#layout = this.#buildLayout(columns, theme, epoch, preset));
+		if (!this.#ticking()) return layout.still;
+		return (layout.frames[this.#frame] ??= [
+			`${layout.prefix}${radarFrame(this.#phase, this.#frame, theme, layout.track)}${theme.fg("dim", "]")}`,
+			layout.metrics,
+		]);
+	}
+
+	#buildLayout(columns: number, theme: Theme, epoch: number, preset: "unicode" | "nerd" | "ascii"): RadarLayout {
+		const ascii = preset === "ascii";
+		const track = ascii ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
+		const header = `${theme.bold(theme.fg("accent", markFor(theme)))}${theme.fg("dim", theme.symbol("sep.dot"))}${theme.fg(this.#facts.phase.tone, this.#facts.phase.label)}`;
+		if (columns < RADAR_COLUMNS) {
+			return { columns, theme, epoch, preset, prefix: "", metrics: "", track, still: singleRow(this.#facts, columns, theme), frames: [] };
+		}
+		const headerWidth = visibleWidth(markFor(theme)) + visibleWidth(theme.symbol("sep.dot")) + visibleWidth(this.#facts.phase.label);
+		const prefix = `${header}${" ".repeat(Math.max(1, columns - headerWidth - visibleWidth(track) - 2))}${theme.fg("dim", "[")}`;
+		const metrics = ansiMetrics(this.#facts.chips, columns, theme);
+		const still = [`${prefix}${theme.fg(this.#facts.phase.tone, track)}${theme.fg("dim", "]")}`, metrics];
+		return { columns, theme, epoch, preset, prefix, metrics, track, still, frames: [] };
 	}
 
 	describe(cx?: DescribeContext): NativeNode | null {
 		if (this.#disposed) return null;
-		// Tern repaints the described sheen from its own clock, so no ANSI repaint timer may run here.
-		this.#stopTimer();
-		const counters = this.#counters;
-		const shimmer = this.#animated() && cx?.reduceMotion !== true && (cx?.supports("shimmer") ?? true);
-		const key = `${this.#phase}\u0000${counters}\u0000${shimmer}`;
-		if (this.#nativeNode !== null && this.#nativeKey === key) return this.#nativeNode;
-		const look = RUN_APPEARANCE[this.#phase];
-		const header = shimmer
-			? pinnedHeader(describeShimmer([{ text: liveHeader(this.#phase), palette: STORM_PALETTE }], "header"))
-			: text([span(STORM_MARK, "accent"), span(` · ${look.label}`, look.tone)], { wrap: "none", truncate: "end", shrink: 0 });
-		const tail = text([span(" · ", "dim"), span(counters)], { wrap: "none", truncate: "end", grow: 1, min: { w: "0ch" } });
-		const described = row([header, tail], { align: "baseline", gap: "none" });
-		this.#nativeKey = key;
-		this.#nativeNode = described;
+		this.#stopTimer(); // Tern paints its own sheen.
+		const columns = Math.max(0, Math.floor(cx?.cols ?? RADAR_COLUMNS));
+		const wide = columns >= RADAR_COLUMNS;
+		const shimmer = wide && this.#animated() && cx?.reduceMotion !== true && (cx?.supports("shimmer") ?? true);
+		const theme = this.#theme();
+		const epoch = getThemeEpoch();
+		const preset = theme.getSymbolPreset();
+		const key = `${wide}|${shimmer}|${columns}|${epoch}|${preset}`;
+		const cached = this.#native;
+		if (cached !== undefined && cached.theme === theme && cached.key === key) return cached.node;
+		const ascii = preset === "ascii";
+		const track = ascii ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
+		let described: NativeNode;
+		if (wide) {
+			const header = text([
+				span(markFor(theme), "accent"),
+				span(theme.symbol("sep.dot"), "dim"),
+				span(this.#facts.phase.label, this.#facts.phase.tone),
+			], { wrap: "none", truncate: "end", shrink: 0 });
+			const field = shimmer
+				? describeShimmer([{ text: track, palette: RADAR_PALETTES[this.#phase as keyof typeof RADAR_PALETTES] }], "storm-radar")
+				: text([span(track, this.#facts.phase.tone)], { wrap: "none", shrink: 0 });
+			described = col([
+				row([
+					header,
+					text(" ", { grow: 1, min: { w: "0ch" } }),
+					text([span("[", "dim")], { shrink: 0 }), field, text([span("]", "dim")], { shrink: 0 }),
+				], { align: "baseline", gap: "none" }),
+				nativeMetricsRow(this.#facts.chips, columns, theme),
+			], { gap: "none" });
+		} else {
+			described = nativeCompactLine(this.#facts, columns, theme);
+		}
+		this.#native = { theme, key, node: described };
 		return described;
 	}
 
@@ -296,7 +583,7 @@ class LiveRunWidget implements Component {
 		this.#stopTimer();
 		this.#offMotion();
 		this.#offNative();
-		this.#forget();
+		this.invalidate();
 		this.#onDisposed?.();
 	}
 
@@ -304,24 +591,28 @@ class LiveRunWidget implements Component {
 		return !this.#disposed && RUN_APPEARANCE[this.#phase].motion && motionEffectsEnabled() && shimmerEnabled();
 	}
 
-	/** The only timer path: one interval while an active phase may shimmer here, none otherwise. */
-	#syncTimer(): void {
-		if (this.#disposed || !this.#animated() || isNativeRendering()) this.#stopTimer();
-		else this.#ensureTimer();
+	#ticking(): boolean {
+		return this.#columns >= RADAR_COLUMNS && this.#animated() && !isNativeRendering();
 	}
 
-	#ensureTimer(): void {
-		if (this.#timer !== undefined || this.#disposed || isNativeRendering() || !this.#animated()) return;
+	/** One scoped repaint timer, only when this terminal actually has room to show the radar. */
+	#syncTimer(): void {
+		if (!this.#ticking()) {
+			this.#stopTimer();
+			return;
+		}
+		if (this.#timer !== undefined) return;
 		const timer = setInterval(() => {
 			if (this.#timer !== timer) return;
-			if (this.#disposed || isNativeRendering() || !this.#animated()) {
+			if (!this.#ticking()) {
 				this.#stopTimer();
-				this.#forget();
-				this.#requestRender();
-				return;
+			} else {
+				const length = RADAR[this.#phase].length;
+				const period = this.#phase === "verifying" ? 2 * (length - 1) : length;
+				this.#frame = (this.#frame + 1) % period;
 			}
 			this.#requestRender();
-		}, SHIMMER_TICK_MS);
+		}, RADAR_TICK_MS);
 		timer.unref?.();
 		this.#timer = timer;
 	}
@@ -334,7 +625,7 @@ class LiveRunWidget implements Component {
 
 	#settingsChanged(): void {
 		if (this.#disposed) return;
-		this.#forget();
+		this.invalidate();
 		this.#syncTimer();
 		this.#requestRender();
 	}
@@ -346,11 +637,8 @@ class LiveRunWidget implements Component {
 		else this.#tui.requestRender();
 	}
 
-	#forget(): void {
-		this.#lastKey = "";
-		this.#lastLines = undefined;
-		this.#lastTheme = undefined;
-		this.#nativeKey = "";
-		this.#nativeNode = null;
+	invalidate(): void {
+		this.#layout = undefined;
+		this.#native = undefined;
 	}
 }

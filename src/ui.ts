@@ -1,16 +1,16 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type Component, matchesKey, ScrollView, type TUI, theme } from "@oh-my-pi/pi-tui";
+import { type Component, getThemeEpoch, matchesKey, parseKey, ScrollView, TabBar, type TUI, theme, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
-import { editorKeys, FramedMessageComponent, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
-import { col, node, span, text } from "@oh-my-pi/pi-tui/native/describe";
+import { editorKeys, FramedMessageComponent, getTabBarTheme, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
+import { col, keyed, node, span, text } from "@oh-my-pi/pi-tui/native/describe";
 import { estimateRows } from "@oh-my-pi/pi-tui/native/measure";
 import type { DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import type { ModelBrowserSource } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { type ModelPickerRegistry, ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { toModelInfo } from "./discovery/models.ts";
 import type { InfoLine, ModelInfo, UiPort } from "./types.ts";
-import { RichFrame } from "./view/info.ts";
+import { infoSymbol, infoSections, RichFrame } from "./view/info.ts";
 
 const REPORT_TYPE = "storm-report";
 /**
@@ -18,6 +18,8 @@ const REPORT_TYPE = "storm-report";
  * presentation, so terminals that ignore VS16 (tmux among them) draw it one cell wide and break the frame border.
  */
 const REPORT_ICON = "🌀";
+/** Storm's frame heading; a title that already names Storm does not repeat it. */
+const frameTag = (title: string): string => (title.startsWith("Storm") ? title : `Storm · ${title}`);
 const PANEL_KEY = "storm-panel";
 /** Rows a selector takes besides its options (frame, padding, key hints), plus the status line and one spare option. */
 const SELECTOR_ROWS = 11;
@@ -27,6 +29,14 @@ const FULL_VIEW = "전체 내용 보기";
 const OVERLAY_SHARE = 0.85;
 const NOTICE_TITLE = { info: "알림", warning: "경고", error: "오류" } as const;
 const SCROLL_HINT = "↑↓ PgUp PgDn 스크롤 · Esc·Enter·q 닫기";
+const TAB_HINT = `←→·Tab 탭 · ${SCROLL_HINT}`;
+const FAST_SCROLL_LINES = 5;
+const REPORT_TABS = [
+	{ key: "1", id: "overview", label: "1 개요", icon: "status.info" },
+	{ key: "2", id: "team", label: "2 팀", icon: "status.enabled" },
+	{ key: "3", id: "runtime", label: "3 런타임", icon: "status.running" },
+	{ key: "4", id: "storage", label: "4 저장 공간", icon: "context.content" },
+] as const;
 /** Rows of native card chrome the row estimator does not count. */
 const NATIVE_SLACK = 3;
 /** A stable context for describing rich nodes; none of them consult it. */
@@ -41,7 +51,7 @@ export function registerReportRenderer(pi: ExtensionAPI): void {
 }
 
 function frame(title: string, markdown: string, info?: readonly InfoLine[]): Component {
-	const tag = `Storm · ${title}`;
+	const tag = frameTag(title);
 	if (info !== undefined && info.length > 0) return new RichFrame(tag, markdown, info, REPORT_ICON);
 	return new FramedMessageComponent({
 		message: { customType: tag, content: markdown },
@@ -58,7 +68,7 @@ interface PanelLayout {
 
 /** A choice's context above the selector, cut to the rows the selector leaves free. */
 class PanelView implements Component {
-	#cache: { width: number; budget: number; native: boolean; layout: PanelLayout } | undefined;
+	#cache: { width: number; budget: number; native: boolean; epoch: number; layout: PanelLayout } | undefined;
 
 	constructor(
 		private readonly tui: TUI,
@@ -87,10 +97,11 @@ class PanelView implements Component {
 	#layout(width: number): PanelLayout {
 		const budget = Math.max(6, this.tui.terminal.rows - this.reserve);
 		const nativeRendering = this.tui.nativeRendering;
-		if (this.#cache?.width === width && this.#cache.budget === budget && this.#cache.native === nativeRendering) return this.#cache.layout;
+		const epoch = getThemeEpoch();
+		if (this.#cache?.width === width && this.#cache.budget === budget && this.#cache.native === nativeRendering && this.#cache.epoch === epoch) return this.#cache.layout;
 		const lines = this.markdown.split("\n");
 		const rich = this.info !== undefined && this.info.length > 0;
-		const tag = `Storm · ${this.title}`;
+		const tag = frameTag(this.title);
 		/** ANSI rows, plus on Tern a conservative native row count (terminal chrome included). */
 		const evaluate = (markdown: string, info: readonly InfoLine[] | undefined) => {
 			const component = rich ? new RichFrame(tag, markdown, info, REPORT_ICON) : frame(this.title, markdown);
@@ -133,7 +144,7 @@ class PanelView implements Component {
 			native = best.native;
 		}
 		const layout: PanelLayout = { rows, cut, native };
-		this.#cache = { width, budget, native: nativeRendering, layout };
+		this.#cache = { width, budget, native: nativeRendering, epoch, layout };
 		return layout;
 	}
 
@@ -142,91 +153,183 @@ class PanelView implements Component {
 	}
 }
 
-/** A report to read and close: scrolls with the arrow, page, Home and End keys, closes with Esc, Enter or q. */
+interface ReportPage {
+	readonly key: string;
+	readonly scroll: ScrollView;
+	readonly rich: RichFrame | undefined;
+	nativeScroll?: NativeScroll;
+}
+
+/** A scrollable report, optionally divided into independently scrolling status tabs. */
 class ReportView implements Component {
-	readonly #scroll: ScrollView;
-	readonly #rich: RichFrame | undefined;
-	#nativeScroll: NativeScroll | undefined;
-	#native: { inner: NativeNode; height: number; scroll: NativeScroll | undefined; node: NativeNode } | undefined;
+	readonly #pages: readonly ReportPage[];
+	readonly #tabs: TabBar | undefined;
+	readonly #tabDefs: readonly (typeof REPORT_TABS)[number][];
+	readonly #hint: string;
+	#tabEpoch: number;
+	#native: { height: number; epoch: number; node: NativeNode } | undefined;
 
 	constructor(
 		private readonly tui: TUI,
 		title: string,
 		markdown: string,
 		info: readonly InfoLine[] | undefined,
+		sectional: boolean,
 		private readonly close: () => void,
 	) {
-		this.#rich = info !== undefined && info.length > 0 ? new RichFrame(`Storm · ${title}`, markdown, info, REPORT_ICON) : undefined;
-		this.#scroll = new ScrollView(this.#rich ?? frame(title, markdown), {
-			height: this.#height(),
-			// Track and thumb share one ASCII stroke. A line next to full blocks
-			// changes silhouette at the thumb, and both default glyphs are ambiguous-width.
-			trackChar: "|",
-			thumbChar: "|",
-			theme: {
-				track: rail => theme.fg("dim", rail),
-				thumb: rail => theme.bold(theme.fg("accent", rail)),
-			},
-		});
+		const sections = sectional ? infoSections(markdown, info) : undefined;
+		const tabs = REPORT_TABS.filter(tab => sections?.has(tab.id));
+		this.#tabDefs = tabs;
+		this.#tabEpoch = getThemeEpoch();
+		if (tabs.length > 0) {
+			this.#tabs = new TabBar("", this.#tabItems(), getTabBarTheme());
+			this.#tabs.showHint = false;
+			this.#tabs.onTabChange = () => {
+				this.#native = undefined;
+				this.tui.requestRender();
+			};
+		}
+		this.#hint = tabs.length > 1 ? TAB_HINT : SCROLL_HINT;
+		const height = this.#height(this.#tabs === undefined ? 1 : 2);
+		const page = (key: string, source: string, annotations: readonly InfoLine[] | undefined): ReportPage => {
+			const rich =
+				this.#tabs !== undefined || annotations?.length
+					? new RichFrame(frameTag(title), source, annotations, REPORT_ICON)
+					: undefined;
+			const scroll = new ScrollView(rich ?? frame(title, source), {
+				height,
+				fastScrollLines: FAST_SCROLL_LINES,
+				// Same ASCII stroke for track and thumb; neither width nor silhouette changes.
+				trackChar: "|",
+				thumbChar: "|",
+				theme: {
+					track: rail => theme.fg("dim", rail),
+					thumb: rail => theme.bold(theme.fg("accent", rail)),
+				},
+			});
+			return { key, scroll, rich };
+		};
+		this.#pages =
+			sections === undefined || this.#tabs === undefined
+				? [page("body", markdown, info)]
+				: tabs.map(tab => {
+						const { lines, info } = sections.get(tab.id)!;
+						return page(`body-${tab.id}`, lines.join("\n"), info);
+					});
 	}
 
-	#height(): number {
-		return Math.max(5, Math.floor(this.tui.terminal.rows * OVERLAY_SHARE) - 1);
+	/** Icon-led labels from the active preset; an empty symbol never leaves a leading space. */
+	#tabItems(): { id: string; label: string }[] {
+		return this.#tabDefs.map(tab => ({ id: tab.id, label: `${infoSymbol(tab.icon) ?? ""}${tab.label}` }));
+	}
+
+	#syncTabs(): void {
+		const epoch = getThemeEpoch();
+		if (epoch === this.#tabEpoch) return;
+		this.#tabEpoch = epoch;
+		if (this.#tabs !== undefined) this.#tabs.setTabs(this.#tabItems(), this.#tabs.getActiveTab()?.id);
+		this.#native = undefined;
+		for (const page of this.#pages) {
+			page.rich?.invalidate();
+			page.scroll.invalidate();
+		}
+	}
+
+	#height(chromeRows: number): number {
+		const budget = Math.max(6, Math.floor(this.tui.terminal.rows * OVERLAY_SHARE));
+		return Math.max(1, budget - chromeRows);
+	}
+
+	get #page(): ReportPage {
+		return this.#pages[this.#tabs?.getActiveIndex() ?? 0]!;
 	}
 
 	render(width: number): readonly string[] {
-		this.#scroll.setHeight(this.#height());
-		return [...this.#scroll.render(width), theme.fg("dim", ` ${SCROLL_HINT}`)];
+		this.#syncTabs();
+		const tabs = this.#tabs?.render(width) ?? [];
+		const { scroll } = this.#page;
+		scroll.setHeight(this.#height(tabs.length + 1));
+		const hint = theme.fg("dim", truncateToWidth(` ${this.#hint}`, width));
+		const body = scroll.render(width);
+		if (this.#tabs === undefined) return [...body, hint];
+		const chrome = (line: string) => theme.bg("customMessageBg", line + " ".repeat(Math.max(0, width - visibleWidth(line))));
+		return [...tabs.map(chrome), ...body, chrome(hint)];
 	}
 
-	/** The full rich body in a native capped scroller; null keeps plain reports on their rendered rows. */
+	/** One capped native scroller per section. Hiding, rather than removing, preserves the terminal's offset. */
 	describe(cx: DescribeContext): NativeNode | null {
-		const rich = this.#rich;
-		if (rich === undefined) return null;
-		const height = Math.max(1, this.#height());
-		const inner = rich.describe(cx);
-		const scroll = this.#nativeScroll;
-		if (this.#native?.inner === inner && this.#native.height === height && this.#native.scroll === scroll) return this.#native.node;
-		// The terminal scrolls this keyed body for each new nonce; the cache keeps a node until one arrives.
-		const body = {
-			k: "col" as const,
-			p: { role: "omp.report.body", max: { h: `${height}lines` as `${number}lines` } },
-			c: [inner],
-			key: "body",
-			...(scroll === undefined ? {} : { scroll }),
-		} satisfies Extract<NativeNode, { k: "col" }>;
-		const hint = text([span(SCROLL_HINT, "dim")], { wrap: "word" });
-		const view = node("col", undefined, [body, hint], "view");
-		this.#native = { inner, height, scroll, node: view };
+		this.#syncTabs();
+		const active = this.#page;
+		if (active.rich === undefined) return null;
+		const height = this.#height(this.#tabs === undefined ? 1 : 2);
+		const epoch = getThemeEpoch();
+		if (this.#native?.height === height && this.#native.epoch === epoch) return this.#native.node;
+		const children: NativeNode[] = [];
+		if (this.#tabs !== undefined) children.push(keyed(this.#tabs.describe(cx), "tabs"));
+		for (const page of this.#pages) {
+			children.push({
+				k: "col",
+				p: { role: "omp.report.body", max: { h: `${height}lines` }, ...(page !== active && { hidden: true }) },
+				c: [page.rich!.describe(cx)],
+				key: page.key,
+				...(page.nativeScroll && { scroll: page.nativeScroll }),
+			});
+		}
+		children.push(text([span(this.#hint, "dim")], { wrap: "none", truncate: "end" }));
+		const view = node("col", undefined, children, "view");
+		this.#native = { height, epoch, node: view };
 		return view;
 	}
 
 	handleInput(data: string): void {
-		// Natively the key becomes a scroll request on the described body; ANSI keeps scrolling the ScrollView.
-		const by: NativeScroll["by"] | undefined =
-			matchesKey(data, "shift+up") || matchesKey(data, "up")
-				? "line-up"
-				: matchesKey(data, "shift+down") || matchesKey(data, "down")
-					? "line-down"
-					: matchesKey(data, "pageUp")
-						? "page-up"
-						: matchesKey(data, "pageDown")
-							? "page-down"
-							: matchesKey(data, "home")
-								? "start"
-								: matchesKey(data, "end")
-									? "end"
-									: undefined;
-		if (this.#scroll.handleScrollKey(data)) {
-			if (by !== undefined) this.#nativeScroll = { by, n: (this.#nativeScroll?.n ?? 0) + 1 };
+		// A focused native custom overlay still receives ordinary keys here. Native events are pointer actions.
+		if (this.#tabs !== undefined) {
+			if (this.#tabs.handleInput(data)) return;
+			const key = parseKey(data);
+			const tab = REPORT_TABS.find(tab => tab.key === key);
+			if (tab !== undefined && this.#tabs.selectTab(tab.id)) return;
+		}
+		const page = this.#page;
+		if (page.scroll.handleScrollKey(data)) {
+			const fastUp = matchesKey(data, "shift+up");
+			const fastDown = matchesKey(data, "shift+down");
+			const by: NativeScroll["by"] | undefined =
+				fastUp || matchesKey(data, "up")
+					? "line-up"
+					: fastDown || matchesKey(data, "down")
+						? "line-down"
+						: matchesKey(data, "pageUp")
+							? "page-up"
+							: matchesKey(data, "pageDown")
+								? "page-down"
+								: matchesKey(data, "home")
+									? "start"
+									: matchesKey(data, "end")
+										? "end"
+										: undefined;
+			if (by !== undefined) {
+				// Tern's reconciler repeats a step by the nonce delta (jumps still happen once).
+				page.nativeScroll = { by, n: (page.nativeScroll?.n ?? 0) + (fastUp || fastDown ? FAST_SCROLL_LINES : 1) };
+				this.#native = undefined;
+			}
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, "escape") || matchesKey(data, "enter") || data === "q") this.close();
+		if (matchesKey(data, "escape") || matchesKey(data, "enter") || matchesKey(data, "q")) this.close();
+	}
+
+	handleNativeEvent(event: NativeUiEvent): void {
+		if (event.key === "tabs") this.#tabs?.handleNativeEvent(event);
+		else if (event.key === "" && event.type === "action" && event.act === "close") this.close();
 	}
 
 	invalidate(): void {
-		this.#scroll.invalidate();
+		for (const page of this.#pages) page.scroll.invalidate();
+		this.#native = undefined;
+	}
+
+	dispose(): void {
+		for (const page of this.#pages) page.scroll.dispose();
 		this.#native = undefined;
 	}
 }
@@ -348,15 +451,21 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 		);
 	};
 	const drawsComponents = ctx.mode === "tui" && ctx.hasUI;
+	const openReport = async (title: string, markdown: string, info: readonly InfoLine[] | undefined, sectional: boolean): Promise<void> => {
+		const tabbed = sectional && info?.some(line => line.section !== undefined) === true;
+		await ctx.ui.custom<void>((tui, _theme, _keys, done) => new ReportView(tui, title, markdown, info, tabbed, () => done()), {
+			overlay: true,
+			overlayOptions: tabbed
+				? { width: "90%", maxHeight: "90%", anchor: "top-center", margin: { top: 1 } }
+				: { width: "90%", maxHeight: "90%", anchor: "center" },
+		});
+	};
 	const report = async (title: string, markdown: string, info?: readonly InfoLine[]): Promise<void> => {
 		if (!drawsComponents) {
 			transcript(title, markdown);
 			return;
 		}
-		await ctx.ui.custom<void>((tui, _theme, _keys, done) => new ReportView(tui, title, markdown, info, () => done()), {
-			overlay: true,
-			overlayOptions: { width: "90%", maxHeight: "90%", anchor: "center" },
-		});
+		await openReport(title, markdown, info, true);
 	};
 	// RPC hosts have no form surface. An ACP client without form support does have the method (omp tells extensions
 	// nothing about the client's capabilities), but there it answers undefined, as its selects do: every dialog is a cancel.
@@ -391,7 +500,8 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 					ctx.ui.setWidget(PANEL_KEY, undefined);
 				}
 				if (answer !== FULL_VIEW) return answer;
-				await report(context.title, context.markdown, context.info);
+				// The whole approval stays in one linear view, regardless of the context's annotations.
+				await openReport(context.title, context.markdown, context.info, false);
 				seen = true;
 			}
 		},

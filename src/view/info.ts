@@ -15,6 +15,7 @@ import {
 	getThemeEpoch,
 	Markdown,
 	Spacer,
+	type SymbolKey,
 	Text,
 	singleLine,
 	theme,
@@ -43,6 +44,74 @@ export interface InfoRichBlock {
 }
 
 export type InfoBlock = InfoProseBlock | InfoRichBlock;
+
+type Section = NonNullable<InfoLine["section"]>;
+
+/** The theme symbols Storm's status hierarchy uses; anything else from a producer is not a trusted icon. */
+const INFO_SYMBOLS: Partial<Record<SymbolKey, true>> = {
+	"status.info": true,
+	"status.success": true,
+	"status.warning": true,
+	"status.error": true,
+	"status.pending": true,
+	"status.enabled": true,
+	"status.running": true,
+	"status.shadowed": true,
+	"context.content": true,
+};
+
+function knownSymbol(icon: unknown): SymbolKey | undefined {
+	return typeof icon === "string" && INFO_SYMBOLS[icon as SymbolKey] === true ? (icon as SymbolKey) : undefined;
+}
+
+/** Resolve a producer's icon through the active preset; unknown keys and empty glyphs render nothing. */
+export function infoSymbol(icon: unknown): string | undefined {
+	const key = knownSymbol(icon);
+	if (key === undefined) return undefined;
+	const glyph = singleLine(sanitizeText(theme.symbol(key)));
+	return glyph.length > 0 ? glyph : undefined;
+}
+
+/** The icon takes the line's emphasis or the first semantic tone, never an unrelated one. */
+function iconTone(line: InfoLine): InfoTone | undefined {
+	if (line.emphasis === "action") return "warning";
+	const semantic = line.spans.find(span => span.tone !== undefined)?.tone;
+	if (line.emphasis === "title") return semantic ?? "accent";
+	return semantic;
+}
+
+/** Split a sectional report before rendering, keeping repeated slices of a section in source order. */
+export function infoSections(markdown: string, info: readonly InfoLine[] | undefined) {
+	if (!info?.some(line => line.section !== undefined)) return undefined;
+	const source = markdown.split("\n");
+	const annotations = new Map<number, InfoLine>();
+	let marked = false;
+	for (const line of info) {
+		const { index } = line;
+		if (!Number.isInteger(index) || index < 0 || index >= source.length || annotations.has(index)) continue;
+		annotations.set(index, line);
+		if (line.section !== undefined) marked = true;
+	}
+	if (!marked) return undefined;
+
+	const sections = new Map<Section, { lines: string[]; info: InfoLine[] }>();
+	let section: Section = "overview";
+	let slice: { lines: string[]; info: InfoLine[] } | undefined;
+	for (let index = 0; index < source.length; index++) {
+		const line = annotations.get(index);
+		if (slice === undefined || (line?.section !== undefined && line.section !== section)) {
+			section = line?.section ?? section;
+			slice = sections.get(section);
+			if (slice === undefined) {
+				slice = { lines: [], info: [] };
+				sections.set(section, slice);
+			}
+		}
+		if (line !== undefined) slice.info.push({ ...line, index: slice.lines.length });
+		slice.lines.push(source[index]!);
+	}
+	return sections;
+}
 
 function isTone(value: unknown): value is InfoTone {
 	return value === "accent" || value === "success" || value === "warning" || value === "error" || value === "muted";
@@ -74,8 +143,9 @@ function normalizedInfo(markdown: string, info: readonly InfoLine[] | undefined)
 						tone: isTone(line.meter.tone) ? line.meter.tone : "muted",
 					}
 				: undefined;
-		if (meter === undefined) byIndex.set(index, { index, spans });
-		else byIndex.set(index, { index, spans, meter });
+		const emphasis = line.emphasis === "title" || line.emphasis === "action" ? line.emphasis : undefined;
+		const icon = knownSymbol(line.icon);
+		byIndex.set(index, { index, spans, ...(meter && { meter }), ...(icon && { icon }), ...(emphasis && { emphasis }) });
 	}
 	return byIndex;
 }
@@ -122,8 +192,13 @@ export function renderMeterAnsi(meter: NonNullable<InfoLine["meter"]>, width = M
 /** ANSI rows for one annotated logical line: themed spans, then a meter that fits beside them or on its own row. */
 export function renderInfoLine(line: InfoLine, width: number): readonly string[] {
 	const safe = Math.max(1, width);
-	let source = "";
-	for (const run of line.spans) source += run.tone === undefined ? theme.fg(BODY_TEXT, run.text) : theme.fg(run.tone, run.text);
+	const defaultTone = line.emphasis === "action" ? "warning" : BODY_TEXT;
+	const icon = infoSymbol(line.icon);
+	let source = icon === undefined ? "" : `${theme.fg(iconTone(line) ?? BODY_TEXT, icon)} `;
+	for (const run of line.spans) {
+		const styled = line.emphasis === undefined ? run.text : theme.bold(run.text);
+		source += theme.fg(run.tone ?? defaultTone, styled);
+	}
 	const rows = [...wrapTextWithAnsi(source, safe)];
 	if (!line.meter) return rows.length === 0 ? [""] : rows;
 	const meter = renderMeterAnsi(line.meter, safe);
@@ -135,7 +210,15 @@ export function renderInfoLine(line: InfoLine, width: number): readonly string[]
 
 /** One native annotated line: semantic spans with a determinate progress bar directly beneath. */
 export function describeInfoLine(line: InfoLine): NativeNode {
-	const body = text(line.spans.map(run => span(run.text, run.tone)), { wrap: "word" });
+	const defaultTone = line.emphasis === "action" ? "warning" : BODY_TEXT;
+	const icon = infoSymbol(line.icon);
+	const body = text(
+		[
+			...(icon === undefined ? [] : [span(icon, iconTone(line) ?? BODY_TEXT), span(" ")]),
+			...line.spans.map(run => span(run.text, line.emphasis === undefined ? run.tone : `${run.tone ?? defaultTone} strong`)),
+		],
+		{ wrap: "word" },
+	);
 	if (!line.meter) return body;
 	const percent = `${Math.round(line.meter.fraction * 100)}%`;
 	const meter = node("progress", { value: line.meter.fraction, tone: line.meter.tone, aria: percent });

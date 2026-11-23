@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetAgents } from "../src/runtime/agents.ts";
-import { agentRecordFiles, bytesText, formatStorage, formatStorageDetail, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
+import { agentRecordFiles, bytesText, formatStorage, formatStorageDetail, storageDetailLines, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
 import { appendRunIndex, readRunIndex, summarizeForIndex } from "../src/runtime/run-index.ts";
 import { pruneRuns, readRun, writeRun } from "../src/runtime/run.ts";
 import { pruneTrialStates, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
@@ -410,6 +410,10 @@ describe("storage inventory", () => {
 		const detail = formatStorageDetail(view, true).join("\n");
 		for (const part of ["최근 3개 실행 보호", "정리 후보", "소유 미상", "자동 삭제하지 않음", "상위 세션 전사", "세션 spill", "정리 대상 아님"]) expect(detail).toContain(part);
 		expect(detail).not.toContain(tmp);
+		const tags = storageDetailLines(view, true);
+		expect(tags.find(line => line.text.startsWith("소유 미상"))?.warning).toBe(true);
+		expect(tags.find(line => line.text.startsWith("정리 후보"))?.warning).toBeUndefined();
+		expect(tags.find(line => line.text.startsWith("최근 3개 실행 보호"))?.warning).toBeUndefined();
 		const line = formatStorage(view, true);
 		for (const part of ["정리 후보 4개 190B", "소유 미상 3개 19B", "omp 자식 기록 9개 234B"]) expect(line).toContain(part);
 	});
@@ -440,6 +444,24 @@ describe("storage inventory", () => {
 		expect(formatStorageDetail(off, false).join("\n")).toContain("자동 정리가 꺼져 있음");
 	});
 
+	test("cleanup off alone is never a storage warning; an unknown owner is", async () => {
+		await writeRecord("Old.jsonl", "o".repeat(10));
+		await writeRecord("Orphan/Orphan.child.jsonl", "x".repeat(5));
+		await trustRuns([
+			{ process: dead, agents: ["Old"] },
+			{ process: dead, agents: [] },
+			{ process: dead, agents: [] },
+			{ process: dead, agents: [] },
+		]);
+		const view = await readStorage(root, storeDir, sessions, { cleanup: false, sessionDir: path.join(sessions, "proj") });
+		const tags = storageDetailLines(view, false);
+		const pending = tags.find(entry => entry.text.startsWith("판단 보류"))!;
+		expect(pending.text).toContain("정리 꺼짐");
+		expect(pending.warning).toBeUndefined();
+		expect(tags.find(entry => entry.text.startsWith("정리 후보: 없음"))?.warning).toBeUndefined();
+		expect(tags.find(entry => entry.text.startsWith("소유 미상"))?.warning).toBe(true);
+	});
+
 	test("stale, missing and outside roots are gaps, never measured zeros", async () => {
 		const missing = path.join(sessions, "proj", "gone");
 		const outside = path.join(tmp, "outside", "sess");
@@ -460,6 +482,9 @@ describe("storage inventory", () => {
 		expect(detail).toContain("실행 목록의 세션 폴더 2곳 사용 불가");
 		expect(detail).toContain("현재 세션 폴더 미지정");
 		expect(detail).toContain("마지막 정리 없음");
+		const tags = storageDetailLines(stale, true);
+		expect(tags.find(entry => entry.text.startsWith("omp 자식 기록: 측정 불가"))?.warning).toBe(true);
+		expect(tags.find(entry => entry.text.startsWith("마지막 정리 없음"))?.warning).toBeUndefined();
 
 		const noRoot = await readStorage(root, storeDir, path.join(tmp, "agent", "absent"), { cleanup: true });
 		expect(noRoot.gaps.sessionsRoot).toBe(true);
@@ -477,6 +502,9 @@ describe("storage inventory", () => {
 		expect(view.total.transcripts.files).toBe(0);
 		expect(formatStorage(view, true)).toContain("일부 누락");
 		expect(formatStorageDetail(view, true).join("\n")).toContain("상위 세션 기록이 없는 폴더 1곳 제외");
+		const tags = storageDetailLines(view, true);
+		expect(tags.find(entry => entry.text.startsWith("집계 누락"))?.warning).toBe(true);
+		expect(tags.find(entry => entry.text.startsWith("상위 세션 전사"))?.warning).toBeUndefined();
 	});
 
 	test("symlinks are never followed and unreadable directories are counted as gaps", async () => {

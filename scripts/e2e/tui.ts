@@ -12,7 +12,7 @@
  * log are what is asserted; the screen is read to know what has the focus. Directive payloads are typed as base64,
  * so no key of them means anything to the composer.
  */
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
@@ -56,6 +56,19 @@ const ASK_ANSWER = "resume-ok";
 /** The widget's static header text: the shared mark, then the shared phase label. */
 const phaseHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
 
+const RADAR_FIELD = /\[[\u2801-\u28ff]{18}\]/;
+const metricsRow = (text: string, preset: "unicode" | "ascii" = "unicode"): string | undefined => {
+	const chips = preset === "unicode" ? /↻\s*\d+\/\d+.*👥\s*\d+\/\d+/u : /\bloop\s*\d+\/\d+.*\bAG\s*\d+\/\d+/;
+	return text.split("\n").map(line => line.trim()).findLast(line => chips.test(line));
+};
+
+function radarFrames(text: string, phase: RunPhase): Set<string> {
+	const head = phaseHeader(phase);
+	return new Set(text.split("\n").flatMap(line => {
+		const field = line.includes(head) ? line.match(RADAR_FIELD)?.[0] : undefined;
+		return field ? [field] : [];
+	}));
+}
 /** The last rendered row carrying a live phase header, without surrounding box edges or padding. */
 function phaseRow(text: string, phase: RunPhase): string | undefined {
 	const header = phaseHeader(phase);
@@ -79,7 +92,7 @@ function idleFooter(line: string | undefined): boolean {
 }
 
 async function session<T>(body: (tui: Tui) => Promise<T>): Promise<T> {
-	const tui = new Tui(env, { model: "fake/general-b" });
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"] });
 	try {
 		await tui.ready();
 		return await body(tui);
@@ -161,6 +174,10 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-DELAY 3000" }, { awaitChild: true }];
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 		await tui.seen(started, text => (phaseRow(text, "workers") !== undefined ? true : undefined), named("workers phase"), 30_000);
+		const active = await tui.seen(started, text => {
+			const metrics = metricsRow(text);
+			return metrics && /👥\s*1\/1\b/u.test(metrics) ? metrics : undefined;
+		}, named("the live chip to report one active worker out of one"), 20_000);
 		// Let the child's request land and its spend repaint once; then the still row is what motion off should hold.
 		let first = phaseRow(tui.text(started), "workers");
 		let stableSince = Date.now();
@@ -173,18 +190,65 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 			}
 		}
 		check(
-			named("the narrow live status keeps its phase header and fits"),
-			first !== undefined && first.includes("/4라운드") && Bun.stringWidth(first) <= columns,
-			`${Bun.stringWidth(first ?? "")} > ${columns}: ${first}`,
+			named("the phase, radar and active worker count fit at 60 columns"),
+			first !== undefined && RADAR_FIELD.test(first) && [first, active].every(line => Bun.stringWidth(line) <= columns),
+			`${first} / ${active}`,
 		);
 		await Bun.sleep(800);
 		const second = phaseRow(tui.text(started), "workers");
-		check(named("motion off leaves the narrow live status still"), first !== undefined && second === first, `${first} → ${second}`);
+		check(named("motion off leaves the radar still"), first !== undefined && second === first && radarFrames(tui.text(started), "workers").size === 1, `${first} → ${second}`);
 		const run = await files.finishedRun(before, 120_000);
 		check(named("the narrow run ends on its own"), run.endReason === "no-changes" && run.status === "ended", `${run.status} ${run.endReason}`);
 		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+		if (background === "dark") {
+			const hub = await tui.submit("/storm");
+			const choices = await tui.selector(hub);
+			check("the narrow hub offers the full dashboard without putting model rows above the menu", choices.includes("전체 현황") && !tui.text(hub).includes("fake/general-b →"));
+			const full = await tui.pick(choices, "전체 현황");
+			await tui.shows(OVERLAY_HINT, full);
+			const storage = await tui.press("4", text => text.includes("Storm 데이터"), "the storage tab to show its actual inventory");
+			const storageReport = tui.text(storage);
+			check("a storage coverage gap has the OMP warning icon and a readable reason", /⚠[^\n]*(측정 불가|집계 누락|일부 누락)/u.test(storageReport));
+			const runtime = await tui.press("\x1b[D", text => text.includes("서브에이전트") && text.includes("컨텍스트") && text.includes("후속 지시"), "Left to show readable worker details on the runtime tab");
+			check("the narrow runtime view keeps worker metrics out of a wrapped table", !tui.text(runtime).includes("┌──"));
+			check("the storage tab is reachable directly at 60 columns", tui.text(storage).includes("Storm 데이터"));
+			tui.send(KEY.enter);
+		}
 	} finally {
 		await tui.close();
+	}
+}
+
+/** OMP's ASCII setting, not a separate Storm switch. Change only the isolated fixture for this session. */
+async function asciiDashboard(): Promise<void> {
+	const profile = join(env.agentDir, "config.yml");
+	const original = readFileSync(profile, "utf8");
+	writeFileSync(profile, `${original.trimEnd()}\nsymbolPreset: ascii\n`);
+	const columns = 60;
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30 });
+	try {
+		await tui.ready();
+		const before = files.runIds();
+		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Ascii", say: "E2E-CHILD-DELAY 2500" }, { awaitChild: true }];
+		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+		const displayed = await tui.seen(started, text => {
+			const state = text.split("\n").findLast(line => line.includes("STORM") && line.includes(RUN_APPEARANCE.workers.label));
+			const chips = metricsRow(text, "ascii");
+			return state && chips && /\bAG\s*1\/1\b/.test(chips) ? { state: state.trim(), chips } : undefined;
+		}, "the 60-column Storm phase and OMP ASCII count chips", 20_000);
+		check("the ASCII preset uses readable count chips and no Braille radar", !/[\u2800-\u28ff]/u.test(displayed.state) && !displayed.chips.includes("👥"), `${displayed.state} / ${displayed.chips}`);
+		check("the measured ASCII rows fit the actual terminal", [displayed.state, displayed.chips].every(line => Bun.stringWidth(line) <= columns), displayed.chips);
+		check("the ASCII cost chip uses one leading currency sign", /\$\s*0\.\d+\/\$\d/.test(displayed.chips) && !/\$\s+\$/.test(displayed.chips), displayed.chips);
+		const run = await files.finishedRun(before, 30_000);
+		check("the ASCII worker run settles normally", run.endReason === "no-changes");
+		const status = await tui.submit("/storm status");
+		await tui.shows(OVERLAY_HINT, status);
+		const storage = await tui.press("4", text => text.includes("Storm 데이터"), "the ASCII status storage tab");
+		check("the ASCII tab uses the host's warning symbol, not a Unicode glyph", /\[!\][^\n]*(측정 불가|집계 누락|일부 누락)/.test(tui.text(storage)));
+		tui.send(KEY.enter);
+	} finally {
+		await tui.close();
+		writeFileSync(profile, original);
 	}
 }
 
@@ -221,16 +285,9 @@ async function main(): Promise<void> {
 				const report = tui.text(status);
 				const heading = `${STORM_MARK} · ${IDLE.label} · v${STORM_VERSION}`;
 				const head = report.indexOf(heading);
-				check(
-					"/storm status leads with the shared Storm mark and the approved team's idle state",
-					head >= 0 && report.slice(head).includes("팀 설정"),
-					report.slice(Math.max(0, head), Math.max(0, head) + 300),
-				);
-				check(
-					"the status heading keeps the team's priority beside its setting",
-					head >= 0 && report.slice(head).includes(`우선순위 ${priorityLabel(files.config().priority)}`),
-					`priority=${files.config().priority}`,
-				);
+				check("the overview leads with the shared mark and idle state without listing role models", head >= 0 && !report.includes("역할별 모델"), report.slice(Math.max(0, head), Math.max(0, head) + 300));
+				const team = await tui.press("2", text => text.includes("팀 설정") && text.includes("승인됨"), "the team tab after setup");
+				check("the team tab shows the approved priority", tui.text(team).includes(`우선순위 ${priorityLabel(files.config().priority)}`), `priority=${files.config().priority}`);
 				tui.send(KEY.enter);
 				await suite.eventually("the calm idle footer names the approved team", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line");
 				const calm = statusLine(tui.raw);
@@ -339,6 +396,7 @@ async function main(): Promise<void> {
 					askPanel.slice(-600),
 				);
 				check("the native ask offers Submit", askPanel.includes("Submit"), askPanel.slice(-600));
+				check("waiting for the user shows the radar without a moving field", radarFrames(shown, "waiting-user").size === 1);
 				const live = await until(() => files.runs().find(run => !before.has(run.runId) && run.status === "running"), 20_000, "the asked run to be active");
 				await tui.press(ASK_ANSWER, text => text.includes(ASK_ANSWER), "the ask control to show the answer");
 				/** The exact answer as the fake provider saw it, not merely text left in the form. */
@@ -369,12 +427,16 @@ async function main(): Promise<void> {
 					}
 					if (!submitted) tui.send(KEY.enter);
 				}
-				await tui.seen(
+				const frames = await tui.seen(
 					first,
-					text => (text.includes(phaseHeader("workers")) || text.includes(phaseHeader("working")) ? true : undefined),
-					"the answered run to continue into work",
-					60_000,
+					text => {
+						const fields = radarFrames(text, "workers");
+						return fields.size >= 2 ? fields : undefined;
+					},
+					"the answered run to resume with at least two distinct worker radar frames",
+					15_000,
 				);
+				console.log(`     real worker radar: ${[...frames].slice(0, 2).join(" → ")}`);
 				await until(answerArrived, 30_000, "the named answer to reach the director");
 				const run = await files.finishedRun(before, 150_000);
 				check("the answer resumed the same run", run.runId === live.runId && run.status !== "running", `${run.runId} vs ${live.runId} ${run.status}`);
@@ -413,12 +475,13 @@ async function main(): Promise<void> {
 					const before = files.runIds();
 					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 					await suite.eventually(
-						"the live widget shows an active phase header with the round and budget",
-						() =>
-							(["working", "workers", "verifying"] as const).some(phase => {
-								const row = phaseRow(tui.text(started), phase);
-								return row !== undefined && row.includes("/4라운드") && row.includes("$0.01");
-							}),
+						"the live widget shows a radar and a fixed row with the round and budget",
+						() => {
+							const painted = tui.text(started);
+							const numbers = metricsRow(painted);
+							return numbers !== undefined && numbers.includes("💲") && numbers.includes("0.01") &&
+								(["working", "workers", "verifying"] as const).some(phase => radarFrames(painted, phase).size !== 0);
+						},
 						() => "",
 						30_000,
 					);
@@ -464,20 +527,12 @@ async function main(): Promise<void> {
 					const top = tui.text(status);
 					const heading = `${STORM_MARK} · ${IDLE.label} · v${STORM_VERSION}`;
 					const head = top.indexOf(heading);
-					check("the TUI renders the approved team's status", top.includes("승인됨") && top.includes("마지막 실행"));
-					check(
-						"/storm status leads with the shared Storm mark and the idle state",
-						head >= 0 && top.slice(head).includes("팀 설정"),
-						top.slice(Math.max(0, head), Math.max(0, head) + 300),
-					);
-					const teamAt = top.indexOf("팀 설정", Math.max(0, head));
-					const approvalAt = top.indexOf("승인", Math.max(0, head));
-					check(
-						"the heading keeps the team setting, its priority, before the approval section",
-						teamAt > head && teamAt < approvalAt && top.slice(teamAt, approvalAt).includes(`우선순위 ${priorityLabel(files.config().priority)}`),
-						`head=${head} team=${teamAt} approval=${approvalAt} priority=${files.config().priority}`,
-					);
+					check("the overview leads with the shared state and last run, without the team detail", head >= 0 && top.includes("마지막 실행") && !top.includes("역할별 모델"), top.slice(0, 300));
 					check("the budget amount and partially filled meter are visible together", top.includes("$0.01") && top.includes(run.runId) && /█+░+/.test(top));
+					const team = await tui.press("2", text => text.includes("팀 설정") && text.includes("승인됨"), "team tab with the approved configuration");
+					check("the team tab keeps the approved priority and roles", tui.text(team).includes(`우선순위 ${priorityLabel(files.config().priority)}`));
+					const overview = await tui.press("\x1b[D", text => text.includes("마지막 실행"), "Left to return to the overview");
+					check("overview takes no focus away from the report", tui.text(overview).includes(run.runId));
 					tui.send(KEY.enter);
 					await suite.eventually("the footer returns to idle after the status report", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 				});
@@ -496,6 +551,8 @@ async function main(): Promise<void> {
 		},
 		300_000,
 	);
+
+	await suite.step("the OMP ASCII preset keeps the live chips and status usable", asciiDashboard, 90_000);
 
 	await suite.step("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
 		await session(async tui => {

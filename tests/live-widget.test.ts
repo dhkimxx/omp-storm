@@ -1,8 +1,5 @@
 /**
- * The live run widget's lifecycle: one below-editor component per run, a phase header that alone may shimmer,
- * static counters from the same formatter as `runStatusText`, a terminal-clocked Tern description, and no timer
- * after a still phase, the run ends, the host replaces it or the session switches. A fake host renders the
- * component the way omp's TUI does; no real terminal is needed.
+ * Live radar layout, structured metric chips, animation isolation, and native and plain terminal motion preferences.
  */
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -14,6 +11,7 @@ import {
 	type NativeNode,
 	setMotionEffects,
 	setNativeRendering,
+	setNativeSymbolPreset,
 	setShimmerMode,
 	theme as activeTheme,
 	type TUI,
@@ -21,7 +19,6 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
 import { LIVE_WIDGET_KEY, LiveStatus } from "../src/view/live.ts";
-import { runStatusCounters } from "../src/view/render.ts";
 import type { RunRecord } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
@@ -38,13 +35,16 @@ const RUN: RunRecord = runRecord({
 	budget: { perRunUsd: 5, onExceed: "block-spawns" },
 	agents: [agentEntry({ id: "Impl", state: "running" }), agentEntry({ id: "Rev", state: "idle" })],
 });
-const COUNTERS = "1/4라운드 · 서브에이전트 2(실행 중 1) · $0.1200/$5.00 · 3분";
+const COUNTERS = "↻ 1/4라운드 · 👥 1/2 · 💲 $0.1200/$5.00 · ⏱ 3분";
+const ASCII_MARK = "~ STORM";
+const ASCII_COUNTERS = "loop 1/4라운드 - AG 1/2 - $0.1200/$5.00 - t: 3분";
 
 type Widget = Component & { dispose?(): void };
 type WidgetFactory = (tui: TUI) => Widget;
 
 interface WidgetHost {
 	ctx: ExtensionContext;
+	ui: { theme: typeof activeTheme };
 	installs: Array<{ key: string; placement: string | undefined }>;
 	statuses: Array<string | undefined>;
 	widgets: Map<string, Widget>;
@@ -81,6 +81,7 @@ function widgetHost(): WidgetHost {
 	};
 	return {
 		ctx: { mode: "tui", hasUI: true, agent: { kind: "main", id: "main", name: "main" }, ui } as unknown as ExtensionContext,
+		ui,
 		installs,
 		statuses,
 		widgets,
@@ -92,10 +93,30 @@ function plain(rows: readonly string[]): string[] {
 	return rows.map(row => Bun.stripANSI(row));
 }
 
+interface NativeTextProps {
+	text?: string;
+	spans?: readonly { t: string; s?: string }[];
+	aria?: string;
+	role?: string;
+	palette?: Record<string, string>;
+}
+
+/** Test-only read of TSP's published props; the nodes inspected here are text and shimmer nodes. */
+function nativeProps(node: NativeNode): NativeTextProps {
+	// Test-only: the inspected nodes are text/shimmer, whose published props the test helper narrows here.
+	const props = (node.p ?? {}) as NativeTextProps;
+	return props;
+}
+
 function nodeText(node: NativeNode): string {
-	// Test-only read of TSP's published text/shimmer prop shape.
-	const props = node.p as { text?: string; spans?: readonly { t: string }[] } | undefined;
-	return props?.text ?? (props?.spans ?? []).map(part => part.t).join("");
+	const props = nativeProps(node);
+	return props.text ?? (props.spans ?? []).map(part => part.t).join("");
+}
+
+function flatText(node: NativeNode): string {
+	const own = nodeText(node);
+	if (own.length > 0) return own;
+	return (node.c ?? []).map(child => ("k" in child ? flatText(child) : "")).join("");
 }
 
 /** The described (non-component) children of a node, in sibling order. */
@@ -105,8 +126,16 @@ function children(node: NativeNode): NativeNode[] {
 	return out;
 }
 
+function styles(node: NativeNode): string[] {
+	return (nativeProps(node).spans ?? []).map(part => part.s ?? "");
+}
+
+function metricChips(row: NativeNode): NativeNode[] {
+	return children(row).filter(node => nativeProps(node).role?.startsWith("omp.storm.live.") === true);
+}
+
 const liveHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
-const fullLine = (phase: RunPhase = "working", run: RunRecord = RUN, now = NOW): string => `${liveHeader(phase)} · ${runStatusCounters(run, now)}`;
+const radar = /\[[\u2801-\u28ff]{18}\]$/;
 
 const describeContext = {
 	cols: 100,
@@ -115,68 +144,111 @@ const describeContext = {
 	supports: (kind: string) => kind === "shimmer",
 } as unknown as DescribeContext;
 
+const activeWidgets: LiveStatus[] = [];
+
+function liveForTest(): LiveStatus {
+	const live = new LiveStatus({ now: () => NOW });
+	activeWidgets.push(live);
+	return live;
+}
+
 afterEach(() => {
+	for (const live of activeWidgets.splice(0)) live.clear();
 	vi.useRealTimers();
 	setMotionEffects(true);
 	setShimmerMode("classic");
 	setNativeRendering(false);
+	setNativeSymbolPreset(undefined);
 });
 
 describe("the live run widget", () => {
-	test("one row: the wind marker and working state, then static counters; width clips the numbers first", () => {
+	test("whole metric chips fit at 60, while narrow hosts keep the phase and then phase counters", () => {
+		vi.useFakeTimers();
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
 		expect(live.show(host.ctx, RUN)).toBe(true);
-		expect(host.installs).toEqual([{ key: LIVE_WIDGET_KEY, placement: "belowEditor" }]);
-		// The run's label moved into the widget; the footer is never a second, shimmering live status.
 		expect(host.statuses).toEqual([undefined]);
-
 		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
-		expect(plain(component.render(220))).toEqual([fullLine()]);
-		expect(component.render(0)).toEqual([]);
-
 		const header = liveHeader("working");
-		const headerWidth = visibleWidth(header);
-		for (const width of [120, 80, 60, 40, 30, 20, headerWidth + 2, headerWidth + 1, headerWidth]) {
+		for (const width of [120, 80, 60, 52]) {
 			const rows = component.render(width);
-			expect(rows).toHaveLength(1);
-			expect(visibleWidth(rows[0]!)).toBeLessThanOrEqual(width);
-			expect(plain(rows)[0]!.startsWith(header)).toBe(true);
+			const [title, metrics] = plain(rows);
+			expect(rows).toHaveLength(2);
+			expect(rows.every(line => visibleWidth(line) <= width)).toBe(true);
+			expect(title).toStartWith(header);
+			expect(title).toMatch(radar);
+			expect(metrics).toBe(`› ${COUNTERS}`);
 		}
-		// The header survives; the expendable numbers take the ellipsis.
-		const clippedTail = plain(component.render(40))[0]!;
-		expect(clippedTail).not.toBe(fullLine());
-		expect(clippedTail).toEndWith("…");
+		// 49 cells of whole chips, including emoji widths, fit inside the 60-cell acceptance width.
+		expect(visibleWidth(component.render(60)[1]!)).toBe(49);
 
-		// Below the header's own width there is nothing else to protect, so the header truncates last.
-		for (const width of [headerWidth - 1, Math.max(1, headerWidth - 5), 1]) {
+		const narrow: Array<[number, string]> = [
+			// Elapsed is dropped before the Storm mark or a counter; at 51 the mark keeps the compact cost.
+			[51, `${header} · ↻ 1/4라운드 · 👥 1/2 · 💲 $0.12`],
+			[45, `${header} · ↻ 1/4 · 👥 1/2 · 💲 $0.12`],
+			[40, `${header} · ↻ 1/4라운드 · 👥 1/2`],
+			[39, `${header} · ↻ 1/4 · 👥 1/2`],
+			[30, "진행 중 · ↻ 1/4라운드 · 👥 1/2"],
+			[25, "진행 중 · ↻ 1/4 · 👥 1/2"],
+			[24, "진행 중 · ↻ 1/4 · 👥 1/2"],
+			[21, "진행 중 · ↻ 1/4라운드"],
+			[20, "진행 중 · ↻ 1/4"],
+			[17, "진행 중 · ↻ 1/4"],
+			[14, "진행 중"],
+			[8, "진행 중"],
+		];
+		for (const [width, expected] of narrow) {
 			const rows = component.render(width);
 			expect(rows).toHaveLength(1);
+			expect(plain(rows)[0]).toBe(expected);
 			expect(visibleWidth(rows[0]!)).toBeLessThanOrEqual(width);
-			expect(plain(rows)[0]!).toEndWith("…");
+			expect(plain(rows)[0]).not.toMatch(radar);
+			expect(vi.getTimerCount()).toBe(0);
 		}
-		// A resize back to a wide host must repaint the full line, not reuse a narrow cached row.
-		expect(plain(component.render(220))).toEqual([fullLine()]);
+		// Below the phase word itself only the phase may truncate; no chip or separator is ever clipped.
+		const clipped = component.render(6);
+		expect(clipped).toHaveLength(1);
+		expect(plain(clipped)[0]).toBe("진행 …");
+		expect(visibleWidth(clipped[0]!)).toBeLessThanOrEqual(6);
+		expect(component.render(0)).toEqual([]);
+		expect(vi.getTimerCount()).toBe(0);
+
+		// Waiting and stopping are not displaced by counters when the width cannot hold both.
+		for (const phase of ["waiting-user", "stopping"] as const) {
+			live.show(host.ctx, RUN, phase);
+			expect(plain(component.render(12))[0]).toBe(RUN_APPEARANCE[phase].label);
+			expect(plain(component.render(8))[0]).toEndWith("…");
+			expect(plain(component.render(6))[0]).toEndWith("…");
+		}
+
+		const radarOf = (phase: RunPhase): string => {
+			live.show(host.ctx, RUN, phase);
+			return plain(component.render(120))[0]!.match(radar)![0];
+		};
+		expect(new Set([radarOf("working"), radarOf("waiting-user"), radarOf("stopping")]).size).toBe(3);
+
+		// The running/total pair is explicit even when the ledger has no agents left.
+		live.show(host.ctx, { ...RUN, agents: [] });
+		expect(plain(component.render(60))[1]).toBe("› ↻ 1/4라운드 · 👥 0/0 · 💲 $0.1200/$5.00 · ⏱ 3분");
 		live.clear();
 	});
 
 	test("a still phase stops the one timer immediately and snaps to still; resuming and ending leave no extra", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
 		live.show(host.ctx, RUN);
 		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
 		expect(vi.getTimerCount()).toBe(0);
-		expect(plain(component.render(120))).toEqual([fullLine("working")]);
+		const first = component.render(120);
 		expect(vi.getTimerCount()).toBe(1);
 		const ticking = host.requests.length;
 		vi.advanceTimersByTime(100);
+		const next = component.render(120);
 		expect(host.requests.length).toBeGreaterThan(ticking);
-
-		// The counters stay put within a phase: only the one header span moves.
-		const frozen = plain(component.render(120))[0]!;
-		vi.advanceTimersByTime(2_000);
-		expect(plain(component.render(120))[0]!).toBe(frozen);
+		expect(plain(next)[0]).toStartWith(liveHeader("working"));
+		expect(plain(next)[0]!.match(radar)?.[0]).not.toBe(plain(first)[0]!.match(radar)?.[0]);
+		expect(next[1]).toBe(first[1]);
 
 		for (const phase of ["waiting-user", "between-rounds", "stopping"] as const) {
 			live.show(host.ctx, RUN, phase);
@@ -184,7 +256,10 @@ describe("the live run widget", () => {
 			const requests = host.requests.length;
 			vi.advanceTimersByTime(1_000);
 			expect(host.requests.length).toBe(requests);
-			expect(plain(component.render(120))).toEqual([fullLine(phase)]);
+			const [title, metrics] = plain(component.render(120));
+			expect(title).toStartWith(liveHeader(phase));
+			expect(title).toMatch(radar);
+			expect(metrics).toBe(`› ${COUNTERS}`);
 			expect(vi.getTimerCount()).toBe(0);
 		}
 
@@ -205,67 +280,116 @@ describe("the live run widget", () => {
 		expect(host.statuses).toEqual([undefined]);
 	});
 
-	test("Tern shimmers only the active header and stills it for reduced motion, capability or either switch", () => {
+	test("native metrics carry whole labels and aria; a narrow host gets one compact line", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
+		live.show(host.ctx, RUN);
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		const native = component.describe!(describeContext)!;
+		const [, metrics] = children(native);
+		const chips = metricChips(metrics!);
+		expect(chips.map(nodeText)).toEqual(["↻ 1/4라운드", "👥 1/2", "💲 $0.1200/$5.00", "⏱ 3분"]);
+		expect(chips.map(chip => nativeProps(chip).aria)).toEqual([
+			"라운드 1/4",
+			"워커 실행 중 1/2",
+			"비용 $0.1200 / 예산 $5.00",
+			"경과 3분",
+		]);
+		expect(flatText(metrics!)).toBe(`› ${COUNTERS}`);
+
+		const narrow = component.describe!({ ...describeContext, cols: 38 })!;
+		expect(flatText(narrow)).toBe("≋ STORM · 진행 중 · ↻ 1/4 · 👥 1/2");
+		expect(nativeProps(narrow).aria).toBe("≋ STORM · 진행 중: 라운드 1/4 · 워커 실행 중 1/2");
+		live.clear();
+	});
+
+	test("only the approved budget thresholds tint spend; the state word carries it too", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		const budget = { perRunUsd: 5, warnAtUsd: 4, onExceed: "block-spawns" as const };
+		live.show(host.ctx, { ...RUN, costUsd: 3.5, budget });
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		expect(plain(component.render(120))[1]).toBe("› ↻ 1/4라운드 · 👥 1/2 · 💲 $3.50/$5.00 · ⏱ 3분");
+
+		const costChip = () => {
+			const metrics = children(component.describe!(describeContext)!)[1]!;
+			return metricChips(metrics).find(chip => nativeProps(chip).role === "omp.storm.live.cost")!;
+		};
+		expect(styles(costChip()).some(style => style.includes("warning") || style.includes("error"))).toBe(false);
+
+		live.show(host.ctx, { ...RUN, costUsd: 4, budget });
+		expect(plain(component.render(120))[1]).toBe("› ↻ 1/4라운드 · 👥 1/2 · 💲 $4.00/$5.00 경고 · ⏱ 3분");
+		const warned = styles(costChip());
+		expect(warned).toContain("warning strong");
+		expect(warned).toContain("warning");
+		expect(nativeProps(costChip()).aria).toBe("비용 $4.00 / 예산 $5.00, 예산 경고");
+
+		live.show(host.ctx, { ...RUN, costUsd: 5.5, budget });
+		expect(plain(component.render(120))[1]).toBe("› ↻ 1/4라운드 · 👥 1/2 · 💲 $5.50/$5.00 초과 · ⏱ 3분");
+		const over = styles(costChip());
+		expect(over).toContain("error strong");
+		expect(over).toContain("error");
+
+		// No approved budget means no warning/overage policy to apply, even at a large spend.
+		const unbudgeted: RunRecord = { ...RUN, costUsd: 99 };
+		delete unbudgeted.budget;
+		live.show(host.ctx, unbudgeted);
+		expect(plain(component.render(120))[1]).toBe("› ↻ 1/4라운드 · 👥 1/2 · 💲 $99.00 · ⏱ 3분");
+		expect(styles(costChip()).some(style => style.includes("warning") || style.includes("error"))).toBe(false);
+		live.clear();
+	});
+
+	test("Tern animates only the radar and keeps it still in compact mode, under reduced motion, or without support", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
 		live.show(host.ctx, RUN);
 		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
 		component.render(120);
 		expect(vi.getTimerCount()).toBe(1);
 
-		const described = component.describe!(describeContext)!;
-		expect(described.k).toBe("row");
-		const [shimmerHeader, tail] = children(described);
-		expect(shimmerHeader!.k).toBe("shimmer");
-		expect(nodeText(shimmerHeader!)).toBe(liveHeader("working"));
-		expect(nodeText(tail!)).toBe(` · ${COUNTERS}`);
-		// Only the header is shimmer; the phase's numbers remain a static tail.
-		// The node kind is checked above, so this reads TSP's published shimmer props.
-		const shimmerProps = shimmerHeader!.p as {
-			spans?: readonly { t: string; s?: string }[];
-			palette?: { low?: string; mid?: string; high?: string };
+		const parts = (native: NativeNode) => {
+			const [header, metrics] = children(native);
+			const [label, , , field] = children(header!);
+			return { label: label!, field: field!, metrics: metrics! };
 		};
-		expect(shimmerProps.spans).toEqual([{ t: liveHeader("working"), s: "borderAccent" }]);
-		expect(shimmerProps.palette).toEqual({ low: "dim", mid: "borderAccent", high: "mdLink" });
-		for (const tier of Object.values(shimmerProps.palette ?? {})) {
-			expect(tier).not.toMatch(/^#[0-9a-f]{3,8}$/i);
-			expect(isValidThemeColor(tier)).toBe(true);
+		const native = component.describe!(describeContext)!;
+		const { label, field, metrics } = parts(native);
+		expect(nodeText(label)).toBe(liveHeader("working"));
+		expect(field.k).toBe("shimmer");
+		expect(`[${nodeText(field)}]`).toMatch(radar);
+		expect(flatText(metrics)).toBe(`› ${COUNTERS}`);
+		const palette = nativeProps(field).palette;
+		expect(Object.values(palette ?? {}).every(isValidThemeColor)).toBe(true);
+		expect(vi.getTimerCount()).toBe(0); // the host owns this animation
+		const narrow = component.describe!({ ...describeContext, cols: 38 })!;
+		expect(flatText(narrow)).toBe("≋ STORM · 진행 중 · ↻ 1/4 · 👥 1/2");
+		for (const cx of [{ ...describeContext, reduceMotion: true }, { ...describeContext, supports: () => false }]) {
+			const still = parts(component.describe!(cx)!);
+			expect(still.field.k).toBe("text");
+			expect(nodeText(still.field)).toBe(nodeText(field));
 		}
-		// Tern clocks the sheen itself: describing stopped the ANSI interval.
-		expect(vi.getTimerCount()).toBe(0);
-
-		const reduced = component.describe!({ ...describeContext, reduceMotion: true })!;
-		const reducedHeader = children(reduced)[0]!;
-		expect(reducedHeader.k).toBe("text");
-		expect(nodeText(reducedHeader)).toBe(liveHeader("working"));
-
-		const unsupported = component.describe!({ ...describeContext, supports: () => false })!;
-		expect(children(unsupported)[0]!.k).toBe("text");
-
 		setShimmerMode("disabled");
-		const disabled = component.describe!(describeContext)!;
-		expect(children(disabled)[0]!.k).toBe("text");
-		component.render(120);
+		expect(parts(component.describe!(describeContext)!).field.k).toBe("text");
+		const disabled = component.render(120);
+		vi.advanceTimersByTime(500);
+		expect(component.render(120)).toEqual(disabled);
 		expect(vi.getTimerCount()).toBe(0);
 
 		setShimmerMode("classic");
 		setMotionEffects(false);
-		const motionOff = component.describe!(describeContext)!;
-		expect(children(motionOff)[0]!.k).toBe("text");
+		expect(parts(component.describe!(describeContext)!).field.k).toBe("text");
 		component.render(120);
 		expect(vi.getTimerCount()).toBe(0);
 
-		// OMP's switches being on does not make a waiting phase move.
 		setMotionEffects(true);
 		live.show(host.ctx, RUN, "waiting-user");
-		const waiting = component.describe!(describeContext)!;
-		const waitingHeader = children(waiting)[0]!;
-		expect(waitingHeader.k).toBe("text");
-		// The kind is checked above, so this reads TSP's published text props.
-		const waitingProps = waitingHeader.p as { spans?: readonly { t: string; s?: string }[] };
-		const waitingSpans = waitingProps.spans ?? [];
-		expect(waitingSpans.map(part => part.s)).toEqual(["accent", "warning"]);
+		const waiting = parts(component.describe!(describeContext)!);
+		expect(waiting.field.k).toBe("text");
+		const waitingSpans = nativeProps(waiting.label).spans ?? [];
+		expect(waitingSpans.map(part => part.s)).toEqual(["accent", "dim", "warning"]);
 		expect(vi.getTimerCount()).toBe(0);
 
 		// A native surface never runs the ANSI timer; Tern still receives the described sheen.
@@ -278,8 +402,7 @@ describe("the live run widget", () => {
 		const nativeRequests = host.requests.length;
 		vi.advanceTimersByTime(500);
 		expect(host.requests.length).toBe(nativeRequests);
-		const native = component.describe!(describeContext)!;
-		expect(children(native)[0]!.k).toBe("shimmer");
+		expect(parts(component.describe!(describeContext)!).field.k).toBe("shimmer");
 		expect(vi.getTimerCount()).toBe(0);
 
 		setNativeRendering(false);
@@ -290,10 +413,84 @@ describe("the live run widget", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
+	test("the ASCII preset rebuilds the mark, radar and chips without braille; phases stay distinct", () => {
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		expect(activeTheme.getSymbolPreset()).toBe("ascii");
+		const host = widgetHost();
+		const live = liveForTest();
+		live.show(host.ctx, RUN);
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		const rows = component.render(60);
+		expect(rows).toHaveLength(2);
+		expect(plain(rows)[0]).toStartWith(`${ASCII_MARK} - 진행 중`);
+		expect(plain(rows)[1]).toBe(`> ${ASCII_COUNTERS}`);
+		expect(plain(rows)[1]).not.toContain("$ $");
+		expect(visibleWidth(rows[1]!)).toBe(50);
+		expect(rows.every(row => visibleWidth(row) <= 60)).toBe(true);
+		expect(plain(rows).join("\n")).not.toMatch(/[\u2801-\u28ff≋↻👥💲⏱›·…]/);
+
+		const fieldOf = (phase: RunPhase): string => {
+			live.show(host.ctx, RUN, phase);
+			const title = plain(component.render(60))[0]!;
+			return title.slice(title.lastIndexOf("[") + 1, -1);
+		};
+		const working = fieldOf("working");
+		const waiting = fieldOf("waiting-user");
+		const stopping = fieldOf("stopping");
+		expect(working).toBe("~-~-~-~-~-~-~-~-~-");
+		expect(waiting).toBe("= = = = = = = = = ");
+		expect(stopping).toBe("|/|/|/|/|/|/|/|/|/");
+		expect(new Set([working, waiting, stopping]).size).toBe(3);
+
+		live.show(host.ctx, RUN, "working");
+		const native = component.describe!(describeContext)!;
+		const [headerRow, metrics] = children(native);
+		expect(nodeText(children(headerRow!)[0]!)).toStartWith(`${ASCII_MARK} - `);
+		expect(`[${nodeText(children(headerRow!)[3]!)}]`).toMatch(/^\[[ -~]{18}\]$/);
+		expect(flatText(metrics!)).toBe(`> ${ASCII_COUNTERS}`);
+		const asciiCost = metricChips(metrics!).find(chip => nativeProps(chip).role === "omp.storm.live.cost")!;
+		expect(nodeText(asciiCost)).toBe("$0.1200/$5.00");
+		expect(nativeProps(asciiCost).aria).toBe("비용 $0.1200 / 예산 $5.00");
+		const narrow = component.describe!({ ...describeContext, cols: 38 })!;
+		expect(flatText(narrow)).toBe(`${ASCII_MARK} - 진행 중 - loop 1/4 - AG 1/2`);
+		live.clear();
+	});
+
+	test("ASCII width pressure keeps cost plus limit intact and drops elapsed first", () => {
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		const host = widgetHost();
+		const live = liveForTest();
+		live.show(host.ctx, { ...RUN, costUsd: 4, budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "block-spawns" } });
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		const rows = component.render(52);
+		expect(plain(rows)[1]).toBe("> loop 1/4라운드 - AG 1/2 - $4.00/$5.00 경고");
+		expect(plain(rows)[1]).not.toContain("t:");
+		expect(plain(rows)[1]).not.toContain("$ $");
+		expect(visibleWidth(rows[1]!)).toBeLessThanOrEqual(52);
+		live.clear();
+	});
+
+	test("a runtime theme change invalidates cached ANSI and native shaping", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		live.show(host.ctx, RUN);
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		expect(plain(component.render(60))[1]).toBe(`› ${COUNTERS}`);
+		expect(flatText(component.describe!(describeContext)!)).toContain("≋ STORM");
+
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		host.ui.theme = activeTheme;
+		expect(plain(component.render(60))[1]).toBe(`> ${ASCII_COUNTERS}`);
+		expect(plain(component.render(60))[0]).toStartWith(`${ASCII_MARK} - 진행 중`);
+		expect(flatText(component.describe!(describeContext)!)).toContain(`${ASCII_MARK} - 진행 중`);
+		live.clear();
+	});
+
 	test("a live update reuses the component and redraws the new phase, round and spend", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
 		live.show(host.ctx, RUN);
 		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
 		component.render(120);
@@ -304,10 +501,10 @@ describe("the live run widget", () => {
 		expect(live.show(host.ctx, next, "verifying")).toBe(true);
 		expect(host.installs).toHaveLength(installs);
 		expect(vi.getTimerCount()).toBe(1);
-		const line = plain(component.render(220))[0]!;
-		expect(line).toBe(fullLine("verifying", next));
-		expect(line).toContain("2/4라운드");
-		expect(line).toContain("$0.2000/$5.00");
+		const [heading, metrics] = plain(component.render(220));
+		expect(heading).toStartWith(liveHeader("verifying"));
+		expect(metrics).toContain("2/4라운드");
+		expect(metrics).toContain("$0.2000/$5.00");
 		expect(host.statuses).toEqual([undefined]);
 
 		live.clear();
@@ -316,7 +513,7 @@ describe("the live run widget", () => {
 	test("dispose or a replaced host stops the old component; the next show installs a fresh one", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
 		live.show(host.ctx, RUN);
 		const first = host.widgets.get(LIVE_WIDGET_KEY)!;
 		first.render(120);
@@ -339,7 +536,7 @@ describe("the live run widget", () => {
 		expect(vi.getTimerCount()).toBe(0);
 		const third = replacement.widgets.get(LIVE_WIDGET_KEY)!;
 		expect(third).not.toBe(second);
-		expect(plain(third.render(120))).toEqual([fullLine("waiting-user")]);
+		expect(plain(third.render(120))[0]).toStartWith(liveHeader("waiting-user"));
 
 		live.clear();
 		expect(vi.getTimerCount()).toBe(0);
@@ -348,7 +545,7 @@ describe("the live run widget", () => {
 
 	test("only the main TUI gets a widget; RPC keeps the plain path and a switch invalidates old work", () => {
 		const host = widgetHost();
-		const live = new LiveStatus({ now: () => NOW });
+		const live = liveForTest();
 		expect(live.show({ ...host.ctx, mode: "rpc" } as ExtensionContext, RUN, "working")).toBe(false);
 		expect(host.installs).toHaveLength(0);
 		expect(host.statuses).toEqual([]);
@@ -361,18 +558,5 @@ describe("the live run widget", () => {
 		expect(live.isCurrent(epoch)).toBe(false);
 		expect(live.isCurrent(next)).toBe(true);
 		expect(host.widgets.size).toBe(0);
-	});
-
-	test("every phase names its state and only the three active phases carry motion", () => {
-		const active: RunPhase[] = ["working", "workers", "verifying"];
-		const still: RunPhase[] = ["waiting-user", "between-rounds", "stopping"];
-		for (const phase of active) {
-			expect(RUN_APPEARANCE[phase].motion).toBe(true);
-			expect(liveHeader(phase)).toBe(`${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`);
-		}
-		for (const phase of still) {
-			expect(RUN_APPEARANCE[phase].motion).toBe(false);
-			expect(liveHeader(phase)).toBe(`${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`);
-		}
 	});
 });

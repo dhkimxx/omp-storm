@@ -282,7 +282,7 @@ describe("/storm without an approved team", () => {
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		expect(f.selects).toHaveLength(1);
-		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(f.selects[0]?.options).toHaveLength(6);
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		expect(f.selects[0]?.markdown).toContain(shortHash(TEAM_08_HASH));
 		expect(await fileText()).toBe(TEAM_08);
@@ -1026,8 +1026,11 @@ describe("/storm menu", () => {
 		await settleAuto(false);
 		const f = scriptedUi([LAST]);
 		expect(await hubFlow(env, f.ui)).toBe(false);
-		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(f.selects[0]?.options).toHaveLength(6);
 		expect(f.selects[0]?.markdown).toContain(shortHash(configHash(TEAM)));
+		expect(f.selects[0]?.markdown).toContain("자동 위임: 꺼짐");
+		expect(f.selects[0]?.markdown).toContain("저장: Storm 데이터");
+		expect(f.selects[0]?.markdown).not.toContain("b/r");
 		// No resume pointer: the hub does not claim a resumable run.
 		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
 		expect(f.selects[0]?.markdown).not.toContain("이어가기 가능");
@@ -1035,12 +1038,24 @@ describe("/storm menu", () => {
 		await approve({ ...TEAM, parallelism: 2 });
 		const g = scriptedUi([LAST]);
 		await hubFlow(env, g.ui);
-		expect(g.selects[0]?.options).toHaveLength(6);
+		expect(g.selects[0]?.options).toHaveLength(7);
 		// The subagents table joins the menu while the session has subagents.
 		const h = scriptedUi([THIRD]);
 		await hubFlow({ ...env, agents: () => [agentEntry()] }, h.ui);
-		expect(h.selects[0]?.options).toHaveLength(7);
+		expect(h.selects[0]?.options).toHaveLength(8);
 		expect(h.reports).toHaveLength(1);
+	});
+
+	test("전체 현황 opens the full read-only status without deciding automatic delegation", async () => {
+		await approve(TEAM);
+		const f = scriptedUi(["전체 현황"]);
+		await hubFlow(env, f.ui);
+		expect(f.selects).toHaveLength(1);
+		expect(f.selects[0]?.options).toContain("전체 현황");
+		expect(f.reports).toHaveLength(1);
+		expect(f.reports[0]?.markdown).toContain("### 역할별 모델");
+		expect(f.reports[0]?.markdown).toContain("### 저장 공간");
+		expect(await autoChoice()).toBe("unset");
 	});
 
 	test("rollback from the menu puts the earlier approved team back", async () => {
@@ -1063,7 +1078,7 @@ describe("/storm menu", () => {
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		// The menu without the way back.
-		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(f.selects[0]?.options).toHaveLength(6);
 	});
 
 	test("a file changed while the rollback dialogs are open is not overwritten", async () => {
@@ -1103,7 +1118,8 @@ describe("ended trials", () => {
 		const f = scriptedUi([SECOND, LAST]);
 		await hubFlow(env, f.ui);
 		// Adopt, keep or later; then the menu, where the trial's config is now an earlier approval to go back to.
-		expect(f.selects.map(s => s.options.length)).toEqual([3, 6]);
+		expect(f.selects).toHaveLength(2);
+		expect(f.selects[1]?.options).toContain("이전 승인으로 되돌리기");
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config).toEqual(TEAM);
@@ -1201,7 +1217,7 @@ describe("resuming the last run", () => {
 		const f = scriptedUi([FIRST]);
 		await hubFlow({ ...env, startRun: starter(started) }, f.ui);
 		// One option more than the menu without a resumable run, and it comes first.
-		expect(f.selects[0]?.options).toHaveLength(6);
+		expect(f.selects[0]?.options).toHaveLength(7);
 		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
 		const about = f.selects[0]?.markdown?.split("\n").filter(line => line.includes("resume-unique-request")) ?? [];
 		expect(about).toHaveLength(1);
@@ -1234,14 +1250,14 @@ describe("resuming the last run", () => {
 			const started: RunSpec[] = [];
 			const f = scriptedUi([LAST]);
 			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
-			expect(f.selects[0]?.options).toHaveLength(5);
+			expect(f.selects[0]?.options).toHaveLength(6);
 			expect(started).toEqual([]);
 		}
 		// A resumable run, but this caller cannot start one.
 		await writeRun(project.root, resumable({ runId: "run-20261119-110000-aaaa" }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
-		expect(f.selects[0]?.options).toHaveLength(5);
+		expect(f.selects[0]?.options).toHaveLength(6);
 	});
 
 	test("a planted record without a pointer, a pointer for another run, or an edited request is not offered", async () => {
@@ -1254,7 +1270,7 @@ describe("resuming the last run", () => {
 			const started: RunSpec[] = [];
 			const f = scriptedUi([LAST]);
 			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
-			expect(f.selects[0]?.options).toHaveLength(5);
+			expect(f.selects[0]?.options).toHaveLength(6);
 			expect(started).toEqual([]);
 			const g = scriptedUi();
 			await resumeFlow({ ...env, startRun: starter(started) }, g.ui);

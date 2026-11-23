@@ -9,6 +9,7 @@
  * - Nothing is approved unless the user picked the approve option in a dialog.
  */
 
+import type { SymbolKey } from "@oh-my-pi/pi-tui";
 import type { ReviewEvidence } from "./runtime/review.ts";
 import type { RunPhase } from "./view/appearance.ts";
 
@@ -68,6 +69,12 @@ export interface InfoLine {
 	spans: readonly InfoSpan[];
 	/** Optional determinate meter; the spans always include the authoritative numeric value. */
 	meter?: { fraction: number; tone: InfoTone };
+	/** An OMP theme symbol led in by the renderer; unknown keys are dropped at render. */
+	icon?: SymbolKey;
+	/** Starts a status section on this line; unmarked lines belong to the preceding section (initially overview). */
+	section?: "overview" | "team" | "runtime" | "storage";
+	/** Emphasizes the existing text without changing the Markdown or adding another row. */
+	emphasis?: "title" | "action";
 }
 
 /** Shown with a choice while it is open (TUI: a panel above the selector, gone once it closes); other hosts get a transcript message. */
@@ -552,6 +559,12 @@ export interface DetectionSummary {
 	warnings: string[];
 }
 
+/** One storage inventory row; `warning` is set where the walk actually missed data or ownership is unknown. */
+export interface StorageDetailLine {
+	text: string;
+	warning?: true;
+}
+
 /** Everything the Storm status report shows. Absent optional fields render as nothing. */
 export interface StatusView {
 	config: ConfigLoad;
@@ -569,8 +582,8 @@ export interface StatusView {
 	dataAsOf?: number | null;
 	/** The concise storage line (`formatStorage`) for the hub, when storage was measured. */
 	storage?: string;
-	/** The full read-only inventory (`formatStorageDetail`), one line per group, for the user's full status. */
-	storageDetail?: string[];
+	/** The full read-only inventory (`storageDetailLines`), one line per group, for the user's full status. */
+	storageDetail?: readonly StorageDetailLine[];
 	/** The Storm run active in this process for this project. */
 	run?: RunRecord;
 	/** Live phase of `run`, view-only; absent when the controller cannot say, so no phase is claimed. */

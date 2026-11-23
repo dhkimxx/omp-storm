@@ -368,10 +368,14 @@ describe("status", () => {
 		expect(bare).not.toContain("—");
 	});
 
-	test("subagents are the shared table; the section is absent without any", () => {
-		const table = renderAgentRows(agentRows([agent], TEAM), NOW);
-		expect(renderStatus(view({ agents: [agent] }), NOW)).toContain(table);
-		expect(renderStatus(view(), NOW)).not.toContain("a1");
+	test("user status stacks worker details while the model retains the compact table", () => {
+		const withAgent = view({ agents: [agent] });
+		const user = renderStatus(withAgent, NOW);
+		expect(user).toContain("- a1 · 구현 · 유휴 1분");
+		expect(user).toContain("a/i · 컨텍스트 250.0k/200.0k");
+		expect(user).toContain("후속 지시 1회 · 상한 도달");
+		expect(renderStatus(withAgent, NOW, "model")).toContain(renderAgentRows(agentRows([agent], TEAM), NOW));
+		expect(renderStatus(view(), NOW)).not.toContain("### 서브에이전트");
 	});
 
 	test("missing and invalid configs: every error is shown, never where the project is", () => {
@@ -382,13 +386,55 @@ describe("status", () => {
 	});
 
 	test("the full status renders the storage inventory line by line, never duplicating the hub's short line", () => {
-		const full = view({ storage: "brief-storage", storageDetail: ["detail-one", "detail-two"] });
+		const full = view({ storage: "brief-storage", storageDetail: [{ text: "detail-one" }, { text: "detail-two" }] });
 		const info: InfoLine[] = [];
 		const md = renderStatus(full, NOW, "user", info);
 		for (const part of ["detail-one", "detail-two"]) expect(md).toContain(part);
 		expect(md).not.toContain("brief-storage");
 		const lines = md.split("\n");
 		for (const entry of info) expect(lines[entry.index]).toContain(entry.spans.map(span => span.text).join(""));
+	});
+
+	test("storage rows make actual gaps and unknown owners amber, while policy and candidates stay muted", () => {
+		const info: InfoLine[] = [];
+		const md = renderStatus(
+			view({
+				storageDetail: [
+					{ text: "집계 누락: 예", warning: true },
+					{ text: "소유 미상: 1개 2B", warning: true },
+					{ text: "정리 후보: 없음 — 자동 정리가 꺼져 있음" },
+				],
+			}),
+			NOW,
+			"user",
+			info,
+		);
+		const row = (text: string) => info.find(line => line.spans.some(span => span.text.includes(text)))!;
+		const gap = row("집계 누락");
+		expect(gap.icon).toBe("status.warning");
+		expect(gap.spans.find(span => span.text.includes("집계 누락"))?.tone).toBe("warning");
+		const policy = row("자동 정리가 꺼져");
+		expect(policy.icon).toBeUndefined();
+		expect(policy.spans.find(span => span.text.includes("자동 정리가 꺼져"))?.tone).toBe("muted");
+		const unknown = row("소유 미상");
+		expect(unknown.icon).toBe("status.warning");
+		expect(unknown.spans.find(span => span.text.includes("소유 미상"))?.tone).toBe("warning");
+		expect(md.split("\n")[gap.index]).toContain("집계 누락: 예");
+	});
+
+	test("required checks are elevated only when the team actually has them", () => {
+		const info: InfoLine[] = [];
+		const withChecks = renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: { ...TEAM, requiredChecks: [{ name: "test", argv: ["bun", "test"] }] }, hash, warnings: [] } }), NOW, "user", info);
+		const present = info.find(line => line.spans[0]?.text === "- 필수 검사: ")!;
+		expect(present.icon).toBe("status.info");
+		expect(present.spans.find(span => span.text.startsWith("test: "))?.tone).toBe("accent");
+		expect(withChecks.split("\n")[present.index]).toContain("test:");
+
+		const plainInfo: InfoLine[] = [];
+		renderStatus(view(), NOW, "user", plainInfo);
+		const absent = plainInfo.find(line => line.spans[0]?.text === "- 필수 검사: ")!;
+		expect(absent.icon).toBeUndefined();
+		expect(absent.spans.find(span => span.text === "없음")?.tone).toBe("muted");
 	});
 
 	test("the whole team setting is in the full status: every switch and run setting changes it", () => {
@@ -461,14 +507,72 @@ describe("status", () => {
 		}
 	});
 
-	test("the brief keeps hash, models and what needs a look in a few lines", () => {
-		const full = view({ run, trials: [{ trial, state: undefined, phase: "active" }], dataAsOf: NOW, quota: [{ provider: "prov-q", state: "limited", usedFraction: 0.42, resetsAt: null }] });
-		const brief = renderStatusBrief(full, NOW);
+	test("the hub shows current and last runs together, without the team's detailed model list", () => {
+		const full = view({ run, lastRun: runRecord({ runId: "run-0", status: "done" }), autoDelegation: "on", trials: [{ trial, state: undefined, phase: "active" }], dataAsOf: NOW, quota: [{ provider: "prov-q", state: "limited", usedFraction: 0.42, resetsAt: null }] });
+		const info: InfoLine[] = [];
+		const brief = renderStatusBrief(full, NOW, info);
 		expect(brief).toContain(shortHash(hash));
-		for (const part of ["a/x → b/z", "run-1", "/storm status"]) expect(brief).toContain(part);
-		expect(brief).not.toContain("prov-q");
+		for (const part of ["실행 중: run-1", "마지막 실행: run-0", "승인됨", "자동 위임: 켜짐", "시험 사용 1건", "/storm status"]) expect(brief).toContain(part);
+		for (const part of ["a/x → b/z", "컨텍스트 상한", "prov-q"]) expect(brief).not.toContain(part);
+		expect(info[0]).toMatchObject({ index: 0, emphasis: "title" });
+		expect(info.every(line => line.section === undefined)).toBe(true);
 		expect(brief.split("\n").length).toBeLessThan(renderStatus(full, NOW).split("\n").length / 2);
 		expect(brief).not.toMatch(ISO_UTC);
+	});
+
+	test("the hub greens approval only when it exists and marks a real warning in the notes", () => {
+		const unapproved: InfoLine[] = [];
+		const brief = renderStatusBrief(
+			view({
+				approval: undefined,
+				quotaMarks: [{ provider: "prov-m", source: "user", markedAt: new Date(NOW).toISOString(), until: new Date(NOW + 3_600_000).toISOString() }],
+			}),
+			NOW,
+			unapproved,
+		);
+		const team = unapproved.find(line => line.spans[0]?.text.startsWith("- 팀 설정"))!;
+		expect(team.icon).toBe("status.warning");
+		expect(team.spans.find(span => span.text === "미승인")?.tone).toBe("warning");
+		const notes = unapproved.find(line => line.spans[0]?.text === "- 확인할 것: ")!;
+		expect(notes.icon).toBe("status.warning");
+		expect(notes.spans.find(span => span.text.includes("쿼터 소진 표시"))?.tone).toBe("warning");
+		expect(brief.split("\n")[notes.index]).toContain("쿼터 소진 표시 prov-m");
+
+		const approved: InfoLine[] = [];
+		renderStatusBrief(view({ autoDelegation: "on" }), NOW, approved);
+		const teamApproved = approved.find(line => line.spans[0]?.text.startsWith("- 팀 설정"))!;
+		expect(teamApproved.icon).toBe("status.success");
+		expect(teamApproved.spans.find(span => span.text === "승인됨")?.tone).toBe("success");
+	});
+
+	test("read-only status keeps the action at the top and returns to Runtime after storage", () => {
+		const info: InfoLine[] = [];
+		const markdown = renderStatus(view({
+			approval: undefined,
+			trials: [{ trial, state: undefined, phase: "active" }],
+			storage: "storage-line",
+		}), NOW, "user", info);
+		const lines = markdown.split("\n");
+		expect(info.filter(line => line.section).map(line => [line.section, lines[line.index]])).toEqual([
+			["team", "### 팀 설정"],
+			["runtime", "### 시험 사용"],
+			["storage", "### 저장 공간"],
+			["runtime", "### 하드 예산 상한"],
+		]);
+		expect(info[0]).toMatchObject({ index: 0, emphasis: "title" });
+		expect(info[1]).toMatchObject({ index: 1, emphasis: "action", icon: "status.warning" });
+		const headings = info.filter(line => lines[line.index]?.startsWith("### "));
+		expect(headings.every(line => line.emphasis === "title" && line.icon !== undefined)).toBe(true);
+		expect(headings.map(line => [lines[line.index], line.icon])).toEqual([
+			["### 팀 설정", "status.enabled"],
+			["### 승인", "status.warning"],
+			["### 역할별 모델", "status.enabled"],
+			["### 실행 설정", "status.enabled"],
+			["### 시험 사용", "status.pending"],
+			["### 저장 공간", "context.content"],
+			["### 하드 예산 상한", "status.info"],
+		]);
+		expect(lines.slice(0, info.find(line => line.section === "team")!.index).join("\n")).not.toContain("a/x → b/z");
 	});
 
 	test("rich info marks approval and only a verified run as success", () => {

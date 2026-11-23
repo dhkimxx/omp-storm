@@ -29,7 +29,7 @@ import { activeLedgerRun } from "./runtime/ledger.ts";
 import { acquireRunLease } from "./runtime/lease.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
 import { findResumeCandidate, resumePointerFile, resumeSpec } from "./runtime/resume.ts";
-import { formatStorage, formatStorageDetail, readStorage } from "./runtime/janitor.ts";
+import { formatStorage, readStorage, storageDetailLines } from "./runtime/janitor.ts";
 import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
@@ -458,7 +458,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 		// The status never says where the project is.
 		shadows: state.shadows.map(shadow => (shadow.scope === "project" ? { ...shadow, path: relative(root, shadow.path) } : shadow)),
 		...(usage.status === "ok" ? { dataAsOf: usage.dataAsOf } : {}),
-		...(storage ? { storage: formatStorage(storage, config?.cleanup === true), storageDetail: formatStorageDetail(storage, config?.cleanup === true) } : {}),
+		...(storage ? { storage: formatStorage(storage, config?.cleanup === true), storageDetail: storageDetailLines(storage, config?.cleanup === true) } : {}),
 		...(quota ? { quota } : {}),
 		...(run ? { run } : {}),
 		...(runPhase ? { runPhase } : {}),
@@ -591,6 +591,7 @@ const MENU = {
 	setup: "팀 다시 설정",
 	models: "모델 점검",
 	agents: "서브에이전트",
+	status: "전체 현황",
 	rollback: "이전 승인으로 되돌리기",
 	reset: "초기화",
 	close: "닫기",
@@ -724,7 +725,7 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	options.push(autoChoice === "on" ? AUTO_MENU.on : AUTO_MENU.off);
 	if (migrate) options.push(AUTO_MIGRATION.switch, AUTO_MIGRATION.stay);
 	if (rollbacks.length) options.push(MENU.rollback);
-	options.push(MENU.reset, MENU.close);
+	options.push(MENU.reset, MENU.status, MENU.close);
 	// The trusted candidate from above, not a second lookup, decides whether the state says "resume".
 	const info: InfoLine[] = [];
 	const brief = renderStatusBrief(view, env.now(), info, resume !== undefined);
@@ -743,6 +744,7 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	else if (migrate && (choice === AUTO_MIGRATION.switch || choice === AUTO_MIGRATION.stay)) await migrateAutoDelegation(env, ui, state as OkState, choice);
 	else if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
 	else if (choice === MENU.reset) return resetFlow(env, ui);
+	else if (choice === MENU.status) await statusFlow(env, ui);
 	return false;
 }
 

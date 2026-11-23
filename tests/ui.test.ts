@@ -7,8 +7,9 @@ import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
 import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
 import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
-import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
+import { ensureThemeSync, getSymbolPresetOverride, setSymbolPreset } from "@oh-my-pi/pi-tui/theme/theme";
 import { readAutoDelegation } from "../src/approval/auto.ts";
+import { configHash } from "../src/config/canonical.ts";
 import { serializeConfig } from "../src/config/store.ts";
 import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../src/flows.ts";
 import { APPROVE } from "../src/proposals/present.ts";
@@ -18,6 +19,7 @@ import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
 import type { InfoLine, UiContext, UiPort } from "../src/types.ts";
 import { createUiPort } from "../src/ui.ts";
+import { renderStatus } from "../src/view/render.ts";
 import { makeProject, TEAM, type TestProject } from "./support.ts";
 
 // Storm's frames are omp components; they draw with omp's theme.
@@ -50,8 +52,9 @@ function describeContext(cols: number) {
 	return { cols, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
 }
 
-/** Visit a native tree, following component children through their own describe. */
+/** Visit visible native nodes, following component children through their own describe. */
 function walkNative(node: NativeNode, visit: (node: NativeNode) => void): void {
+	if (node.p?.hidden) return;
 	visit(node);
 	for (const child of node.c ?? []) {
 		if ("k" in child) walkNative(child, visit);
@@ -108,13 +111,14 @@ function fakeHost(opts: {
 	mode: ExtensionContext["mode"];
 	hasUI: boolean;
 	rows?: number;
+	columns?: number;
 	answers?: Array<string | undefined | ((options: string[]) => string | undefined)>;
 	formDialog?: (html: string) => Promise<FormAnswer | undefined>;
 	models?: Array<Record<string, unknown>>;
 	driveOverlay?: (view: Component, rows: readonly string[]) => void;
 }): FakeHost {
 	const answers = [...(opts.answers ?? [])];
-	const tui = { terminal: { rows: opts.rows ?? 50, columns: 100 }, requestRender() {} };
+	const tui = { terminal: { rows: opts.rows ?? 50, columns: opts.columns ?? 100 }, requestRender() {} };
 	let widget: Component | undefined;
 	const host: FakeHost = {
 		selects: [],
@@ -266,6 +270,158 @@ describe("TUI", () => {
 		]);
 	});
 
+	test("real status tabs show and scroll the selected section in both renderers at 60 columns", async () => {
+		const info: InfoLine[] = [];
+		const markdown = renderStatus(
+			{
+				config: { status: "ok", config: TEAM, path: "/repo/.omp/storm/config.json", hash: configHash(TEAM), warnings: [] },
+				approval: undefined,
+				shadows: [],
+				quota: [{ provider: "status-provider", state: "limited", usedFraction: 0.42, resetsAt: null }],
+				storageDetail: [{ text: "status-store · 18 KiB" }],
+			},
+			Date.parse("2026-11-20T09:30:00Z"),
+			"user",
+			info,
+		);
+		// The centered overlay occupies 90% of the terminal's 60 columns.
+		const width = 54;
+		const cx = describeContext(width);
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			columns: width,
+			driveOverlay(view, top) {
+				const labels = [
+					{ id: "overview", label: "1 개요", icon: "status.info" },
+					{ id: "team", label: "2 팀", icon: "status.enabled" },
+					{ id: "runtime", label: "3 런타임", icon: "status.running" },
+					{ id: "storage", label: "4 저장 공간", icon: "context.content" },
+				] as const;
+				const tabLabel = (id: string): string => {
+					const tab = labels.find(tab => tab.id === id)!;
+					return `${theme.symbol(tab.icon)}${tab.label}`;
+				};
+				const tabRow = stripTerminalSequences(top[0]!);
+				for (const tab of labels) expect(tabRow).toContain(tabLabel(tab.id));
+				expect(stripTerminalSequences(top.at(-1)!)).toContain("←→·Tab");
+				const selected = (id: string, shown: string, absent: string) => {
+					const rows = view.render(width);
+					expect(rows.length).toBeLessThanOrEqual(20);
+					expect(rows.every(row => visibleWidth(row) <= width)).toBe(true);
+					expect(rows[0]).toContain(theme.bold(theme.bg("selectedBg", theme.fg("text", ` ${tabLabel(id)} `))));
+					for (const tab of labels) {
+						if (tab.id !== id) expect(rows[0]).toContain(theme.fg("muted", ` ${tabLabel(tab.id)} `));
+					}
+					const ansi = stripTerminalSequences(rows.join("\n"));
+					const tree = view.describe?.(cx);
+					expect(tree?.c?.[0]).toMatchObject({ k: "tabs", p: { active: id } });
+					const native = nativeTexts(tree).join("\n");
+					for (const output of [ansi, native]) {
+						expect(output).toContain(shown);
+						expect(output).not.toContain(absent);
+					}
+					return tree;
+				};
+				const overview = selected("overview", "/storm에서 팀 승인", "팀 설정");
+				expect(top.join("\n")).toContain(theme.fg("accent", theme.bold(STORM_MARK)));
+				expect(top.join("\n")).toContain(theme.fg("warning", theme.bold("- 다음: ")));
+				expect(nativeSpans(overview)).toContainEqual({ t: STORM_MARK, s: "accent strong" });
+				expect(nativeSpans(overview)).toContainEqual({ t: "- 다음: ", s: "warning strong" });
+
+				view.handleInput?.("\x1b[C"); // Right
+				const team = selected("team", "역할별 모델", "status-provider");
+				expect(nativeSpans(team)).toContainEqual({ t: theme.symbol("status.enabled"), s: "accent" });
+				expect(nativeSpans(team)).toContainEqual({ t: "팀 설정", s: "customMessageText strong" });
+				expect(stripTerminalSequences(view.render(width).join("\n"))).toContain(theme.symbol("status.enabled"));
+				view.handleInput?.("\x1b[F"); // End
+				const tail = view.render(width);
+				expect(stripTerminalSequences(tail.join("\n"))).toContain("필수 검사");
+				expect(tail.slice(1, -1).every(row => stripTerminalSequences(row).endsWith("|") && visibleWidth(row) === width)).toBe(true);
+				const teamBody = () => view.describe?.(cx)?.c?.find(child => "k" in child && child.key === "body-team");
+				expect(teamBody()).toMatchObject({ key: "body-team", p: { max: { h: "18lines" } }, scroll: { by: "end", n: 1 } });
+
+				view.handleInput?.("3");
+				const runtime = selected("runtime", "status-provider", "status-store");
+				// These runtime slices straddle Storage in the Markdown but share a single tab.
+				expect(nativeTexts(runtime)).toContain("하드 예산 상한");
+				expect(stripTerminalSequences(view.render(width).join("\n"))).toContain("하드 예산 상한");
+				expect(teamBody()).toMatchObject({ key: "body-team", p: { hidden: true }, scroll: { by: "end", n: 1 } });
+				view.handleInput?.("\t");
+				selected("storage", "status-store", "status-provider");
+				view.handleInput?.("\x1b[Z"); // Shift+Tab
+				selected("runtime", "status-provider", "status-store");
+
+				view.handleInput?.("2");
+				expect(view.render(width)).toEqual(tail);
+				expect(teamBody()).toMatchObject({ key: "body-team", scroll: { by: "end", n: 1 } });
+				view.handleInput?.("\x1b[H"); // Home
+				selected("team", "팀 설정", "status-provider");
+				view.handleInput?.("\x1b[D"); // Left
+				selected("overview", STORM_MARK, "status-provider");
+				view.handleInput?.("4");
+				selected("storage", "status-store", "status-provider");
+				view.handleNativeEvent?.({ type: "select", key: "tabs", item: "team" });
+				selected("team", "팀 설정", "status-provider");
+				view.handleInput?.("1");
+				selected("overview", STORM_MARK, "status-provider");
+				view.handleInput?.("\x1b"); // Esc
+			},
+		});
+		// A different title still produces tabs: only the annotations opt a report in.
+		await createUiPort(host.pi, host.ctx).report("프로젝트 진단", markdown, info);
+		expect(host.sent).toEqual([]);
+	});
+
+	test("the ASCII preset keeps the 60-column tabs icon-led on one row", async () => {
+		const previous = getSymbolPresetOverride();
+		await setSymbolPreset("ascii");
+		try {
+			const info: InfoLine[] = [];
+			const markdown = renderStatus(
+				{
+					config: { status: "ok", config: TEAM, path: "/repo/.omp/storm/config.json", hash: configHash(TEAM), warnings: [] },
+					approval: undefined,
+					shadows: [],
+					storageDetail: [{ text: "store" }],
+				},
+				Date.parse("2026-11-20T09:30:00Z"),
+				"user",
+				info,
+			);
+			const width = 54;
+			const cx = describeContext(width);
+			const host = fakeHost({
+				mode: "tui",
+				hasUI: true,
+				rows: 24,
+				columns: width,
+				driveOverlay(view, top) {
+					const tabs = ["[i]1 개요", "[x]2 팀", "[~]3 런타임", "#4 저장 공간"];
+					const row = stripTerminalSequences(top[0]!);
+					for (const label of tabs) expect(row).toContain(label);
+					expect(stripTerminalSequences(top[1]!)).not.toContain("4 저장 공간");
+					expect(visibleWidth(top[0]!)).toBe(width);
+					expect(view.describe?.(cx)?.c?.[0]).toMatchObject({
+						k: "tabs",
+						p: { active: "overview", items: tabs.map(label => ({ label })) },
+					});
+					view.handleInput?.("2");
+					const team = view.describe?.(cx);
+					expect(nativeSpans(team)).toContainEqual({ t: "[x]", s: "accent" });
+					expect(nativeSpans(team)).toContainEqual({ t: "팀 설정", s: "customMessageText strong" });
+					expect(stripTerminalSequences(view.render(width)[0]!)).toContain("[x]2 팀");
+					view.handleInput?.("q");
+				},
+			});
+			await createUiPort(host.pi, host.ctx).report("Storm 현황", markdown, info);
+			expect(host.sent).toEqual([]);
+		} finally {
+			await setSymbolPreset(previous ?? "unicode");
+		}
+	});
+
 	test("a context that does not fit adds one option that opens it whole, then the selector comes back", async () => {
 		const host = fakeHost({ mode: "tui", hasUI: true, rows: 30, answers: [options => options.at(-1), "a"] });
 		const ui = createUiPort(host.pi, host.ctx);
@@ -326,13 +482,17 @@ describe("rich metadata", () => {
 			driveOverlay(view, rows) {
 				rendered = rows.join("\n");
 				native = view.describe?.(describeContext(100));
+				expect(native?.c?.[0]).toMatchObject({ k: "col", key: "body" });
 				view.handleInput?.("q");
 			},
 		});
-		await createUiPort(host.pi, host.ctx).report("회계", MARKDOWN, INFO);
+		await createUiPort(host.pi, host.ctx).report("Storm 현황", MARKDOWN, INFO);
 		const visible = stripTerminalSequences(rendered);
 		expect(visible).toContain("대기 중: 3개");
 		expect(visible).toContain("$0.42");
+		expect(visible).toContain("Storm 현황");
+		expect(visible).not.toContain("Storm · Storm 현황");
+		expect(visible).not.toContain("1 개요");
 		expect(visible).toContain("일반 문단");
 		expect(rendered).toContain(theme.fg("accent", "대기 중: "));
 		expect(rendered).toContain(theme.fg("warning", "3개"));
@@ -352,6 +512,27 @@ describe("rich metadata", () => {
 		expect(nativeMds(native)).toContain("일반 문단 **강조**");
 	});
 
+	test("an untrusted icon key is dropped from both renderers, not drawn or echoed", async () => {
+		const info: InfoLine[] = [{ index: 0, icon: "status.evil\u001b[31m" as NonNullable<InfoLine["icon"]>, spans: [{ text: "본문" }] }];
+		let rendered = "";
+		let native: NativeNode | null | undefined;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 30,
+			driveOverlay(view, rows) {
+				rendered = rows.join("\n");
+				native = view.describe?.(describeContext(100));
+				view.handleInput?.("q");
+			},
+		});
+		await createUiPort(host.pi, host.ctx).report("제목", "본문", info);
+		expect(stripTerminalSequences(rendered)).toContain("본문");
+		expect(rendered).not.toContain("evil");
+		expect(nativeTexts(native).join("\n")).toContain("본문");
+		expect(nativeSpans(native).every(run => !run.t.includes("evil") && !run.t.includes("\x1b"))).toBe(true);
+	});
+
 	test("a cut rich panel withholds consent until the full rich report was shown", async () => {
 		const lines = ["### 승인 요약", ...Array.from({ length: 60 }, (_, i) => `- 항목 ${i}`), "- 승인 대상: 마지막 줄"];
 		const markdown = lines.join("\n");
@@ -360,7 +541,8 @@ describe("rich metadata", () => {
 				index === 0
 					? [{ text: "승인 요약", tone: "accent" }]
 					: [{ text: line.replace(/^- /, "• "), tone: index === lines.length - 1 ? "warning" : "muted" }];
-			return { index, spans };
+			// Even if approval context is mistakenly annotated, the full view must be linear.
+			return { index, spans, ...(index === 0 ? { section: "overview" } : index === lines.length - 1 ? { section: "team" } : {}) };
 		});
 		let reportNative: NativeNode | null | undefined;
 		const host = fakeHost({
@@ -368,8 +550,14 @@ describe("rich metadata", () => {
 			hasUI: true,
 			rows: 30,
 			answers: [options => options[0], APPROVE],
-			driveOverlay(view) {
+			driveOverlay(view, top) {
 				reportNative = view.describe?.(describeContext(100));
+				expect(reportNative?.c?.[0]).toMatchObject({ k: "col", key: "body" });
+				view.handleInput?.("2");
+				view.handleInput?.("\t");
+				expect(view.render(100)).toEqual(top);
+				view.handleInput?.("\x1b[F");
+				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("마지막 줄");
 				view.handleInput?.("q");
 			},
 		});

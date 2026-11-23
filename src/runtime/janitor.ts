@@ -11,7 +11,7 @@ import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { readJsonl, serialized, writeTextAtomic } from "../fsutil.ts";
-import type { AgentEntry, CleanupResult, RunRecord, StormConfig } from "../types.ts";
+import type { AgentEntry, CleanupResult, RunRecord, StorageDetailLine, StormConfig } from "../types.ts";
 import { readRun, runIds, stateDir, writeRun } from "./run.ts";
 import { pruneTrialStates } from "./state-files.ts";
 
@@ -877,35 +877,48 @@ export function formatStorage(view: StorageView, cleanupOn: boolean): string {
 }
 
 /**
- * The full storage section for `/storm status`: what was observed, why each excluded group is excluded, and what the
- * scoped walk could not see. Parent transcripts, spill files and every zero outside the record walk stay apart.
+ * The full storage section for `/storm status`, tagged from the same decisions that choose each row: `warning` marks
+ * only a real measurement gap or an unknown owner, never policy (cleanup off) or an ordinary cleanup candidate.
+ * Parent transcripts, spill files and every zero outside the record walk stay apart.
  */
-export function formatStorageDetail(view: StorageView, cleanupOn: boolean): string[] {
-	const out = [`Storm 데이터: ${bytesText(view.stormBytes)} (.omp/storm + 승인 기록)`];
+export function storageDetailLines(view: StorageView, cleanupOn: boolean): StorageDetailLine[] {
+	const out: StorageDetailLine[] = [];
+	const add = (text: string, warning = false): void => {
+		out.push(warning ? { text, warning: true } : { text });
+	};
+	add(`Storm 데이터: ${bytesText(view.stormBytes)} (.omp/storm + 승인 기록)`);
 	if (view.gaps.scanned === 0 && !view.gaps.project) {
-		out.push(`omp 자식 기록: 측정 불가(${gapText(view.gaps) ?? "측정할 세션 폴더 없음"})`);
-		out.push(cleanupText(view));
+		add(`omp 자식 기록: 측정 불가(${gapText(view.gaps) ?? "측정할 세션 폴더 없음"})`, true);
+		add(cleanupText(view));
 		return out;
 	}
 	const gap = gapText(view.gaps);
-	const totalText = pairText(view.total) || (gap !== undefined ? "없음(일부 누락)" : "없음");
-	out.push(`omp 자식 기록: ${totalText} — 이 프로필에서 확인한 세션 폴더(사용자 전체 아님)`);
+	const measured = pairText(view.total);
+	add(`omp 자식 기록: ${measured || (gap !== undefined ? "없음(일부 누락)" : "없음")} — 이 프로필에서 확인한 세션 폴더(사용자 전체 아님)`, measured.length === 0 && gap !== undefined);
 	const recent = pairText(view.groups.recent);
-	if (recent) out.push(`최근 3개 실행 보호: ${recent}`);
+	if (recent) add(`최근 3개 실행 보호: ${recent}`);
 	const live = pairText(view.groups.live);
-	if (live) out.push(`실행 중 프로세스 보호: ${live} — 다른 omp 프로세스가 살아 있음(프로세스 생존만 확인)`);
+	if (live) add(`실행 중 프로세스 보호: ${live} — 다른 omp 프로세스가 살아 있음(프로세스 생존만 확인)`);
 	if (countFiles(view.groups.unclassified).files) {
+		const reasons = view.unclassifiedReasons;
+		// "정리 꺼짐" is a policy, not a gap; when cleanup is on, an unexplained remainder is.
+		const warning = reasons.sameProcess > 0 || reasons.cleaned > 0 || (cleanupOn && reasons.other > 0);
 		const reason = unclassifiedText(view, cleanupOn);
-		out.push(`판단 보류: ${pairText(view.groups.unclassified)}${reason ? ` — ${reason}` : ""}`);
+		add(`판단 보류: ${pairText(view.groups.unclassified)}${reason ? ` — ${reason}` : ""}`, warning);
 	}
 	const candidate = pairText(view.groups.candidate);
-	if (candidate) out.push(`정리 후보: ${candidate} — 3개 이전·프로세스 종료 확인 기준, 정리 켜짐. 실제 삭제는 실행 시 동의와 라이브 확인 뒤`);
-	else if (!cleanupOn) out.push("정리 후보: 없음 — 자동 정리가 꺼져 있음");
+	if (candidate) add(`정리 후보: ${candidate} — 3개 이전·프로세스 종료 확인 기준, 정리 켜짐. 실제 삭제는 실행 시 동의와 라이브 확인 뒤`);
+	else if (!cleanupOn) add("정리 후보: 없음 — 자동 정리가 꺼져 있음");
 	const unknown = pairText(view.groups.unknown);
-	if (unknown) out.push(`소유 미상: ${unknown} — 이 기기 실행 목록에 없는 기록은 자동 삭제하지 않음`);
-	if (view.parent) out.push(`상위 세션 전사: ${tallyText(view.parent)} — 자식 기록과 분리, 정리 대상 아님`);
-	if (view.spill) out.push(`세션 spill: ${tallyText(view.spill)} — 자식 기록과 분리, 정리 대상 아님`);
-	if (gap !== undefined) out.push(`집계 누락: ${gap} — 합계에 포함되지 않음`);
-	out.push(cleanupText(view));
+	if (unknown) add(`소유 미상: ${unknown} — 이 기기 실행 목록에 없는 기록은 자동 삭제하지 않음`, true);
+	if (view.parent) add(`상위 세션 전사: ${tallyText(view.parent)} — 자식 기록과 분리, 정리 대상 아님`);
+	if (view.spill) add(`세션 spill: ${tallyText(view.spill)} — 자식 기록과 분리, 정리 대상 아님`);
+	if (gap !== undefined) add(`집계 누락: ${gap} — 합계에 포함되지 않음`, true);
+	add(cleanupText(view));
 	return out;
+}
+
+/** The plain inventory rows; `formatStorageDetail` stays the public text-only form. */
+export function formatStorageDetail(view: StorageView, cleanupOn: boolean): string[] {
+	return storageDetailLines(view, cleanupOn).map(line => line.text);
 }

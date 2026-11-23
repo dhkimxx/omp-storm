@@ -1,7 +1,7 @@
 import { shortHash } from "../config/canonical.ts";
 import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
-import { agentRows, renderAgentRows } from "../report/agents.ts";
+import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
@@ -71,6 +71,13 @@ const QUOTA_TONE: Record<QuotaState, InfoTone> = {
 	limited: "warning",
 	exhausted: "error",
 	unknown: "muted",
+};
+/** A quota state's icon; only limited/exhausted claim a problem. */
+const QUOTA_ICON: Record<QuotaState, NonNullable<InfoLine["icon"]>> = {
+	available: "status.info",
+	limited: "status.warning",
+	exhausted: "status.error",
+	unknown: "status.info",
 };
 /** A candidate's quota state, with the reset time of an exhausted one when it is known. */
 export function quotaText(state: QuotaState, resetsAt?: number): string {
@@ -354,6 +361,20 @@ function statusState(view: StatusView, resume: boolean): StatusState {
 		: state;
 }
 
+function autoStatusText(view: StatusView): string {
+	if (view.autoDelegation === "on") return "켜짐";
+	if (view.autoDelegation !== "blocked") return "꺼짐";
+	return view.autoModeProblem === undefined ? "켜짐 · 팀 승인 대기" : "켜짐 · 실행 차단";
+}
+
+/** One icon per status section; tabs use the same keys so a section reads the same in both places. */
+const SECTION_ICON: Record<NonNullable<InfoLine["section"]>, NonNullable<InfoLine["icon"]>> = {
+	overview: "status.info",
+	team: "status.enabled",
+	runtime: "status.running",
+	storage: "context.content",
+};
+
 /**
  * `≋ STORM · state · version` opens both the full status and the hub, so the present state and the version's
  * action are the first thing seen. The line's rich form uses the state's theme tone; nothing here animates.
@@ -365,6 +386,7 @@ function pushStatusHead(out: string[], info: InfoLine[] | undefined, state: Stat
 	if (info) {
 		info.push({
 			index,
+			emphasis: "title",
 			spans: [
 				{ text: STORM_MARK, tone: "accent" },
 				{ text: ` · ${state.label}`, tone: state.tone },
@@ -379,9 +401,11 @@ function pushStatusHead(out: string[], info: InfoLine[] | undefined, state: Stat
 		if (info) {
 			info.push({
 				index: actionIndex,
+				icon: "status.warning",
+				emphasis: "action",
 				spans: [
-					{ text: "- 다음: " },
-					{ text: state.action.replaceAll("`", ""), tone: "accent" },
+					{ text: "- 다음: ", tone: "warning" },
+					{ text: state.action.replaceAll("`", ""), tone: "warning" },
 				],
 			});
 		}
@@ -426,8 +450,7 @@ const CONFIG_FILE = ".omp/storm/config.json";
  * The whole status. For the user it leads with present state, version and a real next action, then the active and
  * last run, then everything else with the commands that fix what it points out. For the model (the storm tool) it is
  * the same facts without advice the director could act on (omp commands, /restart, cost flags) and without file
- * paths. `info` only adds the TUI's semantic spans for the same Markdown lines; every plain caller ignores it and
- * gets byte-for-byte the same text.
+ * paths. `info` adds the dashboard's sections and styles without changing the Markdown.
  */
 export function renderStatus(
 	view: StatusView,
@@ -441,26 +464,42 @@ export function renderStatus(
 	// its old version-first payload: no user advice or decorative head enters what the director reads.
 	if (model) out.push(versionLine(undefined));
 	else pushStatusHead(out, info, statusState(view, false), view.newerVersion);
+	let section: NonNullable<InfoLine["section"]> = "overview";
+	/** Mark only section boundaries: each tab may contain several consecutive headings. */
+	const sectionStart = (next: InfoLine["section"]): InfoLine["section"] => {
+		if (model || next === undefined || next === section) return undefined;
+		section = next;
+		return next;
+	};
 	/** A section title: the Markdown keeps `### …`; the rich line carries only the visible title. */
-	const heading = (title: string): void => {
+	const heading = (title: string, next?: InfoLine["section"], icon?: InfoLine["icon"]): void => {
 		const index = out.length;
 		out.push(`### ${title}`);
-		if (info) info.push({ index, spans: [{ text: visible(title), tone: "accent" }] });
+		if (info) {
+			const start = sectionStart(next);
+			info.push({
+				index,
+				spans: [{ text: visible(title) }],
+				emphasis: "title",
+				icon: icon ?? SECTION_ICON[next ?? section],
+				...(start ? { section: start } : {}),
+			});
+		}
 	};
 	/** A list line built from `spans`, so its Markdown and rich text cannot drift apart. */
-	const styled = (spans: readonly InfoSpan[], meter?: InfoLine["meter"]): void => {
+	const styled = (spans: readonly InfoSpan[], meter?: InfoLine["meter"], icon?: InfoLine["icon"]): void => {
 		const safe = spans.map((span) => (span.tone ? { text: visible(span.text), tone: span.tone } : { text: visible(span.text) }));
 		const index = out.length;
 		out.push(safe.map((span) => span.text).join(""));
-		if (info) info.push({ index, spans: safe, ...(meter ? { meter } : {}) });
+		if (info) info.push({ index, spans: safe, ...(meter ? { meter } : {}), ...(icon ? { icon } : {}) });
 	};
 	/** Present-state details for the active run: the authoritative spend line, progress, then review totals. */
 	const runSection = (): void => {
 		const run = view.run;
 		if (!run) return;
 		out.push("");
-		heading("실행 중");
-		styled(runLineSpans(run), runMeter(run));
+		heading("실행 중", undefined, "status.running");
+		styled(runLineSpans(run), runMeter(run), "status.running");
 		const progress = runProgressParts(run, now);
 		const index = out.length;
 		out.push(`- ${progress.join(" · ")}`);
@@ -482,13 +521,13 @@ export function renderStatus(
 		const run = view.lastRun;
 		if (!run) return;
 		out.push("");
-		heading("마지막 실행");
+		heading("마지막 실행", undefined, "status.info");
 		const lines = lastRunLines(run);
 		const index = out.length;
 		out.push(...lines);
 		if (info) {
 			const meter = runMeter(run);
-			info.push({ index, spans: lastRunLineSpans(run), ...(meter ? { meter } : {}) });
+			info.push({ index, spans: lastRunLineSpans(run), icon: RUN_ICON[runTone(run)], ...(meter ? { meter } : {}) });
 		}
 	};
 	// The active run and the last result are present state, so they come before the team setting; the model keeps
@@ -499,10 +538,10 @@ export function renderStatus(
 	}
 	const c = view.config;
 	out.push("");
-	heading("팀 설정");
-	if (c.status === "missing") styled([{ text: "- 없음 — /storm 으로 만드세요", tone: "warning" }]);
+	heading("팀 설정", "team");
+	if (c.status === "missing") styled([{ text: "- 없음 — /storm 으로 만드세요", tone: "warning" }], undefined, "status.warning");
 	else if (c.status === "invalid") {
-		styled([{ text: `- 오류 (\`${CONFIG_FILE}\`)`, tone: "error" }]);
+		styled([{ text: `- 오류 (\`${CONFIG_FILE}\`)`, tone: "error" }], undefined, "status.error");
 		for (const e of c.errors) styled([{ text: `  - ${visible(e)}`, tone: "error" }]);
 	} else {
 		styled([
@@ -511,17 +550,22 @@ export function renderStatus(
 		]);
 	}
 	out.push("");
-	heading("승인");
-	if (view.approval) styled([{ text: "- 승인됨", tone: "success" }, { text: ` · ${isoText(view.approval.approvedAt)}` }]);
-	else if (c.status === "ok") styled([{ text: "- 미승인", tone: "warning" }, { text: " — /storm 으로 승인하세요" }]);
-	else styled([{ text: "- 미승인", tone: "warning" }]);
+	const approvalIcon: InfoLine["icon"] = view.approval ? "status.success" : c.status === "invalid" ? "status.error" : "status.warning";
+	heading("승인", undefined, approvalIcon);
+	if (view.approval) styled([{ text: "- 승인됨", tone: "success" }, { text: ` · ${isoText(view.approval.approvedAt)}` }], undefined, approvalIcon);
+	else if (c.status === "ok") styled([{ text: "- 미승인", tone: "warning" }, { text: " — /storm 으로 승인하세요" }], undefined, approvalIcon);
+	else styled([{ text: "- 미승인", tone: "warning" }], undefined, approvalIcon);
 	if (view.autoDelegation !== undefined) {
 		const auto = view.autoDelegation;
-		styled([
-			{ text: "- 자동 위임: " },
-			{ text: auto === "on" ? "켜짐" : auto === "blocked" ? (view.autoModeProblem === undefined ? "켜짐 · 팀 승인 대기" : "켜짐 · 실행 차단") : "꺼짐", tone: auto === "on" ? "success" : auto === "blocked" ? "warning" : "muted" },
-			{ text: " · /storm auto" },
-		]);
+		styled(
+			[
+				{ text: "- 자동 위임: " },
+				{ text: autoStatusText(view), tone: auto === "on" ? "success" : auto === "blocked" ? "warning" : "muted" },
+				{ text: " · /storm auto" },
+			],
+			undefined,
+			auto === "on" ? "status.success" : auto === "blocked" ? "status.warning" : "status.info",
+		);
 	}
 	if (c.status === "ok") {
 		const team = c.config;
@@ -538,7 +582,21 @@ export function renderStatus(
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,
 			`- 실행 중 다른 에이전트: ${visible(fallbackText(team.fallbackRole))}`,
 			`- 실행이 끝나면 정리: ${team.cleanup === true ? "켬" : "끔"} · 문서 정합: ${team.docs === false ? "끔" : "켬"}`,
-			`- 필수 검사: ${team.requiredChecks?.length ? team.requiredChecks.map(checkText).join(" · ") : "없음"}`,
+		);
+		// The checks are an obligation only when they exist; "없음" is ordinary and stays quiet.
+		const checks = team.requiredChecks ?? [];
+		styled(
+			checks.length
+				? [
+						{ text: "- 필수 검사: " },
+						...checks.flatMap((check, index): InfoSpan[] => [
+							...(index > 0 ? [{ text: " · " }] : []),
+							{ text: checkText(check), tone: "accent" },
+						]),
+					]
+				: [{ text: "- 필수 검사: " }, { text: "없음", tone: "muted" }],
+			undefined,
+			checks.length ? "status.info" : undefined,
 		);
 	}
 	if (model) {
@@ -547,63 +605,79 @@ export function renderStatus(
 	}
 	if (view.trials?.length) {
 		out.push("");
-		heading("시험 사용");
+		heading("시험 사용", "runtime", "status.pending");
 		for (const t of view.trials) out.push(...trialViewLines(t));
 	}
 	if (view.quotaMarks?.length) {
 		out.push("");
-		heading("쿼터 소진 표시");
+		heading("쿼터 소진 표시", "runtime", "status.warning");
 		for (const m of view.quotaMarks) {
-			styled([
-				{ text: "- ", tone: "muted" },
-				{ text: visible(m.provider), tone: "warning" },
-				{ text: `: ${isoText(m.until)}까지 다른 Provider 우선`, tone: "warning" },
-			]);
+			styled(
+				[
+					{ text: "- ", tone: "muted" },
+					{ text: visible(m.provider), tone: "warning" },
+					{ text: `: ${isoText(m.until)}까지 다른 Provider 우선`, tone: "warning" },
+				],
+				undefined,
+				"status.warning",
+			);
 		}
 	}
 	if (view.agents?.length) {
 		out.push("");
-		heading("서브에이전트");
-		out.push(...renderAgentRows(agentRows(view.agents, c.status === "ok" ? c.config : undefined), now).split("\n"));
+		heading("서브에이전트", "runtime", "status.running");
+		const agents = agentRows(view.agents, c.status === "ok" ? c.config : undefined);
+		if (model) out.push(...renderAgentRows(agents, now).split("\n"));
+		else for (const agent of agents) for (const spans of agentStatusSpans(agent, now)) styled(spans);
 	}
 	if (audience === "user" && view.ompAdvice?.length) {
 		out.push("");
-		heading("omp 설정 점검");
-		for (const a of view.ompAdvice) out.push(`- ${visible(a.message)}`, ...(a.command ? [`  - \`${visible(a.command)}\``] : []));
+		heading("omp 설정 점검", "runtime", "status.warning");
+		for (const a of view.ompAdvice) {
+			const messageIndex = out.length;
+			out.push(`- ${visible(a.message)}`, ...(a.command ? [`  - \`${visible(a.command)}\``] : []));
+			if (info) info.push({ index: messageIndex, spans: [{ text: `- ${visible(a.message)}`, tone: "warning" }], icon: "status.warning" });
+		}
 		out.push("- Storm 은 omp 설정을 바꾸지 않습니다. 필요하면 위 명령을 직접 실행하세요.");
 	}
 	if (view.quota) {
 		out.push("");
-		heading("쿼터");
+		heading("쿼터", "runtime", "status.info");
 		if (!view.quota.length) out.push(`- ${DASH}`);
 		for (const q of view.quota) {
-			styled([
-				{ text: "- " },
-				{ text: visible(q.provider) },
-				{ text: ": " },
-				{ text: QUOTA[q.state], tone: QUOTA_TONE[q.state] },
-				{ text: ` · 사용 ${pct(q.usedFraction)}${q.resetsAt != null ? ` · 재설정 ${time(q.resetsAt)}` : ""}` },
-			]);
+			styled(
+				[
+					{ text: "- " },
+					{ text: visible(q.provider) },
+					{ text: ": " },
+					{ text: QUOTA[q.state], tone: QUOTA_TONE[q.state] },
+					{ text: ` · 사용 ${pct(q.usedFraction)}${q.resetsAt != null ? ` · 재설정 ${time(q.resetsAt)}` : ""}` },
+				],
+				undefined,
+				QUOTA_ICON[q.state],
+			);
 		}
 	}
 	if (view.dataAsOf !== undefined) {
 		out.push("");
-		heading("사용 데이터");
+		heading("사용 데이터", "runtime", "status.info");
 		styled([{ text: `- 기준 시각: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)})`, tone: "muted" }]);
 	}
 	if (view.storageDetail?.length) {
 		out.push("");
-		heading("저장 공간");
-		for (const line of view.storageDetail) styled([{ text: `- ${line}`, tone: "muted" }]);
+		heading("저장 공간", "storage");
+		for (const line of view.storageDetail) {
+			styled([{ text: `- ${line.text}`, tone: line.warning === true ? "warning" : "muted" }], undefined, line.warning === true ? "status.warning" : undefined);
+		}
 	} else if (view.storage !== undefined) {
 		out.push("");
-		heading("저장 공간");
+		heading("저장 공간", "storage");
 		styled([{ text: `- ${view.storage}`, tone: "muted" }]);
 	}
 	if (audience === "user") {
 		const b = c.status === "ok" ? c.config.budget : undefined;
 		out.push("");
-		heading("하드 예산 상한");
+		heading("하드 예산 상한", "runtime", "status.info");
 		out.push(
 			b
 				? `- Storm 예산은 새 스폰만 막습니다. 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
@@ -616,7 +690,14 @@ export function renderStatus(
 		const index = out.length;
 		out.push(...shadows);
 		if (info) {
-			info.push({ index, spans: [{ text: shadows[0]!.replace(/^### /, ""), tone: "warning" }] });
+			const start = sectionStart("runtime");
+			info.push({
+				index,
+				spans: [{ text: shadows[0]!.replace(/^### /, ""), tone: "warning" }],
+				emphasis: "title",
+				icon: "status.warning",
+				...(start ? { section: start } : {}),
+			});
 			for (let i = 1; i < shadows.length; i++) info.push({ index: index + i, spans: [{ text: shadows[i]!, tone: "warning" }] });
 		}
 	}
@@ -643,6 +724,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			const meter = runMeter(run);
 			info.push({
 				index,
+				icon: "status.running",
 				spans: [
 					{ text: "- 실행 중: " },
 					{ text: visible(run.runId), tone: "accent" },
@@ -666,23 +748,75 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 		}
 		const agents = run.agents;
 		if (agents !== undefined && agents.some(agent => (agent.review?.reviews ?? 0) > 0)) out.push(reviewLine(agents));
-	} else if (view.lastRun) {
-		out.push(`- 마지막 실행: ${view.lastRun.runId} · ${STATUS_LABEL[view.lastRun.status]} · ${spendText(view.lastRun.costUsd, view.lastRun.budget)}`);
 	}
-	if (c.status === "ok") {
-		if (view.run) out.push("");
-		out.push(`- 팀 설정 ${shortHash(c.hash)} · ${view.approval ? "승인됨" : "미승인"} · 우선순위 ${priorityLabel(c.config.priority)}`);
-		for (const [id, r] of Object.entries(c.config.roles)) out.push(roleLine(id, r));
-		out.push(`- 컨텍스트 상한 ${int(c.config.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`);
-		if (c.config.disabledRoles?.length) out.push(`- 사용 안 함: ${disabledTitles(c.config)}`);
-	} else out.push(c.status === "missing" ? "- 팀 설정 없음" : "- 팀 설정 오류");
-	const notes: string[] = [];
-	if (view.trials?.length) notes.push(`시험 사용 ${view.trials.length}건`);
-	if (view.quotaMarks?.length) notes.push(`쿼터 소진 표시 ${view.quotaMarks.map((m) => m.provider).join(", ")}`);
-	if (view.ompAdvice?.length) notes.push(`omp 설정 점검 ${view.ompAdvice.length}건`);
-	if (notes.length) out.push(`- 확인할 것: ${notes.join(" · ")}`);
+	if (view.lastRun) {
+		const run = view.lastRun;
+		const index = out.length;
+		out.push(`- 마지막 실행: ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`);
+		if (info) {
+			const spend = spendTone(run);
+			info.push({
+				index,
+				icon: RUN_ICON[runTone(run)],
+				spans: [
+					{ text: "- 마지막 실행: " },
+					{ text: visible(run.runId), tone: "accent" },
+					{ text: " · " },
+					{ text: STATUS_LABEL[run.status], tone: runTone(run) },
+					{ text: ` · ${spendText(run.costUsd, run.budget)}`, ...(spend ? { tone: spend } : {}) },
+				],
+			});
+		}
+	}
+	const team = c.status === "ok" ? `팀 설정 ${shortHash(c.hash)}` : c.status === "missing" ? "팀 설정 없음" : "팀 설정 오류";
+	const approval = view.approval ? "승인됨" : "미승인";
+	const teamIcon: InfoLine["icon"] = view.approval ? "status.success" : c.status === "invalid" ? "status.error" : "status.warning";
+	const teamIndex = out.length;
+	out.push(`- ${team} · ${approval}${view.autoDelegation !== undefined ? ` · 자동 위임: ${autoStatusText(view)}` : ""}`);
+	if (info) {
+		const auto = view.autoDelegation;
+		const autoTone: InfoTone | undefined = auto === "on" ? "success" : auto === "blocked" ? "warning" : auto === "off" ? "muted" : undefined;
+		info.push({
+			index: teamIndex,
+			icon: teamIcon,
+			spans: [
+				{ text: `- ${team} · ` },
+				{ text: approval, tone: view.approval ? "success" : c.status === "invalid" ? "error" : "warning" },
+				...(auto === undefined
+					? []
+					: [
+							{ text: " · 자동 위임: " },
+							{ text: autoStatusText(view), ...(autoTone !== undefined ? { tone: autoTone } : {}) },
+						]),
+			],
+		});
+	}
+	const notes: Array<{ text: string; tone?: InfoTone }> = [];
+	if (view.trials?.length) notes.push({ text: `시험 사용 ${view.trials.length}건`, tone: "accent" });
+	if (view.quotaMarks?.length) notes.push({ text: `쿼터 소진 표시 ${view.quotaMarks.map((m) => m.provider).join(", ")}`, tone: "warning" });
+	if (view.ompAdvice?.length) notes.push({ text: `omp 설정 점검 ${view.ompAdvice.length}건`, tone: "warning" });
+	if (notes.length) {
+		const noteIndex = out.length;
+		out.push(`- 확인할 것: ${notes.map((note) => note.text).join(" · ")}`);
+		if (info) {
+			const warning = notes.some((note) => note.tone === "warning");
+			info.push({
+				index: noteIndex,
+				icon: warning ? "status.warning" : "status.info",
+				spans: [
+					{ text: "- 확인할 것: " },
+					...notes.flatMap((note, index): InfoSpan[] => [
+						...(index > 0 ? [{ text: " · " }] : []),
+						{ text: note.text, ...(note.tone ? { tone: note.tone } : {}) },
+					]),
+				],
+			});
+		}
+	}
 	const data = view.dataAsOf !== undefined ? `사용 데이터 기준: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)}) · ` : "";
-	out.push(`- ${data}전체 현황은 /storm status`);
+	const footer = `- ${data}전체 현황은 /storm status`;
+	out.push(footer);
+	if (info) info.push({ index: out.length - 1, icon: "status.info", spans: [{ text: footer, tone: "muted" }] });
 	return out.join("\n");
 }
 
@@ -735,6 +869,15 @@ function runTone(run: RunRecord): InfoTone {
 	if (run.status === "running") return "accent";
 	return "muted";
 }
+
+/** A run's badge icon follows its established tone; unverified and settling runs stay neutral. */
+const RUN_ICON: Record<InfoTone, NonNullable<InfoLine["icon"]>> = {
+	accent: "status.running",
+	success: "status.success",
+	warning: "status.warning",
+	error: "status.error",
+	muted: "status.info",
+};
 
 /** The run line's Markdown, as spans: run id, start time, then spend colored by threshold/overage. */
 function runLineSpans(run: RunRecord): InfoSpan[] {
