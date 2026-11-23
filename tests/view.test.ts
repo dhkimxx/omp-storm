@@ -381,6 +381,16 @@ describe("status", () => {
 		for (const text of [missing, invalid, renderStatus(view(), NOW)]) expect(text).not.toContain("/repo");
 	});
 
+	test("the full status renders the storage inventory line by line, never duplicating the hub's short line", () => {
+		const full = view({ storage: "brief-storage", storageDetail: ["detail-one", "detail-two"] });
+		const info: InfoLine[] = [];
+		const md = renderStatus(full, NOW, "user", info);
+		for (const part of ["detail-one", "detail-two"]) expect(md).toContain(part);
+		expect(md).not.toContain("brief-storage");
+		const lines = md.split("\n");
+		for (const entry of info) expect(lines[entry.index]).toContain(entry.spans.map(span => span.text).join(""));
+	});
+
 	test("the whole team setting is in the full status: every switch and run setting changes it", () => {
 		const of = (over: Partial<StormConfig>) => renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: { ...TEAM, ...over }, hash, warnings: [] } }), NOW);
 		const base = of({});

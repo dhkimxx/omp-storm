@@ -567,8 +567,10 @@ export interface StatusView {
 	quota?: QuotaStatus[];
 	/** Newest usage row (null: no rows), when the usage DB could be read; absent → no usage section. */
 	dataAsOf?: number | null;
-	/** The storage line (`formatStorage`), when storage was measured. */
+	/** The concise storage line (`formatStorage`) for the hub, when storage was measured. */
 	storage?: string;
+	/** The full read-only inventory (`formatStorageDetail`), one line per group, for the user's full status. */
+	storageDetail?: string[];
 	/** The Storm run active in this process for this project. */
 	run?: RunRecord;
 	/** Live phase of `run`, view-only; absent when the controller cannot say, so no phase is claimed. */

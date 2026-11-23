@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, test, vi } from
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { CompactOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
@@ -61,6 +61,11 @@ function fakeOmp(project: TestProject) {
 	let active = ["read", "write"];
 	let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
 	let tool: Tool | undefined;
+	/** What this fake session reports as context usage; tests set it before a turn. */
+	const usage: { current?: { tokens: number; contextWindow: number; percent: number } } = {};
+	/** Background checkpoints the extension asked for; held when `holdCompactions.value` is set. */
+	const compactions: Array<{ options: CompactOptions; complete(): void; fail(error?: Error): void }> = [];
+	const holdCompactions = { value: false };
 	/** Set to make every state load fail, as a broken profile would. */
 	const broken = { agentDir: false };
 	/** Times a handler waited for the session to go idle. */
@@ -115,14 +120,34 @@ function fakeOmp(project: TestProject) {
 				setStatus: (_key: string, text: string | undefined) => statuses.push(text),
 				getEditorText: () => "",
 			},
-			getContextUsage: () => undefined,
-			compact: async () => undefined,
+			getContextUsage: () => usage.current,
+			compact: (optionsOrInstructions: string | CompactOptions | undefined) => {
+				// A bare string is the run preflight's foreground compaction; only checkpoint options are captured.
+				if (typeof optionsOrInstructions !== "object") return Promise.resolve();
+				const options = optionsOrInstructions;
+				const wait = Promise.withResolvers<void>();
+				const call = {
+					options,
+					complete: (): void => {
+						options.onComplete?.({} as never);
+						wait.resolve();
+					},
+					fail: (error?: Error): void => {
+						const failure = error ?? new Error("compaction failed");
+						options.onError?.(failure);
+						wait.reject(failure);
+					},
+				};
+				compactions.push(call);
+				if (!holdCompactions.value) call.complete();
+				return wait.promise;
+			},
 			abort: () => undefined,
 			waitForIdle: async () => {
 				waits.idle++;
 			},
 			modelRegistry: { getAll: () => [], getAvailable: () => [] },
-			sessionManager: { getArtifactsDir: () => project.root },
+			sessionManager: { getArtifactsDir: () => project.root, getSessionDir: () => path.join(project.tmp, "sessions") },
 			runEphemeralTurn: async () => ({ replyText: '{"action":"run"}' }),
 		}) as unknown as ExtensionContext;
 	return {
@@ -133,6 +158,9 @@ function fakeOmp(project: TestProject) {
 		transcript,
 		waits,
 		broken,
+		usage,
+		compactions,
+		holdCompactions,
 		ctx,
 		activeTools: () => active,
 		/** Fires an omp event; the first handler result that is not undefined is omp's answer. */
@@ -1402,6 +1430,159 @@ describe("automatic delegation", () => {
 			{ spawnKey: assigned.input.name, agent: "storm-implementer", outcome: "routed", lane: "fix" },
 		]);
 		expect(verdict(await omp.emit("tool_call", readFile, main))).toBe("auto");
+	});
+
+	test("the first accepted automatic plan starts one background handoff checkpoint for a heavy context", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		omp.usage.current = { tokens: 206_512, contextWindow: 400_000, percent: 52 };
+		omp.holdCompactions.value = true;
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
+		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "fix", kind: "code" }] } }, main);
+		expect(reply.outcome).toBe("ok");
+		const root = (await loadProjectState(project.env)).repo.root;
+		const runId = activeLedgerRun(root)?.runId;
+		expect(runId).toBeDefined();
+		// A tool turn is a real boundary: no user turn, handoff or synthetic round is added.
+		expect(omp.sent).toEqual([]);
+		expect(omp.compactions).toHaveLength(1);
+		const checkpoint = omp.compactions[0];
+		expect(checkpoint?.options).toMatchObject({ mode: "handoff" });
+		expect(checkpoint?.options.signal).toBeDefined();
+		expect(checkpoint?.options.internalGuidance).toContain("fix the login bug");
+		expect(checkpoint?.options.internalGuidance).toContain(`Storm 실행 ${runId as string}`);
+		expect(checkpoint?.options.internalGuidance).toContain("계획 레인 1개");
+		expect(checkpoint?.options.internalGuidance).toContain("- fix (code,");
+		expect(checkpoint?.options.internalGuidance).toContain("Storm 장부");
+		// Not committed yet: nothing claims a checkpoint.
+		expect((await readRun(project.root, runId as string))?.checkpoints).toBeUndefined();
+		// The host applies the summary at its next boundary; the run records only that applied commit.
+		omp.usage.current = { tokens: 30_000, contextWindow: 400_000, percent: 8 };
+		checkpoint?.complete();
+		const tick = Promise.withResolvers<void>();
+		setImmediate(tick.resolve);
+		await tick.promise;
+		// A paused async wait now cannot start a second one.
+		await omp.emit("agent_end", { awaitingAsyncWork: true }, main);
+		expect(omp.compactions).toHaveLength(1);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		// Storm's next round is a delayed timer, never an immediate synthetic turn from the checkpoint.
+		expect(omp.sent).toEqual([]);
+		await omp.emit("session_shutdown", {}, main);
+		const record = await lastRun(project.root);
+		expect(record).toMatchObject({ runId: runId as string, turns: 1, endReason: "shutdown" });
+		expect(record?.checkpoints).toEqual([expect.objectContaining({ before: 206_512, after: 30_000 })]);
+		expect(omp.sent).toEqual([]);
+	});
+
+	test("a heavy ordinary prompt and a small automatic plan never start a checkpoint", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		omp.usage.current = { tokens: 300_000, contextWindow: 400_000, percent: 75 };
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "just chatting", systemPrompt: [] }, main);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(omp.compactions).toEqual([]);
+		// Small accepted automatic work keeps its old path: no compaction.
+		omp.usage.current = { tokens: 80_000, contextWindow: 400_000, percent: 20 };
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "quick fix", systemPrompt: [] }, main);
+		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "one", kind: "code" }] } }, main);
+		expect(reply.outcome).toBe("ok");
+		expect(omp.compactions).toEqual([]);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		await omp.emit("session_shutdown", {}, main);
+		expect((await lastRun(project.root))?.checkpoints).toBeUndefined();
+	});
+
+	test("a wait in a live automatic run starts the checkpoint the plan did not need", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		omp.usage.current = { tokens: 150_000, contextWindow: 400_000, percent: 37 };
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "fix", kind: "code" }] } }, main)).outcome).toBe("ok");
+		// Under the cap at plan time: no summary yet.
+		expect(omp.compactions).toEqual([]);
+		// The run grows while it waits synchronously; the wait tool's start is a real boundary.
+		omp.usage.current = { tokens: 205_000, contextWindow: 400_000, percent: 51 };
+		// A subagent session shares this extension instance but never owns the run: its wait changes nothing.
+		await omp.emit("tool_execution_start", { toolName: "wait", toolCallId: "w0", args: {} }, omp.ctx(sub("Worker")));
+		expect(omp.compactions).toEqual([]);
+		await omp.emit("tool_execution_start", { toolName: "wait", toolCallId: "w1", args: {} }, main);
+		expect(omp.compactions).toHaveLength(1);
+		expect(omp.compactions[0]?.options).toMatchObject({ mode: "handoff" });
+		expect(omp.compactions[0]?.options.internalGuidance).toContain("fix the login bug");
+		// A second wait inside the min gap asks nothing more.
+		await omp.emit("tool_execution_start", { toolName: "wait", toolCallId: "w2", args: {} }, main);
+		expect(omp.compactions).toHaveLength(1);
+		const settled = Promise.withResolvers<void>();
+		setImmediate(settled.resolve);
+		await settled.promise;
+		await omp.emit("session_shutdown", {}, main);
+		const record = await lastRun(project.root);
+		expect(record?.checkpoints).toHaveLength(1);
+		expect(omp.sent).toEqual([]);
+	});
+
+	test("a manual run's async wait uses the same handoff checkpoint; wait tools add nothing", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		omp.usage.current = { tokens: 80_000, contextWindow: 400_000, percent: 20 };
+		await omp.emit("session_start", {}, main);
+		await omp.command("manual task", main);
+		expect(omp.sent).toHaveLength(1);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId;
+		expect(runId).toBeDefined();
+		// The manual run was under both preflight thresholds; its director now grows past the cap.
+		omp.usage.current = { tokens: 210_000, contextWindow: 400_000, percent: 53 };
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", { awaitingAsyncWork: true }, main);
+		// Public manual behavior is unchanged: one recorded checkpoint, with the run ledger in the summary focus.
+		expect(omp.compactions).toHaveLength(1);
+		expect(omp.compactions[0]?.options).toMatchObject({ mode: "handoff" });
+		expect(omp.compactions[0]?.options.internalGuidance).toContain(`Storm 실행 ${runId as string}`);
+		// The automatic-only wait hook does not apply to manual direction.
+		await omp.emit("tool_execution_start", { toolName: "wait", toolCallId: "w1", args: {} }, main);
+		expect(omp.compactions).toHaveLength(1);
+		const settled = Promise.withResolvers<void>();
+		setImmediate(settled.resolve);
+		await settled.promise;
+		await omp.emit("session_shutdown", {}, main);
+		expect((await lastRun(project.root))?.checkpoints).toHaveLength(1);
+	});
+
+	test("a session switch cancels the automatic checkpoint; a late commit never lands", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		omp.usage.current = { tokens: 210_000, contextWindow: 400_000, percent: 53 };
+		omp.holdCompactions.value = true;
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "fix", kind: "code" }] } }, main)).outcome).toBe("ok");
+		const checkpoint = omp.compactions[0];
+		expect(checkpoint).toBeDefined();
+		await omp.emit("session_switch", {}, main);
+		expect(checkpoint?.options.signal?.aborted).toBe(true);
+		checkpoint?.complete();
+		const tick = Promise.withResolvers<void>();
+		setImmediate(tick.resolve);
+		await tick.promise;
+		const record = await lastRun(project.root);
+		expect(record).toMatchObject({ status: "stopped", endReason: "shutdown" });
+		expect(record?.checkpoints).toBeUndefined();
 	});
 
 	test("a new user turn supplies a fresh task, not the previous turn's text", async () => {

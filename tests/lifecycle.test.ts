@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetAgents } from "../src/runtime/agents.ts";
-import { agentRecordFiles, bytesText, formatStorage, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
+import { agentRecordFiles, bytesText, formatStorage, formatStorageDetail, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
 import { appendRunIndex, readRunIndex, summarizeForIndex } from "../src/runtime/run-index.ts";
 import { pruneRuns, readRun, writeRun } from "../src/runtime/run.ts";
 import { pruneTrialStates, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
@@ -331,20 +331,178 @@ describe("janitor omp records", () => {
 		expect(runs[0]?.runId).toBe("run-5");
 	});
 
-	test("storage line counts remaining records and the last cleanup", async () => {
+	test("storage line counts distinct records, the last cleanup, and labels protection", async () => {
 		await seedAgent("Old");
 		await trust([{ process: dead, agents: ["Old"] }]);
 		await writeRun(root, run(2, { cleanup: { agents: 3, files: 9, bytes: 3 * 1024 * 1024, stormFiles: 2 } }));
-		const view = await readStorage(root, storeDir, sessions);
-		expect(view.ompFiles).toBe(5);
-		expect(view.ompBytes).toBe(3 * 5 + 1 + 1);
+		const view = await readStorage(root, storeDir, sessions, { cleanup: true });
+		// Old.jsonl + Old/Old.sub.jsonl; the .json and .jsonl.tombstone + Old.sub.x.json are sidecars. ".md"/other are not records.
+		expect(view.total).toEqual({ transcripts: { files: 2, bytes: 6 }, sidecars: { files: 3, bytes: 11 } });
+		// The only trusted run is among the newest three: all of its records are protected, none is a candidate.
+		expect(view.groups.recent).toEqual(view.total);
+		expect(view.groups.candidate).toEqual({ transcripts: { files: 0, bytes: 0 }, sidecars: { files: 0, bytes: 0 } });
 		expect(view.stormBytes).toBeGreaterThan(0);
 		const line = formatStorage(view, false);
 		// The numbers are on the line; a team without cleanup consent gets a longer one that says so.
-		for (const part of [bytesText(view.ompBytes), String(view.ompFiles), "3MB"]) expect(line).toContain(part);
+		for (const part of [bytesText(17), "5개", "3MB"]) expect(line).toContain(part);
 		expect(formatStorage(view, true).length).toBeLessThan(line.length);
 		expect(line.includes("\n")).toBe(false);
+		const detail = formatStorageDetail(view, true).join("\n");
+		expect(detail).toContain("최근 3개 실행 보호");
+		expect(detail).toContain("마지막 정리");
+		expect(detail).toContain("3MB");
 		expect([bytesText(512), bytesText(512 * 1024), bytesText(38 * 1024 ** 2), bytesText(1.3 * 1024 ** 3)]).toEqual(["512B", "512KB", "38MB", "1.3GB"]);
+	});
+});
+
+describe("storage inventory", () => {
+	const me = processKey();
+	const dead = DEAD_PROCESS;
+
+	async function writeRecord(relative: string, text: string): Promise<void> {
+		const file = path.join(artifacts, ...relative.split("/"));
+		await mkdir(path.dirname(file), { recursive: true });
+		await writeFile(file, text);
+	}
+
+	async function trustRuns(runs: Array<{ process: string; agents: string[]; artifactsDir?: string }>): Promise<void> {
+		for (const [i, r] of runs.entries()) {
+			await recordTrustedRun(storeDir, { runId: run(i + 1).runId, artifactsDir: r.artifactsDir ?? artifacts, process: r.process, agents: r.agents, endedAt: "t" });
+		}
+	}
+
+	test("counts each physical record once and separates recent, candidates, unknown, parent and spill", async () => {
+		await writeFile(`${artifacts}.jsonl`, "P".repeat(101));
+		// A parent transcript with no artifact folder is still parent storage, never a child record.
+		await writeFile(path.join(sessions, "proj", "lonely.jsonl"), "L".repeat(11));
+		await writeRecord("Old.jsonl", "o".repeat(100));
+		await writeRecord("Old.json", "a".repeat(10));
+		await writeRecord("Old/Old.sub.jsonl", "n".repeat(50));
+		// Not the cumulative id directory its name implies: not an omp child record, so not inventory.
+		await writeRecord("Old/other.jsonl", "ignored");
+		await writeRecord("Mid.jsonl", "m".repeat(30));
+		await writeRecord("Recent.jsonl", "r".repeat(20));
+		await writeRecord("Recent.json", "s".repeat(5));
+		await writeRecord("Legacy.jsonl", "l".repeat(7));
+		await writeRecord("Legacy.jsonl.tombstone", "t".repeat(3));
+		await writeRecord("Orphan/Orphan.child.jsonl", "c".repeat(9));
+		await writeRecord("local/7.log", "S".repeat(40));
+		await writeRecord("local/notes.md", "not a record");
+		await trustRuns([
+			// Reused and nested ids: the same physical Old.sub record must be counted once.
+			{ process: dead, agents: ["Old", "Old.sub", "Old"] },
+			{ process: dead, agents: ["Old", "Mid"] },
+			{ process: dead, agents: [] },
+			{ process: dead, agents: ["Recent"] },
+			{ process: dead, agents: ["Recent"] },
+			{ process: dead, agents: ["Recent"] },
+		]);
+		const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj"), alive: () => false });
+		expect(view.total).toEqual({ transcripts: { files: 6, bytes: 216 }, sidecars: { files: 3, bytes: 18 } });
+		expect(view.groups.recent).toEqual({ transcripts: { files: 1, bytes: 20 }, sidecars: { files: 1, bytes: 5 } });
+		expect(view.groups.candidate).toEqual({ transcripts: { files: 3, bytes: 180 }, sidecars: { files: 1, bytes: 10 } });
+		expect(view.groups.unknown).toEqual({ transcripts: { files: 2, bytes: 16 }, sidecars: { files: 1, bytes: 3 } });
+		expect(view.groups.live).toEqual({ transcripts: { files: 0, bytes: 0 }, sidecars: { files: 0, bytes: 0 } });
+		// Parent transcripts and local spill are measured apart and never enter a candidate's bytes.
+		expect(view.parent).toEqual({ files: 2, bytes: 112 });
+		expect(view.spill).toEqual({ files: 1, bytes: 40 });
+		expect(view.gaps).toEqual({ sessionsRoot: false, project: true, staleSessions: 0, trustRoots: 0, roots: 0, entries: 0, symlinks: 0, scanned: 1 });
+		const detail = formatStorageDetail(view, true).join("\n");
+		for (const part of ["최근 3개 실행 보호", "정리 후보", "소유 미상", "자동 삭제하지 않음", "상위 세션 전사", "세션 spill", "정리 대상 아님"]) expect(detail).toContain(part);
+		expect(detail).not.toContain(tmp);
+		const line = formatStorage(view, true);
+		for (const part of ["정리 후보 4개 190B", "소유 미상 3개 19B", "omp 자식 기록 9개 234B"]) expect(line).toContain(part);
+	});
+
+	test("live and same-process records are protected or unclassified, never candidates", async () => {
+		await writeRecord("Live.jsonl", "l".repeat(10));
+		await writeRecord("Mine.jsonl", "m".repeat(20));
+		await writeRecord("Old.jsonl", "o".repeat(30));
+		const live = "8888:1";
+		await trustRuns([
+			{ process: live, agents: ["Live"] },
+			{ process: me, agents: ["Mine"] },
+			{ process: dead, agents: ["Old"] },
+			{ process: dead, agents: [] },
+			{ process: dead, agents: [] },
+			{ process: dead, agents: [] },
+		]);
+		const on = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj"), alive: key => key === live });
+		expect(on.groups.live.transcripts).toEqual({ files: 1, bytes: 10 });
+		expect(on.groups.unclassified.transcripts).toEqual({ files: 1, bytes: 20 });
+		expect(on.groups.candidate.transcripts).toEqual({ files: 1, bytes: 30 });
+		expect(on.unclassifiedReasons).toEqual({ sameProcess: 1, cleaned: 0, other: 0 });
+		// The two live/same-process protections remain; with cleanup off the older dead run is unclassified too.
+		const off = await readStorage(root, storeDir, sessions, { cleanup: false, sessionDir: path.join(sessions, "proj"), alive: key => key === live });
+		expect(off.groups.live.transcripts.files).toBe(1);
+		expect(off.groups.candidate.transcripts.files).toBe(0);
+		expect(off.groups.unclassified.transcripts.files).toBe(2);
+		expect(formatStorageDetail(off, false).join("\n")).toContain("자동 정리가 꺼져 있음");
+	});
+
+	test("stale, missing and outside roots are gaps, never measured zeros", async () => {
+		const missing = path.join(sessions, "proj", "gone");
+		const outside = path.join(tmp, "outside", "sess");
+		await mkdir(outside, { recursive: true });
+		await writeFile(`${outside}.jsonl`, "");
+		await trustRuns([
+			{ process: dead, agents: [], artifactsDir: missing },
+			{ process: dead, agents: [], artifactsDir: outside },
+		]);
+		const stale = await readStorage(root, storeDir, sessions, { cleanup: true });
+		expect(stale.gaps.trustRoots).toBe(2);
+		expect(stale.gaps.currentSession).toBe("unnamed");
+		expect(stale.gaps.scanned).toBe(0);
+		const line = formatStorage(stale, true);
+		expect(line).toContain("측정 불가");
+		expect(line).not.toContain("omp 자식 기록 0");
+		const detail = formatStorageDetail(stale, true).join("\n");
+		expect(detail).toContain("실행 목록의 세션 폴더 2곳 사용 불가");
+		expect(detail).toContain("현재 세션 폴더 미지정");
+		expect(detail).toContain("마지막 정리 없음");
+
+		const noRoot = await readStorage(root, storeDir, path.join(tmp, "agent", "absent"), { cleanup: true });
+		expect(noRoot.gaps.sessionsRoot).toBe(true);
+		expect(formatStorage(noRoot, true)).toContain("측정 불가");
+	});
+
+	test("a session folder without its regular parent transcript is excluded and marked", async () => {
+		await rm(`${artifacts}.jsonl`);
+		await writeRecord("Old.jsonl", "x");
+		await trustRuns([{ process: dead, agents: ["Old"] }]);
+		const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj") });
+		expect(view.gaps.trustRoots).toBe(1);
+		expect(view.gaps.staleSessions).toBe(1);
+		expect(view.gaps.currentSession).toBeUndefined();
+		expect(view.total.transcripts.files).toBe(0);
+		expect(formatStorage(view, true)).toContain("일부 누락");
+		expect(formatStorageDetail(view, true).join("\n")).toContain("상위 세션 기록이 없는 폴더 1곳 제외");
+	});
+
+	test("symlinks are never followed and unreadable directories are counted as gaps", async () => {
+		await writeRecord("Visible.jsonl", "v".repeat(4));
+		const outside = path.join(tmp, "outside.jsonl");
+		await writeFile(outside, "x".repeat(50));
+		await symlink(outside, path.join(artifacts, "Link.jsonl"));
+		const linkedRoot = path.join(sessions, "otherproj", "link-sess");
+		await mkdir(path.dirname(linkedRoot), { recursive: true });
+		await symlink(artifacts, linkedRoot);
+		await writeFile(`${linkedRoot}.jsonl`, "");
+		await trustRuns([{ process: dead, agents: [], artifactsDir: linkedRoot }]);
+		await writeRecord("Blocked/Blocked.child.jsonl", "b".repeat(8));
+		await chmod(path.join(artifacts, "Blocked"), 0o000);
+		try {
+			const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj") });
+			expect(view.total.transcripts).toEqual({ files: 1, bytes: 4 });
+			expect(view.gaps.trustRoots).toBe(1);
+			expect(view.gaps.entries).toBe(1);
+			expect(view.gaps.symlinks).toBe(1);
+			const detail = formatStorageDetail(view, true).join("\n");
+			expect(detail).toContain("심볼릭 링크 1개 건너뜀");
+			expect(detail).toContain("하위 항목 1곳 읽기 실패");
+		} finally {
+			await chmod(path.join(artifacts, "Blocked"), 0o755);
+		}
 	});
 });
 

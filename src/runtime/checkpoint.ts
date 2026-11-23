@@ -1,7 +1,8 @@
 /**
- * Director context checkpoints. Past its context cap the director is compacted while it waits on subagents, keeping
- * decisions and evidence locations rather than raw contents; every compaction (omp's own included) also gets Storm's
- * ledger of the run, so lanes and each agent's `agent://` handle survive it.
+ * Director context checkpoints. Past its context cap the director is compacted — in the background for automatic runs
+ * at their first plan and sync-wait boundaries, and at an async wait for manual runs — keeping decisions and evidence
+ * locations rather than raw contents; every compaction (omp's own included) also gets Storm's ledger of the run, so
+ * lanes and each agent's `agent://` handle survive it.
  */
 import { tokens } from "../report/agents.ts";
 import { roleTitle } from "../roles.ts";
@@ -37,11 +38,26 @@ export const CHECKPOINT_INSTRUCTIONS = [
 	"파일 원문, 명령 출력, 로그 본문은 버리세요. 근거 위치로 다시 읽을 수 있습니다.",
 ].join("\n");
 
-/** Whether the director's context (`tokens`) is at or past `cap` and no checkpoint ran within `minGapMs`. */
-export function shouldCheckpoint(input: { tokens: number; cap: number; lastAt?: number; now: number; minGapMs?: number }): boolean {
+/**
+ * Whether the director's context (`tokens`) is at or past `cap` and no checkpoint ran within `minGapMs`. A checkpoint
+ * in flight excludes another, and a host rejection holds the next try off for the same gap: a host that refuses
+ * (already compacting, nothing to compact, a session change) is never asked at every boundary.
+ */
+export function shouldCheckpoint(input: {
+	tokens: number;
+	cap: number;
+	lastAt?: number;
+	lastRejectedAt?: number;
+	inFlight?: boolean;
+	now: number;
+	minGapMs?: number;
+}): boolean {
+	if (input.inFlight === true) return false;
 	if (input.tokens < input.cap) return false;
-	if (input.lastAt === undefined) return true;
-	return input.now - input.lastAt >= (input.minGapMs ?? CHECKPOINT_MIN_GAP_MS);
+	const gap = input.minGapMs ?? CHECKPOINT_MIN_GAP_MS;
+	if (input.lastAt !== undefined && input.now - input.lastAt < gap) return false;
+	if (input.lastRejectedAt !== undefined && input.now - input.lastRejectedAt < gap) return false;
+	return true;
 }
 
 const STATE_LABEL: Record<AgentLiveState, string> = { running: "실행 중", idle: "유휴", parked: "보관" };
@@ -164,4 +180,13 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 		`Storm이 막은 일: 파일 수정 ${run.blockedEdits ?? 0}, 후속 지시 ${run.blockedFollowUps ?? 0}, 읽기 ${run.reads?.blocked ?? 0}`,
 	);
 	return boundedState(out);
+}
+
+/**
+ * Guidance for a handoff checkpoint. omp's background handoff summarizer receives only this text as its focus (the
+ * `session.compacting` hook context is not part of a handoff request), so the run ledger rides here: the request and
+ * its constraints, the plan and lane goals, the agents' handles, and what Storm blocked survive the compaction.
+ */
+export function checkpointGuidance(run: RunRecord, agents: readonly AgentEntry[]): string {
+	return `${CHECKPOINT_INSTRUCTIONS}\n\nStorm 장부(압축 뒤에도 유지):\n${workingState(run, agents).join("\n")}`;
 }

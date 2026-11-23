@@ -927,6 +927,24 @@ describe("status and agents", () => {
 		expect(full.split("\n").filter(line => line.startsWith("### "))).toEqual(expect.arrayContaining(text.split("\n").filter(line => line.startsWith("### "))));
 	});
 
+	test("the user's storage inventory scans the named project session dir and the model receives none of it", async () => {
+		await approve(TEAM);
+		const projectDir = path.join(env.agentDir, "sessions", "proj");
+		const artifactsDir = path.join(projectDir, "sess");
+		await mkdir(artifactsDir, { recursive: true });
+		await writeFile(`${artifactsDir}.jsonl`, "parent");
+		await writeFile(path.join(artifactsDir, "Legacy.jsonl"), "legacy");
+		const scoped: FlowEnv = { ...env, sessionDir: projectDir };
+		const full = await statusText(scoped, { quota: true });
+		expect(full).toContain("소유 미상");
+		expect(full).toContain("자동 삭제하지 않음");
+		expect(full).not.toContain(projectDir);
+		// No storage section enters the model's context.
+		const model = await statusText(scoped, { quota: false });
+		expect(model).not.toContain("저장 공간");
+		expect(model).not.toContain("소유 미상");
+	});
+
 	test("the user status puts the active run's state and details before the team, and claims no phase that was not given", async () => {
 		const run = runRecord({
 			status: "running",

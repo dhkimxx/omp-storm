@@ -36,7 +36,7 @@ import { directorRead, noteChildRead } from "./policy/reads.ts";
 import { activeAgents, blockedSpawn, blockText, deadline, decideSpawn, failClosed, SPAWN_DECISION_MS, usableRole } from "./policy/spawn.ts";
 import { supervisorToolBlock } from "./policy/supervisor.ts";
 import { decideToolCall } from "./policy/toolcall.ts";
-import { directorCap, PACKAGE_JSON, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
+import { PACKAGE_JSON, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
 import {
 	listAgents,
 	noteAgentChange,
@@ -49,7 +49,7 @@ import {
 	noteAgentUsage,
 	noteVerdictTree,
 } from "./runtime/agents.ts";
-import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "./runtime/checkpoint.ts";
+import { workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
@@ -488,6 +488,13 @@ export default function storm(pi: ExtensionAPI): void {
 	// The host's ask tool is the one real form-open signal a host emits: execution starts before the form waits and
 	// ends when it is answered, cancelled or fails. A host with no UI cannot show the form, so it claims no wait.
 	pi.on("tool_execution_start", (event, ctx) => {
+		// A synchronous wait is the one mid-run tool call that can outlast the plan: if the context crossed the cap
+		// since then, this boundary starts the automatic run's next background checkpoint. A manual run's wait tool
+		// adds nothing; its async wait uses the same handoff directly.
+		if (event.toolName === "wait") {
+			if (ctx.agent.kind === "main") runs.startAutoCheckpoint();
+			return;
+		}
 		if (!ctx.hasUI || event.toolName !== "ask" || !askWaits(event.args)) return;
 		openWait(ctx, "ask", event.toolCallId);
 	});
@@ -502,22 +509,6 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 	pi.on("tool_approval_resolved", (event, ctx) => closeWait(ctx, "approval", event.toolCallId));
 
-	/** Compacts the director while it waits on subagents, once its context reaches the director cap. */
-	const checkpointDirector = (ctx: ExtensionContext): void => {
-		const config = runs.runConfig();
-		const usage = ctx.getContextUsage();
-		if (!config || !usage) return;
-		const lastAt = runs.lastCheckpointAt();
-		const cap = directorCap(config, usage.contextWindow);
-		if (!shouldCheckpoint({ tokens: usage.tokens, cap, now: Date.now(), ...(lastAt !== undefined ? { lastAt } : {}) })) return;
-		const checkpoint = runs.noteCheckpoint(usage.tokens);
-		// Not awaited: agent_end handlers time out after 30s and a summary can take longer; async subagents keep running.
-		ctx.compact(CHECKPOINT_INSTRUCTIONS).then(
-			() => checkpoint.done(ctx.getContextUsage()?.tokens),
-			() => checkpoint.failed(),
-		);
-	};
-
 	const flowEnv = (ctx: ExtensionContext, startRun?: (spec: RunSpec) => Promise<RunRequestResult>): FlowEnv => ({
 		...projectEnv(ctx),
 		ompBin: ompBinary(),
@@ -530,8 +521,19 @@ export default function storm(pi: ExtensionAPI): void {
 		agents: () => listAgents({ ancestorId: ctx.agent.id }),
 		ompSettings,
 		newerVersion,
+		// This conversation's own session directory, from the public session manager; empty where the host has none.
+		sessionDir: sessionDirOf(ctx),
 		...(startRun ? { startRun } : {}),
 	});
+
+	/** The session's own directory from the public session manager; empty when a host keeps its sessions in memory. */
+	const sessionDirOf = (ctx: ExtensionContext): string => {
+		try {
+			return ctx.sessionManager?.getSessionDir() ?? "";
+		} catch {
+			return "";
+		}
+	};
 
 	/** The approval path's host, and what a team change needs besides. Saving drops the caches the spawn hook reads. */
 	const actionHost = (ctx: ExtensionContext, ui: UiPort): ActionHost => ({
@@ -611,7 +613,14 @@ export default function storm(pi: ExtensionAPI): void {
 							return { ok: false, reason: "omp 계획 모드를 확인하지 못해 자동 실행을 열지 않았습니다. 다시 요청하세요." };
 						}
 					}
-					return runs.startWithPlan(ctx, spec, plan, validatedHash);
+					const started = await runs.startWithPlan(ctx, spec, plan, validatedHash);
+					// The first accepted automatic plan is a live tool boundary: the run's heavy pre-work context was
+					// never preflight-compacted (and a sync subagent wait may never pause the agent loop). Start the one
+					// background checkpoint now; omp commits it at its next turn/idle boundary. The already-oversized
+					// first request cannot be prevented from here — the host classifies prompt size only after the
+					// prompt has arrived — so this restores every request after that boundary, not that first one.
+					if (started.ok) runs.startAutoCheckpoint();
+					return started;
 				},
 				agents: () => listAgents({ ancestorId: ctx.agent.id }),
 			},
@@ -994,8 +1003,9 @@ export default function storm(pi: ExtensionAPI): void {
 			if (ledger) touchRun(ledger.runId);
 			return;
 		}
-		// Paused on async subagents: the moment to shed context before their results arrive.
-		if (event.awaitingAsyncWork) checkpointDirector(ctx);
+		// Paused on async subagents: the moment to shed context before their results arrive. Both manual and automatic
+		// runs use the same background handoff, so the recorded ledger is identical.
+		if (event.awaitingAsyncWork) runs.startCheckpoint();
 		// Ends the run when the session settles; a queued run starts detached from this handler.
 		await runs.onAgentEnd(event, ctx);
 		if (!event.willContinue) {

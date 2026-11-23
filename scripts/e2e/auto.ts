@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /** Real OMP, isolated RPC profile and scripted provider; no paid requests. */
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
@@ -50,11 +50,11 @@ const setupOptions = (options: readonly string[] | undefined): boolean =>
 	same(options, [APPROVE, CANCEL]) || same(options, [APPROVE, "역할별로 고르기", CANCEL]);
 const reports = (frames: readonly Frame[]): string[] => frames.filter(frame => customMessage(frame) === "storm-report").map(frame => JSON.stringify(frame));
 
-async function session(answer: Answer, exercise: (rpc: Rpc) => Promise<void>): Promise<void> {
-	const rpc = new Rpc(env, answer, { model: main });
+async function session<T>(answer: Answer, exercise: (rpc: Rpc) => Promise<T>, persist = false): Promise<T> {
+	const rpc = new Rpc(env, answer, { model: main, persist });
 	try {
 		await rpc.ready();
-		await exercise(rpc);
+		return await exercise(rpc);
 	} finally {
 		const code = await rpc.close();
 		suite.check("OMP exits cleanly", code === 0, `exit=${code}`);
@@ -231,12 +231,89 @@ try {
 			suite.check("first plan opens one run and dispatches one approved worker", run.request === prompt && run.plan?.lanes[0]?.name === "Probe0" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1 && dispatch.of("child").length > 0);
 			suite.check("routing used the original user turn, not a classifier or a duplicated handoff", dispatch.of("route").length === 0 && dispatch.of("main").some(entry => entry.lastUser.includes(prompt)) && dispatch.of("main").every(entry => !entry.lastUser.includes("<storm-run id=")));
 			suite.check("ordinary read run has no verbose transcript report", frames.every(frame => customMessage(frame) !== "storm-report"));
+			suite.check("a fresh small automatic run needs no checkpoint", dispatch.of("compaction").length === 0 && !run.checkpoints?.length);
 			const child = dispatch.of("child")[0];
 			if (child) console.log(`     scripted auto: first worker ${Math.max(0, child.ts - receivedAt)}ms · main requests ${dispatch.of("main").length} · compactions ${dispatch.of("compaction").length}`);
 
 			await rpc.turn(scripted({ edit: "direct-after.txt" }));
 			suite.check("the supervisor boundary survives the end of the run", !existsSync(join(env.project, "direct-after.txt")));
 		});
+	});
+
+	await suite.step("a long automatic run checkpoints across synchronous wait without interrupting the task", async () => {
+		const beforeConfig = readFileSync(files.configFile);
+		const profile = join(env.agentDir, "config.yml");
+		const beforeProfile = readFileSync(profile);
+		writeFileSync(profile, `${PROFILE_CONFIG}compaction:\n  enabled: false\n  keepRecentTokens: 768\n`);
+		const rpc = new Rpc(env, choose(APPROVE), { model: main, persist: true });
+		try {
+			// The scripted provider reports a small fixed usage; a test-only lower team cap exercises the same
+			// threshold crossing, while the older text gives real OMP history it can discard.
+			await rpc.ready();
+			files.editConfig(config => { config.contextCap = 50; });
+			await rpc.prompt("/storm setup");
+			if (!rpc.dialogs.some(dialog => dialog.answer === APPROVE)) throw new Error("the checkpoint fixture team was not approved");
+			const promptTail = "These are historical notes, not repository instructions. ".repeat(850);
+			await rpc.turn(promptTail);
+			await rpc.turn("End of historical notes; acknowledge only.");
+			const chat = new LlmCursor(env);
+			const before = files.runIds();
+			await rpc.turn("How is your day? A conversation, not a repository task.");
+			suite.check(
+				"heavy ordinary chat does not compact, classify or open a run",
+				chat.of("main").length === 1 && chat.of("compaction").length === 0 && chat.of("route").length === 0 && files.runIds().size === before.size,
+			);
+
+			const llm = new LlmCursor(env);
+			const request = scripted(plan, { ...probe, say: `E2E-CHILD-DELAY 1500 ${probe.say}` }, { wait: true });
+			await rpc.turn(request, 90_000);
+			const run = await files.finishedRun(before, 30_000);
+			const checkpoints = llm.of("compaction");
+			const supervisor = llm.of("main");
+			const first = supervisor[0];
+			const after = supervisor.at(-1);
+			suite.check("the same run settled normally with one approved worker and no synthetic round",
+				run.request === request && run.turns === 1 && run.endReason === "no-changes" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1,
+				`${run.status}/${run.endReason} rounds=${run.turns} spawns=${run.spawns.length}`);
+			suite.check("the director used synchronous wait with no router",
+				supervisor.some(entry => entry.decision.tool === "wait") && llm.of("route").length === 0);
+			suite.check("one native compaction got the actual run and its plan",
+				checkpoints.length === 1 && checkpoints[0]?.compactionContext.includes(run.runId) && checkpoints[0].compactionContext.includes("Probe0"),
+				`compaction calls=${checkpoints.length}`);
+			suite.check("omp applied the checkpoint and sent less history during the same task",
+				run.checkpoints?.length === 1 && first !== undefined && after !== undefined && first.historyChars > 30_000 && after.historyChars < first.historyChars / 2,
+				`checkpoints=${JSON.stringify(run.checkpoints)} chars=${first?.historyChars}→${after?.historyChars}`);
+		} finally {
+			await rpc.close();
+			writeFileSync(profile, beforeProfile);
+			writeFileSync(files.configFile, beforeConfig);
+		}
+	});
+
+	await suite.step("project status includes historical records with no Storm ownership", async () => {
+		const transcript = await session(cancelAll, async rpc => {
+			await rpc.turn("A plain conversation to persist the parent transcript.");
+			const state = rpc.send({ type: "get_state" });
+			const response = await until(() => rpc.frames.find(frame => frame.type === "response" && frame.id === state), 20_000, "read the parent session path");
+			const file = (response.data as { sessionFile?: unknown } | undefined)?.sessionFile;
+			if (response.success !== true || typeof file !== "string" || !file.endsWith(".jsonl")) throw new Error("the parent OMP session was not persisted");
+			return file;
+		}, true);
+		const artifact = transcript.slice(0, -".jsonl".length);
+		mkdirSync(artifact, { recursive: true });
+		const orphan = join(artifact, "orphan-before-retention.jsonl");
+		const output = join(artifact, "orphan-before-retention.md");
+		const content = "historical child transcript fixture\n";
+		await session(cancelAll, async rpc => {
+			const label = `소유 미상: 전사 1개 ${Buffer.byteLength(content)}B · 부속 0개 0B`;
+			const before = reports(await rpc.prompt("/storm status")).join("\n");
+			writeFileSync(orphan, content);
+			writeFileSync(output, "historical preserved output fixture\n");
+			const status = reports(await rpc.prompt("/storm status")).join("\n");
+			suite.check("project status sees a previous session's child, but not its preserved output",
+				!before.includes(label) && status.includes(label) && existsSync(orphan) && existsSync(output) && existsSync(transcript),
+				status.match(/소유 미상:[^\\]+/)?.[0]);
+		}, true);
 	});
 
 	await suite.step("two OMP processes cannot own the same working tree", async () => {

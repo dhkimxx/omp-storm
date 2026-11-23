@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CHECKPOINT_INSTRUCTIONS, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
+import { CHECKPOINT_INSTRUCTIONS, checkpointGuidance, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
 import type { AgentEntry, RunRecord } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
@@ -22,6 +22,37 @@ describe("shouldCheckpoint", () => {
 		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, lastAt: now - 2 * MIN, now, minGapMs: MIN })).toBe(true);
 		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, lastAt: now, now, minGapMs: MIN })).toBe(false);
 	});
+
+	test("an in-flight checkpoint excludes another; a host rejection waits the same gap", () => {
+		const now = 100 * MIN;
+		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, now, inFlight: true })).toBe(false);
+		// Below the cap, in flight or not, nothing is due.
+		expect(shouldCheckpoint({ tokens: 1, cap: 100_000, now, lastRejectedAt: now })).toBe(false);
+		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, now, lastRejectedAt: now - 9 * MIN })).toBe(false);
+		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, now, lastRejectedAt: now - 10 * MIN })).toBe(true);
+		expect(shouldCheckpoint({ tokens: 200_000, cap: 100_000, now, lastRejectedAt: now - 2 * MIN, minGapMs: MIN })).toBe(true);
+	});
+});
+
+test("handoff checkpoint guidance carries Storm's ledger, not only the summarizer instructions", () => {
+	const text = checkpointGuidance(
+		run({
+			task: "refactor billing",
+			request: "refactor billing\nCONSTRAINT: do not touch refunds",
+			plan: {
+				lanes: [{ name: "move the invoice service", kind: "code", role: "implementer" }],
+				workers: { implementer: 1 },
+				submittedAt: "x",
+			},
+		}),
+		[agent({ id: "Impl", name: "storm-implementer", role: "implementer", state: "running" })],
+	);
+	expect(text).toContain(CHECKPOINT_INSTRUCTIONS);
+	expect(text).toContain("CONSTRAINT: do not touch refunds");
+	expect(text).toContain("move the invoice service");
+	expect(text).toContain("agent://Impl");
+	// The ledger follows the focus, so the summarizer reads its instructions first.
+	expect(text.indexOf("Storm 장부")).toBeGreaterThan(text.indexOf("다음 행동"));
 });
 
 test("the checkpoint instructions stay small: they ride on every mid-run compaction", () => {

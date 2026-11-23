@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent";
+import type { AsyncJobSnapshot, CompactOptions } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -2092,6 +2092,12 @@ describe("run-end cleanup", () => {
 });
 
 describe("director counters", () => {
+	/** The options of a checkpoint compaction; a preflight's bare instructions string is not one. */
+	const checkpointOptions = (options: string | CompactOptions | undefined): CompactOptions => {
+		if (typeof options !== "object" || options === null) throw new Error("expected checkpoint options");
+		return options;
+	};
+
 	test("count only while the run is active and land in the record", async () => {
 		const h = session();
 		h.controller.noteMainSpend(5);
@@ -2140,24 +2146,134 @@ describe("director counters", () => {
 		expect((await h.controller.finish("no-changes"))?.reads).toEqual({ director: 0, directorChars: 0, duplicateChars: 0, blocked: 1 });
 	});
 
-	test("a mid-run compaction is counted with its sizes; one omp refused leaves no trace and does not hold off the next", async () => {
+	test("a heavy run starts one handoff checkpoint; small and in-flight contexts start none and only an applied commit is recorded", async () => {
 		const at = Date.parse("2026-11-20T10:00:00.000Z");
-		const h = session({ now: () => at });
-		expect(h.controller.lastCheckpointAt()).toBeUndefined();
-		// Without a run nothing is noted.
-		h.controller.noteCheckpoint(1).done(1);
-		await h.start();
-		const refused = h.controller.noteCheckpoint(180_000);
-		expect(h.controller.lastCheckpointAt()).toBe(at);
-		refused.failed();
-		expect(h.controller.lastCheckpointAt()).toBeUndefined();
-		h.controller.noteCheckpoint(190_000).done(40_000);
-		h.controller.noteCheckpoint(200_000).done(undefined);
+		const plan: RunPlan = { lanes: [{ name: "probe", kind: "code", role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const startAuto = async (h: FakeSession): Promise<void> => {
+			const started = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash(h.config));
+			if (!started.ok) throw new Error(started.reason);
+		};
+		// Below the director cap nothing is asked of the host.
+		const small = session({ usage: usage(199_999, 49), now: () => at });
+		const smallCalls: CompactOptions[] = [];
+		small.ctx.compact = options => {
+			smallCalls.push(checkpointOptions(options));
+			return Promise.resolve();
+		};
+		await startAuto(small);
+		expect(small.controller.startCheckpoint()).toBe(false);
+		expect(smallCalls).toEqual([]);
+		await small.controller.finish("no-changes");
+
+		const heavy = usage(206_512, 51);
+		const h = session({ usage: heavy, now: () => at });
+		const calls: CompactOptions[] = [];
+		const pending: Array<PromiseWithResolvers<void>> = [];
+		h.ctx.compact = options => {
+			calls.push(checkpointOptions(options));
+			const wait = Promise.withResolvers<void>();
+			pending.push(wait);
+			return wait.promise;
+		};
+		await startAuto(h);
+		expect(h.controller.autoRun()).toBe(true);
+		expect(h.controller.startCheckpoint()).toBe(true);
+		// The same run inside the host's summary never asks twice.
+		expect(h.controller.startCheckpoint()).toBe(false);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({ mode: "handoff" });
+		expect(calls[0]?.internalGuidance).toContain("Storm 장부");
+		expect(calls[0]?.internalGuidance).toContain("probe");
+		expect(calls[0]?.signal).toBeDefined();
+		// Not awaited: startCheckpoint returned while the host summary is still pending.
+		heavy.tokens = 30_000;
+		heavy.percent = 7;
+		calls[0]?.onComplete?.({} as never);
+		pending[0]?.resolve();
+		await until(() => h.controller.active()?.checkpoints?.length === 1);
+		expect(h.controller.active()?.checkpoints).toEqual([{ at: new Date(at).toISOString(), before: 206_512, after: 30_000 }]);
+		// The record and the summary carry the applied compaction only.
 		const record = await h.controller.finish("no-changes");
-		expect(record?.checkpoints).toEqual([
-			{ at: new Date(at).toISOString(), before: 190_000, after: 40_000 },
-			{ at: new Date(at).toISOString(), before: 200_000 },
-		]);
+		expect(record?.checkpoints).toHaveLength(1);
+		expect(record && summarizeRun(record)).toContain("실행 중 압축 1회");
+	});
+
+	test("a rejected or no-op host compaction leaves no mark and holds the retry off for the min gap", async () => {
+		let now = T0;
+		const plan: RunPlan = { lanes: [{ name: "probe", kind: "code", role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const h = session({ usage: usage(210_000, 55), now: () => now });
+		const calls: Array<{ options: CompactOptions; wait: PromiseWithResolvers<void> }> = [];
+		h.ctx.compact = options => {
+			const wait = Promise.withResolvers<void>();
+			calls.push({ options: checkpointOptions(options), wait });
+			return wait.promise;
+		};
+		const started = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash(h.config));
+		if (!started.ok) throw new Error(started.reason);
+		expect(h.controller.startCheckpoint()).toBe(true);
+		// The host refuses: nothing is counted, and the same instant may not ask again.
+		calls[0]?.wait.reject(new Error("Compaction already in progress"));
+		await until(() => calls.length === 1 && !h.controller.active()?.checkpoints);
+		expect(h.controller.startCheckpoint()).toBe(false);
+		expect(h.controller.active()?.checkpoints).toBeUndefined();
+		now += 10 * 60_000;
+		expect(h.controller.startCheckpoint()).toBe(true);
+		// A host that resolves without a commit reports a no-op: still not a checkpoint, and still held off.
+		calls[1]?.wait.resolve();
+		await until(() => calls.length === 2 && !h.controller.active()?.checkpoints);
+		expect(h.controller.active()?.checkpoints).toBeUndefined();
+		expect(h.controller.startCheckpoint()).toBe(false);
+		now += 10 * 60_000;
+		expect(h.controller.startCheckpoint()).toBe(true);
+		calls[2]?.options.onComplete?.({} as never);
+		calls[2]?.wait.resolve();
+		await until(() => h.controller.active()?.checkpoints?.length === 1);
+		expect(h.controller.active()?.checkpoints).toHaveLength(1);
+		await h.controller.finish("no-changes");
+	});
+
+	test("a stop cancels the run's checkpoint; its late commit never marks the next run", async () => {
+		const at = T0;
+		const plan: RunPlan = { lanes: [{ name: "probe", kind: "code", role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const h = session({ usage: usage(220_000, 58), now: () => at });
+		const calls: Array<{ options: CompactOptions; wait: PromiseWithResolvers<void> }> = [];
+		h.ctx.compact = options => {
+			const wait = Promise.withResolvers<void>();
+			calls.push({ options: checkpointOptions(options), wait });
+			return wait.promise;
+		};
+		const first = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash(h.config));
+		if (!first.ok) throw new Error(first.reason);
+		expect(h.controller.startCheckpoint()).toBe(true);
+		await h.controller.finish("shutdown");
+		// A switch/stop aborts the host summary without interrupting any turn.
+		expect(calls[0]?.options.signal?.aborted).toBe(true);
+
+		// A fresh run owns a fresh checkpoint; the old commit resolving after it must not add a mark there.
+		const second = await h.controller.startWithPlan(h.ctx, ask("second"), plan, configHash(h.config));
+		if (!second.ok) throw new Error(second.reason);
+		calls[0]?.options.onComplete?.({} as never);
+		calls[0]?.wait.resolve();
+		const tick = Promise.withResolvers<void>();
+		setImmediate(tick.resolve);
+		await tick.promise;
+		expect(h.controller.active()?.checkpoints).toBeUndefined();
+		// The old abort is not a host rejection either: the new run may checkpoint immediately.
+		expect(h.controller.startCheckpoint()).toBe(true);
+		expect(calls).toHaveLength(2);
+		calls[1]?.options.onComplete?.({} as never);
+		calls[1]?.wait.resolve();
+		await until(() => h.controller.active()?.checkpoints?.length === 1);
+		expect(h.controller.active()?.checkpoints).toHaveLength(1);
+		await h.controller.finish("no-changes");
+	});
+
+	test("the sync-wait checkpoint only starts for an automatic run", async () => {
+		const h = session();
+		await h.start();
+		expect(h.controller.autoRun()).toBe(false);
+		expect(h.controller.startAutoCheckpoint()).toBe(false);
+		await h.controller.finish("no-changes");
 	});
 });
 

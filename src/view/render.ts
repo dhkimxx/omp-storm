@@ -591,7 +591,11 @@ export function renderStatus(
 		heading("사용 데이터");
 		styled([{ text: `- 기준 시각: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)})`, tone: "muted" }]);
 	}
-	if (view.storage !== undefined) {
+	if (view.storageDetail?.length) {
+		out.push("");
+		heading("저장 공간");
+		for (const line of view.storageDetail) styled([{ text: `- ${line}`, tone: "muted" }]);
+	} else if (view.storage !== undefined) {
 		out.push("");
 		heading("저장 공간");
 		styled([{ text: `- ${view.storage}`, tone: "muted" }]);

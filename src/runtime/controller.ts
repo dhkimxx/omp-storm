@@ -1,10 +1,11 @@
 /**
  * Storm run lifecycle for one main session. A run starts from `/storm` at once, or from the storm tool once the turn
  * that queued it settles: team gate, omp's session modes, compaction of a heavy context, then the handoff. An automatic
- * probe opens from the storm tool's first plan inside the running turn, with no handoff, compaction or dialog. At the
- * end of every round the round rules decide whether the run is over; when it is not, Storm sends the next round itself,
- * waiting out the hold while the session is busy. Spawn decisions arrive from any session in the process (children
- * included), so they are collected per run in module scope.
+ * probe opens from the storm tool's first plan inside the running turn, with no handoff or dialog; that accepted plan
+ * starts one background checkpoint when the context is already heavy. At the end of every round the round rules decide
+ * whether the run is over; when it is not, Storm sends the next round itself, waiting out the hold while the session is
+ * busy. Spawn decisions arrive from any session in the process (children included), so they are collected per run in
+ * module scope.
  */
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -13,7 +14,7 @@ import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
 import { formatUsd, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
 import { tokens } from "../report/agents.ts";
-import { PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
+import { directorCap, PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
 import type {
@@ -32,6 +33,7 @@ import type {
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
 import { RunLanes } from "./lanes.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
@@ -236,6 +238,10 @@ interface OwnRun {
 	hold?: unknown;
 	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
 	awaitingAsync: boolean;
+	/** A background director checkpoint of this run is in flight; its abort dies with the run. */
+	checkpoint?: { controller: AbortController; applied: boolean };
+	/** When the host last rejected a checkpoint (memory only): holds off the next try for the min gap. */
+	checkpointRejectedAt?: number;
 	/** View-only: the phase last handed to the live callback. Never written to the record or read by a decision. */
 	shownPhase?: RunPhase;
 	/** View-only: a required-check runner is inside `runRequiredChecks` now, not merely being prepared. */
@@ -740,34 +746,93 @@ export class RunController {
 		});
 	}
 
-	/** When this run last started a mid-run compaction (ms since epoch). */
-	lastCheckpointAt(): number | undefined {
-		const last = this.#own?.record.checkpoints?.at(-1);
-		return last ? Date.parse(last.at) : undefined;
+	/** Whether this session's run is the automatic probe opened inside its live turn. */
+	autoRun(): boolean {
+		return this.#own?.auto === true;
 	}
 
 	/**
-	 * A mid-run compaction started at `before` tokens. `done` records the size after it; `failed` drops the entry, so a
-	 * compaction omp refused (one already running, nothing to compact) neither counts nor holds off the next try.
+	 * Starts one background director checkpoint only for an automatic run. Manual runs reach the same handoff path
+	 * at their async wait, so a wait tool during manual direction changes nothing.
 	 */
-	noteCheckpoint(before: number): { done(after: number | undefined): void; failed(): void } {
+	startAutoCheckpoint(): boolean {
+		return this.autoRun() ? this.startCheckpoint() : false;
+	}
+
+	/**
+	 * Starts one background director checkpoint when this run's context is at its cap and none is in flight.
+	 * omp prepares a handoff summary without interrupting the live turn and commits it at the next natural
+	 * boundary (a continuing tool loop's turn end, or idle); this returns at once and never awaits that commit,
+	 * so a caller inside a tool call or an event handler cannot deadlock. Only a commit that reported completion
+	 * is recorded; a host rejection is remembered in memory and holds off the next try for the same min gap.
+	 * A request already oversized when the prompt arrived has been sent by then: this restores later requests only.
+	 */
+	startCheckpoint(): boolean {
 		const own = this.#own;
-		if (!own) return { done: () => undefined, failed: () => undefined };
-		const checkpoint: RunCheckpoint = { at: iso(this.deps.now()), before };
-		own.record.checkpoints = [...(own.record.checkpoints ?? []), checkpoint];
-		this.#scheduleFlush(own);
-		return {
-			done: after => {
-				if (after === undefined || this.#own !== own) return;
-				checkpoint.after = after;
-				this.#scheduleFlush(own);
-			},
-			failed: () => {
-				if (this.#own !== own) return;
-				own.record.checkpoints = (own.record.checkpoints ?? []).filter(entry => entry !== checkpoint);
-				this.#scheduleFlush(own);
-			},
+		// A stopping run starts no new summary while its owned work drains.
+		if (own === undefined || own.ending !== undefined || own.abort.signal.aborted) return false;
+		const usage = own.ctx.getContextUsage();
+		if (usage === undefined) return false;
+		const now = this.deps.now();
+		const before = usage.tokens;
+		const last = own.record.checkpoints?.at(-1);
+		const lastAt = last === undefined ? undefined : Date.parse(last.at);
+		const cap = directorCap(own.config, usage.contextWindow);
+		if (
+			!shouldCheckpoint({
+				tokens: usage.tokens,
+				cap,
+				now,
+				...(lastAt !== undefined && Number.isFinite(lastAt) ? { lastAt } : {}),
+				...(own.checkpointRejectedAt !== undefined ? { lastRejectedAt: own.checkpointRejectedAt } : {}),
+				...(own.checkpoint !== undefined ? { inFlight: true } : {}),
+			})
+		) {
+			return false;
+		}
+		const attempt = { controller: new AbortController(), applied: false };
+		own.checkpoint = attempt;
+		// Capture the ledger now: it is what the handoff summary must keep, not the context it replaces.
+		const guidance = checkpointGuidance(own.record, this.deps.agents?.(own.record.runId) ?? []);
+		const settle = (completed: boolean): void => {
+			// A stopped, switched or replaced run owns nothing: its late result must not mark the next run.
+			if (this.#own !== own || own.checkpoint !== attempt) return;
+			delete own.checkpoint;
+			// A cancel is not a host rejection: it says nothing about the next run's host.
+			if (attempt.controller.signal.aborted) return;
+			if (!completed || !attempt.applied) {
+				own.checkpointRejectedAt = this.deps.now();
+				return;
+			}
+			delete own.checkpointRejectedAt;
+			const after = own.ctx.getContextUsage()?.tokens;
+			const checkpoint: RunCheckpoint = {
+				at: iso(this.deps.now()),
+				before,
+				...(after !== undefined ? { after } : {}),
+			};
+			own.record.checkpoints = [...(own.record.checkpoints ?? []), checkpoint];
+			this.#scheduleFlush(own);
 		};
+		try {
+			void Promise.resolve(
+				own.ctx.compact({
+					mode: "handoff",
+					internalGuidance: guidance,
+					signal: attempt.controller.signal,
+					onComplete: () => {
+						attempt.applied = true;
+					},
+				}),
+			).then(
+				() => settle(true),
+				() => settle(false),
+			);
+		} catch {
+			settle(false);
+			return false;
+		}
+		return true;
 	}
 
 	/** The approved config this session's run started under. */
@@ -1190,6 +1255,9 @@ export class RunController {
 		own.ending ??= reason;
 		if (ctx !== undefined) own.finishCtx ??= ctx;
 		own.abort.abort();
+		// A background checkpoint belongs to this run: cancel it before the run leaves; a late commit cannot mark another.
+		own.checkpoint?.controller.abort();
+		delete own.checkpoint;
 		this.#disarm(own);
 		// A stopping run is no longer waiting on a dialog: the host either answered it or dropped it.
 		this.#clearUserWaits(own);

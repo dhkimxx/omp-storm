@@ -29,7 +29,7 @@ import { activeLedgerRun } from "./runtime/ledger.ts";
 import { acquireRunLease } from "./runtime/lease.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
 import { findResumeCandidate, resumePointerFile, resumeSpec } from "./runtime/resume.ts";
-import { formatStorage, readStorage } from "./runtime/janitor.ts";
+import { formatStorage, formatStorageDetail, readStorage } from "./runtime/janitor.ts";
 import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
@@ -53,6 +53,8 @@ export interface FlowEnv extends ProjectEnv {
 	autoModeProblem?: () => string | undefined;
 	/** Subagents under this session, for status. */
 	agents?: () => AgentEntry[];
+	/** The current project's OMP session dir (the project-level folder), for the storage inventory; absent/empty → unnamed. */
+	sessionDir?: string;
 	/** omp settings as configured (concurrency, fallbacks, isolation); fields are undefined when unreadable. */
 	ompSettings?: () => Promise<ExplicitSettings>;
 	/** A newer Storm installed on disk than the one this process runs. */
@@ -436,7 +438,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 		lastRun(root),
 		opts.trials ?? (config ? trialViews(env, root, config, now) : []),
 		opts.user ? env.ompSettings?.() : undefined,
-		opts.user ? readStorage(root, state.store.dir, join(env.agentDir, "sessions")) : undefined,
+		opts.user ? readStorage(root, state.store.dir, join(env.agentDir, "sessions"), { ...(env.sessionDir ? { sessionDir: env.sessionDir } : {}), cleanup: config?.cleanup === true }) : undefined,
 		opts.user ? savedAutoChoice(state) : undefined,
 	]);
 	const usage = readUsage({ dbPath: env.statsDb ?? statsDbPath(), windowDays: 1, now });
@@ -456,7 +458,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 		// The status never says where the project is.
 		shadows: state.shadows.map(shadow => (shadow.scope === "project" ? { ...shadow, path: relative(root, shadow.path) } : shadow)),
 		...(usage.status === "ok" ? { dataAsOf: usage.dataAsOf } : {}),
-		...(storage ? { storage: formatStorage(storage, config?.cleanup === true) } : {}),
+		...(storage ? { storage: formatStorage(storage, config?.cleanup === true), storageDetail: formatStorageDetail(storage, config?.cleanup === true) } : {}),
 		...(quota ? { quota } : {}),
 		...(run ? { run } : {}),
 		...(runPhase ? { runPhase } : {}),

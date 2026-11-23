@@ -77,6 +77,7 @@ export type Step = (
 	| { followUp: string }
 	| { read: string }
 	| { ask: string }
+	| { wait: true }
 	| { awaitChild: true }
 ) & {
 	after?: string;
@@ -106,6 +107,8 @@ export interface LlmEntry {
 	stormTool: { actions: string[]; descriptionChars: number } | null;
 	/** Messages besides the system prompt. */
 	messageCount: number;
+	/** The character size of non-system messages that actually reach this request. */
+	historyChars: number;
 	/** Every user message, cut to 300 chars. */
 	users: string[];
 	/** The newest user message, whole (cut at 8,000 chars). */
@@ -268,10 +271,13 @@ const userText = (messages: Message[]): string =>
 const hasCalls = (message: Message): boolean => message.role === "assistant" && (message.tool_calls?.length ?? 0) > 0;
 const callNames = (messages: Message[]): string[] => messages.filter(hasCalls).flatMap(m => (m.tool_calls ?? []).map(call => call.function?.name ?? ""));
 
-/** omp's compaction and short-summary requests: one user message holding the serialized conversation. */
+const HANDOFF_REQUEST = "Write a handoff document for another instance of yourself.";
+
+/** A soft summary wraps the transcript; a native handoff appends its own request to the live history. */
 function isCompaction(messages: Message[]): boolean {
 	const users = messages.filter(message => message.role === "user");
-	return users.length === 1 && textOf(users[0]?.content).trimStart().startsWith(COMPACTION_OPEN);
+	const last = textOf(users.at(-1)?.content).trimStart();
+	return (users.length === 1 && last.startsWith(COMPACTION_OPEN)) || (last.startsWith("<critical>") && last.includes(HANDOFF_REQUEST));
 }
 
 function classify(request: ChatRequest): Who {
@@ -320,6 +326,7 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("bash" in step) return bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
+	if ("wait" in step) return extensionCall(tools, "wait", {});
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
 
@@ -415,13 +422,17 @@ function record(request: ChatRequest, who: Who, decision: Decision): void {
 		tools: request.tools?.map(tool => tool.function.name) ?? [],
 		stormTool: storm ? { actions: (storm.parameters?.properties?.action?.enum ?? []).map(String), descriptionChars: storm.description?.length ?? 0 } : null,
 		messageCount: messages.filter(entry => entry.role !== "system" && entry.role !== "developer").length,
+		historyChars: messages.reduce((count, entry) => count + (entry.role === "system" || entry.role === "developer" ? 0 : entry.text.length), 0),
 		users: users.map(entry => entry.text.slice(0, 300)),
 		lastUser: (users.at(-1)?.text ?? "").slice(0, 8_000),
 		keywordNotice: users.some(entry => NOTICES.some(notice => entry.text.includes(notice))),
 		docRules: docRulesOf(messages.filter(entry => entry.role === "system" || entry.role === "developer").map(entry => entry.text).join("\n")),
 		roles: [...new Set(messages.flatMap(entry => [...entry.text.matchAll(/STORM-ROLE ([\w-]+)/g)].map(match => match[1] ?? "")))],
 		lastTool: last?.role === "tool" ? last.text.slice(0, 1_000) : "",
-		compactionContext: who === "compaction" ? (users[0]?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ?? "") : "",
+		compactionContext: who === "compaction"
+			? (users.at(-1)?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ??
+				users.at(-1)?.text.match(/Additional focus: ([\s\S]*?)<\/instruction>/)?.[1] ?? "")
+			: "",
 		decision: decision.kind === "tool" ? { tool: decision.name, args: decision.args } : { text: decision.text.slice(0, 200) },
 	};
 	appendFileSync(LOG, `${JSON.stringify(entry)}\n`);
