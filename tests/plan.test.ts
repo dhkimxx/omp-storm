@@ -109,6 +109,83 @@ describe("validatePlan", () => {
 		expect(tooLong.errors[1]).toContain("progress");
 	});
 
+	test("isolationReason is opt-in: omitted lanes share the tree, a present one trims and persists as one bounded line", () => {
+		const r = validatePlan(
+			config,
+			{
+				lanes: [
+					{ name: "shared", kind: "code" },
+					{ name: "probe", kind: "run", isolationReason: "  compare parser backends  " },
+					{ name: "bench", kind: "code", isolationReason: "x".repeat(MAX_LANE_TEXT) },
+				],
+			},
+			NOW,
+		);
+		expect(r.errors).toEqual([]);
+		expect(r.plan!.lanes[0]).not.toHaveProperty("isolationReason");
+		expect(r.plan!.lanes[1]!.isolationReason).toBe("compare parser backends");
+		expect(r.plan!.lanes[2]!.isolationReason).toHaveLength(MAX_LANE_TEXT);
+	});
+
+	test("a present isolationReason must be an actual single safe line; a boolean or a blank is rejected", () => {
+		const check = (reason: unknown) => validatePlan(config, { lanes: [{ name: "probe", kind: "code", isolationReason: reason }] }, NOW);
+		for (const reason of [
+			true,
+			false,
+			"",
+			"   ",
+			"line one\nline two",
+			"tab\there",
+			"bell\u0007",
+			"separator\u2028here",
+			"x".repeat(MAX_LANE_TEXT + 1),
+		]) {
+			const r = check(reason);
+			expect(r.plan).toBeUndefined();
+			expect(r.errors).toHaveLength(1);
+			expect(r.errors[0]).toContain("isolationReason");
+		}
+	});
+
+	test("selective isolation is refused on the final review role or kind; legacy isolated teams still plan", () => {
+		const reason = "compare independent implementations";
+		for (const lane of [
+			{ name: "check", kind: "review", isolationReason: reason },
+			{ name: "check", kind: "code", role: "reviewer", isolationReason: reason },
+		]) {
+			const r = validatePlan(config, { lanes: [lane] }, NOW);
+			expect(r.plan).toBeUndefined();
+			expect(r.errors).toHaveLength(1);
+			expect(r.errors[0]).toContain("통합 트리");
+			expect(r.errors[0]).toContain("code/run");
+		}
+		const legacy = validatePlan(
+			{ ...config, isolation: "isolated" },
+			{ lanes: [{ name: "a", kind: "code" }, { name: "b", kind: "run", isolationReason: reason }] },
+			NOW,
+		);
+		expect(legacy.errors).toEqual([]);
+		expect(legacy.plan!.lanes[0]).not.toHaveProperty("isolationReason");
+		expect(legacy.plan!.lanes[1]!.isolationReason).toBe(reason);
+	});
+
+	test("a file overlap stays a warning and never isolates the other lane", () => {
+		const r = validatePlan(
+			config,
+			{
+				lanes: [
+					{ name: "a", kind: "code", files: ["x.ts"], isolationReason: "independent experiment" },
+					{ name: "b", kind: "run", files: ["x.ts"] },
+				],
+			},
+			NOW,
+		);
+		expect(r.errors).toEqual([]);
+		expect(r.warnings).toHaveLength(1);
+		expect(r.warnings[0]).toContain("순서");
+		expect(r.plan!.lanes[1]).not.toHaveProperty("isolationReason");
+	});
+
 	test("errors: lane count, names, kind, files, role id and worker values", () => {
 		const bad = (input: unknown) => validatePlan(config, input, NOW);
 		expect(bad({ lanes: [] }).errors).toHaveLength(1);

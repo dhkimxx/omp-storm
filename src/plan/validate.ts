@@ -24,12 +24,40 @@ export const MAX_LANE_TEXT = 200;
 const LANE_KINDS = Object.keys(LANE_ROLES) as LaneKind[];
 /** Lanes of these kinds change or occupy files; two of them on one file collide. */
 const WRITING_KINDS: readonly LaneKind[] = ["code", "run"];
+/** A reason is one visible line: control characters, DEL and Unicode line separators would break that. */
+const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /** Goal and progress take the same shape: optional, trimmed, non-empty and bounded. */
 function laneText(value: unknown, path: string, errors: string[]): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const text = value.trim();
 	if (!text) return undefined;
+	if (text.length > MAX_LANE_TEXT) {
+		errors.push(`${path}: ${MAX_LANE_TEXT}자 이하여야 합니다`);
+		return undefined;
+	}
+	return text;
+}
+
+/**
+ * Selective isolation is opt-in: absent means the lane shares the parent tree. A present value must be an actual
+ * trimmed, non-empty, single safe line, bounded like the other lane labels; a boolean or a blank value is an error.
+ */
+function isolationText(value: unknown, path: string, errors: string[]): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		errors.push(`${path}: 격리 사유는 한 줄 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (UNSAFE_LINE.test(value)) {
+		errors.push(`${path}: 제어 문자나 줄바꿈 없이 한 줄이어야 합니다`);
+		return undefined;
+	}
+	const text = value.trim();
+	if (!text) {
+		errors.push(`${path}: 비어 있지 않은 격리 사유여야 합니다`);
+		return undefined;
+	}
 	if (text.length > MAX_LANE_TEXT) {
 		errors.push(`${path}: ${MAX_LANE_TEXT}자 이하여야 합니다`);
 		return undefined;
@@ -93,6 +121,16 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		if (files !== undefined) lane.files = [...(files as string[])];
 		const goal = laneText(l.goal, `${path}.goal`, errors);
 		if (goal !== undefined) lane.goal = goal;
+		const reason = isolationText(l.isolationReason, `${path}.isolationReason`, errors);
+		if (reason !== undefined) {
+			if (role === "reviewer" || kind === "review") {
+				errors.push(
+					`${path}.isolationReason: 최종 리뷰 레인은 통합 트리를 봐야 하므로 격리할 수 없습니다. 독립 실험은 code/run 레인으로 분리해 따로 리뷰하세요`,
+				);
+			} else {
+				lane.isolationReason = reason;
+			}
+		}
 		const progress = laneText(l.progress, `${path}.progress`, errors);
 		if (progress !== undefined) lane.progress = progress;
 		lanes.push(lane);
@@ -124,7 +162,7 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		if (!WRITING_KINDS.includes(l.kind)) continue;
 		for (const f of new Set(l.files ?? [])) {
 			const other = owner.get(f);
-			if (other !== undefined) warnings.push(`${f}: ${other}, ${l.name} 레인이 같은 파일을 맡습니다. 동시에 돌리면 충돌합니다`);
+			if (other !== undefined) warnings.push(`${f}: ${other}, ${l.name} 레인이 같은 파일을 맡습니다. 동시에 돌리면 충돌하니 순서를 나누세요`);
 			else owner.set(f, l.name);
 		}
 	}

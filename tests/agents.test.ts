@@ -1,5 +1,8 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
 import { agentRows, duration, renderAgentRows, tokens } from "../src/report/agents.ts";
+import { bindLedgerChild, resetLedger, startLedgerRun } from "../src/runtime/ledger.ts";
+import { RunLanes } from "../src/runtime/lanes.ts";
 import { reviewEvidenceOf } from "../src/runtime/review.ts";
 import {
 	listAgents,
@@ -12,6 +15,7 @@ import {
 	noteAgentRun,
 	noteAgentStart,
 	noteAgentUsage,
+	noteRegistryAgent,
 	noteVerdictTree,
 	resetAgents,
 } from "../src/runtime/agents.ts";
@@ -340,5 +344,78 @@ describe("noteAgentChange", () => {
 		expect(a?.changes).toBeUndefined();
 		expect(a?.lastChangeAt).toBeUndefined();
 		expect(a?.lastVerdict).toBeUndefined();
+	});
+});
+
+
+describe("worker-homed agents", () => {
+	beforeEach(() => {
+		resetAgents();
+		resetLedger();
+		AgentRegistry.resetGlobalForTests();
+	});
+	afterEach(() => {
+		resetAgents();
+		resetLedger();
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	test("a launch with no requests cannot finish its lane; real session usage from the process registry can", () => {
+		const run = startLedgerRun({ runId: "run-homed", repoId: "repo", root: "/repo" });
+		const team = teamOf({ quick: { models: ["a/q"], workers: { min: 1, max: 1 } } });
+		const plan = {
+			lanes: [{ name: "experiment", kind: "run" as const, role: "quick", files: ["experiment.txt"], isolationReason: "independent result" }],
+			workers: { quick: 1 },
+			submittedAt: "2026-01-01T00:00:00Z",
+		};
+		const work = new RunLanes(run.runId);
+		const placed = work.assign({ agent: "storm-quick", task: "Run the experiment" }, plan, team, { host: { enabled: true, apply: false } });
+		if (!placed.ok) throw new Error(placed.reason);
+		const id = String(placed.input.name);
+		expect(bindLedgerChild(run.runId, id, "Main", undefined)).toBe(true);
+		expect(work.admit({ spawnKey: id, agent: "storm-quick", outcome: "routed" })).toBe("experiment");
+
+		AgentRegistry.global().register({
+			id,
+			displayName: "storm-quick",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "running",
+			createdAt: T0,
+			lastActivity: T0 + 1,
+		});
+		let [entry] = listAgents({ runId: run.runId });
+		expect(entry).toMatchObject({ id, name: "storm-quick", role: "quick", runId: run.runId, state: "running", requests: 0, costUsd: 0 });
+		expect(entry?.changes).toBeUndefined();
+		// A launch is not completion: the lane stays pending with zero requests.
+		expect(work.remaining(plan, listAgents({ runId: run.runId }), new Set())).toEqual(["experiment"]);
+
+		AgentRegistry.global().setHistory(id, {
+			agent: "storm-quick",
+			metrics: { tokens: 220, requests: 2, tools: 1, cost: 0.01, durationMs: 500, durationKind: "active", contextTokens: 100 },
+		});
+		AgentRegistry.global().setStatus(id, "idle");
+		[entry] = listAgents({ runId: run.runId });
+		expect(entry).toMatchObject({ state: "idle", requests: 2, costUsd: 0.01, contextTokens: 100 });
+		// The isolated change stays in the registry's patch artifact, never in the integrated-change ledger.
+		expect(entry?.changes).toBeUndefined();
+		expect(work.remaining(plan, listAgents({ runId: run.runId }), new Set())).toEqual([]);
+
+		// An aborted host never settles the lane, even though its session had made requests.
+		AgentRegistry.global().setStatus(id, "aborted");
+		[entry] = listAgents({ runId: run.runId });
+		expect(entry).toMatchObject({ state: "parked", lastWorkFailed: true });
+		expect(work.remaining(plan, listAgents({ runId: run.runId }), new Set())).toEqual(["experiment"]);
+	});
+
+	test("child-session events outrank the registry; an aborted registry child never counts as settled work", () => {
+		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
+		noteAgentUsage({ id: "A", model: "a/i", promptTokens: 10, costUsd: 0.01, now: T0 + 1 });
+		noteRegistryAgent({ id: "A", runId: "r1", name: "storm-implementer", status: "idle", startedAt: T0, lastActivityAt: T0 + 2, requests: 9, costUsd: 1 });
+		expect(listAgents({ runId: "r1" })[0]).toMatchObject({ state: "running", requests: 1, costUsd: 0.01 });
+
+		noteRegistryAgent({ id: "B", runId: "r1", name: "storm-quick", status: "aborted", startedAt: T0, lastActivityAt: T0 + 3, requests: 2, costUsd: 0.02 });
+		expect(listAgents({ runId: "r1" }).find(agent => agent.id === "B")).toMatchObject({ state: "parked", lastWorkFailed: true, requests: 2 });
 	});
 });

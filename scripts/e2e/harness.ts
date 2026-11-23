@@ -3,7 +3,8 @@
  * the fake LLM), the step runner, the RPC and pty drivers, and readers of what Storm writes.
  *
  * Env: OMP_BIN (default node_modules/.bin/omp), E2E_PORT, E2E_PROFILE (default storm-e2e), E2E_WORK (default
- * <tmp>/storm-e2e[-tui]), E2E_KEEP=1 keeps the work dir after a green run (it is always kept after a failure).
+ * <tmp>/storm-e2e[-tui]), E2E_ONLY (run only scenarios whose name contains this text; a step marked `always` still
+ * runs), E2E_KEEP=1 keeps the work dir after a green run (it is always kept after a failure).
  * omp runs with HOME inside the work dir, so nothing under the real ~/.omp is read or written.
  */
 import type { BunFile, Subprocess } from "bun";
@@ -215,6 +216,8 @@ export class Suite {
 	readonly #started = Date.now();
 	readonly #failed: string[] = [];
 	readonly #steps: string[] = [];
+	/** `E2E_ONLY`: run only scenarios whose name contains this text; a focused scenario still runs the whole fixture. */
+	readonly #only = process.env.E2E_ONLY?.trim().toLowerCase() || undefined;
 	#checks = 0;
 
 	constructor(
@@ -227,7 +230,11 @@ export class Suite {
 	 * once this one is over: on a timeout its omp processes are killed and its body, whose waits now throw, is
 	 * awaited before the step returns.
 	 */
-	async step(name: string, body: () => Promise<void>, timeoutMs = 120_000): Promise<void> {
+	async step(name: string, body: () => Promise<void>, timeoutMs = 120_000, options: { always?: boolean } = {}): Promise<void> {
+		if (!options.always && this.#only !== undefined && !name.toLowerCase().includes(this.#only)) {
+			console.log(`     (${name}: skipped by E2E_ONLY=${process.env.E2E_ONLY})`);
+			return;
+		}
 		const step: StepScope = { name };
 		this.#steps.push(name);
 		const started = Date.now();

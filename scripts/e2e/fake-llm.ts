@@ -20,6 +20,7 @@
  *   E2E-CHILD-READ <a,b>    call `read` on each path first
  *   E2E-CHILD-WRITE <path>  call `write` with that path first (before the yield)
  *   E2E-CHILD-BASH <path>   change that path with `bash` first, through no edit tool
+ *   E2E-CHILD-SH <base64>   run that shell command with `bash` first, so the child can record its real cwd/files
  *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
@@ -64,14 +65,15 @@ interface Message {
  * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a shell command, a follow-up to a
  * subagent, a read, a native `ask` form (`ask` is one HTML `<form>`), or `awaitChild`: a text reply (it ends the
  * turn, so it belongs last) held until a child of the last task call has made its first request, so the turn ends
- * with that child known to be running.
+ * with that child known to be running. `isolated[i]` marks task item i `isolated: true`; the host's native task
+ * isolation places that child, and only probes that deliberately bypass Storm use it.
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
  */
 export type Step = (
 	| { storm: Record<string, unknown> }
-	| { task: string[]; as?: string; say?: string }
+	| { task: string[]; as?: string; say?: string; isolated?: boolean[] }
 	| { edit: string }
 	| { bash: string }
 	| { followUp: string }
@@ -224,12 +226,13 @@ function payload(text: string, marker: string): unknown {
 	return undefined;
 }
 
-function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say?: string): Decision {
+function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say?: string, isolated?: boolean[]): Decision {
 	const item = (agent: string, index: number) => ({
 		name: `${prefix}${index}`,
 		agent,
 		task: `Reply with OK (${CHILD_MARK} ${index}).${say ? ` ${say}` : ""}`,
 		solutionSpace: "e2e: fixed reply",
+		...(isolated?.[index] === true ? { isolated: true } : {}),
 	});
 	const batch = Boolean(schemaOf(tools, "task")?.properties?.tasks);
 	const args = batch ? { context: "OMP Storm E2E", tasks: agents.map(item) } : item(agents[0] ?? "task", 0);
@@ -320,7 +323,7 @@ async function hold(open: () => boolean): Promise<void> {
 
 function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("storm" in step) return extensionCall(tools, "storm", step.storm);
-	if ("task" in step) return taskCall(tools, step.task, step.as, step.say);
+	if ("task" in step) return taskCall(tools, step.task, step.as, step.say, step.isolated);
 	if ("read" in step) return readCall(tools, step.read);
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
 	if ("bash" in step) return bashCall(tools, step.bash);
@@ -361,6 +364,7 @@ function childDecision(request: ChatRequest): Decision {
 	const reads = (/E2E-CHILD-READ[ \t]+(\S+)/.exec(text)?.[1] ?? "").split(",").filter(Boolean);
 	const write = /E2E-CHILD-WRITE[ \t]+(\S+)/.exec(text)?.[1];
 	const bash = /E2E-CHILD-BASH[ \t]+(\S+)/.exec(text)?.[1];
+	const sh = /E2E-CHILD-SH[ \t]+(\S+)/.exec(text)?.[1];
 	const commit = /E2E-CHILD-COMMIT[ \t]+(\S+)/.exec(text)?.[1];
 	const correct = /E2E-CHILD-VERDICT[ \t]+correct\b/.test(text);
 	const calls = callNames(messages);
@@ -369,6 +373,7 @@ function childDecision(request: ChatRequest): Decision {
 	if (last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: "done" };
 	if (done < reads.length) return readCall(request.tools, reads[done] ?? "");
 	if (commit !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${commit} && git commit -qam storm-e2e-commit`);
+	if (sh !== undefined && !calls.includes("bash")) return bashCall(request.tools, Buffer.from(sh, "base64").toString("utf8"));
 	if (bash !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${bash}`);
 	if (write !== undefined && !calls.includes("write")) return writeCall(write, "storm child change\n");
 	const yieldSchema = schemaOf(request.tools, "yield");

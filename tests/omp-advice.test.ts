@@ -77,6 +77,7 @@ describe("ompSettingsAdvice", () => {
 			const [advice] = ompSettingsAdvice(isolated, settings);
 			expect(advice?.key).toBe("task.isolation.enabled");
 			expect(advice?.command).toBe("omp config set task.isolation.enabled true");
+			expect(advice?.message).toContain("공유 작업 트리로 대신 실행하지 않습니다");
 		}
 		expect(keys(known({ isolationEnabled: true }), isolated)).toEqual([]);
 		expect(keys(known({ isolationEnabled: false }))).toEqual([]);

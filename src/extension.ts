@@ -5,7 +5,8 @@
  * everything else is decided in dialogs and overlays. Module-level state is shared by every session in the process,
  * because subagent sessions reuse this module.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation } from "./approval/auto.ts";
@@ -13,7 +14,7 @@ import { resolveRepo } from "./approval/repo.ts";
 import { loadConfig } from "./config/store.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
-import { readExplicitSettings } from "./discovery/settings.ts";
+import { liveIsolationSettings, readExplicitSettings } from "./discovery/settings.ts";
 import {
 	agentsFlow,
 	approveAndSave,
@@ -51,7 +52,7 @@ import {
 } from "./runtime/agents.ts";
 import { workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
-import { replanConflict } from "./runtime/lanes.ts";
+import { replanConflict, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
@@ -120,6 +121,7 @@ This session delegates project work automatically.
 - Keep the scope tiny: one lane and one worker for a quick mechanical edit or a read-only lookup. When the request is uncertain, submit an explore-only plan first instead of guessing implementation lanes.
 - Any repository inspection, verification, or file change belongs to the approved Storm team. First submit a plan with the \`storm\` tool (action "plan"); it opens a run for this turn's user request. Then spawn the plan's approved workers with \`task\`.
 - You own replanning: change the plan only when cross-lane evidence changes an assumption. On a replan keep each existing lane's name, kind, role, files and goal; put status in \`progress\`, and give a real scope change a new lane name. Name each task item after its planned lane so the worker can be matched to it.
+- Lanes share this work tree by default. Add \`isolationReason\` to a lane only when its result must stay outside the parent tree as an independent experiment; Storm requires omp isolation to be on and \`task.isolation.apply\` off for that lane. Never add \`isolationReason\` to the final review: its verdict must prove the integrated work, and Storm withholds a review it cannot bind to the tree that reviewer actually saw.
 - Do not call read, grep, glob, bash, edit, ast_edit, eval, or any other file, shell, or unknown tool yourself; for \`write\`, only the two forms below are allowed. Do not spawn an agent before the plan opens the run. Storm blocks those calls.
 - Direct writes are limited to \`write local://<name>.md\` notes and \`write agent://<id>\` messages; read worker results with \`read agent://<id>\` and bounded line ranges.
 - Follow up on the same worker with \`write agent://<id>\`; when Storm blocks it, start a fresh worker that reads \`agent://<id>\`.
@@ -169,6 +171,14 @@ function autoRefusal(problem: string | undefined, detail: string | undefined): s
 	const reason = problem === undefined ? "" : ` ${problem}`;
 	const rule = detail === undefined ? "" : ` ${detail}`;
 	return `[storm:auto] 자동 위임이 켜져 있어 메인 세션이 프로젝트 도구를 직접 쓰지 않습니다.${reason} 작업은 storm plan으로 이번 사용자 요청의 실행을 연 뒤 승인된 팀에 맡기세요.${rule}`;
+}
+
+/**
+ * Whether task placement needs host isolation at all. A shared team with no reason-marked lane is settled by the plan
+ * alone, so it never pays for a settings read; an isolated team or any selective lane resolves it once per run.
+ */
+function needsIsolationHost(plan: RunPlan | undefined, config: StormConfig): boolean {
+	return config.isolation === "isolated" || (plan?.lanes.some(lane => lane.isolationReason !== undefined) ?? false);
 }
 
 /** The same refusal during an active automatic run: the run is already open, so the work belongs to its workers. */
@@ -223,13 +233,18 @@ function approvedReviewer(config: StormConfig | undefined): string | undefined {
 
 interface ReviewerBaseline {
 	runId: string;
+	/** The run's integrated parent worktree. */
 	root: string;
 	base: string;
 	tree: string;
+	/** The checkout the reviewer session actually read; equal to `root` on a shared team, a copy on legacy isolation. */
+	reviewerRoot: string;
 }
 
 /** Reviewer starts per child session, keyed by the artifact root and the id its parent admitted. */
 const reviewerBaselines = new Map<string, ReviewerBaseline>();
+/** The work tree each subagent session actually runs in, so a reused reviewer's copy cannot pass for the parent. */
+const childWorkTrees = new Map<string, string>();
 /** A snapshot that outlasts this is no snapshot: the proof must not wait on a hung git read. */
 const REVIEW_SNAPSHOT_MS = 12_000;
 
@@ -239,6 +254,20 @@ function reviewerBaselineKey(artifacts: string | undefined, id: string): string 
 
 function fingerprintOf(reading: TreeReading): string {
 	return `${reading.state.diff}:${reading.state.files}`;
+}
+
+/** Real path when the host still has it, lexical path otherwise: a deleted isolated workspace is still not the parent. */
+function realTreeOf(path: string): string {
+	try {
+		return realpathSync.native(path);
+	} catch {
+		return resolvePath(path);
+	}
+}
+
+/** Whether two paths name one physical worktree; an isolated copy is a different tree even when its content matches. */
+function sameWorkTree(a: string, b: string): boolean {
+	return realTreeOf(a) === realTreeOf(b);
 }
 
 /** A tree read bounded by a timer, so a reviewer's first turn or verdict cannot hang on git. */
@@ -256,25 +285,44 @@ async function boundedTree(exec: Exec, root: string, base?: string): Promise<Tre
 	}
 }
 
-/** Records the run's main tree when reviewer work starts; an unreadable tree removes any older baseline. */
-async function recordReviewerBaseline(exec: Exec, artifacts: string | undefined, id: string, run: LedgerRun): Promise<void> {
+/**
+ * Records the tree reviewer work starts from. A reviewer in another checkout may review only when its complete
+ * fingerprint, against the run's base, equals the integrated parent's; otherwise there is no baseline and no proof.
+ * An unreadable or incomplete tree removes any older baseline.
+ */
+async function recordReviewerBaseline(
+	exec: Exec,
+	artifacts: string | undefined,
+	id: string,
+	run: LedgerRun,
+	reviewerRoot: string,
+): Promise<void> {
 	const key = reviewerBaselineKey(artifacts, id);
 	if (getLedgerRun(run.runId) !== run || run.closing) {
 		reviewerBaselines.delete(key);
 		return;
 	}
 	const reading = await boundedTree(exec, run.root, run.base);
-	if (!reading) {
+	if (!reading || reading.state.incomplete) {
 		reviewerBaselines.delete(key);
 		return;
 	}
-	reviewerBaselines.set(key, { runId: run.runId, root: run.root, base: reading.base, tree: fingerprintOf(reading) });
+	const tree = fingerprintOf(reading);
+	if (!sameWorkTree(run.root, reviewerRoot)) {
+		const reviewed = await boundedTree(exec, reviewerRoot, reading.base);
+		if (!reviewed || reviewed.state.incomplete || fingerprintOf(reviewed) !== tree) {
+			reviewerBaselines.delete(key);
+			return;
+		}
+	}
+	reviewerBaselines.set(key, { runId: run.runId, root: run.root, base: reading.base, tree, reviewerRoot });
 }
 
 /**
- * Binds a reviewer verdict only when the run is still the admitted one and its main tree is exactly the baseline read
- * before reviewer work started. A mismatch, a disappeared run or an unreadable tree consumes the baseline without
- * proof, so the gate cannot accept work the reviewer did not see.
+ * Binds a reviewer verdict only when the run is still the admitted one and both the integrated parent and the
+ * reviewer's own checkout still carry the complete fingerprint recorded before reviewer work started. A mismatch,
+ * a disappeared run, an unreadable tree or any later mutation consumes the baseline without proof, so the gate
+ * cannot accept work the reviewer did not see.
  */
 async function bindReviewerVerdict(exec: Exec, ctx: ExtensionContext, run: LedgerRun, at: number): Promise<void> {
 	const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
@@ -283,8 +331,13 @@ async function bindReviewerVerdict(exec: Exec, ctx: ExtensionContext, run: Ledge
 	reviewerBaselines.delete(key);
 	const current = getLedgerRun(baseline.runId);
 	if (!current || current.closing || current.root !== baseline.root) return;
-	const fresh = await boundedTree(exec, baseline.root, baseline.base);
-	if (!fresh || fingerprintOf(fresh) !== baseline.tree) return;
+	const shared = sameWorkTree(baseline.root, baseline.reviewerRoot);
+	const [fresh, reviewed] = await Promise.all([
+		boundedTree(exec, baseline.root, baseline.base),
+		shared ? Promise.resolve(undefined) : boundedTree(exec, baseline.reviewerRoot, baseline.base),
+	]);
+	if (!fresh || fresh.state.incomplete || fingerprintOf(fresh) !== baseline.tree) return;
+	if (!shared && (!reviewed || reviewed.state.incomplete || fingerprintOf(reviewed) !== baseline.tree)) return;
 	noteVerdictTree(ctx.agent.id, at, baseline.tree);
 }
 
@@ -440,6 +493,28 @@ export default function storm(pi: ExtensionAPI): void {
 
 	/** Read on every use: these settings may change during a session, and only status and setup ask. */
 	const ompSettings = (): Promise<ExplicitSettings> => readExplicitSettings(exec, ompBinary());
+	/**
+	 * The live host's task-isolation capability. A running omp exposes effective settings directly, so ordinary
+	 * spawns pay nothing; a host that cannot expose them falls back to one cached `omp config list` read per run,
+	 * never one subprocess per spawn. Unknown fields stay absent: they are not proof that isolation is off.
+	 */
+	let isolationHostCache: { runId: string; load: Promise<TaskIsolationHost> } | undefined;
+	const isolationHost = (runId: string): Promise<TaskIsolationHost> => {
+		const live = liveIsolationSettings();
+		if (live.isolationEnabled !== undefined) {
+			return Promise.resolve({
+				enabled: live.isolationEnabled,
+				...(live.isolationApply !== undefined ? { apply: live.isolationApply } : {}),
+			});
+		}
+		if (isolationHostCache?.runId === runId) return isolationHostCache.load;
+		const load = readExplicitSettings(exec, ompBinary()).then(settings => ({
+			...(settings.isolationEnabled !== undefined ? { enabled: settings.isolationEnabled } : {}),
+			...(settings.isolationApply !== undefined ? { apply: settings.isolationApply } : {}),
+		}));
+		isolationHostCache = { runId, load };
+		return load;
+	};
 
 	const runs = new RunController({
 		pi,
@@ -860,6 +935,8 @@ export default function storm(pi: ExtensionAPI): void {
 			return { systemPrompt: [...event.systemPrompt, AUTO_INSTRUCTION] };
 		}
 		const { id, name, parentId } = ctx.agent;
+		const artifacts = artifactsOf(ctx);
+		childWorkTrees.set(reviewerBaselineKey(artifacts, id), ctx.cwd);
 		const ledger = childLedger(ctx);
 		const runId = ledger?.runId;
 		noteAgentStart({
@@ -878,8 +955,9 @@ export default function storm(pi: ExtensionAPI): void {
 		const state = await stateCache.get(ledger ? runEnv(ctx, ledger.root) : projectEnv(ctx));
 		const approvedConfig = state.config.status === "ok" && isApproved(state) ? state.config.config : undefined;
 		if (ledger && name === approvedReviewer(approvedConfig)) {
-			// Snapshot before the reviewer's first provider request, so a later tree change cannot inherit its verdict.
-			await recordReviewerBaseline(exec, artifactsOf(ctx), id, ledger);
+			// Snapshot before the reviewer's first provider request. On an isolated team this also fingerprints the
+			// reviewer's own checkout: its verdict can certify the parent only while both copies still match exactly.
+			await recordReviewerBaseline(exec, artifacts, id, ledger, ctx.cwd);
 		}
 		// Doc rules ride on a Storm role's system prompt (first turn and revive) while the team keeps docs on.
 		if (!roleChild) return undefined;
@@ -925,24 +1003,37 @@ export default function storm(pi: ExtensionAPI): void {
 			else runs.noteBlockedFollowUp();
 			return { block: true, reason: blockText(block) };
 		}
-		// Automatic delegation binds each task to a lane before the host allocates its spawn id, so the admitted
-		// spawn can prove which lane it finished. Ambiguous or unbounded task shapes are refused, never guessed.
-		if (auto.enabled && event.toolName === "task") {
+		// Every native task call is placed before omp allocates its spawn id: auto direction also reserves a lane name,
+		// manual direction keeps the caller's handle. The plan decides isolation for both; a direct isolated claim
+		// without a planned exception is refused, never guessed.
+		if (event.toolName === "task") {
 			const plan = getLedgerRun(runId)?.plan ?? runs.active()?.plan;
 			const lanes = runs.runLanes();
-			if (plan === undefined || lanes === undefined) {
-				return { block: true, reason: "[storm:auto] 계획이나 레인 배정을 확인하지 못해 task를 막았습니다. plan을 다시 제출하세요." };
+			if (lanes === undefined) {
+				return { block: true, reason: "[storm:isolation] 이 실행의 레인 배정을 확인하지 못해 task를 막았습니다. 실행 상태를 확인한 뒤 다시 스폰하세요." };
 			}
-			const assigned = lanes.assign(event.input, plan, config);
-			if (!assigned.ok) return { block: true, reason: `[storm:auto] ${assigned.reason}` };
-			return { input: assigned.input };
+			const host = needsIsolationHost(plan, config) ? await isolationHost(runId) : undefined;
+			const options = host === undefined ? {} : { host };
+			if (auto.enabled && plan === undefined) {
+				return { block: true, reason: "[storm:auto] 계획을 확인하지 못해 task를 막았습니다. plan을 다시 제출하세요." };
+			}
+			const placed =
+				auto.enabled && plan !== undefined
+					? lanes.assign(event.input, plan, config, options)
+					: lanes.place(event.input, plan, config, options);
+			if (!placed.ok) return { block: true, reason: `${auto.enabled ? "[storm:auto]" : "[storm:isolation]"} ${placed.reason}` };
+			return placed.input === event.input ? undefined : { input: placed.input };
 		}
-		// A follow-up to a reused reviewer starts new work: take its tree baseline before the write executes.
+		// A follow-up to a reused reviewer starts new work: take both tree baselines before the write executes. A
+		// reused isolated reviewer is certified only when its checkout matches the parent at that same moment.
 		const followTarget = deliveredFollowUp(event.toolName, event.input, false);
 		const followAgent = followTarget === undefined ? undefined : followUpAgent(listAgents(), followTarget);
 		if (followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
 			const run = getLedgerRun(runId);
-			if (run !== undefined) await recordReviewerBaseline(exec, artifactsOf(ctx), followAgent.id, run);
+			const key = reviewerBaselineKey(artifactsOf(ctx), followAgent.id);
+			const cwd = childWorkTrees.get(key);
+			if (run !== undefined && cwd !== undefined) await recordReviewerBaseline(exec, artifactsOf(ctx), followAgent.id, run, cwd);
+			else reviewerBaselines.delete(key);
 		}
 		return undefined;
 	});
@@ -1043,7 +1134,9 @@ export default function storm(pi: ExtensionAPI): void {
 		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
 		if (ctx.agent.kind === "sub") {
 			noteAgentParked(ctx.agent.id);
-			reviewerBaselines.delete(reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id));
+			const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
+			reviewerBaselines.delete(key);
+			childWorkTrees.delete(key);
 		} else {
 			resetCloseoutChoices(ctx);
 		}

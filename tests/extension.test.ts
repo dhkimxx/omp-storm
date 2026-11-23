@@ -237,6 +237,27 @@ const enableAuto = async (): Promise<string> => {
 	return dir;
 };
 
+/**
+ * Answers `omp config list --json` from this test, leaving git real. Returns the number of CLI reads so a test can
+ * prove a run resolves host capability once instead of once per spawn.
+ */
+const installOmpSettings = (values: Record<string, boolean>): { calls: () => number } => {
+	const previous = project.env.exec;
+	const entries = Object.fromEntries(
+		Object.entries(values).map(([key, value]) => [key, { value, type: "boolean", description: "" }]),
+	);
+	let calls = 0;
+	project.env.exec = (command, args, options) => {
+		if (command === "git") return previous(command, args, options);
+		if (command === "omp" && args[0] === "config" && args[1] === "list") {
+			calls++;
+			return Promise.resolve({ stdout: JSON.stringify(entries), stderr: "", code: 0 });
+		}
+		return Promise.resolve({ stdout: "", stderr: "", code: 1 });
+	};
+	return { calls: () => calls };
+};
+
 /** Tests drive child sessions directly; bind one exactly as an admitted parent spawn would. */
 const admitChild = (runId: string | undefined, id: string): void => {
 	if (runId === undefined) throw new Error("test needs an active run");
@@ -335,6 +356,65 @@ describe("a run through the hooks", () => {
 		// Afterwards the main session is ordinary again.
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("task", "T", ["x/unapproved"]), main))).toBe("pass");
+	});
+
+	test("manual task placement keeps handles, flags only planned isolation and refuses a direct isolated claim", async () => {
+		await approve(TEAM);
+		const settings = installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		const planned = await omp.toolReply(
+			{
+				action: "plan",
+				plan: {
+					lanes: [
+						{ name: "core", kind: "code" },
+						{ name: "probe", kind: "run", isolationReason: "keep the experimental result outside the tree" },
+					],
+					workers: { implementer: 2 },
+				},
+			},
+			main,
+		);
+		expect(planned.outcome).toBe("ok");
+
+		const probe = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "probe", task: "Probe" } }, main)) as { input: Record<string, unknown> };
+		expect(probe.input).toMatchObject({ name: "probe", isolated: true });
+		const core = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "core", task: "Core", isolated: true } }, main)) as { input: Record<string, unknown> };
+		expect(core.input).toMatchObject({ name: "core" });
+		expect(core.input).not.toHaveProperty("isolated");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", task: "Stray", isolated: true } }, main))).toBe("isolation");
+		// Three task calls, one host capability read: the per-run cache holds across shared and selective spawns.
+		expect(settings.calls()).toBe(1);
+	});
+
+	test("a legacy isolated team isolates manual work and its approved reviewer too", async () => {
+		const isolatedTeam: StormConfig = { ...TEAM, isolation: "isolated" };
+		await approve(isolatedTeam);
+		installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": true });
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(
+			await omp.tool(
+				{
+					action: "plan",
+					plan: {
+						lanes: [
+							{ name: "api", kind: "code" },
+							{ name: "check", kind: "review", role: "reviewer" },
+						],
+						workers: { implementer: 1, reviewer: 1 },
+					},
+				},
+				main,
+			),
+		).toBe("ok");
+		const work = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "api", task: "Implement" } }, main)) as { input: Record<string, unknown> };
+		expect(work.input).toMatchObject({ name: "api", isolated: true });
+		const review = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-reviewer", name: "check", task: "Review" } }, main)) as { input: Record<string, unknown> };
+		expect(review.input).toMatchObject({ name: "check", isolated: true });
 	});
 
 	test("the status line shows the live run, then the idle label again when it ends", async () => {
@@ -996,7 +1076,7 @@ describe("a run through the hooks", () => {
 		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
 	});
 
-	test("a verdict reads the run's main tree against its base, not the subagent's cwd", async () => {
+	test("a reviewer in another work tree cannot stamp the run's main tree it never saw", async () => {
 		await gitRepo(project.root);
 		await approve(TEAM);
 		const omp = fakeOmp(project);
@@ -1017,10 +1097,87 @@ describe("a run through the hooks", () => {
 		await child.emit("agent_end", {}, rev);
 		const expected = await treeAgainst(project.env.exec, project.root, ledger?.base);
 		expect(expected).toBeDefined();
-		const pair = `${expected?.state.diff}:${expected?.state.files}`;
-		await until(() => listAgents().find(agent => agent.id === "Rev")?.lastVerdict?.tree === pair);
+		await until(() => listAgents().find(agent => agent.id === "Rev")?.lastVerdict !== undefined);
+		// The verdict is real but carries no tree: a reviewer that worked in a copy cannot prove the integrated parent.
+		expect(listAgents().find(agent => agent.id === "Rev")?.lastVerdict).toMatchObject({ correct: true });
+		expect(listAgents().find(agent => agent.id === "Rev")?.lastVerdict?.tree).toBeUndefined();
 		// The side work tree is clean: a verdict read from there would not match the run's tree.
 		expect((await treeAgainst(project.env.exec, side, ledger?.base))?.state.diff).not.toBe(expected?.state.diff);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("an isolated reviewer certifies the integrated tree only while its checkout stays identical", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const side = path.join(project.tmp, "review-copy");
+		await git(project.root, "worktree", "add", side, "-b", "review-copy");
+		await omp.command("task", main);
+		const ledger = activeLedgerRun((await loadProjectState(project.env)).repo.root);
+		admitChild(ledger?.runId, "RevA");
+		const rev = { ...child.ctx(sub("RevA", "storm-reviewer")), cwd: side } as ExtensionContext;
+		// The isolated copy carries exactly the integrated parent's uncommitted change at review start.
+		await writeFile(path.join(project.root, ".keep"), "same uncommitted change\n");
+		await writeFile(path.join(side, ".keep"), "same uncommitted change\n");
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await child.emit("agent_end", {}, rev);
+		await until(() => listAgents().find(agent => agent.id === "RevA")?.lastVerdict?.tree !== undefined);
+		const reading = await treeAgainst(project.env.exec, project.root, ledger?.base);
+		expect(reading).toBeDefined();
+		expect(listAgents().find(agent => agent.id === "RevA")?.lastVerdict?.tree).toBe(`${reading?.state.diff}:${reading?.state.files}`);
+		// The matching copy is accepted as proof of this exact integrated tree, not just recorded as a verdict.
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		expect(await lastRun(project.root)).toMatchObject({ status: "done", endReason: "verified" });
+	});
+
+	test("a reviewer checkout that changes during review withholds the integrated-tree verdict", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const side = path.join(project.tmp, "review-copy-drift");
+		await git(project.root, "worktree", "add", side, "-b", "review-copy-drift");
+		await omp.command("task", main);
+		admitChild(activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId, "RevB");
+		const rev = { ...child.ctx(sub("RevB", "storm-reviewer")), cwd: side } as ExtensionContext;
+		await writeFile(path.join(project.root, ".keep"), "reviewed change\n");
+		await writeFile(path.join(side, ".keep"), "reviewed change\n");
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		await writeFile(path.join(side, ".keep"), "changed in the reviewer copy\n");
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await child.emit("agent_end", {}, rev);
+		await until(() => listAgents().find(agent => agent.id === "RevB")?.lastVerdict !== undefined);
+		expect(listAgents().find(agent => agent.id === "RevB")?.lastVerdict).toMatchObject({ correct: true });
+		expect(listAgents().find(agent => agent.id === "RevB")?.lastVerdict?.tree).toBeUndefined();
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("an incomplete reviewer checkout cannot certify even when its content matches", async () => {
+		await gitRepo(project.root);
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const side = path.join(project.tmp, "review-copy-incomplete");
+		await git(project.root, "worktree", "add", side, "-b", "review-copy-incomplete");
+		await omp.command("task", main);
+		admitChild(activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId, "RevC");
+		const rev = { ...child.ctx(sub("RevC", "storm-reviewer")), cwd: side } as ExtensionContext;
+		// A file past the tree reader's content-hash limit makes both fingerprints incomplete, never proof.
+		const huge = "x".repeat(2 * 1024 * 1024 + 1);
+		await writeFile(path.join(project.root, "huge.bin"), huge);
+		await writeFile(path.join(side, "huge.bin"), huge);
+		await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+		await child.emit("agent_end", {}, rev);
+		await until(() => listAgents().find(agent => agent.id === "RevC")?.lastVerdict !== undefined);
+		expect(listAgents().find(agent => agent.id === "RevC")?.lastVerdict).toMatchObject({ correct: true });
+		expect(listAgents().find(agent => agent.id === "RevC")?.lastVerdict?.tree).toBeUndefined();
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -1444,6 +1601,43 @@ describe("automatic delegation", () => {
 			{ spawnKey: assigned.input.name, agent: "storm-implementer", outcome: "routed", lane: "fix" },
 		]);
 		expect(verdict(await omp.emit("tool_call", readFile, main))).toBe("auto");
+	});
+
+	test("auto placement reads host isolation only when a plan asks for it, then obeys the planned lane", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const settings = installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix it", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } }, main)).outcome).toBe("ok");
+		const runId = activeLedgerRun((await loadProjectState(project.env)).repo.root)?.runId as string;
+		const shared = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "core", task: "Core" } }, main)) as { input: { name: string } };
+		expect(shared.input.name).toBe(`${runId}-lane-1`);
+		// A shared plan is settled by the plan alone: no `omp config list` subprocess and no isolation flag.
+		expect(settings.calls()).toBe(0);
+		expect(shared.input).not.toHaveProperty("isolated");
+		expect(
+			(
+				await omp.toolReply(
+					{
+						action: "plan",
+						plan: {
+							lanes: [
+								{ name: "core", kind: "code" },
+								{ name: "probe", kind: "run", isolationReason: "keep the experiment isolated" },
+							],
+							workers: { implementer: 2 },
+						},
+					},
+					main,
+				)
+			).outcome,
+		).toBe("ok");
+		const selective = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "probe", task: "Probe", isolated: false } }, main)) as { input: Record<string, unknown> };
+		expect(selective.input).toMatchObject({ name: `${runId}-lane-2`, isolated: true });
+		expect(settings.calls()).toBe(1);
 	});
 
 	test("the first accepted automatic plan starts one background handoff checkpoint for a heavy context", async () => {

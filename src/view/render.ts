@@ -94,7 +94,7 @@ const PRIORITY_LABEL: Record<StoredPriority, string> = {
 export function priorityLabel(p: StoredPriority): string {
 	return PRIORITY_LABEL[p];
 }
-const ISOLATION: Record<StormConfig["isolation"], string> = { shared: "공유 작업 트리", isolated: "격리" };
+const ISOLATION: Record<StormConfig["isolation"], string> = { shared: "공유 작업 트리", isolated: "팀 격리(리뷰 포함)" };
 export const ON_EXCEED: Record<BudgetConfig["onExceed"], string> = { "block-spawns": "새 스폰 차단", stop: "실행 중단" };
 
 /** Local "YYYY-MM-DD HH:mm". */
@@ -513,6 +513,11 @@ export function renderStatus(
 				],
 			});
 		}
+		if (run.plan) {
+			for (const line of isolationLaneLines(run.plan, run)) styled([{ text: line }], undefined, "status.warning");
+			const note = isolationNote(run.plan);
+			if (note !== undefined) styled([{ text: note, tone: "muted" }]);
+		}
 		const agents = run.agents;
 		if (agents !== undefined && agents.some(agent => (agent.review?.reviews ?? 0) > 0)) out.push(reviewLine(agents));
 	};
@@ -746,6 +751,12 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 				],
 			});
 		}
+		if (run.plan) {
+			const isolated = isolationLaneLines(run.plan, run);
+			if (isolated.length) out.push(...isolated);
+			const note = isolationNote(run.plan);
+			if (note !== undefined) out.push(note);
+		}
 		const agents = run.agents;
 		if (agents !== undefined && agents.some(agent => (agent.review?.reviews ?? 0) > 0)) out.push(reviewLine(agents));
 	}
@@ -935,7 +946,13 @@ function lastRunLines(run: RunRecord): string[] {
 	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
 	if (blocked?.reason) out.push(`- 첫 차단: ${visible(blocked.agent)} · ${visible(blocked.reason)}`);
-	if (run.plan) out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
+	if (run.plan) {
+		out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
+		const isolated = isolationLaneLines(run.plan, run);
+		const note = isolationNote(run.plan);
+		if (isolated.length) out.push(...isolated);
+		if (note !== undefined) out.push(note);
+	}
 	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
 	if (Array.isArray(run.checks) && run.checks.length) {
 		const checks = run.checks
@@ -952,6 +969,45 @@ export function planCounts(plan: RunPlan): string {
 	const counts = new Map<string, number>();
 	for (const l of plan.lanes) counts.set(l.role, (counts.get(l.role) ?? 0) + 1);
 	return [...counts].map(([role, n]) => `${roleTitle(role)} ${n}`).join(", ");
+}
+
+/** A lane's separate-checkout reason; a stored plan is repository data, so only a named lane with a non-empty string counts. */
+function laneIsolationReason(lane: RunPlan["lanes"][number]): string | undefined {
+	if (typeof lane?.name !== "string") return undefined;
+	const reason = typeof lane.isolationReason === "string" ? lane.isolationReason.trim() : "";
+	return reason === "" ? undefined : reason;
+}
+
+/**
+ * The status lines for lanes whose plan keeps their work outside the parent tree. An ordinary plan adds none: sharing
+ * the checkout is the default and is not worth a row. A lane is named with its reason and what actually happened,
+ * because a plan alone never means a worker started; a refused isolated spawn is named as refused, not as shared.
+ */
+export function isolationLaneLines(plan: RunPlan, run?: RunRecord): string[] {
+	const lanes = plan.lanes.flatMap(lane => {
+		const reason = laneIsolationReason(lane);
+		return reason === undefined ? [] : [{ lane, reason }];
+	});
+	return lanes.map(({ lane, reason }) => {
+		const latest = run?.spawns.filter(spawn => spawn.lane === lane.name).at(-1);
+		const refusal = latest?.reason?.trim();
+		const state =
+			latest === undefined
+				? run === undefined || run.status === "running"
+					? "아직 시작 전"
+					: "시작하지 않음"
+				: latest.outcome === "blocked"
+					? `시작하지 못함: ${visible(refusal ? refusal : "이유가 기록되지 않았습니다")}`
+					: "분리 체크아웃에서 시작함";
+		return `- 격리 레인: ${visible(lane.name)} — ${visible(reason)} · ${state}`;
+	});
+}
+
+/** Keeps a reason-marked lane's separate result from being read as already in this tree or as a branch that merges itself. */
+export function isolationNote(plan: RunPlan): string | undefined {
+	return plan.lanes.some(lane => laneIsolationReason(lane) !== undefined)
+		? "- 격리 레인은 git 브랜치와 별개의 분리 체크아웃이며, 성공해도 그 변경은 이 작업 트리로 자동 반영되지 않습니다."
+		: undefined;
 }
 
 function trialViewLines(v: TrialView): string[] {

@@ -318,6 +318,19 @@ describe("handoff", () => {
 		expect(isolated.some(l => l.includes("reads `agent://<id>`"))).toBe(true);
 	});
 
+	test("shared lanes share the checkout; a reason-marked independent lane alone leaves it, never for parallelism", () => {
+		const shared = rules(buildHandoff({ ...base, config: five })).find(l => l.includes("Share this checkout"))!;
+		expect(shared).toContain("reviewer too");
+		expect(shared).toContain("sequence overlapping edits");
+		expect(shared).toContain("`isolationReason`");
+		expect(shared).toContain("work stays outside");
+		expect(shared).not.toContain("parallelism");
+		const isolated = rules(buildHandoff({ ...base, config: { ...five, isolation: "isolated" } })).find(l => l.includes("`isolated: true`"))!;
+		expect(isolated).toContain("separate checkout apart from a branch");
+		expect(isolated).toContain("changes land only as omp applies them");
+		expect(isolated).toContain("An isolated review must match the integrated tree to verify");
+	});
+
 	test("a budget adds one line naming the amount and what happens past it", () => {
 		const none = rules(buildHandoff({ ...base, config: five }));
 		const block = rules(buildHandoff({ ...base, config: { ...five, budget: { perRunUsd: 5, onExceed: "block-spawns" } } }));
@@ -387,6 +400,19 @@ describe("handoff", () => {
 		expect(bare).not.toContain("- quiet (storm-implementer):");
 		const outside = buildHandoff({ ...base, config, resume: { runId: "run-old", plan: plan([{ name: "rev", kind: "review", role: "reviewer" }]) } });
 		expect(outside).toContain("- rev (reviewer)");
+	});
+
+	test("a resumed plan keeps an isolated lane's reason and does not call its changes local", () => {
+		const plan: RunPlan = {
+			lanes: [{ name: "lab", kind: "code", role: "implementer", goal: "try the migration", isolationReason: "separate database" }],
+			workers: { implementer: 1 },
+			submittedAt: "2026-11-19T09:00:00.000Z",
+		};
+		const text = buildHandoff({ ...base, config: five, resume: { runId: "run-old", turns: 1, plan } });
+		expect(text).toContain("- lab (storm-implementer) [separate checkout: separate database]: try the migration");
+		expect(text).toContain("Lanes with a reason used separate checkouts apart from branches");
+		expect(text).toContain("check whether their changes landed here before redoing them");
+		expect(text).not.toContain("Its changes are in the working tree or committed.");
 	});
 
 	test("no earlier plan part when the old run had no lanes", () => {

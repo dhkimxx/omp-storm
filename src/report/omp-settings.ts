@@ -56,7 +56,8 @@ export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSetting
 	if (config.isolation === "isolated" && settings.isolationEnabled !== true) {
 		advice.push({
 			key: "task.isolation.enabled",
-			message: "팀 설정은 격리인데 omp 격리가 꺼져 있어, 켜기 전까지 서브에이전트가 공유 작업 트리에서 일합니다.",
+			message:
+				"팀 설정이 팀 격리인데 omp 격리가 꺼져 있거나 확인되지 않아 격리 실행이 거부됩니다. 공유 작업 트리로 대신 실행하지 않습니다. 격리를 쓸 팀이면 아래 명령으로 켜세요.",
 			command: "omp config set task.isolation.enabled true",
 		});
 	}

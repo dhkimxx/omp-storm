@@ -50,13 +50,17 @@ describe("tool definition", () => {
 		expect(tool.parameters.safeParse({ action: "brief", brief: { result: "r", verification: "v" } }).success).toBe(false);
 		expect(tool.parameters.safeParse({ action: "plan", plan: { lanes: [{ name: "core", kind: "code", progress: "절반" }] } }).success).toBe(true);
 		// The schema caps match the domain parser, so an oversized label or brief fails before the action runs.
-		const lane = (field: "goal" | "progress", length: number) => ({
+		const lane = (field: "goal" | "progress" | "isolationReason", length: number) => ({
 			action: "plan",
 			plan: { lanes: [{ name: "core", kind: "code", [field]: "x".repeat(length) }] },
 		});
 		expect(tool.parameters.safeParse(lane("goal", MAX_LANE_TEXT)).success).toBe(true);
 		expect(tool.parameters.safeParse(lane("goal", MAX_LANE_TEXT + 1)).success).toBe(false);
 		expect(tool.parameters.safeParse(lane("progress", MAX_LANE_TEXT + 1)).success).toBe(false);
+		expect(tool.parameters.safeParse(lane("isolationReason", MAX_LANE_TEXT)).success).toBe(true);
+		expect(tool.parameters.safeParse(lane("isolationReason", MAX_LANE_TEXT + 1)).success).toBe(false);
+		const isolated = tool.parameters.parse({ action: "plan", plan: { lanes: [{ name: "probe", kind: "run", isolationReason: "compare parser backends" }] } });
+		expect(isolated.plan?.lanes[0]?.isolationReason).toBe("compare parser backends");
 		const longBrief = { result: "x".repeat(CLOSEOUT_TEXT_MAX + 1), verification: "v", next: ["a", "b", "c"] };
 		expect(tool.parameters.safeParse({ action: "brief", brief: longBrief }).success).toBe(false);
 		const longNext = { result: "r", verification: "v", next: ["a", "b", "x".repeat(CLOSEOUT_NEXT_MAX + 1)] };
@@ -119,6 +123,66 @@ describe("plan", () => {
 		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", goal: "ship it", progress: "절반" }] } });
 		expect(r.outcome).toBe("ok");
 		expect(f.plans[0]!.lanes[0]).toMatchObject({ name: "core", kind: "code", goal: "ship it", progress: "절반" });
+	});
+
+	test("selective isolation persists on its lane and adds one display line only for that exception", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, {
+			action: "plan",
+			plan: {
+				lanes: [
+					{ name: "core", kind: "code", files: ["src/a.ts"] },
+					{ name: "probe", kind: "run", isolationReason: "compare parser backends" },
+				],
+			},
+		});
+		expect(r.outcome).toBe("ok");
+		expect(f.plans[0]!.lanes[0]).not.toHaveProperty("isolationReason");
+		expect(f.plans[0]!.lanes[1]!.isolationReason).toBe("compare parser backends");
+		const lines = r.text.split("\n").filter((line) => line.startsWith("- 격리("));
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("probe");
+		expect(lines[0]).toContain("compare parser backends");
+
+		const shared = fakeHost({ runActive: true });
+		const plain = await run(shared, { action: "plan", plan: { lanes } });
+		expect(plain.text).not.toContain("- 격리(");
+		expect(shared.plans[0]!.lanes.every((lane) => lane.isolationReason === undefined)).toBe(true);
+	});
+
+	test("a checked-only plan still shows the isolation exception once", async () => {
+		const f = fakeHost();
+		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "probe", kind: "run", isolationReason: "compare parser backends" }] } });
+		expect(r.outcome).toBe("ok");
+		expect(f.plans).toEqual([]);
+		expect(r.text).toContain("검증만 했습니다");
+		expect(r.text.split("\n").filter((line) => line.startsWith("- 격리("))).toHaveLength(1);
+	});
+
+	test("an approval dialog shows the isolation exception once and the approved plan keeps it", async () => {
+		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+		const r = await run(f, {
+			action: "plan",
+			plan: {
+				lanes: [
+					{ name: "core", kind: "code", files: ["src/a.ts"] },
+					{ name: "probe", kind: "run", isolationReason: "compare parser backends" },
+				],
+				workers: { implementer: 5 },
+			},
+		});
+		expect(r.outcome).toBe("approved");
+		expect(f.selects[0]!.markdown?.split("\n").filter((line) => line.startsWith("- 격리("))).toHaveLength(1);
+		expect(f.plans[0]!.lanes[1]!.isolationReason).toBe("compare parser backends");
+	});
+
+	test("a final review lane cannot request selective isolation", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "check", kind: "review", isolationReason: "independent experiment" }] } });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("통합 트리");
+		expect(f.plans).toEqual([]);
+		expect(f.selects).toEqual([]);
 	});
 
 	test("a replan conflict is refused before an out-of-bounds plan can open a proposal", async () => {

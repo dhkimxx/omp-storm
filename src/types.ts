@@ -252,6 +252,8 @@ export interface ExplicitSettings {
 	modelRoles: Record<string, string>;
 	/** `task.isolation.enabled`: whether the task tool accepts `isolated: true`. */
 	isolationEnabled?: boolean;
+	/** `task.isolation.apply`: omp applies an isolated subagent's changes to the parent checkout when it settles (omp's default). */
+	isolationApply?: boolean;
 	/** `task.maxConcurrency`: subagents omp runs at once. */
 	maxConcurrency?: number;
 	/** `retry.modelFallback`: omp may switch to `retry.fallbackChains` models after provider errors. */
@@ -847,6 +849,11 @@ export interface PlanLane {
 	files?: string[];
 	/** What the lane delivers: stable identity. Changing it for the same name on replan is a conflict. */
 	goal?: string;
+	/**
+	 * Why this lane is an independent experiment whose result stays outside the parent tree. Omitted means the lane
+	 * shares the parent worktree; a team configured as `isolated` still isolates every lane without one.
+	 */
+	isolationReason?: string;
 	/** The lane's status as the director reports it. Never evidence, proof, write scope, or part of its evidence key. */
 	progress?: string;
 }
@@ -979,6 +986,8 @@ export interface PlanRequest {
 		role?: RoleId | undefined;
 		files?: string[] | undefined;
 		goal?: string | undefined;
+		/** Only for an independent experiment kept outside the parent tree; omitted lanes share the tree. */
+		isolationReason?: string | undefined;
 		progress?: string | undefined;
 	}>;
 	workers?: Record<string, number> | undefined;

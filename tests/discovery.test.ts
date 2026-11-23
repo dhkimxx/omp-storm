@@ -235,6 +235,7 @@ describe("parseConfigList", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry(true, "boolean"),
+				"task.isolation.apply": entry(false, "boolean"),
 				"task.maxConcurrency": entry(4, "number"),
 				"retry.modelFallback": entry(true, "boolean"),
 				"retry.fallbackChains": entry({
@@ -249,6 +250,7 @@ describe("parseConfigList", () => {
 		expect(s).toEqual({
 			modelRoles: {},
 			isolationEnabled: true,
+			isolationApply: false,
 			maxConcurrency: 4,
 			modelFallback: true,
 			fallbackChains: { "a/x": ["b/y", "c/z"], default: [] },
@@ -259,6 +261,7 @@ describe("parseConfigList", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry("true", "boolean"),
+				"task.isolation.apply": entry("false", "boolean"),
 				"task.maxConcurrency": entry(0, "number"),
 				"retry.modelFallback": entry(null, "boolean"),
 				"retry.fallbackChains": entry(["a/x"]),

@@ -38,13 +38,13 @@ const ACTIONS = ["run", "plan", "brief", "status", "agents"] as const satisfies 
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 
-const DESCRIPTION = `OMP Storm: hand work to this project's approved team and direct a run.
-- run {task}: the user wants team work. task: the request verbatim. Call it, then end your reply at once: Storm starts the run after this turn.
-- plan {plan}: required before spawns in a run. lanes [{name, kind, role?, files?, goal?, progress?}]; workers: live agents per role. On replan keep name/kind/role/files/goal; progress is status only, new scope needs a new name. Past bounds, the user approves a config change.
-- brief {brief}: once, after a substantial run's results: result, verification evidence, remaining?, next: 3 concrete directions (first recommended). Stages only: no verification or end; Storm shows the menu. Skip trivial lookups.
+const DESCRIPTION = `OMP Storm: hand work to the team and direct a run.
+- run {task}: user wants team work; task verbatim, then end reply: Storm starts after this turn.
+- plan {plan}: required before spawns. lanes [{name, kind, role?, files?, goal?, progress?, isolationReason?}]; workers per role. Lanes share the parent tree: reviews see dirty changes, overlaps are sequenced, never isolated. isolationReason (one safe line) only for an independent experiment kept outside the parent tree, never final review. Replan: same name/kind/role/files/goal; progress is status, new scope needs a name. Past bounds: approval.
+- brief {brief}: once after substantial work: result, verification, remaining?, 3 directions (first recommended). Stages only; Storm shows the menu. Skip trivial.
 - status: team, approval, runs, trials, subagents.
-- agents: this session's subagents: context cap, follow-up allowance.
-Team setup and changes are the user's, through /storm.`;
+- agents: session subagents: context cap, follow-up allowance.
+Team changes: /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
@@ -60,6 +60,11 @@ function stormParams(z: Zod): StormToolSchema {
 							role: z.enum(ROLE_IDS).optional().describe("Role doing the lane; default from kind"),
 							files: z.array(z.string()).optional().describe("Files the lane may change"),
 							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep it on replan"),
+							isolationReason: z
+								.string()
+								.max(MAX_LANE_TEXT)
+								.optional()
+								.describe("Only for an independent experiment preserved outside the parent tree; one safe line. Omit to share the tree"),
 							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Lane status only; a real scope change needs a new name"),
 						}),
 					)
@@ -176,6 +181,12 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 	}
 }
 
+/** The one plan line for selective isolation; shared lanes add no line. */
+function isolationLine(plan: RunPlan): string | undefined {
+	const isolated = plan.lanes.flatMap((l) => (l.isolationReason === undefined ? [] : [`${l.name} — ${l.isolationReason}`]));
+	return isolated.length === 0 ? undefined : `- 격리(부모 트리 밖 보존): ${isolated.join(" · ")}`;
+}
+
 /** Lanes and workers of a plan per role, as the director and the dialog read them. */
 function planLines(config: StormConfig, plan: RunPlan): string[] {
 	const out: string[] = [];
@@ -183,6 +194,8 @@ function planLines(config: StormConfig, plan: RunPlan): string[] {
 		const lanes = plan.lanes.filter((l) => l.role === role).map((l) => l.name);
 		out.push(`- ${roleTitle(role)}(${role}): 워커 ${n}개/최대 ${workerRange(role, config.roles[role]).max} · 레인 ${lanes.join(", ")}`);
 	}
+	const isolation = isolationLine(plan);
+	if (isolation !== undefined) out.push(isolation);
 	return out;
 }
 
@@ -224,7 +237,15 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 			.join(", ");
 		const fit = `승인된 범위 안으로 계획을 줄여 다시 제출하세요(${maxima || "설정된 역할만 쓰세요"}).`;
 		if ("error" in built) return rejected(`계획이 승인된 범위를 넘습니다.\n${gapLines(gaps).join("\n")}\n${built.error}\n${fit}`);
-		const context = ["### 실행 계획", ...check.plan.lanes.map((l) => `- ${l.name} (${l.kind} → ${roleTitle(l.role)})${l.files?.length ? `: ${l.files.join(", ")}` : ""}`), "", "### 범위를 넘는 것", ...gapLines(gaps)].join("\n");
+		const isolation = isolationLine(check.plan);
+		const context = [
+			"### 실행 계획",
+			...check.plan.lanes.map((l) => `- ${l.name} (${l.kind} → ${roleTitle(l.role)})${l.files?.length ? `: ${l.files.join(", ")}` : ""}`),
+			...(isolation === undefined ? [] : [isolation]),
+			"",
+			"### 범위를 넘는 것",
+			...gapLines(gaps),
+		].join("\n");
 		const reply = await propose(host, cur.state, "plan", built, {
 			warnings: [...check.warnings, ...(ctx ? modelWarnings(built.config, ctx) : [])],
 			context,

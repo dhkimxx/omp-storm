@@ -7,8 +7,8 @@ import { rollbackLabels, runRollback } from "../src/view/review.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
 import { DEFAULT_WORKERS, roleTitle } from "../src/roles.ts";
-import type { InfoLine, RollbackOption, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
-import { agentEntry, approvalRecord, runRecord } from "./fixtures.ts";
+import type { InfoLine, RollbackOption, RunPlan, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
+import { agentEntry, approvalRecord, runRecord, spawnRecord } from "./fixtures.ts";
 import { cand, pick, rec, recs, scriptedUi, TEAM } from "./support.ts";
 import { TEAM_08 } from "./team-08.ts";
 
@@ -444,6 +444,8 @@ describe("status", () => {
 			expect(of(over)).not.toBe(base);
 		}
 		expect(of({ contextCap: 123_456 })).toContain("123,456");
+		expect(of({})).toContain("공유 작업 트리");
+		expect(of({ isolation: "isolated" })).toContain("팀 격리(리뷰 포함)");
 		expect(renderStatus(view({ storage: "storage-line" }), NOW)).toContain("storage-line");
 	});
 
@@ -543,6 +545,55 @@ describe("status", () => {
 		const teamApproved = approved.find(line => line.spans[0]?.text.startsWith("- 팀 설정"))!;
 		expect(teamApproved.icon).toBe("status.success");
 		expect(teamApproved.spans.find(span => span.text === "승인됨")?.tone).toBe("success");
+	});
+
+	test("an ordinary shared plan adds no workspace line, in the full status or the hub", () => {
+		const plan: RunPlan = {
+			lanes: [{ name: "login", kind: "code", role: "implementer", goal: "fix login" }],
+			workers: { implementer: 1 },
+			submittedAt: "2026-11-20T09:00:00.000Z",
+		};
+		const shared = runRecord({ status: "running", plan });
+		for (const md of [
+			renderStatus(view({ run: shared }), NOW),
+			renderStatus(view({ lastRun: shared }), NOW),
+			renderStatusBrief(view({ run: shared }), NOW),
+		]) {
+			expect(md).not.toContain("격리 레인");
+			expect(md).not.toContain("분리 체크아웃");
+		}
+	});
+
+	test("an exceptional lane is named with its Korean reason and is never shown as started by the plan alone", () => {
+		const lane = { name: "러너 비교", kind: "run" as const, role: "implementer", goal: "compare runners", isolationReason: "새 러너가 기존 캐시를 지워 별도 체크아웃에서만 비교" };
+		const plan: RunPlan = { lanes: [lane], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const active = runRecord({ status: "running", plan });
+		const info: InfoLine[] = [];
+		const md = renderStatus(view({ run: active }), NOW, "user", info);
+		expect(md).toContain("- 격리 레인: 러너 비교 — 새 러너가 기존 캐시를 지워 별도 체크아웃에서만 비교 · 아직 시작 전");
+		expect(md).toContain("git 브랜치와 별개의 분리 체크아웃이며, 성공해도 그 변경은 이 작업 트리로 자동 반영되지 않습니다");
+		expect(md).not.toContain("분리 체크아웃에서 시작함");
+		const line = info.find(entry => entry.spans.some(span => span.text.includes("격리 레인")))!;
+		expect(line.icon).toBe("status.warning");
+		expect(md.split("\n")[line.index]).toContain("러너 비교");
+		expect(renderStatusBrief(view({ run: active }), NOW)).toContain("- 격리 레인: 러너 비교 —");
+	});
+
+	test("a refused isolated lane is shown as refused, not as a shared run; an admitted one as started", () => {
+		const lane = { name: "마이그레이션 실험", kind: "code" as const, role: "implementer", isolationReason: "기존 DB를 건드리지 않는 별도 실험" };
+		const plan: RunPlan = { lanes: [lane], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const refused = runRecord({
+			status: "running",
+			plan,
+			spawns: [spawnRecord({ lane: lane.name, agent: "storm-implementer", outcome: "blocked", reason: "omp 격리가 꺼져 있습니다" })],
+		});
+		const denied = renderStatus(view({ run: refused }), NOW);
+		expect(denied).toContain("시작하지 못함: omp 격리가 꺼져 있습니다");
+		expect(denied).not.toContain("아직 시작 전");
+		expect(denied).not.toContain("분리 체크아웃에서 시작함");
+		const started = runRecord({ status: "running", plan, spawns: [spawnRecord({ lane: lane.name, agent: "storm-implementer", outcome: "routed" })] });
+		expect(renderStatus(view({ run: started }), NOW)).toContain("분리 체크아웃에서 시작함");
+		expect(renderStatus(view({ lastRun: started }), NOW)).toContain("- 격리 레인: 마이그레이션 실험 — 기존 DB를 건드리지 않는 별도 실험 · 분리 체크아웃에서 시작함");
 	});
 
 	test("read-only status keeps the action at the top and returns to Runtime after storage", () => {

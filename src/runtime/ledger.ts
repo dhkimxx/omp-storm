@@ -87,6 +87,23 @@ export function ledgerRunForChild(id: string, parentId: string | undefined, arti
 	return getLedgerRun(children.get(childKey(id, parentId, artifactsDir)));
 }
 
+/**
+ * The run that admitted a child id, whichever artifact root that thread reported. Child ids are unique only inside
+ * one artifact tree, so a known parent narrows the match; no match, or more than one run, is no binding.
+ */
+export function ledgerRunForChildId(id: string, parentId?: string): LedgerRun | undefined {
+	let found: LedgerRun | undefined;
+	for (const [key, runId] of children) {
+		const [, boundParent, boundId] = key.split("\0");
+		if (boundId !== id || (parentId !== undefined && boundParent !== parentId)) continue;
+		const run = runs.get(runId);
+		if (run === undefined) continue;
+		if (found !== undefined && found !== run) return undefined;
+		found = run;
+	}
+	return found;
+}
+
 /** Whether any Storm run is active in this process, whichever project it belongs to. */
 export function anyLedgerRun(): boolean {
 	return runs.size > 0;

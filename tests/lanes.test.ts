@@ -71,6 +71,161 @@ test("a progress update keeps settled evidence, a new or failed lane never inher
 	expect(other.remaining(reordered, [agentEntry({ id: filesId, requests: 1, state: "idle" })], new Set())).toEqual([]);
 });
 
+test("shared placement flags only planned isolation lanes and strips an unplanned claim", () => {
+	const work = new RunLanes("run-placement");
+	const p = plan(lane("api", "Implement API"), { ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
+	const placed = work.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "api", task: "Implement", isolated: true },
+				{ agent: "storm-implementer", name: "probe", task: "Probe" },
+			],
+		},
+		p,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const tasks = placed.input.tasks as Array<Record<string, unknown>>;
+	expect(tasks[0]).not.toHaveProperty("isolated");
+	expect(tasks[1]).toMatchObject({ name: "probe", isolated: true });
+	// The manual handle is kept: only a selected lane's placement changes.
+	const flat = work.place({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
+	expect(flat.ok && flat.input).toMatchObject({ name: "probe", isolated: true });
+});
+
+test("a batch-wide isolated shorthand cannot leak into shared items", () => {
+	const work = new RunLanes("run-batch");
+	const sharedOnly = plan(lane("api", "Implement API"));
+	const plain = work.place(
+		{ isolated: true, tasks: [{ agent: "storm-implementer", name: "api", task: "Implement" }] },
+		sharedOnly,
+		team,
+	);
+	expect(plain.ok).toBe(true);
+	if (!plain.ok) return;
+	expect(plain.input).not.toHaveProperty("isolated");
+	expect((plain.input.tasks as Array<Record<string, unknown>>)[0]).not.toHaveProperty("isolated");
+
+	const selected = plan(lane("api", "Implement API"), { ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent" });
+	const placed = work.place(
+		{
+			isolated: true,
+			tasks: [
+				{ agent: "storm-implementer", name: "api", task: "Implement" },
+				{ agent: "storm-implementer", name: "probe", task: "Probe" },
+			],
+		},
+		selected,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	expect(placed.input).not.toHaveProperty("isolated");
+	const tasks = placed.input.tasks as Array<Record<string, unknown>>;
+	expect(tasks[0]).not.toHaveProperty("isolated");
+	expect(tasks[1]).toMatchObject({ isolated: true });
+});
+
+test("isolation placement fails closed on unknown, disabled or auto-applying host capability", () => {
+	const work = new RunLanes("run-capability");
+	const p = plan({ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
+	const input = { agent: "storm-implementer", name: "probe", task: "Probe" };
+	const unknown = work.place(input, p, team);
+	expect(unknown.ok).toBe(false);
+	if (!unknown.ok) {
+		expect(unknown.reason).toContain("task.isolation.enabled");
+		expect(unknown.reason).toContain("omp config set task.isolation.enabled true");
+	}
+	const disabled = work.place(input, p, team, { host: { enabled: false, apply: false } });
+	expect(disabled.ok).toBe(false);
+	if (!disabled.ok) expect(disabled.reason).toContain("task.isolation.enabled=false");
+	const applying = work.place(input, p, team, { host: { enabled: true, apply: true } });
+	expect(applying.ok).toBe(false);
+	if (!applying.ok) {
+		expect(applying.reason).toContain("omp config set task.isolation.apply false");
+		expect(applying.reason).toContain("patch/branch");
+		expect(applying.reason).toContain("공유 레인");
+	}
+});
+
+test("a legacy isolated team isolates every lane including the final reviewer, and requires host isolation", () => {
+	const reviewTeam = teamOf({ implementer: "fake/dev", reviewer: "fake/rev" }, { isolation: "isolated" });
+	const work = new RunLanes("run-legacy");
+	const p: RunPlan = {
+		lanes: [
+			{ name: "api", kind: "code", role: "implementer", goal: "Implement" },
+			{ name: "check", kind: "review", role: "reviewer", goal: "Review" },
+		],
+		workers: { implementer: 1, reviewer: 1 },
+		submittedAt: "2026-01-01T00:00:00Z",
+	};
+	const placed = work.place(
+		{ tasks: [{ agent: "storm-implementer", name: "api", task: "Implement" }, { agent: "storm-reviewer", name: "check", task: "Review" }] },
+		p,
+		reviewTeam,
+		{ host: { enabled: true, apply: true } },
+	);
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const tasks = placed.input.tasks as Array<Record<string, unknown>>;
+	expect(tasks[0]).toMatchObject({ isolated: true });
+	// The operator's isolation commitment includes the final reviewer; omp's apply semantics stay untouched.
+	expect(tasks[1]).toMatchObject({ isolated: true });
+	const blocked = work.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, reviewTeam);
+	expect(blocked.ok).toBe(false);
+});
+
+test("an unbound direct task cannot claim an isolated lane, and a rejected batch reserves nothing", () => {
+	const work = new RunLanes("run-reserve");
+	const p = plan({ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
+	const direct = work.place({ agent: "storm-implementer", task: "Probe", isolated: true }, undefined, team);
+	expect(direct.ok).toBe(false);
+	if (!direct.ok) expect(direct.reason).toContain("계획에 없는");
+	expect(work.place({ agent: "storm-implementer", task: "Probe" }, undefined, team).ok).toBe(true);
+	const rejected = work.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "probe", task: "Probe" },
+				{ agent: "storm-implementer", task: "Stray", isolated: true },
+			],
+		},
+		p,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(rejected.ok).toBe(false);
+	// The rejected batch did not advance the reservation serial or leave a lane behind.
+	const assigned = work.assign({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
+	expect(assigned.ok).toBe(true);
+	if (assigned.ok) expect(assigned.input.name).toContain("run-reserve-lane-1");
+});
+
+test("isolation presence is lane identity while its wording is not, and shared evidence keeps covering", () => {
+	const work = new RunLanes("run-identity");
+	const shared = plan(lane("probe", "Run experiment"));
+	const id = assigned(work, shared, "probe");
+	work.admit({ spawnKey: id, agent: "storm-implementer", outcome: "routed" });
+	const agent = agentEntry({ id, requests: 1, state: "idle" });
+	const first = plan({ ...lane("probe", "Run experiment"), isolationReason: "first reason" });
+	const second = plan({ ...lane("probe", "Run experiment"), isolationReason: "rewritten reason" });
+	expect(replanConflict(shared, first)).toContain("isolation");
+	// A new placement does not inherit the old shared worker's evidence.
+	expect(work.remaining(first, [agent], new Set())).toEqual(["probe"]);
+	expect(replanConflict(first, second)).toBeUndefined();
+	expect(work.remaining(second, [agent], new Set())).toEqual(["probe"]);
+	const isolatedWork = new RunLanes("run-identity-isolated");
+	const placed = isolatedWork.assign({ agent: "storm-implementer", name: "probe", task: "Probe" }, first, team, { host: { enabled: true, apply: false } });
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	isolatedWork.admit({ spawnKey: placed.input.name as string, agent: "storm-implementer", outcome: "routed" });
+	const isolatedAgent = agentEntry({ id: placed.input.name as string, requests: 1, state: "idle" });
+	// Changing only the reason's wording keeps the already admitted evidence.
+	expect(isolatedWork.remaining(second, [isolatedAgent], new Set())).toEqual([]);
+});
+
 test("replanConflict rejects changing a lane's stable identity under the same name", () => {
 	const base = plan({ ...lane("api", "Implement API"), files: ["b.ts", "a.ts"] });
 	expect(replanConflict(undefined, base)).toBeUndefined();

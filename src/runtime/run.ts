@@ -182,6 +182,8 @@ interface ResumeLane {
 	name: string;
 	role: string;
 	goal?: string;
+	/** Why the lane's work is outside the parent tree; a resumed run must not put it back in the shared checkout. */
+	isolationReason?: string;
 }
 
 /** A stored plan is repository data: only an array of objects with a string name is a plan. */
@@ -194,18 +196,20 @@ function resumeLanes(plan: unknown): ResumeLane[] | undefined {
 			name: lane.name,
 			role: typeof lane.role === "string" ? lane.role : "",
 			...(typeof lane.goal === "string" && lane.goal.trim() ? { goal: lane.goal } : {}),
+			...(typeof lane.isolationReason === "string" && lane.isolationReason.trim() ? { isolationReason: lane.isolationReason } : {}),
 		});
 	}
 	return out;
 }
 
-/** One plan line: its name and the agent doing it, and its goal when it had one. */
+/** One plan line: its name and the agent doing it, its goal when it had one, and a separate checkout when it had a reason. */
 function resumeLane(config: StormConfig, lane: ResumeLane): string {
 	const agent = lane.role === "" ? undefined : (usableRole(config, lane.role)?.agent ?? lane.role);
 	const head = agent === undefined ? `- ${lane.name}` : `- ${lane.name} (${agent})`;
-	const line = lane.goal ? `${head}: ${lane.goal}` : head;
-	// A goal is the model's text: keep its line breaks from adding lines the bounds above do not cover.
-	return line.replace(/\s+/g, " ").slice(0, RESUME_LANE_CHARS);
+	const isolated = lane.isolationReason === undefined ? "" : ` [separate checkout: ${lane.isolationReason}]`;
+	const line = lane.goal ? `${head}${isolated}: ${lane.goal}` : `${head}${isolated}`;
+	// A stored plan is repository data: keep control characters and line breaks from adding lines the bounds above do not cover.
+	return line.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").replace(/\s+/g, " ").slice(0, RESUME_LANE_CHARS);
 }
 
 /** The user's sentence in one line, short enough to stay a note. */
@@ -218,7 +222,8 @@ function resumeSaid(said: string | undefined): string | undefined {
 
 /** What the director of a resumed run reads before the team: the old run, where it stopped, and the plan it was following. */
 function resumeBlock(config: StormConfig, resume: ResumeInfo): string[] {
-	const lanes = (resumeLanes(resume.plan) ?? []).slice(0, RESUME_LANES);
+	const allLanes = resumeLanes(resume.plan) ?? [];
+	const lanes = allLanes.slice(0, RESUME_LANES);
 	const turns = resume.turns ?? 0;
 	const rounds = Number.isFinite(turns) ? Math.max(0, Math.trunc(turns)) : 0;
 	// Both came from a repository file: an id that is not a run id or a reason this version does not know is not shown.
@@ -226,8 +231,13 @@ function resumeBlock(config: StormConfig, resume: ResumeInfo): string[] {
 	const reason =
 		resume.endReason !== undefined && Object.hasOwn(END_STATUS, resume.endReason) ? ` (${resume.endReason})` : "";
 	const said = resumeSaid(resume.said);
+	const isolated = allLanes.some(lane => lane.isolationReason !== undefined);
 	return [
-		`Continues ${subject}, which stopped${reason} after ${rounds} rounds. Its changes are in the working tree or committed.`,
+		`Continues ${subject}, which stopped${reason} after ${rounds} rounds. ${
+			isolated
+				? "Its shared-checkout changes are in the working tree or committed. Lanes with a reason used separate checkouts apart from branches; check whether their changes landed here before redoing them."
+				: "Its changes are in the working tree or committed."
+		}`,
 		"First check the current state (git status and diff, the tests), then finish what is left. Do not redo finished work.",
 		...(resume.requestLength === REQUEST_LIMIT ? ["The stored request was cut at 20,000 characters."] : []),
 		...(said ? [said] : []),
@@ -261,17 +271,17 @@ export function buildHandoff(input: {
 		"- Delegate all changes; your own file edits are blocked.",
 		`- Before spawning use \`storm plan\`. Lane kinds: ${laneRoles(config)}.`,
 		"- Replan: keep goal/kind/role/files; use `progress` for updates, a new name for changed scope.",
-		"- Cite file:line or command/exit/log. Verify only the relevant ranges.",
+		"- Cite file:line or command/exit/log; verify relevant ranges.",
 		isolated
-			? "- Use `isolated: true`. For follow-up, a new agent reads `agent://<id>`."
-			: "- Follow up via `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
+			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. For follow-up, a new agent reads `agent://<id>`."
+			: "- Share this checkout, reviewer too; sequence overlapping edits. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
 		`- Resolve \`incorrect\` reviews and open P0s${docsEnabled(config) ? ", including doc findings" : ""}.`,
 		"- Finish every lane or report its blocker.",
-		"- Stage `storm brief` from evidence for substantial work, best next task first. Storm reports after it settles.",
+		"- Stage `storm brief` from evidence for substantial work, best next first. Storm reports after it settles.",
 	];
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {
-		const check = `- Storm checks the run: all changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;
+		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;
 		rules.push(
 			input.maxRounds === 1
 				? `${check} Without it the run ends unverified.`

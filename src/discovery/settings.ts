@@ -1,3 +1,5 @@
+import { Settings } from "@oh-my-pi/pi-coding-agent";
+import { cfgTaskIsolationApply, cfgTaskIsolationEnabled } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { Exec, ExplicitSettings } from "../types.ts";
 
 type Rec = Record<string, unknown>;
@@ -33,6 +35,8 @@ export function parseConfigList(text: string): ExplicitSettings {
 	if (settings.modelRoles.default) settings.defaultModel = settings.modelRoles.default;
 	const isolation = valueOf("task.isolation.enabled");
 	if (typeof isolation === "boolean") settings.isolationEnabled = isolation;
+	const apply = valueOf("task.isolation.apply");
+	if (typeof apply === "boolean") settings.isolationApply = apply;
 	const concurrency = valueOf("task.maxConcurrency");
 	if (typeof concurrency === "number" && Number.isFinite(concurrency) && concurrency > 0) settings.maxConcurrency = concurrency;
 	const modelFallback = valueOf("retry.modelFallback");
@@ -48,6 +52,22 @@ export function parseConfigList(text: string): ExplicitSettings {
 		}
 	}
 	return settings;
+}
+
+/**
+ * omp's effective task-isolation values from the live host settings, without a CLI subprocess. Undefined fields mean
+ * this host cannot prove them (for example a test host with no initialized settings), never that they are off.
+ */
+export function liveIsolationSettings(): Pick<ExplicitSettings, "isolationEnabled" | "isolationApply"> {
+	try {
+		const settings = Settings.instance;
+		return {
+			isolationEnabled: cfgTaskIsolationEnabled.get(settings),
+			isolationApply: cfgTaskIsolationApply.get(settings),
+		};
+	} catch {
+		return {};
+	}
 }
 
 export async function readExplicitSettings(exec: Exec, ompBin: string): Promise<ExplicitSettings> {
