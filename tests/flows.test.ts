@@ -15,7 +15,7 @@ import { writeRun } from "../src/runtime/run.ts";
 import { noteResumePointer, resumeCandidate, resumePointerFile } from "../src/runtime/resume.ts";
 import { RUN_APPEARANCE, STORM_MARK } from "../src/view/appearance.ts";
 import { parseModelEntry } from "../src/selector.ts";
-import { BROWSE, FIELD, MODEL_DEFAULT, NONE } from "../src/setup/form.ts";
+import { BROWSE, FIELD, NONE } from "../src/setup/form.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { isApproved, loadProjectState } from "../src/state.ts";
 import type { RunRequestResult } from "../src/tool/host.ts";
@@ -36,6 +36,8 @@ const THIRD = pick(2);
 const FOURTH = pick(3);
 const LAST = pick(-1);
 const PICK_BY_ROLE = "역할별로 고르기";
+const EDIT_MODELS = "모델·effort 수정";
+const KEEP_EDITING = "계속 수정";
 const PRIMARY = "주 모델";
 const FALLBACK = "폴백";
 /** The old toggle labels are still the explicit-switch contract; the first approval default is separate. */
@@ -289,6 +291,226 @@ describe("/storm without an approved team", () => {
 	});
 });
 
+describe("model slot edit", () => {
+	test("one approved-team slot changes alone, without opening a form", async () => {
+		await approve(TEAM);
+		const forms: string[] = [];
+		const calls: Array<{ title: string; current?: { selector: string; effort?: string } }> = [];
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", APPROVE]);
+		f.ui.form = async (html) => {
+			forms.push(html);
+			return undefined;
+		};
+		f.ui.pickModel = async (title, current) => {
+			calls.push({ title, ...(current ? { current } : {}) });
+			return { model: model("c/j"), effort: "high" };
+		};
+		await hubFlow(env, f.ui);
+		expect(forms).toEqual([]);
+		expect(calls).toEqual([{ title: "구현 · 주 모델", current: { selector: "a/i" } }]);
+		expect(f.selects[0]?.options).toContain(EDIT_MODELS);
+		expect(f.selects[1]?.options).toEqual(["탐색 · 주 모델", "탐색 · 폴백", "구현 · 주 모델", "리뷰 · 주 모델", CANCEL]);
+		expect(f.selects[2]?.options).toEqual([APPROVE, KEEP_EDITING, CANCEL]);
+		// The diff names only the changed slot; no other role or policy row appears.
+		expect(f.selects[2]?.markdown).toContain("구현 모델");
+		expect(f.selects[2]?.markdown).toContain("a/i → c/j:high");
+		expect(f.selects[2]?.markdown).not.toContain("탐색 모델");
+		const state = await load();
+		expect(state.config.status === "ok" && state.config.config).toEqual({
+			...TEAM,
+			roles: { ...TEAM.roles, implementer: { agent: "storm-implementer", models: ["c/j:high"], workers: { min: 1, max: 3 } } },
+		});
+		expect(isApproved(state)).toBe(true);
+	});
+
+	test("every configured fallback is a slot, numbered only when the role has several", async () => {
+		const multi: StormConfig = {
+			...TEAM,
+			roles: {
+				...TEAM.roles,
+				explorer: { agent: "storm-explorer", models: ["a/x", "b/z", "c/k"], effort: "low" },
+			},
+		};
+		await approve(multi);
+		const f = scriptedUi([EDIT_MODELS, "탐색 · 폴백 2", APPROVE]);
+		f.ui.pickModel = async (title, current) => {
+			expect(title).toBe("탐색 · 폴백 2");
+			expect(current).toEqual({ selector: "c/k", effort: "low" });
+			return { model: model("d/m"), effort: "high" };
+		};
+		await hubFlow(env, f.ui);
+		expect(f.selects[1]?.options).toEqual([
+			"탐색 · 주 모델", "탐색 · 폴백 1", "탐색 · 폴백 2", "구현 · 주 모델", "리뷰 · 주 모델", CANCEL,
+		]);
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		// The other fallbacks keep their order and the role-level effort; only the picked slot gets a suffix.
+		expect(saved?.roles.explorer).toEqual({ agent: "storm-explorer", models: ["a/x", "b/z", "d/m:high"], effort: "low" });
+	});
+
+	test("reverting a staged slot to the approved value keeps the draft honest", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", KEEP_EDITING, "구현 · 주 모델", "리뷰 · 주 모델", APPROVE]);
+		const picks = [model("c/j"), model("a/i"), model("d/k")];
+		const titles: string[] = [];
+		f.ui.pickModel = async (title) => {
+			titles.push(title);
+			return { model: picks.shift()! };
+		};
+		await hubFlow(env, f.ui);
+		expect(titles).toEqual(["구현 · 주 모델", "구현 · 주 모델", "리뷰 · 주 모델"]);
+		// The final proposal is the reverted implementer plus the reviewer edit, never the earlier c/j.
+		expect(f.selects[5]?.markdown).not.toContain("c/j");
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		expect(saved?.roles.implementer?.models).toEqual(["a/i"]);
+		expect(saved?.roles.reviewer?.models).toEqual(["d/k"]);
+	});
+
+	test("the same model keeps its place and only the effort changes", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", APPROVE]);
+		f.ui.pickModel = async () => ({ model: model("a/i"), effort: "high" });
+		await hubFlow(env, f.ui);
+		expect(f.selects[2]?.markdown).toContain("a/i → a/i:high");
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		expect(saved?.roles.implementer?.models).toEqual(["a/i:high"]);
+		expect(saved?.roles.explorer).toEqual(TEAM.roles.explorer!);
+		expect(saved?.roles.reviewer).toEqual(TEAM.roles.reviewer!);
+	});
+
+	test("cancelling the picker returns to the slot list, and leaving either dialog writes nothing", async () => {
+		await approve(TEAM);
+		const before = await fileText();
+		const beforeRecords = await (await load()).store.list();
+		const cancelled = scriptedUi([EDIT_MODELS, "구현 · 주 모델", CANCEL]);
+		cancelled.ui.pickModel = async () => undefined;
+		await hubFlow(env, cancelled.ui);
+		// Hub, slot list, and the slot list after the picker was cancelled; no approval was asked.
+		expect(cancelled.selects).toHaveLength(3);
+		expect(cancelled.selects[2]?.options).toEqual(cancelled.selects[1]?.options);
+		expect(await fileText()).toBe(before);
+		expect(await (await load()).store.list()).toHaveLength(beforeRecords.length);
+
+		const review = scriptedUi([EDIT_MODELS, "구현 · 주 모델", CANCEL]);
+		review.ui.pickModel = async () => ({ model: model("c/j") });
+		await hubFlow(env, review.ui);
+		expect(review.selects[2]?.options).toEqual([APPROVE, KEEP_EDITING, CANCEL]);
+		expect(await fileText()).toBe(before);
+		expect(await (await load()).store.list()).toHaveLength(beforeRecords.length);
+	});
+
+	test("continuing the review keeps the draft and allows another slot edit", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", KEEP_EDITING, "탐색 · 폴백", APPROVE]);
+		const picks = [model("c/j"), model("d/k")];
+		f.ui.pickModel = async () => ({ model: picks.shift()! });
+		await hubFlow(env, f.ui);
+		expect(f.selects.map((select) => select.options)).toEqual([
+			expect.arrayContaining([EDIT_MODELS]),
+			["탐색 · 주 모델", "탐색 · 폴백", "구현 · 주 모델", "리뷰 · 주 모델", CANCEL],
+			[APPROVE, KEEP_EDITING, CANCEL],
+			["탐색 · 주 모델", "탐색 · 폴백", "구현 · 주 모델", "리뷰 · 주 모델", CANCEL],
+			[APPROVE, KEEP_EDITING, CANCEL],
+		]);
+		// The final diff carries both edits made through the same draft.
+		expect(f.selects[4]?.markdown).toContain("c/j");
+		expect(f.selects[4]?.markdown).toContain("d/k");
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		expect(saved?.roles.implementer?.models).toEqual(["c/j"]);
+		expect(saved?.roles.explorer?.models).toEqual(["a/x:low", "d/k"]);
+		expect(saved?.roles.explorer?.effort).toBeUndefined();
+	});
+
+	test("a model already in another slot of the role is rejected with an explanation and no save", async () => {
+		await approve(TEAM);
+		const before = await fileText();
+		const f = scriptedUi([EDIT_MODELS, "탐색 · 주 모델", CANCEL]);
+		f.ui.pickModel = async () => ({ model: model("b/z") });
+		await hubFlow(env, f.ui);
+		// Back at the slot list after the rejection; no approval dialog.
+		expect(f.selects).toHaveLength(3);
+		expect(f.notices.some((notice) => notice.level === "warning" && notice.text.includes("이미"))).toBe(true);
+		expect(await fileText()).toBe(before);
+	});
+
+	test("an unavailable or non-tool model and an unsupported effort are explained, not substituted", async () => {
+		await approve(TEAM);
+		const before = await fileText();
+		for (const picked of [
+			{ model: model("d/k", { available: false }) },
+			{ model: model("d/k", { supportsTools: false }) },
+			{ model: model("d/k", { efforts: ["low"] }), effort: "high" as const },
+		]) {
+			const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", CANCEL]);
+			f.ui.pickModel = async () => picked;
+			await hubFlow(env, f.ui);
+			expect(f.notices.some((notice) => notice.level === "warning")).toBe(true);
+			// The rejection keeps the slot list open and no approval dialog is offered.
+			expect(f.selects).toHaveLength(3);
+			expect(await fileText()).toBe(before);
+		}
+	});
+
+	test("editing one slot preserves a legacy role-level effort for the untouched fallback", async () => {
+		await approve(TEAM);
+		const f = scriptedUi([EDIT_MODELS, "탐색 · 주 모델", APPROVE]);
+		f.ui.pickModel = async () => ({ model: model("c/j"), effort: "high" });
+		await hubFlow(env, f.ui);
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		// The explicit pick carries its own effort; the untouched fallback keeps inheriting the role-level effort.
+		expect(saved?.roles.explorer).toEqual({ agent: "storm-explorer", models: ["c/j:high", "b/z"], effort: "low" });
+		// The role that was not edited keeps its legacy setting byte-for-byte.
+		expect(saved?.roles.reviewer).toEqual(TEAM.roles.reviewer!);
+	});
+
+	test("the first recommendation's direct edit keeps the disclosure and the ordinary final approval", async () => {
+		const proposed = await recommended();
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", APPROVE]);
+		f.ui.pickModel = async () => ({ model: model("pz/native", { efforts: ["minimal"] }), effort: "minimal" });
+		await setupFlow(env, f.ui);
+		expect(f.selects[0]?.options).toEqual([APPROVE, EDIT_MODELS, CANCEL]);
+		expect(f.selects[2]?.options).toEqual([APPROVE, KEEP_EDITING, CANCEL]);
+		expect(f.selects[2]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		expect(saved?.roles.implementer?.models[0]).toBe("pz/native:minimal");
+		expect(saved?.roles.implementer?.models.slice(1)).toEqual(proposed.roles.implementer?.models.slice(1));
+		expect(isApproved(state)).toBe(true);
+		expect(await autoChoice()).toBe("on");
+	});
+
+	test("an unchanged recommendation still exposes the direct edit", async () => {
+		const team = await recommended();
+		await approve(team);
+		const f = scriptedUi([EDIT_MODELS, "구현 · 주 모델", APPROVE]);
+		f.ui.pickModel = async () => ({ model: model("pz/native") });
+		await setupFlow(env, f.ui);
+		expect(f.selects[0]?.options).toEqual([EDIT_MODELS, "닫기"]);
+		expect(f.selects[2]?.options).toEqual([APPROVE, KEEP_EDITING, CANCEL]);
+		expect(f.selects[2]?.markdown).not.toContain(AUTO_DISCLOSURE);
+		const state = await load();
+		const saved = state.config.status === "ok" ? state.config.config : undefined;
+		expect(saved?.roles.implementer?.models[0]).toBe("pz/native");
+		expect(saved?.roles.explorer).toEqual(team.roles.explorer!);
+		expect(await autoChoice()).toBe("unset");
+	});
+
+	test("without a native picker neither the hub nor the recommendation offers the edit", async () => {
+		await approve(TEAM);
+		const hub = scriptedUi(["닫기"]);
+		await hubFlow(env, hub.ui);
+		expect(hub.selects[0]?.options).not.toContain(EDIT_MODELS);
+
+		const setup = scriptedUi([CANCEL]);
+		await setupFlow(env, setup.ui);
+		expect(setup.selects.every((select) => !select.options.includes(EDIT_MODELS))).toBe(true);
+	});
+});
+
 describe("setup", () => {
 	test("first setup, approved: the recommended team is saved and automatic delegation is on by default", async () => {
 		const expected = await recommended();
@@ -437,7 +659,7 @@ describe("setup", () => {
 		expect(saved?.roles.explorer).toEqual(base.roles.explorer!);
 	});
 
-	test("models outside the recommendations get their own primary and fallback effort pages before approval", async () => {
+	test("a native pick supplies model and effort together, with no second effort page", async () => {
 		const primary = model("pd/outside-primary", { efforts: ["minimal", "low"], contextWindow: 64_000 });
 		const fallback = model("pe/outside-fallback", { efforts: ["high", "xhigh"], contextWindow: 64_000 });
 		const catalog = [...CATALOG, ...[primary, fallback].map(m => ({
@@ -452,9 +674,10 @@ describe("setup", () => {
 		const roleId = "explorer";
 		const title = roleTitle(roleId);
 		const steps: string[] = [];
-		f.ui.pickModel = async slotTitle => {
+		f.ui.pickModel = async (slotTitle, current) => {
 			steps.push(`picker ${slotTitle}`);
-			return slotTitle.endsWith(FALLBACK) ? fallback : primary;
+			expect(current).toBeUndefined();
+			return slotTitle.endsWith(FALLBACK) ? { model: fallback, effort: "xhigh" } : { model: primary, effort: "minimal" };
 		};
 		withForms(f, form => {
 			if (hasField(form, FIELD.primary(roleId))) {
@@ -472,16 +695,6 @@ describe("setup", () => {
 					[FIELD.workersMax(roleId)]: 3,
 				};
 			}
-			for (const [slot, picked, initial, effort] of [[PRIMARY, primary, "low", "minimal"], [FALLBACK, fallback, "high", "xhigh"]] as const) {
-				if (!hasField(form, FIELD.effort) || !legend(form).includes(picked.selector)) continue;
-				expect(legend(form)).toContain(slot);
-				steps.push(`${slot} ${picked.selector}`);
-				const field = choice(form, FIELD.effort);
-				expect(spansText(field.label)).toBe(FIELD.effort);
-				expect(field.options.map(option => option.value)).toEqual([MODEL_DEFAULT, ...picked.efforts]);
-				expect(defaultFormData(form)[FIELD.effort]).toBe(initial);
-				return { [FIELD.effort]: effort };
-			}
 			steps.push(page(form));
 			return {};
 		});
@@ -491,12 +704,10 @@ describe("setup", () => {
 		expect(steps).toEqual([
 			roleId,
 			`picker ${title} · ${PRIMARY}`,
-			`${PRIMARY} ${primary.selector}`,
 			`picker ${title} · ${FALLBACK}`,
-			`${FALLBACK} ${fallback.selector}`,
 			...expected.slice(nextRole),
 		]);
-		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
+		expect(f.selects.map(s => s.options)).toEqual([[APPROVE, EDIT_MODELS, PICK_BY_ROLE, CANCEL], [APPROVE, CANCEL]]);
 		expect(f.selects[1]?.markdown?.startsWith(AUTO_DISCLOSURE)).toBe(true);
 		const state = await load();
 		expect(state.config.status === "ok" && state.config.config.roles[roleId]).toMatchObject({
@@ -607,7 +818,7 @@ describe("automatic delegation", () => {
 		const tiny = { ...env, registry: { getAll: () => [small], getAvailable: () => [small] } };
 		const g = scriptedUi([PICK_BY_ROLE, APPROVE]);
 		withForms(g);
-		g.ui.pickModel = async () => model("pz/tiny", { contextWindow: 64_000 });
+		g.ui.pickModel = async () => ({ model: model("pz/tiny", { contextWindow: 64_000 }) });
 		await setupFlow(tiny, g.ui);
 		expect(g.selects[0]?.options).toEqual([PICK_BY_ROLE, CANCEL]);
 		expect(g.selects[1]?.options).toEqual([APPROVE, CANCEL]);

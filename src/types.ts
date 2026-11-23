@@ -92,6 +92,12 @@ export interface UiContext {
 /** Answers of a form by control name: text, a number for number inputs, or a group's checked values. */
 export type FormData = Record<string, string | number | string[]>;
 
+/** One Storm role slot's model choice, made in a single picker. An absent `effort` means the model's own default. */
+export interface StormModelPick {
+	model: ModelInfo;
+	effort?: Effort;
+}
+
 /** The subset of omp's `ctx.ui` Storm uses, plus Storm's own views. */
 export interface UiPort {
 	/** Resolves to the chosen label, or undefined when cancelled or when no UI can answer. */
@@ -104,8 +110,13 @@ export interface UiPort {
 	record(title: string, markdown: string): void;
 	/** Draws an HTML `<form>` and resolves to its answers, or undefined when cancelled or timed out. Absent when the host has no form surface. */
 	form?(html: string): Promise<FormData | undefined>;
-	/** Selects an available tool-capable chat model for a Storm role, without changing the session. TUI only; Esc cancels. */
-	pickModel?(title: string): Promise<ModelInfo | undefined>;
+	/**
+	 * Selects an available tool-capable chat model and its supported effort for one Storm role slot, without changing
+	 * the omp session or its settings. `current` is this slot's canonical selector and known effort (not the session's
+	 * model state): the picker opens on it and shows its effort. Resolves undefined on cancel; a pick without `effort`
+	 * means the model default (a bare selector). TUI only; Esc cancels.
+	 */
+	pickModel?(title: string, current?: { selector: string; effort?: Effort }): Promise<StormModelPick | undefined>;
 }
 
 // ── Catalog ─────────────────────────────────────────────────────────────────────────────────

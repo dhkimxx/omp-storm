@@ -1,9 +1,9 @@
 /**
- * /storm flows: setup (the recommended team or the role-by-role interview), status,
- * approval of a config changed by hand, rollback, trial decisions, automatic-delegation consent, reset. None of them
- * calls a model or sends a message. A config is approved only by the exact "승인" in Storm's dialog; the first such
- * approval initializes automatic delegation, later changes need its own exact choice, and reset deletes only after
- * the single exact "초기화" choice.
+ * /storm flows: setup (the recommended team, a one-slot model edit from the native picker, or the role-by-role
+ * interview), status, approval of a config changed by hand, rollback, trial decisions, automatic-delegation consent,
+ * reset. None of them calls a model or sends a message. A config is approved only by the exact "승인" in Storm's
+ * dialog; the first such approval initializes automatic delegation, later changes need its own exact choice, and reset
+ * deletes only after the single exact "초기화" choice.
  */
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -34,9 +34,11 @@ import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
 import { BROWSE, commonSettingsForm, effortForm, FIELD, type FormRetry, interviewRoles, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, setupConfig, subagentShares } from "./setup/form.ts";
+import { applySlotPick, entryForPick, modelSlots, slotCurrent } from "./setup/model-draft.ts";
+import { type ModelEntry } from "./selector.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult } from "./tool/host.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, ProposalKind, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -81,6 +83,10 @@ function decideHost(env: FlowEnv, ui: UiPort): DecideHost {
 const MOVED = "창이 열려 있는 사이 팀 설정이나 가림 정의가 바뀌어 저장하지 않았습니다. /storm 으로 다시 확인하세요.";
 
 const PICK_BY_ROLE = "역할별로 고르기";
+/** The direct one-slot edit: a native model pick becomes a real diff through the ordinary approval dialog. */
+const EDIT_MODELS = "모델·effort 수정";
+/** Offered on every direct-edit approval; the draft (including earlier edits in the same dialog) stays. */
+const KEEP_EDITING = "계속 수정";
 /** Number of invalid submissions allowed per page; cancelling the native picker is not a validation error. */
 const FORM_TRIES = 5;
 
@@ -225,6 +231,17 @@ async function pickByRole(
 		}
 		return pickedEntry(input, id, selector, effort, model);
 	};
+	/** A native pick is already a model and effort: no second effort page. Cancelling is not an invalid answer. */
+	const native = async (title: string, id: RoleId, index: number): Promise<ModelEntry | "cancel" | "invalid"> => {
+		const picked = await pickModel?.(title, slotCurrent(input.current?.roles[id], index));
+		if (!picked) return "cancel";
+		const made = entryForPick(picked, title);
+		if ("error" in made) {
+			ui.notify(made.error, "warning");
+			return "invalid";
+		}
+		return made.entry;
+	};
 	for (const [index, id] of roles.entries()) {
 		const title = roleTitle(id);
 		let retry: FormRetry | undefined;
@@ -246,19 +263,29 @@ async function pickByRole(
 				break;
 			}
 			retry = { answers, errors: [] };
-			const primaryModel = choices.primary === BROWSE ? await pickModel?.(`${title} · 주 모델`) : undefined;
-			if (choices.primary === BROWSE && !primaryModel) continue;
-			const primary = await chooseEffort(id, "주 모델", primaryModel?.selector ?? choices.primary, primaryModel);
-			if (!primary) return cancelled();
-			let fallback;
+			let primary: ModelEntry;
+			if (choices.primary === BROWSE) {
+				const picked = await native(`${title} · 주 모델`, id, 0);
+				if (picked === "cancel" || picked === "invalid") continue;
+				primary = picked;
+			} else {
+				const entry = await chooseEffort(id, "주 모델", choices.primary);
+				if (!entry) return cancelled();
+				primary = entry;
+			}
+			let fallback: ModelEntry | undefined;
 			if (choices.fallback !== undefined) {
-				const fallbackModel = choices.fallback === BROWSE ? await pickModel?.(`${title} · 폴백`) : undefined;
-				if (choices.fallback === BROWSE && !fallbackModel) continue;
-				const selector = fallbackModel?.selector ?? choices.fallback;
-				if (selector !== primary.selector) {
-					fallback = await chooseEffort(id, "폴백", selector, fallbackModel);
-					if (!fallback) return cancelled();
+				let entry: ModelEntry | undefined;
+				if (choices.fallback === BROWSE) {
+					const picked = await native(`${title} · 폴백`, id, 1);
+					if (picked === "cancel" || picked === "invalid") continue;
+					entry = picked;
+				} else if (choices.fallback !== primary.selector) {
+					entry = await chooseEffort(id, "폴백", choices.fallback);
+					if (!entry) return cancelled();
 				}
+				// The form says the same model in both slots means no fallback.
+				if (entry && entry.selector !== primary.selector) fallback = entry;
 			}
 			selected[id] = { primary, ...(fallback ? { fallback } : {}), workers: choices.workers };
 			break;
@@ -285,6 +312,83 @@ async function pickByRole(
 	return false;
 }
 
+interface SlotEditOptions {
+	/** The project state the flow started from: the approval gate and the stale check use it. */
+	state: ProjectState;
+	/** One line above the approval; the first recommendation keeps its own summary. */
+	summary: string;
+	/** Disclosures that make the approval accurate (first-approval consent, cleanup, an invalid file being replaced). */
+	context: string;
+	/** Model warnings for the draft; the hub's one-slot edit has no analysis context to check against. */
+	warnings?: (config: StormConfig) => readonly string[];
+}
+
+/**
+ * One-slot model edits from the native picker: choose a slot of the draft, pick a model and effort, then approve the
+ * ordinary diff. No form is opened. "계속 수정" keeps the draft (including earlier edits) and returns to the slot
+ * list; cancelling the picker only returns to that list, while leaving it cancels the unsaved change. Only the exact
+ * approval in `decideProposal` writes, and a stale config or an approval that is no longer there is refused there.
+ */
+async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts: SlotEditOptions): Promise<boolean> {
+	const pickModel = ui.pickModel?.bind(ui);
+	if (!pickModel) return false;
+	const kind: ProposalKind = isApproved(opts.state) ? "reselect" : "setup";
+	let draft = base;
+	while (true) {
+		const slots = modelSlots(draft);
+		if (!slots.length) {
+			ui.notify("바꿀 모델 슬롯이 없습니다.", "warning");
+			return false;
+		}
+		const choice = await ui.select("바꿀 모델 슬롯을 고르세요", [...slots.map((slot) => slot.label), CANCEL], {
+			title: `${STORM_MARK} · ${EDIT_MODELS}`,
+			markdown: [
+				"### 지금 슬롯",
+				...slots.map((slot) => {
+					const now = slotCurrent(draft.roles[slot.roleId], slot.index);
+					return visible(`- ${slot.label}: ${now ? [now.selector, ...(now.effort ? [now.effort] : [])].join(" · ") : "없음"}`);
+				}),
+			].join("\n"),
+		});
+		if (choice === undefined || choice === CANCEL) {
+			ui.notify("모델·effort를 바꾸지 않았습니다.");
+			return false;
+		}
+		const slot = slots.find((candidate) => candidate.label === choice);
+		if (!slot) continue;
+		const picked = await pickModel(slot.label, slotCurrent(draft.roles[slot.roleId], slot.index));
+		// A cancelled picker is not an invalid pick: it goes back to the slot list.
+		if (!picked) continue;
+		const applied = applySlotPick(draft, slot, picked);
+		if ("error" in applied) {
+			ui.notify(applied.error, "warning");
+			continue;
+		}
+		const decision = await decideProposal(decideHost(env, ui), opts.state, { kind, summary: opts.summary, config: applied.config }, {
+			...(opts.warnings ? { warnings: opts.warnings(applied.config) } : {}),
+			...(opts.context ? { context: opts.context } : {}),
+			extraOptions: [KEEP_EDITING],
+		});
+		if (decision.outcome === "approved") {
+			ui.notify(`모델·effort를 승인하고 저장했습니다(${shortHash(decision.hash)}).`);
+			return true;
+		}
+		if (decision.outcome === "extra" && decision.extra === KEEP_EDITING) {
+			// The reviewed draft carries forward, so another slot can be edited before the final approval.
+			draft = applied.config;
+			continue;
+		}
+		if (decision.outcome === "unchanged") {
+			// A revert to the approved team is a draft change too; keeping the earlier edit here would save it later.
+			draft = applied.config;
+			ui.notify("지금 승인된 팀과 같은 모델·effort라 바뀐 것이 없습니다.");
+			continue;
+		}
+		ui.notify(decision.outcome === "rejected" ? decision.reason : "모델·effort를 바꾸지 않았습니다.", decision.outcome === "rejected" ? "warning" : "info");
+		return false;
+	}
+}
+
 /**
  * Setup and re-setup, without the model: Storm computes the recommended team (what the user chose before carries
  * over) and shows it in the approval dialog. "승인" saves it; where the host draws forms, "역할별로 고르기" opens the
@@ -301,6 +405,8 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const recs = ctx.recommend(priority);
 	const proposed = recommendedConfig(recs, priority, current);
 	const form = ui.form?.bind(ui);
+	/** The native picker makes the one-slot edit possible without a form. */
+	const canPick = ui.pickModel !== undefined;
 	const input: SetupFormInput = {
 		recs,
 		proposed,
@@ -332,39 +438,62 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		firstApproval ? AUTO_DISCLOSURE : "",
 		cleanupNotice,
 		state.config.status === "invalid" ? "지금 팀 설정 파일에 오류가 있어 새로 만듭니다." : "",
-		form ? "" : "이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 승인한 뒤 `/storm <요청>` 으로 바꾸세요.",
+		form
+			? ""
+			: canPick
+				? `이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 「${EDIT_MODELS}」으로 모델만 바꿀 수 있습니다.`
+				: "이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 승인한 뒤 `/storm <요청>` 으로 바꾸세요.",
 	]
 		.filter(Boolean)
 		.join("\n\n");
 	const notesInfo: InfoLine[] = [];
 	const notes = recommendationNotes(recs, proposed, notesInfo);
-	const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary: current ? "Storm 추천 팀으로 다시 설정" : "Storm 추천 팀", config: proposed }, {
-		warnings: [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...modelWarnings(proposed, ctx)],
+	const summary = current ? "Storm 추천 팀으로 다시 설정" : "Storm 추천 팀";
+	const warnings = (config: StormConfig) => [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...modelWarnings(config, ctx)];
+	const extras = [...(canPick ? [EDIT_MODELS] : []), ...(form ? [PICK_BY_ROLE] : [])];
+	const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary, config: proposed }, {
+		warnings: warnings(proposed),
 		context,
 		notes,
 		notesInfo,
-		...(form ? { extraOptions: [PICK_BY_ROLE] } : {}),
+		...(extras.length ? { extraOptions: extras } : {}),
 	});
-	// "역할별로 고르기" is offered only with a form.
-	if (!form) {
-		notifySetup(ui, decision.outcome === "extra" ? { outcome: "cancelled" } : decision);
-		if (decision.outcome === "approved") await activateAutoAfterApproval(state, ui, firstApproval);
-		return;
-	}
+	/** Both direct-edit routes approve through the ordinary dialog; only the exact approval turns auto on. */
+	const edit = async (): Promise<void> => {
+		if (await editModelSlots(env, ui, proposed, { state, summary, context, warnings })) {
+			await activateAutoAfterApproval(state, ui, firstApproval);
+		}
+	};
 	if (decision.outcome === "unchanged") {
-		// The recommendation is the approved team, so there is nothing to approve; picking role by role is still open.
-		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", [PICK_BY_ROLE, MENU.close], {
+		// The recommendation is the approved team, so there is nothing to approve; direct edit and role by role stay open.
+		if (!form && !canPick) {
+			notifySetup(ui, decision);
+			return;
+		}
+		const options = [...(canPick ? [EDIT_MODELS] : []), ...(form ? [PICK_BY_ROLE] : []), MENU.close];
+		const choice = await ui.select("Storm 추천 팀이 지금 승인된 팀과 같습니다", options, {
 			title: `${STORM_MARK} · 팀 제안`,
 			markdown: notes,
 			info: notesInfo,
 		});
-		if (choice !== PICK_BY_ROLE) return;
-	} else if (decision.outcome !== "extra") {
+		if (choice === EDIT_MODELS) await edit();
+		else if (choice === PICK_BY_ROLE && form && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
+			await activateAutoAfterApproval(state, ui, firstApproval);
+		}
+		return;
+	}
+	if (decision.outcome !== "extra") {
 		notifySetup(ui, decision);
 		if (decision.outcome === "approved") await activateAutoAfterApproval(state, ui, firstApproval);
 		return;
 	}
-	if (await pickByRole(env, ui, form, state, ctx, input, firstApproval)) await activateAutoAfterApproval(state, ui, firstApproval);
+	if (decision.extra === EDIT_MODELS) {
+		await edit();
+		return;
+	}
+	if (decision.extra === PICK_BY_ROLE && form && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
+		await activateAutoAfterApproval(state, ui, firstApproval);
+	}
 }
 
 /**
@@ -719,7 +848,7 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	]);
 	/** An approved team from before the default: offer the transition once, beside every normal action. */
 	const migrate = autoChoice === "unset";
-	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, MENU.models];
+	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, ...(ui.pickModel ? [EDIT_MODELS] : []), MENU.models];
 	// The status view already read this session's agents; do not query the same trusted list again.
 	if (view.agents?.length) options.push(MENU.agents);
 	options.push(autoChoice === "on" ? AUTO_MENU.on : AUTO_MENU.off);
@@ -738,7 +867,10 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	});
 	if (choice === MENU.resume && resume) await startResume(env, ui, resume);
 	else if (choice === MENU.setup) await setupFlow(env, ui);
-	else if (choice === MENU.models) await modelsFlow(env, ui);
+	else if (choice === EDIT_MODELS) {
+		// The approved team as it is, never a recommendation: this change only replaces the picked slot.
+		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: EDIT_MODELS, context: "" });
+	} else if (choice === MENU.models) await modelsFlow(env, ui);
 	else if (choice === MENU.agents) await agentsFlow(env, ui);
 	else if (choice === AUTO_MENU.on || choice === AUTO_MENU.off) await autoDelegationFlow(env, ui);
 	else if (migrate && (choice === AUTO_MIGRATION.switch || choice === AUTO_MIGRATION.stay)) await migrateAutoDelegation(env, ui, state as OkState, choice);

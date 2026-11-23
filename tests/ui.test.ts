@@ -197,38 +197,371 @@ describe("form surface per host", () => {
 });
 
 describe("TUI", () => {
+	/** A catalog row as omp hands it to the registry: real ladders so the native thinking slider is live. */
+	const chatModel = (provider: string, id: string, efforts: readonly string[]) => ({
+		provider,
+		id,
+		name: `${id} display`,
+		kind: "chat",
+		reasoning: efforts.length > 0,
+		input: ["text"],
+		contextWindow: 200_000,
+		...(efforts.length > 0 ? { thinking: { efforts, defaultLevel: efforts[0] } } : {}),
+		supportsTools: true,
+		cost: { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 },
+		identity: { class: id.split("-")[0] },
+		int: 50,
+		tps: 70,
+	});
+	const INSIDE = chatModel("example", "inside", ["low", "medium", "high"]);
+	const OUTSIDE = chatModel("example", "outside", ["minimal", "low", "high"]);
+	const XHIGH = chatModel("example", "wide", ["low", "medium", "high", "xhigh"]);
+	const FROZEN = chatModel("example", "frozen", []);
+	const WILD = chatModel("example", "wild", ["low", "turbo"]);
+
 	test("the native picker exposes available chat models without switching the host session", async () => {
-		const picked = {
-			provider: "example",
-			id: "outside",
-			name: "Outside recommendation",
-			kind: "chat",
-			input: ["text"],
-			contextWindow: 64_000,
-			thinking: { efforts: ["low", "high"] },
-			supportsTools: true,
-		};
 		for (const key of ["\r", "\x1b"]) {
 			const host = fakeHost({
 				mode: "tui",
 				hasUI: true,
-				models: [picked, { ...picked, id: "no-tools", name: "No tools", supportsTools: false }],
+				models: [OUTSIDE, { ...OUTSIDE, id: "no-tools", name: "No tools", supportsTools: false }],
 				driveOverlay(view, rows) {
 					expect(view).toBeInstanceOf(ModelPickerComponent);
 					const rendered = rows.join("\n");
 					expect(rendered).toContain("탐색 · 주 모델");
-					expect(rendered).toContain(picked.name);
+					expect(rendered).toContain(OUTSIDE.name);
 					expect(rendered).not.toContain("No tools");
 					view.handleInput?.(key);
 				},
 			});
 			const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델");
-			if (key === "\r") expect(result).toMatchObject({ selector: "example/outside", efforts: ["low", "high"] });
-			else expect(result).toBeUndefined();
+			if (key === "\r") {
+				expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside", efforts: ["minimal", "low", "high"] }) });
+				expect(result).not.toHaveProperty("effort");
+			} else {
+				expect(result).toBeUndefined();
+			}
 			expect(host.overlays).toBe(1);
 			expect(host.selects).toEqual([]);
 			expect(host.sent).toEqual([]);
 		}
+	});
+
+	test("opens on the slot's effort first and updates it in place at 60 columns", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			columns: 60,
+			models: [XHIGH, OUTSIDE, FROZEN],
+			driveOverlay(view, rows) {
+				const status = stripTerminalSequences(rows[1] ?? "");
+				expect(status).toContain("thinking XHigh · 이 역할에만 · 세션 유지 · Auto=기본값");
+				const footer = stripTerminalSequences(rows.at(-2) ?? "");
+				expect(footer).toContain("effort");
+				expect(footer).toContain("공급자");
+				expect(footer).toContain("취소");
+				for (const line of rows) expect(visibleWidth(line)).toBeLessThanOrEqual(60);
+				// XHigh → High: the selected level is what changes first in the status row.
+				view.handleInput?.("\x1b[D");
+				expect(stripTerminalSequences(view.render(60)[1] ?? "")).toContain("thinking High · 이 역할에만 · 세션 유지 · Auto=기본값");
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/wide", effort: "xhigh" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/wide" }), effort: "xhigh" });
+		expect(host.overlays).toBe(1);
+		expect(host.selects).toEqual([]);
+	});
+
+	test("the native sheet seeds the slot model and level, and keeps a refusal on screen", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, OUTSIDE],
+			driveOverlay(view) {
+				const opened = view.describe?.(describeContext(100));
+				expect(opened?.k).toBe("picker");
+				if (opened?.k !== "picker") return;
+				expect(opened.p?.title).toBe("Storm 모델 선택 · 탐색 · 주 모델");
+				expect(opened.p?.subtitle).toContain("Auto=기본값");
+				expect(opened.p?.level?.value).toBe("high");
+				expect(opened.p?.level?.steps.map(step => step.id)).toEqual(["auto", "off", "low", "medium", "high"]);
+
+				// High → Medium → Low → Off: the native sheet stays open with the reason and the alternatives.
+				for (let step = 0; step < 3; step++) view.handleInput?.("\x1b[D");
+				const offSheet = view.describe?.(describeContext(100));
+				expect(offSheet?.k === "picker" ? offSheet.p?.level?.value : undefined).toBe("off");
+				view.handleInput?.("\r");
+				const refused = view.describe?.(describeContext(100));
+				expect(refused?.k === "picker" ? refused.p?.subtitle : undefined).toContain("Off는 Storm effort가 아닙니다");
+				expect(refused?.k === "picker" ? refused.p?.subtitle : undefined).toContain("지원: low, medium, high");
+				expect(refused?.k === "picker" ? refused.p?.level?.value : undefined).toBe("off");
+
+				// The same sheet closes on a supported step.
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "low" });
+
+		// Without picker support the card fallback still says what the keys do and what Auto means.
+		const cardHost = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE],
+			driveOverlay(view) {
+				const cx = { ...describeContext(100), supports: () => false };
+				const card = view.describe?.(cx);
+				expect(card?.k).toBe("card");
+				expect(nativeTexts(card).join("\n")).not.toContain("\u001b");
+				const shown = stripTerminalSequences(nativeTexts(card).join("\n"));
+				expect(shown).toContain("thinking High");
+				expect(shown).toContain("Auto=기본값");
+				expect(shown).toContain("effort");
+				// The card has no level widget, so its status must follow the slider after a step.
+				view.handleInput?.("\x1b[D");
+				const stepped = view.describe?.(cx);
+				expect(stripTerminalSequences(nativeTexts(stepped).join("\n"))).toContain("thinking Med");
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+			},
+		});
+		expect(await createUiPort(cardHost.pi, cardHost.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toMatchObject({
+			effort: "high",
+		});
+	});
+
+	test("a native close action cancels without a pick", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE],
+			driveOverlay(view) {
+				view.handleNativeEvent?.({ type: "action", key: "", act: "close", mods: [] });
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
+		expect(host.sent).toEqual([]);
+	});
+
+	test("same model plus untouched keeps its valid effort, or stays bare when it has none", async () => {
+		const keep = async (current: { selector: string; effort?: "high" | "max" }) => {
+			const host = fakeHost({
+				mode: "tui",
+				hasUI: true,
+				models: [INSIDE, OUTSIDE],
+				driveOverlay(view, rows) {
+					expect(stripTerminalSequences(rows.join("\n"))).toContain(current.effort === "high" ? "thinking High" : "thinking Auto");
+					view.handleInput?.("\r");
+				},
+			});
+			return { host, result: await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", current) };
+		};
+		const withEffort = await keep({ selector: "example/inside", effort: "high" });
+		expect(withEffort.result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "high" });
+		const bare = await keep({ selector: "example/inside" });
+		expect(bare.result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }) });
+		expect(bare.result).not.toHaveProperty("effort");
+		// An effort the slot's model no longer supports is not carried silently; the model default shows instead.
+		const stale = await keep({ selector: "example/inside", effort: "max" });
+		expect(stale.result).not.toHaveProperty("effort");
+	});
+
+	test("cancelling after moving the slider applies nothing and leaves no session artifact", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, OUTSIDE],
+			driveOverlay(view) {
+				// High → Medium, then Esc: the pending effort is not a pick and no onKeepThinking path exists.
+				view.handleInput?.("\x1b[D");
+				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("thinking Med");
+				view.handleInput?.("\x1b");
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
+		expect(host.overlays).toBe(1);
+		expect(host.selects).toEqual([]);
+		expect(host.sent).toEqual([]);
+	});
+
+	test("steps a supported effort on the same model and picks model plus effort in one overlay", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, OUTSIDE],
+			driveOverlay(view, rows) {
+				// High → Medium on the current slot's own ladder.
+				view.handleInput?.("\x1b[D");
+				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("thinking Med");
+				expect(rows.length).toBeGreaterThan(0);
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "medium" });
+		expect(host.overlays).toBe(1);
+		expect(host.selects).toEqual([]);
+	});
+
+	test("a fresh pick follows Auto → Off (refused) → Low → High without leaving the overlay", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE],
+			driveOverlay(view, rows) {
+				const status = () => stripTerminalSequences(view.render(100)[1] ?? "");
+				expect(stripTerminalSequences(rows[1] ?? "")).toContain("thinking Auto");
+				view.handleInput?.("\x1b[C");
+				expect(status()).toContain("thinking Off");
+				view.handleInput?.("\r");
+				expect(status()).toContain("Off는 Storm effort가 아닙니다");
+				view.handleInput?.("\x1b[C");
+				expect(status()).toContain("thinking Low");
+				view.handleInput?.("\x1b[C");
+				expect(status()).toContain("thinking Med");
+				view.handleInput?.("\x1b[C");
+				expect(status()).toContain("thinking High");
+				view.handleInput?.("\r");
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델")).toMatchObject({
+			effort: "high",
+		});
+	});
+
+	test("an untouched new model starts at its own default instead of the slot's effort", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, OUTSIDE],
+			driveOverlay(view) {
+				view.handleInput?.("outside");
+				const shown = stripTerminalSequences(view.render(100).join("\n"));
+				expect(shown).toContain("outside display");
+				expect(shown).toContain("thinking Auto");
+				expect(shown).not.toContain("thinking High");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside" }) });
+		expect(result).not.toHaveProperty("effort");
+	});
+
+	test("a carried slider step lands on the new model's exact supported effort, not the slot's", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, OUTSIDE],
+			driveOverlay(view) {
+				// High → Medium on the slot's ladder, then a model whose ladder has no medium.
+				view.handleInput?.("\x1b[D");
+				view.handleInput?.("outside");
+				const shown = stripTerminalSequences(view.render(100).join("\n"));
+				expect(shown).toContain("thinking Low");
+				expect(shown).not.toContain("thinking Med");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside" }), effort: "low" });
+	});
+
+	test("Auto means the model default, explained on screen and stored as a bare pick", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE],
+			driveOverlay(view) {
+				// High → Medium → Low → Off → Auto.
+				for (let step = 0; step < 4; step++) view.handleInput?.("\x1b[D");
+				const shown = stripTerminalSequences(view.render(100).join("\n"));
+				expect(shown).toContain("thinking Auto");
+				expect(shown).toContain("Auto=기본값");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }) });
+		expect(result).not.toHaveProperty("effort");
+	});
+
+	test("Off and an unknown ladder entry keep the picker open with the supported efforts listed", async () => {
+		const off = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE],
+			driveOverlay(view) {
+				// High → Medium → Low → Off; Off is not a Storm effort.
+				for (let step = 0; step < 3; step++) view.handleInput?.("\x1b[D");
+				view.handleInput?.("\r");
+				const refused = stripTerminalSequences(view.render(100).join("\n"));
+				expect(refused).toContain("Off는 Storm effort가 아닙니다");
+				expect(refused).toContain("지원: low, medium, high");
+				// Off → Low, then pick the supported effort.
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+			},
+		});
+		expect(await createUiPort(off.pi, off.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toMatchObject({
+			effort: "low",
+		});
+
+		const unknown = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [WILD],
+			driveOverlay(view) {
+				// Low → Turbo: the catalog declares it, Storm has no such effort.
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+				const refused = stripTerminalSequences(view.render(100).join("\n"));
+				expect(refused).toContain("turbo는 이 모델에서 지원되지 않습니다");
+				expect(refused).toContain("지원: low");
+				view.handleInput?.("\x1b[D");
+				view.handleInput?.("\r");
+			},
+		});
+		expect(await createUiPort(unknown.pi, unknown.ctx).pickModel!("탐색 · 주 모델", { selector: "example/wild", effort: "low" })).toMatchObject({
+			effort: "low",
+		});
+	});
+
+	test("a model with no effort control picks bare and keeps the frozen reason visible", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			models: [INSIDE, FROZEN],
+			driveOverlay(view) {
+				view.handleInput?.("frozen");
+				const shown = stripTerminalSequences(view.render(100).join("\n"));
+				expect(shown).toContain("frozen display");
+				expect(shown).toContain("no thinking");
+				view.handleInput?.("\x1b[C");
+				view.handleInput?.("\r");
+			},
+		});
+		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
+		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/frozen", efforts: [] }) });
+		expect(result).not.toHaveProperty("effort");
+	});
+
+	test("an empty catalog still draws and Esc cancels without a pick", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			columns: 60,
+			models: [],
+			driveOverlay(view, rows) {
+				expect(stripTerminalSequences(rows.join("\n"))).toContain("No models available");
+				view.handleInput?.("\x1b");
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
+		expect(host.sent).toEqual([]);
 	});
 
 	test("a choice's context is a panel above the selector that leaves nothing behind", async () => {

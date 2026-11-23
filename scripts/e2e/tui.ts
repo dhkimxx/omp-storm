@@ -25,6 +25,8 @@ import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml,
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
 const PICK_BY_ROLE = "역할별로 고르기";
+const DIRECT_MODEL = "모델·effort 수정";
+const CONTINUE_EDITING = "계속 수정";
 const FULL_VIEW = "전체 내용 보기";
 /** Key hints of Storm's report overlay, which Enter closes. */
 const OVERLAY_HINT = "PgDn";
@@ -91,8 +93,8 @@ function idleFooter(line: string | undefined): boolean {
 	});
 }
 
-async function session<T>(body: (tui: Tui) => Promise<T>): Promise<T> {
-	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"] });
+async function session<T>(body: (tui: Tui) => Promise<T>, model = "fake/general-b", flags: string[] = []): Promise<T> {
+	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags] });
 	try {
 		await tui.ready();
 		return await body(tui);
@@ -124,6 +126,32 @@ async function answer(tui: Tui, from: number, label: string): Promise<number> {
 		mark = tui.send(KEY.enter);
 	}
 	throw new Error(`the dialog never offered ${label}`);
+}
+
+/** The selected native effort is in the picker header, not in a later Ask form. */
+const pickerLevel = (text: string): string | undefined =>
+	[...text.matchAll(/\b(?:thinking|effort)[: ]+\s*(Auto|Off|Min|Low|Med|High|XHigh|Max)\b/gi)].at(-1)?.[1]?.toLowerCase();
+
+async function stepEffort(tui: Tui, level: string): Promise<void> {
+	await tui.press(KEY.right, painted => pickerLevel(painted) === level, `the picker to show effort ${level}`, 10_000);
+}
+
+/** A replaced selector's unchanged footer may be absent from the PTY delta. The rows themselves are enough to pick. */
+async function openExplorerPrimary(tui: Tui, from: number): Promise<number> {
+	const slot = "탐색 · 주 모델";
+	const options = await tui.seen(
+		from,
+		text => {
+			const start = text.indexOf("바꿀 모델 슬롯을 고르세요");
+			if (start < 0) return undefined;
+			const rows = [...text.slice(start).matchAll(/^│ +(?:❯ +)?([^│\n]+?) +│/gm)].map(match => match[1]!.trim()).filter(Boolean);
+			const end = rows.indexOf(slot);
+			return end >= 0 ? rows.slice(0, end + 1) : undefined;
+		},
+		"the slot menu to list the explorer's primary model",
+		15_000,
+	);
+	return tui.pick(options, slot);
 }
 
 /** A key typed into the focused field of a form, and the repaint that shows omp took it. */
@@ -260,17 +288,23 @@ async function main(): Promise<void> {
 	linkPlugin(env);
 
 	await suite.step(
-		"setup: the dialog, approve",
+		"setup: edit the first recommendation, then approve",
 		async () => {
 			const llm = new LlmCursor(env);
 			await session(async tui => {
 				const typed = await tui.submit("/storm");
 				const offered = await tui.selector(typed);
-				check("the dialog is up and nothing is saved yet", offered.includes(PICK_BY_ROLE) && !existsSync(files.configFile), JSON.stringify(offered));
+				check("the first team offers direct model editing before anything is saved", offered.includes(PICK_BY_ROLE) && offered.includes(DIRECT_MODEL) && !existsSync(files.configFile), JSON.stringify(offered));
 				if (offered.includes(FULL_VIEW)) check("a clipped proposal withholds approval", !offered.includes(APPROVE));
+				const slots = await tui.pick(offered, DIRECT_MODEL);
+				const opened = await openExplorerPrimary(tui, slots);
+				await tui.shows("Storm 모델 선택", opened, 15_000);
+				const review = tui.send(KEY.enter);
+				await tui.selector(review);
+				check("picking a slot in setup still requires approval", !existsSync(files.configFile));
 				// `answer` opens the full view when the panel is cut, so the disclosure is on screen either way.
-				const approved = await answer(tui, typed, APPROVE);
-				check("the approval panel discloses that approval turns automatic delegation on", tui.text(typed).includes(TURNS_AUTO_ON), tui.text(typed).slice(-400));
+				const approved = await answer(tui, review, APPROVE);
+				check("the edited proposal still discloses that approval turns automatic delegation on", tui.text(review).includes(TURNS_AUTO_ON), tui.text(review).slice(-400));
 				// Storm writes the approval and the config, then the personal choice the approval now implies.
 				await suite.eventually("approve saves the config and one approval", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
 				const store = files.storeDir();
@@ -316,8 +350,11 @@ async function main(): Promise<void> {
 						await tui.shows("Storm 모델 선택", mark);
 						mark = await submitForm(tui, tui.send("\x1b"), agent, 4);
 						await tui.shows("Storm 모델 선택", mark);
-						await tui.press(OUTSIDE, text => text.includes(OUTSIDE), "the native picker to find the outside model");
-						mark = await submitForm(tui, tui.send(KEY.enter), `fake/${OUTSIDE}`, 1, { 0: [option("l", "low")] });
+						await tui.press(OUTSIDE, text => text.includes(OUTSIDE) && pickerLevel(text) === "auto", "the native picker to find the outside model at its default");
+						await stepEffort(tui, "off");
+						await tui.press(KEY.enter, text => text.includes("Off는 Storm effort가 아닙니다"), "Off to be refused without leaving the native picker");
+						await stepEffort(tui, "low");
+						mark = tui.send(KEY.enter);
 					}
 					for (const [index, model] of models.entries()) {
 						if ((explorer && index === 0) || model.effort === undefined) continue;
@@ -348,6 +385,49 @@ async function main(): Promise<void> {
 		},
 		240_000,
 	);
+
+	await suite.step("one approved Storm slot can change effort without walking the interview", async () => {
+		await session(async tui => {
+			const before = files.config();
+			const approvals = files.approvals().length;
+			const bytes = files.configBytes();
+			const llm = new LlmCursor(env);
+			const chooseDirect = await answer(tui, await tui.submit("/storm"), DIRECT_MODEL);
+			const openSlot = async (from: number, level: string): Promise<void> => {
+				const opened = await openExplorerPrimary(tui, from);
+				await tui.seen(
+					opened,
+					text => (text.includes("Storm 모델 선택") && text.includes(OUTSIDE) && pickerLevel(text) === level ? true : undefined),
+					`the same model to be initially selected at ${level}`,
+					15_000,
+				);
+			};
+			await openSlot(chooseDirect, "low");
+			await stepEffort(tui, "high");
+			const cancelled = tui.send("\x1b");
+			await openSlot(cancelled, "low");
+			check("Escape returns to slot selection without writing the pending effort", files.configBytes() === bytes && files.approvals().length === approvals);
+			await stepEffort(tui, "high");
+			const firstDiff = tui.send(KEY.enter);
+			const continued = await answer(tui, firstDiff, CONTINUE_EDITING);
+			const diff = tui.text(firstDiff);
+			check("the approval shows the old and new effort even though the model name did not change", diff.includes(`${OUTSIDE}:low`) && diff.includes(`${OUTSIDE}:high`));
+			await openSlot(continued, "high");
+			check("the in-memory draft keeps high while the approved file still has low", files.configBytes() === bytes);
+			await answer(tui, tui.send(KEY.enter), APPROVE);
+			await suite.eventually(
+				"the one-slot effort is saved only after approval",
+				() => files.config().roles.explorer?.models[0] === `fake/${OUTSIDE}:high` && files.approvals().length === approvals + 1,
+			);
+			const expected = structuredClone(before);
+			expected.roles.explorer!.models[0] = `fake/${OUTSIDE}:high`;
+			check("the other slots, roles and policies stay unchanged", JSON.stringify(files.config()) === JSON.stringify(expected));
+			check("partial editing makes no model call", mains(llm.all()).length === 0);
+			await tui.submit("Hello. No repository task.");
+			const main = await until(() => mains(llm.all())[0], 15_000, "the next main provider request");
+			check("the native picker never changed the main OMP model or effort", main.model === OUTSIDE && main.effort === "low", JSON.stringify(main));
+		}, `fake/${OUTSIDE}`, ["--thinking", "low"]);
+	}, 180_000);
 
 	await suite.step(
 		"a plain request ends without changes",

@@ -8,8 +8,9 @@ import { estimateRows } from "@oh-my-pi/pi-tui/native/measure";
 import type { DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import type { ModelBrowserSource } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { type ModelPickerRegistry, ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { toModelInfo } from "./discovery/models.ts";
-import type { InfoLine, ModelInfo, UiPort } from "./types.ts";
+import { EFFORTS, type Effort, type InfoLine, type ModelInfo, type StormModelPick, type UiPort } from "./types.ts";
 import { infoSymbol, infoSections, RichFrame } from "./view/info.ts";
 
 const REPORT_TYPE = "storm-report";
@@ -334,7 +335,7 @@ class ReportView implements Component {
 	}
 }
 
-const STORM_PICKER_STATUS = "이 Storm 역할에만 적용 · 현재 세션 모델은 변경하지 않음";
+const STORM_PICKER_STATUS = "이 역할에만 · 세션 유지 · Auto=기본값";
 const STORM_PICKER_SOURCE: ModelBrowserSource = {
 	revision: 0,
 	defaultThinkingLevel: "off",
@@ -348,52 +349,171 @@ const STORM_PICKER_SOURCE: ModelBrowserSource = {
 	resolveRoleValue: () => ({ model: undefined, explicitThinkingLevel: false }),
 };
 
+const isStormEffort = (value: string): value is Effort => (EFFORTS as readonly string[]).includes(value);
+
+/** The picker slider's structured state: the step it shows, or why it is frozen. */
+interface PickerLevel {
+	value: string;
+	label: string;
+	disabled?: string | true;
+}
+
+/** Read the active slider step from the picker's structured description, not from ANSI rows. */
+function activeLevel(node: NativeNode | undefined): PickerLevel | undefined {
+	if (node?.k !== "picker") return undefined;
+	const level = node.p?.level;
+	if (!level) return undefined;
+	const label = level.steps.find(step => step.id === level.value)?.label ?? level.value;
+	return level.disabled ? { value: level.value, label, disabled: level.disabled } : { value: level.value, label };
+}
+
 /** The host picker owns the search, provider scopes, list and preview; replace only the session-switch chrome. */
 class StormModelPicker extends ModelPickerComponent {
-	#description: { source: NativeNode; node: NativeNode } | undefined;
+	#description: { source: NativeNode; refusal: string | undefined; level: string | undefined; node: NativeNode } | undefined;
+	#refusal: string | undefined;
 	readonly #catalogError: boolean;
 
 	constructor(
-		tui: TUI,
+		private readonly tui: TUI,
 		private readonly title: string,
 		registry: ModelPickerRegistry,
+		current: { selector: string; effort?: Effort } | undefined,
 		private readonly cancel: () => void,
-		pick: (model: ModelInfo | undefined) => void,
+		pick: (pick: StormModelPick | undefined) => void,
 	) {
-		super(tui, STORM_PICKER_SOURCE, registry, [], {
-			onPick: raw => pick(toModelInfo(raw, true)),
-			onCancel: cancel,
-		});
+		super(
+			tui,
+			STORM_PICKER_SOURCE,
+			registry,
+			[],
+			{
+				onPick: (raw, _selector, meta) => {
+					const info = toModelInfo(raw, true);
+					if (info === undefined) return;
+					const effort = meta.thinkingLevel;
+					if (effort === undefined) {
+						// Untouched: carry the slot's effort only when the same model still supports it; a new model is bare.
+						const kept =
+							current !== undefined &&
+							current.selector === info.selector &&
+							current.effort !== undefined &&
+							info.efforts.includes(current.effort)
+								? current.effort
+								: undefined;
+						pick(kept === undefined ? { model: info } : { model: info, effort: kept });
+						return;
+					}
+					// Auto is the model's own default in Storm, stored as a bare selector; the status line says so.
+					if (effort === "auto") {
+						pick({ model: info });
+						return;
+					}
+					// Off is not a Storm effort, and neither is a ladder entry Storm does not know: keep the picker open.
+					if (!isStormEffort(effort) || !info.efforts.includes(effort)) {
+						this.#refuse(effort, info);
+						return;
+					}
+					pick({ model: info, effort });
+				},
+				onCancel: cancel,
+			},
+			{
+				...(current === undefined ? {} : { currentSelector: current.selector }),
+				// The slot's own known effort shows as itself; every other model (and a bare slot) shows Auto, which
+				// the status line defines as this model's own default: an untouched pick then stays a bare selector.
+				thinkingLevelFor: model => {
+					if (current === undefined) return "auto";
+					const info = toModelInfo(model, true);
+					if (info?.selector !== current.selector) return "auto";
+					return current.effort !== undefined && info.efforts.includes(current.effort)
+						? (current.effort as ConfiguredThinkingLevel)
+						: "auto";
+				},
+			},
+		);
 		this.#catalogError = Boolean(registry.getError());
+	}
+
+	#refuse(effort: string, info: ModelInfo): void {
+		const supported = info.efforts.length > 0 ? info.efforts.join(", ") : "없음";
+		// Reason and alternatives first: at 60 columns the row has no room for the Auto definition too.
+		this.#refusal =
+			effort === "off"
+				? `Off는 Storm effort가 아닙니다 · 지원: ${supported}`
+				: `${effort}는 이 모델에서 지원되지 않습니다 · 지원: ${supported}`;
+		this.tui.requestRender();
+	}
+
+	/** The slider the picker is showing now; the picker is always described as a picker, whatever the host draws. */
+	#level(): PickerLevel | undefined {
+		return activeLevel(super.describe(NATIVE_CX));
+	}
+
+	/** The selected level leads when normal; a refusal leads when it must stay readable at 60 columns. */
+	#status(level: PickerLevel | undefined): string {
+		const status = theme.fg(this.#refusal === undefined ? "muted" : "warning", this.#refusal ?? STORM_PICKER_STATUS);
+		if (level === undefined) return status;
+		const shown = level.disabled
+			? theme.fg("dim", "no thinking")
+			: `${theme.fg("muted", "thinking ")}${theme.getThinkingBorderColor(level.value)(level.label)}`;
+		return this.#refusal === undefined ? `${shown} · ${status}` : `${status} · ${shown}`;
+	}
+
+	/** The card fallback draws native text, so its status stays plain instead of carrying terminal escapes. */
+	#plainStatus(level: PickerLevel | undefined): string {
+		const status = this.#refusal ?? STORM_PICKER_STATUS;
+		const shown = level === undefined ? undefined : level.disabled ? "no thinking" : `thinking ${level.label}`;
+		if (shown === undefined) return status;
+		return this.#refusal === undefined ? `${shown} · ${status}` : `${status} · ${shown}`;
 	}
 
 	#hints(): string {
 		const move = editorKeys("tui.select.up", "tui.select.down");
-		return `${move} 이동 · ${formatKeyHint("enter")} 선택 · ${formatKeyHint("tab")} 공급자 · ${formatKeyHint("escape")} 취소`;
+		// The native picker binds plain ←/→ to its slider; Alt+←/→ stay with the search for word jumps.
+		const effort = `${formatKeyHint("left")}/${formatKeyHint("right")} effort`;
+		return `${move} 이동 · ${formatKeyHint("enter")} 선택 · ${formatKeyHint("tab")} 공급자 · ${effort} · ${formatKeyHint("escape")} 취소`;
 	}
 
 	override handleInput(data: string): void {
 		// Leave the interview step, rather than clearing the search on the first Esc as Alt+P does.
-		if (matchesKey(data, "escape")) this.cancel();
-		else super.handleInput(data);
+		if (matchesKey(data, "escape")) {
+			this.cancel();
+			return;
+		}
+		// A changed highlight or slider step may make the previous refusal moot.
+		this.#refusal = undefined;
+		super.handleInput(data);
 	}
 
 	override handleNativeEvent(event: NativeUiEvent): void {
-		if (event.type === "action" && event.key === "" && event.act === "close") this.cancel();
-		else super.handleNativeEvent(event);
+		if (event.type === "action" && event.key === "" && event.act === "close") {
+			this.cancel();
+			return;
+		}
+		this.#refusal = undefined;
+		super.handleNativeEvent(event);
 	}
 
 	override render(width: number): string[] {
 		const rows = super.render(width).slice();
 		rows[0] = topBorder(width, this.title);
-		if (!this.#catalogError) rows[1] = row(theme.fg("muted", STORM_PICKER_STATUS), width);
+		if (!this.#catalogError) {
+			// The stock picker carries the selected level only in its status row; read it structurally and keep it.
+			rows[1] = row(this.#status(this.#level()), width);
+		}
 		rows[rows.length - 2] = row(theme.fg("dim", this.#hints()), width);
 		return rows;
 	}
 
 	override describe(cx?: DescribeContext): NativeNode {
 		const source = super.describe(cx);
-		if (this.#description?.source === source) return this.#description.node;
+		// The card fallback has no level widget of its own, so its status carries the same structured step.
+		const cardLevel = source.k === "card" ? this.#level() : undefined;
+		const cardKey =
+			cardLevel === undefined ? undefined : `${cardLevel.value}\0${cardLevel.label}\0${String(cardLevel.disabled ?? "")}`;
+		if (this.#description?.source === source && this.#description.refusal === this.#refusal && this.#description.level === cardKey) {
+			return this.#description.node;
+		}
 		let node = source;
 		if (source.k === "picker") {
 			node = {
@@ -402,7 +522,7 @@ class StormModelPicker extends ModelPickerComponent {
 					...source.p,
 					search: "head",
 					title: this.title,
-					subtitle: source.p?.subtitle ?? STORM_PICKER_STATUS,
+					subtitle: this.#refusal ?? source.p?.subtitle ?? STORM_PICKER_STATUS,
 					placeholder: "모델 검색…",
 				},
 			};
@@ -411,13 +531,13 @@ class StormModelPicker extends ModelPickerComponent {
 				...source,
 				p: { ...source.p, head: this.title },
 				c: [
-					this.#catalogError ? source.c[0] : text(STORM_PICKER_STATUS),
+					this.#catalogError ? source.c[0] : text(this.#plainStatus(cardLevel)),
 					...source.c.slice(1, -1),
 					text(this.#hints()),
 				],
 			};
 		}
-		this.#description = { source, node };
+		this.#description = { source, refusal: this.#refusal, level: cardKey, node };
 		return node;
 	}
 }
@@ -511,13 +631,14 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 		record: transcript,
 		...(drawsComponents
 			? {
-					pickModel: (title: string) =>
-						ctx.ui.custom<ModelInfo | undefined>(
+					pickModel: (title: string, current?: { selector: string; effort?: Effort }) =>
+						ctx.ui.custom<StormModelPick | undefined>(
 							(tui, _theme, _keys, done) =>
 								new StormModelPicker(
 									tui,
 									`Storm 모델 선택 · ${title}`,
 									modelPickerRegistry(ctx.modelRegistry),
+									current,
 									() => done(undefined),
 									done,
 								),

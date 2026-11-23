@@ -579,7 +579,7 @@ export default function storm(pi: ExtensionAPI): void {
 			...ui,
 			select: (title, options, context) => around(() => ui.select(title, options, context)),
 			...(form === undefined ? {} : { form: (html: string) => around(() => form(html)) }),
-			...(pickModel === undefined ? {} : { pickModel: (title: string) => around(() => pickModel(title)) }),
+			...(pickModel === undefined ? {} : { pickModel: (title: string, current?: Parameters<NonNullable<UiPort["pickModel"]>>[1]) => around(() => pickModel(title, current)) }),
 		};
 	};
 
