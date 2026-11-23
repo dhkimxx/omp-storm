@@ -33,8 +33,19 @@ import type {
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import {
+	CLOSEOUT_CHOICE_HINT,
+	CLOSEOUT_TITLE,
+	closeoutCard,
+	type CloseoutDraft,
+	closeoutSessionId,
+	isSubstantiveRun,
+	parseCloseout,
+	rememberCloseoutReport,
+	resetCloseoutChoices,
+} from "./closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
-import { RunLanes } from "./lanes.ts";
+import { replanConflict, RunLanes } from "./lanes.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
@@ -183,6 +194,8 @@ interface OwnRun {
 	repoId: string;
 	/** The session that directs the run: live record writes happen without a ctx of their own. */
 	ctx: ExtensionContext;
+	/** Snapshot at admission: the host may mutate the session manager when it switches conversations. */
+	readonly sessionId: string | undefined;
 	/** The approved config the run started under. */
 	config: StormConfig;
 	/** Approval records of the repo: the run-end janitor keeps them within their limits. */
@@ -199,6 +212,8 @@ interface OwnRun {
 	checking?: string;
 	/** The compact evidence of the latest check report, written with every live and final record. */
 	checkEvidence?: RunCheckEvidence[];
+	/** The last valid closeout brief submitted for this run; the final record only, never a status change. */
+	closeout?: CloseoutDraft;
 	/** The context of the first stop, reused when the run finalizes after a deferred drain. */
 	finishCtx?: ExtensionContext;
 	/** A stopping run's detached recheck timer; it never blocks a shutdown or an agent_end handler. */
@@ -530,6 +545,7 @@ export class RunController {
 				root,
 				repoId: state.repo.repoId,
 				ctx,
+				sessionId: closeoutSessionId(ctx),
 				config,
 				store: state.store,
 				lanes: new RunLanes(runId),
@@ -844,12 +860,36 @@ export class RunController {
 	setPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string } {
 		const own = this.#own;
 		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 계획을 저장하지 않았습니다." };
+		// A lane keeps the identity its evidence is bound to: goal, kind, role and files. A status update belongs in
+		// progress; renaming a changed lane is the only way to start its evidence over. Reject before touching the plan
+		// in force or the record, so a refused replan leaves both exactly as they were.
+		const conflict = replanConflict(own.record.plan, plan);
+		if (conflict !== undefined) return { ok: false, reason: conflict };
 		// A stopping run blocks new spawns; its plan is no longer authority for them.
 		if (!setLedgerPlan(own.record.runId, plan)) {
 			return { ok: false, reason: "실행이 끝나는 중이라 계획을 적용하지 않았습니다." };
 		}
 		own.record.plan = plan;
 		this.#scheduleFlush(own);
+		return { ok: true };
+	}
+
+	/**
+	 * Stages the director's closeout brief for this session's run. It is presentation data only: no status, review,
+	 * stop or start is touched and no transcript record is written here. A later valid submission replaces it; the
+	 * final record keeps exactly the last one.
+	 */
+	submitCloseout(draft: CloseoutDraft): { ok: true } | { ok: false; reason: string } {
+		const own = this.#own;
+		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 결과 브리프를 저장하지 않았습니다." };
+		const parsed = parseCloseout(draft);
+		if (parsed === undefined) {
+			return {
+				ok: false,
+				reason: "결과 브리프가 올바르지 않습니다. 결과·검증은 비어 있지 않은 한 줄, next는 서로 다른 세 방향이어야 합니다.",
+			};
+		}
+		own.closeout = parsed;
 		return { ok: true };
 	}
 
@@ -1434,11 +1474,14 @@ export class RunController {
 		liveWriters.delete(own.record.runId);
 		const ledger = endLedgerRun(own.record.runId);
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
-		spawnsByRun.delete(own.record.runId);
-		clearRunReads(own.record.runId);
 		const seen = this.deps.agents?.(own.record.runId) ?? [];
 		// A team with doc consistency off asked for no doc findings, so none are counted.
 		const agents = docsEnabled(own.config) ? seen : seen.map(withoutDocFindings);
+		// Read while the run's spawn map still binds its failed ids: a lane is pending only from authoritative state.
+		const pendingLanes =
+			own.record.plan === undefined ? [] : own.lanes.remaining(own.record.plan, agents, this.#failedIds(own, agents));
+		spawnsByRun.delete(own.record.runId);
+		clearRunReads(own.record.runId);
 		const record: RunRecord = {
 			...own.record,
 			endedAt: iso(this.deps.now()),
@@ -1448,8 +1491,13 @@ export class RunController {
 			costByModel: { ...(ledger?.costByModel ?? own.record.costByModel) },
 			spawns,
 			...(agents.length ? { agents } : {}),
+			...(own.closeout !== undefined ? { closeout: own.closeout } : {}),
 		};
 		if (own.checkEvidence?.length) record.checks = own.checkEvidence;
+		// A routine probe keeps the existing quiet/summary behavior. Real work gets one card, and only that card: the
+		// routine summary below is skipped for it so the transcript never carries both.
+		const requiredChecks = own.config.requiredChecks?.map(check => check.name) ?? [];
+		const card = isSubstantiveRun(record) ? closeoutCard(record, pendingLanes, requiredChecks) : undefined;
 		try {
 			await this.#liveWrite;
 			// Only runs this machine recorded are ever cleaned later: run records in the repo are not trusted for paths.
@@ -1472,16 +1520,32 @@ export class RunController {
 			await pruneRuns(own.root, RUN_KEEP, protect);
 			if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now());
 			// An automatic probe stays out of the main transcript while it is routine; a blocked spawn is not routine, and
-			// the live status line already carried the rest.
+			// the live status line already carried the rest. The substantive card waits for the lease release below.
 			const quietAuto =
+				card === undefined &&
 				own.auto === true &&
 				(record.endReason === "no-changes" || record.endReason === "verified") &&
 				!record.spawns.some(spawn => spawn.outcome === "blocked");
-			if (ctx && !quietAuto) this.deps.ui(ctx).record("Storm 실행 결과", summarizeRun(record));
-			return record;
+			if (ctx && card === undefined && !quietAuto) this.deps.ui(ctx).record(CLOSEOUT_TITLE, summarizeRun(record));
 		} finally {
 			if (own.lease !== undefined) await this.#releaseLease(own.lease, ctx);
 		}
+		// The transcript card is the last word of a settled run: the record is on disk and no lease is held. A shutdown
+		// (or a switch, which ends as one) opens no new UI: the transcript it belonged to is already gone. A stable
+		// identity that differs from the one that directed the run is the same case even when the reason was not shutdown.
+		const showingSession = ctx === undefined ? undefined : closeoutSessionId(ctx);
+		const sameSession = own.sessionId === showingSession;
+		if (ctx !== undefined && reason !== "shutdown" && sameSession && card !== undefined) {
+			const registered = rememberCloseoutReport(ctx, record.runId, card.options);
+			const hint = ctx.mode === "tui" && registered ? `\n\n${CLOSEOUT_CHOICE_HINT}` : "";
+			try {
+				this.deps.ui(ctx).record(CLOSEOUT_TITLE, `${card.text}${hint}`);
+			} catch (error) {
+				if (registered) resetCloseoutChoices(ctx);
+				throw error;
+			}
+		}
+		return record;
 	}
 
 	/** Releases the execution slot, surfacing a failed release instead of silently leaving it to a later owner. */

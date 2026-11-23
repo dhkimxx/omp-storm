@@ -446,6 +446,58 @@ async function main(): Promise<void> {
 		240_000,
 	);
 
+	await suite.step("a substantial automatic run hands back three choices without starting another run", async () => {
+		const llm = new LlmCursor(env);
+		await session(async tui => {
+			const scope = { name: "scope", kind: "explore", goal: "Locate the first input boundary" };
+			const compare = { name: "compare", kind: "code", goal: "Compare the current evidence without changing files" };
+			const setPlan = (...lanes: Array<typeof scope & { progress?: string }>): Step => ({ storm: { action: "plan", plan: { lanes } } });
+			const chosen = `E2E-NEXT E2E-STEPS ${b64([plan("probe", "explore"), { task: ["storm-explorer"], as: "probe" }])}`;
+			const brief = {
+				result: "E2E-BRIEF-RESULT: the current comparison has one unresolved boundary.",
+				verification: "E2E-BRIEF-EVIDENCE: two local records were compared.",
+				remaining: "E2E-BRIEF-REMAINING: device latency was not measured.",
+				next: [chosen, "Compare the missing boundary offline", "Document the limits and stop"],
+			};
+			const steps: Step[] = [
+				setPlan(scope),
+				{ task: ["storm-explorer"], as: "scope" },
+				{ wait: true },
+				setPlan({ ...scope, goal: "Located the first input boundary (완료)" }, compare),
+				setPlan({ ...scope, progress: "Located the first input boundary (완료)" }, compare),
+				{ task: ["storm-implementer"], as: "compare" },
+				{ wait: true },
+				{ storm: { action: "brief", brief } },
+			];
+			const before = files.runIds();
+			const started = await tui.submit(`E2E-STEPS ${b64(steps)}`);
+			const run = await files.finishedRun(before, 60_000);
+			await tui.seen(started, text =>
+				text.includes("E2E-BRIEF-RESULT") && text.includes("E2E-BRIEF-REMAINING") && text.includes("Document the limits and stop")
+					? true : undefined,
+				"the settled closeout with all three next directions", 20_000);
+			const shown = tui.text(started);
+			check("automatic investigation reports the outcome once with option 1 recommended", shown.match(/E2E-BRIEF-RESULT/g)?.length === 1 && /추천[^\n]*E2E-NEXT/u.test(shown));
+			check(
+				"updating progress preserves real completed coverage even though a changed goal was refused",
+				run.endReason === "no-changes" && run.turns === 1 && run.spawns.filter(spawn => spawn.outcome === "routed").length === 2 &&
+					run.plan?.lanes[0]?.goal === scope.goal && run.plan?.lanes[0]?.progress?.includes("(완료)") === true,
+				`${run.status}/${run.endReason} in ${run.turns} turns`,
+			);
+			check("the director was told to leave an assigned goal alone", mains(llm.all()).some(entry => entry.lastTool.includes("계획 레인 'scope'") && entry.lastTool.includes("progress")));
+			check("briefing itself neither starts a run nor uses a classifier", files.runIds().size === before.size + 1 && llm.of("route").length === 0);
+			const withCompleted = files.runIds();
+			const selected = await tui.submit("1");
+			const next = await files.finishedRun(withCompleted, 60_000);
+			check("the chosen direction starts one new authorized Storm run", next.runId !== run.runId && next.task.startsWith("E2E-NEXT") && next.spawns.some(spawn => spawn.outcome === "routed"));
+			const after = files.runIds().size;
+			const ordinary = new LlmCursor(env);
+			await tui.submit("1");
+			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 15_000, "an ordinary number after the one-shot choice");
+			check("the routine follow-up asks no question and does not reopen the choices", !tui.text(selected).includes("다음으로 무엇을 할까요?") && files.runIds().size === after);
+		});
+	}, 180_000);
+
 	await suite.step(
 		"a native ask pauses the run and its answer resumes it",
 		async () => {
@@ -565,13 +617,17 @@ async function main(): Promise<void> {
 						() => "",
 						30_000,
 					);
-					await tui.seen(
+					const verifying = await tui.seen(
 						started,
-						text => (phaseRow(text, "verifying") !== undefined ? true : undefined),
+						text => (phaseRow(text, "verifying") !== undefined ? text : undefined),
 						"the verifying phase while the real required check runs",
 						120_000,
 					);
+					check("verification still in flight does not display the final brief", !verifying.includes("다음으로 무엇을 할까요?"));
 					const run = await files.finishedRun(before, 240_000);
+					await tui.shows("다음으로 무엇을 할까요?", started, 20_000);
+					const completed = tui.text(started);
+					check("the fallback brief names the actual verified result and check", completed.includes("상태(공식): 완료") && completed.includes("e2e-verify-hold passed(0)"));
 					await suite.eventually(
 						"the status line returns to idle after the run",
 						() => idleFooter(statusLine(tui.raw)),

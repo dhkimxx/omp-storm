@@ -867,7 +867,7 @@ async function main(): Promise<void> {
 		await session(cancelAll, async rpc => {
 			let frames = await rpc.turn('E2E-TOOL {"action":"status"}');
 			const offered = mains(llm.all())[0]?.stormTool;
-			check("the tool offers run, plan, status, agents", same(offered?.actions, ["run", "plan", "status", "agents"]), JSON.stringify(offered?.actions));
+			check("the tool offers the staged brief as well as run, plan, status and agents", same(offered?.actions, ["run", "plan", "brief", "status", "agents"]), JSON.stringify(offered?.actions));
 			check("its description stays within 900 chars", (offered?.descriptionChars ?? 0) > 0 && (offered?.descriptionChars ?? 0) <= 900, `chars=${offered?.descriptionChars}`);
 			check("status: ok", same(toolOutcomes(frames), [{ action: "status", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
 			frames = await rpc.turn('E2E-TOOL {"action":"agents"}');

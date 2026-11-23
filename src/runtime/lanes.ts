@@ -11,9 +11,39 @@ type TaskBinding = { ok: true; input: Record<string, unknown> } | { ok: false; r
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
-/** An old worker can still complete an unchanged lane, but not one whose goal or file scope changed. */
+/** Write scope compares as a set of paths, matching the validator's duplicate-tolerant collision check. */
+function normalizeFiles(lane: PlanLane): string[] {
+	return [...new Set(lane.files ?? [])].sort();
+}
+
+/**
+ * An old worker can still complete an unchanged lane, but not one whose goal or file scope changed. `progress` is
+ * status text, never identity: it neither grants proof nor drops the proof already earned.
+ */
 function key(lane: PlanLane): string {
-	return JSON.stringify([lane.name, lane.kind, lane.role, lane.goal ?? "", [...(lane.files ?? [])].sort()]);
+	return JSON.stringify([lane.name, lane.kind, lane.role, (lane.goal ?? "").trim(), normalizeFiles(lane)]);
+}
+
+/**
+ * Why a replan is not the same plan, if a lane keeps its name but changes the identity its evidence is bound to.
+ * A status update belongs in `progress`; an actual change needs a new lane name. Removing lanes is allowed, and a
+ * new name starts with no evidence.
+ */
+export function replanConflict(previous: RunPlan | undefined, next: RunPlan): string | undefined {
+	if (!previous) return undefined;
+	const before = new Map(previous.lanes.map(lane => [lane.name, lane]));
+	for (const lane of next.lanes) {
+		const old = before.get(lane.name);
+		if (!old) continue;
+		const changed: string[] = [];
+		if ((old.goal ?? "").trim() !== (lane.goal ?? "").trim()) changed.push("goal");
+		if (old.kind !== lane.kind) changed.push("kind");
+		if (old.role !== lane.role) changed.push("role");
+		if (JSON.stringify(normalizeFiles(old)) !== JSON.stringify(normalizeFiles(lane))) changed.push("files");
+		if (changed.length === 0) continue;
+		return `계획 레인 '${lane.name}'의 ${changed.join(", ")} 항목이 바뀌었습니다. 진행 상태는 progress에 적고, 실제 변경은 새 레인 이름으로 내세요. 같은 이름으로 기존 증거를 조용히 덮어쓰거나 완화할 수 없습니다.`;
+	}
+	return undefined;
 }
 
 function workerRole(config: StormConfig, agent: string): string | undefined {

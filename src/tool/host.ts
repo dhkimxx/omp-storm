@@ -4,6 +4,7 @@
  * and only after the user picked the exact approval label.
  */
 import type { DecideHost } from "../proposals/decide.ts";
+import type { CloseoutDraft } from "../runtime/closeout.ts";
 import type { AgentEntry, AnalysisContext, RunPlan, RunSpec } from "../types.ts";
 
 export type RunRequestResult = { ok: true; runId: string } | { ok: false; reason: string };
@@ -34,8 +35,19 @@ export interface StormToolHost extends DecideHost {
 	runtime: {
 		/** Queues a run that starts once the current agent turn settles. */
 		requestRun(spec: RunSpec): RunRequestResult;
+		/**
+		 * Why this plan would rewrite the evidence identity of a lane already in force, if it would; absent outside a
+		 * run or when the runtime cannot answer. The tool checks it before a config proposal, and setRunPlan again at
+		 * commit, so a refused replan neither opens nor saves a team change.
+		 */
+		replanConflict?(plan: RunPlan): string | undefined;
 		/** Puts a validated plan in force for the active run (replacing any earlier one); fails when no run is active. */
 		setRunPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string };
+		/**
+		 * Holds the director's closeout for this session's current run until it settles; a later brief replaces it.
+		 * Optional for hosts without the closeout runtime, which the tool then refuses.
+		 */
+		submitCloseout?(draft: CloseoutDraft): { ok: true } | { ok: false; reason: string };
 		/** Whether this session itself directs a run now; another session's run in the same repo is not this one. */
 		runActive?(): boolean;
 		/**

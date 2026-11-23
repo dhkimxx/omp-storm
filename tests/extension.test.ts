@@ -14,7 +14,9 @@ import { prepareAnalysis } from "../src/context.ts";
 import storm from "../src/extension.ts";
 import { approveAndSave } from "../src/flows.ts";
 import { docPromptFor } from "../src/policy/docs.ts";
+import { APPROVE } from "../src/proposals/present.ts";
 import { listAgents, resetAgents } from "../src/runtime/agents.ts";
+import { rememberCloseoutReport, resetCloseoutChoices } from "../src/runtime/closeout.ts";
 import { activeLedgerRun, bindLedgerChild, resetLedger } from "../src/runtime/ledger.ts";
 import { processKey } from "../src/runtime/janitor.ts";
 import { ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
@@ -56,6 +58,8 @@ function fakeOmp(project: TestProject) {
 	const statuses: Array<string | undefined> = [];
 	/** Answers to the next dialogs, by position; empty means the user dismissed them. */
 	const answers: Array<string | undefined | ((options: string[]) => string | undefined)> = [];
+	/** Every select dialog this session opened, so a guard can prove nothing was asked. */
+	const selects: Array<{ title: string; options: string[] }> = [];
 	/** Transcript messages (notices and records outside the TUI); none of them reaches the model. */
 	const transcript: unknown[] = [];
 	let active = ["read", "write"];
@@ -70,6 +74,8 @@ function fakeOmp(project: TestProject) {
 	const broken = { agentDir: false };
 	/** Times a handler waited for the session to go idle. */
 	const waits = { idle: 0 };
+	/** Whether this fake session reports itself idle; input guards read it. */
+	const idle = { value: true };
 	const pi = {
 		exec: project.env.exec,
 		pi: {
@@ -107,11 +113,12 @@ function fakeOmp(project: TestProject) {
 			hasUI: true,
 			mode: "rpc",
 			agent,
-			isIdle: () => true,
+			isIdle: () => idle.value,
 			hasPendingMessages: () => false,
 			ui: {
 				notify: (text: string, level = "info") => notices.push({ text, level }),
-				select: async (_title: string, options: string[]) => {
+				select: async (title: string, options: string[]) => {
+					selects.push({ title, options });
 					const answer = answers.shift();
 					return typeof answer === "function" ? answer(options) : answer;
 				},
@@ -147,7 +154,11 @@ function fakeOmp(project: TestProject) {
 				waits.idle++;
 			},
 			modelRegistry: { getAll: () => [], getAvailable: () => [] },
-			sessionManager: { getArtifactsDir: () => project.root, getSessionDir: () => path.join(project.tmp, "sessions") },
+			sessionManager: {
+				getArtifactsDir: () => project.root,
+				getSessionDir: () => path.join(project.tmp, "sessions"),
+				getSessionId: () => `session-${agent.id}`,
+			},
 			runEphemeralTurn: async () => ({ replyText: '{"action":"run"}' }),
 		}) as unknown as ExtensionContext;
 	return {
@@ -155,8 +166,10 @@ function fakeOmp(project: TestProject) {
 		notices,
 		statuses,
 		answers,
+		selects,
 		transcript,
 		waits,
+		idle,
 		broken,
 		usage,
 		compactions,
@@ -211,6 +224,7 @@ afterEach(async () => {
 	resetLedger();
 	resetAgents();
 	resetTrialSpawns();
+	resetCloseoutChoices();
 	await project.remove();
 });
 
@@ -1663,5 +1677,111 @@ describe("automatic delegation", () => {
 		await omp.emit("session_switch", {}, main);
 		expect(verdict(await omp.emit("tool_call", readFile, main))).toBe("auto");
 		expect(omp.statuses.at(-1)).toContain("자동 위임");
+	});
+});
+
+describe("closeout direction input", () => {
+	const directions = ["첫 방향 작업", "둘째 방향 작업", "셋째 방향 작업"] as const;
+	const brief = { result: "결과", verification: "검증", next: [...directions] };
+
+	test("a brief on a settled run renders one card, and an exact number starts that direction as a normal user run", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("fix it", main);
+		expect((await omp.toolReply({ action: "brief", brief }, main)).outcome).toBe("ok");
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+
+		const card = omp.transcript
+			.flatMap(message =>
+				message !== null && typeof message === "object" && "content" in message && typeof message.content === "string"
+					? [message.content]
+					: [],
+			)
+			.find(content => content.includes("1. 추천 —"));
+		expect(card).toContain(`1. 추천 — ${directions[0]}`);
+		expect(card).toContain(`3. ${directions[2]}`);
+		expect(omp.sent).toHaveLength(1);
+
+		expect(await omp.emit("input", { type: "input", text: "1", source: "interactive" }, main)).toEqual({ handled: true });
+		await until(() => omp.sent.length === 2);
+		expect(omp.sent[1]).toContain(directions[0]);
+		expect(omp.activeTools()).toContain("storm");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("extension text, images, another session, and a busy turn are never a numbered pick", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+
+		rememberCloseoutReport(main, "run-old", directions);
+		// An extension-authored submission is not direct user input, and leaves the card answerable.
+		expect(await omp.emit("input", { type: "input", text: "1", source: "extension" }, main)).toBeUndefined();
+		// A subagent session has no card of its own; the main session's offer is untouched.
+		expect(await omp.emit("input", { type: "input", text: "1", source: "interactive" }, omp.ctx(sub("Other")))).toBeUndefined();
+		// A host with no UI never showed the menu, so its text is not a choice and does not consume one.
+		const noUi = { ...main, hasUI: false } as ExtensionContext;
+		expect(await omp.emit("input", { type: "input", text: "1", source: "interactive" }, noUi)).toBeUndefined();
+		// An image is not a numbered pick; it consumes the offer instead of starting a run from it.
+		expect(
+			await omp.emit(
+				"input",
+				{ type: "input", text: "1", source: "interactive", images: [{ type: "image", data: "AA==", mimeType: "image/png" }] },
+				main,
+			),
+		).toBeUndefined();
+		expect(await omp.emit("input", { type: "input", text: "1", source: "interactive" }, main)).toBeUndefined();
+		expect(omp.sent).toHaveLength(0);
+
+		// A busy session also consumes without starting; the next number misses rather than reviving it.
+		rememberCloseoutReport(main, "run-busy", directions);
+		omp.idle.value = false;
+		expect(await omp.emit("input", { type: "input", text: "2", source: "interactive" }, main)).toBeUndefined();
+		omp.idle.value = true;
+		expect(await omp.emit("input", { type: "input", text: "2", source: "interactive" }, main)).toBeUndefined();
+		expect(omp.sent).toHaveLength(0);
+	});
+
+	test("any other real input invalidates the offer, and a stale pick cannot start a second run", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		rememberCloseoutReport(main, "run-old", directions);
+		expect(await omp.emit("input", { type: "input", text: "hello", source: "interactive" }, main)).toBeUndefined();
+		expect(await omp.emit("input", { type: "input", text: "1", source: "interactive" }, main)).toBeUndefined();
+		expect(omp.sent).toHaveLength(0);
+
+		await omp.command("first work", main);
+		rememberCloseoutReport(main, "run-old", directions);
+		const before = omp.notices.length;
+		expect(await omp.emit("input", { type: "input", text: "3", source: "interactive" }, main)).toEqual({ handled: true });
+		expect(omp.sent).toHaveLength(1);
+		expect(omp.notices.length).toBe(before + 1);
+		expect(omp.notices.at(-1)?.text).toContain("이미 Storm 실행");
+		await omp.emit("session_shutdown", {}, main);
+	});
+});
+
+describe("replan preflight", () => {
+	test("a reused lane's changed identity is refused before any out-of-bounds team proposal opens", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("fix it", main);
+		const first = await omp.toolReply({ action: "plan", plan: { lanes: [{ name: "fix", kind: "code", goal: "ship it" }] } }, main);
+		expect(first.outcome).toBe("ok");
+		omp.answers.push(APPROVE);
+		const again = await omp.toolReply(
+			{ action: "plan", plan: { lanes: [{ name: "fix", kind: "code", goal: "other scope" }], workers: { implementer: 5 } } },
+			main,
+		);
+		expect(again.outcome).toBe("rejected");
+		expect(again.text).toContain("fix");
+		expect(again.text).toContain("progress");
+		expect(omp.selects).toEqual([]);
+		expect(omp.answers).toHaveLength(1);
+		await omp.emit("session_shutdown", {}, main);
 	});
 });

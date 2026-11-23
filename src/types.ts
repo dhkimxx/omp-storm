@@ -10,6 +10,7 @@
  */
 
 import type { SymbolKey } from "@oh-my-pi/pi-tui";
+import type { CloseoutDraft } from "./runtime/closeout.ts";
 import type { ReviewEvidence } from "./runtime/review.ts";
 import type { RunPhase } from "./view/appearance.ts";
 
@@ -774,6 +775,8 @@ export interface RunRecord {
 	/** Most rounds the run may take, fixed at its start. */
 	maxRounds?: number;
 	endReason?: RunEndReason;
+	/** The director's bounded, evidence-based briefing for this run; not approval or verification evidence. */
+	closeout?: CloseoutDraft;
 	/** The limits the user stated with the request. */
 	limits?: { rounds?: number; minutes?: number };
 }
@@ -842,7 +845,10 @@ export interface PlanLane {
 	role: string;
 	/** Write scope; lanes that run at the same time should not share files. */
 	files?: string[];
+	/** What the lane delivers: stable identity. Changing it for the same name on replan is a conflict. */
 	goal?: string;
+	/** The lane's status as the director reports it. Never evidence, proof, write scope, or part of its evidence key. */
+	progress?: string;
 }
 
 /**
@@ -963,7 +969,7 @@ export interface AnalysisContext {
 
 // ── storm tool (implemented in src/tool) ────────────────────────────────────────────────────
 
-export type StormToolAction = "run" | "plan" | "status" | "agents";
+export type StormToolAction = "run" | "plan" | "brief" | "status" | "agents";
 
 /** A run plan as the director sends it; `validatePlan` checks it and resolves roles and workers. */
 export interface PlanRequest {
@@ -973,6 +979,7 @@ export interface PlanRequest {
 		role?: RoleId | undefined;
 		files?: string[] | undefined;
 		goal?: string | undefined;
+		progress?: string | undefined;
 	}>;
 	workers?: Record<string, number> | undefined;
 	note?: string | undefined;
@@ -983,6 +990,8 @@ export interface StormToolParams {
 	action: StormToolAction;
 	/** plan: the run plan */
 	plan?: PlanRequest;
+	/** brief: results and the next directions for the current run, held until it actually settles. */
+	brief?: CloseoutDraft;
 	/** run: the user's request, verbatim */
 	task?: string;
 }

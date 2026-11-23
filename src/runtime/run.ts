@@ -258,18 +258,20 @@ export function buildHandoff(input: {
 	});
 	const isolated = config.isolation === "isolated";
 	const rules = [
-		"- You direct this run: your file edits are blocked. Delegate every change to the team.",
-		`- Before spawning, submit a plan with the \`storm\` tool (action \`plan\`). Lane kinds: ${laneRoles(config)}.`,
-		"- Results carry evidence locations (file and line range, command and exit code, log path). Verify by reading those ranges, not whole files.",
+		"- Delegate all changes; your own file edits are blocked.",
+		`- Before spawning use \`storm plan\`. Lane kinds: ${laneRoles(config)}.`,
+		"- Replan: keep goal/kind/role/files; use `progress` for updates, a new name for changed scope.",
+		"- Cite file:line or command/exit/log. Verify only the relevant ranges.",
 		isolated
-			? "- Put `isolated: true` on each task item. Isolated agents take no messages: for follow-up work start a fresh agent that reads `agent://<id>`."
-			: "- Follow up on the same area with `write agent://<id>`. When Storm blocks it, start a fresh agent that reads `agent://<id>`.",
-		`- Do not finish with an \`incorrect\` review verdict or an open P0${docsEnabled(config) ? "; doc findings count like code findings" : ""}.`,
-		"- Keep going until every lane is done or blocked.",
+			? "- Use `isolated: true`. For follow-up, a new agent reads `agent://<id>`."
+			: "- Follow up via `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
+		`- Resolve \`incorrect\` reviews and open P0s${docsEnabled(config) ? ", including doc findings" : ""}.`,
+		"- Finish every lane or report its blocker.",
+		"- Stage `storm brief` from evidence for substantial work, best next task first. Storm reports after it settles.",
 	];
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {
-		const check = `- When you stop, Storm checks the run: files changed during it, with any tool or shell command, need a \`correct\` verdict from \`${reviewer}\` given after the last change.`;
+		const check = `- Storm checks the run: all changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;
 		rules.push(
 			input.maxRounds === 1
 				? `${check} Without it the run ends unverified.`

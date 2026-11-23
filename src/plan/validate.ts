@@ -19,9 +19,23 @@ export interface PlanCheck {
 }
 
 export const MAX_LANES = 50;
+/** Lane goal and progress are one-line labels, not reports; both trim and share this bound. */
+export const MAX_LANE_TEXT = 200;
 const LANE_KINDS = Object.keys(LANE_ROLES) as LaneKind[];
 /** Lanes of these kinds change or occupy files; two of them on one file collide. */
 const WRITING_KINDS: readonly LaneKind[] = ["code", "run"];
+
+/** Goal and progress take the same shape: optional, trimmed, non-empty and bounded. */
+function laneText(value: unknown, path: string, errors: string[]): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.trim();
+	if (!text) return undefined;
+	if (text.length > MAX_LANE_TEXT) {
+		errors.push(`${path}: ${MAX_LANE_TEXT}자 이하여야 합니다`);
+		return undefined;
+	}
+	return text;
+}
 
 export function validatePlan(config: StormConfig, input: unknown, now: number): PlanCheck {
 	const errors: string[] = [];
@@ -77,7 +91,10 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		}
 		const lane: PlanLane = { name, kind: kind as LaneKind, role };
 		if (files !== undefined) lane.files = [...(files as string[])];
-		if (typeof l.goal === "string" && l.goal.trim()) lane.goal = l.goal.trim();
+		const goal = laneText(l.goal, `${path}.goal`, errors);
+		if (goal !== undefined) lane.goal = goal;
+		const progress = laneText(l.progress, `${path}.progress`, errors);
+		if (progress !== undefined) lane.progress = progress;
 		lanes.push(lane);
 	});
 

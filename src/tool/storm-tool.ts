@@ -1,19 +1,20 @@
 /**
  * The `storm` tool of the main session: `run` queues a Storm run for the end of the turn, `plan` puts a run plan in
- * force (asking the user when it goes past the approved bounds), `status` and `agents` report. Team changes are not
- * here: the user makes them through `/storm`.
+ * force (asking the user when it goes past the approved bounds), `brief` stages the director's closeout for the
+ * current run, `status` and `agents` report. Team changes are not here: the user makes them through `/storm`.
  */
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, teamPriority } from "../config/schema.ts";
 import { planChange } from "../plan/change.ts";
-import { type PlanGap, validatePlan } from "../plan/validate.ts";
+import { MAX_LANE_TEXT, type PlanGap, validatePlan } from "../plan/validate.ts";
 import { modelWarnings } from "../proposals/build.ts";
 import { NEEDS_APPROVAL } from "../proposals/decide.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { type ActionOutcome, type ActionReply, NO_CONFIG, propose } from "../request/actions.ts";
 import { runSpec } from "../request/args.ts";
 import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
+import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, parseCloseout } from "../runtime/closeout.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import type { LaneKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { StormToolHost } from "./host.ts";
@@ -33,15 +34,16 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["run", "plan", "status", "agents"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["run", "plan", "brief", "status", "agents"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 
-const DESCRIPTION = `OMP Storm: hand work to this project's approved multi-agent team, and direct a run.
-- run {task}: the user wants work done by the team. task: the request verbatim. Call it, then end your reply at once: Storm starts the run after this turn.
-- plan {plan}: required during a run before any spawn. lanes [{name, kind, role?, files?, goal?}], kind explore|code|run|review|design; workers: live agents per role. Past the approved bounds the user approves a config change in a dialog. Resubmit when the plan changes.
+const DESCRIPTION = `OMP Storm: hand work to this project's approved team and direct a run.
+- run {task}: the user wants team work. task: the request verbatim. Call it, then end your reply at once: Storm starts the run after this turn.
+- plan {plan}: required before spawns in a run. lanes [{name, kind, role?, files?, goal?, progress?}]; workers: live agents per role. On replan keep name/kind/role/files/goal; progress is status only, new scope needs a new name. Past bounds, the user approves a config change.
+- brief {brief}: once, after a substantial run's results: result, verification evidence, remaining?, next: 3 concrete directions (first recommended). Stages only: no verification or end; Storm shows the menu. Skip trivial lookups.
 - status: team, approval, runs, trials, subagents.
-- agents: this session's subagents: context against the cap, whether a follow-up is allowed.
+- agents: this session's subagents: context cap, follow-up allowance.
 Team setup and changes are the user's, through /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
@@ -57,7 +59,8 @@ function stormParams(z: Zod): StormToolSchema {
 							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
 							role: z.enum(ROLE_IDS).optional().describe("Role doing the lane; default from kind"),
 							files: z.array(z.string()).optional().describe("Files the lane may change"),
-							goal: z.string().optional().describe("What the lane delivers"),
+							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep it on replan"),
+							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Lane status only; a real scope change needs a new name"),
 						}),
 					)
 					.describe("1-50 lanes"),
@@ -66,6 +69,23 @@ function stormParams(z: Zod): StormToolSchema {
 			})
 			.optional()
 			.describe("plan: the run plan"),
+		brief: z
+			.object({
+				result: z.string().max(CLOSEOUT_TEXT_MAX).describe("What the run delivered, with evidence locations"),
+				verification: z.string().max(CLOSEOUT_TEXT_MAX).describe("What proves it, with evidence locations"),
+				remaining: z.string().max(CLOSEOUT_TEXT_MAX).optional().describe("What is still open; omit when nothing is"),
+				next: z
+					.array(z.string().max(CLOSEOUT_NEXT_MAX))
+					.refine(directions => directions.length === 3, "next: 정확히 세 방향이어야 합니다")
+					.transform(directions => directions as [string, string, string])
+					.describe("Three concrete next directions; the first is recommended"),
+			})
+			.transform(value => {
+				const { remaining, ...rest } = value;
+				return remaining === undefined ? rest : { ...rest, remaining };
+			})
+			.optional()
+			.describe("brief: results and the next directions for the current run"),
 	});
 }
 
@@ -81,7 +101,7 @@ export function createStormTool(
 		loadMode: "essential",
 		// Off until a Storm project's main session turns it on, so other sessions never carry its schema.
 		defaultInactive: true,
-		// Reports change nothing; a run or a plan does.
+		// Reports change nothing; a run, a plan or a staged brief does.
 		approval: (args) => (isRecord(args) && (args.action === "status" || args.action === "agents") ? "read" : "write"),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const reply = await runStormTool(hostFor(ctx), params);
@@ -100,6 +120,12 @@ const AUTO_RUN_REJECTED =
 	"자동 위임에서는 run으로 실행을 예약하지 않습니다. 이번 사용자 요청의 계획을 plan으로 제출하세요. 계획이 같은 턴에서 실행을 열고, 그 범위 안에서 승인된 워커를 스폰할 수 있습니다.";
 const AUTO_NO_TASK =
 	"자동 위임에서 실행을 열 사용자 요청을 찾지 못했습니다. 계획을 저장하지 않았습니다. 사용자에게 요청을 새로 입력해 달라고 안내하세요. 사진이나 첨부만 있고 글이 없는 요청은 실행으로 열 수 없습니다.";
+const BRIEF_INVALID =
+	"마무리 보고가 올바르지 않습니다. result(결과), verification(검증 근거), next(구체적인 다음 방향 3개, 첫 번째가 추천)를 증거 위치와 함께 적어 다시 제출하세요. 단순 조회에는 쓰지 않습니다.";
+const BRIEF_NO_HOST =
+	"이 호스트에서는 마무리 보고를 준비할 수 없습니다. 보고 내용은 응답에 직접 적고, 실행 종료는 Storm에 맡기세요.";
+const BRIEF_STAGED =
+	"마무리 보고를 준비했습니다. 최종 검증과 실행 종료는 Storm 검증 게이트가 결정합니다. 다음 방향 메뉴는 실행이 끝난 뒤 Storm이 사용자에게 보여주므로 응답에 번호 목록을 다시 쓰지 말고, 검증 전에는 검증됐다고 말하지 마세요. 이후 라운드에서 결과가 바뀌면 새 보고로 다시 제출하세요.";
 
 interface Current {
 	state: ProjectState;
@@ -138,6 +164,15 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 		}
 		case "plan":
 			return submitPlan(host, params.plan);
+		case "brief": {
+			// Brief only stages a closeout for the current run: it never opens, plans, approves, or ends anything.
+			const draft = parseCloseout(params.brief);
+			if (draft === undefined) return rejected(BRIEF_INVALID);
+			const staged = host.runtime.submitCloseout?.(draft);
+			if (staged === undefined) return rejected(BRIEF_NO_HOST);
+			if (!staged.ok) return rejected(staged.reason);
+			return { outcome: "ok", text: BRIEF_STAGED };
+		}
 	}
 }
 
@@ -172,6 +207,10 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 	let validatedHash = cur.state.config.status === "ok" ? cur.state.config.hash : undefined;
 	let check = validatePlan(config, raw, host.now());
 	if (check.errors.length) return rejected(`계획이 올바르지 않습니다. 고쳐서 다시 제출하세요.\n${check.errors.map((e) => `- ${e}`).join("\n")}`);
+	// A reused lane keeps the identity its evidence is bound to. Refuse before an out-of-bounds plan can open a team
+	// config proposal: a status update belongs in progress, and an actual change needs a new lane name.
+	const conflict = host.runtime.replanConflict?.(check.plan!);
+	if (conflict !== undefined) return rejected(`계획을 적용하지 않았습니다. ${conflict}`);
 	const head: string[] = [];
 	const gaps = check.outOfBounds;
 	if (gaps.length && check.plan) {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { planChange } from "../src/plan/change.ts";
-import { validatePlan } from "../src/plan/validate.ts";
+import { MAX_LANE_TEXT, validatePlan } from "../src/plan/validate.ts";
 import { ROLES } from "../src/roles.ts";
 import type { Candidate, RoleRecommendation, StormConfig } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
@@ -75,6 +75,38 @@ describe("validatePlan", () => {
 			{ kind: "workers", role: "implementer", want: 4, max: 3 },
 		]);
 		expect(r.plan?.workers).toEqual({ implementer: 4, architect: 1, explorer: 2 });
+	});
+
+	test("goal and progress trim, stay optional, and share one bound; progress adds no write scope", () => {
+		const r = validatePlan(
+			config,
+			{
+				lanes: [
+					{ name: "a", kind: "code", goal: "  Deliver A  ", progress: "  (완료) A16  " },
+					{ name: "b", kind: "code", goal: "   ", progress: "" },
+					{ name: "c", kind: "code", goal: "x".repeat(MAX_LANE_TEXT), progress: "y".repeat(MAX_LANE_TEXT) },
+				],
+			},
+			NOW,
+		);
+		expect(r.errors).toEqual([]);
+		expect(r.plan!.lanes[0]).toMatchObject({ goal: "Deliver A", progress: "(완료) A16" });
+		expect(r.plan!.lanes[0]!.files).toBeUndefined();
+		expect(r.plan!.lanes[1]).not.toHaveProperty("goal");
+		expect(r.plan!.lanes[1]).not.toHaveProperty("progress");
+		expect(r.plan!.lanes[2]).toMatchObject({
+			goal: "x".repeat(MAX_LANE_TEXT),
+			progress: "y".repeat(MAX_LANE_TEXT),
+		});
+		const tooLong = validatePlan(
+			config,
+			{ lanes: [{ name: "a", kind: "code", goal: "x".repeat(MAX_LANE_TEXT + 1), progress: "y".repeat(MAX_LANE_TEXT + 1) }] },
+			NOW,
+		);
+		expect(tooLong.plan).toBeUndefined();
+		expect(tooLong.errors).toHaveLength(2);
+		expect(tooLong.errors[0]).toContain("goal");
+		expect(tooLong.errors[1]).toContain("progress");
 	});
 
 	test("errors: lane count, names, kind, files, role id and worker values", () => {

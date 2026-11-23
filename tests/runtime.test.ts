@@ -237,8 +237,8 @@ describe("handoff", () => {
 		expect(maxOf("storm-explorer")).toBe(4);
 		expect(maxOf("storm-architect")).toBe(1);
 		expect(maxOf("storm-explorer")).not.toBe(maxOf("storm-implementer"));
-		// Seven rules without a budget, shared work tree: the reviewer check is one of them.
-		expect(rules(text)).toHaveLength(7);
+		expect(rules(text).some(l => l.includes("`progress`") && l.includes("new name"))).toBe(true);
+		expect(rules(text).some(l => l.includes("`storm brief`") && l.includes("after it settles"))).toBe(true);
 		expect(rules(text).every(l => l.startsWith("- "))).toBe(true);
 	});
 
@@ -255,7 +255,6 @@ describe("handoff", () => {
 		expect(rules(disabled).some(l => l.includes("Storm checks the run"))).toBe(false);
 		// The two-role team has no reviewer: nothing to check the team's changes against.
 		const small = buildHandoff({ ...base, config });
-		expect(rules(small)).toHaveLength(6);
 		expect(rules(small).some(l => l.includes("Storm checks the run"))).toBe(false);
 	});
 

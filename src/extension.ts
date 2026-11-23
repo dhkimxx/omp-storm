@@ -51,8 +51,10 @@ import {
 } from "./runtime/agents.ts";
 import { workingState } from "./runtime/checkpoint.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
+import { replanConflict } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
+import { resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
@@ -117,7 +119,7 @@ This session delegates project work automatically.
 - General conversation needs no tools: answer directly.
 - Keep the scope tiny: one lane and one worker for a quick mechanical edit or a read-only lookup. When the request is uncertain, submit an explore-only plan first instead of guessing implementation lanes.
 - Any repository inspection, verification, or file change belongs to the approved Storm team. First submit a plan with the \`storm\` tool (action "plan"); it opens a run for this turn's user request. Then spawn the plan's approved workers with \`task\`.
-- You own replanning: change the plan only when cross-lane evidence changes an assumption. Name each task item after its planned lane so the worker can be matched to it.
+- You own replanning: change the plan only when cross-lane evidence changes an assumption. On a replan keep each existing lane's name, kind, role, files and goal; put status in \`progress\`, and give a real scope change a new lane name. Name each task item after its planned lane so the worker can be matched to it.
 - Do not call read, grep, glob, bash, edit, ast_edit, eval, or any other file, shell, or unknown tool yourself; for \`write\`, only the two forms below are allowed. Do not spawn an agent before the plan opens the run. Storm blocks those calls.
 - Direct writes are limited to \`write local://<name>.md\` notes and \`write agent://<id>\` messages; read worker results with \`read agent://<id>\` and bounded line ranges.
 - Follow up on the same worker with \`write agent://<id>\`; when Storm blocks it, start a fresh worker that reads \`agent://<id>\`.
@@ -125,6 +127,8 @@ This session delegates project work automatically.
 - When you need the user, use the native \`ask\` tool within this turn; never end by pretending no lane was work.
 - Spawn only the plan's approved roles and worker counts; Storm refuses anything outside the plan.
 - When the team has a reviewer, the run ends verified only after that reviewer accepts the tree as it is after the last change.
+- Near the end of a substantial run, after its results and before you end the turn, submit one \`brief\` action with the \`storm\` tool: \`result\`, \`verification\` with evidence locations, optional \`remaining\`, and exactly three concrete \`next\` directions (the first is your recommendation). Restage it if later rounds change the result. A brief only stages the closeout; it neither verifies nor ends the run, and submitting it is no proof. Skip the brief and next directions for a trivial lookup or a quick one-step request.
+- Do not repeat the brief's directions as a numbered menu in your prose: Storm shows the menu when the run settles. Never claim work is verified before Storm's final gate says so. Do not make another model call just to write the brief.
 - A refusal names the fix (usually /storm). Relay it to the user; never work around it with a direct tool.
 - Keep going until the plan's lanes are done or blocked.
 </storm-auto>`;
@@ -599,7 +603,9 @@ export default function storm(pi: ExtensionAPI): void {
 			}),
 			runtime: {
 				requestRun: spec => runs.request(spec),
+				replanConflict: plan => replanConflict(getLedgerRun(runs.runId())?.plan, plan),
 				setRunPlan: plan => runs.setPlan(plan),
+				submitCloseout: draft => runs.submitCloseout(draft),
 				runActive: () => runs.runId() !== undefined,
 				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) => {
 					// Public plan mode means the user is still planning; an automatic run may not start there.
@@ -1038,6 +1044,8 @@ export default function storm(pi: ExtensionAPI): void {
 		if (ctx.agent.kind === "sub") {
 			noteAgentParked(ctx.agent.id);
 			reviewerBaselines.delete(reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id));
+		} else {
+			resetCloseoutChoices(ctx);
 		}
 		// No status load or widget from before the shutdown may land after it.
 		liveStatus.beginSession();
@@ -1050,6 +1058,7 @@ export default function storm(pi: ExtensionAPI): void {
 		if (ctx.agent.kind !== "main") return;
 		liveStatus.beginSession();
 		openWaits.clear();
+		resetCloseoutChoices(ctx);
 		auto.task = undefined;
 		await runs.finish("shutdown", ctx);
 		// The same profile and repository keep the policy, but a fresh conversation gets the durable consent file.
@@ -1065,6 +1074,46 @@ export default function storm(pi: ExtensionAPI): void {
 		const active = pi.getActiveTools();
 		if (active.includes(tool.name)) await pi.setActiveTools(active.filter(name => name !== tool.name));
 	};
+	/**
+	 * The user-authorized way into a manual run, shared by /storm <request> and a closeout direction pick. It reads
+	 * no automatic-delegation consent and never touches supervisor tools: a pick starts the same run /storm would.
+	 */
+	const startUserRun = async (ctx: ExtensionContext, spec: RunSpec): Promise<RunRequestResult> => {
+		const reason = runs.refusal();
+		if (reason !== undefined) return { ok: false, reason };
+		await activateTool();
+		return runs.start(ctx, spec);
+	};
+
+	/**
+	 * A closeout direction is chosen by the user typing its number, not by a model tool. Only direct interactive
+	 * text from this main session can reach it; the controller accepts an exact 1-3 while one just-finished run
+	 * still offers them and invalidates the offer on any other real input. The pick starts asynchronously through
+	 * the same user-authorized path as /storm, so no streaming turn is awaited and no input is generated here.
+	 */
+	pi.on("input", (event, ctx) => {
+		// A host with no UI never showed the menu; its text is not a choice, even if a stale card was recorded.
+		if (event.source !== "interactive" || ctx.agent.kind !== "main" || !ctx.hasUI) return undefined;
+		const direction = takeCloseoutChoice(ctx, event.text);
+		if (direction === undefined) return undefined;
+		// An image or a busy session cannot be a numbered pick: the input keeps its normal path, and the offer is gone.
+		if (event.images?.length || !ctx.isIdle()) return undefined;
+		const refusal = runs.refusal();
+		if (refusal !== undefined) {
+			if (ctx.hasUI) ctx.ui.notify(`Storm 실행을 시작하지 못했습니다: ${refusal}`, "warning");
+			return { handled: true };
+		}
+		void startUserRun(ctx, { task: direction }).then(
+			result => {
+				if (!result.ok && ctx.hasUI) ctx.ui.notify(`Storm 실행을 시작하지 못했습니다: ${result.reason}`, "warning");
+			},
+			(error: unknown) => {
+				if (ctx.hasUI) ctx.ui.notify(`Storm 실행을 시작하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
+			},
+		);
+		return { handled: true };
+	});
+
 	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
 	const syncSession = async (ctx: ExtensionContext, loaded?: ProjectState): Promise<void> => {
 		const epoch = liveStatus.epoch();
@@ -1103,6 +1152,7 @@ export default function storm(pi: ExtensionAPI): void {
 		// Subagents never manage the team: no tool, no status line.
 		if (ctx.agent.kind !== "main") return;
 		const epoch = liveStatus.beginSession();
+		resetCloseoutChoices(ctx);
 		try {
 			const state = await loadProjectState(projectEnv(ctx));
 			// A run whose process died stays `running` until a later run ends; here it becomes the last run and resumable.
@@ -1135,8 +1185,7 @@ export default function storm(pi: ExtensionAPI): void {
 				const reason = runs.refusal();
 				if (reason !== undefined) return { ok: false, reason };
 				await ctx.waitForIdle();
-				await activateTool();
-				return runs.start(ctx, spec);
+				return startUserRun(ctx, spec);
 			};
 			const env = flowEnv(ctx, startRun);
 			const input = args.trim();
