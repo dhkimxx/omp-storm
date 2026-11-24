@@ -14,7 +14,7 @@ export interface ApprovalView {
 	shadows?: readonly ShadowInfo[];
 	/** Validation warnings and model availability warnings of the config being approved. */
 	warnings?: readonly string[];
-	/** Shown first (a run plan, what a setup switches on). */
+	/** Shown first: what a setup switches on, or the target a change applies to. */
 	context?: string;
 	/** Background shown after the diff (why these models): the first thing a small terminal cuts. */
 	notes?: string;
@@ -94,8 +94,6 @@ export function renderApproval(
 	return out.join("\n");
 }
 
-const TITLE: Partial<Record<Proposal["kind"], string>> = { setup: "Storm 팀 제안", plan: "Storm 실행 계획" };
-
 /** Asks about one proposal. `extraOptions` are offered between "승인" and "취소" and come back as `{ extra }`. */
 export async function presentProposal(
 	ui: UiPort,
@@ -106,8 +104,9 @@ export async function presentProposal(
 	const extras = opts.extraOptions ?? [];
 	const info: InfoLine[] = [];
 	const markdown = renderApproval(proposal.summary, current, proposal.config, opts, info);
+	const title = proposal.kind === "setup" ? "Storm 팀 제안" : "Storm 변경 제안";
 	const answer = await ui.select("이 변경을 승인할까요?", [APPROVE, ...extras, CANCEL], {
-		title: TITLE[proposal.kind] ?? "Storm 변경 제안",
+		title,
 		consent: [APPROVE],
 		markdown,
 		...(info.length ? { info } : {}),

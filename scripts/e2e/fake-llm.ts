@@ -87,7 +87,8 @@ export interface ScriptedTask {
  * One step of a scripted main turn: a storm tool call, a task batch (`as` prefixes the children's names, `say` is
  * appended to each assignment, e.g. an E2E-CHILD directive; `tasks` gives every item its own name and assignment),
  * a file write, a shell command, a follow-up to a subagent, a read, a native `ask` form (`ask` is one HTML `<form>`),
- * or `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the last task call has
+ * `ifAskApproved` (run the shell command only when the previous ask's answer explicitly applies/approves it), or
+ * `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the last task call has
  * made its first request, so the turn ends with that child known to be running. `isolated[i]` marks task item i
  * `isolated: true`; the host's native task isolation places that child, and only probes that deliberately bypass
  * Storm use it.
@@ -106,6 +107,7 @@ export type Step = (
 	| { followUp: string; content?: string }
 	| { read: string }
 	| { ask: string }
+	| { ifAskApproved: string }
 	| { wait: true; releaseChildren?: string[] }
 	| { awaitChild: true }
 ) & {
@@ -340,6 +342,28 @@ const userText = (messages: Message[]): string =>
 const hasCalls = (message: Message): boolean => message.role === "assistant" && (message.tool_calls?.length ?? 0) > 0;
 const callNames = (messages: Message[]): string[] => messages.filter(hasCalls).flatMap(m => (m.tool_calls ?? []).map(call => call.function?.name ?? ""));
 
+/** The tool result answering the newest `ask` call, if any: what an `ifAskApproved` step decides on. */
+function lastAskResult(messages: Message[]): string | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message?.role !== "tool") continue;
+		for (let before = index - 1; before >= 0; before--) {
+			const call = messages[before];
+			if (!call || call.role !== "assistant" || !hasCalls(call)) continue;
+			const asked = (call.tool_calls ?? []).some(item => item.function?.name === "ask");
+			if (asked) return textOf(message.content);
+			break;
+		}
+	}
+	return undefined;
+}
+
+/** An ask answer that explicitly applies/approves the proposed effect. A cancel or deny is never approval. */
+function approvedByAsk(answer: string): boolean {
+	return /"(?:choice|decision|answer|approval)"\s*:\s*"(?:apply|approve|approved|yes)"/i.test(answer) ||
+		/User answers:[\s\S]*\b(?:Apply|Approve|Approved|Yes)\b/i.test(answer);
+}
+
 const HANDOFF_REQUEST = "Write a handoff document for another instance of yourself.";
 
 /** A soft summary wraps the transcript; a native handoff appends its own request to the live history. */
@@ -418,6 +442,10 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 	if (step.afterResult !== undefined && !seen(step.afterResult, role => role === "user")) return { kind: "text", text: "waiting" };
 	// A follow-up waits for its target's async result (a user message), so the target's usage is on the ledger by then.
 	if ("followUp" in step && !seen(step.followUp.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
+	if ("ifAskApproved" in step) {
+		// The step still consumes its slot on a denial, so the script proceeds without applying the proposed effect.
+		return approvedByAsk(lastAskResult(later) ?? "") ? bashCall(tools, step.ifAskApproved) : extensionCall(tools, "storm", { action: "status" });
+	}
 	return stepCall(step, tools);
 }
 

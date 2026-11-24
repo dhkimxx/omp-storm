@@ -201,7 +201,7 @@ describe("decideProposal", () => {
 		const state = await loadProjectState(project.env);
 		const workers = buildWorkers(edited, "explorer", 1, 3);
 		if ("error" in workers) throw new Error(workers.error);
-		for (const kind of ["workers", "reselect", "priority", "quota", "trial", "budget", "settings", "plan"] as const) {
+		for (const kind of ["workers", "reselect", "priority", "quota", "trial", "budget", "settings"] as const) {
 			const f = host([]);
 			const decision = await decideProposal(f.host, state, { kind, summary: workers.summary, config: workers.config });
 			expect(decision).toEqual({ outcome: "rejected", reason: NEEDS_APPROVAL });

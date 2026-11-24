@@ -28,6 +28,9 @@ run bun scripts/e2e/tui.ts
 # Automatic-delegation consent, lease safety for concurrent readers vs writers.
 run bun scripts/e2e/auto.ts
 
+# Routine decisions: a bounds refusal without a dialog, a worker ask, one marked irreversible decision, closeout.
+run bun scripts/e2e/decisions.ts
+
 # Selective lane isolation and host settings.
 run bun scripts/e2e/isolation.ts
 

@@ -65,8 +65,9 @@ const OUTSIDE = "interview-outside";
 const IDLE = idleAppearance({ team: "approved", auto: "on", resume: false });
 /** The same footer while a stopped run can be continued. */
 const RESUME = idleAppearance({ team: "approved", auto: "on", resume: true });
-/** A native ask form with a named text control: its label becomes the question, its placeholder is visible. */
-const ASK_FORM = '<form><fieldset><legend>E2E 확인</legend><label>E2E-QUESTION <input name="e2e-answer" placeholder="E2E-ANSWER"></label></fieldset></form>';
+/** A native ask form with a named text control: its label becomes the question, its placeholder is visible. It carries
+ * the managed-decision marker a Storm director must use for a genuine user choice. */
+const ASK_FORM = '<form data-storm-decision="e2e-tui-ask-v1" data-storm-reason="user-choice"><fieldset><legend>E2E 확인</legend><label>E2E-QUESTION <input name="e2e-answer" placeholder="E2E-ANSWER"></label></fieldset></form>';
 const ASK_ANSWER = "resume-ok";
 
 /** The widget's static header text: the shared mark, then the shared phase label. */

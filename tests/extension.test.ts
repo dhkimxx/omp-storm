@@ -2514,17 +2514,15 @@ describe("native session ownership", () => {
 		expect(omp.statuses.at(-1)).toContain("대기");
 	});
 
-	test("an approval dialog that outlives its session writes neither the old nor the new one", async () => {
+	test("an out-of-bounds plan opens no dialog and writes neither the old nor a new session", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.emit("session_start", {}, main);
-		omp.answers.push(async () => {
-			omp.setSessionId("session-next");
-			await omp.emit("session_switch", { reason: "new" }, main);
-			return APPROVE;
-		});
-		await expect(omp.toolReply({ action: "plan", plan: { lanes: [coreLane], workers: { implementer: 5 } } }, main)).rejects.toThrow();
+		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [coreLane], workers: { implementer: 5 } } }, main);
+		expect(reply.outcome).toBe("rejected");
+		expect(reply.text).toContain("승인된");
+		expect(omp.selects).toHaveLength(0);
 		expect((await loadProjectState({ ...project.env, sessionId: "session-next" })).config.status).toBe("missing");
 		const original = await loadProjectState(project.env);
 		expect(original.config.status).toBe("ok");
@@ -2684,6 +2682,236 @@ describe("persisted worker authority across module boundaries", () => {
 		expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: "../outside.txt", content: "x" } }, probe))).toBe("lane-scope");
 		// The attempt is bound to the first claimed checkout; a different cwd cannot inherit it.
 		expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: "allowed.txt", content: "x" } }, moved))).toBe("authority");
+		await omp.emit("session_shutdown", {}, main);
+	});
+});
+
+describe("native ask decisions", () => {
+	const form = (key: string, reason: string, body = '<label><input type="radio" name="choice" value="go"> Go</label>') =>
+		({ html: `<form data-storm-decision="${key}" data-storm-reason="${reason}">${body}</form>` });
+	const askCall = (input: unknown) => ({ toolName: "ask", input });
+	const ask = (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, input: unknown) => omp.emit("tool_call", askCall(input), main);
+
+	test("a manual run admits one marked decision, preserves the native wait and cancel, and never reads silence as consent", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		// Before a run this is an ordinary session: its ask stays the host's and no Storm decision section appears.
+		expect(verdict(await ask(omp, main, { html: "<form><p>ordinary</p></form>" }))).toBe("pass");
+		expect(await omp.emit("before_agent_start", { reason: "prompt", prompt: "ordinary prompt", systemPrompt: ["base"] }, main)).toBeUndefined();
+
+		await omp.command("manual task", main);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId as string;
+		expect(runId).toBeDefined();
+		// The manual director gets the shared contract as a stable system section, not in the brief handoff.
+		const manual = (await omp.emit("before_agent_start", { reason: "prompt", prompt: "manual task", systemPrompt: ["base"] }, main)) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		const manualPrompt = manual?.systemPrompt ?? [];
+		expect(manualPrompt.at(-1)).toContain("<storm-decision>");
+		expect(manualPrompt.join("\n")).toContain("data-storm-decision");
+		expect(manualPrompt.join("\n")).toContain("irreversible");
+		expect(manualPrompt.join("\n")).toContain("work that is ready first");
+		expect(await omp.emit("before_agent_start", { reason: "prompt", prompt: "manual task", systemPrompt: manualPrompt }, main)).toBeUndefined();
+
+		// Routine confirmation without the marker, a literal reason list, and a bare string are declined as feedback.
+		expect(verdict(await ask(omp, main, { html: "<form><p>Run the tests?</p></form>" }))).toBe("ask-contract");
+		expect(verdict(await ask(omp, main, { html: '<form data-storm-decision="tests" data-storm-reason="scope-change|user-choice">' }))).toBe("ask-contract");
+		expect(verdict(await ask(omp, main, { html: '<form data-storm-decision="has space" data-storm-reason="user-choice">' }))).toBe("ask-contract");
+		expect(verdict(await ask(omp, main, "one question"))).toBe("ask-contract");
+		expect(verdict(await ask(omp, main, { questions: [{ id: "q", question: "Proceed?" }] }))).toBe("ask-contract");
+
+		// A genuine user choice is left to the host: the form opens a real wait, and cancel closes it.
+		const choice = form("pick-store", "user-choice", '<label><input type="radio" name="store" value="sqlite" checked> SQLite</label>');
+		const before = await readRun(project.sessionDir, runId);
+		expect(verdict(await ask(omp, main, choice))).toBe("pass");
+		await omp.emit("tool_execution_start", { toolCallId: "pick-store-1", toolName: "ask", args: choice }, main);
+		expect(omp.statuses.at(-1)).toContain("응답 대기");
+		await omp.emit("tool_execution_end", { toolCallId: "pick-store-1", toolName: "ask", result: { details: { timedOut: true } }, isError: true }, main);
+		expect(omp.statuses.at(-1)).toContain("진행 중");
+		// A timeout or cancel leaves the run untouched and does not turn into an approval.
+		const after = await readRun(project.sessionDir, runId);
+		expect(after?.status).toBe("running");
+		expect(after?.results).toEqual(before?.results);
+		expect(after?.closeout).toBeUndefined();
+
+		// A timeout with no answer is also not consent, and the run stays exactly as it was.
+		const timeout = form("pick-timeout", "user-choice");
+		expect(verdict(await ask(omp, main, timeout))).toBe("pass");
+		await omp.emit("tool_execution_start", { toolCallId: "pick-timeout-1", toolName: "ask", args: timeout }, main);
+		await omp.emit("tool_execution_end", { toolCallId: "pick-timeout-1", toolName: "ask", result: { details: { answers: [], timedOut: true } }, isError: false }, main);
+		const afterTimeout = await readRun(project.sessionDir, runId);
+		expect(afterTimeout?.status).toBe("running");
+		expect(afterTimeout?.results).toEqual(before?.results);
+		expect(afterTimeout?.closeout).toBeUndefined();
+		expect(verdict(await ask(omp, main, timeout))).toBe("ask-repeat");
+
+		// The same decision after cancellation/settlement is not asked again; a different one is still reachable.
+		expect(verdict(await ask(omp, main, choice))).toBe("ask-repeat");
+		expect(verdict(await ask(omp, main, form("pick-reviewer", "user-choice")))).toBe("pass");
+
+		// A high-risk form with a default that silence could submit is refused; a safe form for the same key is allowed.
+		const riskyDefault = form("delete-branch", "irreversible-action", '<label><input type="radio" name="go" value="yes" checked> Delete</label>');
+		expect(verdict(await ask(omp, main, riskyDefault))).toBe("ask-default");
+		expect(verdict(await ask(omp, main, form("delete-branch", "irreversible-action")))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("auto work gates one decision per user request across rounds, while another session or generation starts clean", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const prompt = (text: string) => omp.emit("before_agent_start", { reason: "prompt", prompt: text, systemPrompt: [] }, main);
+		const started = (await prompt("fix the login bug")) as { systemPrompt: string[] };
+		const assembled = started.systemPrompt.join("\n");
+		expect(assembled).toContain("<storm-auto>");
+		expect(assembled).toContain("<storm-decision>");
+		expect(assembled).toContain("data-storm-decision");
+		expect(assembled).toContain("timeout or cancel is not consent");
+
+		const decision = form("deploy-window", "user-choice");
+		expect(verdict(await ask(omp, main, decision))).toBe("pass");
+		expect(verdict(await ask(omp, main, decision))).toBe("ask-repeat");
+
+		// The first plan opens the run inside the same user request; the repeat stays refused.
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).outcome).toBe("ok");
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		expect(verdict(await ask(omp, main, decision))).toBe("ask-repeat");
+
+		// A Storm round is the same request.
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: `<storm-run id="${runId}" round="2/2">continue</storm-run>`, systemPrompt: [] }, main);
+		expect(verdict(await ask(omp, main, decision))).toBe("ask-repeat");
+
+		// Another native session has its own request and does not inherit this key.
+		await writeAutoDelegation(sessionStoreDir(project.agentDir, "session-other"), true);
+		omp.setSessionId("session-other");
+		await omp.emit("session_switch", { reason: "new" }, main);
+		await prompt("other task");
+		expect(verdict(await ask(omp, main, decision))).toBe("pass");
+
+		// A new prompt in the original session is a new request too, not the old generation.
+		omp.setSessionId(project.sessionId);
+		await omp.emit("session_switch", { reason: "resume" }, main);
+		await prompt("resume task");
+		expect(verdict(await ask(omp, main, decision))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a managed worker cannot ask; persisted and closed admissions still prove management while an unrelated child stays ordinary", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("manual task", main);
+		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId as string;
+		admitChild(runId, "Impl");
+		const decision = form("worker-choice", "user-choice");
+
+		// The in-memory run binding is enough, before the tool can open a form.
+		const impl = child.ctx(sub("Impl"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		expect(verdict(await child.emit("tool_call", askCall(decision), impl))).toBe("worker-ask");
+
+		// A persisted admission from another host thread is the same management.
+		await persistWorkerAdmission({
+			agentDir: project.agentDir,
+			artifactRoot: project.root,
+			parentId: "Main",
+			childId: "Pooled",
+			runId,
+			sessionId: project.sessionId,
+			sessionDir: project.sessionDir,
+			repoId: "dir-project-test",
+			targetRoot: project.root,
+			policy: { kind: "read", reason: "test read lane" },
+		});
+		const pooled = child.ctx(sub("Pooled"));
+		expect(verdict(await child.emit("tool_call", askCall(decision), pooled))).toBe("worker-ask");
+
+		// A closed record still proves management; it does not reopen the worker's ask tool.
+		await revokeWorkerAdmissions(project.agentDir, { runId });
+		expect(verdict(await child.emit("tool_call", askCall(decision), pooled))).toBe("worker-ask");
+
+		// An unrelated native child outside this run's parent is ordinary.
+		const free = child.ctx({ kind: "sub", id: "Free", name: "free", parentId: "OtherParent" });
+		expect(verdict(await child.emit("tool_call", askCall(decision), free))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("the main form scan is quote-aware, ignores comments and attribute text, and a corrected form keeps its key", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("manual task", main);
+
+		// A quoted > is part of the attribute, not the end of the control tag: a benign placeholder is accepted...
+		const placeholder = form(
+			"quoted-placeholder",
+			"irreversible-action",
+			'<label>Scope <input type="text" name="scope" placeholder="2 > 1"></label>',
+		);
+		expect(verdict(await ask(omp, main, placeholder))).toBe("pass");
+		// ...while a real non-empty default after that > is still found and refused.
+		const defaultValue = form(
+			"quoted-value",
+			"irreversible-action",
+			'<label>Scope <input type="text" name="scope" value="2 > 1"></label>',
+		);
+		expect(verdict(await ask(omp, main, defaultValue))).toBe("ask-default");
+
+		// A commented-out form/default and a <form string inside an attribute are not the main form or a control.
+		const commented = {
+			html:
+				'<!-- <form data-storm-decision="ghost" data-storm-reason="scope-change"><input type="radio" name="x" checked></form> -->' +
+				'<form data-storm-decision="real-form" data-storm-reason="irreversible-action">' +
+				'<p title="<form is text>">Preview</p><!-- <input type="radio" name="x" checked> -->' +
+				'<label><input type="radio" name="x" value="no"> No</label></form>',
+		};
+		expect(verdict(await ask(omp, main, commented))).toBe("pass");
+
+		// A form with no answerable field, then a malformed control, must not consume the stable key before the host
+		// has a chance to show the corrected form.
+		expect(
+			verdict(await ask(omp, main, { html: '<form data-storm-decision="retry-decision" data-storm-reason="user-choice"><p>No field</p></form>' })),
+		).toBe("ask-contract");
+		expect(
+			verdict(await ask(omp, main, { html: '<form data-storm-decision="retry-decision" data-storm-reason="user-choice"><input type="text" name="scope" value="unterminated></form>' })),
+		).toBe("ask-contract");
+		expect(verdict(await ask(omp, main, form("retry-decision", "user-choice")))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a managed headless ask is refused before the form and does not consume the decision key", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("manual task", main);
+		const decision = form("headless-choice", "user-choice");
+		const headless = { ...main, hasUI: false } as ExtensionContext;
+		expect(verdict(await ask(omp, headless, decision))).toBe("ask-no-ui");
+		// The refusal is feedback, not a recorded question: a host with a form can still ask it once.
+		expect(verdict(await ask(omp, main, decision))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("the bounded decision log keeps old keys at the cap instead of reopening a repeat", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("manual task", main);
+		for (let index = 0; index < 64; index++) {
+			expect(verdict(await ask(omp, main, form(`cap-${index}`, "user-choice")))).toBe("pass");
+		}
+		expect(verdict(await ask(omp, main, form("cap-new", "user-choice")))).toBe("ask-limit");
+		// The oldest key is still present, so it is a repeat rather than a new authorization.
+		expect(verdict(await ask(omp, main, form("cap-0", "user-choice")))).toBe("ask-repeat");
 		await omp.emit("session_shutdown", {}, main);
 	});
 });

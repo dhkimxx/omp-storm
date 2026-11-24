@@ -68,6 +68,7 @@ import { replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsola
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
+import { DecisionRequests, decisionAsk } from "./runtime/decisions.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
@@ -241,6 +242,19 @@ This session delegates project work automatically.
 - A refusal names the fix (usually /storm). Relay it to the user; never work around it with a direct tool.
 - Keep going until the plan's lanes are done or blocked.
 </storm-auto>`;
+
+/**
+ * The stable native-ask contract shared by every active Storm director: the automatic director and the manual
+ * director of a live run. It carries no run id, count or other live state, so appending it once per assembled prompt
+ * keeps the prompt cache stable. The per-request decision history lives in the runtime, never in this text.
+ */
+const DECISION_INSTRUCTION = `<storm-decision>
+Routine in-scope setup, checks, retries and fixes the user already requested need no confirmation: do the work that is ready first.
+Only a genuine user decision may use the native \`ask\` tool: a scope change, an irreversible action, or a choice that belongs to the user. Replan within the approved bounds instead of asking to widen them.
+Put \`data-storm-decision="<stable-key>"\` and exactly one \`data-storm-reason\` (\`scope-change\`, \`irreversible-action\`, \`user-choice\`) on the main \`<form>\` tag; keep the same key across replans and rounds of this request.
+For a scope change or irreversible action, preselect nothing: a timeout or cancel is not consent and must never submit an approval.
+Ask once per request, consolidate related questions, and never repeat an authorization.
+</storm-decision>`;
 
 /** Said when an automatic session tries to spawn outside the run its plan opens. */
 const AUTO_SPAWN_REASON =
@@ -549,6 +563,8 @@ export default function storm(pi: ExtensionAPI): void {
 	 * never one of whichever run this session directs by then.
 	 */
 	const openWaits = new Map<string, { runId: string; key: string }>();
+	/** The decisions this conversation's current user request already asked; keys only, never answers. */
+	const decisions = new DecisionRequests();
 	/**
 	 * One live run: the editor widget in a true TUI, the plain status line everywhere else. The phase is view-only
 	 * evidence from the controller; `working` is the safe default for a host that cannot say.
@@ -806,6 +822,49 @@ export default function storm(pi: ExtensionAPI): void {
 			// A failed close leaves the record for the parent's run-end revocation.
 		}
 	};
+	/**
+	 * The native ask gate for a managed director. It runs before the host opens a form: a marked genuine decision is
+	 * left to the host unchanged, while a routine, malformed or repeated question is declined as tool feedback so the
+	 * director keeps working. The marker is coordination only; it grants no approval and replaces no host permission.
+	 */
+	const mainAskGate = (
+		ctx: ExtensionContext,
+		input: unknown,
+		autoOn: boolean,
+		runId: string | undefined,
+	): { block: true; reason: string } | undefined => {
+		const sessionId = mainSessionId(ctx);
+		if (sessionId === undefined) return undefined;
+		// Auto work is gated before, during and after its run. A manual run is gated only while it is this session's.
+		if (!autoOn && (runId === undefined || getLedgerRun(runId)?.sessionId !== sessionId)) return undefined;
+		if (!ctx.hasUI) {
+			return {
+				block: true,
+				reason: "[storm:ask-no-ui] 이 호스트에는 사용자 폼 UI가 없어 관리 실행의 native ask를 열 수 없습니다. 결정에 의존하지 않는 범위 안 작업을 먼저 끝내고, 막히면 선택지와 진행 상황을 최종 답변이나 감독 보고에 남기세요. native ask를 다시 호출해도 폼은 열리지 않습니다.",
+			};
+		}
+		const checked = decisionAsk(input);
+		if (!checked.ok) {
+			const tag = checked.code === "default" ? "ask-default" : "ask-contract";
+			return {
+				block: true,
+				reason: `[storm:${tag}] 이번 사용자 요청에서 이미 승인된 범위의 작업은 확인 질문이 필요 없습니다. 네이티브 ask는 실제 사용자 결정에만 쓰고, MAIN <form> 태그에 data-storm-decision="<stable-key>"와 data-storm-reason(scope-change, irreversible-action, user-choice 중 정확히 하나)을 넣으세요. 결정에 의존하지 않는 작업을 먼저 끝내고 같은 결정은 이번 요청에서 한 번만 물으세요. ${checked.detail}`,
+			};
+		}
+		const remembered = decisions.remember(sessionId, sessionGeneration, checked.ask.key, checked.ask.reason);
+		if (remembered.status === "recorded") return undefined;
+		if (remembered.status === "full") {
+			return {
+				block: true,
+				reason: "[storm:ask-limit] 이번 사용자 요청의 결정 기록 한도에 도달해 새 결정을 더 기록할 수 없습니다. 이미 물은 결정을 다시 요청하지 말고, 범위 안 작업을 계속하거나 선택지와 진행 상황을 감독 보고에 남기세요. 타임아웃·취소는 동의가 아닙니다.",
+			};
+		}
+		return {
+			block: true,
+			reason: `[storm:ask-repeat] 이번 사용자 요청에서 이미 결정 '${checked.ask.key}'(${remembered.reason})을 물었습니다. 같은 승인을 다시 요청하지 말고, 이전 답이나 취소·타임아웃을 그대로 상태로 두고 범위 안 작업을 계속하거나 막힘을 보고하세요. 타임아웃·취소는 동의가 아닙니다.`,
+		};
+	};
+
 	/** Parent side: write the exact admission before returning from the spawn hook. */
 	const persistChildAdmission = async (input: {
 		ctx: ExtensionContext;
@@ -1006,36 +1065,6 @@ export default function storm(pi: ExtensionAPI): void {
 		};
 	};
 
-	/** One counter for Storm's own tool dialogs; the key only has to differ while a dialog waits. */
-	let toolDialogs = 0;
-	/**
-	 * Storm's `storm` tool can open its own approval dialogs mid-run. This observes that port only: every call is the
-	 * original one, and a call made during a run marks a user wait until it settles. It never answers or replaces a
-	 * prompt; the host's ask and tool-approval events are tracked separately.
-	 */
-	const observingUi = (ctx: ExtensionContext, ui: UiPort): UiPort => {
-		const around = <T>(call: () => Promise<T>): Promise<T> => {
-			const runId = runs.runId();
-			if (!ctx.hasUI || runId === undefined) return call();
-			const key = `storm-ui:${++toolDialogs}`;
-			noteRunUserWait(runId, key, true);
-			try {
-				return Promise.resolve(call()).finally(() => noteRunUserWait(runId, key, false));
-			} catch (error) {
-				noteRunUserWait(runId, key, false);
-				throw error;
-			}
-		};
-		const form = ui.form;
-		const pickModel = ui.pickModel;
-		return {
-			...ui,
-			select: (title, options, context) => around(() => ui.select(title, options, context)),
-			...(form === undefined ? {} : { form: (html: string) => around(() => form(html)) }),
-			...(pickModel === undefined ? {} : { pickModel: (title: string, current?: Parameters<NonNullable<UiPort["pickModel"]>>[1]) => around(() => pickModel(title, current)) }),
-		};
-	};
-
 	const toolHost = (ctx: ExtensionContext): StormToolHost => {
 		const env = projectEnv(ctx);
 		const generation = sessionGeneration;
@@ -1045,13 +1074,14 @@ export default function storm(pi: ExtensionAPI): void {
 		const stale = "대화가 바뀌어 이 호출은 적용하지 않았습니다. 새 대화에서 다시 시도하세요.";
 		const flow = flowEnv(ctx);
 		const scope = agentScope(ctx);
-		const { ui, now, loadState, prepare, approveAndSave: save } = actionHost(ctx, observingUi(ctx, createUiPort(pi, ctx)));
+		/** Fresh state under the captured session; a stale call reads nothing and writes nothing. */
+		const loadState = async (): Promise<ProjectState> => {
+			if (!stillOwner()) throw new Error(stale);
+			return loadProjectState(env);
+		};
 		return {
-			ui,
-			now,
+			now: Date.now,
 			loadState,
-			prepare,
-			approveAndSave: save,
 			statusText: opts => {
 				if (!stillOwner()) throw new Error(stale);
 				return statusText(flow, opts);
@@ -1421,6 +1451,7 @@ export default function storm(pi: ExtensionAPI): void {
 			// Without a native session identity there is no Storm policy to apply; the ordinary conversation is untouched.
 			const sessionId = mainSessionId(ctx);
 			if (sessionId === undefined) return undefined;
+			const generation = sessionGeneration;
 			const auto = autoFor(sessionId);
 			// Only an ordinary prompt carries a user request. A revive has no prompt, and Storm's own run messages
 			// are generated continuations: neither may capture or replace the task a plan opens.
@@ -1435,13 +1466,26 @@ export default function storm(pi: ExtensionAPI): void {
 			if (!runMessage) {
 				// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
 				// reminders and steers must not replace it; a prompt while this session directs is run context.
-				if (runs.runId() === undefined && auto.task === undefined) auto.task = prompt;
+				if (runs.runId() === undefined && auto.task === undefined) {
+					auto.task = prompt;
+					// The first prompt of a user turn starts its request; decisions never inherit from the last one.
+					decisions.nextRequest(sessionId, sessionGeneration);
+				}
 				const env = envForSession(sessionId, ctx.cwd);
 				await refreshAuto(ctx, () => stateCache.get(env));
 			}
-			if (autos.get(sessionId) !== auto || !auto.enabled || event.systemPrompt.includes(AUTO_INSTRUCTION)) return undefined;
-			// Append only: the prompt itself is the host's, and this block is stable between turns.
-			return { systemPrompt: [...event.systemPrompt, AUTO_INSTRUCTION] };
+			// A switch during the read must not attach Storm guidance to another conversation's prompt.
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId) return undefined;
+			const autoOn = autos.get(sessionId) === auto && auto.enabled;
+			const activeRun = getLedgerRun(runs.runId());
+			const manualOn = activeRun !== undefined && activeRun.sessionId === sessionId;
+			if (!autoOn && !manualOn) return undefined;
+			const additions: string[] = [];
+			if (!event.systemPrompt.includes(DECISION_INSTRUCTION)) additions.push(DECISION_INSTRUCTION);
+			if (autoOn && !event.systemPrompt.includes(AUTO_INSTRUCTION)) additions.push(AUTO_INSTRUCTION);
+			if (additions.length === 0) return undefined;
+			// Append only: the prompt itself is the host's, and these blocks are stable between turns.
+			return { systemPrompt: [...event.systemPrompt, ...additions] };
 		}
 		const ledger = childLedger(ctx);
 		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
@@ -1483,10 +1527,12 @@ export default function storm(pi: ExtensionAPI): void {
 			let authority = agentAuthorities.get(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			let managed = authority !== undefined || boundRunId !== undefined;
 			let denied: string | undefined;
+			const asks = event.toolName === "ask";
 			// The in-memory map is thread-local. For every non-read tool, the persisted parent admission is the truth,
 			// so a worker-homed child after a module rebind enforces the same path/read policy. A managed run with no
-			// record for this child is denied instead of silently becoming ordinary.
-			if (!readOnlyTool(event.toolName)) {
+			// record for this child is denied instead of silently becoming ordinary. `ask` is read-only to the lane policy
+			// but is still resolved here: a managed worker must never put its own form in front of the user.
+			if (asks || !readOnlyTool(event.toolName)) {
 				const resolved = await childWorkerAuthority(ctx);
 				if (resolved.kind === "authorized") {
 					authority = resolved.authority;
@@ -1497,6 +1543,15 @@ export default function storm(pi: ExtensionAPI): void {
 				} else {
 					managed = managed || authority !== undefined;
 				}
+			}
+			// A managed worker never owns the user's attention: its question belongs to the director, with the choices
+			// and progress it found. An unrelated native child keeps its own ask tool.
+			if (asks && managed) {
+				const director = ctx.agent.parentId === undefined ? "감독" : `agent://${ctx.agent.parentId}`;
+				return {
+					block: true,
+					reason: `[storm:worker-ask] Storm이 관리하는 워커는 사용자에게 직접 ask할 수 없습니다. 막힌 도구 결과, 확인한 선택지와 진행 상황을 ${director}에게 보고하세요. 사용자의 확인을 추측하거나 새로 만들지 마세요.`,
+				};
 			}
 			// A nested spawn would bypass the director's plan and this worker's authority. The fence is tied to this
 			// process's Storm workers/run binding or the persisted admission, so an unrelated concurrent subagent
@@ -1574,6 +1629,10 @@ export default function storm(pi: ExtensionAPI): void {
 		const generation = sessionGeneration;
 		const mainId = mainSessionId(ctx);
 		const runId = runs.runId();
+		if (event.toolName === "ask") {
+			const blocked = mainAskGate(ctx, event.input, autoOn, runId);
+			if (blocked !== undefined) return blocked;
+		}
 		if (runId === undefined) {
 			// Automatic delegation: the main session may orchestrate and inspect worker results, but every repository
 			// tool and every direct spawn is refused until the first plan opens this turn's run.
@@ -1963,7 +2022,10 @@ export default function storm(pi: ExtensionAPI): void {
 	/** The closure's in-memory view of one conversation is dropped at every identity boundary. */
 	const forgetConversation = (ctx: ExtensionContext): void => {
 		const id = mainSessionId(ctx);
-		if (id !== undefined) autos.delete(id);
+		if (id !== undefined) {
+			autos.delete(id);
+			decisions.forget(id);
+		}
 		stateCache.clear();
 		attempts.stop();
 		liveStatus.beginSession();
@@ -2034,7 +2096,13 @@ export default function storm(pi: ExtensionAPI): void {
 		const reason = runs.refusal();
 		if (reason !== undefined) return { ok: false, reason };
 		await activateTool();
-		return runs.start(ctx, spec);
+		const result = await runs.start(ctx, spec);
+		// A user-started run is a new user request even when the previous run already settled.
+		if (result.ok) {
+			const sessionId = mainSessionId(ctx);
+			if (sessionId !== undefined) decisions.nextRequest(sessionId, sessionGeneration);
+		}
+		return result;
 	};
 
 	/**
@@ -2131,6 +2199,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		sessionGeneration++;
 		autos.delete(sessionId);
+		decisions.forget(sessionId);
 		stateCache.clear();
 		const generation = sessionGeneration;
 		const epoch = liveStatus.beginSession();

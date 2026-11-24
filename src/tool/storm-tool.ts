@@ -1,12 +1,11 @@
 /**
  * The `storm` tool of the main session: `run` queues a Storm run for the end of the turn, `plan` puts a run plan in
- * force (asking the user when it goes past the approved bounds), `brief` stages the director's closeout for the
- * current run, `status` and `agents` report. Team changes are not here: the user makes them through `/storm`.
+ * force (refusing one past the approved bounds), `brief` stages the director's closeout for the current run,
+ * `status` and `agents` report. Team changes are not here: the user makes them through `/storm`.
  */
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
-import { isRecord, teamPriority } from "../config/schema.ts";
-import { planChange } from "../plan/change.ts";
+import { isRecord } from "../config/schema.ts";
 import {
 	LANE_NEEDS,
 	MAX_LANE_DEPENDENCIES,
@@ -21,14 +20,12 @@ import {
 	RESULT_KINDS,
 	validatePlan,
 } from "../plan/validate.ts";
-import { modelWarnings } from "../proposals/build.ts";
-import { NEEDS_APPROVAL } from "../proposals/decide.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
-import { type ActionOutcome, type ActionReply, NO_CONFIG, propose } from "../request/actions.ts";
+import { type ActionOutcome, type ActionReply, NO_CONFIG } from "../request/actions.ts";
 import { runSpec } from "../request/args.ts";
 import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
 import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, closeoutSessionId, parseCloseout } from "../runtime/closeout.ts";
-import { isApproved, type ProjectState } from "../state.ts";
+import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { StormToolHost } from "./host.ts";
 
@@ -55,7 +52,7 @@ const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
 
 const DESCRIPTION = `OMP Storm: hand work to the team, direct a run.
 - run {task}: team work; task verbatim; end reply; Storm starts after the turn.
-- plan {plan}: before spawns. lanes [{name,kind,role?,files?,goal?,progress?,isolationReason?,results,dependsOn?}], workers per role. Review: dirty tree; overlaps sequence. isolationReason: isolated experiment only; no review. results [{id,kind,criterion,path?,contains?,check?}]: required on every non-review lane, not proof; check=approved check. dependsOn [{lane,need:result|integrated|reviewable}]: wait; not proof. Replan: same name/kind/role/files/goal; progress=status; scope=new name. Past bounds: approval.
+- plan {plan}: before spawns. lanes [{name,kind,role?,files?,goal?,progress?,isolationReason?,results,dependsOn?}], workers per role. Review: dirty tree; overlaps sequence. isolationReason: isolated experiment only; no review. results [{id,kind,criterion,path?,contains?,check?}]: required on every non-review lane, not proof; check=approved check. dependsOn [{lane,need:result|integrated|reviewable}]: wait; not proof. Replan: same name/kind/role/files/goal; progress=status; scope=new name. Past bounds: refused.
 - brief {brief}: once after work: result, verification, remaining?, 3 next (first recommended). Stages only; menu after run; skip trivial.
 - status: team, approval, runs, trials, agents.
 - agents: subagents: context cap, follow-up allowance.
@@ -285,73 +282,47 @@ function planLines(config: StormConfig, plan: RunPlan): string[] {
 	return out;
 }
 
-/** What lies past the approved bounds, one line each. */
+/** What lies past the approved bounds, one line each: the exact role, its used count and the approved max. */
 function gapLines(gaps: readonly PlanGap[]): string[] {
 	return gaps.map((g) =>
 		g.kind === "workers"
-			? `- ${roleTitle(g.role)}(${g.role}): 워커 ${g.want}개 요청, 최대 ${g.max}`
-			: `- ${roleTitle(g.role)}(${g.role}): ${g.state === "disabled" ? "사용 안 함으로 설정된 역할" : "팀 설정에 없는 역할"}`,
+			? `- ${roleTitle(g.role)}(${g.role}): 워커 ${g.want}개 사용, 승인된 최대 ${g.max}개`
+			: `- ${roleTitle(g.role)}(${g.role}): 승인된 팀에 ${g.state === "disabled" ? "사용 안 함으로 설정된 역할" : "없는 역할"}`,
+	);
+}
+
+const OUT_OF_BOUNDS = "계획이 승인된 팀 범위를 넘어 적용하지 않았습니다. 팀 설정과 승인은 도구에서 바꾸지 않습니다.";
+
+/** A refused plan changes no config, approval, plan in force or spawn: only a new submitted plan can apply. */
+function outOfBoundsReply(config: StormConfig, gaps: readonly PlanGap[]): StormToolReply {
+	const approved = Object.keys(config.roles).map((id) => `${roleTitle(id)}(${id})`).join(", ") || "없음";
+	return rejected(
+		[
+			OUT_OF_BOUNDS,
+			...gapLines(gaps),
+			`- 승인된 역할: ${approved}`,
+			"워커 수를 승인된 최대 이하로 줄이거나 같은 역할의 승인된 워커 수만큼 레인을 순차 실행하도록 계획을 다시 제출하세요. 레인이나 필수 결과를 빼지 말고, 레인의 안전 범위(읽기·쓰기·리뷰)를 유지한 채 승인된 역할을 쓰세요. 역할 추가·활성화나 상한 변경은 사용자가 /storm에서 직접 해야 합니다.",
+		].join("\n"),
 	);
 }
 
 /**
- * Validates a run plan; past the approved bounds the user approves (or cancels) the config change first.
- * The plan goes in force for the active run; outside a run it is only checked.
+ * Validates a run plan. Past the approved bounds it is refused before it can reach the config, approval or run; a
+ * valid plan goes in force for the active run, and outside a run it is only checked.
  */
 async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Promise<StormToolReply> {
 	if (raw === undefined) return rejected("plan이 필요합니다.");
 	const cur = await loadCurrent(host);
 	if ("outcome" in cur) return cur;
-	let config = cur.config;
-	let validatedHash = cur.state.config.status === "ok" ? cur.state.config.hash : undefined;
-	let check = validatePlan(config, raw, host.now());
+	const config = cur.config;
+	const validatedHash = cur.state.config.status === "ok" ? cur.state.config.hash : undefined;
+	const check = validatePlan(config, raw, host.now());
 	if (check.errors.length) return rejected(`계획이 올바르지 않습니다. 고쳐서 다시 제출하세요.\n${check.errors.map((e) => `- ${e}`).join("\n")}`);
-	// A reused lane keeps the identity its evidence is bound to. Refuse before an out-of-bounds plan can open a team
-	// config proposal: a status update belongs in progress, and an actual change needs a new lane name.
+	// A reused lane keeps the identity its evidence is bound to. Refuse before the bounds check or any application:
+	// a status update belongs in progress, and an actual change needs a new lane name.
 	const conflict = host.runtime.replanConflict?.(check.plan!);
 	if (conflict !== undefined) return rejected(`계획을 적용하지 않았습니다. ${conflict}`);
-	const head: string[] = [];
-	const gaps = check.outOfBounds;
-	if (gaps.length && check.plan) {
-		if (!isApproved(cur.state)) return rejected(NEEDS_APPROVAL);
-		const adding = gaps.some((g) => g.kind === "role");
-		const ctx = adding ? await host.prepare() : undefined;
-		const built = planChange(config, gaps, ctx && { recs: ctx.recommend(teamPriority(config)) });
-		const maxima = Object.keys(check.plan.workers)
-			.filter((id) => config.roles[id])
-			.map((id) => `${roleTitle(id)} 최대 ${workerRange(id, config.roles[id]).max}`)
-			.join(", ");
-		const fit = `승인된 범위 안으로 계획을 줄여 다시 제출하세요(${maxima || "설정된 역할만 쓰세요"}).`;
-		if ("error" in built) return rejected(`계획이 승인된 범위를 넘습니다.\n${gapLines(gaps).join("\n")}\n${built.error}\n${fit}`);
-		const isolation = isolationLine(check.plan);
-		const dependencies = dependencyLine(check.plan);
-		const context = [
-			"### 실행 계획",
-			...check.plan.lanes.map((l) => `- ${l.name} (${l.kind} → ${roleTitle(l.role)})${l.files?.length ? `: ${l.files.join(", ")}` : ""}`),
-			...(isolation === undefined ? [] : [isolation]),
-			...(dependencies === undefined ? [] : [dependencies]),
-			"",
-			"### 범위를 넘는 것",
-			...gapLines(gaps),
-		].join("\n");
-		const reply = await propose(host, cur.state, "plan", built, {
-			warnings: [...check.warnings, ...(ctx ? modelWarnings(built.config, ctx) : [])],
-			context,
-		});
-		if (reply.outcome === "cancelled") {
-			return { outcome: "cancelled", text: `팀 설정을 바꾸지 않아 계획을 적용하지 않았습니다. 범위를 넘는 것:\n${gapLines(gaps).join("\n")}\n${fit}` };
-		}
-		if (reply.outcome !== "approved") return reply;
-		head.push(reply.text);
-		const fresh = await loadCurrent(host);
-		if ("outcome" in fresh) return fresh;
-		config = fresh.config;
-		validatedHash = fresh.state.config.status === "ok" ? fresh.state.config.hash : validatedHash;
-		check = validatePlan(config, raw, host.now());
-		if (check.errors.length || check.outOfBounds.length) {
-			return rejected(`${head.join("\n")}\n저장한 팀 설정으로도 계획이 범위를 넘습니다. 다시 제출하세요.\n${[...check.errors.map((e) => `- ${e}`), ...gapLines(check.outOfBounds)].join("\n")}`);
-		}
-	}
+	if (check.outOfBounds.length) return outOfBoundsReply(config, check.outOfBounds);
 	const plan = check.plan!;
 	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(config, plan)];
 	if (check.warnings.length) body.push("경고:", ...check.warnings.map((w) => `- ${w}`));
@@ -367,14 +338,13 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 		const started = await start(spec.spec, plan, validatedHash);
 		if (!started.ok) return rejected(started.reason);
 		return {
-			outcome: head.length ? "approved" : "ok",
-			text: [...head, `자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 이 계획 범위 안에서 승인된 팀 워커를 스폰하세요.`, ...body].join("\n"),
+			outcome: "ok",
+			text: [`자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 이 계획 범위 안에서 승인된 팀 워커를 스폰하세요.`, ...body].join("\n"),
 		};
 	}
 	const set = await host.runtime.setRunPlan(plan);
 	if (!set.ok) {
-		const saved = head.length ? " 승인한 범위 변경은 저장했습니다." : "";
-		return { outcome: head.length ? "approved" : "ok", text: [...head, `실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다).${saved} ${set.reason}`, ...body].join("\n") };
+		return { outcome: "ok", text: [`실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다). ${set.reason}`, ...body].join("\n") };
 	}
-	return { outcome: head.length ? "approved" : "ok", text: [...head, "실행 계획을 적용했습니다. 이 범위 안에서 스폰하세요.", ...body].join("\n") };
+	return { outcome: "ok", text: ["실행 계획을 적용했습니다. 이 범위 안에서 스폰하세요.", ...body].join("\n") };
 }

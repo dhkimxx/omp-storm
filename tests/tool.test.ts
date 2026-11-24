@@ -2,17 +2,50 @@ import { describe, expect, test } from "bun:test";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { MAX_LANE_DEPENDENCIES, MAX_LANE_RESULTS, MAX_LANE_TEXT, MAX_RESULT_CRITERION, MAX_RESULT_ID } from "../src/plan/validate.ts";
 import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
-import { APPROVE, CANCEL } from "../src/proposals/present.ts";
+import { APPROVE } from "../src/proposals/present.ts";
+import { runChange } from "../src/request/actions.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
 import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, type CloseoutDraft } from "../src/runtime/closeout.ts";
+import type { ProjectState } from "../src/state.ts";
 import type { RunRequestResult, StormToolHost } from "../src/tool/host.ts";
 import { createStormTool, runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
-import type { AgentEntry, RunPlan, RunSpec } from "../src/types.ts";
+import type { AgentEntry, RunPlan, RunSpec, StormConfig } from "../src/types.ts";
 import { fakeHost, NOW, STATUS_TEXT } from "./fake-host.ts";
 import { agentEntry as ledgerEntry } from "./fixtures.ts";
 import { TEAM as base } from "./support.ts";
 
 const run = (f: { host: StormToolHost }, params: StormToolInput) => runStormTool(f.host, params);
+
+/** The tool-facing part of the fake host plus its no-mutation/UI probes. */
+interface ToolHostFixture {
+	host: StormToolHost;
+	config(): StormConfig | null;
+	selects: readonly unknown[];
+	saved: readonly unknown[];
+	plans: readonly RunPlan[];
+	runs: readonly RunSpec[];
+	prepares(): number;
+}
+
+/** Everything a refused plan must leave alone: config bytes, approval, dialogs, saves, spawns and the plan in force. */
+interface PlanSnapshot {
+	state: ProjectState;
+	bytes: string;
+	plans: RunPlan[];
+	runs: RunSpec[];
+}
+
+async function expectNoPlanMutation(f: ToolHostFixture, before: PlanSnapshot) {
+	const after = await f.host.loadState();
+	expect(JSON.stringify(f.config())).toBe(before.bytes);
+	expect(after.config).toEqual(before.state.config);
+	expect(after.approval).toEqual(before.state.approval);
+	expect(f.selects).toEqual([]);
+	expect(f.saved).toEqual([]);
+	expect(f.prepares()).toBe(0);
+	expect(f.plans).toEqual(before.plans);
+	expect(f.runs).toEqual(before.runs);
+}
 
 /** The fresh-plan contract the tool boundary requires for a change or answer lane. */
 const coreLane = {
@@ -152,6 +185,7 @@ describe("plan", () => {
 		expect(r.outcome).toBe("ok");
 		expect(f.selects).toEqual([]);
 		expect(f.saved).toEqual([]);
+		expect(f.prepares()).toBe(0);
 		expect(f.plans).toHaveLength(1);
 		expect(f.plans[0]!.workers.implementer).toBe(2);
 		expect(f.plans[0]!.lanes.map(l => l.role)).toEqual(["implementer", "explorer"]);
@@ -263,20 +297,6 @@ describe("plan", () => {
 		expect(r.text.split("\n").filter((line) => line.startsWith("- 격리("))).toHaveLength(1);
 	});
 
-	test("an approval dialog shows the isolation exception once and the approved plan keeps it", async () => {
-		const f = fakeHost({ runActive: true, answers: [APPROVE] });
-		const r = await run(f, {
-			action: "plan",
-			plan: {
-				lanes: [coreLane, probeLane],
-				workers: { implementer: 5 },
-			},
-		});
-		expect(r.outcome).toBe("approved");
-		expect(f.selects[0]!.markdown?.split("\n").filter((line) => line.startsWith("- 격리("))).toHaveLength(1);
-		expect(f.plans[0]!.lanes[1]!.isolationReason).toBe("compare parser backends");
-	});
-
 	test("a final review lane cannot request selective isolation", async () => {
 		const f = fakeHost({ runActive: true });
 		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "check", kind: "review", isolationReason: "independent experiment" }] } });
@@ -303,7 +323,7 @@ describe("plan", () => {
 	});
 
 	test("an invalid dependency rejects before any dialog, save or applied plan", async () => {
-		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+		const f = fakeHost({ runActive: true });
 		const r = await run(f, {
 			action: "plan",
 			plan: { lanes: [{ ...coreLane, dependsOn: [{ lane: "gone", need: "result" }] }], workers: { implementer: 5 } },
@@ -315,22 +335,8 @@ describe("plan", () => {
 		expect(f.saved).toEqual([]);
 	});
 
-	test("the approval dialog shows the dependency edges of the plan it asks to widen", async () => {
-		const f = fakeHost({ runActive: true, answers: [APPROVE] });
-		const r = await run(f, {
-			action: "plan",
-			plan: {
-				lanes: [coreLane, { ...scanLane, name: "consume", dependsOn: [{ lane: "core", need: "reviewable" }] }],
-				workers: { implementer: 4 },
-			},
-		});
-		expect(r.outcome).toBe("approved");
-		expect(f.selects[0]!.markdown).toContain("- 선행: consume ← core(reviewable)");
-		expect(f.plans[0]!.lanes[1]!.dependsOn).toEqual([{ lane: "core", need: "reviewable" }]);
-	});
-
-	test("a replan conflict is refused before an out-of-bounds plan can open a proposal", async () => {
-		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+	test("a replan conflict is refused before the bounds check or any dialog", async () => {
+		const f = fakeHost({ runActive: true });
 		const host: StormToolHost = {
 			...f.host,
 			runtime: {
@@ -354,54 +360,97 @@ describe("plan", () => {
 		expect((await run(fakeHost({ config: null }), { action: "plan", plan: { lanes } })).outcome).toBe("rejected");
 	});
 
-	test("past the bounds of an unapproved config: refused, nothing asked, nothing saved", async () => {
+	test("an unapproved config still refuses an out-of-bounds plan on its merits, with nothing asked or saved", async () => {
 		const f = fakeHost({ approved: false, runActive: true });
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
 		const r = await run(f, { action: "plan", plan: { lanes: [coreLane], workers: { implementer: 9 } } });
-		expect(r).toEqual({ outcome: "rejected", text: NEEDS_APPROVAL });
-		expect(f.selects).toEqual([]);
-		expect(f.prepares()).toBe(0);
-		expect(f.saved).toEqual([]);
-		expect(f.plans).toEqual([]);
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).not.toBe(NEEDS_APPROVAL);
+		expect(r.text).toContain("워커 9개 사용");
+		expect(r.text).toContain("승인된 최대 3개");
+		await expectNoPlanMutation(f, before);
 	});
 
-	test("workers past max: approving raises the max, then the plan applies", async () => {
-		const f = fakeHost({ runActive: true, answers: [APPROVE] });
-		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
-		expect(r.outcome).toBe("approved");
-		expect(f.selects[0]?.options).toEqual([APPROVE, CANCEL]);
-		expect(f.selects[0]?.markdown).toContain("core");
-		expect(f.saved).toHaveLength(1);
-		expect(f.saved[0]!.config.roles.implementer!.workers).toEqual({ min: 1, max: 5 });
-		expect(f.prepares()).toBe(0);
-		expect(f.plans[0]!.workers.implementer).toBe(5);
+	test("workers past max: refused with the exact role, used count and approved max; a valid follow-on still applies", async () => {
+		const f = fakeHost({ runActive: true });
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
+		const asked = { action: "plan" as const, plan: { lanes, workers: { implementer: 5 } } };
+		const r = await run(f, asked);
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("구현(implementer)");
+		expect(r.text).toContain("워커 5개 사용");
+		expect(r.text).toContain("승인된 최대 3개");
+		expect(r.text).toContain("순차 실행");
+		expect(r.text).toContain("/storm");
+		await expectNoPlanMutation(f, before);
+
+		// The same rejected call stays noninteractive and changes nothing.
+		expect(await run(f, asked)).toEqual(r);
+		await expectNoPlanMutation(f, before);
+
+		// A plan that fits the approved team continues normally.
+		const ok = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 3 } } });
+		expect(ok.outcome).toBe("ok");
+		expect(f.plans).toHaveLength(1);
+		expect(f.plans[0]!.workers.implementer).toBe(3);
 	});
 
-	test("a disabled role: approving adds it with recommended models, then the plan applies", async () => {
+	test("a disabled role: refused without adding or remapping it; a plan with approved roles continues", async () => {
 		const cfg = structuredClone(base);
 		delete cfg.roles.reviewer;
 		cfg.disabledRoles = ["reviewer"];
-		const f = fakeHost({ config: cfg, runActive: true, answers: [APPROVE] });
+		const f = fakeHost({ config: cfg, runActive: true });
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
 		const r = await run(f, { action: "plan", plan: { lanes: [...lanes, { name: "check", kind: "review", role: "reviewer" }] } });
-		expect(r.outcome).toBe("approved");
-		const saved = f.saved[0]!.config;
-		expect(saved.disabledRoles).toBeUndefined();
-		expect(saved.roles.reviewer).toEqual({ agent: "storm-reviewer", models: ["b/r:high"], workers: { min: 1, max: 2 } });
-		expect(f.plans[0]!.lanes[2]!.role).toBe("reviewer");
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("리뷰(reviewer)");
+		expect(r.text).toContain("사용 안 함으로 설정된 역할");
+		expect(r.text).toContain("/storm");
+		await expectNoPlanMutation(f, before);
+		expect(f.config()?.disabledRoles).toEqual(["reviewer"]);
+
+		const ok = await run(f, { action: "plan", plan: { lanes } });
+		expect(ok.outcome).toBe("ok");
+		expect(f.plans[0]!.lanes.map(l => l.role)).toEqual(["implementer", "explorer"]);
 	});
 
-	test("cancelling saves nothing and applies nothing", async () => {
-		const f = fakeHost({ runActive: true, answers: [CANCEL] });
-		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
-		expect(r.outcome).toBe("cancelled");
-		expect(f.saved).toEqual([]);
+	test("a rejected replan leaves the plan in force; the next fitting plan still applies", async () => {
+		const f = fakeHost({ runActive: true });
+		expect((await run(f, { action: "plan", plan: { lanes: [coreLane] } })).outcome).toBe("ok");
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
+		const r = await run(f, { action: "plan", plan: { lanes: [{ ...coreLane, progress: "절반" }], workers: { implementer: 5 } } });
+		expect(r.outcome).toBe("rejected");
+		await expectNoPlanMutation(f, before);
+		expect(f.plans[0]!.lanes[0]).not.toHaveProperty("progress");
+
+		const ok = await run(f, { action: "plan", plan: { lanes: [{ ...coreLane, progress: "절반" }] } });
+		expect(ok.outcome).toBe("ok");
+		expect(f.plans).toHaveLength(2);
+		expect(f.plans[1]!.lanes[0]!.progress).toBe("절반");
+	});
+
+	test("no active run: an out-of-bounds plan is refused and a fitting plan is checked, not stored or saved", async () => {
+		const f = fakeHost();
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
+		expect((await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } })).outcome).toBe("rejected");
+		await expectNoPlanMutation(f, before);
+
+		const checked = await run(f, { action: "plan", plan: { lanes } });
+		expect(checked.outcome).toBe("ok");
+		expect(checked.text).toContain("검증만 했습니다");
 		expect(f.plans).toEqual([]);
+		expect(f.saved).toEqual([]);
+		expect(f.selects).toEqual([]);
 	});
 
-	test("no active run: validated, not stored; an approved change still saves", async () => {
-		const f = fakeHost({ answers: [APPROVE] });
-		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
-		expect(r.outcome).toBe("approved");
+	test("explicit /storm settings still approves and saves after a plan refusal", async () => {
+		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+		const refused = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 5 } } });
+		expect(refused.outcome).toBe("rejected");
+		const changed = await runChange(f.host, { action: "settings", docs: false });
+		expect(changed.outcome).toBe("approved");
 		expect(f.saved).toHaveLength(1);
+		expect(f.saved[0]!.config.docs).toBe(false);
 		expect(f.plans).toEqual([]);
 	});
 });
@@ -552,6 +601,23 @@ describe("automatic delegation", () => {
 		expect(starts[0]!.hash).toMatch(/^jcs-sha256:/);
 		expect(starts[0]!.plan).toMatchObject({ lanes: [{ name: "core", kind: "code", role: "implementer" }], workers: { implementer: 1 } });
 		expect(f.plans).toEqual([]);
+	});
+
+	test("an out-of-bounds first plan is refused before startWithPlan; a fitting plan then starts", async () => {
+		const { f, host, starts } = autoHost({ task: "fix it" });
+		const before = { state: await f.host.loadState(), bytes: JSON.stringify(f.config()), plans: structuredClone(f.plans), runs: structuredClone(f.runs) };
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane], workers: { implementer: 5 } } });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("구현(implementer)");
+		expect(r.text).toContain("워커 5개 사용");
+		expect(r.text).toContain("승인된 최대 3개");
+		expect(starts).toEqual([]);
+		await expectNoPlanMutation(f, before);
+
+		const ok = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
+		expect(ok.outcome).toBe("ok");
+		expect(starts).toHaveLength(1);
+		expect(starts[0]!.plan.workers.implementer).toBe(1);
 	});
 
 	test("without a captured user request it refuses instead of writing a plan", async () => {

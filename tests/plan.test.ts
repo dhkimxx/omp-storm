@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { planChange } from "../src/plan/change.ts";
 import {
 	MAX_LANE_DEPENDENCIES,
 	MAX_LANE_RESULTS,
@@ -12,10 +11,8 @@ import {
 	parseLaneResults,
 	validatePlan,
 } from "../src/plan/validate.ts";
-import { ROLES } from "../src/roles.ts";
-import type { Candidate, RoleRecommendation, StormConfig } from "../src/types.ts";
+import type { StormConfig } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
-import { cand as candidate } from "./support.ts";
 
 const NOW = Date.parse("2026-11-21T00:00:00Z");
 /** A minimal observable contract for a fresh lane: answer lanes report, change lanes deliver a tree change. */
@@ -584,41 +581,5 @@ describe("validatePlan", () => {
 			const bad = parseLaneDependencies([{ lane: "produce", need: "done" }]);
 			expect(bad.ok).toBe(false);
 		});
-	});
-});
-
-const cand = (selector: string): Candidate => candidate(selector, { label: selector });
-
-describe("planChange", () => {
-	const recs: RoleRecommendation[] = ROLES.map((role) => ({
-		role,
-		candidates: [cand(`a/${role.id}`), cand(`b/${role.id}`)],
-		chosenIndex: 0,
-		fallback: cand(`b/${role.id}`),
-		excluded: [],
-	}));
-
-	test("raises max keeping min, and adds a disabled role with recommended models and default range", () => {
-		const r = planChange(
-			config,
-			[
-				{ kind: "role", role: "architect", state: "disabled" },
-				{ kind: "workers", role: "implementer", want: 5, max: 3 },
-				{ kind: "workers", role: "quick", want: 4, max: 2 },
-			],
-			{ recs },
-		);
-		if ("error" in r) throw new Error(r.error);
-		expect(r.config.roles.implementer!.workers).toEqual({ min: 1, max: 5 });
-		expect(r.config.roles.quick!.workers).toEqual({ min: 2, max: 4 });
-		// The role is built the way setup builds it: the recommendation's pick, then its fallback, the default worker range.
-		expect(r.config.roles.architect).toMatchObject({ agent: "storm-architect", workers: { min: 1, max: 1 } });
-		expect(r.config.roles.architect?.models.map((m) => m.split(":")[0])).toEqual(["a/architect", "b/architect"]);
-		expect(r.config.disabledRoles).toBeUndefined();
-	});
-
-	test("a role to add needs recommendations; a want past 16 fails validation", () => {
-		expect(planChange(config, [{ kind: "role", role: "explorer", state: "missing" }])).toHaveProperty("error");
-		expect(planChange(config, [{ kind: "workers", role: "implementer", want: 17, max: 3 }])).toHaveProperty("error");
 	});
 });

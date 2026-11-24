@@ -1,11 +1,11 @@
 /**
- * What the `storm` tool needs from the extension. The extension wires real implementations;
- * tests pass fakes. The tool never writes config or approvals except through `approveAndSave`,
- * and only after the user picked the exact approval label.
+ * What the `storm` tool needs from the extension. The extension wires real implementations and tests pass fakes. A
+ * plan past the approved bounds is refused: the tool never reads the UI, prepares analysis, or writes config or
+ * approvals.
  */
-import type { DecideHost } from "../proposals/decide.ts";
 import type { CloseoutDraft } from "../runtime/closeout.ts";
-import type { AgentEntry, AnalysisContext, RunPlan, RunSpec } from "../types.ts";
+import type { ProjectState } from "../state.ts";
+import type { AgentEntry, RunPlan, RunSpec } from "../types.ts";
 
 export type RunRequestResult = { ok: true; runId: string } | { ok: false; reason: string };
 
@@ -23,11 +23,11 @@ export interface AutoDelegationState {
 	task?: string;
 }
 
-/** `ui`, `loadState` and `approveAndSave` are the approval path's (`DecideHost`). */
-export interface StormToolHost extends DecideHost {
+/** The tool's host: project reads and the run operations only. Config/approval writes stay with `/storm` flows. */
+export interface StormToolHost {
+	/** Reads this session's project state fresh; the extension guards that it is still the owning conversation. */
+	loadState(): Promise<ProjectState>;
 	now(): number;
-	/** Reads catalog, quota and usage, then analyzes. Slow (seconds); may refresh omp's stats DB. */
-	prepare(): Promise<AnalysisContext>;
 	/** The status report `/storm status` shows, as markdown; `quota` adds omp's provider quota (about a second). */
 	statusText(opts: { quota: boolean }): Promise<string>;
 	/** The main session's automatic-delegation policy; absent hosts behave as if it were never opted in. */
@@ -37,8 +37,8 @@ export interface StormToolHost extends DecideHost {
 		requestRun(spec: RunSpec): RunRequestResult;
 		/**
 		 * Why this plan would rewrite the evidence identity of a lane already in force, if it would; absent outside a
-		 * run or when the runtime cannot answer. The tool checks it before a config proposal, and setRunPlan again at
-		 * commit, so a refused replan neither opens nor saves a team change.
+		 * run or when the runtime cannot answer. The tool checks it before the bounds check, and setRunPlan again at
+		 * commit, so a refused replan leaves the plan in force untouched.
 		 */
 		replanConflict?(plan: RunPlan): string | undefined;
 		/**

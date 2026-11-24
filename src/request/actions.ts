@@ -1,7 +1,7 @@
 /**
  * Team changes a `/storm <request>` resolves to: priority, workers, model reselection, quota marks, trials, budget
  * and switches. Each builds a config with the builders and goes through `decideProposal`, so nothing is saved
- * without the exact approval label. The storm tool's plan action uses the same `propose` for out-of-bounds plans.
+ * without the exact approval label. The storm tool has no config-changing action; out-of-bounds plans are refused.
  */
 import { shortHash } from "../config/canonical.ts";
 import { isRecord, teamPriority } from "../config/schema.ts";
@@ -76,11 +76,11 @@ export async function propose(
 	state: ProjectState,
 	kind: ProposalKind,
 	built: Built,
-	opts: { warnings?: readonly string[]; context?: string } = {},
+	opts: { warnings?: readonly string[] } = {},
 ): Promise<ActionReply> {
 	if ("error" in built) return rejected(built.error);
-	// A team change applies to this session at the current target; a run plan names its own target in its context.
-	const context = [kind === "plan" ? "" : targetScopeLine(state.repo.root), opts.context ?? ""].filter(Boolean).join("\n\n");
+	// A team change applies to this session at the current target; the approval dialog names it above the diff.
+	const context = targetScopeLine(state.repo.root);
 	const decision = await decideProposal(host, state, { kind, summary: built.summary, config: built.config }, { ...opts, context });
 	switch (decision.outcome) {
 		case "approved":

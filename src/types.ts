@@ -1069,7 +1069,7 @@ export interface SpawnOutcome {
 
 // ── Proposals (implemented in src/proposals) ──────────────────────────────────────────────────
 
-export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "settings" | "setup" | "plan";
+export type ProposalKind = "priority" | "workers" | "reselect" | "quota" | "trial" | "budget" | "settings" | "setup";
 
 /** A config change waiting for the user's answer in the approval dialog; it lives in memory only. */
 export interface Proposal {
