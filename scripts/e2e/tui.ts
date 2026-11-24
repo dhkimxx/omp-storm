@@ -36,6 +36,8 @@ const OLD_PROMPT = "자동 위임을 켤까요?";
 /** The head of omp's form panel (answered and total fields) and the label of its last stop. */
 const FORM_HEAD = /Ask · (\d+) of (\d+) answered/g;
 const FORM_SUBMIT = "Submit";
+/** Exact user text materialized in the seed transcript before every interactive launch. */
+const SESSION_SEED = "Storm TUI fixture transcript.";
 
 const env = prepare("storm-e2e-tui", 18559);
 const suite = new Suite("E2E (tui)", env);
@@ -108,11 +110,18 @@ function idleFooter(line: string | undefined): boolean {
 	});
 }
 
+async function readyForSubmission(tui: Tui): Promise<void> {
+	await tui.ready();
+	// OMP can already paint the composer and accept typing while startup still disables Enter. Replay starts
+	// after the submit gate is lifted and the prior draft has been restored, so wait for the resumed transcript.
+	await tui.shows(SESSION_SEED);
+}
+
 async function session<T>(body: (tui: Tui, files: StormFiles) => Promise<T>, model = "fake/general-b", flags: string[] = []): Promise<T> {
 	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
 	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags], resume: ownedSession.id, sessionDir: ownedSession.dir });
 	try {
-		await tui.ready();
+		await readyForSubmission(tui);
 		return await body(tui, new StormFiles(env, tui.sessionId));
 	} finally {
 		await tui.close();
@@ -223,7 +232,7 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, background, resume: ownedSession.id, sessionDir: ownedSession.dir });
 	const named = (name: string): string => `${background}: ${name}`;
 	try {
-		await tui.ready();
+		await readyForSubmission(tui);
 		await tui.seen(0, () => (idleFooter(statusLine(tui.raw)) ? true : undefined), named("narrow idle footer"), 30_000);
 		const idle = statusLine(tui.raw);
 		check(named("the narrow footer uses the shared mark and an idle state"), idleFooter(idle), idle ?? "no status line");
@@ -288,7 +297,7 @@ async function asciiDashboard(): Promise<void> {
 	const columns = 60;
 	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, resume: ownedSession.id, sessionDir: ownedSession.dir });
 	try {
-		await tui.ready();
+		await readyForSubmission(tui);
 		const before = files.runIds();
 		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Ascii", say: `E2E-CHILD-DELAY 2500 ${readProbe}` }, { awaitChild: true }];
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
@@ -325,7 +334,7 @@ async function main(): Promise<void> {
 	const seed = new Rpc(env, cancelAll, { model: "fake/general-b" });
 	try {
 		await seed.ready();
-		await seed.turn("hello");
+		await seed.turn(SESSION_SEED);
 		await seed.identify();
 		if (seed.sessionFile === undefined || !existsSync(seed.sessionFile)) throw new Error("the TUI fixture session wrote no transcript");
 		ownedSession = { id: seed.sessionId, dir: seed.sessionDir };
@@ -791,7 +800,7 @@ async function main(): Promise<void> {
 			const tui = new Tui(env, { model: "fake/general-b", resume: ownedSession.id, sessionDir: ownedSession.dir });
 			let runId: string | undefined;
 			try {
-				await tui.ready();
+				await readyForSubmission(tui);
 				const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { awaitChild: true }];
 				const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 				await tui.seen(

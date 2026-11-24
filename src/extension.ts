@@ -623,6 +623,7 @@ export default function storm(pi: ExtensionAPI): void {
 	 */
 	interface AutoEntry extends AutoStatus {
 		task: string | undefined;
+		settling?: Promise<void>;
 		epoch: number;
 	}
 	const autos = new Map<string, AutoEntry>();
@@ -1457,13 +1458,20 @@ export default function storm(pi: ExtensionAPI): void {
 			// are generated continuations: neither may capture or replace the task a plan opens.
 			if (event.reason !== "prompt") return undefined;
 			const prompt = typeof event.prompt === "string" ? event.prompt : "";
-			if (prompt.trim() === "") {
-				// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
-				if (runs.runId() === undefined) auto.task = undefined;
-				return undefined;
-			}
-			const runMessage = prompt.trimStart().startsWith("<storm-run ");
+			const text = prompt.trimStart();
+			const runMessage = text.startsWith("<storm-run ");
 			if (!runMessage) {
+				// The host can start a new prompt while its detached terminal agent_end is still closing Storm's run.
+				// Wait for that decision and lease release before deciding if this is a new task or run context.
+				if (auto.settling !== undefined) {
+					await auto.settling.catch(() => undefined);
+					if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId || autos.get(sessionId) !== auto) return undefined;
+				}
+				if (text === "") {
+					// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
+					if (runs.runId() === undefined) auto.task = undefined;
+					return undefined;
+				}
 				// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
 				// reminders and steers must not replace it; a prompt while this session directs is run context.
 				if (runs.runId() === undefined && auto.task === undefined) {
@@ -1983,18 +1991,20 @@ export default function storm(pi: ExtensionAPI): void {
 			}
 			return;
 		}
-		// Snapshot the identity before any await: the host may mutate the session manager when the conversation changes.
 		const eventSessionId = mainSessionId(ctx);
+		const auto = !event.willContinue && eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
+		// Clear the ending request before yielding; a detached old handler must never clear a newer prompt's task.
+		if (auto !== undefined) auto.task = undefined;
 		// Paused on async subagents: the moment to shed context before their results arrive. Both manual and automatic
 		// runs use the same background handoff, so the recorded ledger is identical.
 		if (event.awaitingAsyncWork) runs.startCheckpoint();
 		// Ends the run when the session settles; a queued run starts detached from this handler.
-		await runs.onAgentEnd(event, ctx);
-		if (!event.willContinue) {
-			// The user turn is over, including a paused async wait: the next prompt must supply its own task. Only the
-			// entry this event started under may be cleared, never a conversation that replaced it.
-			const auto = eventSessionId === undefined ? undefined : autos.get(eventSessionId);
-			if (auto !== undefined) auto.task = undefined;
+		const settlement = runs.onAgentEnd(event, ctx);
+		if (auto !== undefined && !event.awaitingAsyncWork) auto.settling = settlement;
+		try {
+			await settlement;
+		} finally {
+			if (auto?.settling === settlement) delete auto.settling;
 		}
 		if (!event.willContinue && !event.awaitingAsyncWork) {
 			// A plugin update installed meanwhile shows up on the status line without waiting for /storm.

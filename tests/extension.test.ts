@@ -2087,11 +2087,58 @@ describe("automatic delegation", () => {
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "old request", systemPrompt: [] }, main);
 		await omp.emit("agent_end", {}, main);
+		await omp.emit("before_agent_start", { reason: "revive", prompt: "revived context", systemPrompt: [] }, main);
+		await omp.emit("before_agent_start", {
+			reason: "prompt",
+			prompt: '<storm-run id="old" round="2/2">continue</storm-run>',
+			systemPrompt: [],
+		}, main);
+		const missing = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
+		expect(missing.outcome).toBe("rejected");
+		expect(missing.text).toContain("사용자 요청을 찾지 못했습니다");
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "new request", systemPrompt: [] }, main);
 		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
 		expect(reply.outcome).toBe("ok");
 		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
 		expect(await readRun(project.sessionDir, runId as string)).toMatchObject({ request: "new request" });
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a new user prompt can overlap detached Storm closeout without losing its task", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const finalizing = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const exec = project.env.exec;
+		let holdCloseout = false;
+		project.env.exec = async (command, args, options) => {
+			if (holdCloseout && command === "git" && args.includes("--show-toplevel")) {
+				holdCloseout = false;
+				finalizing.resolve();
+				await release.promise;
+			}
+			return exec(command, args, options);
+		};
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const plan = { action: "plan", plan: { lanes: [fixLane] } };
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "old request", systemPrompt: [] }, main);
+		expect((await omp.toolReply(plan, main)).text).toContain("자동 위임 실행");
+		await omp.emit("agent_start", {}, main);
+		// Hold the old run's cleanup, after it drops the active ledger but before its terminal handler returns.
+		holdCloseout = true;
+		const ending = omp.emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, main);
+		await finalizing.promise;
+		const next = omp.emit("before_agent_start", { reason: "prompt", prompt: "new request", systemPrompt: [] }, main);
+		release.resolve();
+		await Promise.all([ending, next]);
+
+		expect((await lastRun(project.sessionDir))?.request).toBe("old request");
+		expect((await omp.toolReply(plan, main)).text).toContain("자동 위임 실행");
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		expect(await readRun(project.sessionDir, runId)).toMatchObject({ request: "new request" });
+		expect(omp.sent).toEqual([]);
 		await omp.emit("session_shutdown", {}, main);
 	});
 
