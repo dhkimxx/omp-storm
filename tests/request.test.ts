@@ -396,6 +396,7 @@ describe("changes: approval gate", () => {
 			// A teammate's edit: another implementer model and parallelism, never approved here.
 			const edited = structuredClone(base);
 			edited.roles.implementer!.models = ["z/teammate"];
+			edited.roles.explorer!.workers = { min: 2, max: 4 }; // a saved range that differs from current setup defaults
 			edited.parallelism = 9;
 			await writeFile(configPath(project.sessionDir), serializeConfig(edited));
 			const f = scriptedUi([]);

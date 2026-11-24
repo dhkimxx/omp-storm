@@ -904,6 +904,97 @@ describe("declared results", () => {
 	});
 });
 
+describe("non-code output settlement", () => {
+	const output = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "answer", lane: "read", state: "accepted", kind: "answer", ...over });
+	const artifact = (over: Partial<CoverageResult> = {}): CoverageResult => output({ id: "artifact", lane: "experiment", kind: "artifact", ...over });
+
+	test("all accepted answers/artifacts with done coverage return the existing verified gate", () => {
+		expect(reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output()] })).toEqual({ state: "passed" });
+		expect(
+			reviewGate(
+				[],
+				TEAM,
+				{ start: CLEAN, now: CLEAN },
+				{ checks: [], lanes: [{ name: "read", state: "done" }, { name: "experiment", state: "done", writes: false }], results: [output(), artifact()] },
+			),
+		).toEqual({ state: "passed" });
+		// Absent lanes mean no plan coverage remains, exactly as the ordinary no-changes gate reads it.
+		expect(reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], results: [output()] })).toEqual({ state: "passed" });
+		const gate = reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output()] });
+		expect(decideRound({ gate, turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 })).toEqual({
+			action: "end",
+			reason: "verified",
+		});
+	});
+
+	test("an open required result stays the results cause instead of passing", () => {
+		const negative = output({ state: "unmet", reason: "인용한 출처가 답과 일치하지 않습니다." });
+		expect(reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [negative] })).toMatchObject({
+			state: "unverified",
+			cause: "results",
+			result: "answer",
+			resultState: "unmet",
+			resultReason: "인용한 출처가 답과 일치하지 않습니다.",
+		});
+		// One accepted output never hides a second requirement that was not accepted.
+		expect(
+			reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output(), output({ id: "negative", state: "reviewable" })] }),
+		).toMatchObject({ state: "unverified", cause: "results", result: "negative", resultState: "reviewable" });
+	});
+
+	test("a change row, a legacy row without a media, or an open dependency keeps the ordinary gate", () => {
+		expect(reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output({ kind: "change" })] })).toEqual({
+			state: "none",
+			why: "no-changes",
+		});
+		expect(
+			reviewGate(
+				[],
+				TEAM,
+				{ start: CLEAN, now: CLEAN },
+				{ checks: [], lanes: [], results: [{ id: "answer", lane: "read", state: "accepted" }] },
+			),
+		).toEqual({
+			state: "none",
+			why: "no-changes",
+		});
+		expect(
+			reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output({ blockedBy: "producer" })] }),
+		).toEqual({ state: "none", why: "no-changes" });
+	});
+
+	test("an unfinished lane, missing required check, or open P0 never becomes verified", () => {
+		expect(
+			reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [{ name: "read", state: "pending" }], results: [output()] }),
+		).toMatchObject({ state: "unverified", cause: "lanes", lane: "read" });
+		const checked = teamOf({ implementer: "a/i", reviewer: "a/r" }, { requiredChecks: [{ name: "test", argv: ["true"] }] });
+		expect(reviewGate([], checked, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output()] })).toEqual({
+			state: "none",
+			why: "no-changes",
+		});
+		// A real passing check on the unchanged tree is the evidence the verified gate may use.
+		expect(
+			reviewGate(
+				[],
+				checked,
+				{ start: CLEAN, now: CLEAN },
+				{ checks: [check({ tree: treeFingerprint(CLEAN) })], lanes: [], requiredChecks: ["test"], results: [output()] },
+			),
+		).toEqual({ state: "passed" });
+		const p0 = reviewer(T0 + 1, true, { tree: treeFingerprint(CLEAN), findings: findings(0) });
+		expect(reviewGate([p0], TEAM, { start: CLEAN, now: CLEAN }, { checks: [], lanes: [], results: [output()] })).toEqual({
+			state: "none",
+			why: "no-changes",
+		});
+	});
+
+	test("a code change still follows the review path rather than the output settlement", () => {
+		expect(
+			reviewGate([writer()], TEAM, { start: CLEAN, now: CHANGED }, { checks: [], lanes: [], results: [output()] }),
+		).toMatchObject({ state: "unverified", cause: "no-review", changes: 1 });
+	});
+});
+
 describe("S3 directed result feedback", () => {
 	const openRow = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "r1", lane: "work", state: "unmet", ...over });
 	const gateOf = (rows: readonly CoverageResult[], over: Partial<CoverageInput> = {}): Unverified => {

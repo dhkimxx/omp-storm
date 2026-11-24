@@ -149,6 +149,11 @@ export type ResultRemedy = "work" | "replan" | "review" | "producer" | "retry" |
 /** The media a required result is observed in; mirrors the plan's kind without importing plan types. */
 export type ResultKind = "change" | "artifact" | "answer";
 
+/** A requirement the tree cannot show: its acceptance is the run's own output proof, not a change review. */
+function isOutputKind(kind: ResultKind | undefined): kind is "answer" | "artifact" {
+	return kind === "answer" || kind === "artifact";
+}
+
 /** One declared requirement and how far the run's own evidence got; plan text alone never satisfies a row. */
 export interface CoverageResult {
 	/** Plan-wide stable id. */
@@ -429,6 +434,35 @@ function withResults(gate: Gate, coverage: CoverageInput | undefined): Gate {
 	};
 }
 
+/**
+ * A run that changed no file and whose every declared requirement is an already accepted answer or retained artifact
+ * has delivered the work it contracted. It may use the existing verified gate, but only the gate's own no-changes
+ * shape can be upgraded: a file change still needs the review path, and an open row, an unfinished lane, an open
+ * dependency, required check evidence that is not proof, or an unresolved P0 all keep the ordinary gate. Acceptance
+ * says the declared output was observed, never that a scientific claim or an unrun check was proven.
+ */
+function outputSettled(
+	agents: readonly AgentEntry[],
+	config: StormConfig,
+	tree: { start?: TreeState; now?: TreeState; rereviewedAt?: number } | undefined,
+	coverage: CoverageInput | undefined,
+): boolean {
+	if (coverage === undefined) return false;
+	const rows = coverage.results ?? [];
+	if (rows.length === 0) return false;
+	if (!rows.every(row => row.state === "accepted" && isOutputKind(row.kind) && row.blockedBy === undefined)) return false;
+	if ((coverage.lanes ?? []).some(lane => lane.state !== "done")) return false;
+	const treeNow = tree?.now === undefined || tree.now.incomplete ? undefined : treeFingerprint(tree.now);
+	const required = [...new Set([...(config.requiredChecks ?? []).map(check => check.name), ...(coverage.requiredChecks ?? [])])];
+	if (checkProblem(coverage, required, treeNow, lastWriterChangeAt(agents)) !== undefined) return false;
+	const reviewer = usableRole(config, "reviewer");
+	const verdicts =
+		reviewer === undefined ? [] : agents.filter(agent => agent.role === "reviewer" && agent.name === reviewer.agent && (agent.changes ?? 0) === 0);
+	// An unresolved P0 is never settled by an output row, and without the current tree its clearance cannot be proven.
+	if (verdicts.length > 0 && (treeNow === undefined || p0Remains(verdicts, treeNow))) return false;
+	return true;
+}
+
 /** What the run's file changes, the work tree and review verdicts amount to: nothing to verify, verified, or unverified with why. */
 export function reviewGate(
 	agents: readonly AgentEntry[],
@@ -436,7 +470,9 @@ export function reviewGate(
 	tree?: { start?: TreeState; now?: TreeState; rereviewedAt?: number },
 	coverage?: CoverageInput,
 ): Gate {
-	return withResults(gateCore(agents, config, tree, coverage), coverage);
+	const gate = gateCore(agents, config, tree, coverage);
+	if (gate.state === "none" && gate.why === "no-changes" && outputSettled(agents, config, tree, coverage)) return { state: "passed" };
+	return withResults(gate, coverage);
 }
 
 function gateCore(

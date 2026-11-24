@@ -121,41 +121,128 @@ export function usableRole(config: StormConfig, id: string): StormConfig["roles"
 }
 
 /**
- * A spawn decided this recently whose agent has not reported yet still counts as live: it is starting. The ledger
- * registers an agent on its first turn, so a spawn that never starts frees its slot after this.
+ * Legacy fallback for callers that pass no authoritative reservations: a spawn decided this recently whose agent has
+ * not reported still counts as starting. A managed run passes `reservedWorkers` and releases on an observed failure or
+ * settled turn instead, so this timer never decides its concurrency.
  */
 export const PENDING_SPAWN_MS = 30_000;
 
 /** The role a live spawn counts against: a stand-in spawn counts against the role it asked for, not the borrowed one. */
-function countedRole(record: SpawnRecord): string | undefined {
+export function countedRole(record: SpawnRecord): string | undefined {
 	if (record.outcome === "substituted" && record.agent.startsWith(ROLE_AGENT_PREFIX)) {
 		return ROLES.find(r => r.agent === record.agent)?.id ?? record.role;
 	}
 	return record.role;
 }
 
+/** One live worker reservation: a fresh spawn the host has not shown yet, or a reused worker's new work turn. */
+export interface WorkerSlot {
+	/** Host spawn key or agent id; one worker has one slot however many work-bearing notes it receives. */
+	key: string;
+	role?: string;
+	lane?: string;
+	at: number;
+}
+
 /**
- * Live agents of a run: spawns Storm let through whose agent is running in the ledger, or that have no ledger entry
- * yet and were decided within `PENDING_SPAWN_MS`. Records without a spawn key cannot be matched and do not count.
+ * The one authoritative concurrency accounting of a run. A spawn decision reserves before the host has a running
+ * agent row; a genuine reactivation (work delivered to an idle/parked worker) reserves the same way. A work-bearing
+ * note to an already running worker reuses its slot and a `?progress` note never reaches admission. Release happens
+ * only on an observed failure, a settled turn (or park), or a closed run — never because a pending timer expired.
+ */
+const workerSlots = new Map<string, Map<string, WorkerSlot>>();
+
+function slotsOf(runId: string): Map<string, WorkerSlot> {
+	let slots = workerSlots.get(runId);
+	if (!slots) workerSlots.set(runId, (slots = new Map()));
+	return slots;
+}
+
+/** Reserve one worker slot. Re-reserving the same key only refreshes its role/lane: it is never a second slot. */
+export function reserveWorkerSlot(input: { runId: string; key: string; role?: string; lane?: string; now?: number }): void {
+	if (!input.runId || !input.key) return;
+	const slots = slotsOf(input.runId);
+	const current = slots.get(input.key);
+	if (current !== undefined) {
+		if (input.role !== undefined) current.role = input.role;
+		if (input.lane !== undefined) current.lane = input.lane;
+		return;
+	}
+	slots.set(input.key, {
+		key: input.key,
+		...(input.role === undefined ? {} : { role: input.role }),
+		...(input.lane === undefined ? {} : { lane: input.lane }),
+		at: input.now ?? Date.now(),
+	});
+}
+
+export function workerSlot(runId: string, key: string): WorkerSlot | undefined {
+	return workerSlots.get(runId)?.get(key);
+}
+
+/** Every live reservation of a run, for admission counts and the extension's follow-up gate. */
+export function reservedWorkers(runId: string): readonly WorkerSlot[] {
+	return [...(workerSlots.get(runId)?.values() ?? [])];
+}
+
+/** Drop one worker's slot after a failure, a settled turn, a park, or a closed run. */
+export function releaseWorkerSlot(runId: string, key: string): boolean {
+	const slots = workerSlots.get(runId);
+	if (!slots || !slots.delete(key)) return false;
+	if (slots.size === 0) workerSlots.delete(runId);
+	return true;
+}
+
+export function clearWorkerSlots(runId: string): void {
+	workerSlots.delete(runId);
+}
+
+/** Tests only: no slot may leak from one fixture's run into another. */
+export function resetWorkerSlots(): void {
+	workerSlots.clear();
+}
+
+/**
+ * Live workers of a run. Identities are deduplicated so one worker is one slot: an authoritative reservation (a
+ * fresh start before the host row, or a safely bound reactivation), a spawn record whose host agent is running, or a
+ * running ledger agent without a spawn record. With `reserved` supplied, a spawn record with no reservation is not
+ * live on a timer: only an actual running agent or an explicit reservation counts. Without it (legacy callers and
+ * tests) the pending window remains a fallback.
  */
 export function activeAgents(
 	spawns: readonly SpawnRecord[],
 	agents: readonly AgentEntry[],
 	now: number,
+	reserved?: readonly Pick<WorkerSlot, "key" | "role">[],
 ): { total: number; byRole: Record<string, number> } {
 	const byId = new Map(agents.map(a => [a.id, a]));
+	const slots = new Map((reserved ?? []).map(slot => [slot.key, slot]));
+	const counted = new Set<string>();
 	const byRole: Record<string, number> = {};
-	let total = 0;
+	const count = (key: string, role: string | undefined): void => {
+		if (counted.has(key)) return;
+		counted.add(key);
+		if (role !== undefined) byRole[role] = (byRole[role] ?? 0) + 1;
+	};
 	for (const record of spawns) {
 		if (record.outcome === "blocked" || record.spawnKey === undefined) continue;
 		const agent = byId.get(record.spawnKey);
-		const live = agent ? agent.state === "running" : now - Date.parse(record.ts) < PENDING_SPAWN_MS;
-		if (!live) continue;
-		total++;
-		const role = countedRole(record);
-		if (role !== undefined) byRole[role] = (byRole[role] ?? 0) + 1;
+		const live = agent
+			? agent.state === "running"
+			: slots.has(record.spawnKey) || (reserved === undefined && now - Date.parse(record.ts) < PENDING_SPAWN_MS);
+		if (live) count(record.spawnKey, countedRole(record) ?? slots.get(record.spawnKey)?.role);
 	}
-	return { total, byRole };
+	// A reused worker has no current spawn record. Its reservation is one worker whether it is waiting, idle, or the
+	// host has already started the new turn. A running row can supply the role if the reservation omitted it.
+	for (const slot of slots.values()) {
+		const agent = byId.get(slot.key);
+		count(slot.key, slot.role ?? (agent?.state === "running" ? agent.role : undefined));
+	}
+	// A running agent without a spawn row or reservation still occupies a slot: never let it run uncounted.
+	for (const agent of agents) {
+		if (agent.state === "running") count(agent.id, agent.role);
+	}
+	return { total: counted.size, byRole };
 }
 
 /** During a run every Storm-decided spawn waits for the director's run plan. */
@@ -173,7 +260,7 @@ function totalBlock(config: StormConfig, runtime: SpawnRuntime): SpawnBlock | un
 	if (!runtime.run || total < config.parallelism) return undefined;
 	return {
 		code: "parallelism",
-		reason: `서브에이전트 ${total}개가 실행 중이라 팀 동시 상한 ${config.parallelism}개에 닿아 스폰을 막았습니다. 하나가 끝나기를 기다리세요.`,
+		reason: `서브에이전트 ${total}개가 실행 중이라 팀 동시 상한 ${config.parallelism}개에 닿아 스폰을 막았습니다. 사용자에게 묻지 말고 native wait나 완료 알림으로 하나가 끝난 뒤 다시 스폰하세요.`,
 	};
 }
 
@@ -194,7 +281,7 @@ function roleCapBlock(config: StormConfig, runtime: SpawnRuntime, roleId: string
 	const max = workerRange(roleId, config.roles[roleId]).max;
 	return {
 		code: "role-cap",
-		reason: `${roleTitle(roleId)} 역할 서브에이전트 ${running}개가 실행 중이라 계획의 워커 ${cap}개에 닿아 ${agent} 스폰을 막았습니다. 하나가 끝나기를 기다리거나, plan 동작으로 워커를 늘려 계획을 다시 내세요(이 역할 최대 ${max}개).`,
+		reason: `${roleTitle(roleId)} 역할 서브에이전트 ${running}개가 실행 중이라 계획의 워커 ${cap}개에 닿아 ${agent} 스폰을 막았습니다. 사용자에게 묻지 말고 native wait나 완료 알림으로 하나가 끝난 뒤 다시 스폰하거나, plan 동작으로 워커를 늘려 계획을 다시 내세요(이 역할 최대 ${max}개).`,
 	};
 }
 
@@ -206,7 +293,8 @@ function roleCapBlock(config: StormConfig, runtime: SpawnRuntime, roleId: string
 function laneBindingBlock(runtime: SpawnRuntime, roleId: string, agent: string, spawnKey: string | undefined): SpawnBlock | undefined {
 	const plan = runtime.run?.plan;
 	if (!plan) return undefined;
-	const eligible = plan.lanes.filter(lane => lane.role === roleId);
+	// A job lane uses a role only to name its lane kind; its work is run by the host, never by an AI worker.
+	const eligible = plan.lanes.filter(lane => lane.job === undefined && lane.role === roleId);
 	if (eligible.length === 0) {
 		return {
 			code: "unassigned-lane",

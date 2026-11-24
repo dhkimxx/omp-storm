@@ -216,6 +216,16 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 			line("필수 검사", prev?.requiredChecks !== undefined ? "없음" : undefined, next.requiredChecks !== undefined ? "없음" : DASH);
 		}
 	}
+	const beforeJobs = new Map(prev?.jobs?.map(job => [job.name, job]));
+	const afterJobs = new Map(next.jobs?.map(job => [job.name, job]));
+	for (const name of new Set([...beforeJobs.keys(), ...afterJobs.keys()])) {
+		const a = beforeJobs.get(name);
+		const b = afterJobs.get(name);
+		line(`정형 작업 ${name}`, a === undefined ? undefined : JSON.stringify(a), b === undefined ? "(삭제)" : JSON.stringify(b));
+	}
+	if (beforeJobs.size === 0 && afterJobs.size === 0 && (prev?.jobs !== undefined || next.jobs !== undefined)) {
+		line("정형 작업", prev?.jobs === undefined ? undefined : "없음", next.jobs === undefined ? DASH : "없음");
+	}
 	const ids = new Set([...Object.keys(prev?.roles ?? {}), ...Object.keys(next.roles)]);
 	for (const id of ids) {
 		const a = prev?.roles[id];
@@ -608,6 +618,7 @@ export function renderStatus(
 			undefined,
 			checks.length ? "status.info" : undefined,
 		);
+		if (team.jobs?.length) out.push(`- 정형 작업: ${team.jobs.map(job => job.name).join(" · ")}`);
 	}
 	if (model) {
 		runSection();

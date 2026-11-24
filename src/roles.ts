@@ -96,9 +96,13 @@ export const LANE_ROLES: Readonly<Record<LaneKind, RoleId>> = {
 	design: "architect",
 };
 
-/** Worker ranges a new team starts from: explorers and quick workers fan out, the expensive roles stay narrow. */
+/**
+ * Worker ranges a new team starts from: explorers and quick workers fan out, the expensive roles stay narrow.
+ * `min` is the setup suggestion and `max` the approved concurrency ceiling; a plan that omits its worker count uses
+ * its actual worker lanes (at least one, never past `max`), not `min`.
+ */
 export const DEFAULT_WORKERS: Readonly<Record<RoleId, WorkerRange>> = {
-	explorer: { min: 2, max: 4 },
+	explorer: { min: 1, max: 4 },
 	implementer: { min: 1, max: 2 },
 	reviewer: { min: 1, max: 2 },
 	quick: { min: 1, max: 3 },

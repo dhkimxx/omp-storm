@@ -5,7 +5,7 @@
  */
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
-import { isRecord } from "../config/schema.ts";
+import { isRecord, MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
 import {
 	LANE_NEEDS,
 	MAX_LANE_DEPENDENCIES,
@@ -44,24 +44,26 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["run", "plan", "brief", "status", "agents"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["run", "plan", "execute", "brief", "status", "agents"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
 const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
 
-const DESCRIPTION = `OMP Storm: hand work to the team, direct a run.
-- run {task}: team work; task verbatim; end reply; Storm starts after the turn.
-- plan {plan}: before spawns. lanes [{name,kind,role?,files?,goal?,progress?,isolationReason?,results,dependsOn?}], workers per role. Review: dirty tree; overlaps sequence. isolationReason: isolated experiment only; no review. results [{id,kind,criterion,path?,contains?,check?}]: required on every non-review lane, not proof; check=approved check. dependsOn [{lane,need:result|integrated|reviewable}]: wait; not proof. Replan: same name/kind/role/files/goal; progress=status; scope=new name. Past bounds: refused.
-- brief {brief}: once after work: result, verification, remaining?, 3 next (first recommended). Stages only; menu after run; skip trivial.
-- status: team, approval, runs, trials, agents.
-- agents: subagents: context cap, follow-up allowance.
+const DESCRIPTION = `OMP Storm: plan, delegate, and close approved work.
+- run {task}: queue verbatim request; end turn.
+- plan {plan}: before work. Each non-review lane needs results; dependsOn waits for proof. Keep name, kind, role, job, files and goal on replan; progress is status, new scope needs a new name. Review the dirty tree. Sequence overlaps.
+- execute {lanes}: ready run lanes with an approved job, not AI workers. Use a pathless answer with an exact stdout contains marker. Exit and marker prove execution only. Batch independent jobs; do not repeat accepted jobs.
+- brief {brief}: result, verification, remaining?, three concrete next directions (first recommended). Stages only; skip trivial.
+- status: team, approval, runs, approved job names.
+- agents: existing workers and follow-up allowance.
 Team: /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
 		action: z.enum(ACTIONS).describe("Operation to perform"),
 		task: z.string().optional().describe("run: the user's task request, verbatim"),
+		lanes: z.array(z.string().min(1).max(MAX_LANE_TEXT)).min(1).max(50).optional().describe("execute: exact planned job lane names"),
 		plan: z
 			.object({
 				lanes: z
@@ -70,6 +72,7 @@ function stormParams(z: Zod): StormToolSchema {
 							name: z.string().describe("Unique lane name"),
 							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
 							role: z.enum(ROLE_IDS).optional().describe("Role doing the lane; default from kind"),
+							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("Approved project job name; use with kind run instead of an AI worker"),
 							files: z.array(z.string()).optional().describe("Files the lane may change"),
 							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep it on replan"),
 							isolationReason: z
@@ -170,7 +173,7 @@ export function createStormTool(
 		defaultInactive: true,
 		// Reports change nothing; a run, a plan or a staged brief does.
 		approval: (args) => (isRecord(args) && (args.action === "status" || args.action === "agents") ? "read" : "write"),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			// Storm data belongs to one native main session. A child's own session is never a Storm session, and a host
 			// that exposes no identity has nowhere to keep the team: both fail closed without touching the conversation.
 			const refusal =
@@ -182,7 +185,7 @@ export function createStormTool(
 			if (refusal !== undefined) {
 				return { content: [{ type: "text", text: refusal }], details: { action: params.action, outcome: "rejected" } };
 			}
-			const reply = await runStormTool(hostFor(ctx), params);
+			const reply = await runStormTool(hostFor(ctx), params, signal);
 			return { content: [{ type: "text", text: reply.text }], details: { action: params.action, outcome: reply.outcome } };
 		},
 	};
@@ -216,7 +219,7 @@ async function loadCurrent(host: StormToolHost): Promise<Current | StormToolRepl
 	return { state, config: state.config.config };
 }
 
-export async function runStormTool(host: StormToolHost, params: StormToolInput): Promise<StormToolReply> {
+export async function runStormTool(host: StormToolHost, params: StormToolInput, signal?: AbortSignal): Promise<StormToolReply> {
 	switch (params.action) {
 		// Quota is left out: reading it costs seconds, and `/storm status` shows it.
 		case "status":
@@ -242,6 +245,14 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput):
 		}
 		case "plan":
 			return submitPlan(host, params.plan);
+		case "execute": {
+			const lanes = params.lanes;
+			if (lanes === undefined || lanes.length === 0 || lanes.length > 50 || new Set(lanes).size !== lanes.length) {
+				return rejected("실행할 서로 다른 계획 레인 이름 1~50개가 필요합니다.");
+			}
+			const reply = await host.runtime.executeJobs?.(lanes, signal);
+			return reply?.ok === true ? { outcome: "ok", text: reply.text } : rejected(reply?.reason ?? "이 호스트는 정형 실행을 지원하지 않습니다.");
+		}
 		case "brief": {
 			// Brief only stages a closeout for the current run: it never opens, plans, approves, or ends anything.
 			const draft = parseCloseout(params.brief);
@@ -275,6 +286,8 @@ function planLines(config: StormConfig, plan: RunPlan): string[] {
 		const lanes = plan.lanes.filter((l) => l.role === role).map((l) => l.name);
 		out.push(`- ${roleTitle(role)}(${role}): 워커 ${n}개/최대 ${workerRange(role, config.roles[role]).max} · 레인 ${lanes.join(", ")}`);
 	}
+	const jobs = plan.lanes.filter(lane => lane.job !== undefined).map(lane => `${lane.name} ← ${lane.job}`);
+	if (jobs.length > 0) out.push(`- 승인된 정형 작업: ${jobs.join(" · ")}`);
 	const isolation = isolationLine(plan);
 	if (isolation !== undefined) out.push(isolation);
 	const dependencies = dependencyLine(plan);
@@ -339,12 +352,12 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 		if (!started.ok) return rejected(started.reason);
 		return {
 			outcome: "ok",
-			text: [`자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 이 계획 범위 안에서 승인된 팀 워커를 스폰하세요.`, ...body].join("\n"),
+			text: [`자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 승인된 범위에서 워커를 스폰하거나 정형 레인을 실행하세요.`, ...body].join("\n"),
 		};
 	}
 	const set = await host.runtime.setRunPlan(plan);
 	if (!set.ok) {
 		return { outcome: "ok", text: [`실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다). ${set.reason}`, ...body].join("\n") };
 	}
-	return { outcome: "ok", text: ["실행 계획을 적용했습니다. 이 범위 안에서 스폰하세요.", ...body].join("\n") };
+	return { outcome: "ok", text: ["실행 계획을 적용했습니다. 승인된 범위에서 워커를 스폰하거나 정형 레인을 실행하세요.", ...body].join("\n") };
 }

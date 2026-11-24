@@ -72,9 +72,9 @@ const agentEntry = (over: Partial<AgentEntry> = {}): AgentEntry =>
 describe("tool definition", () => {
 	const tool = createStormTool(zod, () => fakeHost().host);
 
-	test("exposes exactly run, plan, brief, status and agents", () => {
+	test("exposes run, plan, execute, brief, status and agents without adding team changes", () => {
 		expect(tool).toMatchObject({ name: "storm", label: "Storm", loadMode: "essential", defaultInactive: true });
-		for (const action of ["run", "plan", "brief", "status", "agents"]) expect(tool.parameters.safeParse({ action }).success).toBe(true);
+		for (const action of ["run", "plan", "execute", "brief", "status", "agents"]) expect(tool.parameters.safeParse({ action }).success).toBe(true);
 		const gone = ["models", "priority", "workers", "reselect", "quota", "trial", "budget", "settings", "propose", "delete-everything"];
 		for (const action of gone) expect(tool.parameters.safeParse({ action }).success).toBe(false);
 	});
@@ -86,7 +86,7 @@ describe("tool definition", () => {
 		expect(tool.description).toContain("dependsOn");
 	});
 
-	test("the schema has exactly action, task, plan and brief", () => {
+	test("the schema accepts run fields but strips modes and unknown top-level fields", () => {
 		const draft = { result: "r", verification: "v", next: ["a", "b", "c"] };
 		const parsed = tool.parameters.parse({ action: "run", task: "t", plan: { lanes: [] }, brief: draft, mode: "loop", iterations: 3, minutes: 5, tokenBudget: 10 });
 		expect(Object.keys(parsed).sort()).toEqual(["action", "brief", "plan", "task"]);

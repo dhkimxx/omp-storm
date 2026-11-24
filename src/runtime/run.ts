@@ -277,7 +277,7 @@ export function buildHandoff(input: {
 	const rules = [
 		"- Delegate all changes; your own file edits are blocked.",
 		`- Before spawning use \`storm plan\`; non-review lanes need \`results\`. Kinds: ${laneRoles(config)}.`,
-		"- Replan: keep goal/kind/role/files/results; `progress`=status, new name=scope.",
+		"- Replan: keep goal/kind/role/job/files/results; `progress`=status, new name=scope.",
 		"- Cite file:line or command/exit/log; verify ranges.",
 		isolated
 			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. For follow-up, a new agent reads `agent://<id>`."
@@ -286,6 +286,9 @@ export function buildHandoff(input: {
 		"- Finish every lane or report its blocker.",
 		"- Stage `storm brief` from evidence, best next first; Storm reports after it settles.",
 	];
+	if (config.jobs?.length) {
+		rules.push(`- Approved project jobs: ${JSON.stringify(config.jobs.map(job => job.name))}. Plan kind run with job and use storm execute instead of spawning a worker.`);
+	}
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {
 		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;

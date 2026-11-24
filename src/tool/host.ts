@@ -46,6 +46,8 @@ export interface StormToolHost {
 		 * A write-capable plan upgrades the target lease, so the runtime may answer asynchronously.
 		 */
 		setRunPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string } | Promise<{ ok: true } | { ok: false; reason: string }>;
+		/** Executes already planned named jobs, not arbitrary commands. */
+		executeJobs?(lanes: readonly string[], signal?: AbortSignal): Promise<{ ok: true; text: string } | { ok: false; reason: string }>;
 		/**
 		 * Holds the director's closeout for this session's current run until it settles; a later brief replaces it.
 		 * Optional for hosts without the closeout runtime, which the tool then refuses.

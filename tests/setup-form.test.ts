@@ -72,7 +72,7 @@ describe("role form", () => {
 		expect(values(choiceOf(form, "fallback_explorer"))).toEqual([NONE, "a/x", "a/y", "b/z"]);
 		expect(values(choiceOf(page(inp, "implementer"), "primary_implementer"))).toEqual(["a/i", "c/j"]);
 		expect(defaultFormData(form)).toEqual({
-			primary_explorer: "a/x", fallback_explorer: "b/z", workers_min_explorer: 2, workers_max_explorer: 4,
+			primary_explorer: "a/x", fallback_explorer: "b/z", workers_min_explorer: 1, workers_max_explorer: 4,
 		});
 		const workers = textOf(form, "workers_max_explorer");
 		expect([workers.type, workers.min, workers.max, workers.required]).toEqual(["number", 1, 16, true]);
@@ -129,7 +129,7 @@ describe("role answers", () => {
 
 	test("unoffered answers fall back to defaults; the required role cannot be turned off", () => {
 		expect(read("explorer", { primary_explorer: "x/unknown", fallback_explorer: 7 })).toEqual({
-			primary: "a/x", fallback: "b/z", workers: { min: 2, max: 4 },
+			primary: "a/x", fallback: "b/z", workers: { min: 1, max: 4 },
 		});
 		expect(read("implementer", { primary_implementer: NONE })).toMatchObject({ primary: "a/i" });
 	});

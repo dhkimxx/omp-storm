@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { BUILTIN_AGENT_ROLES, ROLES } from "../roles.ts";
+import { BUILTIN_AGENT_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
 import { scopesOverlap, type LanePolicy } from "../policy/capability.ts";
+import { activeAgents, releaseWorkerSlot, reservedWorkers, reserveWorkerSlot } from "../policy/spawn.ts";
 import type {
 	AgentEntry,
 	LaneNeed,
@@ -19,7 +20,7 @@ interface Assignment {
 	agent: string;
 }
 
-export type LaneBlockCode = "lane-dependency" | "lane-write" | "lane-capability";
+export type LaneBlockCode = "lane-dependency" | "lane-write" | "lane-capability" | "lane-job" | "lane-capacity";
 
 type TaskBinding =
 	| { ok: true; input: Record<string, unknown> }
@@ -109,6 +110,7 @@ function normalizeFiles(lane: PlanLane): string[] {
  */
 function key(lane: PlanLane): string {
 	const parts: unknown[] = [lane.name, lane.kind, lane.role, (lane.goal ?? "").trim(), normalizeFiles(lane)];
+	if (lane.job !== undefined) parts.push(["job", lane.job]);
 	if (lane.isolationReason !== undefined) parts.push(true);
 	// A result contract is evidence identity, not status: a changed obligation must not inherit the old proof.
 	if (lane.results !== undefined) parts.push(lane.results);
@@ -121,10 +123,11 @@ function key(lane: PlanLane): string {
  * different role, goal, file scope or placement is a genuinely different route the director may reassign to.
  */
 export function laneRouteFingerprint(lane: PlanLane): string {
-	return createHash("sha256")
-		.update(JSON.stringify([lane.kind, lane.role, (lane.goal ?? "").trim(), normalizeFiles(lane), lane.isolationReason !== undefined]))
-		.digest("hex")
-		.slice(0, 12);
+	const identity: unknown[] = [lane.kind, lane.role, (lane.goal ?? "").trim(), normalizeFiles(lane), lane.isolationReason !== undefined];
+	// A job and an AI worker are different routes even with the same kind, goal and file scope. Added only when set so
+	// existing worker-lane fingerprints keep their stored identity.
+	if (lane.job !== undefined) identity.push(["job", lane.job]);
+	return createHash("sha256").update(JSON.stringify(identity)).digest("hex").slice(0, 12);
 }
 
 /**
@@ -142,6 +145,7 @@ export function replanConflict(previous: RunPlan | undefined, next: RunPlan): st
 		if ((old.goal ?? "").trim() !== (lane.goal ?? "").trim()) changed.push("goal");
 		if (old.kind !== lane.kind) changed.push("kind");
 		if (old.role !== lane.role) changed.push("role");
+		if (old.job !== lane.job) changed.push("job");
 		if (JSON.stringify(normalizeFiles(old)) !== JSON.stringify(normalizeFiles(lane))) changed.push("files");
 		if ((old.isolationReason !== undefined) !== (lane.isolationReason !== undefined)) changed.push("isolationReason");
 		// A lane that declared nothing may gain its contract (the repair path). Once a lane has results, changing or
@@ -183,6 +187,13 @@ export function plannedTaskLanes(input: unknown, plan: RunPlan, config: StormCon
 		const name = typeof item.name === "string" ? item.name : undefined;
 		const named = name === undefined ? undefined : plan.lanes.find(lane => lane.name === name);
 		if (named !== undefined) {
+			if (named.job !== undefined) {
+				return {
+					ok: false,
+					code: "lane",
+					reason: `${name}: 정형 작업(job: ${named.job}) 레인은 호스트 러너가 실행하며 AI 서브에이전트에 배정할 수 없습니다. task에는 job이 없는 워커 레인을 쓰세요.`,
+				};
+			}
 			if (role === undefined || named.role !== role) {
 				return {
 					ok: false,
@@ -197,7 +208,9 @@ export function plannedTaskLanes(input: unknown, plan: RunPlan, config: StormCon
 		}
 		// Manual direction keeps the caller's handle even when it is not a lane name; it still has to map by the one
 		// authorized lane of that agent's role. An isolated claim without such a lane keeps its own refusal.
-		const eligible = role === undefined ? [] : plan.lanes.filter(candidate => candidate.role === role && !used.has(candidate.name));
+		const eligible = role === undefined
+			? []
+			: plan.lanes.filter(candidate => candidate.job === undefined && candidate.role === role && !used.has(candidate.name));
 		if (eligible.length === 1) {
 			used.add(eligible[0]!.name);
 			lanes.push(eligible[0]!);
@@ -458,6 +471,8 @@ interface PlacedEntry {
 }
 
 export interface FollowUpGateInput {
+	/** The run whose spawn decisions and reactivations share one concurrency accounting. */
+	runId?: string;
 	/** The reused agent's id; its own in-flight reservation never blocks its continuation. */
 	agentId: string;
 	agent: string;
@@ -469,6 +484,8 @@ export interface FollowUpGateInput {
 	canonicalFiles?: readonly string[];
 	/** The plan in force when the lane was resolved; absent means no planned lane. */
 	plan?: RunPlan;
+	/** The approved team, for the run's global parallelism. Absent skips the run-wide check. */
+	config?: StormConfig;
 	/** `config.isolation === "isolated"`: every worker output stays private, so no shared write is reserved. */
 	isolated: boolean;
 	readiness?: LaneReadinessView;
@@ -476,7 +493,9 @@ export interface FollowUpGateInput {
 	now?: number;
 }
 
-export type FollowUpGate = { ok: true; token: string } | { ok: false; reason: string; code: LaneBlockCode };
+export type FollowUpGate =
+	| { ok: true; token: string; reserved?: boolean }
+	| { ok: false; reason: string; code: LaneBlockCode; retry?: boolean };
 
 /** One spawn's admission result: a lane when bound, or the reason a late reservation conflict refused it. */
 export type LaneAdmission = { ok: true; lane?: string } | { ok: false; code: LaneBlockCode; reason: string };
@@ -496,8 +515,8 @@ export class RunLanes {
 	readonly #agents = new Map<string, string>();
 	/** Shared write scopes placed but not yet released; private/read-only work never appears here. */
 	readonly #writes = new Map<string, WriteReservation>();
-	/** Follow-up admission tokens; only a failed preflight releases the reservation it created. */
-	readonly #followTokens = new Map<string, { key: string; created: boolean }>();
+	/** Follow-up admission tokens; only a failed preflight releases the write/capacity reservations it created. */
+	readonly #followTokens = new Map<string, { key?: string; created: boolean; capacityKey?: string }>();
 	#serial = 0;
 	#writeSerial = 0;
 	#tokenSerial = 0;
@@ -540,7 +559,9 @@ export class RunLanes {
 				lane = planned.lanes[index];
 			} else {
 				const named = typeof item.name === "string" ? plan?.lanes.find(candidate => candidate.name === item.name) : undefined;
-				const eligible = plan === undefined || role === undefined ? [] : plan.lanes.filter(candidate => candidate.role === role && !used.has(candidate.name));
+				const eligible = plan === undefined || role === undefined
+					? []
+					: plan.lanes.filter(candidate => candidate.job === undefined && candidate.role === role && !used.has(candidate.name));
 				lane = named ?? (eligible.length === 1 ? eligible[0] : undefined);
 				const unambiguous = lane !== undefined && lane.role === role && !used.has(lane.name);
 				if (rewrite && !unambiguous) {
@@ -648,7 +669,7 @@ export class RunLanes {
 		// Resolve a manual lane before a refusal: a blocked spawn must still release the lane it would have used.
 		if (!assignment && manual) {
 			const role = workerRole(manual.config, spawn.agent);
-			const eligible = manual.plan.lanes.filter(lane => lane.role === role);
+			const eligible = manual.plan.lanes.filter(lane => lane.job === undefined && lane.role === role);
 			const name = spawn.spawnKey.split(".").at(-1);
 			const lane = eligible.find(item => item.name === name) ?? (eligible.length === 1 ? eligible[0] : undefined);
 			if (lane) assignment = { lane: lane.name, key: key(lane), agent: spawn.agent };
@@ -795,6 +816,8 @@ export class RunLanes {
 				this.#writes.delete(key);
 			}
 		}
+		// The same event is the only release of its concurrency slot: a failed spawn, a settled turn, or a park.
+		releaseWorkerSlot(this.runId, spawnKey);
 	}
 
 	/**
@@ -821,12 +844,49 @@ export class RunLanes {
 	checkFollowUp(input: FollowUpGateInput): FollowUpGate {
 		const lane = input.lane;
 		if (input.policy?.kind === "blocked") return { ok: false, reason: input.policy.reason, code: "lane-capability" };
+		if (lane?.job !== undefined) {
+			return {
+				ok: false,
+				code: "lane-job",
+				reason: `'${lane.name}' 레인은 정형 작업(job: ${lane.job})이라 호스트 러너가 실행합니다. AI 서브에이전트에 후속 작업을 보내지 말고 job 실행 결과나 별도 워커 레인을 쓰세요.`,
+			};
+		}
 		if (lane !== undefined) {
 			const reason = dependencyBlock(lane, input.readiness);
 			if (reason !== undefined) return { ok: false, reason, code: "lane-dependency" };
 		}
 		const now = input.now ?? Date.now();
 		this.#pruneWrites(input.agents, now);
+		const role = input.role ?? lane?.role;
+		const target = input.agents?.find(agent => agent.id === input.agentId);
+		const running = target?.state === "running";
+		const reserved = input.runId === undefined ? [] : reservedWorkers(input.runId);
+		const hasSlot = reserved.some(slot => slot.key === input.agentId);
+		// A worker already running, or one that already holds a slot, is not a second worker: a work-bearing note to it
+		// charges no new slot. A genuine reactivation of an idle/parked worker checks and takes a slot like a fresh start.
+		const needsCapacity = input.runId !== undefined && lane !== undefined && !running && !hasSlot;
+		if (needsCapacity) {
+			const active = activeAgents([], input.agents ?? [], now, reserved);
+			const cap = role === undefined ? undefined : input.plan?.workers[role];
+			if (role !== undefined && cap !== undefined && (active.byRole[role] ?? 0) >= cap) {
+				const max = workerRange(role, input.config?.roles[role]).max;
+				return {
+					ok: false,
+					code: "lane-capacity",
+					retry: true,
+					reason: `${roleTitle(role)} 역할 워커가 이미 계획의 ${cap}개(역할 최대 ${max}개)만큼 살아 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 사용자에게 묻지 말고 wait 도구나 완료 알림으로 하나가 끝난 뒤 같은 write를 다시 보내세요.`,
+				};
+			}
+			const limit = input.config?.parallelism;
+			if (limit !== undefined && active.total >= limit) {
+				return {
+					ok: false,
+					code: "lane-capacity",
+					retry: true,
+					reason: `이 실행의 서브에이전트 ${active.total}개가 동시 상한 ${limit}개에 닿아 ${input.agent} 후속 작업을 보내지 않았습니다. 사용자에게 묻지 말고 wait 도구나 완료 알림으로 하나가 끝난 뒤 같은 write를 다시 보내세요.`,
+				};
+			}
+		}
 		const scope = writeScope(
 			lane,
 			input.role,
@@ -835,7 +895,15 @@ export class RunLanes {
 			input.canonicalFiles,
 		);
 		const token = `follow:${++this.#tokenSerial}`;
-		if (scope.kind === "read" || scope.kind === "private") return { ok: true, token };
+		const capacityKey = needsCapacity ? input.agentId : undefined;
+		const trackSlot = input.runId !== undefined && lane !== undefined && !hasSlot;
+		if (scope.kind === "read" || scope.kind === "private") {
+			if (trackSlot) {
+				reserveWorkerSlot({ runId: input.runId!, key: input.agentId, ...(role === undefined ? {} : { role }), lane: lane!.name, now });
+			}
+			this.#followTokens.set(token, { created: false, ...(capacityKey === undefined ? {} : { capacityKey }) });
+			return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
+		}
 		for (const reservation of this.#writes.values()) {
 			if (reservation.agentId === input.agentId) continue;
 			if (!scopesConflict(scope, reservation.scope)) continue;
@@ -845,8 +913,11 @@ export class RunLanes {
 		const key = lane !== undefined ? `lane:${lane.name}` : `spawn:${input.agentId}`;
 		const existing = this.#writes.get(key);
 		this.#writes.set(key, { scope, ...(lane === undefined ? {} : { lane: lane.name }), agentId: input.agentId, at: now });
-		this.#followTokens.set(token, { key, created: existing === undefined });
-		return { ok: true, token };
+		if (trackSlot) {
+			reserveWorkerSlot({ runId: input.runId!, key: input.agentId, ...(role === undefined ? {} : { role }), lane: lane!.name, now });
+		}
+		this.#followTokens.set(token, { key, created: existing === undefined, ...(capacityKey === undefined ? {} : { capacityKey }) });
+		return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 	}
 
 	/** Keep the reservation on a delivered follow-up; release one made by a preflight that then refused the turn. */
@@ -854,7 +925,9 @@ export class RunLanes {
 		const entry = this.#followTokens.get(token);
 		if (entry === undefined) return;
 		this.#followTokens.delete(token);
-		if (!keep && entry.created) this.#writes.delete(entry.key);
+		if (keep) return;
+		if (entry.created && entry.key !== undefined) this.#writes.delete(entry.key);
+		if (entry.capacityKey !== undefined) releaseWorkerSlot(this.runId, entry.capacityKey);
 	}
 
 	/** An admitted worker must actually run and settle before its lane can provide evidence. */

@@ -438,6 +438,7 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 
 	const lanes: PlanLane[] = [];
 	const names = new Set<string>();
+	const jobNames = new Set<string>();
 	/** Result ids identify requirements across the whole plan, not just within their lane. */
 	const resultIds = new Set<string>();
 	const gapRoles = new Set<string>();
@@ -461,8 +462,24 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 			errors.push(`${path}.files: 문자열 배열이어야 합니다`);
 			return;
 		}
+		const job = l.job;
+		if (job !== undefined && (kind !== "run" || typeof job !== "string" || !config.jobs?.some(candidate => candidate.name === job))) {
+			errors.push(`${path}.job: run 레인에는 팀 설정에 등록된 정형 작업 이름만 지정할 수 있습니다`);
+			return;
+		}
+		if (job !== undefined && (l.role !== undefined || files !== undefined || l.isolationReason !== undefined)) {
+			errors.push(`${path}.job: 실행 권한과 자원은 승인된 작업 정의에서 가져오므로 role·files·isolationReason을 같이 지정할 수 없습니다`);
+			return;
+		}
 		let role: string | undefined;
-		if (l.role !== undefined) {
+		if (typeof job === "string") {
+			if (jobNames.has(job)) {
+				errors.push(`${path}.job: 같은 정형 작업을 한 계획의 여러 레인에 중복 지정할 수 없습니다 (${job})`);
+				return;
+			}
+			jobNames.add(job);
+			role = LANE_ROLES.run; // internal lane kind mapping only; no AI worker is allocated
+		} else if (l.role !== undefined) {
 			if (typeof l.role !== "string" || !ROLES.some((r) => r.id === l.role)) {
 				errors.push(`${path}.role: Storm 역할 id여야 합니다 (${ROLES.map((r) => r.id).join("|")})`);
 				return;
@@ -481,6 +498,7 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 			}
 		}
 		const lane: PlanLane = { name, kind: kind as LaneKind, role };
+		if (typeof job === "string") lane.job = job;
 		if (files !== undefined) lane.files = [...(files as string[])];
 		const goal = laneText(l.goal, `${path}.goal`, errors);
 		if (goal !== undefined) lane.goal = goal;
@@ -498,6 +516,11 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		if (progress !== undefined) lane.progress = progress;
 		const results = readLaneResults(config, l.results, `${path}.results`, resultIds, errors);
 		if (results !== undefined) lane.results = results;
+		if (lane.job !== undefined && results?.some(result =>
+			result.kind !== "answer" || result.path !== undefined || result.contains === undefined || result.check !== undefined,
+		)) {
+			errors.push(`${path}.results: 정형 작업은 contains로 stdout의 실행 근거를 지정한 경로 없는 answer를 요구합니다. 의미 검증은 별도 레인으로 선언하세요`);
+		}
 		// A fresh plan owes an observable contract for every lane that delivers something. Only an omitted field is
 		// this error: a present but malformed list already failed above and keeps its own precise message.
 		if (l.results === undefined && DELIVERABLE_KINDS.includes(kind as LaneKind)) {
@@ -516,7 +539,8 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 	// against a lane without declared results rejects the plan before it can apply. Entry-level errors come first.
 	if (errors.length === 0) errors.push(...dependencyGraphErrors(lanes));
 
-	const used = [...new Set(lanes.map((l) => l.role))];
+	const workerLanes = lanes.filter(lane => lane.job === undefined);
+	const used = [...new Set(workerLanes.map(lane => lane.role))];
 	const asked = input.workers;
 	if (asked !== undefined && !isRecord(asked)) errors.push("plan.workers: 역할별 숫자 객체여야 합니다");
 	const workers: Record<string, number> = {};
@@ -529,9 +553,10 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 	}
 	for (const role of used) {
 		const range = workerRange(role, config.roles[role]);
-		// Without a count the role gets one worker per lane, inside its approved range.
-		const laneCount = lanes.filter((l) => l.role === role).length;
-		const n = isRecord(asked) && typeof asked[role] === "number" ? asked[role] : Math.min(range.max, Math.max(range.min, laneCount));
+		// Without an explicit count the role gets exactly its actual worker lanes, up to the approved maximum. A job
+		// lane has no AI worker and never raises this count; its role is only an internal lane-kind mapping.
+		const laneCount = workerLanes.filter(lane => lane.role === role).length;
+		const n = isRecord(asked) && typeof asked[role] === "number" ? asked[role] : Math.min(range.max, Math.max(1, laneCount));
 		workers[role] = n;
 		// A role being added gets its default range (workerRange of an absent role), so its max is checked too.
 		if (n > range.max) outOfBounds.push({ kind: "workers", role, want: n, max: range.max });

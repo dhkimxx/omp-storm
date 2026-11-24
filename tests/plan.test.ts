@@ -25,7 +25,7 @@ const config: StormConfig = teamOf(
 );
 
 describe("validatePlan", () => {
-	test("roles resolve from kind along the stand-ins; a role's default workers are its lanes, clamped to its range", () => {
+	test("roles resolve from kind along the stand-ins; a role's default workers are its lanes, capped by max", () => {
 		const r = validatePlan(
 			config,
 			{
@@ -47,15 +47,18 @@ describe("validatePlan", () => {
 		expect(r.plan!.workers).toEqual({ implementer: 1, quick: 2, reviewer: 2 });
 	});
 
-	test("default workers follow the lane count up to the role's max and never go below its min", () => {
+	test("default workers are the actual lane count up to the role's max; explicit counts may be lower", () => {
 		const lanes = (n: number, kind: "code" | "run") =>
 			Array.from({ length: n }, (_, i) => ({ name: `${kind}${i}`, kind, results: contract(`${kind}-${i}`, kind) }));
 		const workers = (input: unknown) => validatePlan(config, input, NOW).plan?.workers;
 		expect(workers({ lanes: lanes(2, "code") })).toEqual({ implementer: 2 });
 		expect(workers({ lanes: lanes(5, "code") })).toEqual({ implementer: 3 });
-		expect(workers({ lanes: lanes(1, "run") })).toEqual({ quick: 2 });
-		// An explicit count wins over the default.
+		// One run lane gets one quick worker even though the configured range starts at two; the range's min is a setup
+		// suggestion, not an implicit second worker.
+		expect(workers({ lanes: lanes(1, "run") })).toEqual({ quick: 1 });
+		// An explicit count wins over the default, including a lower count than lanes.
 		expect(workers({ lanes: lanes(3, "code"), workers: { implementer: 1 } })).toEqual({ implementer: 1 });
+		expect(workers({ lanes: lanes(1, "run"), workers: { quick: 2 } })).toEqual({ quick: 2 });
 		expect(validatePlan(config, { lanes: lanes(5, "code") }, NOW).outOfBounds).toEqual([]);
 	});
 
@@ -91,7 +94,7 @@ describe("validatePlan", () => {
 			{ kind: "role", role: "explorer", state: "missing" },
 			{ kind: "workers", role: "implementer", want: 4, max: 3 },
 		]);
-		expect(r.plan?.workers).toEqual({ implementer: 4, architect: 1, explorer: 2 });
+		expect(r.plan?.workers).toEqual({ implementer: 4, architect: 1, explorer: 1 });
 	});
 
 	test("goal and progress trim, stay optional, and share one bound; progress adds no write scope", () => {

@@ -36,9 +36,11 @@ const TOP_KEYS = [
 	"docs",
 	"rounds",
 	"requiredChecks",
+	"jobs",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
 const CHECK_KEYS = ["name", "argv"];
+const JOB_KEYS = ["name", "argv", "resources", "timeoutMs"];
 /** Highest `contextCap` a config may set (team or role), in tokens. */
 export const MAX_CONTEXT_CAP = 10_000_000;
 /** Bounds on `requiredChecks`: an approval row must stay readable and a run's obligations enumerable. */
@@ -47,15 +49,34 @@ export const MAX_CHECK_NAME_LENGTH = 80;
 export const MAX_CHECK_ARGS = 32;
 export const MAX_CHECK_ARG_LENGTH = 1024;
 export const MAX_CHECK_ARGV_LENGTH = 4096;
+/** Bounds on `jobs`: the approval row stays readable and one run cannot queue an unbounded list. */
+export const MAX_JOBS = 16;
+export const MAX_JOB_RESOURCES = 8;
+export const MAX_RESOURCE_KEY_LENGTH = 128;
+/** A configured job may run a long experiment, but never without a real deadline. */
+export const MAX_JOB_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const BUDGET_KEYS = ["perRunUsd", "warnAtUsd", "onExceed"];
 const TRIAL_KEYS = ["id", "role", "model", "effort", "share", "maxSpawns", "startsAt", "endsAt", "budgetUsd"];
 // Full timestamps with an explicit zone; date-only or zone-less strings parse differently across hosts.
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 // "provider/id" with an optional ":<suffix>"; the id may contain more '/' (aggregator routes).
 const MODEL_RE = /^[^\s/:]+\/[^\s]*[^\s/:]$/;
+// A portable resource key: ASCII only, no whitespace, no quoting; case-sensitive on purpose.
+const RESOURCE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+=#-]*$/;
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * The one accepted resource-key form: bounded ASCII, no whitespace or quoting, case-sensitive. Keys are opaque to the
+ * scheduler; they serialize work, never grant authority. A key that needs a path or model text is pre-hashed by the
+ * caller instead of smuggled through this namespace.
+ */
+export function canonicalResourceKey(value: unknown): string | undefined {
+	if (typeof value !== "string" || value.length === 0 || value.length > MAX_RESOURCE_KEY_LENGTH) return undefined;
+	if (!RESOURCE_KEY_RE.test(value)) return undefined;
+	return value.normalize("NFC");
 }
 
 function oneOf(v: unknown, allowed: readonly string[]): boolean {
@@ -83,6 +104,7 @@ export function unknownFields(value: unknown): Array<{ path: string; value: unkn
 	if (Array.isArray(value.requiredChecks)) {
 		value.requiredChecks.forEach((check: unknown, i) => scan(check, CHECK_KEYS, `requiredChecks[${i}]`));
 	}
+	if (Array.isArray(value.jobs)) value.jobs.forEach((job: unknown, i) => scan(job, JOB_KEYS, `jobs[${i}]`));
 	return out;
 }
 
@@ -245,6 +267,82 @@ function validateRequiredChecks(checks: unknown, errors: string[]): void {
 }
 
 /**
+ * `jobs`: bounded named commands with unique names, the same argv bounds as required checks, canonical resource keys
+ * and a finite timeout. Unknown job fields only warn; `unsafeText` already rejects control and bidi characters.
+ */
+function validateJobs(jobs: unknown, errors: string[]): void {
+	if (!Array.isArray(jobs)) {
+		errors.push("jobs: 배열이어야 합니다");
+		return;
+	}
+	if (jobs.length > MAX_JOBS) errors.push(`jobs: 최대 ${MAX_JOBS}개까지 둘 수 있습니다`);
+	const names = new Set<string>();
+	jobs.forEach((job: unknown, i) => {
+		const path = `jobs[${i}]`;
+		if (!isRecord(job)) {
+			errors.push(`${path}: 객체여야 합니다`);
+			return;
+		}
+		const name = job.name;
+		if (typeof name !== "string" || name.trim() === "") {
+			errors.push(`${path}.name: 비어 있지 않은 문자열이어야 합니다`);
+		} else if (name !== name.trim() || name.length > MAX_CHECK_NAME_LENGTH) {
+			errors.push(`${path}.name: 앞뒤 공백 없이 ${MAX_CHECK_NAME_LENGTH}자 이하여야 합니다`);
+		} else if (names.has(name)) {
+			errors.push(`${path}.name: 중복된 이름입니다 (${name})`);
+		} else {
+			names.add(name);
+		}
+		const argv = job.argv;
+		if (!Array.isArray(argv) || argv.length === 0) {
+			errors.push(`${path}.argv: 실행 파일과 인자를 담은 배열이어야 합니다`);
+		} else {
+			if (argv.length > MAX_CHECK_ARGS) {
+				errors.push(`${path}.argv: 실행 파일과 인자를 합쳐 최대 ${MAX_CHECK_ARGS}개까지 둘 수 있습니다`);
+			}
+			let total = 0;
+			argv.forEach((arg: unknown, j) => {
+				if (typeof arg !== "string") {
+					errors.push(`${path}.argv[${j}]: 문자열이어야 합니다`);
+					return;
+				}
+				if (j === 0 && arg.trim() === "") errors.push(`${path}.argv[0]: 실행 파일이 비어 있습니다`);
+				if (arg.length > MAX_CHECK_ARG_LENGTH) {
+					errors.push(`${path}.argv[${j}]: ${MAX_CHECK_ARG_LENGTH}자 이하여야 합니다`);
+				}
+				total += arg.length;
+			});
+			if (total > MAX_CHECK_ARGV_LENGTH) {
+				errors.push(`${path}.argv: 실행 파일과 인자를 합쳐 ${MAX_CHECK_ARGV_LENGTH}자 이하여야 합니다`);
+			}
+		}
+		if (job.resources !== undefined) {
+			if (!Array.isArray(job.resources)) {
+				errors.push(`${path}.resources: 배열이어야 합니다`);
+			} else {
+				if (job.resources.length > MAX_JOB_RESOURCES) {
+					errors.push(`${path}.resources: 최대 ${MAX_JOB_RESOURCES}개까지 둘 수 있습니다`);
+				}
+				const seen = new Set<string>();
+				job.resources.forEach((resource: unknown, j) => {
+					const key = canonicalResourceKey(resource);
+					if (key === undefined) {
+						errors.push(`${path}.resources[${j}]: ${MAX_RESOURCE_KEY_LENGTH}자 이하의 영문·숫자·. _ : / @ + = # - 자원 키여야 합니다`);
+					} else if (seen.has(key)) {
+						errors.push(`${path}.resources[${j}]: 중복된 자원 키입니다 (${key})`);
+					} else {
+						seen.add(key);
+					}
+				});
+			}
+		}
+		if (job.timeoutMs !== undefined && !isIntIn(job.timeoutMs, 1, MAX_JOB_TIMEOUT_MS)) {
+			errors.push(`${path}.timeoutMs: 1~${MAX_JOB_TIMEOUT_MS} 사이 정수여야 합니다`);
+		}
+	});
+}
+
+/**
  * Checks a parsed config against schema version 1. Unknown fields only warn; they still count toward the hash.
  * Fields earlier versions wrote (`contract`, `runtime`, the priorities "speed" and "quota", `workers: n`) stay valid.
  * No message carries a raw unsafe character: what a message quotes from the config is escaped.
@@ -339,6 +437,7 @@ export function validateConfig(value: unknown): ConfigValidation {
 	if (value.trials !== undefined) validateTrials(value.trials, roleKeys, errors);
 	if (value.disabledRoles !== undefined) validateDisabled(value.disabledRoles, roleKeys, errors);
 	if (value.requiredChecks !== undefined) validateRequiredChecks(value.requiredChecks, errors);
+	if (value.jobs !== undefined) validateJobs(value.jobs, errors);
 
 	if (errors.length > 0) return { errors: errors.map(escapeUnsafe), warnings };
 	return { config: value as unknown as StormConfig, errors, warnings };

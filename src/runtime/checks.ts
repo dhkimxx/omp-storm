@@ -197,7 +197,16 @@ function spawnErrorNote(error: unknown): string {
 	return typeof code === "string" && code.length <= 40 ? `실행하지 못했습니다 (${code})` : "실행하지 못했습니다";
 }
 
-interface ProcessResult {
+export interface BoundedProcessInput {
+	/** Executable first, then its arguments; never a shell command line. */
+	argv: readonly string[];
+	cwd: string;
+	timeoutMs: number;
+	outputLimitBytes: number;
+	signal?: AbortSignal;
+}
+
+export interface BoundedProcessResult {
 	status: Exclude<CheckStatus, "unrun">;
 	exitCode: number | null;
 	signal: string | null;
@@ -206,26 +215,23 @@ interface ProcessResult {
 	durationMs: number;
 	stdout: CheckOutput;
 	stderr: CheckOutput;
+	/** True only when the OS reported the child closed (or it never started); false means teardown gave up. */
+	processEnded: boolean;
 	note?: string;
 }
 
 /**
- * Spawns one check and waits for it. A timeout or abort sends SIGTERM to its process group, then SIGKILL, and settles
- * the result even if teardown does not finish, so a check can never hold the run forever. Stdout/stderr are retained
- * only as bounded tails.
+ * Spawns one command and waits for it. A timeout or abort sends SIGTERM to its process group, then SIGKILL, and settles
+ * the result even if teardown does not finish, so a caller can never hang forever. Stdout/stderr are retained only as
+ * bounded tails. `processEnded` tells a caller whether releasing a resource fence is provable.
  */
-function runProcess(
-	argv: readonly string[],
-	cwd: string,
-	timeoutMs: number,
-	outputLimitBytes: number,
-	signal: AbortSignal | undefined,
-): Promise<ProcessResult> {
+export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedProcessResult> {
+	const { argv, cwd, timeoutMs, outputLimitBytes, signal } = input;
 	const stdout = new BoundedTail(outputLimitBytes);
 	const stderr = new BoundedTail(outputLimitBytes);
 	const startedAt = new Date().toISOString();
 	const began = performance.now();
-	const { promise, resolve } = Promise.withResolvers<ProcessResult>();
+	const { promise, resolve } = Promise.withResolvers<BoundedProcessResult>();
 	const executable = argv[0];
 	if (executable === undefined) {
 		resolve({
@@ -237,6 +243,7 @@ function runProcess(
 			durationMs: Math.round(performance.now() - began),
 			stdout: stdout.result(),
 			stderr: stderr.result(),
+			processEnded: true,
 			note: "실행 파일이 없습니다",
 		});
 		return promise;
@@ -260,6 +267,7 @@ function runProcess(
 			durationMs: Math.round(performance.now() - began),
 			stdout: stdout.result(),
 			stderr: stderr.result(),
+			processEnded: true,
 			note: spawnErrorNote(error),
 		});
 		return promise;
@@ -273,7 +281,7 @@ function runProcess(
 	let killGrace: NodeJS.Timeout | undefined;
 	let hardTeardown: NodeJS.Timeout | undefined;
 	let onAbort: (() => void) | undefined;
-	const finish = (code: number | null, endedBy: string | null): void => {
+	const finish = (code: number | null, endedBy: string | null, processEnded: boolean): void => {
 		if (settled) return;
 		settled = true;
 		clearTimeout(deadline);
@@ -299,6 +307,7 @@ function runProcess(
 			durationMs: Math.round(performance.now() - began),
 			stdout: stdout.result(),
 			stderr: stderr.result(),
+			processEnded,
 			...(note === undefined ? {} : { note }),
 		});
 	};
@@ -314,22 +323,23 @@ function runProcess(
 		}, KILL_GRACE_MS);
 		hardTeardown = setTimeout(() => {
 			if (settled) return;
-			// A process that cannot be reaped must not keep this promise or its pipes alive.
+			// A process that cannot be reaped must not keep this promise or its pipes alive. Its end is unproven.
 			child.stdout?.destroy();
 			child.stderr?.destroy();
 			child.unref();
-			finish(null, null);
+			finish(null, null, false);
 		}, KILL_GRACE_MS + HARD_TEARDOWN_MS);
 	};
 
 	child.on("error", (error) => {
 		spawnError = spawnErrorNote(error);
-		finish(null, null);
+		// A spawn that never got a pid never created a process; an error after a pid exists does not prove it ended.
+		finish(null, null, child.pid === undefined);
 	});
 	child.on("close", (code, endedBy) => {
 		// A spawn that never got a pid is a spawn failure even if only `close` reports it.
 		if (spawnError === undefined && child.pid === undefined) spawnError = "실행하지 못했습니다";
-		finish(code, endedBy);
+		finish(code, endedBy, true);
 	});
 	child.stdout?.on("data", (chunk: Buffer) => stdout.add(chunk));
 	child.stderr?.on("data", (chunk: Buffer) => stderr.add(chunk));
@@ -365,7 +375,13 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 			for (const rest of gate.checks.slice(index)) evidence.push(unrun(rest));
 			break;
 		}
-		const result = await runProcess(check.argv, input.cwd, timeoutMs, outputLimitBytes, input.signal);
+		const result = await runBoundedProcess({
+			argv: check.argv,
+			cwd: input.cwd,
+			timeoutMs,
+			outputLimitBytes,
+			...(input.signal === undefined ? {} : { signal: input.signal }),
+		});
 		evidence.push({
 			name: check.name,
 			argv: [...check.argv],

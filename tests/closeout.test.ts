@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
+	CLOSEOUT_JOB_ENTRY_MAX,
 	CLOSEOUT_NEXT_MAX,
 	CLOSEOUT_RESULT_ENTRY_MAX,
 	CLOSEOUT_TEXT_MAX,
@@ -12,7 +13,7 @@ import {
 	resetCloseoutChoices,
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
-import type { RunPlan, RunRecord, RunResult } from "../src/types.ts";
+import type { RunJob, RunPlan, RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
 const draft = (over: Partial<CloseoutDraft> = {}): CloseoutDraft => ({
@@ -93,6 +94,41 @@ describe("closeout brief validation", () => {
 describe("substantive run detection", () => {
 	test("a submitted brief always makes the run substantive", () => {
 		expect(isSubstantiveRun(record({ closeout: draft() }))).toBe(true);
+	});
+
+	test("one accepted answer is substantive; a read without a result stays quiet", () => {
+		const read = plan(
+			lane("read-report", "explore", {
+				results: [{ id: "report-answer", kind: "answer", criterion: "states the total", path: "report.json" }],
+			}),
+		);
+		expect(
+			isSubstantiveRun(
+				record({
+					plan: read,
+					results: [{ id: "report-answer", lane: "read-report", state: "accepted" }],
+				}),
+			),
+		).toBe(true);
+		// The same lane with no declared or observed result is a casual read, not a delivered output.
+		expect(isSubstantiveRun(record({ plan: read }))).toBe(false);
+		expect(isSubstantiveRun(record({ plan: plan(lane("read-report", "explore")) }))).toBe(false);
+	});
+
+	test("an accepted artifact is substantive even when its plan is gone", () => {
+		expect(
+			isSubstantiveRun(
+				record({
+					results: [
+						{
+							id: "experiment-output",
+							state: "accepted",
+							contract: { id: "experiment-output", kind: "artifact", criterion: "retained output" },
+						},
+					],
+				}),
+			),
+		).toBe(true);
 	});
 
 	test("multiple lanes are substantive, while one explore or an unproductive code probe stays routine", () => {
@@ -189,6 +225,7 @@ describe("closeout card", () => {
 	test("omits a checks line when no check evidence or required check name exists", () => {
 		const card = closeoutCard(record({ status: "stopped", endReason: "no-progress", closeout: draft() }), []);
 		expect(card.text).not.toContain("- 체크");
+		expect(card.text).not.toContain("- 잡 영수증");
 		expect(card.text).not.toContain("- 미완료 레인:");
 	});
 });
@@ -217,14 +254,131 @@ describe("required-result closeout rows", () => {
 			],
 		});
 		expect(isSubstantiveRun(run)).toBe(true);
-		expect(isSubstantiveRun({ ...run, results: [accepted] })).toBe(false);
+		// The accepted answer alone is delivered output now, even without a file edit or a submitted brief.
+		expect(isSubstantiveRun({ ...run, results: [accepted] })).toBe(true);
 		const card = closeoutCard(run, ["report"]);
 		expect(card.text).toContain("- 상태(공식): 끝남 · 변경 없음");
 		expect(card.text).toContain(
 			"- 미해결 필수 결과(공식): report-change [report] 미충족 — 사전 기준선 이후 바뀐 내용이 없습니다.",
 		);
-		expect(card.text).not.toContain("report-answer");
+		expect(card.text).toContain(
+			"- 이행 필수 결과(공식): report-answer [read-report] 이행 — 기존 내용을 출처와 함께 확인했습니다.",
+		);
 		expect(card.text).not.toContain("- 미완료 레인:");
+	});
+
+	test("T01c: one accepted answer is one substantive card with its status, host reference and conservative directions", () => {
+		const run = record({
+			status: "done",
+			endReason: "verified",
+			task: "report.json의 total 값 확인",
+			plan: plan(
+				lane("read-report", "explore", {
+					results: [{ id: "report-answer", kind: "answer", criterion: "states the total", path: "report.json" }],
+				}),
+			),
+			agents: [agentEntry({ name: "storm-explorer", role: "explorer", changes: 0 })],
+			results: [
+				{
+					id: "report-answer",
+					lane: "read-report",
+					state: "accepted",
+					reason: "report.json:2에서 42를 확인했습니다.",
+					attemptId: "job:job-1:read-report",
+				},
+			],
+		});
+		expect(isSubstantiveRun(run)).toBe(true);
+		const card = closeoutCard(run);
+		// The verified web reason normally says a code review passed; an output-only run must not claim that.
+		expect(card.text).toContain("- 상태(공식): 완료 · 필수 결과 이행");
+		expect(card.text).not.toContain("리뷰 통과");
+		expect(card.text).toContain(
+			"- 이행 필수 결과(공식): report-answer [read-report] 이행 · 시도: job:job-1:read-report — report.json:2에서 42를 확인했습니다.",
+		);
+		// No director draft is synthesized: the card says so and still recommends exactly the first of three choices.
+		expect(card.text).toContain("- 결과: 검증된 결과 브리프가 제출되지 않았습니다.");
+		expect(card.text).toContain(`1. 추천 — ${card.options[0]}`);
+		expect(card.text.match(/^[1-3]\. /gm)).toHaveLength(3);
+		expect(new Set(card.options).size).toBe(3);
+		expect(card.options[0]).toContain("필수 결과 이행");
+	});
+
+	test("T01d: an unaccepted required answer stays on the unresolved line", () => {
+		const run = record({
+			status: "stopped",
+			endReason: "no-progress",
+			plan: plan(
+				lane("read-report", "explore", {
+					results: [{ id: "report-answer", kind: "answer", criterion: "states the total", path: "report.json" }],
+				}),
+			),
+			results: [
+				{
+					id: "report-answer",
+					lane: "read-report",
+					state: "unmet",
+					reason: "인용한 출처가 답과 일치하지 않습니다.",
+				},
+			],
+		});
+		expect(isSubstantiveRun(run)).toBe(true);
+		const card = closeoutCard(run, ["read-report"]);
+		expect(card.text).toContain(
+			"- 미해결 필수 결과(공식): report-answer [read-report] 미충족 — 인용한 출처가 답과 일치하지 않습니다.",
+		);
+		expect(card.text).not.toContain("- 이행 필수 결과");
+		expect(card.text).not.toContain("리뷰 통과");
+	});
+
+	test("an accepted row without a reason or a safe reference shows only its state", () => {
+		const card = closeoutCard(
+			record({
+				results: [{ id: "answer", state: "accepted", attemptId: "/tmp/storm/attempt" }],
+			}),
+		);
+		expect(card.text).toContain("- 이행 필수 결과(공식): answer 이행");
+		expect(card.text).not.toContain("answer 이행 —");
+		expect(card.text).not.toContain("/tmp/");
+	});
+
+	test("T01e: host job receipts follow result rows and never stand in for an accepted output", () => {
+		const job = (
+			lane: string,
+			name: string,
+			status: "passed" | "failed" | "timed-out",
+			exitCode: number | null,
+		): RunJob => ({ lane, name, status, exitCode, startedAt: null, finishedAt: null });
+		const card = closeoutCard(
+			record({
+				status: "done",
+				endReason: "verified",
+				results: [
+					{
+						id: "answer",
+						lane: "bench",
+						state: "accepted",
+						contract: { id: "answer", kind: "answer", criterion: "state the benchmark outcome" },
+						reason: "bench 결과를 출처와 함께 확인했습니다.",
+					},
+				],
+				jobs: [
+					job("bench", "bench", "passed", 0),
+					job("train", "train", "timed-out", null),
+					job("probe", "probe", "failed", 1),
+					job("extra", "extra", "passed", 0),
+				],
+			}),
+		);
+		const resultAt = card.text.indexOf("- 이행 필수 결과");
+		const receiptAt = card.text.indexOf("- 잡 영수증(호스트):");
+		expect(resultAt).toBeGreaterThanOrEqual(0);
+		expect(receiptAt).toBeGreaterThan(resultAt);
+		expect(card.text).toContain(
+			`- 잡 영수증(호스트): bench [bench] passed(0) · train [train] timed-out · probe [probe] failed(1) · 외 ${4 - CLOSEOUT_JOB_ENTRY_MAX}건`,
+		);
+		// An exit receipt is not a review or a scientific conclusion.
+		expect(card.text).not.toContain("리뷰 통과");
 	});
 
 	test("T06: a reviewable qualitative submission is visible with its reason, without becoming unmet or verified", () => {

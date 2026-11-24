@@ -432,6 +432,29 @@ export interface RequiredCheck {
 	argv: string[];
 }
 
+/**
+ * One named command an approved config lets a run start without a new approval. `argv` is executed directly, first
+ * element as the executable and the rest as its arguments: no shell, interpolation, generated script or model-chosen
+ * argument. The name is the selection key; the same job name always means the same approved argv.
+ *
+ * `resources` are opaque canonical keys the scheduler makes mutually exclusive across every Storm session and process
+ * on this host. Omitting them (or an empty list) declares nothing: the caller must treat such a job as exclusive on
+ * its target tree, because its writes are unknown. Resource keys never convey authority; they only serialize work.
+ */
+export interface ConfiguredJob {
+	/** Unique within the config; shown with the exact command in the approval dialog. */
+	name: string;
+	/** Executable first, then its arguments, in order. */
+	argv: readonly string[];
+	/**
+	 * Canonical resource keys this job needs exclusively, e.g. "gpu:0" or "repo:shared". Sorted and deduplicated by the
+	 * runner. Absent/empty means the job's target-tree footprint is undeclared; the caller must add an exclusive key.
+	 */
+	resources?: readonly string[];
+	/** Wall-clock limit in ms; the runner terminates the job's process group at it. */
+	timeoutMs?: number;
+}
+
 /** `.omp/storm/config.json` (schema version 1). Unknown fields are kept and hashed. */
 export interface StormConfig {
 	version: 1;
@@ -469,6 +492,11 @@ export interface StormConfig {
 	 * under an approved config whose hash the user approved; absent → no checks and the config hash is unchanged.
 	 */
 	requiredChecks?: RequiredCheck[];
+	/**
+	 * Named commands the approved config lets a run start without another approval. Exact argv only: selection binds a
+	 * plan lane to an approved name, never to model-supplied text. Absent → no jobs and the config hash is unchanged.
+	 */
+	jobs?: readonly ConfiguredJob[];
 }
 
 export type ConfigLoad =
@@ -816,6 +844,8 @@ export interface RunRecord {
 	costByModel: Record<string, number>;
 	budget?: BudgetConfig;
 	checks?: RunCheckEvidence[];
+	/** Host-observed execution of a named project job, keyed by its plan lane. */
+	jobs?: RunJob[];
 	/** One row per required result, keyed by the plan's stable id; written by the runtime, never by this schema. */
 	results?: RunResult[];
 	spawns: SpawnRecord[];
@@ -852,6 +882,17 @@ export interface RunRecord {
 	closeout?: CloseoutDraft;
 	/** The limits the user stated with the request. */
 	limits?: { rounds?: number; minutes?: number };
+}
+
+export interface RunJob {
+	lane: string;
+	name: string;
+	status: "passed" | "failed" | "timed-out" | "cancelled" | "spawn-error" | "unrun";
+	exitCode: number | null;
+	startedAt: string | null;
+	finishedAt: string | null;
+	/** Fixed runtime explanation, never process output. */
+	detail?: string;
 }
 
 export interface RunReads {
@@ -960,6 +1001,8 @@ export interface PlanLane {
 	kind: LaneKind;
 	/** Role key; resolved from `kind` when the director names none. */
 	role: string;
+	/** Approved deterministic job used instead of a subagent for this run lane. */
+	job?: string | undefined;
 	/** Write scope; lanes that run at the same time should not share files. */
 	files?: string[];
 	/** What the lane delivers: stable identity. Changing it for the same name on replan is a conflict. */
@@ -1098,13 +1141,14 @@ export interface AnalysisContext {
 
 // ── storm tool (implemented in src/tool) ────────────────────────────────────────────────────
 
-export type StormToolAction = "run" | "plan" | "brief" | "status" | "agents";
+export type StormToolAction = "run" | "plan" | "execute" | "brief" | "status" | "agents";
 
 /** A run plan as the director sends it; `validatePlan` checks it and resolves roles and workers. */
 export interface PlanRequest {
 	lanes: Array<{
 		name: string;
 		kind: LaneKind;
+		job?: string | undefined;
 		role?: RoleId | undefined;
 		files?: string[] | undefined;
 		goal?: string | undefined;
@@ -1124,6 +1168,8 @@ export interface StormToolParams {
 	action: StormToolAction;
 	/** plan: the run plan */
 	plan?: PlanRequest;
+	/** execute: exact lane names from the active plan; no model-supplied commands. */
+	lanes?: string[];
 	/** brief: results and the next directions for the current run, held until it actually settles. */
 	brief?: CloseoutDraft;
 	/** run: the user's request, verbatim */

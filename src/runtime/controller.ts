@@ -7,12 +7,13 @@
  * busy. Spawn decisions arrive from any session in the process (children included), so they are collected per run in
  * module scope.
  */
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ApprovalStore } from "../approval/store.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
-import { formatUsd, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
+import { clearWorkerSlots, formatUsd, reservedWorkers, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
 import { tokens } from "../report/agents.ts";
 import { directorCap, PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
@@ -24,6 +25,7 @@ import type {
 	ResultInputVersion,
 	RunCheckpoint,
 	RunCheckEvidence,
+	RunJob,
 	RunEndReason,
 	RunPlan,
 	RunRecord,
@@ -39,6 +41,7 @@ import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, Attempt
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import { runConfiguredJob } from "./job-executor.ts";
 import {
 	CLOSEOUT_CHOICE_HINT,
 	CLOSEOUT_TITLE,
@@ -51,7 +54,7 @@ import {
 	resetCloseoutChoices,
 } from "./closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
-import { laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { dependencyBlock, laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
 import { hasStaleInputs, inputSnapshot, requirementConflict, staleRequirementIds, currentInputVersion } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
@@ -330,6 +333,9 @@ interface OwnRun {
 	checks: Map<string, CheckReport | "skipped">;
 	/** The tree a required-check run is currently evaluating; no second run starts for it. */
 	checking?: string;
+	/** Jobs may overlap inside a batch by declared resource, never with unchecked worktree writers. */
+	jobBatch?: true;
+	jobFence?: true;
 	/** The compact evidence of the latest check report, written with every live and final record. */
 	checkEvidence?: RunCheckEvidence[];
 	/** The last valid closeout brief submitted for this run; the final record only, never a status change. */
@@ -1832,7 +1838,140 @@ export class RunController {
 		if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) {
 			return { ok: false, reason: "다른 세션이 시작한 실행의 쓰기 권한은 빌려올 수 없습니다." };
 		}
+		if (this.jobsRunning()) return { ok: false, reason: "[storm:job-wait] 정형 작업이 정리된 뒤 작업 트리를 쓸 수 있습니다." };
 		return this.#upgradeLease(own);
+	}
+
+	jobsRunning(): boolean {
+		return this.#own?.jobBatch === true || this.#own?.jobFence === true;
+	}
+
+	/** Executes only jobs in this run's plan and current approval. Tool input never supplies argv or lock keys. */
+	async executeJobs(
+		ctx: ExtensionContext,
+		names: readonly string[],
+		stillOwner: () => boolean,
+		signal?: AbortSignal,
+	): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+		const own = this.#own;
+		const plan = own?.record.plan;
+		if (own === undefined || plan === undefined || !stillOwner() || closeoutSessionId(ctx) !== own.sessionId || own.ending !== undefined) {
+			return { ok: false, reason: "현재 대화의 실행 계획에서만 정형 작업을 시작할 수 있습니다." };
+		}
+		if (reservedWorkers(own.record.runId).length > 0 || this.#hasLiveWork(own)) {
+			return { ok: false, reason: "[storm:job-wait] 실행 중인 워커·검사·정형 작업이 끝난 뒤 호출하세요. 팀 변경은 필요하지 않습니다." };
+		}
+		const pending = [];
+		for (const name of names) {
+			const lane = plan.lanes.find(candidate => candidate.name === name);
+			const job = own.config.jobs?.find(candidate => candidate.name === lane?.job);
+			if (lane === undefined || job === undefined) return { ok: false, reason: `${name}: 이 계획에 승인된 정형 작업 레인이 아닙니다.` };
+			pending.push({ lane, job });
+		}
+		const jobSignal = signal === undefined ? own.abort.signal : AbortSignal.any([own.abort.signal, signal]);
+		const owner = (): boolean =>
+			this.#own === own && own.record.plan === plan && own.ending === undefined && own.jobFence !== true &&
+			!jobSignal.aborted && stillOwner() && closeoutSessionId(ctx) === own.sessionId;
+		const approved = async (): Promise<boolean> => {
+			if (!owner()) return false;
+			const state = await this.deps.loadState(ctx).catch(() => undefined);
+			return owner() && state !== undefined && state.sessionDir === own.sessionDir && state.repo.root === own.root &&
+				state.repo.repoId === own.repoId && state.config.status === "ok" &&
+				state.config.hash === own.record.configHash && isApproved(state);
+		};
+		own.jobBatch = true;
+		try {
+			if (!(await approved())) return { ok: false, reason: "현재 팀 승인과 작업 대상을 확인하지 못해 시작하지 않았습니다." };
+			const lease = await this.#upgradeLease(own);
+			if (!lease.ok) return lease;
+			const lines: string[] = [];
+			this.#syncResults(own);
+			while (pending.length > 0 && owner()) {
+				const ready: typeof pending = [];
+				const deferred: typeof pending = [];
+				const waiting = new Map<string, string>();
+				const resources = new Set<string>();
+				const prerequisites = new Set(pending.flatMap(({ lane }) => (lane.dependsOn ?? []).map(edge => edge.lane)));
+				const view = await this.laneReadiness(plan, prerequisites);
+				if (!owner()) break;
+				for (const entry of pending) {
+					const { lane, job } = entry;
+					if (own.record.jobs?.some(receipt => receipt.lane === lane.name && receipt.status === "passed") &&
+						(lane.results ?? []).every(result => own.record.results?.some(row => row.id === result.id && row.state === "accepted"))) {
+						lines.push(`${lane.name}: 완료된 결과를 유지했습니다.`);
+						continue;
+					}
+					const reason = dependencyBlock(lane, view);
+					const keys = job.resources ?? [];
+					if (reason !== undefined) waiting.set(lane.name, reason);
+					if (reason !== undefined || ready.length >= 4 ||
+						(ready.length > 0 && (keys.length === 0 || resources.size === 0)) || keys.some(key => resources.has(key))) {
+						deferred.push(entry);
+						continue;
+					}
+					ready.push(entry);
+					for (const key of keys) resources.add(key);
+				}
+				if (ready.length === 0) {
+					for (const [name, reason] of waiting) lines.push(`${name}: 대기 · ${reason}`);
+					break;
+				}
+				lines.push(...await Promise.all(ready.map(async ({ lane, job }) => {
+					const inputs = inputSnapshot(plan, lane, own.record.results);
+					const receipt = await runConfiguredJob({
+						job,
+						cwd: own.root,
+						resourceKeys: job.resources?.length
+							? job.resources.map(key => `resource:${createHash("sha256").update(key).digest("hex")}`)
+							: [`target:${createHash("sha256").update(own.root).digest("hex")}`],
+						signal: jobSignal,
+						canStart: approved,
+					});
+					if (receipt.fenceRetained === true) own.jobFence = true;
+					const { name, status, exitCode, startedAt, finishedAt, detail } = receipt;
+					const saved: RunJob = { lane: lane.name, name, status, exitCode, startedAt, finishedAt, ...(detail === undefined ? {} : { detail }) };
+					if (receipt.fenceRetained === true && stillOwner()) {
+						this.deps.ui(ctx).notify(detail ?? "프로세스 종료를 확인하지 못해 정형 작업 자원 예약을 유지했습니다.", "warning");
+					}
+					const receipts = (own.record.jobs ??= []);
+					const index = receipts.findIndex(item => item.lane === lane.name);
+					if (index < 0) receipts.push(saved);
+					else receipts[index] = saved;
+					const attempt = `job:${++own.attemptSerial}`;
+					const version = createHash("sha256").update(receipt.stdout.tail).digest("hex");
+					for (const result of lane.results ?? []) {
+						const row = own.record.results?.find(candidate => candidate.id === result.id && candidate.lane === lane.name);
+						if (!row || row.identity !== resultContractIdentity(result)) continue;
+						const matches = status === "passed" && exitCode === 0 && result.contains !== undefined && receipt.stdout.tail.includes(result.contains);
+						row.state = matches ? "accepted" : "unmet";
+						row.origin = "attempt";
+						row.attemptId = attempt;
+						delete row.remedy;
+						delete row.unblock;
+						delete row.retryRoute;
+						delete row.reviewTree;
+						if (inputs.length > 0) row.consumed = inputs;
+						else delete row.consumed;
+						if (matches) {
+							row.contentVersion = version;
+							delete row.reason;
+						} else {
+							delete row.contentVersion;
+							row.reason = status === "passed" ? "기대한 stdout 근거를 확인하지 못했습니다." :
+								compactResultReason(detail ?? `실행 ${status}${exitCode === null ? "" : ` (exit ${exitCode})`}`);
+						}
+					}
+					return `${lane.name} (${name}): ${status}${exitCode === null ? "" : ` · exit ${exitCode}`}${detail === undefined ? "" : ` · ${detail}`}`;
+				})));
+				this.#invalidateConsumers(own);
+				this.#scheduleFlush(own);
+				pending.splice(0, pending.length, ...deferred);
+			}
+			return { ok: true, text: lines.join("\n") || "정형 작업을 시작하기 전에 실행이 중단되었습니다." };
+		} finally {
+			delete own.jobBatch;
+			if (this.#own === own) this.#emitPhase(own);
+		}
 	}
 
 	/**
@@ -1845,6 +1984,13 @@ export class RunController {
 		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 계획을 저장하지 않았습니다." };
 		if (closeoutSessionId(ctx) !== own.sessionId) {
 			return { ok: false, reason: "다른 세션이 시작한 실행에는 계획을 적용할 수 없습니다." };
+		}
+		if (this.jobsRunning()) return { ok: false, reason: "정형 실행이 끝난 다음 계획을 바꿀 수 있습니다." };
+		for (const receipt of own.record.jobs ?? []) {
+			const lane = plan.lanes.find(candidate => candidate.job === receipt.name);
+			if (lane !== undefined && lane.name !== receipt.lane) {
+				return { ok: false, reason: `${receipt.name}: 이미 확인된 정형 작업 레인 ${receipt.lane}의 이름을 유지하세요.` };
+			}
 		}
 		// A lane keeps the identity its evidence is bound to: goal, kind, role and files. A status update belongs in
 		// progress; renaming a changed lane is the only way to start its evidence over. Reject before touching the plan
@@ -2059,6 +2205,9 @@ export class RunController {
 		const plan = own.record.plan;
 		if (plan === undefined) return undefined;
 		const remaining = new Set(own.lanes.remaining(plan, agents, this.#failedIds(own, agents)));
+		for (const lane of plan.lanes) {
+			if (lane.job !== undefined && own.record.jobs?.some(job => job.lane === lane.name && job.status === "passed")) remaining.delete(lane.name);
+		}
 		for (const row of own.record.results ?? []) {
 			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) remaining.add(row.lane);
 		}
@@ -2642,6 +2791,7 @@ export class RunController {
 
 	/** Whether this run still owns live work: a running agent, a running check, a settlement being evaluated, or a bound job. */
 	#hasLiveWork(own: OwnRun): boolean {
+		if (own.jobBatch === true || own.jobFence === true) return true;
 		if (own.checking !== undefined) return true;
 		// A settlement already inside `settleAttempt` has left `attempts` for `settling`; the record it will write is
 		// current evidence, so finalization must wait for it instead of judging the previous accepted row.
@@ -2755,6 +2905,7 @@ export class RunController {
 			return undefined;
 		}
 		this.#own = undefined;
+		clearWorkerSlots(own.record.runId);
 		// A late child event or dialog answer now finds no watcher for this run, so it cannot mark the next one.
 		phaseWatchers.delete(own.record.runId);
 		this.#clearUserWaits(own);
@@ -2789,9 +2940,7 @@ export class RunController {
 		// Read while the run's spawn map still binds its failed ids: a lane is pending only from authoritative state.
 		// A settled worker is not a finished requirement: an open result row keeps its lane, including a consumer whose
 		// producer changed after the last attempt (T05).
-		const pendingNames = new Set(
-			own.record.plan === undefined ? [] : own.lanes.remaining(own.record.plan, agents, this.#failedIds(own, agents)),
-		);
+		const pendingNames = new Set(this.#planLanes(own, agents)?.filter(lane => lane.state === "pending").map(lane => lane.name) ?? []);
 		for (const row of own.record.results ?? []) {
 			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) pendingNames.add(row.lane);
 		}

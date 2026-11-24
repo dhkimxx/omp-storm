@@ -421,7 +421,7 @@ async function main(): Promise<void> {
 			run.request === request && run.task.length <= 200 && run.maxRounds === 4,
 			`request=${run.request === request} task=${run.task.length} maxRounds=${run.maxRounds}`,
 		);
-		check("the run record: no changes, ended after one round", run.endReason === "no-changes" && run.status === "ended" && run.turns === 1, `${run.endReason} ${run.status} turns=${run.turns}`);
+		check("the accepted answers close the run after one round", run.endReason === "verified" && run.status === "done" && run.turns === 1 && run.results?.every(row => row.state === "accepted") === true, `${run.endReason} ${run.status} turns=${run.turns}`);
 		const outcome = (agent: string) => run.spawns.find(spawn => spawn.agent === agent);
 		check(
 			"storm roles are routed, outside models are swapped for the role's",
@@ -445,7 +445,7 @@ async function main(): Promise<void> {
 		check("spawn records link to ledger agents", run.spawns.length === 4 && run.spawns.every(spawn => ledger.some(agent => agent.id === spawn.spawnKey)));
 		check("the plan is in the record", run.plan?.lanes.length === 3 && run.plan.workers.implementer === 2, JSON.stringify(run.plan?.workers));
 		const summary = files.index().find(line => line.runId === run.runId);
-		check("the run summary index has its line", summary?.schema === "storm.run-summary/v1" && summary.endReason === "no-changes" && summary.turns === 1, JSON.stringify(summary));
+		check("the run summary index has its actual outcome", summary?.schema === "storm.run-summary/v1" && summary.endReason === run.endReason && summary.turns === 1, JSON.stringify(summary));
 		check("the run's report is in the transcript, off the model's context", reports(frames).some(report => report.includes(run.runId) && report.includes('"excludeFromContext":true')));
 
 		const verdict = ledger.find(agent => agent.role === "reviewer")?.review;
@@ -490,7 +490,7 @@ async function main(): Promise<void> {
 		}));
 		check(
 			"a reply that still says mode loop is a plain run",
-			stale.dialogs === 0 && stale.run.endReason === "no-changes" && stale.run.status === "ended" && stale.run.turns === 1 && stale.run.limits === undefined,
+			stale.dialogs === 0 && stale.run.endReason === "verified" && stale.run.status === "done" && stale.run.turns === 1 && stale.run.limits === undefined,
 			`${stale.run.endReason} ${stale.run.status} turns=${stale.run.turns} limits=${JSON.stringify(stale.run.limits)} dialogs=${stale.dialogs}`,
 		);
 	});
@@ -941,12 +941,12 @@ async function main(): Promise<void> {
 		}, { resume: killedSession.id, sessionDir: killedSession.dir, setup: "off" });
 	});
 
-	await suite.step("the storm tool's four actions", async () => {
+	await suite.step("Storm tool actions stay within run scope", async () => {
 		const llm = new LlmCursor(env);
 		await session(cancelAll, async (rpc, files) => {
 			let frames = await rpc.turn('E2E-TOOL {"action":"status"}');
 			const offered = mains(llm.all())[0]?.stormTool;
-			check("the tool offers the staged brief as well as run, plan, status and agents", same(offered?.actions, ["run", "plan", "brief", "status", "agents"]), JSON.stringify(offered?.actions));
+			check("run tool offers execute and brief but no team mutations", same(offered?.actions, ["run", "plan", "execute", "brief", "status", "agents"]), JSON.stringify(offered?.actions));
 			check("its description stays within 900 chars", (offered?.descriptionChars ?? 0) > 0 && (offered?.descriptionChars ?? 0) <= 900, `chars=${offered?.descriptionChars}`);
 			check("status: ok", same(toolOutcomes(frames), [{ action: "status", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
 			frames = await rpc.turn('E2E-TOOL {"action":"agents"}');
@@ -963,8 +963,8 @@ async function main(): Promise<void> {
 			const run = await files.finishedRun(before);
 			check("run: queued, and started once the turn settled", toolOutcomes(rpc.frames.slice(from))[0]?.outcome === "queued", JSON.stringify(toolOutcomes(rpc.frames.slice(from))));
 			check(
-				"a run whose subagents changed no file ends after one round",
-				run.status === "ended" && run.endReason === "no-changes" && run.turns === 1 && run.spawns.some(spawn => spawn.outcome === "routed"),
+				"a run whose workers deliver an accepted answer without editing ends after one round",
+				run.status === "done" && run.endReason === "verified" && run.turns === 1 && run.results?.some(row => row.id === "tool-run-report" && row.state === "accepted") === true,
 				`${run.status} ${run.endReason} turns=${run.turns} ${JSON.stringify(run.spawns.map(spawn => spawn.outcome))}`,
 			);
 		});
@@ -1458,7 +1458,7 @@ async function main(): Promise<void> {
 				await rpc.turn("hello");
 				const run = await runOf(rpc, files, startRun([plan([{ name: "impl", kind: "code", results: [trackedAnswer("heavy-report")] }]), { task: ["storm-implementer"], as: "Impl", say: READ_AND_CLAIM }]));
 				const compactions = llm.of("compaction").length;
-				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "ended" && run.endReason === "no-changes" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} ${run.endReason} compactions=${compactions}`);
+				check("the run starts without a dialog, after compacting", rpc.dialogs.length === 0 && run.status === "done" && run.endReason === "verified" && compactions > 0, `dialogs=${rpc.dialogs.length} status=${run.status} ${run.endReason} compactions=${compactions}`);
 			},
 			{ model: "fake/heavy-main" },
 		);

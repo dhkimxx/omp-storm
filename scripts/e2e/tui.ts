@@ -265,7 +265,8 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 		const second = phaseRow(tui.text(started), "workers");
 		check(named("motion off leaves the radar still"), first !== undefined && second === first && radarFrames(tui.text(started), "workers").size === 1, `${first} → ${second}`);
 		const run = await files.finishedRun(before, 120_000);
-		check(named("the narrow run ends on its own"), run.endReason === "no-changes" && run.status === "ended", `${run.status} ${run.endReason}`);
+		check(named("the narrow run accepts its answer but does not certify the unrun code check"),
+			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes", `${run.status} ${run.endReason}`);
 		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 		if (background === "dark") {
 			const hub = await tui.submit("/storm");
@@ -310,7 +311,8 @@ async function asciiDashboard(): Promise<void> {
 		check("the measured ASCII rows fit the actual terminal", [displayed.state, displayed.chips].every(line => Bun.stringWidth(line) <= columns), displayed.chips);
 		check("the ASCII cost chip uses one leading currency sign", /\$\s*0\.\d+\/\$\d/.test(displayed.chips) && !/\$\s+\$/.test(displayed.chips), displayed.chips);
 		const run = await files.finishedRun(before, 30_000);
-		check("the ASCII worker run settles normally", run.endReason === "no-changes");
+		check("the ASCII view run retains its answer without claiming the code check",
+			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes");
 		const status = await tui.submit("/storm status");
 		await tui.shows(OVERLAY_HINT, status);
 		const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the ASCII status storage tab");
@@ -485,14 +487,14 @@ async function main(): Promise<void> {
 	}, 180_000);
 
 	await suite.step(
-		"a plain request ends without changes",
+		"a plain request delivers a verified answer without file changes",
 		async () => {
 			const llm = new LlmCursor(env);
 			await session(async (tui, files) => {
 				const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: readProbe }];
 				const run = await runOf(tui, files, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 150_000);
 				check("one side turn routed it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
-				check("one turn, ended with no changes", run.turns === 1 && run.endReason === "no-changes" && run.status === "ended", `turns=${run.turns} ${run.endReason} ${run.status}`);
+				check("one turn, ended with accepted evidence", run.turns === 1 && run.endReason === "verified" && run.status === "done", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
 				check("it ended once", files.index().filter(line => line.runId === run.runId).length === 1);
 				await suite.eventually("the footer returns to its idle state after the run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
@@ -535,7 +537,7 @@ async function main(): Promise<void> {
 			check("automatic investigation reports the outcome once with option 1 recommended", shown.match(/E2E-BRIEF-RESULT/g)?.length === 1 && /추천[^\n]*E2E-NEXT/u.test(shown));
 			check(
 				"updating progress preserves real completed coverage even though a changed goal was refused",
-				run.endReason === "no-changes" && run.turns === 1 && run.spawns.filter(spawn => spawn.outcome === "routed").length === 2 &&
+				run.endReason === "verified" && run.turns === 1 && run.spawns.filter(spawn => spawn.outcome === "routed").length === 2 &&
 					run.plan?.lanes[0]?.goal === scope.goal && run.plan?.lanes[0]?.progress?.includes("(완료)") === true,
 				`${run.status}/${run.endReason} in ${run.turns} turns`,
 			);
@@ -631,7 +633,7 @@ async function main(): Promise<void> {
 				await until(answerArrived, 30_000, "the named answer to reach the director");
 				const run = await files.finishedRun(before, 150_000);
 				check("the answer resumed the same run", run.runId === live.runId && run.status !== "running", `${run.runId} vs ${live.runId} ${run.status}`);
-				check("the answered run ends normally after one round", run.endReason === "no-changes" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
+				check("the answered run verifies its result after one round", run.endReason === "verified" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
 				await suite.eventually("the footer returns after the answered run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 			});
 		},
@@ -699,10 +701,11 @@ async function main(): Promise<void> {
 						"the verifying phase while the real required check runs",
 						120_000,
 					);
-					check("verification still in flight does not display the final brief", !verifying.includes("다음으로 무엇을 할까요?"));
+					const currentCheck = "e2e-verify-hold passed(0)";
+					check("verification in flight does not display this run's final evidence", !verifying.includes(currentCheck));
 					const run = await files.finishedRun(before, 240_000);
-					await tui.shows("다음으로 무엇을 할까요?", started, 20_000);
-					const completed = tui.text(started);
+					await tui.shows(currentCheck, started, 20_000);
+					const completed = tui.text(started).split("### Storm 실행 결과").at(-1) ?? "";
 					check("the fallback brief names the actual verified result and check", completed.includes("상태(공식): 완료") && completed.includes("e2e-verify-hold passed(0)"));
 					await suite.eventually(
 						"the status line returns to idle after the run",

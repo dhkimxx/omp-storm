@@ -2739,7 +2739,7 @@ describe("declared results", () => {
 		expect(await Bun.file(path.join(root, REPORT)).text()).toBe(REPORT_TEXT);
 	});
 
-	test("T01b: a witnessed answer is accepted on its native attempt and the read-only run ends no-changes", async () => {
+	test("T01b: a witnessed answer completes a read-only run on its native attempt without a code review", async () => {
 		await writeFile(path.join(root, REPORT), REPORT_TEXT);
 		const agents: AgentEntry[] = [];
 		const h = session({ agents });
@@ -2774,7 +2774,7 @@ describe("declared results", () => {
 		await h.turn();
 
 		const run = await readRun(h.sessionDir, runId);
-		expect(run).toMatchObject({ status: "ended", endReason: "no-changes" });
+		expect(run).toMatchObject({ status: "done", endReason: "verified" });
 		expect(run?.results?.find(item => item.id === "report-answer")).toMatchObject({ state: "accepted", lane: "read-report", attemptId: `job:job-1:${spawnKey}` });
 		expect(run?.agents?.some(item => item.role === "reviewer")).not.toBe(true);
 	});

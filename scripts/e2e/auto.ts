@@ -237,11 +237,12 @@ try {
 			const dispatch = new LlmCursor(env);
 			const prompt = scripted(plan, probe);
 			const receivedAt = Date.now();
-			const frames = await rpc.turn(prompt);
+			await rpc.turn(prompt);
 			const run = await files.finishedRun(before, 20_000);
 			suite.check("first plan opens one run and dispatches one approved worker", run.request === prompt && run.plan?.lanes[0]?.name === "Probe0" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1 && dispatch.of("child").length > 0);
 			suite.check("routing used the original user turn, not a classifier or a duplicated handoff", dispatch.of("route").length === 0 && dispatch.of("main").some(entry => entry.lastUser.includes(prompt)) && dispatch.of("main").every(entry => !entry.lastUser.includes("<storm-run id=")));
-			suite.check("ordinary read run has no verbose transcript report", frames.every(frame => customMessage(frame) !== "storm-report"));
+			const outcome = await until(() => reports(rpc.frames).find(report => report.includes("Storm 실행 결과")), 5_000, "read-only result closeout");
+			suite.check("a source-backed answer closes as a result even without a repo change", run.endReason === "verified" && run.results?.some(row => row.id === "probe-answer" && row.state === "accepted") === true && outcome.includes("probe-answer"));
 			suite.check("a fresh small automatic run needs no checkpoint", dispatch.of("compaction").length === 0 && !run.checkpoints?.length);
 			const child = dispatch.of("child")[0];
 			if (child) console.log(`     scripted auto: first worker ${Math.max(0, child.ts - receivedAt)}ms · main requests ${dispatch.of("main").length} · compactions ${dispatch.of("compaction").length}`);
@@ -286,7 +287,7 @@ try {
 			const first = supervisor[0];
 			const after = supervisor.at(-1);
 			suite.check("the same run settled normally with one approved worker and no synthetic round",
-				run.request === request && run.turns === 1 && run.endReason === "no-changes" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1,
+				run.request === request && run.turns === 1 && run.endReason === "verified" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1,
 				`${run.status}/${run.endReason} rounds=${run.turns} spawns=${run.spawns.length}`);
 			suite.check("the director used synchronous wait with no router",
 				supervisor.some(entry => entry.decision.tool === "wait") && llm.of("route").length === 0);
@@ -397,6 +398,70 @@ try {
 			} finally {
 				rmSync(join(env.project, output), { force: true });
 			}
+		}
+	});
+
+	await suite.step("a batch overlaps independent resource lanes and reports real failures without AI workers", async () => {
+		const rendezvous = join(env.work, "job-rendezvous");
+		const resource = `test-device:${new Bun.CryptoHasher("sha256").update(env.work).digest("hex").slice(0, 12)}`;
+		const argv = (id: string, other: string, exit: number) => [
+			process.execPath, "-e",
+			[
+				'const fs=require("node:fs"), path=require("node:path");',
+				"const [root,id,other,exit]=process.argv.slice(-4);",
+				'fs.mkdirSync(root,{recursive:true}); fs.writeFileSync(path.join(root,id),"started");',
+				'fs.appendFileSync(path.join(root,"events"), id+"\\n");',
+				"const limit=Date.now()+3000;",
+				"while(other && !fs.existsSync(path.join(root,other)) && Date.now()<limit) await new Promise(r=>setTimeout(r,10));",
+				"if(other && !fs.existsSync(path.join(root,other))) process.exit(9);",
+				'console.log("JOB-RECEIPT:"+id); process.exit(Number(exit));',
+			].join(" "),
+			rendezvous, id, other, String(exit),
+		];
+		ownedFiles().editConfig(config => {
+			delete config.requiredChecks;
+			config.jobs = [
+				{ name: "case-a", argv: argv("a", "b", 0), resources: [`${resource}:a`] },
+				{ name: "case-b", argv: argv("b", "a", 0), resources: [`${resource}:b`] },
+				{ name: "case-c", argv: argv("c", "", 7), resources: [`${resource}:a`] },
+			];
+		});
+		try {
+			await session(choose(APPROVE), async (rpc, files) => {
+				await rpc.prompt("/storm");
+				if (!rpc.dialogs.some(dialog => dialog.answer === APPROVE)) throw new Error("the named job fixture team was not approved");
+				const start = files.runIds();
+				const dialogs = rpc.dialogs.length;
+				const llm = new LlmCursor(env);
+				const lanes = ["a", "b", "c"].map(id => ({
+					name: `case-${id}`, kind: "run", job: `case-${id}`,
+					results: [{ id: `result-${id}`, kind: "answer", criterion: `real case-${id} receipt marker`, contains: `JOB-RECEIPT:${id}` }],
+				}));
+				await rpc.turn(scripted(
+					{ storm: { action: "plan", plan: { lanes } } },
+					{ storm: { action: "execute", lanes: ["unplanned"] } },
+					{ storm: { action: "execute", lanes: lanes.map(lane => lane.name) } },
+					{ storm: { action: "execute", lanes: ["case-a", "case-b"] } },
+				));
+				const run = await files.finishedRun(start, 30_000);
+				const jobs = new Map(run.jobs?.map(job => [job.name, job]));
+				const a = jobs.get("case-a"), b = jobs.get("case-b"), c = jobs.get("case-c");
+				suite.check("two resources rendezvous, while the third case waits for resource A",
+					a?.status === "passed" && b?.status === "passed" && c?.status === "failed" &&
+						c.exitCode === 7 && c.startedAt !== null && a.finishedAt !== null && c.startedAt >= a.finishedAt,
+					JSON.stringify(run.jobs));
+				suite.check("no worker/config dialog and only the failed case remains open",
+					llm.of("child").length === 0 && rpc.dialogs.length === dialogs &&
+						run.results?.filter(row => row.state === "accepted").length === 2 &&
+						run.results?.find(row => row.id === "result-c")?.state === "unmet" && run.endReason !== "verified",
+					JSON.stringify(run.results));
+				suite.check("only planned jobs run once; retrying accepted lanes has no side effect",
+					existsSync(join(rendezvous, "events")) && same(readFileSync(join(rendezvous, "events"), "utf8").trim().split("\n").sort(), ["a", "b", "c"]));
+				const card = await until(() => reports(rpc.frames).find(report => report.includes("result-c") && report.includes("Storm 실행 결과")), 5_000, "partial-result closeout");
+				suite.check("the final card exposes the failed result", card.includes("result-c"));
+			});
+		} finally {
+			rmSync(rendezvous, { recursive: true, force: true });
 		}
 	});
 

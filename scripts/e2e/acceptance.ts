@@ -405,7 +405,7 @@ async function main(): Promise<void> {
 			);
 			check(
 				"T01b: the read-only query did not force a review or a diff",
-				reviewer === false && run.status === "ended" && run.endReason === "no-changes",
+				reviewer === false && (CONTRACT ? run.status === "done" && run.endReason === "verified" : run.status === "ended" && run.endReason === "no-changes"),
 				`reviewer=${reviewer} observed=${run.status}/${run.endReason} run=${run.runId}`,
 			);
 			check(
@@ -431,8 +431,8 @@ async function main(): Promise<void> {
 					JSON.stringify({ obligation: obligation ?? null, spawnKey: spawn?.spawnKey ?? null, worker: child?.name ?? null }),
 				);
 				check(
-					"T01b contract: accepted is an obligation, not global verification",
-					obligation?.state === "accepted" && reviewer === false && run.endReason === "no-changes" && run.status === "ended",
+					"T01b contract: accepted source evidence completes the no-write run without a code review",
+					obligation?.state === "accepted" && reviewer === false && run.endReason === "verified" && run.status === "done",
 					`state=${obligation?.state ?? "none"} observed=${run.status}/${run.endReason} reviewer=${reviewer}`,
 				);
 			}
