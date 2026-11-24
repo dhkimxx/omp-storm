@@ -182,7 +182,6 @@ describe("trial comparison", () => {
 		version: 1,
 		priority: "balanced",
 		roles: { implementer: { agent: "storm-implementer", models: ["anthropic/claude-a:high"] } },
-		parallelism: 2,
 		isolation: "shared",
 		trials,
 	});

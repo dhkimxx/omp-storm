@@ -484,8 +484,15 @@ export interface FollowUpGateInput {
 	canonicalFiles?: readonly string[];
 	/** The plan in force when the lane was resolved; absent means no planned lane. */
 	plan?: RunPlan;
-	/** The approved team, for the run's global parallelism. Absent skips the run-wide check. */
+	/** The approved team, for the plan's role caps. */
 	config?: StormConfig;
+	/**
+	 * Live OMP `task.maxConcurrency` of the main session that owns this run: 0 is unlimited, absent is unknown.
+	 * A genuine reactivation checks it with the same reservation count as a fresh spawn.
+	 */
+	maxConcurrency?: number;
+	/** Running native workers outside this plan, proven to belong to the same scheduler. */
+	otherActive?: number;
 	/** `config.isolation === "isolated"`: every worker output stays private, so no shared write is reserved. */
 	isolated: boolean;
 	readiness?: LaneReadinessView;
@@ -837,7 +844,7 @@ export class RunLanes {
 	}
 
 	/**
-	 * The same admission rules for a work-bearing `write agent://<id>` (a status `?progress` note never reaches here):
+	 * Any message that can start a turn (including native quiet writes) passes the same admission rules:
 	 * the target lane's prerequisites must hold, and a shared write reserves its scope before omp delivers the turn.
 	 * Its own in-flight reservation never blocks the continuation.
 	 */
@@ -864,7 +871,7 @@ export class RunLanes {
 		const hasSlot = reserved.some(slot => slot.key === input.agentId);
 		// A worker already running, or one that already holds a slot, is not a second worker: a work-bearing note to it
 		// charges no new slot. A genuine reactivation of an idle/parked worker checks and takes a slot like a fresh start.
-		const needsCapacity = input.runId !== undefined && lane !== undefined && !running && !hasSlot;
+		const needsCapacity = input.runId !== undefined && !running && !hasSlot;
 		if (needsCapacity) {
 			const active = activeAgents([], input.agents ?? [], now, reserved);
 			const cap = role === undefined ? undefined : input.plan?.workers[role];
@@ -877,13 +884,14 @@ export class RunLanes {
 					reason: `${roleTitle(role)} 역할 워커가 이미 계획의 ${cap}개(역할 최대 ${max}개)만큼 살아 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 사용자에게 묻지 말고 wait 도구나 완료 알림으로 하나가 끝난 뒤 같은 write를 다시 보내세요.`,
 				};
 			}
-			const limit = input.config?.parallelism;
-			if (limit !== undefined && active.total >= limit) {
+			const limit = input.maxConcurrency;
+			const total = active.total + (input.otherActive ?? 0);
+			if (limit !== undefined && limit > 0 && total >= limit) {
 				return {
 					ok: false,
 					code: "lane-capacity",
 					retry: true,
-					reason: `이 실행의 서브에이전트 ${active.total}개가 동시 상한 ${limit}개에 닿아 ${input.agent} 후속 작업을 보내지 않았습니다. 사용자에게 묻지 말고 wait 도구나 완료 알림으로 하나가 끝난 뒤 같은 write를 다시 보내세요.`,
+					reason: `OMP 동시 상한(task.maxConcurrency ${limit})에 닿아 ${input.agent} 후속 작업을 보내지 않았습니다. 사용자에게 묻지 말고 진행 중인 워커가 끝난 뒤 같은 write를 다시 보내세요.`,
 				};
 			}
 		}
@@ -896,11 +904,11 @@ export class RunLanes {
 		);
 		const token = `follow:${++this.#tokenSerial}`;
 		const capacityKey = needsCapacity ? input.agentId : undefined;
-		const trackSlot = input.runId !== undefined && lane !== undefined && !hasSlot;
+		const slot = input.runId !== undefined && !hasSlot
+			? { runId: input.runId, key: input.agentId, ...(role === undefined ? {} : { role }), ...(lane === undefined ? {} : { lane: lane.name }), now }
+			: undefined;
 		if (scope.kind === "read" || scope.kind === "private") {
-			if (trackSlot) {
-				reserveWorkerSlot({ runId: input.runId!, key: input.agentId, ...(role === undefined ? {} : { role }), lane: lane!.name, now });
-			}
+			if (slot !== undefined) reserveWorkerSlot(slot);
 			this.#followTokens.set(token, { created: false, ...(capacityKey === undefined ? {} : { capacityKey }) });
 			return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 		}
@@ -913,9 +921,7 @@ export class RunLanes {
 		const key = lane !== undefined ? `lane:${lane.name}` : `spawn:${input.agentId}`;
 		const existing = this.#writes.get(key);
 		this.#writes.set(key, { scope, ...(lane === undefined ? {} : { lane: lane.name }), agentId: input.agentId, at: now });
-		if (trackSlot) {
-			reserveWorkerSlot({ runId: input.runId!, key: input.agentId, ...(role === undefined ? {} : { role }), lane: lane!.name, now });
-		}
+		if (slot !== undefined) reserveWorkerSlot(slot);
 		this.#followTokens.set(token, { key, created: existing === undefined, ...(capacityKey === undefined ? {} : { capacityKey }) });
 		return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 	}

@@ -1,5 +1,9 @@
-import { Settings } from "@oh-my-pi/pi-coding-agent";
-import { cfgTaskIsolationApply, cfgTaskIsolationEnabled } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { findScopedSettings, type Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	cfgTaskIsolationApply,
+	cfgTaskIsolationEnabled,
+	cfgTaskMaxConcurrency,
+} from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { Exec, ExplicitSettings } from "../types.ts";
 
 type Rec = Record<string, unknown>;
@@ -10,7 +14,7 @@ function isRec(value: unknown): value is Rec {
 
 /**
  * Parses `omp config list --json`: a flat map of dotted keys to `{ value?, type, description }`.
- * Only model preferences, subagent concurrency and isolation, and retry fallback are read; other keys (auth.* included) are ignored.
+ * Only model preferences, isolation and retry fallback are read; other keys (auth.* included) are ignored.
  */
 export function parseConfigList(text: string): ExplicitSettings {
 	const settings: ExplicitSettings = { modelRoles: {} };
@@ -37,8 +41,6 @@ export function parseConfigList(text: string): ExplicitSettings {
 	if (typeof isolation === "boolean") settings.isolationEnabled = isolation;
 	const apply = valueOf("task.isolation.apply");
 	if (typeof apply === "boolean") settings.isolationApply = apply;
-	const concurrency = valueOf("task.maxConcurrency");
-	if (typeof concurrency === "number" && Number.isFinite(concurrency) && concurrency > 0) settings.maxConcurrency = concurrency;
 	const modelFallback = valueOf("retry.modelFallback");
 	if (typeof modelFallback === "boolean") settings.modelFallback = modelFallback;
 	// An entry counts only when it is a list of non-empty selectors; others are dropped whole.
@@ -60,13 +62,41 @@ export function parseConfigList(text: string): ExplicitSettings {
  */
 export function liveIsolationSettings(): Pick<ExplicitSettings, "isolationEnabled" | "isolationApply"> {
 	try {
-		const settings = Settings.instance;
+		const settings = findScopedSettings();
+		if (settings === undefined) return {};
 		return {
 			isolationEnabled: cfgTaskIsolationEnabled.get(settings),
 			isolationApply: cfgTaskIsolationApply.get(settings),
 		};
 	} catch {
 		return {};
+	}
+}
+
+/**
+ * The effective OMP subagent ceiling (`task.maxConcurrency`) of one settings instance: 0 is unlimited, and an absent
+ * instance is unknown, never a Storm-invented default. The getter's own registered default applies only to a real
+ * instance, so this module does not restate it.
+ */
+export function taskMaxConcurrencyOf(settings: Settings | undefined): number | undefined {
+	if (settings === undefined) return undefined;
+	try {
+		const value = cfgTaskMaxConcurrency.get(settings);
+		return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The live session's effective OMP subagent ceiling, read without a subprocess. The host wraps extension handlers in
+ * the active session's settings scope, so a session/project overlay is honored; an uninitialized host is unknown.
+ */
+export function liveTaskMaxConcurrency(): number | undefined {
+	try {
+		return taskMaxConcurrencyOf(findScopedSettings());
+	} catch {
+		return undefined;
 	}
 }
 

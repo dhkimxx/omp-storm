@@ -108,7 +108,7 @@ const route = (reply: Record<string, unknown>, rest = "please"): string => `/sto
 const runRequest = (reply: Record<string, unknown>, steps: Step[]): string => route(reply, `E2E-STEPS ${JSON.stringify(steps)}`);
 const startRun = (steps: Step[]): string => runRequest({ action: "run" }, steps);
 /** One plan lane; every non-review lane carries the observable result its worker actually delivers. */
-type LaneSpec = { name: string; kind: string; role?: string; results?: PlanLaneResult[] };
+type LaneSpec = { name: string; kind: string; role?: string; files?: string[]; results?: PlanLaneResult[] };
 const plan = (lanes: LaneSpec[], workers?: Record<string, number>): Extract<Step, { storm: unknown }> => ({
 	storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } },
 });
@@ -973,9 +973,8 @@ async function main(): Promise<void> {
 	await suite.step("approval gate on an unapproved config", async () => {
 		const llm = new LlmCursor(env);
 		await session(cancelAll, async (rpc, files) => {
-			// A teammate's edit in this session: fewer parallel agents, no architect.
+			// A teammate's edit in this session: no architect.
 			files.editConfig(config => {
-				config.parallelism = 2;
 				delete config.roles.architect;
 				config.disabledRoles = ["architect"];
 			});
@@ -1014,9 +1013,8 @@ async function main(): Promise<void> {
 	await suite.step("spawn enforcement codes", async () => {
 		const llm = new LlmCursor(env);
 		await session(cancelAll, async (rpc, files) => {
-			// The boundaries need a two-wide team with no architect; approve that config in this same session.
+			// The disabled-role check needs a team without an architect; approve that config in this same session.
 			await editAndApprove(rpc, files, config => {
-				config.parallelism = 2;
 				delete config.roles.architect;
 				config.disabledRoles = ["architect"];
 			});
@@ -1026,22 +1024,17 @@ async function main(): Promise<void> {
 				{ name: "read-a", kind: "explore", role: "explorer", results: [trackedAnswer("read-a-report", "the explorer reports the tracked fixture from source")] },
 				{ name: "read-b", kind: "explore", role: "explorer", results: [trackedAnswer("read-b-report", "the explorer reports the tracked fixture from source")] },
 				{ name: "read-c", kind: "explore", role: "explorer", results: [trackedAnswer("read-c-report", "the explorer reports the tracked fixture from source")] },
-				{ name: "read-d", kind: "explore", role: "explorer", results: [trackedAnswer("read-d-report", "the explorer reports the tracked fixture from source")] },
-				{ name: "write", kind: "code", role: "implementer", results: [trackedAnswer("write-report", "the implementer reports the tracked fixture from source")] },
-				{ name: "review-a", kind: "review", role: "reviewer" },
-				{ name: "review-b", kind: "review", role: "reviewer" },
 			];
 			const gateKey = (lane: string): string => `spawn-cap-${lane}`;
 			const holdLane = (lane: string): string => `E2E-CHILD-GATE ${gateKey(lane)} ${READ_AND_CLAIM}`;
 			const roleBoundary = ["read-a", "read-b"].map(gateKey);
-			const teamBoundary = ["read-d", "write"].map(gateKey);
 			const run = await runOf(
 				rpc,
 				files,
 				startRun([
 					// Before any plan: a spawn is refused, and the next valid plan still takes effect.
 					{ task: ["storm-explorer"], as: "Early" },
-					{ ...plan(lanes, { explorer: 2, implementer: 1, reviewer: 1 }), after: "[storm:no-plan]" },
+					{ ...plan(lanes, { explorer: 2 }), after: "[storm:no-plan]" },
 					// One unknown lane rejects the whole native batch before its earlier valid item starts.
 					{
 						tasks: [
@@ -1056,22 +1049,11 @@ async function main(): Promise<void> {
 							{ name: "read-b", agent: "storm-explorer", say: holdLane("read-b") },
 						],
 					},
-					// Reach the provider with both first replies held before making the overflow request.
+					// Reach the provider with both first replies held before making the overflow request. The native
+					// default ceiling is above this plan's role cap, so the request reaches Storm's spawn hook.
 					{ tasks: [{ name: "read-c", agent: "storm-explorer", say: READ_AND_CLAIM }], awaitChildren: roleBoundary },
 					// Keep both alive through the asynchronous spawn decision, then let native wait drain them.
 					{ wait: true, afterResult: "Background job read-c has completed.", releaseChildren: roleBoundary },
-					// Boundary request for the team: one fresh explorer + one implementer fill parallelism 2.
-					{
-						tasks: [
-							{ name: "read-d", agent: "storm-explorer", say: holdLane("read-d") },
-							{ name: "write", agent: "storm-implementer", say: holdLane("write") },
-						],
-					},
-					// The fresh reviewer role has capacity, but the two held children fill the team.
-					{ tasks: [{ name: "review-a", agent: "storm-reviewer", say: "E2E-CAP-REVIEW-A" }], awaitChildren: teamBoundary },
-					{ wait: true, afterResult: "Background job review-a has completed.", releaseChildren: teamBoundary },
-					// Native wait has returned both settlements, so a distinct reviewer lane can now start.
-					{ tasks: [{ name: "review-b", agent: "storm-reviewer", say: "E2E-CAP-REVIEW-B" }] },
 					{ task: ["storm-architect"], as: "Arch" },
 					{ task: ["storm-quick"], as: "Quick" },
 					{ wait: true },
@@ -1096,8 +1078,6 @@ async function main(): Promise<void> {
 					return first >= 0 && first < probe && next > probe;
 				});
 			};
-			const postWait = modelRequests[taskRequestIndex("review-b")]?.lastTool ?? "";
-			const childRequests = children(modelRequests);
 			check("no plan yet: the spawn starts no child and says no-plan", blockCodes(run).includes("no-plan") && results.includes("[storm:no-plan]") && !routed.some(spawn => spawn.spawnKey === "Early0"), detail);
 			check(
 				"a batch naming an unknown lane starts nothing, not even its valid first item",
@@ -1115,26 +1095,12 @@ async function main(): Promise<void> {
 				`${detail} reasons=${reasons.slice(0, 300)}`,
 			);
 			check(
-				"the boundary request at the team's parallelism starts both concrete lanes",
-				routedLanes.includes("read-d") && routedLanes.includes("write") && probeSawLivePair("review-a", teamBoundary),
-				detail,
-			);
-			check(
-				"one more live lane than the team's parallelism is refused with parallelism, and a later valid request starts",
-				reasons.includes("[storm:parallelism]") && run.spawns.find(spawn => spawn.spawnKey === "review-a")?.code === "parallelism" &&
-					!childRequests.some(kid => kid.lastUser.includes("E2E-CAP-REVIEW-A")) &&
-					postWait.includes("### read-d [task] — completed") && postWait.includes("### write [task] — completed") &&
-					run.spawns.filter(spawn => spawn.lane === "review-b" && spawn.outcome !== "blocked").length === 1 &&
-					childRequests.some(kid => kid.lastUser.includes("E2E-CAP-REVIEW-B")),
-				`${detail} wait=${postWait.slice(0, 700)} reasons=${reasons.slice(0, 300)}`,
-			);
-			check(
 				"a disabled role and a role without a lane are denied without starting a child",
 				reasons.includes("storm-architect") && reasons.includes("storm-quick") && !run.spawns.some(spawn => spawn.outcome !== "blocked" && (spawn.agent === "storm-architect" || spawn.role === "architect" || spawn.agent === "storm-quick" || spawn.role === "quick")),
 				`${detail} reasons=${reasons.slice(0, 300)}`,
 			);
 			check("every blocked spawn has a code", run.spawns.filter(spawn => spawn.outcome === "blocked").every(spawn => spawn.code !== undefined), detail);
-			check("the valid boundary and post-refusal requests ran", routed.length >= 3 && children(llm.all()).length >= 3, detail);
+			check("the role boundary and post-refusal requests ran", routed.length >= 2 && children(llm.all()).length >= 2, detail);
 
 			rpc.answer = choose(APPROVE);
 			await rpc.prompt(route({ action: "budget", budgetUsd: 0.0001 }, "cap each run"));
@@ -1151,6 +1117,228 @@ async function main(): Promise<void> {
 			await rpc.prompt(route({ action: "budget", budgetUsd: 0 }, "drop the cap"));
 			check("budget 0 removes it", files.config().budget === undefined, JSON.stringify(files.config().budget));
 		});
+	});
+
+	await suite.step("native concurrency: queued starts, managed block at two, and status notes", async () => {
+		const profileBefore = readFileSync(PROFILE_FILE);
+		// The isolated profile is the only place this limit lives; the real user settings are never touched.
+		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}task:\n  maxConcurrency: 2\n`);
+		const llm = new LlmCursor(env);
+		const implFile = "e2e-native-cap.txt";
+		try {
+			await session(cancelAll, async (rpc, files) => {
+				const explorerLane = (name: string): LaneSpec => ({ name, kind: "explore", role: "explorer", results: [trackedAnswer(`${name}-report`, "the explorer reports the tracked fixture from source")] });
+				// Run A: two fresh starts hold the native ceiling. A third fresh start queues in the host before Storm's
+				// spawn hook, so it makes no provider request until a permit is released. An idle wake is refused by
+				// Storm at the same ceiling.
+				const queuedLanes: LaneSpec[] = [
+					explorerLane("read-a"),
+					explorerLane("read-d"),
+					{ name: "impl", kind: "code", role: "implementer", results: [trackedAnswer("impl-report", "the implementer reports the tracked fixture from source")] },
+					{ name: "review-a", kind: "review", role: "reviewer" },
+				];
+				let from = rpc.frames.length;
+				const queued = await runOf(
+					rpc,
+					files,
+					startRun([
+						plan(queuedLanes, { explorer: 2, implementer: 1, reviewer: 1 }),
+						// An ordinary child settles and becomes a parked worker, ready for a genuine reactivation.
+						{ tasks: [{ name: "read-a", agent: "storm-explorer", say: READ_AND_CLAIM }] },
+						{ wait: true, afterResult: "Background job read-a has completed." },
+						{
+							tasks: [
+								{ name: "read-d", agent: "storm-explorer", say: `E2E-CHILD-GATE cap-q-d ${READ_AND_CLAIM}` },
+								{ name: "impl", agent: "storm-implementer", say: `E2E-CHILD-GATE cap-q-impl ${READ_AND_CLAIM}` },
+							],
+						},
+						// Both native permits are taken. This third fresh start has a valid planned lane, so only the
+						// native semaphore delays it: its spawn hook does not run until a permit is released.
+						{ tasks: [{ name: "review-a", agent: "storm-reviewer", say: "E2E-CHILD-VERDICT correct E2E-CAP-QUEUE-THIRD" }], awaitChildren: ["cap-q-d", "cap-q-impl"] },
+						// A genuine reactivation of the parked explorer is refused by Storm at the same ceiling.
+						{ followUp: "agent://read-a", content: "E2E-CAP-QUEUE-REFUSED" },
+						// Freeing the permits lets the queued start reach the hook; the wait reports ordinary task
+						// completions as before. Its async result proves the job settled.
+						{ wait: true, releaseChildren: ["cap-q-d", "cap-q-impl"], after: "[storm:lane-capacity]" },
+						{ wait: true },
+						// A freed slot admits the same parked-worker wake on retry.
+						{ followUp: "agent://read-a", content: "E2E-CAP-QUEUE-WAKE-LATE" },
+						{ wait: true },
+					]),
+				);
+				const queuedReasons = rpc.frames.slice(from).map(text).join("\n");
+				const queuedRequests = llm.all();
+				const wakeAt = queuedRequests.findIndex(entry => entry.who === "main" && entry.decision.tool === "write" && entry.decision.args?.path === "agent://read-a");
+				const releaseAt = queuedRequests.findIndex((entry, index) => index > wakeAt && entry.who === "main" && entry.decision.tool === "wait");
+				const queuedProbeAt = queuedRequests.findIndex(entry => {
+					const tasks = entry.decision.args?.tasks;
+					const items = Array.isArray(tasks) ? tasks : [entry.decision.args];
+					return entry.who === "main" && entry.decision.tool === "task" && items.some(item => typeof item?.task === "string" && item.task.includes("E2E-CAP-QUEUE-THIRD"));
+				});
+				const progressed = rpc.frames.slice(from).filter(frame => frame.type === "tool_execution_end" && frame.toolName === "wait").map(text).join("\n");
+				const releasedAt = queuedRequests[releaseAt]?.ts ?? 0;
+				const queuedSpawns = queued.spawns.filter(spawn => spawn.spawnKey === "review-a");
+				const queuedAfter = queuedSpawns.find(spawn => Date.parse(spawn.ts) >= releasedAt);
+				const lateWakeAt = queuedRequests.findIndex(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-QUEUE-WAKE-LATE"));
+				check(
+					"two fresh starts hold the native ceiling and a third fresh start waits without a provider request",
+					queuedProbeAt >= 0 && queuedProbeAt < releaseAt && queuedAfter !== undefined && !queuedSpawns.some(spawn => Date.parse(spawn.ts) < releasedAt) && !queuedRequests.some((entry, index) => index < releaseAt && entry.who === "child" && entry.lastUser.includes("E2E-CAP-QUEUE-THIRD")),
+					`probe=${queuedProbeAt} release=${releaseAt} after=${JSON.stringify(queuedAfter)} spawns=${JSON.stringify(queued.spawns.map(spawn => [spawn.spawnKey, spawn.outcome, spawn.code, spawn.ts]))}`,
+				);
+				check(
+					"the queued fresh start is unseen by the spawn hook while the native permits are held",
+					!queued.spawns.some(spawn => spawn.agent === "storm-reviewer" && Date.parse(spawn.ts) < releasedAt),
+					`releaseAt=${releasedAt} spawns=${JSON.stringify(queued.spawns.map(spawn => [spawn.agent, spawn.ts, spawn.code]))}`,
+				);
+				check(
+					"an idle worker is refused at two and accepts a later wake after the permits release",
+					queuedReasons.includes("[storm:lane-capacity]") &&
+						!queuedRequests.some(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-QUEUE-REFUSED")) &&
+						lateWakeAt > releaseAt && queued.agents?.find(agent => agent.id === "read-a")?.followUps === 1,
+					`lateWake=${lateWakeAt} release=${releaseAt} read-a=${JSON.stringify(queued.agents?.find(agent => agent.id === "read-a"))}`,
+				);
+				check(
+					"the wait still reports ordinary task completions",
+					progressed.includes("### read-d [task] — completed") && progressed.includes("### impl [task] — completed"),
+					progressed.slice(0, 700),
+				);
+
+				// Run B: one fresh start holds one native permit while a genuinely resumed parked worker holds the other
+				// Storm slot. The host sees one free permit, so a second fresh start reaches Storm's hook and is refused
+				// with parallelism. A status note stays a note, and a released slot starts the retry.
+				const managedLanes: LaneSpec[] = [
+					explorerLane("m-read-a"),
+					explorerLane("m-read-b"),
+					explorerLane("m-read-d"),
+					{ name: "m-impl", kind: "code", role: "implementer", results: [changeResult("managed-impl", implFile, "storm child change", `the implementer writes ${implFile}`)] },
+				];
+				from = rpc.frames.length;
+				const managedStart = llm.all().length;
+				const managed = await runOf(
+					rpc,
+					files,
+					startRun([
+						plan(managedLanes, { explorer: 3, implementer: 1 }),
+						// Both become parked workers before the ceiling is filled; each single-item job has its own result.
+						{ tasks: [{ name: "m-read-a", agent: "storm-explorer", say: READ_AND_CLAIM }] },
+						{ wait: true, afterResult: "Background job m-read-a has completed." },
+						{ tasks: [{ name: "m-read-b", agent: "storm-explorer", say: READ_AND_CLAIM }] },
+						{ wait: true, afterResult: "Background job m-read-b has completed." },
+						{ tasks: [{ name: "m-read-d", agent: "storm-explorer", say: `E2E-CHILD-GATE cap-m-d ${READ_AND_CLAIM}` }] },
+						// Hold both the fresh worker and the woken worker at the provider, rather than relying on timing.
+						{ followUp: "agent://m-read-a", content: `E2E-CAP-MANAGED-RESUME E2E-WAKE-GATE cap-m-wake ${READ_AND_CLAIM}` },
+						{ tasks: [{ name: "m-impl", agent: "storm-implementer", say: `E2E-CAP-MANAGED-BLOCKED E2E-CHILD-WRITE ${implFile}` }], awaitChildren: ["cap-m-d", "cap-m-wake"] },
+						{ edit: "agent://m-read-b?progress", afterResult: "[storm:parallelism]" },
+						{ read: "agent://m-read-b", after: "[storm:lane-capacity]" },
+						{ wait: true, releaseChildren: ["cap-m-d", "cap-m-wake"] },
+						// The free slot admits the same start on retry; its change result proves it ran.
+						{ wait: true },
+						{ tasks: [{ name: "m-impl", agent: "storm-implementer", say: `E2E-CAP-MANAGED-LATE E2E-CHILD-WRITE ${implFile}` }] },
+						{ wait: true },
+					]),
+				);
+				const managedReasons = rpc.frames.slice(from).map(text).join("\n");
+				const managedRequests = llm.all().slice(managedStart);
+				const resumeAt = managedRequests.findIndex(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-MANAGED-RESUME"));
+				const managedWakeAt = managedRequests.findIndex(entry => entry.who === "main" && entry.decision.tool === "write" && entry.decision.args?.path === "agent://m-read-a");
+				const blockedProbeAt = managedRequests.findIndex(entry => {
+					const tasks = entry.decision.args?.tasks;
+					const items = Array.isArray(tasks) ? tasks : [entry.decision.args];
+					return entry.who === "main" && entry.decision.tool === "task" && items.some(item => typeof item?.task === "string" && item.task.includes("E2E-CAP-MANAGED-BLOCKED"));
+				});
+				const managedReleaseAt = managedRequests.findIndex((entry, index) => index > blockedProbeAt && entry.who === "main" && entry.decision.tool === "wait");
+				const statusReadAt = managedRequests.findIndex(entry => entry.who === "main" && entry.decision.tool === "read" && entry.decision.args?.path === "agent://m-read-b");
+				const lateAt = managedRequests.findIndex(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-MANAGED-LATE"));
+				const blockedImpl = managed.spawns.find(spawn => spawn.agent === "storm-implementer" && spawn.outcome === "blocked");
+				check(
+					"one fresh start plus a resumed worker fills native two: the next fresh start is refused with parallelism",
+					managedWakeAt >= 0 && managedWakeAt < blockedProbeAt && blockedImpl?.code === "parallelism" && !managedRequests.some(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-MANAGED-BLOCKED")),
+					`wake=${managedWakeAt} probe=${blockedProbeAt} resume=${resumeAt} blocked=${JSON.stringify(managed.spawns.map(spawn => [spawn.spawnKey, spawn.outcome, spawn.code]))} reasons=${managedReasons.slice(0, 300)}`,
+				);
+				check(
+					"the resumed worker was admitted and took the second slot",
+					managed.agents?.find(agent => agent.id === "m-read-a")?.followUps === 1 && resumeAt >= 0 && resumeAt < blockedProbeAt,
+					`blockedFollowUps=${managed.blockedFollowUps} read-a=${JSON.stringify(managed.agents?.find(agent => agent.id === "m-read-a"))} resume=${resumeAt}`,
+				);
+				check(
+					"an idle progress write is refused at the ceiling, but reading its output starts no model turn",
+					statusReadAt >= 0 && statusReadAt < managedReleaseAt && managedReasons.includes("[storm:lane-capacity]") &&
+						!managedRequests.some(entry => entry.who === "child" && entry.lastUser.includes("storm director check")) &&
+						managed.agents?.find(agent => agent.id === "m-read-b")?.followUps === 0,
+					`read=${statusReadAt} release=${managedReleaseAt} read-b=${JSON.stringify(managed.agents?.find(agent => agent.id === "m-read-b"))}`,
+				);
+				check(
+					"the released slot admits the rejected fresh start on retry",
+					lateAt > managedReleaseAt && existsSync(join(env.project, implFile)) && readFileSync(join(env.project, implFile), "utf8") === "storm child change\n" && managed.results?.some(row => row.id === "managed-impl" && row.state === "accepted") === true,
+					`late=${lateAt} release=${managedReleaseAt} file=${existsSync(join(env.project, implFile))} results=${JSON.stringify(managed.results)}`,
+				);
+			});
+		} finally {
+			writeFileSync(PROFILE_FILE, profileBefore);
+			rmSync(join(env.project, implFile), { force: true });
+		}
+	});
+
+	await suite.step("native above four admits six independently scoped lanes", async () => {
+		const profileBefore = readFileSync(PROFILE_FILE);
+		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}task:\n  maxConcurrency: 6\n`);
+		const llm = new LlmCursor(env);
+		const filesOut = Array.from({ length: 4 }, (_, index) => `e2e-native6-${index}.txt`);
+		const scopeDir = join(env.project, ".omp", "agents");
+		const scopeFile = join(scopeDir, "storm-implementer.md");
+		mkdirSync(scopeDir, { recursive: true });
+		// Shell-capable shared implementers must run sequentially. Approve a path-only worker in this fixture.
+		writeFileSync(scopeFile, "---\nname: storm-implementer\ndescription: Scoped writer\ntools: read, write, edit\n---\nWrite only the assigned file.\n");
+		try {
+			await session(cancelAll, async (rpc, files) => {
+				const workers = files.config().roles.implementer?.workers;
+				const min = typeof workers === "number" ? workers : workers?.min;
+				const max = typeof workers === "number" ? workers : workers?.max;
+				check("the recommended team offers one to four implementers", min === 1 && max === 4, JSON.stringify(workers));
+				const lanes: LaneSpec[] = [
+					...filesOut.map((file, index) => ({ name: `impl-${index}`, kind: "code", role: "implementer", files: [file], results: [changeResult(`native6-${index}`, file, "storm child change", `the implementer writes ${file}`)] })),
+					...Array.from({ length: 2 }, (_, index) => ({ name: `read-${index}`, kind: "explore", role: "explorer", results: [trackedAnswer(`native6-read-${index}`, "the explorer reports the tracked fixture from source")] })),
+				];
+				const barrierLane: LaneSpec = { name: "barrier", kind: "review", role: "reviewer" };
+				const gates = lanes.map(lane => `native6-${lane.name}`);
+				const tasks = lanes.map((lane, index) => ({
+					name: lane.name,
+					agent: lane.role === "implementer" ? "storm-implementer" : "storm-explorer",
+					say: lane.role === "implementer" ? `E2E-CHILD-GATE ${gates[index]} E2E-CHILD-WRITE ${filesOut[index]}` : `E2E-CHILD-GATE ${gates[index]} ${READ_AND_CLAIM}`,
+				}));
+				const run = await runOf(
+					rpc,
+					files,
+					startRun([
+						plan([...lanes, barrierLane], { implementer: 4, explorer: 2, reviewer: 1 }),
+						{ tasks },
+						// The barrier is sent only after all six children hold their first reply at the provider; with
+						// six native permits taken, it queues and its hook runs only after a release.
+						{ tasks: [{ name: "barrier", agent: "storm-reviewer", say: "E2E-NATIVE6-BARRIER E2E-CHILD-VERDICT correct" }], awaitChildren: gates },
+						{ wait: true, releaseChildren: gates },
+						{ wait: true, afterResult: "Background job barrier has completed." },
+					]),
+				);
+				const requests = llm.all();
+				const releaseAt = requests.findIndex(entry => entry.who === "main" && entry.decision.tool === "wait");
+				const held = gates.map(gate => requests.findIndex(entry => entry.who === "child" && entry.lastUser.includes(`E2E-CHILD-GATE ${gate} `)));
+				const routed = run.spawns.filter(spawn => spawn.spawnKey !== "barrier" && spawn.outcome !== "blocked");
+				check(
+					"native six admits six genuinely independent lanes at once",
+					releaseAt >= 0 && held.every(index => index >= 0 && index < releaseAt) && routed.length === 6 && routed.filter(spawn => spawn.role === "implementer").length === 4 && routed.filter(spawn => spawn.role === "explorer").length === 2,
+					`release=${releaseAt} held=${JSON.stringify(held)} spawns=${JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.role, spawn.outcome, spawn.code]))}`,
+				);
+				check(
+					"all six independent lanes settled with accepted results",
+					run.results?.filter(row => row.state === "accepted").length === 6 && filesOut.every(file => existsSync(join(env.project, file)) && readFileSync(join(env.project, file), "utf8") === "storm child change\n"),
+					`${run.status}/${run.endReason} results=${JSON.stringify(run.results)} files=${filesOut.map(file => existsSync(join(env.project, file))).join(",")}`,
+				);
+			});
+		} finally {
+			rmSync(scopeFile, { force: true });
+			writeFileSync(PROFILE_FILE, profileBefore);
+			for (const file of filesOut) rmSync(join(env.project, file), { force: true });
+		}
 	});
 
 	await suite.step("director: edit block, read policy, follow-ups", async () => {

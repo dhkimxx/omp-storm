@@ -81,6 +81,8 @@ function hostSettings(isolation: { enabled: boolean; apply?: boolean } = { enabl
 		PROFILE_CONFIG.trimEnd(),
 		"task:",
 		"  workerThreads: 4",
+		// The native subagent ceiling this fixture needs: eight independent reads plus the experiment.
+		"  maxConcurrency: 12",
 		"  isolation:",
 		`    enabled: ${isolation.enabled}`,
 	];
@@ -300,7 +302,7 @@ async function main(): Promise<void> {
 	linkPlugin(env);
 
 	await suite.step(
-		"fixture: approved 12-slot team, host isolation and worker threads",
+		"fixture: approved shared team, native limit, host isolation and worker threads",
 		async () => {
 			hostSettings();
 			await session(cancelAll, async (rpc, files) => {
@@ -316,16 +318,15 @@ async function main(): Promise<void> {
 				);
 				files.editConfig(config => {
 					config.isolation = "shared";
-					config.parallelism = 12;
 					config.roles.explorer = { ...config.roles.explorer!, workers: { min: 4, max: 6 } };
 				});
 				await rpc.prompt("/storm");
 				const explorerWorkers = files.config().roles.explorer?.workers;
 				const explorerMax = typeof explorerWorkers === "object" && explorerWorkers !== null ? explorerWorkers.max : explorerWorkers;
 				check(
-					"the hand-edited 12-slot shared team is approved again",
-					files.config().isolation === "shared" && files.config().parallelism === 12 && explorerMax === 6,
-					JSON.stringify({ isolation: files.config().isolation, parallelism: files.config().parallelism, explorerWorkers }),
+					"the hand-edited shared team is approved again",
+					files.config().isolation === "shared" && explorerMax === 6,
+					JSON.stringify({ isolation: files.config().isolation, explorerWorkers }),
 				);
 				rpc.answer = choose(LABEL.autoOff);
 				await rpc.prompt("/storm auto");

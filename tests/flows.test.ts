@@ -99,7 +99,7 @@ function choice(form: HtmlForm, name: string) {
 
 /** Identify a page without depending on the number of effort pages that came before it. */
 function page(form: HtmlForm): string {
-	if (hasField(form, FIELD.parallelism)) return "settings";
+	if (hasField(form, FIELD.rounds)) return "settings";
 	if (hasField(form, FIELD.effort)) {
 		const title = legend(form);
 		const model = CATALOG.find(row => title.includes(`${row.provider}/${row.id}`));
@@ -156,14 +156,14 @@ describe("/storm without an approved team", () => {
 	});
 
 	test("invalid config: every error in one dialog, and setup starts only when chosen", async () => {
-		await editByHand(JSON.stringify({ ...TEAM, parallelism: 99, isolation: "nope" }));
+		await editByHand(JSON.stringify({ ...TEAM, rounds: 99, isolation: "nope" }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		expect(f.selects).toHaveLength(1);
 		// Setup or nothing: an invalid file cannot be approved.
 		expect(f.selects[0]?.options).toHaveLength(2);
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
-		for (const field of ["parallelism", "isolation"]) expect(f.selects[0]?.markdown).toContain(field);
+		for (const field of ["rounds", "isolation"]) expect(f.selects[0]?.markdown).toContain(field);
 
 		const g = scriptedUi([FIRST, APPROVE]);
 		await hubFlow(env, g.ui);
@@ -190,7 +190,7 @@ describe("/storm without an approved team", () => {
 
 	test("unapproved config: the dialog shows what the hash covers and offers approval, rollback, setup or cancel", async () => {
 		await approve(TEAM);
-		const edited = { ...structuredClone(TEAM), parallelism: 9, typo: 1 } as StormConfig;
+		const edited = { ...structuredClone(TEAM), rounds: 9, typo: 1 } as StormConfig;
 		edited.roles.reviewer!.models = ["z/teammate"];
 		await editByHand(serializeConfig(edited));
 		const f = scriptedUi([LAST]);
@@ -200,18 +200,18 @@ describe("/storm without an approved team", () => {
 		expect(f.selects[0]?.options[0]).toBe(APPROVE);
 		const md = f.selects[0]!.markdown!;
 		// The diff against the last approved team, the unknown field with its value, and a warning per model not usable here.
-		for (const part of ["b/r → z/teammate", "4 → 9", "typo=1", "z/teammate: "]) expect(md).toContain(part);
+		for (const part of ["b/r → z/teammate", "기본(3) → 9", "typo=1", "z/teammate: "]) expect(md).toContain(part);
 		expect(isApproved(await load())).toBe(false);
 		expect(f.selects).toHaveLength(1);
 	});
 
 	test("an approved snapshot that no longer validates is not diffed against: the whole team is shown", async () => {
 		await approve(TEAM);
-		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 		const intact = scriptedUi([LAST]);
 		await hubFlow(env, intact.ui);
 		const state = await load();
-		await writeFile(path.join(state.store.dir, "snapshots", `${configHash(TEAM).split(":")[1]}.json`), JSON.stringify({ ...TEAM, parallelism: "many\n### forged" }));
+		await writeFile(path.join(state.store.dir, "snapshots", `${configHash(TEAM).split(":")[1]}.json`), JSON.stringify({ ...TEAM, rounds: "many\n### forged" }));
 		const damaged = scriptedUi([LAST]);
 		await hubFlow(env, damaged.ui);
 		// A diff has the one changed row; the whole team has a row per field, and nothing of the damaged file.
@@ -250,7 +250,7 @@ describe("/storm without an approved team", () => {
 
 	test("a file changed while the approval dialog is open is not approved", async () => {
 		await editByHand(serializeConfig(TEAM));
-		const moved = { ...TEAM, parallelism: 2 };
+		const moved = { ...TEAM, rounds: 2 };
 		const f = scriptedUi([
 			async () => {
 				await editByHand(serializeConfig(moved));
@@ -266,7 +266,7 @@ describe("/storm without an approved team", () => {
 
 	test("rolling back from an unapproved config needs no new approval", async () => {
 		await approve(TEAM);
-		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 		const f = scriptedUi([SECOND, FIRST, FIRST]);
 		await hubFlow(env, f.ui);
 		const state = await load();
@@ -620,14 +620,14 @@ describe("setup", () => {
 		expect(plain.selects).toEqual([]);
 
 		const f = scriptedUi([PICK_BY_ROLE, APPROVE]);
-		const forms = withForms(f, form => hasField(form, FIELD.parallelism) ? { [FIELD.parallelism]: 2 } : {});
+		const forms = withForms(f, form => hasField(form, FIELD.rounds) ? { [FIELD.rounds]: 7 } : {});
 		await setupFlow(env, f.ui);
 		expect(forms.map(page)).toEqual(defaultPages(team));
 		expect(f.selects[0]?.options).not.toContain(APPROVE);
 		expect(f.selects[1]?.options).toEqual([APPROVE, CANCEL]);
 		expect(f.selects[1]?.markdown).not.toContain(AUTO_DISCLOSURE);
 		const state = await load();
-		expect(state.config.status === "ok" && state.config.config).toEqual({ ...team, parallelism: 2 });
+		expect(state.config.status === "ok" && state.config.config).toEqual({ ...team, rounds: 7 });
 		expect(await autoChoice()).toBe("unset");
 	});
 
@@ -637,7 +637,7 @@ describe("setup", () => {
 		const forms = withForms(f, form => {
 			if (hasField(form, FIELD.primary("reviewer"))) return { [FIELD.primary("reviewer")]: NONE };
 			if (hasField(form, FIELD.fallback("implementer"))) return { [FIELD.fallback("implementer")]: NONE };
-			if (hasField(form, FIELD.parallelism)) return { [FIELD.budget]: 3, [FIELD.cleanup]: "off" };
+			if (hasField(form, FIELD.rounds)) return { [FIELD.budget]: 3, [FIELD.cleanup]: "off" };
 			return {};
 		});
 		await setupFlow(env, f.ui);
@@ -752,13 +752,13 @@ describe("setup", () => {
 	test("only invalid settings reopen with the errors; cancelling a page or approval saves nothing", async () => {
 		const f = scriptedUi([PICK_BY_ROLE, CANCEL]);
 		let attempts = 0;
-		const forms = withForms(f, form => hasField(form, FIELD.parallelism) ? { [FIELD.parallelism]: ++attempts === 1 ? 99 : 3 } : {});
+		const forms = withForms(f, form => hasField(form, FIELD.rounds) ? { [FIELD.rounds]: ++attempts === 1 ? 99 : 3 } : {});
 		await setupFlow(env, f.ui);
 		const expected = defaultPages(await recommended());
 		expect(forms.map(page)).toEqual([...expected, "settings"]);
 		const reopened = forms.at(-1)!;
 		expect(reopened.sections.some(s => s.blocks.some(b => b.kind === "list"))).toBe(true);
-		expect(defaultFormData(reopened)[FIELD.parallelism]).toBe(99);
+		expect(defaultFormData(reopened)[FIELD.rounds]).toBe(99);
 		expect(f.selects.at(-1)?.options).toEqual([APPROVE, CANCEL]);
 		await expectEmptySetup();
 
@@ -875,7 +875,7 @@ describe("automatic delegation", () => {
 		expect(again.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
 		expect(await autoChoice()).toBe("off");
 
-		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 		const reapproved = scriptedUi([APPROVE]);
 		await hubFlow(env, reapproved.ui);
 		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
@@ -897,7 +897,7 @@ describe("automatic delegation", () => {
 		expect(again.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
 		expect(await autoChoice()).toBe("on");
 
-		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 		const reapproved = scriptedUi([APPROVE]);
 		await hubFlow(env, reapproved.ui);
 		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
@@ -967,7 +967,7 @@ describe("automatic delegation", () => {
 
 		await rm(path.join((await load()).sessionDir, "auto-delegation.json"), { force: true });
 		const stale = scriptedUi([async () => {
-			await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+			await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 			return AUTO.enable;
 		}]);
 		await autoDelegationFlow(env, stale.ui);
@@ -978,7 +978,7 @@ describe("automatic delegation", () => {
 
 	test("a stale team cannot enable it, but an existing on choice can always be turned off", async () => {
 		await approve(TEAM);
-		await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
+		await editByHand(serializeConfig({ ...TEAM, rounds: 9 }));
 		const no = scriptedUi();
 		await autoDelegationFlow(env, no.ui);
 		expect(no.selects).toEqual([]);
@@ -986,7 +986,7 @@ describe("automatic delegation", () => {
 		expect(no.notices.at(-1)?.level).toBe("warning");
 		expect(await autoChoice()).toBe("unset");
 
-		for (const stale of [serializeConfig({ ...TEAM, parallelism: 9 }), "{ not json"]) {
+		for (const stale of [serializeConfig({ ...TEAM, rounds: 9 }), "{ not json"]) {
 			await approve(TEAM);
 			await autoDelegationFlow(env, scriptedUi([AUTO.enable]).ui);
 			expect(await autoChoice()).toBe("on");
@@ -1054,7 +1054,7 @@ describe("automatic delegation", () => {
 describe("status and agents", () => {
 	const agent = agentEntry({ id: "agent-one", model: "a/i", startedAt: NOW - 600_000, lastActivityAt: NOW - 60_000, costUsd: 0.1 });
 
-	/** A status with something to advise on everywhere: a shadowing definition, an omp setting below the team's, a newer install. */
+	/** A status with something to advise on everywhere: a shadowing definition, missing omp fallback chains, a newer install. */
 	async function busyEnv(): Promise<{ env: FlowEnv; calls: { settings: number; omp: number } }> {
 		const agents = path.join(project.root, ".omp", "agents");
 		await mkdir(agents, { recursive: true });
@@ -1072,7 +1072,7 @@ describe("status and agents", () => {
 				},
 				ompSettings: async () => {
 					calls.settings++;
-					return { modelRoles: {}, maxConcurrency: 1 };
+					return { modelRoles: {}, fallbackChains: {} };
 				},
 				newerVersion: () => "99.0.0",
 			},
@@ -1087,7 +1087,7 @@ describe("status and agents", () => {
 		expect(text).toContain("### 적용 범위");
 		expect(text).toContain(project.root);
 		expect(text).not.toContain((await load()).repo.repoId);
-		for (const part of ["omp config set task.maxConcurrency", "99.0.0", "--max-cost", path.join(".omp", "agents", "shadow-file.md")]) expect(text).toContain(part);
+		for (const part of ["omp config set retry.fallbackChains", "99.0.0", "--max-cost", path.join(".omp", "agents", "shadow-file.md")]) expect(text).toContain(part);
 		expect(busy.calls.settings).toBe(1);
 		const f = scriptedUi();
 		await statusFlow(busy.env, f.ui);
@@ -1216,7 +1216,7 @@ describe("/storm menu", () => {
 		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
 		expect(f.selects[0]?.markdown).not.toContain("이어가기 가능");
 
-		await approve({ ...TEAM, parallelism: 2 });
+		await approve({ ...TEAM, rounds: 2 });
 		const g = scriptedUi([LAST]);
 		await hubFlow(env, g.ui);
 		expect(g.selects[0]?.options).toHaveLength(7);
@@ -1242,20 +1242,20 @@ describe("/storm menu", () => {
 	test("rollback from the menu puts the earlier approved team back", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
-		await approve({ ...TEAM, parallelism: 2 });
+		await approve({ ...TEAM, rounds: 2 });
 		const f = scriptedUi([FOURTH, FIRST, FIRST]);
 		await hubFlow(env, f.ui);
 		const state = await load();
-		expect(state.config.status === "ok" && state.config.config.parallelism).toBe(4);
+		expect(state.config.status === "ok" && state.config.config).toEqual(TEAM);
 		expect(isApproved(state)).toBe(true);
 	});
 
 	test("an earlier approval whose stored copy no longer matches its hash is not offered: it would restore what nobody approved", async () => {
 		const hash = await approve(TEAM);
 		await settleAuto(false);
-		await approve({ ...TEAM, parallelism: 2 });
+		await approve({ ...TEAM, rounds: 2 });
 		const store = (await load()).store;
-		await writeFile(path.join(store.dir, "snapshots", `${hash.slice(hash.indexOf(":") + 1)}.json`), serializeConfig({ ...TEAM, parallelism: 7 }));
+		await writeFile(path.join(store.dir, "snapshots", `${hash.slice(hash.indexOf(":") + 1)}.json`), serializeConfig({ ...TEAM, rounds: 7 }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		// The menu without the way back.
@@ -1265,8 +1265,8 @@ describe("/storm menu", () => {
 	test("a file changed while the rollback dialogs are open is not overwritten", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
-		await approve({ ...TEAM, parallelism: 2 });
-		const pulled = serializeConfig({ ...TEAM, parallelism: 9 });
+		await approve({ ...TEAM, rounds: 2 });
+		const pulled = serializeConfig({ ...TEAM, rounds: 9 });
 		const f = scriptedUi([
 			FOURTH,
 			FIRST,
@@ -1325,7 +1325,7 @@ describe("ended trials", () => {
 
 	test("keeping the current model does not overwrite a file changed while the dialog was open", async () => {
 		await approve(withTrial);
-		const pulled = serializeConfig({ ...withTrial, parallelism: 9 });
+		const pulled = serializeConfig({ ...withTrial, rounds: 9 });
 		const f = scriptedUi([
 			async options => {
 				await editByHand(pulled);
@@ -1382,7 +1382,7 @@ describe("stale dialog owner", () => {
 
 	test("an unapproved team's approval dialog after a switch approves nothing", async () => {
 		await approve(TEAM);
-		const edited = { ...TEAM, parallelism: 9 };
+		const edited = { ...TEAM, rounds: 9 };
 		await editByHand(serializeConfig(edited));
 		let live = true;
 		const f = scriptedUi([
@@ -1415,7 +1415,7 @@ describe("stale dialog owner", () => {
 
 	test("a rollback confirmed after a switch restores nothing", async () => {
 		await approve(TEAM);
-		const newer = { ...TEAM, parallelism: 2 };
+		const newer = { ...TEAM, rounds: 2 };
 		await approve(newer);
 		let live = true;
 		const f = scriptedUi([
@@ -1472,6 +1472,7 @@ describe("team export", () => {
 				},
 			],
 			unknownCredential: "SECRET-VALUE",
+			parallelism: 9,
 		} as unknown as StormConfig;
 		await approve(secret);
 		const before = await snapshot(project.tmp);
@@ -1484,6 +1485,8 @@ describe("team export", () => {
 		expect(markdown).toContain('"version": 1');
 		expect(markdown).toContain('"implementer"');
 		expect(markdown).toContain('"models"');
+		expect(markdown).not.toContain("parallelism");
+		expect(markdown).not.toContain("병렬도");
 		expect(markdown).not.toContain("requiredChecks");
 		expect(markdown).not.toContain("argv");
 		expect(markdown).not.toContain("private-check");

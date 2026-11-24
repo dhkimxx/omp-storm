@@ -4,7 +4,6 @@ import { formatModelEntry } from "../selector.ts";
 import type { Candidate, Priority, RoleConfig, RoleRecommendation, StormConfig } from "../types.ts";
 
 /** Run settings of a first setup. */
-const FIRST_PARALLELISM = 4;
 const FIRST_ISOLATION: StormConfig["isolation"] = "shared";
 
 /** A models[] entry with the candidate's effort for the role; bare when the model has no effort control. */
@@ -43,7 +42,6 @@ export function recommendedConfig(recs: RoleRecommendation[], priority: Priority
 		version: 1,
 		priority,
 		roles,
-		parallelism: current?.parallelism ?? FIRST_PARALLELISM,
 		isolation: current?.isolation ?? FIRST_ISOLATION,
 	};
 	if (current?.budget) config.budget = { ...current.budget };

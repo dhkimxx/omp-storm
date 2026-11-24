@@ -77,7 +77,7 @@ describe("the spawn hook's state cache", () => {
 		expect(loads).toBe(2);
 
 		// A teammate's edit lands: the old approval answers for at most the same 2 s.
-		await writeConfig(sessionStoreDir(project.env.agentDir, SESSION_A), { ...TEAM, parallelism: 9 });
+		await writeConfig(sessionStoreDir(project.env.agentDir, SESSION_A), { ...TEAM, rounds: 9 });
 		setSystemTime(new Date(T0 + 3_999));
 		expect(isApproved(await cache.get(env))).toBe(true);
 		setSystemTime(new Date(T0 + 4_000));

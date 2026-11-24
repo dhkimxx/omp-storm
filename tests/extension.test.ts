@@ -8,6 +8,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
 import type { CompactOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { writeConfig } from "../src/config/store.ts";
@@ -574,9 +575,11 @@ describe("a run through the hooks", () => {
 				),
 			),
 		).toBe("lane-write");
-		// A work-bearing follow-up to the idle holder collides with the writer; the native progress note does not.
+		// Both messages can wake the idle holder and collide with the writer. A read cannot start a turn.
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0", content: "work" } }, main))).toBe("lane-write");
-		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0?progress", content: "status" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0?progress", content: "status" } }, main))).toBe("lane-write");
+		expect(verdict(await omp.emit("tool_call", { toolName: "read", input: { path: "agent://H0" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://all", content: "resume" } }, main))).toBe("lane-capacity");
 		// The writer's turn ends: its reservation is released with it.
 		await child.emit("agent_end", {}, writer);
 		// With the writer gone the holder's work follow-up is admitted; its own turn releases the shared scope.
@@ -993,7 +996,7 @@ describe("a run through the hooks", () => {
 
 	test("the idle hint needs an approved team, without its approval", async () => {
 		await approve(TEAM);
-		await writeConfig(project.sessionDir, { ...TEAM, parallelism: 2 });
+		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 200_000 });
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.emit("session_start", {}, main);
@@ -1612,13 +1615,36 @@ describe("the spawn hook", () => {
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("no-config");
 	});
 
+	test("the live native task ceiling bounds a fresh start once, and OMP 0 means unlimited", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("task", main);
+		await applyRunPlan(omp, main, {
+			lanes: [
+				{ name: "A", kind: "code", role: "implementer", files: ["a.txt"], results: changeFor("a-change") },
+				{ name: "B", kind: "code", role: "implementer", files: ["b.txt"], results: changeFor("b-change") },
+			],
+			workers: { implementer: 2 },
+		});
+		const spawn = (name: string, maxConcurrency: number) =>
+			withActiveSettings(Settings.isolated({ "task.maxConcurrency": maxConcurrency }), () =>
+				omp.emit("before_subagent_spawn", spawnOf("storm-implementer", name), main));
+		expect(verdict(await spawn("A", 1))).toBe("route:a/i");
+		// A's reservation fills the one live native slot before any host agent row exists.
+		expect(verdict(await spawn("B", 1))).toBe("parallelism");
+		// OMP's unlimited value adds no Storm cap of its own.
+		expect(verdict(await spawn("B", 0))).toBe("route:a/i");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
 	test("the approval it checks is at most 2 s old: an edit after approval blocks spawns from then on", async () => {
 		setSystemTime(new Date(T0));
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("route:a/i");
-		await writeConfig(project.sessionDir, { ...TEAM, parallelism: 9 });
+		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 150_000 });
 		setSystemTime(new Date(T0 + 1_999));
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("route:a/i");
 		setSystemTime(new Date(T0 + 2_000));
@@ -2209,7 +2235,7 @@ describe("automatic delegation", () => {
 		const main = omp.ctx(MAIN);
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "first", systemPrompt: [] }, main);
-		await writeConfig(project.sessionDir, { ...TEAM, parallelism: 2 });
+		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 200_000 });
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "second", systemPrompt: [] }, main);
 		expect(verdict(await omp.emit("tool_call", { toolName: "bash", input: { command: "npm test" } }, main))).toBe("auto");
 		const plan = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
@@ -2645,7 +2671,7 @@ describe("native session ownership", () => {
 		expect(reports.length).toBeGreaterThanOrEqual(2);
 		const first = reports.at(-2)?.content ?? "";
 		expect(first).toContain("### Storm 팀 템플릿");
-		expect(first).toContain('"parallelism"');
+		expect(first).toContain('"isolation"');
 		expect(first).toBe(reports[reports.length - 1]?.content ?? "");
 		expect(first).not.toContain(project.root);
 		expect(first).not.toContain(project.sessionDir);

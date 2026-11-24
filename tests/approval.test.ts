@@ -13,7 +13,7 @@ import { DEAD_PROCESS, teamOf } from "./fixtures.ts";
 import { exec, git } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
-const config: StormConfig = teamOf({ implementer: "a/b" }, { parallelism: 2, isolation: "isolated" });
+const config: StormConfig = teamOf({ implementer: "a/b" }, { rounds: 2, isolation: "isolated" });
 /** The pid a lock file names: a process that cannot exist. */
 const DEAD_PID = DEAD_PROCESS.split(":")[0];
 

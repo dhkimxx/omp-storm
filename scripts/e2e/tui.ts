@@ -378,6 +378,11 @@ async function main(): Promise<void> {
 				check("the overview leads with the shared mark and idle state without listing role models", head >= 0 && !report.includes("역할별 모델"), report.slice(Math.max(0, head), Math.max(0, head) + 300));
 				const team = await tui.press("2", text => text.includes("팀 설정") && text.includes("승인됨"), "the team tab after setup");
 				check("the team tab shows the approved priority", tui.text(team).includes(`우선순위 ${priorityLabel(files.config().priority)}`), `priority=${files.config().priority}`);
+				const workers = files.config().roles.implementer?.workers;
+				check("the fresh team shows the implementer range without a duplicate team limit",
+					typeof workers === "object" && workers.min === 1 && workers.max === 4 &&
+					!Object.hasOwn(files.config(), "parallelism") && !tui.text(team).includes("병렬도"),
+					tui.text(team).slice(-400));
 				tui.send(KEY.enter);
 				await suite.eventually("the calm idle footer names the approved team", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line");
 				const calm = statusLine(tui.raw);
@@ -419,7 +424,7 @@ async function main(): Promise<void> {
 						mark = await submitForm(tui, mark, model.selector, 1);
 					}
 				}
-				const settings = await submitForm(tui, mark, "예산", 8);
+				const settings = await submitForm(tui, mark, "예산", 7);
 				await tui.selector(settings);
 				check("role and effort pages don't save without approval", files.approvals().length === approvals && JSON.stringify(files.config()) === JSON.stringify(before));
 				await answer(tui, settings, APPROVE);

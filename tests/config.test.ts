@@ -130,15 +130,28 @@ describe("validateConfig", () => {
 		]);
 	});
 
-	test("the 0.8 team validates without errors or warnings and keeps its hash", () => {
+	test("the 0.8 team validates, warns only about the retired team cap, and keeps its hash", () => {
 		const r = validateConfig(parsed(TEAM_08));
 		expect(r.errors).toEqual([]);
-		expect(r.warnings).toEqual([]);
+		// `parallelism` is no longer a known field, so it follows the ordinary unknown-key policy: warned and hashed.
+		expect(paths(r.warnings)).toEqual(["parallelism"]);
 		expect(Object.keys(r.config?.roles ?? {})).toHaveLength(5);
 		// The hash covers the file's own content, deprecated fields included: an approval given by 0.8 still matches it.
 		expect(configHash(parsed(TEAM_08))).toBe(TEAM_08_HASH);
 		const { contract: _contract, ...withoutContract } = JSON.parse(TEAM_08);
 		expect(configHash(withoutContract)).not.toBe(TEAM_08_HASH);
+	});
+
+	test("the retired parallelism key is an ordinary unknown field: no validation, warned and hashed", () => {
+		for (const value of [99, 0, 1.5, "many", null]) {
+			const c = clone();
+			c.parallelism = value;
+			const r = validateConfig(c);
+			expect(r.errors).toEqual([]);
+			expect(paths(r.warnings)).toEqual(["parallelism"]);
+			expect(unknownFields(c)).toContainEqual({ path: "parallelism", value });
+			expect(configHash(c)).not.toBe(configHash(base));
+		}
 	});
 
 	test("rounds is a known field: an integer 0~10, and absent stays absent", () => {
@@ -202,9 +215,6 @@ describe("validateConfig", () => {
 		["model empty id", c => (c.roles.explorer.models = ["a/"]), "roles.explorer.models[0]:"],
 		["model non-string", c => (c.roles.explorer.models = [1]), "roles.explorer.models[0]:"],
 		["effort", c => (c.roles.reviewer.effort = "huge"), "roles.reviewer.effort:"],
-		["parallelism zero", c => (c.parallelism = 0), "parallelism:"],
-		["parallelism 17", c => (c.parallelism = 17), "parallelism:"],
-		["parallelism fraction", c => (c.parallelism = 1.5), "parallelism:"],
 		["isolation", c => (c.isolation = "none"), "isolation:"],
 		["runtime", c => (c.runtime = "orca"), "runtime:"],
 		["contract object", c => (c.contract = { toString: 1 }), "contract:"],
@@ -428,9 +438,9 @@ describe("config store", () => {
 			expect(dup.rawSha256).toMatch(/^[0-9a-f]{64}$/);
 		}
 
-		await fs.writeFile(configPath(session), JSON.stringify({ ...base, parallelism: 99 }));
+		await fs.writeFile(configPath(session), JSON.stringify({ ...base, rounds: 99 }));
 		const bad = await loadConfig(session);
-		expect(bad.status === "invalid" && paths(bad.errors)).toEqual(["parallelism"]);
+		expect(bad.status === "invalid" && paths(bad.errors)).toEqual(["rounds"]);
 
 		await fs.writeFile(configPath(session), new Uint8Array([0x7b, 0xff, 0x7d]));
 		expect((await loadConfig(session)).status).toBe("invalid");

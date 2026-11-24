@@ -37,7 +37,6 @@ describe("recommendedConfig", () => {
 				implementer: { agent: "storm-implementer", models: ["a/i", "c/j:medium"], workers: DEFAULT_WORKERS.implementer },
 				reviewer: { agent: "storm-reviewer", models: ["b/r:high"], workers: DEFAULT_WORKERS.reviewer },
 			},
-			parallelism: 4,
 			isolation: "shared",
 			cleanup: true,
 			fallbackRole: "implementer",
@@ -45,6 +44,9 @@ describe("recommendedConfig", () => {
 		const checked = validateConfig(config);
 		expect(checked.errors).toEqual([]);
 		expect(checked.warnings).toEqual([]);
+		// A fresh team recommends a 1~4 implementer range and persists no team-wide cap.
+		expect(config.roles.implementer!.workers).toEqual({ min: 1, max: 4 });
+		expect(config).not.toHaveProperty("parallelism");
 	});
 
 	test("the fallback is the recommendation's, also when it lies beyond the listed candidates", () => {
@@ -61,7 +63,6 @@ describe("recommendedConfig", () => {
 				explorer: { agent: "storm-explorer", models: ["old/x"], workers: { min: 1, max: 7 }, contextCap: 90_000 },
 				implementer: { agent: "storm-implementer", models: ["old/i"], workers: 3 },
 			},
-			parallelism: 9,
 			isolation: "isolated",
 			budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "stop" },
 			contextCap: 150_000,
@@ -77,7 +78,6 @@ describe("recommendedConfig", () => {
 				explorer: { agent: "storm-explorer", models: ["a/x2:low", "b/z2:medium"], workers: { min: 1, max: 7 }, contextCap: 90_000 },
 				implementer: { agent: "storm-implementer", models: ["a/i2", "c/j2:medium"], workers: { min: 3, max: 3 } },
 			},
-			parallelism: 9,
 			isolation: "isolated",
 			budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "stop" },
 			contextCap: 150_000,
@@ -87,6 +87,7 @@ describe("recommendedConfig", () => {
 			trials: [{ ...trial, role: "explorer" }],
 		});
 		expect(validateConfig(next).errors).toEqual([]);
+		expect(next).not.toHaveProperty("parallelism");
 	});
 
 	test("cleanup is recommended only on a first setup; a current team's choice stands either way", () => {
@@ -98,6 +99,7 @@ describe("recommendedConfig", () => {
 		const next = recommendedConfig(recs(), "balanced", JSON.parse(TEAM_08));
 		expect(next).not.toHaveProperty("contract");
 		expect(next).not.toHaveProperty("runtime");
+		expect(next).not.toHaveProperty("parallelism");
 		expect(next.contextCap).toBe(200_000);
 		expect(next.roles.explorer!.workers).toEqual({ min: 1, max: 2 });
 		expect(next.fallbackRole).toBe("implementer");
@@ -134,7 +136,6 @@ describe("config diff", () => {
 			c => (c.roles.reviewer.contextCap = 50_000),
 			c => delete c.roles.reviewer,
 			c => (c.disabledRoles = ["quick"]),
-			c => (c.parallelism = 5),
 			c => (c.rounds = 7),
 			c => (c.contextCap = 100_000),
 			c => (c.isolation = "isolated"),
@@ -440,9 +441,10 @@ describe("status", () => {
 	test("the whole team setting is in the full status: every switch and run setting changes it", () => {
 		const of = (over: Partial<StormConfig>) => renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: { ...TEAM, ...over }, hash, warnings: [] } }), NOW);
 		const base = of({});
-		for (const over of [{ priority: "quality" }, { parallelism: 9 }, { isolation: "isolated" }, { cleanup: true }, { docs: false }, { contextCap: 123_456 }, { fallbackRole: "implementer" }, { budget: { perRunUsd: 7.5, onExceed: "stop" } }] as Array<Partial<StormConfig>>) {
+		for (const over of [{ priority: "quality" }, { isolation: "isolated" }, { cleanup: true }, { docs: false }, { contextCap: 123_456 }, { fallbackRole: "implementer" }, { budget: { perRunUsd: 7.5, onExceed: "stop" } }] as Array<Partial<StormConfig>>) {
 			expect(of(over)).not.toBe(base);
 		}
+		expect(base).not.toContain("병렬도");
 		expect(of({ contextCap: 123_456 })).toContain("123,456");
 		expect(of({})).toContain("공유 작업 트리");
 		expect(of({ isolation: "isolated" })).toContain("팀 격리(리뷰 포함)");
@@ -468,7 +470,7 @@ describe("status", () => {
 	test("for the model: no commands, no cost flags and no paths, with the shadowing definition still named", () => {
 		const busy = view({
 			shadows: [{ agent: "storm-reviewer", path: "/home/u/.omp/agent/agents/x.md", scope: "user", sha256: "s" }],
-			ompAdvice: [{ key: "task.maxConcurrency", message: "advice-text", command: "omp config set task.maxConcurrency 4" }],
+			ompAdvice: [{ key: "retry.fallbackChains", message: "advice-text", command: "omp config set retry.fallbackChains '{}'" }],
 			newerVersion: "99.0.0",
 		});
 		const user = renderStatus(busy, NOW);

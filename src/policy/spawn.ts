@@ -254,13 +254,15 @@ function planBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 	};
 }
 
-/** Live agents of the run against the team's parallelism. */
-function totalBlock(config: StormConfig, runtime: SpawnRuntime): SpawnBlock | undefined {
-	const total = runtime.run?.active?.total ?? 0;
-	if (!runtime.run || total < config.parallelism) return undefined;
+/** Live agents of the run against this main session's native subagent ceiling. Absent or 0 means no Storm guard. */
+function totalBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
+	const limit = runtime.maxConcurrency;
+	if (!runtime.run || limit === undefined || limit <= 0) return undefined;
+	const total = runtime.run.active?.total ?? 0;
+	if (total < limit) return undefined;
 	return {
 		code: "parallelism",
-		reason: `서브에이전트 ${total}개가 실행 중이라 팀 동시 상한 ${config.parallelism}개에 닿아 스폰을 막았습니다. 사용자에게 묻지 말고 native wait나 완료 알림으로 하나가 끝난 뒤 다시 스폰하세요.`,
+		reason: `OMP 동시 상한(task.maxConcurrency ${limit})에 닿아 스폰을 막았습니다. 사용자에게 묻지 말고 진행 중인 워커가 끝난 뒤 다시 스폰하세요.`,
 	};
 }
 
@@ -370,7 +372,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 			(counted.role === undefined
 				? undefined
 				: (roleCapBlock(checked.config, runtime, counted.role, event.agent) ??
-					totalBlock(checked.config, runtime) ??
+					totalBlock(runtime) ??
 					laneBindingBlock(runtime, counted.role, event.agent, event.spawnKey)));
 		if (runBlock) return block(runBlock, counted);
 		const requested = stripEffort(event.patterns[0] ?? "");
@@ -443,7 +445,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	const runBlock =
 		planBlock(runtime) ??
 		roleCapBlock(config, runtime, requestedRole, event.agent) ??
-		totalBlock(config, runtime) ??
+		totalBlock(runtime) ??
 		laneBindingBlock(runtime, requestedRole, event.agent, event.spawnKey);
 	if (runBlock) return block(runBlock, { role: roleKey });
 

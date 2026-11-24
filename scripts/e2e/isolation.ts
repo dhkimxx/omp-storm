@@ -324,13 +324,12 @@ async function main(): Promise<void> {
 				check("the recommended team was approved", files.approvals().length === 1 && existsSync(files.configFile));
 				const roles = Object.keys(files.config().roles).sort();
 				check("the team has the roles the lanes need", ["explorer", "implementer", "quick", "reviewer"].every(role => roles.includes(role)), roles.join(","));
-				// A manual run proves the plan/task path; four slots keep the two lanes concurrent.
+				// A manual run proves the plan/task path; the native ceiling comfortably keeps the two lanes concurrent.
 				files.editConfig(config => {
 					config.isolation = "shared";
-					config.parallelism = 4;
 				});
 				await rpc.prompt("/storm");
-				check("the hand-edited shared team is approved again", files.config().isolation === "shared" && files.config().parallelism === 4, JSON.stringify({ isolation: files.config().isolation, parallelism: files.config().parallelism }));
+				check("the hand-edited shared team is approved again", files.config().isolation === "shared", JSON.stringify({ isolation: files.config().isolation }));
 				rpc.answer = choose(LABEL.autoOff);
 				await rpc.prompt("/storm auto");
 				await waitAuto(files, "off");

@@ -200,7 +200,7 @@ try {
 		// earlier approval. Toggling a field can coincide with an old approval and make /storm setup report "unchanged".
 		const active = ownedFiles();
 		active.editConfig(config => {
-			config.parallelism = 3;
+			config.contextCap = 61_000;
 		});
 		const approvals = active.approvals().length;
 		await session(choose(APPROVE), async (rpc, files) => {
@@ -494,7 +494,7 @@ try {
 
 	await suite.step("stale approval blocks new work, not the supervisor boundary", async () => {
 		// Never approved before: the team is stale even though older approval records still exist.
-		ownedFiles().editConfig(config => { config.parallelism = 7; });
+		ownedFiles().editConfig(config => { config.contextCap = 71_000; });
 		await session(cancelAll, async (rpc, files) => {
 			const start = files.runIds();
 			const dispatch = new LlmCursor(env);
@@ -553,7 +553,7 @@ try {
 			// A value approved nowhere in this fixture, so the changed file is unapproved and /storm setup must really
 			// re-approve it; a previously approved value would be reported as "unchanged" and test nothing.
 			files.editConfig(config => {
-				config.parallelism = 5;
+				config.contextCap = 64_000;
 			});
 			const later = files.approvals().length;
 			rpc.answer = choose(APPROVE);

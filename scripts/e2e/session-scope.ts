@@ -23,6 +23,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpat
 import { basename, join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { resolveRepo } from "../../src/approval/repo.ts";
+import { configHash, shortHash } from "../../src/config/canonical.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
 import { sessionStoreDir } from "../../src/session-scope.ts";
 import type { Exec } from "../../src/types.ts";
@@ -102,7 +103,7 @@ async function main(): Promise<void> {
 	linkPlugin(env);
 
 	/** The first session, its own team and the native transcript the resume step copies. */
-	let a: { id: string; dir: string; sessionDir: string; file: string; config: string } | undefined;
+	let a: { id: string; dir: string; sessionDir: string; file: string; config: string; hash: string } | undefined;
 	let b: { id: string; dir: string; sessionDir: string } | undefined;
 	/** Old-format files seeded once the fixture has a real approval to copy into them. */
 	let legacy = new Map<string, string>();
@@ -123,16 +124,16 @@ async function main(): Promise<void> {
 			check("an empty id is rejected", (() => { try { sessionStoreDir(env.agentDir, " "); return false; } catch { return true; } })());
 			check("the second session starts with no config, approval or run", second.files.configBytes() === null && second.files.approvals().length === 0 && second.files.runs().length === 0);
 
-			// The first session: its own team (two-wide) and automatic delegation off.
+			// The first session: its own team (a distinct context cap) and automatic delegation off.
 			await approveTeam(first.rpc, "on");
 			first.files.editConfig(config => {
-				config.parallelism = 2;
+				config.contextCap = 50_000;
 			});
 			first.rpc.answer = choose(APPROVE);
 			await first.rpc.prompt("/storm");
 			first.rpc.answer = choose(AUTO_OFF_LABEL);
 			await first.rpc.prompt("/storm auto");
-			check("the first session's edited team is approved in its own store", first.files.approvals().length === 2 && first.files.config().parallelism === 2, `approvals=${first.files.approvals().length}`);
+			check("the first session's edited team is approved in its own store", first.files.approvals().length === 2 && first.files.config().contextCap === 50_000, `approvals=${first.files.approvals().length}`);
 			check("the first session's automatic delegation is off", (await readAutoDelegationChoice(first.files.sessionDir)) === "off");
 
 			// A real run, so history is not just an empty state directory.
@@ -151,23 +152,23 @@ async function main(): Promise<void> {
 			second.rpc.answer = choose(AUTO_ON_LABEL);
 			await second.rpc.prompt("/storm auto");
 			check("the second session approved its own team", second.files.approvals().length === 1, `approvals=${second.files.approvals().length}`);
-			check("the second session's team differs from the first", second.files.config().parallelism !== first.files.config().parallelism, `${second.files.config().parallelism} vs ${first.files.config().parallelism}`);
+			check("the second session's team differs from the first", second.files.config().contextCap !== first.files.config().contextCap, `${second.files.config().contextCap} vs ${first.files.config().contextCap}`);
 			check("automatic delegation is per session", (await readAutoDelegationChoice(second.files.sessionDir)) === "on" && (await readAutoDelegationChoice(first.files.sessionDir)) === "off");
 			check("the second session has no run history", second.files.runs().length === 0 && second.files.index().length === 0);
 
 			// Two read-only commands at once, each reporting only its own team.
 			const [firstStatus, secondStatus] = await Promise.all([first.rpc.prompt("/storm status"), second.rpc.prompt("/storm status")]);
 			const said = (frames: Frame[]): string => frames.filter(frame => frame.type === "message_end").map(frame => JSON.stringify(frame)).join("\n");
-			const firstTeam = `병렬도: ${first.files.config().parallelism}`;
-			const secondTeam = `병렬도: ${second.files.config().parallelism}`;
+			const firstTeam = shortHash(configHash(first.files.config()));
+			const secondTeam = shortHash(configHash(second.files.config()));
 			check(
 				"concurrent status reads see separate approvals",
-				said(firstStatus).includes(firstTeam) && said(secondStatus).includes(secondTeam) && said(secondStatus).includes(`병렬도: ${second.files.config().parallelism} ·`),
+				said(firstStatus).includes(firstTeam) && said(secondStatus).includes(secondTeam) && !said(firstStatus).includes(secondTeam) && !said(secondStatus).includes(firstTeam),
 				`first=${said(firstStatus).includes(firstTeam)} second=${said(secondStatus).includes(secondTeam)}`,
 			);
 
 			const file = await persistedFile(first);
-			a = { id: first.rpc.sessionId, dir: first.rpc.sessionDir, sessionDir: first.files.sessionDir, file, config: readFileSync(first.files.configFile, "utf8") };
+			a = { id: first.rpc.sessionId, dir: first.rpc.sessionDir, sessionDir: first.files.sessionDir, file, config: readFileSync(first.files.configFile, "utf8"), hash: firstTeam };
 			b = { id: second.rpc.sessionId, dir: second.rpc.sessionDir, sessionDir: second.files.sessionDir };
 
 			// Old-format sentinels: the same config and approval copied into `.omp/storm` and the pre-session profile
@@ -226,11 +227,11 @@ async function main(): Promise<void> {
 		try {
 			check("the resumed process reports the same native id", resumed.rpc.sessionId === a.id, `${resumed.rpc.sessionId} vs ${a.id}`);
 			check("the id, not the transcript path, picks the store", resumed.files.sessionDir === a.sessionDir, resumed.files.sessionDir);
-			check("the team is the session's own", readFileSync(resumed.files.configFile, "utf8") === a.config && resumed.files.config().parallelism === 2);
+			check("the team is the session's own", readFileSync(resumed.files.configFile, "utf8") === a.config && resumed.files.config().contextCap === 50_000);
 			check("approvals and automatic delegation survived", resumed.files.approvals().length === 2 && (await readAutoDelegationChoice(resumed.files.sessionDir)) === "off");
 			check("run history survived", resumed.files.runs().length === 1 && resumed.files.index().length === 1, `runs=${resumed.files.runs().length}`);
 			const status = await resumed.rpc.prompt("/storm status");
-			check("the resumed session reports its approved team", status.filter(frame => frame.type === "message_end").map(frame => JSON.stringify(frame)).join("\n").includes("병렬도: 2"));
+			check("the resumed session reports its approved team", status.filter(frame => frame.type === "message_end").map(frame => JSON.stringify(frame)).join("\n").includes(a.hash));
 			check("the other session's store is not reachable through this id", resumed.files.sessionDir !== b.sessionDir);
 		} finally {
 			await close(resumed);
@@ -272,12 +273,12 @@ async function main(): Promise<void> {
 			check("both resumed sessions read their own approved team", first.files.approvals().length === 2 && second.files.approvals().length === 1);
 			first.rpc.answer = choose("초기화");
 			second.files.editConfig(config => {
-				config.parallelism = 5;
+				config.contextCap = 66_000;
 			});
 			second.rpc.answer = choose(APPROVE);
 			await Promise.all([first.rpc.prompt("/storm reset"), second.rpc.prompt("/storm")]);
 			check("the reset deleted only its own session store", !existsSync(first.files.sessionDir) && first.files.approvals().length === 0 && first.files.configBytes() === null);
-			check("the approving session kept its new approved team", second.files.config().parallelism === 5 && second.files.approvals().length === 2, `approvals=${second.files.approvals().length}`);
+			check("the approving session kept its new approved team", second.files.config().contextCap === 66_000 && second.files.approvals().length === 2, `approvals=${second.files.approvals().length}`);
 			check(
 				"neither concurrent write touched the old sentinels",
 				sameHashes(legacy, new Map([...treeHashes(join(env.project, ".omp", "storm")), ...treeHashes(join(env.agentDir, "storm", "approvals", (await resolveRepo(env.project, exec)).repoId))])),

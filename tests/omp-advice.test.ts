@@ -12,7 +12,6 @@ const config: StormConfig = teamOf({ explorer: ["a/x:low", "b/y:high", "a/x:max"
 
 const known = (extra: Partial<ExplicitSettings> = {}): ExplicitSettings => ({
 	modelRoles: {},
-	maxConcurrency: 8,
 	modelFallback: true,
 	fallbackChains: { "a/x": ["b/y"] },
 	...extra,
@@ -28,13 +27,6 @@ describe("ompSettingsAdvice", () => {
 
 	test("unknown settings give no advice", () => {
 		expect(ompSettingsAdvice(config, { modelRoles: {} })).toEqual([]);
-	});
-
-	test("maxConcurrency below parallelism asks to raise it", () => {
-		const [advice] = ompSettingsAdvice(config, known({ maxConcurrency: 2 }));
-		expect(advice?.key).toBe("task.maxConcurrency");
-		expect(advice?.command).toBe("omp config set task.maxConcurrency 4");
-		expect(keys(known({ maxConcurrency: 4 }))).toEqual([]);
 	});
 
 	test("wanted chains drop efforts, dedupe, skip single-model roles and merge shared primaries", () => {

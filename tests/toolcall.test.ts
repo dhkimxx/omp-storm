@@ -13,7 +13,7 @@ const dir = realpathSync(mkdtempSync(join(tmpdir(), "storm-toolcall-")));
 writeFileSync(join(dir, "notes.md"), "line\n".repeat(10_000));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-const config: StormConfig = teamOf({ implementer: "a/i" }, { parallelism: 2 });
+const config: StormConfig = teamOf({ implementer: "a/i" });
 
 const agent = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ runId: RUN, ...over });
 

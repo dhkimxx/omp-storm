@@ -180,7 +180,6 @@ async function main(): Promise<void> {
 		await approveTeam(rpc, "on");
 		check("the disposable team is approved and automatic delegation is on", existsSync(files.configFile) && files.approvals().length === 1);
 		files.editConfig(config => {
-			config.parallelism = 2;
 			if (config.roles.quick) config.roles.quick.workers = { min: 1, max: 2 };
 		});
 		const approvals = files.approvals().length;

@@ -196,7 +196,7 @@ describe("decideProposal", () => {
 		await approve(base);
 		const edited = structuredClone(base);
 		edited.roles.reviewer!.models = ["z/unseen"];
-		edited.parallelism = 9;
+		edited.rounds = 9;
 		await editByHand(edited);
 		const state = await loadProjectState(project.env);
 		const workers = buildWorkers(edited, "explorer", 1, 3);
@@ -220,7 +220,7 @@ describe("decideProposal", () => {
 		edited.roles.reviewer!.models = ["z/unseen"];
 		await editByHand(edited);
 		const next = structuredClone(edited);
-		next.parallelism = 2;
+		next.rounds = 2;
 		const f = host(["승인"]);
 		const decision = await decideProposal(f.host, await loadProjectState(project.env), { kind: "setup", summary: "s", config: next });
 		expect(decision.outcome).toBe("approved");
@@ -251,14 +251,14 @@ describe("decideProposal", () => {
 		const state = await loadProjectState(project.env);
 		const f = host([]);
 		expect(await decideProposal(f.host, state, { kind: "settings", summary: "s", config: structuredClone(base) })).toEqual({ outcome: "unchanged" });
-		const broken = { ...base, parallelism: 99 };
+		const broken = { ...base, rounds: 99 };
 		expect((await decideProposal(f.host, state, { kind: "settings", summary: "s", config: broken })).outcome).toBe("rejected");
 		expect(f.selects).toEqual([]);
 	});
 
 	test("a config changed while the dialog was open blocks the save", async () => {
 		await approve(base);
-		const moved = { ...base, parallelism: 2 };
+		const moved = { ...base, rounds: 2 };
 		const f = host([
 			async () => {
 				await editByHand(moved);
@@ -367,7 +367,7 @@ describe("builders", () => {
 		expect(buildWorkers(base, "implementer", 3, 2)).toHaveProperty("error");
 		expect(buildWorkers(base, "implementer", undefined, undefined)).toHaveProperty("error");
 		expect(buildWorkers(base, "nope", 2, 2)).toHaveProperty("error");
-		// implementer unset → default 1~2; raising max keeps min.
+		// implementer unset → default 1~4; raising max keeps min.
 		const wide = buildWorkers(base, "implementer", undefined, 4);
 		if ("error" in wide) throw new Error(wide.error);
 		expect(wide.config.roles.implementer!.workers).toEqual({ min: 1, max: 4 });

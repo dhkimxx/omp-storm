@@ -86,7 +86,7 @@ function childTranscript(agentId: string): string | undefined {
 
 async function main(): Promise<void> {
 	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
-	writeFileSync(join(env.agentDir, "config.yml"), "setupVersion: 3\n");
+	writeFileSync(join(env.agentDir, "config.yml"), `setupVersion: 3\ntask:\n  maxConcurrency: ${COUNT}\n`);
 	const shadowDir = join(env.project, ".omp", "agents");
 	Bun.spawnSync(["mkdir", "-p", shadowDir]);
 	writeFileSync(join(shadowDir, "storm-implementer.md"), "---\nname: storm-implementer\ndescription: path-only worker authority\ntools: read, write, edit\n---\nPath-only worker.\n");
@@ -100,7 +100,6 @@ async function main(): Promise<void> {
 		rpc.answer = choose(APPROVE);
 		await rpc.prompt("/storm");
 		files.editConfig(config => {
-			config.parallelism = COUNT;
 			(config.roles.implementer as unknown as Record<string, unknown>).workers = { min: COUNT, max: COUNT };
 		});
 		rpc.answer = choose(APPROVE);

@@ -6,14 +6,14 @@
  * because subagent sessions reuse this module.
  */
 import { readFileSync, realpathSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
-import { liveIsolationSettings, readExplicitSettings } from "./discovery/settings.ts";
+import { liveIsolationSettings, liveTaskMaxConcurrency, readExplicitSettings } from "./discovery/settings.ts";
 import {
 	agentsFlow,
 	approveAndSave,
@@ -32,7 +32,7 @@ import { serialized } from "./fsutil.ts";
 import { execPort, ompBinary } from "./omp.ts";
 import { changesFiles, pathOf } from "./policy/director.ts";
 import { docPromptFor } from "./policy/docs.ts";
-import { deliveredFollowUp, followUpAgent } from "./policy/followup.ts";
+import { deliveredFollowUp, followUpAgent, followUpProgress, followUpTarget } from "./policy/followup.ts";
 import {
 	canonicalScope,
 	effectiveAgentTools,
@@ -363,6 +363,24 @@ function artifactsOf(ctx: ExtensionContext): string | undefined {
 /** A subagent's run, only through the binding its parent recorded before the spawn was admitted. */
 function childLedger(ctx: ExtensionContext): LedgerRun | undefined {
 	return ledgerRunForChild(ctx.agent.id, ctx.agent.parentId, artifactsOf(ctx));
+}
+
+/** Count native workers outside Storm only with proof that they belong to this session's task scheduler. */
+function otherNativeWorkers(ctx: ExtensionContext, known: ReadonlySet<string>): number {
+	const artifacts = artifactsOf(ctx);
+	if (artifacts === undefined) return 0;
+	const scope = resolvePath(artifacts) + sep;
+	try {
+		let active = 0;
+		for (const ref of AgentRegistry.global().list()) {
+			// Main agent ids are shared by several SDK sessions. The direct parent AND artifact scope must match.
+			if (ref.kind === "sub" && ref.parentId === ctx.agent.id && ref.status === "running" && ref.session !== null &&
+				ref.sessionFile !== null && !known.has(ref.id) && resolvePath(ref.sessionFile).startsWith(scope)) ++active;
+		}
+		return active;
+	} catch {
+		return 0;
+	}
 }
 
 /** The approved reviewer agent of a run's team; a disabled or modelless reviewer is not authority. */
@@ -1260,6 +1278,20 @@ export default function storm(pi: ExtensionAPI): void {
 				if (capturedRunId !== undefined && (current === undefined || current.closing)) return closed();
 				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(state.sessionDir, now), readTrialStates(state.sessionDir)]);
 				if (!stillOwn()) return moved();
+				// One authoritative count for this decision: reservations and running Storm rows dedupe by worker id,
+				// then observed direct children that Storm does not own add their native-session occupancy once.
+				const nativeLimit = liveTaskMaxConcurrency();
+				const reservedSlots = current === undefined ? [] : reservedWorkers(current.runId);
+				const stormSpawns = current === undefined ? [] : runSpawns(current.runId);
+				const stormAgents = current === undefined ? [] : listAgents({ runId: current.runId, scope: current.sessionDir });
+				const stormActive = activeAgents(stormSpawns, stormAgents, now, reservedSlots);
+				let nativeOther = 0;
+				if (current !== undefined && nativeLimit !== undefined && nativeLimit > 0) {
+					const known = new Set(reservedSlots.map(slot => slot.key));
+					for (const spawn of stormSpawns) if (spawn.outcome !== "blocked" && spawn.spawnKey !== undefined) known.add(spawn.spawnKey);
+					for (const agent of stormAgents) known.add(agent.id);
+					nativeOther = otherNativeWorkers(ctx, known);
+				}
 				const outcome = decideSpawn(
 					event,
 					{ config: state.config, approval: state.approval, shadows: state.shadows },
@@ -1267,6 +1299,7 @@ export default function storm(pi: ExtensionAPI): void {
 						now,
 						quotaMarks,
 						trials,
+						...(nativeLimit === undefined ? {} : { maxConcurrency: nativeLimit }),
 						...(current
 							? {
 									run: {
@@ -1274,12 +1307,7 @@ export default function storm(pi: ExtensionAPI): void {
 										costUsd: current.costUsd,
 										...(current.budget ? { budget: current.budget } : {}),
 										...(current.plan ? { plan: current.plan } : {}),
-										active: activeAgents(
-											runSpawns(current.runId),
-											listAgents({ runId: current.runId, scope: current.sessionDir }),
-											now,
-											reservedWorkers(current.runId),
-										),
+										active: { total: stormActive.total + nativeOther, byRole: stormActive.byRole },
 									},
 								}
 							: {}),
@@ -1816,17 +1844,18 @@ export default function storm(pi: ExtensionAPI): void {
 			attempts.observeTaskCall({ runId, parentId: ctx.agent.id, toolCallId: event.toolCallId, input: placed.input, startedAt: Date.now() });
 			return placed.input === event.input ? undefined : { input: placed.input };
 		}
-		// A work-bearing follow-up is not a new spawn, but it starts a new turn that may write: it passes the same
-		// prerequisite and shared-write gate as a task. A `?progress` note never reaches here (`deliveredFollowUp`
-		// excludes it), so a status note reserves nothing and waits for no lane.
-		const followTarget = deliveredFollowUp(event.toolName, event.input, false);
+		// Even a quiet `?progress` write can wake an idle OMP recipient. A read is the no-wake status path.
+		const progress = followUpProgress(event.toolName, event.input);
+		const followTarget = followUpTarget(event.toolName, event.input);
+		if (followTarget?.toLowerCase() === "all") {
+			return { block: true, reason: "[storm:lane-capacity] 한꺼번에 여러 워커를 깨울 수 있어 실행 중에는 agent://all 에 쓰지 않습니다. agent://<id>로 워커 한 명에게 보내세요." };
+		}
 		const followAgent = followTarget === undefined ? undefined : followUpAgent(listAgents({ scope: runScope }), followTarget);
 		const followLanes = runs.runLanes();
 		let followToken: string | undefined;
 		let followLane: PlanLane | undefined;
 		if (followAgent !== undefined && followLanes !== undefined) {
-			// A job batch owns the run while it executes and starts only with no live workers. A genuine work-bearing
-			// note would make a worker live, so it waits for the batch; a `?progress` note never reaches this block.
+			// A job batch starts only with no live workers; do not admit a message that can wake one into it.
 			const blockedByJob = runs.jobGate();
 			if (blockedByJob !== undefined) return { block: true, reason: blockedByJob };
 			// A work-bearing follow-up starts a new turn that may write: prove the target's write lease first.
@@ -1874,6 +1903,14 @@ export default function storm(pi: ExtensionAPI): void {
 			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
 				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 후속 지시를 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 			}
+			const followAgents = listAgents({ runId, scope: runScope });
+			const nativeLimit = liveTaskMaxConcurrency();
+			let nativeOther = 0;
+			if (nativeLimit !== undefined && nativeLimit > 0) {
+				const known = new Set(followAgents.map(agent => agent.id));
+				for (const slot of reservedWorkers(runId)) known.add(slot.key);
+				nativeOther = otherNativeWorkers(ctx, known);
+			}
 			const gate = followLanes.checkFollowUp({
 				runId,
 				agentId: followAgent.id,
@@ -1882,9 +1919,11 @@ export default function storm(pi: ExtensionAPI): void {
 				...(lane === undefined ? {} : { lane }),
 				...(plan === undefined ? {} : { plan }),
 				config,
+				...(nativeLimit === undefined ? {} : { maxConcurrency: nativeLimit }),
 				isolated: config.isolation === "isolated",
 				...(readiness === undefined ? {} : { readiness }),
-				agents: listAgents({ runId, scope: runScope }),
+				agents: followAgents,
+				otherActive: nativeOther,
 				now: Date.now(),
 			});
 			if (!gate.ok) return { block: true, reason: `[storm:${gate.code}] ${gate.reason}` };
@@ -1910,7 +1949,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		// A follow-up turn is new work: capture its lane's pre-write baseline before the write executes. A child this
 		// run never admitted is left alone; the collector only tracks lanes with declared results.
-		if (followAgent !== undefined && followLane !== undefined) {
+		if (!progress && followAgent !== undefined && followLane !== undefined) {
 			const artifactMode = followLane.isolationReason !== undefined || config.isolation === "isolated" ? "isolated" : "shared";
 			const admitted = await attempts.admitFollowUp({
 				runId,
@@ -2020,17 +2059,19 @@ export default function storm(pi: ExtensionAPI): void {
 			if (read) runs.noteRead(chars, read.indexed);
 			return undefined;
 		}
-		// A follow-up counts when its write was delivered, for the agent omp resolved it to. That delivery also admits
-		// a reused live agent into this run, and gives a reused reviewer a fresh baseline before its next turn.
-		const target = deliveredFollowUp(event.toolName, event.input, event.isError);
+		// Normal deliveries count as follow-ups. A quiet write can still wake the child, but owes no result.
+		const progress = followUpProgress(event.toolName, event.input);
+		const target = progress && !event.isError ? followUpTarget(event.toolName, event.input)
+			: deliveredFollowUp(event.toolName, event.input, event.isError);
 		const targetRun = getLedgerRun(runId);
 		const agent =
 			target === undefined || targetRun === undefined
 				? undefined
 				: followUpAgent(listAgents({ scope: targetRun.sessionDir }), target);
 		if (!agent || targetRun === undefined) return undefined;
-		noteAgentFollowUp(agent.id, targetRun.sessionDir);
 		bindLedgerChild(runId, agent.id, agent.parentId ?? ctx.agent.id, artifactsOf(ctx));
+		if (progress) return undefined;
+		noteAgentFollowUp(agent.id, targetRun.sessionDir);
 		// The follow-up's next async job is already in this parent session's own snapshot. Its exact id (not a guessed
 		// name) is what lets the first delivery bind to this turn instead of looking stale.
 		const snapshot = ctx.getAsyncJobSnapshot?.();

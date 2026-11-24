@@ -771,7 +771,6 @@ function exportableTeam(config: StormConfig): StormConfig {
 		version: config.version,
 		priority: config.priority,
 		roles,
-		parallelism: config.parallelism,
 		isolation: config.isolation,
 		...(config.budget
 			? {
@@ -806,7 +805,7 @@ export async function exportFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const markdown = [
 		"### 복사용 팀 옵션",
 		"",
-		"- 모델·effort·워커·병렬도·예산·실행 설정처럼 나눌 수 있는 값만 담았습니다.",
+		"- 모델·effort·워커·예산·실행 설정처럼 나눌 수 있는 값만 담았습니다.",
 		"- 승인 기록, 설정 해시, 실행·시험 기록, 자동 위임 선택, 필수 검사 명령, 자격 증명, 세션·작업 대상 경로는 들어 있지 않습니다.",
 		"- Storm은 이 내용을 읽어 들이거나 자동으로 물려받지 않습니다. 필요하면 사람이 직접 비교해 옮겨 적으세요.",
 		"",

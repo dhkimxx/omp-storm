@@ -150,7 +150,6 @@ describe("common settings form", () => {
 	test("only common fields, with the defaults of first setup", () => {
 		const form = parseHtmlForm(commonSettingsForm(input()));
 		expect(defaultFormData(form)).toEqual({
-			parallelism: 4,
 			context_cap: 200_000,
 			rounds: 3,
 			budget_usd: 0,
@@ -159,7 +158,7 @@ describe("common settings form", () => {
 			cleanup: "on",
 			docs: "on",
 		});
-		expect(form.fields.map(f => f.name)).toEqual(["parallelism", "context_cap", "rounds", "budget_usd", "budget_warn_usd", "budget_exceed", "cleanup", "docs"]);
+		expect(form.fields.map(f => f.name)).toEqual(["context_cap", "rounds", "budget_usd", "budget_warn_usd", "budget_exceed", "cleanup", "docs"]);
 		const rounds = textOf(form, "rounds");
 		expect([rounds.type, rounds.min, rounds.max, rounds.required]).toEqual(["number", 0, 10, true]);
 		expect(textOf(form, "budget_usd").min).toBe(0);
@@ -179,13 +178,12 @@ describe("common settings form", () => {
 	});
 
 	test("re-setup opens on the current settings", () => {
-		const current: StormConfig = { ...TEAM, parallelism: 7, contextCap: 150_000, rounds: 2, budget: { perRunUsd: 5, warnAtUsd: 3, onExceed: "stop" }, docs: false };
+		const current: StormConfig = { ...TEAM, contextCap: 150_000, rounds: 2, budget: { perRunUsd: 5, warnAtUsd: 3, onExceed: "stop" }, docs: false };
 		const inp = input(current);
 		const form = parseHtmlForm(commonSettingsForm(inp));
 		expect(defaultFormData(page(inp, "implementer"))).toMatchObject({ workers_min_implementer: 1, workers_max_implementer: 3 });
 		expect(defaultFormData(parseHtmlForm(effortForm(inp, "reviewer", "주 모델", "b/r")!))).toEqual({ effort: "high" });
 		expect(defaultFormData(form)).toMatchObject({
-			parallelism: 7,
 			context_cap: 150_000,
 			rounds: 2,
 			budget_usd: 5,
@@ -199,7 +197,7 @@ describe("common settings form", () => {
 	test("reopened with errors: they are listed and the typed answers are kept", () => {
 		const inp = input();
 		const first = defaultFormData(parseHtmlForm(commonSettingsForm(inp)));
-		const answers = { ...first, parallelism: "", cleanup: "off" };
+		const answers = { ...first, context_cap: "", cleanup: "off" };
 		const form = parseHtmlForm(commonSettingsForm(inp, { answers, errors: ["error-one", "error-two"] }));
 		const list = form.sections[0]!.blocks.find(b => b.kind === "list");
 		expect(list?.kind === "list" && list.items.map(spansText)).toEqual(["error-one", "error-two"]);
@@ -212,6 +210,10 @@ describe("answers to config", () => {
 		const inp = input();
 		const built = submit(inp);
 		expect(built).toEqual({ config: inp.proposed, warnings: [] });
+		// A fresh team recommends implementation at 1~4 workers and writes no team-wide cap.
+		const config = configOf(built);
+		expect(config.roles.implementer!.workers).toEqual({ min: 1, max: 4 });
+		expect(config).not.toHaveProperty("parallelism");
 	});
 
 	test("the default interview preserves the current team, including legacy role effort", () => {
@@ -323,8 +325,8 @@ describe("answers to config", () => {
 	});
 
 	test("run settings and switches map to the config; the default context cap stays unwritten", () => {
-		const config = configOf(submit(input(), { parallelism: 8, context_cap: 400_000, cleanup: "off", docs: "off", workers_min_explorer: 1, workers_max_explorer: 6 }));
-		expect(config).toMatchObject({ parallelism: 8, contextCap: 400_000, docs: false });
+		const config = configOf(submit(input(), { rounds: 7, context_cap: 400_000, cleanup: "off", docs: "off", workers_min_explorer: 1, workers_max_explorer: 6 }));
+		expect(config).toMatchObject({ rounds: 7, contextCap: 400_000, docs: false });
 		expect(config.cleanup).toBeUndefined();
 		expect(config.roles.explorer!.workers).toEqual({ min: 1, max: 6 });
 		expect(configOf(submit(input())).contextCap).toBeUndefined();
@@ -333,8 +335,6 @@ describe("answers to config", () => {
 
 	test("numbers that are missing or out of range are errors, not a config: one each, in the form's words, not the schema's paths", () => {
 		const mistakes: FormData[] = [
-			{ parallelism: "" },
-			{ parallelism: 99 },
 			{ workers_min_explorer: 5, workers_max_explorer: 2 },
 			{ workers_max_reviewer: 2.5 },
 			{ budget_usd: 2, budget_warn_usd: 3 },
@@ -348,9 +348,9 @@ describe("answers to config", () => {
 			const built = submit(input(), over);
 			const errors = "errors" in built ? built.errors : [];
 			expect(errors).toHaveLength(1);
-			expect(errors[0]).not.toMatch(/roles\.|[a-z]+\.[a-z]|contextCap|parallelism|perRunUsd|warnAtUsd|explorer|reviewer/);
+			expect(errors[0]).not.toMatch(/roles\.|[a-z]+\.[a-z]|contextCap|perRunUsd|warnAtUsd|explorer|reviewer/);
 		}
-		const common = submit(input(), { parallelism: 99, budget_usd: 2, budget_warn_usd: 3 });
+		const common = submit(input(), { rounds: 11, budget_usd: 2, budget_warn_usd: 3 });
 		expect("errors" in common && common.errors).toHaveLength(2);
 	});
 

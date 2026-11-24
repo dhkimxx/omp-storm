@@ -51,7 +51,7 @@ export function teamBrief(state: ProjectState): string {
 		? `${formatUsd(config.budget.perRunUsd)} per run${config.budget.warnAtUsd !== undefined ? `, warn at ${formatUsd(config.budget.warnAtUsd)}` : ""}, past it: ${config.budget.onExceed}`
 		: "none";
 	return [
-		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, parallelism ${config.parallelism}, isolation ${config.isolation}, rounds ${config.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
+		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, isolation ${config.isolation}, rounds ${config.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
 		...roles,
 		...(config.disabledRoles?.length ? [`Disabled roles: ${config.disabledRoles.join(", ")}`] : []),
 		...(config.trials ?? []).map(trial => `Trial: ${trial.role} → ${trial.model}, share ${trial.share}, until ${trial.endsAt}`),

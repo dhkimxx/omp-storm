@@ -23,7 +23,6 @@ const TOP_KEYS = [
 	"version",
 	"priority",
 	"roles",
-	"parallelism",
 	"isolation",
 	"contract",
 	"runtime",
@@ -392,10 +391,6 @@ export function validateConfig(value: unknown): ConfigValidation {
 		}
 	}
 
-	const p = value.parallelism;
-	if (typeof p !== "number" || !Number.isInteger(p) || p < 1 || p > 16) {
-		errors.push("parallelism: 1~16 사이 정수여야 합니다");
-	}
 	if (value.contextCap !== undefined && !isIntIn(value.contextCap, 1, MAX_CONTEXT_CAP)) {
 		errors.push(`contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
 	}

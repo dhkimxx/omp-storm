@@ -36,6 +36,7 @@
  *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
  *                           observed deterministically while the child really runs
  *   E2E-CHILD-GATE <key>   mark this child as waiting and hold its first reply until a scripted wait releases it
+ *   E2E-WAKE-GATE <key>    hold the first provider reply to a follow-up, including an already-used child
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
  *                           answered), so the parent's turn ends and is compacted while the child still runs
  *   E2E-CHILD-HOLD-ONCE <key>
@@ -211,6 +212,7 @@ const heldOnce = new Set<string>();
 const failedOnce = new Set<string>();
 /** The named children whose first provider replies are parked until the director releases them. */
 const waitingChildren = new Set<string>();
+const seenWakeGates = new Set<string>();
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -688,10 +690,16 @@ Bun.serve({
 			if (missing.length > 0) return gateError(`Cannot release children not at their gates: ${missing.join(", ")}`);
 			for (const key of releaseChildren) waitingChildren.delete(key);
 		}
-		const gate = who === "child" && !request.messages.some(message => message.role === "assistant")
-			? /E2E-CHILD-GATE[ \t]+(\S+)/.exec(userText(request.messages))?.[1]
+		const wakeGate = who === "child"
+			? /E2E-WAKE-GATE[ \t]+(\S+)/.exec(textOf(request.messages.findLast(message => message.role === "user")?.content))?.[1]
 			: undefined;
+		const gate = wakeGate !== undefined && !seenWakeGates.has(wakeGate)
+			? wakeGate
+			: who === "child" && !request.messages.some(message => message.role === "assistant")
+				? /E2E-CHILD-GATE[ \t]+(\S+)/.exec(userText(request.messages))?.[1]
+				: undefined;
 		if (gate !== undefined) {
+			if (wakeGate !== undefined) seenWakeGates.add(wakeGate);
 			waitingChildren.add(gate);
 			if (!(await hold(() => !waitingChildren.has(gate)))) {
 				waitingChildren.delete(gate);

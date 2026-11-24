@@ -16,7 +16,7 @@ export const DEAD_PROCESS = "99999999:1";
 
 /**
  * A team config. Each role is its models (one selector or a list) or the role's fields without `agent`, which is
- * always `storm-<id>`. Defaults: balanced, parallelism 4, shared work tree.
+ * always `storm-<id>`. Defaults: balanced, shared work tree.
  */
 export function teamOf(roles: Record<string, string | string[] | Omit<RoleConfig, "agent">>, over: Partial<StormConfig> = {}): StormConfig {
 	const role = (id: string, spec: string | string[] | Omit<RoleConfig, "agent">): RoleConfig => ({
@@ -27,7 +27,6 @@ export function teamOf(roles: Record<string, string | string[] | Omit<RoleConfig
 		version: 1,
 		priority: "balanced",
 		roles: Object.fromEntries(Object.entries(roles).map(([id, spec]) => [id, role(id, spec)])),
-		parallelism: 4,
 		isolation: "shared",
 		...over,
 	};

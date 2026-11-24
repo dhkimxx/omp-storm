@@ -98,18 +98,18 @@ export const LANE_ROLES: Readonly<Record<LaneKind, RoleId>> = {
 
 /**
  * Worker ranges a new team starts from: explorers and quick workers fan out, the expensive roles stay narrow.
- * `min` is the setup suggestion and `max` the approved concurrency ceiling; a plan that omits its worker count uses
- * its actual worker lanes (at least one, never past `max`), not `min`.
+ * `min` is the setup suggestion, never a spawn floor: a plan that omits its worker count uses its actual worker
+ * lanes (at least one, never past `max`). `max` is the role's approved concurrency ceiling.
  */
 export const DEFAULT_WORKERS: Readonly<Record<RoleId, WorkerRange>> = {
 	explorer: { min: 1, max: 4 },
-	implementer: { min: 1, max: 2 },
+	implementer: { min: 1, max: 4 },
 	reviewer: { min: 1, max: 2 },
 	quick: { min: 1, max: 3 },
 	architect: { min: 1, max: 1 },
 };
 
-/** Highest `workers.max` a config may set (parallelism shares the bound). */
+/** Highest `workers.max` a config may set. */
 export const MAX_WORKERS = 16;
 
 /** Default context ceiling in tokens (team setting `contextCap`). */

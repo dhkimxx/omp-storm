@@ -245,7 +245,6 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 		}
 	}
 	if (prev !== undefined || next.disabledRoles?.length) line("사용 안 함", prev && (disabledTitles(prev) || "없음"), disabledTitles(next) || "없음");
-	line("병렬도", prev && String(prev.parallelism), String(next.parallelism));
 	line("추가 라운드", prev && roundsText(prev.rounds), roundsText(next.rounds));
 	if (prev?.contextCap !== undefined || next.contextCap !== undefined) line("컨텍스트 상한", prev && capText(prev.contextCap), capText(next.contextCap));
 	line("격리", prev && ISOLATION[prev.isolation], ISOLATION[next.isolation]);
@@ -596,7 +595,7 @@ export function renderStatus(
 		out.push("");
 		heading("실행 설정");
 		out.push(
-			`- 병렬도: ${team.parallelism} · ${ISOLATION[team.isolation]}`,
+			`- 격리: ${ISOLATION[team.isolation]}`,
 			`- 추가 라운드: ${team.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
 			`- 컨텍스트 상한: ${int(team.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`,
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,

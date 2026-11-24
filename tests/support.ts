@@ -255,6 +255,5 @@ export const TEAM: StormConfig = {
 		implementer: { agent: "storm-implementer", models: ["a/i"], workers: { min: 1, max: 3 } },
 		reviewer: { agent: "storm-reviewer", models: ["b/r"], effort: "high" },
 	},
-	parallelism: 4,
 	isolation: "shared",
 };

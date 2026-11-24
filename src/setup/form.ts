@@ -51,7 +51,6 @@ export const FIELD = {
 	effort: "effort",
 	workersMin: (id: RoleId) => `workers_min_${id}`,
 	workersMax: (id: RoleId) => `workers_max_${id}`,
-	parallelism: "parallelism",
 	contextCap: "context_cap",
 	rounds: "rounds",
 	budget: "budget_usd",
@@ -64,7 +63,6 @@ export const FIELD = {
 const LABEL = {
 	workersMin: "워커 최소",
 	workersMax: "워커 최대",
-	parallelism: "병렬도",
 	contextCap: "팀 컨텍스트 상한",
 	rounds: "검증이 안 됐을 때 추가 라운드",
 	budget: "실행당 예산",
@@ -236,7 +234,7 @@ export function roleForm(input: SetupFormInput, id: RoleId, browse: boolean, ste
 		select(FIELD.fallback(id), "폴백", fallbacks, choice(retry?.answers, FIELD.fallback(id), fallbacks.map(([value]) => value), defaults.fallback)),
 		"<p>주 모델과 같은 폴백은 폴백 없음으로 봅니다.</p>",
 		...(more.length ? [`<p>${esc(`폴백이 ${more.length}개 더 있습니다(${more.join(", ")}). 고른 폴백 뒤에 그대로 두며, 폴백 없음을 고르면 함께 뺍니다.`)}</p>`] : []),
-		numberInput(FIELD.workersMin(id), `${LABEL.workersMin} (계획이 수를 정하지 않을 때)`, typed(retry, FIELD.workersMin(id), workers.min), 1, MAX_WORKERS),
+		numberInput(FIELD.workersMin(id), `${LABEL.workersMin} (추천값, 스폰 하한 아님)`, typed(retry, FIELD.workersMin(id), workers.min), 1, MAX_WORKERS),
 		numberInput(FIELD.workersMax(id), `${LABEL.workersMax} (동시에 살아 있는 수의 상한)`, typed(retry, FIELD.workersMax(id), workers.max), 1, MAX_WORKERS),
 		"</fieldset>",
 		"</form>",
@@ -297,7 +295,6 @@ export function commonSettingsForm(input: SetupFormInput, retry?: FormRetry): st
 	const budget = base.budget;
 	out.push(
 		"<fieldset><legend>실행</legend>",
-		numberInput(FIELD.parallelism, `${LABEL.parallelism} (동시에 도는 서브에이전트 수)`, typed(retry, FIELD.parallelism, base.parallelism), 1, MAX_WORKERS),
 		numberInput(FIELD.contextCap, `${LABEL.contextCap} (토큰. 넘은 서브에이전트는 후속 지시를 받지 않습니다)`, typed(retry, FIELD.contextCap, base.contextCap ?? DEFAULT_CONTEXT_CAP), 1, MAX_CONTEXT_CAP),
 		numberInput(FIELD.rounds, `${LABEL.rounds} (0이면 다시 보내지 않음)`, typed(retry, FIELD.rounds, base.rounds ?? DEFAULT_EXTRA_ROUNDS), 0, MAX_EXTRA_ROUNDS),
 		"</fieldset>",
@@ -399,7 +396,7 @@ export function setupConfig(input: SetupFormInput, answers: RoleAnswers, data: F
 		roles[id] = { agent, models: picked.map(formatModelEntry), workers, ...(before?.contextCap !== undefined ? { contextCap: before.contextCap } : {}) };
 	}
 
-	const config: StormConfig = { ...structuredClone(base), roles, parallelism: whole(data, errors, FIELD.parallelism, LABEL.parallelism, 1, MAX_WORKERS) };
+	const config: StormConfig = { ...structuredClone(base), roles };
 	const contextCap = whole(data, errors, FIELD.contextCap, LABEL.contextCap, 1, MAX_CONTEXT_CAP);
 	// The default stays unwritten, as in a team that never set it.
 	if (base.contextCap !== undefined || contextCap !== DEFAULT_CONTEXT_CAP) config.contextCap = contextCap;

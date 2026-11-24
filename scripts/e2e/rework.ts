@@ -417,13 +417,12 @@ async function main(): Promise<void> {
 				);
 				files.editConfig(config => {
 					config.isolation = "shared";
-					config.parallelism = 4;
 				});
 				await rpc.prompt("/storm");
 				check(
 					"the hand-edited shared team is approved again",
-					files.config().isolation === "shared" && files.config().parallelism === 4,
-					JSON.stringify({ isolation: files.config().isolation, parallelism: files.config().parallelism }),
+					files.config().isolation === "shared",
+					JSON.stringify({ isolation: files.config().isolation }),
 				);
 				rpc.answer = choose(LABEL.autoOff);
 				await rpc.prompt("/storm auto");

@@ -945,7 +945,7 @@ describe("start with plan", () => {
 
 	test("a team change after the plan was checked refuses instead of using the new authority", async () => {
 		const first = approvedState(root, SESSION_TEAM);
-		const changed = approvedState(root, { ...SESSION_TEAM, parallelism: 3 });
+		const changed = approvedState(root, { ...SESSION_TEAM, contextCap: 300_000 });
 		let loads = 0;
 		const h = session({ loadState: async () => (++loads === 1 ? first : changed) });
 		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
@@ -1031,7 +1031,7 @@ describe("lease, drain and required checks", () => {
 
 	test("a plan hash other than the approved team refuses before taking the lease", async () => {
 		const h = session();
-		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash({ ...h.config, parallelism: 3 }));
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash({ ...h.config, contextCap: 300_000 }));
 		expect(result.ok).toBe(false);
 		expect(h.leases.acquired).toEqual([]);
 		expect(h.controller.directing()).toBe(false);

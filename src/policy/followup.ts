@@ -50,8 +50,8 @@ export function followUpBlock(
 }
 
 /**
- * A native `?progress` note on an `agent://` handle. omp treats it as a status write, not a new work turn: it never
- * needs a write reservation or a prerequisite gate, and it is not counted as a follow-up.
+ * A native quiet `?progress` write. It can still wake an idle recipient, but it is not a requested result
+ * and is not counted as a follow-up in the report.
  */
 export function followUpProgress(toolName: string, input: unknown): boolean {
 	if (toolName !== "write") return false;

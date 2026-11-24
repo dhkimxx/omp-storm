@@ -23,7 +23,7 @@ const team: StormConfig = teamOf(
 		explorer: { models: ["a/e"], workers: { min: 2, max: 4 } },
 		quick: { models: ["a/q"], workers: { min: 1, max: 2 } },
 	},
-	{ parallelism: 2, isolation: "shared" },
+	{ isolation: "shared" },
 );
 const approval: ApprovalRecord = approvalRecord(HASH, { repoId: "git-r-000000000000000000000000" });
 const load: Extract<ConfigLoad, { status: "ok" }> = {
@@ -97,11 +97,21 @@ describe("one authoritative worker accounting", () => {
 
 	test("total saturation blocks a fresh start and release lets the same spawn retry", () => {
 		reserveWorkerSlot({ runId: RUN, key: "Scout", role: "explorer", now: NOW });
-		const narrow = { ...load, config: { ...team, parallelism: 1 } };
-		const full = runtime(plan(), { run: { ...runtime(plan()).run!, active: activeAgents([], [], NOW, reservedWorkers(RUN)) } });
-		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: narrow, approval, shadows: [] }, full))).toBe("parallelism");
+		const full = runtime(plan(), {
+			maxConcurrency: 1,
+			run: { ...runtime(plan()).run!, active: activeAgents([], [], NOW, reservedWorkers(RUN)) },
+		});
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, full))).toBe("parallelism");
 		releaseWorkerSlot(RUN, "Scout");
-		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: narrow, approval, shadows: [] }, runtime(plan())))).toBeUndefined();
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(plan(), { maxConcurrency: 1 })))).toBeUndefined();
+	});
+
+	test("OMP 0 is unlimited, and an absent host ceiling adds no Storm default", () => {
+		reserveWorkerSlot({ runId: RUN, key: "Scout", role: "explorer", now: NOW });
+		const busy = { run: { ...runtime(plan()).run!, active: activeAgents([], [], NOW, reservedWorkers(RUN)) } };
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(plan(), busy)))).toBeUndefined();
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(plan(), { ...busy, maxConcurrency: 0 })))).toBeUndefined();
+		releaseWorkerSlot(RUN, "Scout");
 	});
 
 	test("role saturation blocks a fresh start and release lets it retry", () => {
@@ -176,7 +186,6 @@ describe("reactivations use the same slots as fresh starts", () => {
 		const lanes = work();
 		const runPlan = plan();
 		const build = runPlan.lanes.find(candidate => candidate.role === "implementer")!;
-		const narrow: StormConfig = { ...team, parallelism: 1 };
 		reserveWorkerSlot({ runId: RUN, key: "Scout", role: "explorer", now: NOW });
 		const blocked = lanes.checkFollowUp({
 			runId: RUN,
@@ -185,7 +194,8 @@ describe("reactivations use the same slots as fresh starts", () => {
 			role: "implementer",
 			lane: build,
 			plan: runPlan,
-			config: narrow,
+			config: team,
+			maxConcurrency: 1,
 			isolated: false,
 			agents: [agentEntry({ id: "Impl", state: "idle" })],
 			now: NOW,
@@ -193,7 +203,8 @@ describe("reactivations use the same slots as fresh starts", () => {
 		expect(blocked.ok).toBe(false);
 		if (!blocked.ok) {
 			expect(blocked.code).toBe("lane-capacity");
-			expect(blocked.reason).toContain("동시 상한");
+			expect(blocked.reason).toContain("task.maxConcurrency 1");
+			expect(blocked.retry).toBe(true);
 		}
 		releaseWorkerSlot(RUN, "Scout");
 		const retry = lanes.checkFollowUp({
@@ -203,12 +214,56 @@ describe("reactivations use the same slots as fresh starts", () => {
 			role: "implementer",
 			lane: build,
 			plan: runPlan,
-			config: narrow,
+			config: team,
+			maxConcurrency: 1,
 			isolated: false,
 			agents: [agentEntry({ id: "Impl", state: "idle" })],
 			now: NOW,
 		});
 		expect(retry.ok && retry.reserved).toBe(true);
+	});
+
+	test("a reactivation respects OMP 0 as unlimited and counts an observed non-Storm running worker once", () => {
+		const lanes = work();
+		const runPlan = plan();
+		const build = runPlan.lanes.find(candidate => candidate.role === "implementer")!;
+		const gate = (maxConcurrency: number) => lanes.checkFollowUp({
+			runId: RUN,
+			agentId: "Impl",
+			agent: "storm-implementer",
+			role: "implementer",
+			lane: build,
+			plan: runPlan,
+			config: team,
+			maxConcurrency,
+			isolated: false,
+			agents: [agentEntry({ id: "Impl", state: "idle" })],
+			otherActive: 1,
+			now: NOW,
+		});
+		const blocked = gate(1);
+		expect(blocked.ok).toBe(false);
+		if (!blocked.ok) {
+			expect(blocked.code).toBe("lane-capacity");
+			expect(blocked.reason).toContain("task.maxConcurrency 1");
+		}
+		expect(gate(0).ok).toBe(true);
+		// A work-bearing note to an already running worker never checks the ceiling or takes a second slot.
+		const running = [agentEntry({ id: "Impl", state: "running" })];
+		expect(lanes.checkFollowUp({
+			runId: RUN,
+			agentId: "Impl",
+			agent: "storm-implementer",
+			role: "implementer",
+			lane: build,
+			plan: runPlan,
+			config: team,
+			maxConcurrency: 1,
+			isolated: false,
+			agents: running,
+			otherActive: 1,
+			now: NOW,
+		}).ok).toBe(true);
 	});
 
 	test("a refused preflight releases a slot it created, so the retry can start", () => {

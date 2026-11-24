@@ -1093,7 +1093,7 @@ describe("accepting on a small terminal", () => {
 			const form = parseHtmlForm(html);
 			forms.push(form);
 			const data = defaultFormData(form);
-			if (Object.hasOwn(data, FIELD.parallelism)) data[FIELD.parallelism] = 3;
+			if (Object.hasOwn(data, FIELD.rounds)) data[FIELD.rounds] = 4;
 			return { data };
 		};
 		const refused = fakeHost({
@@ -1122,12 +1122,12 @@ describe("accepting on a small terminal", () => {
 			ROLES.map(role => FIELD.primary(role.id)),
 		);
 		expect(names.some(fields => fields.includes(FIELD.effort))).toBe(true);
-		expect(names.at(-1)).toContain(FIELD.parallelism);
+		expect(names.at(-1)).toContain(FIELD.rounds);
 		const state = await loadProjectState(env);
 		const saved = state.config.status === "ok" ? state.config.config : undefined;
 		expect(Object.keys(saved?.roles ?? {})).toHaveLength(5);
 		expect(saved?.cleanup).toBe(true);
-		expect(saved?.parallelism).toBe(3);
+		expect(saved?.rounds).toBe(4);
 		expect(host.overlays).toBe(1);
 		expect(host.selects).toHaveLength(3);
 		expect(host.selects.at(-1)?.options).toContain(APPROVE);
@@ -1145,7 +1145,7 @@ describe("accepting on a small terminal", () => {
 		// The ordinary rollback item needs consent on the next screen; the menu itself changes nothing.
 		const state = await loadProjectState(env);
 		await approveAndSave(state, TEAM, { shadowedAgents: state.shadows });
-		await approveAndSave(await loadProjectState(env), { ...TEAM, parallelism: 2 }, { shadowedAgents: state.shadows });
+		await approveAndSave(await loadProjectState(env), { ...TEAM, rounds: 2 }, { shadowedAgents: state.shadows });
 		const rollback = recordingUi(["이전 승인으로 되돌리기", 0]);
 		await hubFlow(env, rollback.ui);
 		const [menu, confirm] = rollback.dialogs;

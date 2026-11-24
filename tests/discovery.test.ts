@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { collectModels, toModelInfo } from "../src/discovery/models.ts";
 import { exhaustedLimit, parseUsageJson, readQuota } from "../src/discovery/quota.ts";
-import { parseConfigList, readExplicitSettings } from "../src/discovery/settings.ts";
+import { parseConfigList, readExplicitSettings, liveTaskMaxConcurrency, taskMaxConcurrencyOf } from "../src/discovery/settings.ts";
+import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Exec } from "../src/types.ts";
 
 const NOW = 1_800_000_000_000;
@@ -231,7 +232,7 @@ describe("parseConfigList", () => {
 		expect(parseConfigList("not json")).toEqual({ modelRoles: {} });
 	});
 
-	test("reads isolation, concurrency and retry fallback settings", () => {
+	test("reads isolation and retry fallback; concurrency stays a live host setting", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry(true, "boolean"),
@@ -251,25 +252,32 @@ describe("parseConfigList", () => {
 			modelRoles: {},
 			isolationEnabled: true,
 			isolationApply: false,
-			maxConcurrency: 4,
 			modelFallback: true,
 			fallbackChains: { "a/x": ["b/y", "c/z"], default: [] },
 		});
 	});
 
-	test("wrong types and a non-positive concurrency are ignored", () => {
+	test("wrong types are ignored", () => {
 		const s = parseConfigList(
 			JSON.stringify({
 				"task.isolation.enabled": entry("true", "boolean"),
 				"task.isolation.apply": entry("false", "boolean"),
-				"task.maxConcurrency": entry(0, "number"),
 				"retry.modelFallback": entry(null, "boolean"),
 				"retry.fallbackChains": entry(["a/x"]),
 			}),
 		);
 		expect(s).toEqual({ modelRoles: {} });
-		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(-2, "number") })).maxConcurrency).toBeUndefined();
-		expect(parseConfigList(JSON.stringify({ "task.maxConcurrency": entry(undefined, "number") })).maxConcurrency).toBeUndefined();
+	});
+
+	test("the native ceiling is the live effective setting, with 0 preserved and no Storm default", () => {
+		const live = (overrides: Record<string, unknown>): number | undefined =>
+			withActiveSettings(Settings.isolated(overrides), liveTaskMaxConcurrency);
+		expect(live({ "task.maxConcurrency": 0 })).toBe(0);
+		expect(live({ "task.maxConcurrency": 2 })).toBe(2);
+		// A real host has its registered effective default; Storm neither changes nor duplicates it.
+		expect(live({})).toBe(32);
+		// No settings instance is unknown, never a Storm-invented number.
+		expect(taskMaxConcurrencyOf(undefined)).toBeUndefined();
 	});
 
 	test("command failure gives empty defaults", async () => {

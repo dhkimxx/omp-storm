@@ -27,7 +27,7 @@ const HASH = `jcs-sha256:${"ab12".repeat(16)}`;
 
 const config: StormConfig = teamOf(
 	{ explorer: { models: ["google/gemini-flash"], effort: "low", workers: 2 }, implementer: "openai/gpt-5.2" },
-	{ parallelism: 3, isolation: "isolated" },
+	{ rounds: 3, isolation: "isolated" },
 );
 
 let root: string;
@@ -266,8 +266,8 @@ describe("handoff", () => {
 		expect(teamLines(text).map(l => l.slice(2, l.indexOf(":")))).toEqual(ROLES.map(role => role.agent));
 		const maxOf = (agent: string) => Number(/(\d+) workers?$/.exec(teamLines(text).find(l => l.startsWith(`- ${agent}:`)) ?? "")?.[1]);
 		expect(maxOf("storm-explorer")).toBe(4);
+		expect(maxOf("storm-implementer")).toBe(4);
 		expect(maxOf("storm-architect")).toBe(1);
-		expect(maxOf("storm-explorer")).not.toBe(maxOf("storm-implementer"));
 		expect(rules(text).some(l => l.includes("`progress`") && l.includes("new name"))).toBe(true);
 		expect(rules(text).some(l => l.includes("`storm brief`") && l.includes("after it settles"))).toBe(true);
 		expect(rules(text).every(l => l.startsWith("- "))).toBe(true);

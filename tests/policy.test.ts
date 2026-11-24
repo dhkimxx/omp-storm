@@ -36,7 +36,7 @@ const NOW = Date.parse("2026-11-20T12:00:00.000Z");
 
 const config: StormConfig = teamOf(
 	{ reviewer: { models: ["openai/gpt-5.2", "anthropic/claude-x:low", "openrouter/qwen/qwen3"], effort: "high" }, explorer: "google/gemini-flash" },
-	{ parallelism: 2, isolation: "isolated" },
+	{ isolation: "isolated" },
 );
 
 const ok: Extract<ConfigLoad, { status: "ok" }> = {
@@ -371,24 +371,38 @@ describe("decideSpawn: role states", () => {
 			workers: { quick: 1, implementer: 2 },
 		};
 		const busy = inRun({ plan, active: { total: 1, byRole: { quick: 1 } } });
-		expect(code(decideSpawn(ev("storm-quick", [], "quick"), withConfig({ ...team, parallelism: 4 }), busy))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-implementer", [], "impl"), withConfig({ ...team, parallelism: 4 }), busy))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-quick", [], "quick"), withConfig(team), busy))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-implementer", [], "impl"), withConfig(team), busy))).toBeUndefined();
 	});
 });
 
 describe("decideSpawn: run plan and live caps", () => {
-	test("order of the run checks: budget, then plan, then role, then the team's parallelism", () => {
+	test("order of the run checks: budget, then plan, then role, then the native ceiling", () => {
 		const spent = { costUsd: 9, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
 		const { plan: _plan, ...noPlan } = inRun().run as Run;
 		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: { ...noPlan, ...spent } })))).toBe("budget");
 		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: noPlan })))).toBe("no-plan");
 		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), runtime({ run: noPlan })))).toBe("no-plan");
 		const full = { total: 2, byRole: { reviewer: 2 } };
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ active: full })))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("parallelism");
-		// An unmapped native agent is refused before the team-wide parallelism check.
-		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("unmapped-agent");
-		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"], "build"), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("parallelism");
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ active: full }, { maxConcurrency: 2 })))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 })))).toBe("parallelism");
+		// An unmapped native agent is refused before the native ceiling check.
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 })))).toBe("unmapped-agent");
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"], "build"), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 })))).toBe("parallelism");
+	});
+
+	test("the native ceiling is enforced as read, and absent or 0 never invents a Storm cap", () => {
+		const full = { total: 2, byRole: { reviewer: 0, explorer: 0, implementer: 0 } };
+		const spawn = (runtime: SpawnRuntime) => code(decideSpawn(ev("storm-explorer", [], "look"), state(), runtime));
+		// Undefined host settings leave the run-wide decision to the host semaphore, not a Storm default.
+		expect(spawn(inRun({ plan: FULL_PLAN, active: full }))).toBeUndefined();
+		// OMP's 0 is unlimited.
+		expect(spawn(inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 0 }))).toBeUndefined();
+		// 2 live < 3 passes; 2 live >= 2 blocks with the parallelism code.
+		expect(spawn(inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 3 }))).toBeUndefined();
+		const blocked = decideSpawn(ev("storm-explorer", [], "look"), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 }));
+		expect(code(blocked)).toBe("parallelism");
+		expect(blocked.decision && "block" in blocked.decision ? blocked.decision.reason : "").toContain("task.maxConcurrency 2");
 	});
 
 	test("a role absent from the plan cannot spawn; outside a run no plan is needed", () => {
@@ -399,9 +413,9 @@ describe("decideSpawn: run plan and live caps", () => {
 
 	test("the role cap is the plan's workers for the role", () => {
 		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1, explorer: 1 } };
-		const wide = withConfig({ ...config, parallelism: 8 });
-		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } })))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } })))).toBeUndefined();
+		const wide = withConfig(config);
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } }, { maxConcurrency: 8 })))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } }, { maxConcurrency: 8 })))).toBeUndefined();
 	});
 });
 

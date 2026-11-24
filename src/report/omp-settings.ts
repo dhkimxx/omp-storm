@@ -22,13 +22,6 @@ export function wantedFallbackChains(config: StormConfig): Record<string, string
 /** omp settings that do not fit the approved team. Unknown settings give no advice, except isolation (omp's default is off). */
 export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSettings): OmpAdvice[] {
 	const advice: OmpAdvice[] = [];
-	if (settings.maxConcurrency !== undefined && settings.maxConcurrency < config.parallelism) {
-		advice.push({
-			key: "task.maxConcurrency",
-			message: `omp 동시 서브에이전트 상한(${settings.maxConcurrency})이 Storm 병렬도(${config.parallelism})보다 낮습니다. 올리면 계획한 만큼 동시에 돕니다.`,
-			command: `omp config set task.maxConcurrency ${config.parallelism}`,
-		});
-	}
 	const wanted = wantedFallbackChains(config);
 	const primaries = Object.keys(wanted);
 	if (primaries.length > 0) {

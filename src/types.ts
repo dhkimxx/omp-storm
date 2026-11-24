@@ -255,8 +255,6 @@ export interface ExplicitSettings {
 	isolationEnabled?: boolean;
 	/** `task.isolation.apply`: omp applies an isolated subagent's changes to the parent checkout when it settles (omp's default). */
 	isolationApply?: boolean;
-	/** `task.maxConcurrency`: subagents omp runs at once. */
-	maxConcurrency?: number;
 	/** `retry.modelFallback`: omp may switch to `retry.fallbackChains` models after provider errors. */
 	modelFallback?: boolean;
 	/** `retry.fallbackChains`: model role, selector or `provider/*` → ordered fallback selectors. */
@@ -379,8 +377,9 @@ export interface RoleConfig {
 	/** Default effort for entries without their own suffix. Storm writes a suffix per model and leaves this unset. */
 	effort?: Effort;
 	/**
-	 * Workers of this role in one Storm run. `min` is the count a run plan gets when it sets none for a role it uses;
-	 * `max` caps the role's live agents (Storm refuses spawns past it) and bounds what a plan may ask for.
+	 * Workers of this role in one Storm run. `min` is only the setup recommendation, not a spawn floor: a run plan
+	 * that sets no count gets its actual worker lanes (at least one). `max` caps the role's live agents (Storm refuses
+	 * spawns past it) and bounds what a plan may ask for.
 	 * A bare number n (configs before v0.8) means { min: n, max: n }; read it through `workerRange`.
 	 */
 	workers?: number | WorkerRange;
@@ -461,7 +460,6 @@ export interface StormConfig {
 	version: 1;
 	priority: StoredPriority;
 	roles: Record<string, RoleConfig>;
-	parallelism: number;
 	isolation: "isolated" | "shared";
 	/** Deprecated since 0.10: accepted and ignored; Storm no longer writes it. */
 	contract?: string;
@@ -655,7 +653,7 @@ export interface StatusView {
 
 /** An omp setting that does not fit the approved team. Storm shows it with a copy-ready command and never changes it. */
 export interface OmpAdvice {
-	/** Setting key, e.g. "task.maxConcurrency". */
+	/** Setting key, e.g. "retry.fallbackChains". */
 	key: string;
 	message: string;
 	/** `omp config set …` that fixes it, when one does. */
@@ -1099,6 +1097,11 @@ export interface TrialView {
 /** Spawn-time runtime facts beyond the v0.1 SpawnState. */
 export interface SpawnRuntime {
 	now: number;
+	/**
+	 * Live effective OMP `task.maxConcurrency`, never a Storm config value: 0 means unlimited, absent means OMP's
+	 * effective value is unavailable. The runtime repurposes `SpawnBlockCode` "parallelism" against this host cap.
+	 */
+	maxConcurrency?: number;
 	/** The run active in this process for this project, if any. */
 	run?: {
 		runId: string;

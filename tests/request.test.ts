@@ -152,6 +152,7 @@ describe("route: prompt", () => {
 		const brief = teamBrief(await fakeHost({ config }).host.loadState());
 		for (const part of ["explorer: a/x, b/z; workers", "implementer: a/i; workers 1-3", "reviewer: b/r", "$5.00", "stop", "quick", "docs off", "cleanup off", "rounds 5"]) expect(brief).toContain(part);
 		expect(brief).not.toContain("NOT approved");
+		expect(brief).not.toContain("parallelism");
 		expect(teamBrief(await fakeHost({ approved: false }).host.loadState())).toContain("NOT approved");
 		expect(teamBrief(await fakeHost().host.loadState())).toContain("rounds 3");
 	});
@@ -393,11 +394,11 @@ describe("changes: approval gate", () => {
 		try {
 			const load = () => loadProjectState(project.env);
 			await approveAndSave(await load(), base, { shadowedAgents: [] });
-			// A teammate's edit: another implementer model and parallelism, never approved here.
+			// A teammate's edit: another implementer model and extra rounds, never approved here.
 			const edited = structuredClone(base);
 			edited.roles.implementer!.models = ["z/teammate"];
 			edited.roles.explorer!.workers = { min: 2, max: 4 }; // a saved range that differs from current setup defaults
-			edited.parallelism = 9;
+			edited.rounds = 9;
 			await writeFile(configPath(project.sessionDir), serializeConfig(edited));
 			const f = scriptedUi([]);
 			const host: ActionHost = { ...fakeHost().host, ui: f.ui, loadState: load, approveAndSave };
@@ -451,7 +452,7 @@ describe("changes: approval gate", () => {
 		const g = fakeHost({
 			answers: [
 				() => {
-					g.setConfig({ ...base, parallelism: 8 });
+					g.setConfig({ ...base, rounds: 8 });
 					return "승인";
 				},
 			],
