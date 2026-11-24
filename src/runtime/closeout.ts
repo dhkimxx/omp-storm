@@ -5,7 +5,8 @@
  * selection made in another session can never resolve this session's card.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { AgentEntry, LaneResultKind, RunJob, RunRecord, RunResult, RunResultState } from "../types.ts";
+import type { AgentEntry, LaneResultKind, RunJob, RunRecord, RunResult } from "../types.ts";
+import { resultProgress, resultRowText, RESULT_LANE_MAX, type ResultRow } from "../view/results.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
 
 /** Bounded fields: a brief is a card, not a report. */
@@ -15,11 +16,6 @@ export const CLOSEOUT_NEXT_MAX = 240;
 export const CLOSEOUT_RESULT_ENTRY_MAX = 3;
 /** How many host job receipts one card line names before the rest become a count. */
 export const CLOSEOUT_JOB_ENTRY_MAX = 3;
-const RESULT_ID_MAX = 40;
-const RESULT_LANE_MAX = 30;
-const RESULT_REASON_MAX = 100;
-const RESULT_UNBLOCK_MAX = 120;
-const RESULT_REF_MAX = 64;
 const JOB_NAME_MAX = 40;
 const JOB_STATUS_MAX = 20;
 
@@ -39,8 +35,6 @@ export const CLOSEOUT_CHOICE_HINT = "1~3 또는 원하는 방향을 입력하세
 // Control characters would either break the card into arbitrary lines or hide content; line separators count too.
 const UNSAFE = /[\u0000-\u001f\u007f\u2028\u2029]/;
 const UNSAFE_ALL = /[\u0000-\u001f\u007f\u2028\u2029]/g;
-/** A host attempt id is a short token; anything path-like is omitted rather than shown as evidence. */
-const HOST_REF = /^[A-Za-z0-9:._-]{1,64}$/;
 
 function line(value: unknown, max: number): string | undefined {
 	if (typeof value !== "string") return undefined;
@@ -157,57 +151,18 @@ function jobsLine(jobs: readonly RunJob[] | undefined): string | undefined {
 	return `- 잡 영수증(호스트): ${parts.join(" · ")}`;
 }
 
-const RESULT_STATE_LABEL: Readonly<Record<RunResultState, string>> = {
-	pending: "대기",
-	unmet: "미충족",
-	reviewable: "검토 가능",
-	accepted: "이행",
-};
-
-/** State semantics only: when the record has no reason, say what the state means rather than invent a cause. */
-const RESULT_FALLBACK_REASON: Readonly<Record<RunResultState, string>> = {
-	pending: "아직 판정 근거가 기록되지 않았습니다.",
-	unmet: "미충족 사유가 기록되지 않았습니다.",
-	reviewable: "판단할 제출물이 기록되었습니다.",
-	accepted: "",
-};
-
-/** One compact row: stable id, optional lane, state, host attempt reference, reason, and a known remedy. */
-function resultEntry(result: RunResult, includeState: boolean): string {
-	const id = typeof result.id === "string" ? clean(result.id, RESULT_ID_MAX) : "";
-	const lane = typeof result.lane === "string" ? clean(result.lane, RESULT_LANE_MAX) : "";
-	const state = RESULT_STATE_LABEL[result.state] ?? "미확인";
-	const rawReason = typeof result.reason === "string" ? clean(result.reason, RESULT_REASON_MAX) : "";
-	const reason = rawReason === "" ? (RESULT_FALLBACK_REASON[result.state] ?? "사유 미기재") : rawReason;
-	// Only a controller-classified row carries these; accepted rows never claim a pending remedy.
-	const remedy = result.state === "accepted" ? undefined : result.remedy;
-	const marker = remedy === "blocked" ? " · 차단" : remedy === "retry" ? " · 재시도 소진" : "";
-	// An accepted output keeps the host's attempt reference as its only external locator; a path-like value is omitted.
-	const reference =
-		result.state === "accepted" && typeof result.attemptId === "string" && HOST_REF.test(result.attemptId)
-			? ` · 시도: ${clean(result.attemptId, RESULT_REF_MAX)}`
-			: "";
-	const unblock =
-		result.state === "accepted" || typeof result.unblock !== "string" || result.unblock.trim() === ""
-			? ""
-			: ` · 해소: ${clean(result.unblock, RESULT_UNBLOCK_MAX)}`;
-	const head = `${id === "" ? "(id 없음)" : id}${lane === "" ? "" : ` [${lane}]`}${includeState ? ` ${state}` : ""}${marker}${reference}`;
-	const detail = `${reason}${unblock}`;
-	return detail === "" ? head : `${head} — ${detail}`;
-}
-
 function resultLine(
 	header: string,
-	entries: readonly RunResult[],
+	entries: readonly ResultRow[],
 	shownLanes: Set<string>,
 	includeState: boolean,
 ): string | undefined {
 	if (entries.length === 0) return undefined;
 	const shown = entries.slice(0, CLOSEOUT_RESULT_ENTRY_MAX);
 	for (const result of shown) {
-		if (typeof result.lane === "string" && result.lane.trim() !== "") shownLanes.add(result.lane);
+		if (result.lane !== undefined) shownLanes.add(result.lane);
 	}
-	const parts = shown.map(result => resultEntry(result, includeState));
+	const parts = shown.map(result => resultRowText(result, { includeState }));
 	const omitted = entries.length - shown.length;
 	if (omitted > 0) parts.push(`외 ${omitted}건`);
 	return `${header}${parts.join(" · ")}`;
@@ -220,26 +175,29 @@ interface ResultBrief {
 }
 
 /**
- * The official ledger's requirements by state. Unmet/pending obligations keep their id and runtime reason; reviewable
- * submissions stay on their own line and are never called verified; accepted outputs show their state and, when the
- * host recorded one, a bounded reason or attempt reference. No row claims the run itself is done/verified.
+ * The official ledger's requirements by state, read from the shared result projection. Unmet/pending obligations keep
+ * their criterion and runtime reason; reviewable submissions stay on their own line and are never called verified;
+ * accepted outputs show their state and, when the host recorded one, a bounded attempt/source reference. An operator
+ * excluded row is visibly listed last and never counted as an in-scope obligation. No row claims the run is done.
  */
 function resultBrief(run: RunRecord): ResultBrief {
-	const results = (Array.isArray(run.results) ? run.results : []).filter(
-		(result): result is RunResult => typeof result === "object" && result !== null,
-	);
-	const unresolved = results.filter(result => result.state !== "accepted" && result.state !== "reviewable");
-	const reviewable = results.filter(result => result.state === "reviewable");
-	const accepted = results.filter(result => result.state === "accepted");
+	const progress = resultProgress(run);
+	const inScope = progress.rows.filter(row => !row.excluded);
+	const unresolved = inScope.filter(row => row.state !== "accepted" && row.state !== "reviewable");
+	const reviewable = inScope.filter(row => row.state === "reviewable");
+	const accepted = inScope.filter(row => row.state === "accepted");
+	const excluded = progress.rows.filter(row => row.excluded);
 	const lanes = new Set<string>();
 	const lines: string[] = [];
 	const unmet = resultLine("- 미해결 필수 결과(공식): ", unresolved, lanes, true);
 	if (unmet !== undefined) lines.push(unmet);
 	const pending = resultLine("- 검토 가능 필수 결과(공식): ", reviewable, lanes, false);
 	if (pending !== undefined) lines.push(pending);
-	// Accepted lanes are not unfinished; a throwaway set keeps them from hiding a genuinely pending lane.
+	// Accepted and excluded lanes are not unfinished; a throwaway set keeps them from hiding a pending lane.
 	const settled = resultLine("- 이행 필수 결과(공식): ", accepted, new Set<string>(), true);
 	if (settled !== undefined) lines.push(settled);
+	const scoped = resultLine("- 사용자 제외 필수 결과(공식): ", excluded, new Set<string>(), false);
+	if (scoped !== undefined) lines.push(scoped);
 	return { lines, lanes };
 }
 
@@ -300,19 +258,27 @@ export function closeoutCard(
 	const draft = run.closeout;
 	const options = draft?.next ?? fallbackNext(run, pending);
 	const lines = [`- 상태(공식): ${statusLine(run)}`];
-	if (draft !== undefined) {
-		lines.push(
-			`- 결과(감독 보고): ${draft.result}`,
-			`- 검증(감독 보고): ${draft.verification}`,
-			`- 남은 일(감독 보고): ${draft.remaining ?? "미기재 — 남은 작업이 없다는 증거는 아닙니다."}`,
-		);
-	} else {
-		lines.push("- 결과: 검증된 결과 브리프가 제출되지 않았습니다.");
-	}
-	const checks = checksLine(run, requiredChecks);
-	if (checks !== undefined) lines.push(checks);
 	const results = resultBrief(run);
-	lines.push(...results.lines);
+	const report =
+		draft !== undefined
+			? [
+					`- 결과(감독 보고): ${draft.result}`,
+					`- 검증(감독 보고): ${draft.verification}`,
+					`- 남은 일(감독 보고): ${draft.remaining ?? "미기재 — 남은 작업이 없다는 증거는 아닙니다."}`,
+				]
+			: ["- 결과: 검증된 결과 브리프가 제출되지 않았습니다."];
+	if (results.lines.length > 0) {
+		// The official disposition leads; the director's report cannot precede or stand in for it.
+		lines.push(...results.lines);
+		const checks = checksLine(run, requiredChecks);
+		if (checks !== undefined) lines.push(checks);
+		lines.push(...report);
+	} else {
+		// Legacy record with no observed result ledger: the established order and text stay intact.
+		lines.push(...report);
+		const checks = checksLine(run, requiredChecks);
+		if (checks !== undefined) lines.push(checks);
+	}
 	// Receipts are host facts about process exit, not evidence for a result or a scientific conclusion.
 	const receipts = jobsLine(run.jobs);
 	if (receipts !== undefined) lines.push(receipts);

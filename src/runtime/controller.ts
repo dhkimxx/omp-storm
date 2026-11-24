@@ -32,12 +32,28 @@ import type {
 	RunRecord,
 	RunResult,
 	RunSpec,
+	RunAdjustment,
 	SpawnBlockCode,
 	SpawnRecord,
 	StormConfig,
 	UiPort,
 } from "../types.ts";
 import { attemptUsable, type AttemptReport } from "./attempt-report.ts";
+import {
+	excludeProblem,
+	excludedPlanConflict,
+	exclusionNudgeText,
+	resolveAdjustTarget,
+	retryAdjustmentKey,
+	retryNudgeText,
+	retryProblem,
+	sameInputs,
+	stripExcludedPlan,
+	type AdjustOutcome,
+	type AdjustRequest,
+	type AdjustTarget,
+	type RetryGrant,
+} from "./adjust.ts";
 import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, AttemptSettlement } from "./attempt-bridge.ts";
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
@@ -276,6 +292,12 @@ function persistedResultContract(result: PlanLaneResult): PlanLaneResult {
 }
 /** A requirement whose lane left the plan is still owed: only an explicit scope change or acceptance clears it. */
 const ORPHAN_RESULT_REASON = "계획에서 빠진 필수 결과입니다. 다시 배정하거나 사용자가 범위를 바꿔야 합니다.";
+/** A user exclusion is not an orphan: it keeps its binding and reason, and no later plan may recreate it. */
+const EXCLUDED_RESULT_REASON = "사용자가 이 결과를 실행 범위에서 제외했습니다.";
+/** The audit list is bounded like every other record list; the newest actions win. */
+const ADJUSTMENTS_MAX = 50;
+/** A repeated ordinary directive within this window is a duplicate delivery, not a second attempt. */
+const ADJUST_REPLAY_MS = 120_000;
 const RESULT_FALLBACK_REASON: Record<"unmet" | "reviewable", string> = {
 	unmet: "요구 결과가 충족되지 않았습니다.",
 	reviewable: "제출물이 있어 자연어 판단이 필요합니다.",
@@ -386,6 +408,16 @@ interface OwnRun {
 	attempts: Map<string, PreparedAttempt>;
 	/** Monotonic attempt order; a newer attempt of a lane fences every older settlement. */
 	attemptSerial: number;
+	/** Bumped whenever the effective plan is replaced or a lane is removed by a user exclusion. */
+	planRevision: number;
+	/** The one user-requested retry still waiting for its next matching lane attempt; never restored on resume. */
+	retry?: RetryGrant;
+	/** One-shot keys already granted; a redelivered request with the same settled attempt is not a second grant. */
+	retryAcks: Set<string>;
+	/** The last ordinary retry directive, for duplicate-delivery detection only (bounded text, no authority). */
+	lastRetry?: { text: string; lane: string; result: string; at: number };
+	/** Exclusion nudges deferred while a turn or host hold owns the session; sent once with the next round. */
+	adjustNotes?: string[];
 	/** Latest prepared attempt epoch per lane, so a late success/failure cannot overwrite newer evidence. */
 	laneAttempt: Map<string, number>;
 	/** The latest settled attempt per lane, for a bounded re-evaluation once approved check evidence exists. */
@@ -736,7 +768,16 @@ export class RunController {
 				if (!upgraded.ok) return refuse(upgraded.reason);
 				if (stale()) return gone();
 			}
-			plan ??= restoredPlan;
+			// A continuation keeps the user's exclusions: only a stored row whose shape and contract still validate may
+			// remove a lane from the effective plan. The record is untrusted input; an arbitrary scope marker cannot
+			// hide a planned lane.
+			const priorExcluded = (continued?.results ?? []).filter(row => {
+				if (row?.scope !== "excluded-by-user" || typeof row.id !== "string" || row.contract === undefined) return false;
+				const contract = normalizeCheckpointContract(row.contract);
+				return contract !== undefined && contract.id === row.id && row.identity === resultContractIdentity(contract);
+			});
+			if (plan !== undefined) plan = stripExcludedPlan(plan, priorExcluded);
+			else if (restoredPlan !== undefined) plan = stripExcludedPlan(restoredPlan, priorExcluded);
 			const resume =
 				continued === undefined
 					? undefined
@@ -813,6 +854,8 @@ export class RunController {
 				lanes: new RunLanes(runId),
 				attempts: new Map(),
 				attemptSerial: 0,
+				planRevision: 0,
+				retryAcks: new Set(),
 				laneAttempt: new Map(),
 				settled: new Map(),
 				restoredLanes: new Set(),
@@ -855,8 +898,8 @@ export class RunController {
 						? undefined
 						: {
 								kept, reopened: rows.length - kept - blocked, blocked,
-								laneNames: restoredPlan?.lanes.filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name) ?? [],
-								...(restoredPlan === undefined ? { planUnavailable: true as const } : {}),
+								laneNames: plan?.lanes.filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name) ?? [],
+								...(plan === undefined ? { planUnavailable: true as const } : {}),
 							};
 					handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit,
 						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }) });
@@ -1177,6 +1220,16 @@ export class RunController {
 		}
 		this.#syncResults(own);
 		const lane = own.record.plan?.lanes.find(candidate => candidate.name === input.lane);
+		// A lane removed by a user exclusion (or any replan) is no longer authority for a prepared dispatch. A caller
+		// that captured the old plan must not spawn under it; a plan-less legacy lane keeps its old behavior.
+		if (own.record.plan !== undefined && lane === undefined) {
+			return { ok: false, reason: "이 레인은 현재 계획에 없습니다(사용자 제외 포함). 다시 계획하거나 스폰하지 말고 남은 계획을 진행하세요." };
+		}
+		// A stale plan that still names a user-excluded result must not spawn its lane. The exclusion is authoritative in
+		// the ledger even when a restored or replayed plan disagrees.
+		if (lane?.results?.some(result => own.record.results?.some(row => row.id === result.id && row.scope === "excluded-by-user"))) {
+			return { ok: false, reason: "사용자가 범위에서 제외한 결과의 레인입니다. 다시 계획하거나 스폰하지 말고 남은 계획을 진행하세요." };
+		}
 		if (lane?.results === undefined || lane.results.length === 0) return { ok: true };
 		if (own.restoredLanes.has(lane.name)) {
 			await this.#revokeUnlocatedAccepted(own, true);
@@ -1210,6 +1263,26 @@ export class RunController {
 		});
 		if (!capture.ok) {
 			return { ok: false, reason: `필수 결과의 사전 기준선을 만들지 못해 작업을 시작하지 않았습니다: ${capture.reason}` };
+		}
+		// The baseline read awaits: a plan change or a user exclusion may have removed or replaced this exact lane.
+		// Never bind the captured before state to an obsolete plan, owner or stopping run.
+		if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted) {
+			return { ok: false, reason: "기준선을 만드는 동안 실행이 바뀌어 작업을 시작하지 않았습니다." };
+		}
+		if (own.record.plan?.lanes.find(candidate => candidate.name === input.lane) !== lane) {
+			return { ok: false, reason: "기준선을 만드는 동안 계획이 바뀌어 작업을 시작하지 않았습니다. 새 계획 아래에서 다시 스폰하세요." };
+		}
+		const retry = own.retry;
+		if (retry !== undefined && retry.lane === lane.name) {
+			if (this.#retryMatches(own, retry)) {
+				delete own.retry;
+				this.#markRetryTaken(own, retry);
+				this.#scheduleFlush(own);
+			} else {
+				delete own.retry;
+				own.retryAcks.delete(retry.key);
+				this.deps.ui(own.ctx).notify("계획이나 입력이 바뀌어 예약한 재시도를 적용하지 않았습니다. 현재 계획의 정상 시도로만 진행합니다.", "warning");
+			}
 		}
 		// Snapshot the producer versions now, before the child runs: this attempt's evidence may only be used against
 		// these versions. A newer attempt of the same lane fences this one even if its settlement arrives later.
@@ -1312,7 +1385,35 @@ export class RunController {
 		}
 		const rows = new Map(own.record.results?.map(row => [row.id, row]));
 		for (const old of oldRows.values()) {
-			if (old === null || rows.has(old.id)) continue;
+			if (old === null) continue;
+			if (old.scope === "excluded-by-user") {
+				const existing = rows.get(old.id);
+				if (existing !== undefined) {
+					if (existing.scope !== "excluded-by-user") {
+						existing.scope = "excluded-by-user";
+						existing.state = "pending";
+						existing.reason = EXCLUDED_RESULT_REASON;
+					}
+					continue;
+				}
+				const contract = normalizeCheckpointContract(old.contract);
+				if (contract === undefined || old.id !== contract.id || old.identity !== resultContractIdentity(contract)) continue;
+				const lane = typeof old.lane === "string" && old.lane.trim() !== "" && old.lane.length <= 200 ? old.lane : undefined;
+				const row: RunResult = {
+					id: contract.id,
+					identity: old.identity,
+					contract,
+					state: "pending",
+					scope: "excluded-by-user",
+					origin: "plan",
+					reason: EXCLUDED_RESULT_REASON,
+					...(lane === undefined ? {} : { lane }),
+				};
+				(own.record.results ??= []).push(row);
+				rows.set(row.id, row);
+				continue;
+			}
+			if (rows.has(old.id)) continue;
 			const contract = normalizeCheckpointContract(old.contract);
 			if (contract === undefined || old.id !== contract.id || old.identity !== resultContractIdentity(contract)) continue;
 			const row: RunResult = {
@@ -1421,6 +1522,9 @@ export class RunController {
 				const identity = resultContractIdentity(result);
 				assigned.add(result.id);
 				const row = byId.get(result.id);
+				// A user exclusion is never reassigned or reset by a later plan. The plan gate and continuation filter
+				// refuse reintroduction; this is the ledger's last defense against a stale or replayed plan.
+				if (row !== undefined && row.scope === "excluded-by-user") continue;
 				if (row === undefined) {
 					rows.push({
 						id: result.id,
@@ -1463,7 +1567,7 @@ export class RunController {
 					delete row.reason;
 					delete row.attemptId;
 					delete row.remedy;
-			delete row.retryRoute;
+					delete row.retryRoute;
 					delete row.unblock;
 					delete row.contentVersion;
 					delete row.consumed;
@@ -1476,6 +1580,15 @@ export class RunController {
 		}
 		for (const row of rows) {
 			if (assigned.has(row.id)) continue;
+			// An exclusion is not a removed/orphan requirement: it keeps its last lane binding for display and a
+			// stable reason, and no coverage or proof obligation reads it.
+			if (row.scope === "excluded-by-user") {
+				if (row.reason !== EXCLUDED_RESULT_REASON) {
+					row.reason = EXCLUDED_RESULT_REASON;
+					changed = true;
+				}
+				continue;
+			}
 			if (row.lane !== undefined) {
 				delete row.lane;
 				changed = true;
@@ -1895,7 +2008,7 @@ export class RunController {
 					row.reviewTree = treeNow;
 					delete row.reason;
 					delete row.remedy;
-			delete row.retryRoute;
+					delete row.retryRoute;
 					delete row.unblock;
 					changed = true;
 				}
@@ -2267,6 +2380,10 @@ export class RunController {
 				return { ok: false, reason: `${receipt.name}: 이미 확인된 정형 작업 레인 ${receipt.lane}의 이름을 유지하세요.` };
 			}
 		}
+		// An acknowledged user exclusion is not a relaxable obligation: the same id and the excluded lane name may not
+		// be reintroduced by a later plan, even one that would otherwise be a valid replan.
+		const excluded = excludedPlanConflict(own.record.results, plan);
+		if (excluded !== undefined) return { ok: false, reason: excluded };
 		// A lane keeps the identity its evidence is bound to: goal, kind, role and files. A status update belongs in
 		// progress; renaming a changed lane is the only way to start its evidence over. Reject before touching the plan
 		// in force or the record, so a refused replan leaves both exactly as they were. The run's own row identities are
@@ -2275,16 +2392,21 @@ export class RunController {
 		if (weakened !== undefined) return { ok: false, reason: weakened };
 		const conflict = replanConflict(own.record.plan, plan);
 		if (conflict !== undefined) return { ok: false, reason: conflict };
+		const revision = own.planRevision;
 		if (planNeedsWrite(plan)) {
 			const upgraded = await this.#upgradeLease(own);
 			if (!upgraded.ok) return upgraded;
 			if (this.#own !== own) return { ok: false, reason: "실행이 바뀌어 계획을 적용하지 않았습니다." };
+			// A user exclusion may have removed a lane while the lease upgrade awaited; applying this plan now would
+			// reintroduce it and race the persisted adjustment.
+			if (own.planRevision !== revision) return { ok: false, reason: "계획이 동시에 바뀌어 계획을 적용하지 않았습니다. 현재 계획을 확인한 뒤 다시 제출하세요." };
 		}
 		// A stopping run blocks new spawns; its plan is no longer authority for them.
 		if (!setLedgerPlan(own.record.runId, plan)) {
 			return { ok: false, reason: "실행이 끝나는 중이라 계획을 적용하지 않았습니다." };
 		}
 		own.record.plan = plan;
+		own.planRevision += 1;
 		// Required results are obligations, not plan text: adding a lane seeds pending rows, and a removed lane keeps
 		// every requirement it still owed.
 		this.#syncResults(own);
@@ -2292,9 +2414,265 @@ export class RunController {
 			if (lane.job === undefined || historicalJob(own.record, lane.job)?.status !== "unknown") continue;
 			for (const row of own.record.results ?? []) if (row.lane === lane.name) blockedJobRow(row, UNCERTAIN_JOB);
 		}
+		// A pending retry is valid only against the contract, route and inputs it was granted for.
+		this.#revalidateRetry(own, ctx);
 		this.#scheduleFlush(own);
 		return { ok: true };
 	}
+
+	/**
+	 * Applies one direct user steering action to this session's active run. Only the interactive input hook and the
+	 * explicit `/storm adjust` fallback call it: there is no model tool, no queued authority, and no new run. The
+	 * resolved target, the run owner and every admission fact are read from the host's current state here, not from
+	 * the text at a later turn.
+	 */
+	async adjust(ctx: ExtensionContext, request: AdjustRequest): Promise<AdjustOutcome> {
+		const own = this.#own;
+		if (own === undefined) return { ok: false, reason: "진행 중인 Storm 실행이 없습니다. 조정은 이 세션의 실행 중에만 적용됩니다." };
+		if (closeoutSessionId(ctx) !== own.sessionId) return { ok: false, reason: "다른 세션이 시작한 실행은 조정할 수 없습니다." };
+		if (own.ending !== undefined || own.abort.signal.aborted) {
+			return { ok: false, reason: "실행이 끝나는 중이라 범위나 재시도를 바꾸지 않았습니다." };
+		}
+		const resolved = resolveAdjustTarget(own.record.plan, own.record.results, request.kind, request.target, request.exact === true);
+		if (!resolved.ok) return { ok: false, reason: resolved.reason };
+		return request.kind === "exclude"
+			? this.#excludeResult(own, resolved.target, ctx)
+			: this.#retryResult(own, resolved.target, request, ctx);
+	}
+
+	/** Removes one untouched lane from the effective plan and records the operator's exclusion. */
+	async #excludeResult(own: OwnRun, target: AdjustTarget, ctx: ExtensionContext): Promise<AdjustOutcome> {
+		const plan = own.record.plan;
+		if (plan === undefined) return { ok: false, reason: "이 실행에는 적용 중인 계획이 없어 결과를 제외할 수 없습니다." };
+		const row = own.record.results?.find(candidate => candidate.id === target.resultId);
+		if (row === undefined) return { ok: false, reason: `결과 '${target.resultId}'의 기록을 찾지 못해 제외하지 않았습니다.` };
+		if (row.scope === "excluded-by-user") {
+			return { ok: true, already: true, text: `결과 '${target.label}'(${target.resultId})는 이미 범위에서 제외되어 있습니다.` };
+		}
+		const lane = plan.lanes.find(candidate => candidate.name === target.laneName);
+		if (lane === undefined) return { ok: false, reason: "대상 레인이 현재 계획에 없어 결과를 제외할 수 없습니다." };
+		const touched = (spawnsByRun.get(own.record.runId) ?? []).some(spawn => spawn.lane === lane.name && spawn.outcome !== "blocked");
+		const problem = excludeProblem({
+			plan,
+			rows: own.record.results ?? [],
+			lane,
+			resultId: target.resultId,
+			laneBusy: this.#laneBusy(own, lane.name),
+			laneTouched: touched,
+		});
+		if (problem !== undefined) return { ok: false, reason: problem };
+		const nextPlan: RunPlan = { ...plan, lanes: plan.lanes.filter(candidate => candidate.name !== lane.name) };
+		// Validation had no await, so this is the same plan the guards read. Keep the check anyway: a host callback can
+		// run between two statements only through an await, and this method must never apply on an obsolete owner.
+		if (this.#own !== own || own.record.plan !== plan) return { ok: false, reason: "실행이나 계획이 바뀌어 결과를 제외하지 않았습니다." };
+		if (!setLedgerPlan(own.record.runId, nextPlan)) return { ok: false, reason: "실행이 끝나는 중이라 계획에서 레인을 제외하지 않았습니다." };
+		own.record.plan = nextPlan;
+		own.planRevision += 1;
+		row.scope = "excluded-by-user";
+		row.reason = EXCLUDED_RESULT_REASON;
+		// A user intervention is a new external fact for the round witness: clear only the progress baseline, never a
+		// round counter, role, budget or approval. It does not reset the run or authorize any new scope.
+		delete own.progress;
+		this.#syncResults(own);
+		this.#recordAdjustment(own, "exclude", target);
+		this.#scheduleFlush(own);
+		try {
+			await this.#writeLiveSnapshot(own);
+		} catch {
+			return { ok: false, reason: "결과 제외는 적용했지만 실행 기록을 저장하지 못했습니다. 기록 상태를 확인하세요." };
+		}
+		if (this.#own === own) this.#sendAdjustNudge(own, ctx, exclusionNudgeText(own.record.runId, target), "exclude");
+		return {
+			ok: true,
+			text: `결과 '${target.label}'(${target.resultId})를 이 실행의 범위에서 제외했습니다. 레인은 계획에서 빠졌고 다른 결과의 증거는 그대로입니다.`,
+		};
+	}
+
+	/** Grants exactly one retry of a host-settled, unmet, read-only single-result lane on its unchanged route. */
+	async #retryResult(own: OwnRun, target: AdjustTarget, request: AdjustRequest, ctx: ExtensionContext): Promise<AdjustOutcome> {
+		const plan = own.record.plan;
+		if (plan === undefined) return { ok: false, reason: "이 실행에는 적용 중인 계획이 없어 재시도를 예약할 수 없습니다." };
+		const lane = plan.lanes.find(candidate => candidate.name === target.laneName);
+		if (lane === undefined) return { ok: false, reason: "대상 레인이 현재 계획에 없어 재시도할 수 없습니다." };
+		const row = own.record.results?.find(candidate => candidate.id === target.resultId);
+		if (row?.scope === "excluded-by-user") return { ok: false, reason: `결과 '${target.label}'은 사용자가 범위에서 제외해 재시도하지 않습니다.` };
+		const now = this.deps.now();
+		const normalized = request.target.normalize("NFC").trim();
+		const last = own.lastRetry;
+		if (request.source === "interactive" && last !== undefined && last.text === normalized && last.lane === lane.name &&
+			last.result === target.resultId && now - last.at < ADJUST_REPLAY_MS) {
+			return { ok: true, already: true, text: `방금 같은 재시도 요청을 접수했습니다. 결과 '${target.label}'(${target.resultId})에 중복 시도를 만들지 않습니다.` };
+		}
+		if (own.retry !== undefined) {
+			if (own.retry.lane === lane.name && own.retry.result === target.resultId) {
+				return { ok: true, already: true, text: `결과 '${target.label}'(${target.resultId})의 재시도가 이미 한 번 예약되어 있습니다.` };
+			}
+			return { ok: false, reason: "이미 다른 결과의 재시도가 예약되어 있습니다. 그 시도가 시작된 뒤 다시 요청하세요." };
+		}
+		const inputs = inputSnapshot(plan, lane, own.record.results);
+		const problem = retryProblem({
+			plan,
+			rows: own.record.results ?? [],
+			lane,
+			resultId: target.resultId,
+			laneBusy: this.#laneBusy(own, lane.name),
+			inputsMatch: sameInputs(inputs, row?.consumed),
+			inputsAvailable: !(row?.consumed ?? []).some(input => input.version === "missing"),
+		});
+		if (problem !== undefined) return { ok: false, reason: problem };
+		const baseAttempt = row?.attemptId;
+		if (baseAttempt === undefined) return { ok: false, reason: `결과 '${target.label}'은 호스트가 확정한 시도가 없어 재시도할 수 없습니다.` };
+		const key = retryAdjustmentKey(lane.name, target.resultId, baseAttempt);
+		if (own.retryAcks.has(key)) {
+			return { ok: true, already: true, text: `결과 '${target.label}'(${target.resultId})의 같은 시도에 대한 재시도는 이미 접수했습니다.` };
+		}
+		const result = lane.results?.[0];
+		if (result === undefined) return { ok: false, reason: "대상 레인에 결과가 없어 재시도할 수 없습니다." };
+		const agentId = own.lanes.agentForLane(lane.name);
+		const grant: RetryGrant = {
+			key,
+			lane: lane.name,
+			result: target.resultId,
+			label: target.label,
+			...(agentId === undefined ? {} : { agentId }),
+			dependencies: JSON.stringify(lane.dependsOn ?? []),
+			route: laneRouteFingerprint(lane),
+			identity: resultContractIdentity(result),
+			inputs,
+			baseAttempt,
+			at: now,
+		};
+		const previousProgress = own.progress;
+		own.retry = grant;
+		own.retryAcks.add(key);
+		own.lastRetry = { text: normalized, lane: lane.name, result: target.resultId, at: now };
+		delete own.progress;
+		this.#recordAdjustment(own, "retry", target);
+		this.#scheduleFlush(own);
+		try {
+			await this.#writeLiveSnapshot(own);
+		} catch {
+			if (own.retry === grant) delete own.retry;
+			own.retryAcks.delete(key);
+			delete own.lastRetry;
+			if (previousProgress !== undefined) own.progress = previousProgress;
+			this.#removeAdjustment(own, "retry", target);
+			return { ok: false, reason: "재시도 예약을 실행 기록에 저장하지 못해 적용하지 않았습니다." };
+		}
+		if (this.#own !== own) return { ok: false, reason: "실행이 바뀌어 재시도를 예약하지 않았습니다." };
+		if (own.ending !== undefined || own.abort.signal.aborted) return { ok: false, reason: "실행이 끝나는 중이라 재시도를 예약하지 않았습니다." };
+		if (own.retry !== grant) return { ok: false, reason: "계획이나 입력이 바뀌어 예약한 재시도를 적용하지 않았습니다. 현재 계획의 정상 흐름으로만 진행합니다." };
+		this.#sendAdjustNudge(own, ctx, retryNudgeText(own.record.runId, grant), "retry");
+		return {
+			ok: true,
+			text: `결과 '${target.label}'(${target.resultId})의 재시도를 한 번 예약했습니다. 같은 계약·경로·입력 버전의 다음 정상 시도 한 번에만 적용되고, 계획이 바뀌면 취소됩니다.`,
+		};
+	}
+
+	/** A lane is busy only from live work or an admission already in flight; an idle settled worker is not. */
+	#laneBusy(own: OwnRun, laneName: string): boolean {
+		for (const prepared of own.attempts.values()) if (prepared.lane === laneName) return true;
+		if (own.settling.has(laneName)) return true;
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
+		return own.lanes.laneBusy(laneName, agents, this.deps.now());
+	}
+
+	/** Whether the pending grant still names the same run contract, route, settled attempt and input versions. */
+	#retryMatches(own: OwnRun, grant: RetryGrant): boolean {
+		const plan = own.record.plan;
+		const lane = plan?.lanes.find(candidate => candidate.name === grant.lane);
+		const result = lane?.results?.[0];
+		if (plan === undefined || lane === undefined || result === undefined || (lane.results?.length ?? 0) !== 1) return false;
+		if (result.id !== grant.result || resultContractIdentity(result) !== grant.identity || laneRouteFingerprint(lane) !== grant.route) return false;
+		if (JSON.stringify(lane.dependsOn ?? []) !== grant.dependencies || own.lanes.agentForLane(lane.name) !== grant.agentId) return false;
+		const row = own.record.results?.find(candidate => candidate.id === grant.result);
+		if (row === undefined || row.scope === "excluded-by-user" || row.state !== "unmet" || row.attemptId !== grant.baseAttempt) return false;
+		return sameInputs(inputSnapshot(plan, lane, own.record.results), grant.inputs);
+	}
+
+	/** Drops a pending grant whose plan, row or inputs moved; the user is told instead of a stale retry being replayed. */
+	#revalidateRetry(own: OwnRun, ctx?: ExtensionContext): void {
+		const grant = own.retry;
+		if (grant === undefined || this.#retryMatches(own, grant)) return;
+		delete own.retry;
+		own.retryAcks.delete(grant.key);
+		delete own.lastRetry;
+		if (ctx !== undefined) this.deps.ui(ctx).notify("계획이나 입력이 바뀌어 예약한 재시도를 적용하지 않았습니다. 현재 계획의 정상 흐름으로만 진행합니다.", "warning");
+	}
+
+	/** Marks the one-shot grant as consumed by a prepared attempt and stamps the durable acknowledgement. */
+	#markRetryTaken(own: OwnRun, grant: RetryGrant): void {
+		const row = own.record.results?.find(candidate => candidate.id === grant.result);
+		if (row !== undefined) row.reason = compactResultReason("사용자 요청으로 같은 계약을 한 번 더 시도합니다.");
+		const list = own.record.adjustments;
+		if (list === undefined) return;
+		for (let index = list.length - 1; index >= 0; index -= 1) {
+			const entry = list[index];
+			if (entry?.kind !== "retry" || entry.id !== grant.result || entry.lane !== grant.lane || entry.takenAt !== undefined) continue;
+			entry.takenAt = iso(this.deps.now());
+			break;
+		}
+	}
+
+	/** Appends one bounded audit entry; this is an acknowledgement, never authority a later run can replay. */
+	#recordAdjustment(own: OwnRun, kind: RunAdjustment["kind"], target: AdjustTarget): void {
+		const list = (own.record.adjustments ??= []);
+		list.push({
+			kind,
+			id: target.resultId,
+			...(target.laneName === "" ? {} : { lane: target.laneName }),
+			at: iso(this.deps.now()),
+		});
+		if (list.length > ADJUSTMENTS_MAX) list.splice(0, list.length - ADJUSTMENTS_MAX);
+	}
+
+	/** Rolls back an acknowledgement entry when its live write failed before the action was confirmed. */
+	#removeAdjustment(own: OwnRun, kind: RunAdjustment["kind"], target: AdjustTarget): void {
+		const list = own.record.adjustments;
+		if (list === undefined) return;
+		for (let index = list.length - 1; index >= 0; index -= 1) {
+			const entry = list[index];
+			if (entry?.kind !== kind || entry.id !== target.resultId || entry.takenAt !== undefined) continue;
+			list.splice(index, 1);
+			break;
+		}
+		if (list.length === 0) delete own.record.adjustments;
+	}
+
+	/**
+	 * Sends the bounded adjustment nudge only when the session is not in a turn or held; a retry stays for the next
+	 * normal round message, and an exclusion note is appended there. This is a message to the same main supervisor,
+	 * never a new run, spawn or task.
+	 */
+	#sendAdjustNudge(own: OwnRun, ctx: ExtensionContext, message: string, kind: RunAdjustment["kind"]): void {
+		if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted) return;
+		// A scheduled look, a turn, a running check or held async work already owns the next normal round. Deliver the
+		// hint with that round instead of injecting an extra user turn ahead of it.
+		const deferred =
+			own.inTurn || own.awaitingRound !== undefined || own.hold !== undefined || own.awaitingAsync ||
+			own.checking !== undefined || own.checksRunning === true || own.jobBatch === true || this.#held(ctx);
+		if (kind === "retry") {
+			const grant = own.retry;
+			if (grant === undefined || deferred) return;
+			grant.nudged = true;
+			this.deps.pi.sendUserMessage(message).catch(() => {
+				if (this.#own !== own || own.retry !== grant) return;
+				delete grant.nudged;
+			});
+			return;
+		}
+		if (deferred) {
+			(own.adjustNotes ??= []).push(message);
+			if (own.adjustNotes.length > 4) own.adjustNotes.shift();
+			return;
+		}
+		this.deps.pi.sendUserMessage(message).catch(() => {
+			if (this.#own !== own) return;
+			(own.adjustNotes ??= []).push(message);
+			if (own.adjustNotes.length > 4) own.adjustNotes.shift();
+		});
+	}
+
 
 	/**
 	 * Stages the director's closeout brief for this session's run. It is presentation data only: no status, review,
@@ -2494,9 +2872,16 @@ export class RunController {
 					(row.state === "accepted" || (row.state === "reviewable" && row.restoredFrom !== undefined))))) remaining.delete(lane.name);
 		}
 		for (const row of own.record.results ?? []) {
+			if (row.scope === "excluded-by-user") continue;
 			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) remaining.add(row.lane);
 		}
-		return plan.lanes.map(lane => ({ name: lane.name, state: remaining.has(lane.name) ? "pending" : "done" }));
+		const excludedIds = new Set((own.record.results ?? []).filter(row => row.scope === "excluded-by-user").map(row => row.id));
+		return plan.lanes
+			.filter(lane => {
+				const results = lane.results ?? [];
+				return results.length === 0 || !results.every(result => excludedIds.has(result.id));
+			})
+			.map(lane => ({ name: lane.name, state: remaining.has(lane.name) ? "pending" : "done" }));
 	}
 
 	/** The latest native task outcome also catches admission and merge failures outside a child's agent loop. */
@@ -2563,7 +2948,7 @@ export class RunController {
 		const rows = own.record.results ?? [];
 		let changed = false;
 		for (const row of rows) {
-			if (row.state !== "pending" || row.lane === undefined) continue;
+			if (row.scope === "excluded-by-user" || row.state !== "pending" || row.lane === undefined) continue;
 			const refusal = this.#configRefusal(own, row.lane);
 			if (refusal === undefined) {
 				if (row.remedy === "blocked") {
@@ -2616,6 +3001,9 @@ export class RunController {
 		}
 		const out: CoverageResult[] = [];
 		for (const row of rows) {
+			// An acknowledged user exclusion is not a proof obligation or a gate blocker. Its row remains in the record
+			// for display and is never accepted; finalization separately refuses a verified label with no in-scope proof.
+			if (row.scope === "excluded-by-user") continue;
 			const result = planned.get(row.id);
 			const candidates: { id: string; accepted: boolean }[] = [];
 			if ((row.consumed ?? []).length > 0) {
@@ -2887,9 +3275,24 @@ export class RunController {
 		this.#liveStatus(ctx, this.active());
 		own.awaitingRound = round;
 		this.#emitPhase(own);
-		this.deps.pi.sendUserMessage(
-			buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, ...(reviewer !== undefined ? { reviewer } : {}) }),
-		).catch((error: unknown) => {
+		const notes = own.adjustNotes ?? [];
+		if (notes.length > 0) delete own.adjustNotes;
+		let retryNote: string | undefined;
+		if (own.retry !== undefined) {
+			if (this.#retryMatches(own, own.retry)) {
+				if (own.retry.nudged !== true) {
+					retryNote = retryNudgeText(own.record.runId, own.retry);
+					own.retry.nudged = true;
+				}
+			} else {
+				own.retryAcks.delete(own.retry.key);
+				delete own.retry;
+				delete own.lastRetry;
+			}
+		}
+		const base = buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, ...(reviewer !== undefined ? { reviewer } : {}) });
+		const extra = [...notes, ...(retryNote === undefined ? [] : [retryNote])].join("\n\n");
+		this.deps.pi.sendUserMessage(extra === "" ? base : `${base}\n\n${extra}`).catch((error: unknown) => {
 			// No turn started from this message: a later user turn must not be mistaken for the scheduled round.
 			if (own.awaitingRound === round) delete own.awaitingRound;
 			// The user interrupted the prompt's setup: no round started, so nothing about it is unverified progress.
@@ -3221,8 +3624,13 @@ export class RunController {
 		// Vanished evidence reopens the row and what consumed its version; a verified label additionally requires every
 		// row to still be accepted after that re-read.
 		await this.#revokeUnlocatedAccepted(own);
+		const finalRows = own.record.results ?? [];
+		const inScopeRows = finalRows.filter(row => row.scope !== "excluded-by-user");
+		// Excluded rows are not proof obligations, but they are never proof either: when every declared result was
+		// excluded, a gate with no in-scope result evidence must not turn into `verified`.
+		const onlyExcluded = finalRows.length > 0 && inScopeRows.length === 0;
 		let finalReason: RunEndReason =
-			reason === "verified" && (own.record.results ?? []).some(row => row.state !== "accepted") ? "no-progress" : reason;
+			reason === "verified" && (onlyExcluded || inScopeRows.some(row => row.state !== "accepted")) ? "no-progress" : reason;
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
 		const seen = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		// A team with doc consistency off asked for no doc findings, so none are counted.
@@ -3232,6 +3640,7 @@ export class RunController {
 		// producer changed after the last attempt (T05).
 		const pendingNames = new Set(this.#planLanes(own, agents)?.filter(lane => lane.state === "pending").map(lane => lane.name) ?? []);
 		for (const row of own.record.results ?? []) {
+			if (row.scope === "excluded-by-user") continue;
 			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) pendingNames.add(row.lane);
 		}
 		const pendingLanes = (own.record.plan?.lanes ?? []).filter(lane => pendingNames.has(lane.name)).map(lane => lane.name);

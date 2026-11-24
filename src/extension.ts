@@ -77,6 +77,7 @@ import {
 	noteVerdictTree,
 } from "./runtime/agents.ts";
 import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
+import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
@@ -115,6 +116,7 @@ import { createUiPort, registerReportRenderer } from "./ui.ts";
 import { isLiveTui, LiveStatus } from "./view/live.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./view/appearance.ts";
 import { runStatusText } from "./view/render.ts";
+import { plannedResultLabels } from "./view/results.ts";
 import {
 	activeWorkerRunInTree,
 	endWorkerAdmission,
@@ -920,6 +922,7 @@ export default function storm(pi: ExtensionAPI): void {
 
 	/** The last run shown live; its child admissions close when finalization reports no run. */
 	let liveRunId: string | undefined;
+	let announcedResultPlan: string | undefined;
 	const runs = new RunController({
 		pi,
 		ui: ctx => createUiPort(pi, ctx),
@@ -934,10 +937,20 @@ export default function storm(pi: ExtensionAPI): void {
 			if (run) {
 				liveRunId = run.runId;
 				showRunStatus(ctx, run, runs.phase());
+				if (announcedResultPlan !== run.runId && run.plan !== undefined) {
+					const labels = plannedResultLabels(run);
+					if (labels.length > 0) {
+						announcedResultPlan = run.runId;
+						const shown = labels.slice(0, 5);
+						const rest = labels.length > shown.length ? ` · 외 ${labels.length - shown.length}개` : "";
+						createUiPort(pi, ctx).notify(`이번에 만들 결과: ${shown.join(" · ")}${rest}`);
+					}
+				}
 				return;
 			}
 			const ended = liveRunId;
 			liveRunId = undefined;
+			announcedResultPlan = undefined;
 			if (ended !== undefined) void revokeWorkerAdmissionsFor({ runId: ended });
 			liveStatus.clear();
 			// Finalization already dropped the controller's keys; the session's records only existed to close them.
@@ -2258,7 +2271,25 @@ export default function storm(pi: ExtensionAPI): void {
 		// A host with no UI never showed the menu; its text is not a choice, even if a stale card was recorded.
 		if (event.source !== "interactive" || ctx.agent.kind !== "main" || !ctx.hasUI) return undefined;
 		const direction = takeCloseoutChoice(ctx, event.text);
-		if (direction === undefined) return undefined;
+		if (direction === undefined) {
+			// A direct scope/retry adjustment is a native action at submission, like the closeout pick above. The input
+			// event carries a source but no delivery id, and a later model call is not delivery proof; only this exact
+			// interactive submission can apply it. Unmatched instructions, questions, quotes, code and complex turns
+			// fall through untouched to OMP's ordinary queue.
+			if (event.images?.length) return undefined;
+			const adjustment = parseAdjustment(event.text);
+			if (adjustment === undefined || runs.active() === undefined) return undefined;
+			void runs.adjust(ctx, { ...adjustment, source: "interactive" }).then(
+				outcome => {
+					if (!ctx.hasUI) return;
+					ctx.ui.notify(outcome.ok ? outcome.text : `Storm 실행 조정을 적용하지 않았습니다: ${outcome.reason}`, outcome.ok ? "info" : "warning");
+				},
+				(error: unknown) => {
+					if (ctx.hasUI) ctx.ui.notify(`Storm 실행 조정을 적용하지 않았습니다: ${error instanceof Error ? error.message : String(error)}`, "error");
+				},
+			);
+			return { handled: true };
+		}
 		// An image or a busy session cannot be a numbered pick: the input keeps its normal path, and the offer is gone.
 		if (event.images?.length || !ctx.isIdle()) return undefined;
 		const refusal = runs.refusal();
@@ -2394,6 +2425,26 @@ export default function storm(pi: ExtensionAPI): void {
 			};
 			const input = args.trim();
 			try {
+				// The human fallback is exact and native. It is not offered by the model tool and carries no text grammar;
+				// a terminal-only main session is the only caller, and the controller re-checks run ownership.
+				if (input === "adjust" || input.startsWith("adjust ")) {
+					const request = parseAdjustCommand(input.slice("adjust".length).trim());
+					if (request === undefined) {
+						ui.notify("사용법: /storm adjust exclude <결과 id> | /storm adjust retry <결과 id>", "warning");
+						return;
+					}
+					if (ctx.mode !== "tui" || !ctx.hasUI || ctx.agent.kind !== "main") {
+						ui.notify("실행 조정은 이 세션의 터미널 상호작용에서만 적용됩니다. RPC·출력 모드나 워커 세션에서는 바꾸지 않습니다.", "warning");
+						return;
+					}
+					if (!stillOwner()) {
+						ui.notify("대화가 바뀌어 이전 세션의 실행을 조정하지 않았습니다. 새 대화에서 현재 실행 상태를 확인하세요.", "warning");
+						return;
+					}
+					const outcome = await runs.adjust(ctx, { kind: request.kind, target: request.id, exact: true, source: "command" });
+					ui.notify(outcome.ok ? outcome.text : `Storm 실행 조정을 적용하지 않았습니다: ${outcome.reason}`, outcome.ok ? "info" : "warning");
+					return;
+				}
 				const env = flowEnv(ctx, startRun);
 				/** Bare /storm: the hub, or just the status where no dialog can be answered. */
 				const menu = async (): Promise<void> => {

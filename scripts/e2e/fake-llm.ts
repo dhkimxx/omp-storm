@@ -46,8 +46,8 @@
  *
  * `GET /v1/models` answers the readiness probe. Env: FAKE_LLM_PORT, FAKE_LLM_LOG (both required).
  */
-import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { isRecord } from "../../src/config/schema.ts";
 
 interface JsonSchema {
@@ -114,6 +114,8 @@ export type Step = (
 ) & {
 	after?: string;
 	afterResult?: string;
+	/** Park an unmet `after` reply until the PTY driver observes the intermediate state and signals release. */
+	releaseFile?: string;
 };
 interface ChatRequest {
 	model: string;
@@ -127,7 +129,7 @@ interface ChatRequest {
 type Decision = (
 	| { kind: "text"; text: string; awaitChild?: boolean }
 	| { kind: "tool"; name: string; args: Record<string, unknown> }
-) & { awaitChildren?: string[]; releaseChildren?: string[] };
+) & { awaitChildren?: string[]; releaseChildren?: string[]; releaseFile?: string };
 /** Who a request is from: the main session, a spawned child, Storm's router, a compaction, or omp's own auxiliary calls. */
 export type Who = "main" | "child" | "route" | "compaction" | "side";
 
@@ -454,8 +456,12 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | undefined): Decision {
 	if (!step) return { kind: "text", text: "done" };
 	const seen = (text: string, from: (role: string) => boolean) => later.some(m => from(m.role) && textOf(m.content).includes(text));
-	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) return { kind: "text", text: "waiting" };
 	if (step.afterResult !== undefined && !seen(step.afterResult, role => role === "user")) return { kind: "text", text: "waiting" };
+	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) {
+		return step.releaseFile === undefined
+			? { kind: "text", text: "waiting" }
+			: { kind: "text", text: "waiting", releaseFile: step.releaseFile };
+	}
 	// A follow-up waits for its target's async result (a user message), so the target's usage is on the ledger by then.
 	if ("followUp" in step && !seen(step.followUp.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
 	if ("ifAskApproved" in step) {
@@ -685,6 +691,11 @@ Bun.serve({
 			return gateError(`Children never reached their gates: ${awaitChildren.filter(key => !waitingChildren.has(key)).join(", ")}`);
 		}
 		record(request, who, decision, bodyBytes);
+		const releaseFile = decision.releaseFile;
+		if (releaseFile !== undefined && (!/^[a-z][a-z0-9-]*$/u.test(releaseFile) ||
+			!(await hold(() => existsSync(join(dirname(LOG), releaseFile)))))) {
+			return gateError(`Director reply was never released: ${releaseFile}`);
+		}
 		if (releaseChildren) {
 			const missing = releaseChildren.filter(key => !waitingChildren.has(key));
 			if (missing.length > 0) return gateError(`Cannot release children not at their gates: ${missing.join(", ")}`);

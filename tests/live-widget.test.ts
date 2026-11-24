@@ -19,7 +19,7 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
 import { LIVE_WIDGET_KEY, LiveStatus } from "../src/view/live.ts";
-import type { RunRecord } from "../src/types.ts";
+import type { RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
 ensureThemeSync();
@@ -507,6 +507,86 @@ describe("the live run widget", () => {
 		expect(metrics).toContain("$0.2000/$5.00");
 		expect(host.statuses).toEqual([undefined]);
 
+		live.clear();
+	});
+
+	test("result progress leads worker chips and repaints when only the ledger changes", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		const run: RunRecord = {
+			...RUN,
+			plan: {
+				lanes: [
+					{
+						name: "api",
+						kind: "code",
+						role: "implementer",
+						results: [{ id: "api", kind: "change", criterion: "API 검증" }],
+					},
+				],
+				workers: { implementer: 1 },
+				submittedAt: "2026-11-20T09:00:00.000Z",
+			},
+			results: [
+				{ id: "api", lane: "api", state: "unmet", reason: "응답 계약이 다릅니다." },
+				{ id: "docs", lane: "api", state: "accepted", reason: "문서 갱신을 확인했습니다." },
+			],
+		};
+		live.show(host.ctx, run);
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		for (const width of [200, 120]) {
+			const row = plain(component.render(width))[1]!;
+			expect(row).toContain("API 검증");
+			expect(row).toContain("미충족");
+			expect(row.indexOf("API 검증")).toBeLessThan(row.indexOf("↻"));
+			expect(visibleWidth(component.render(width)[1]!)).toBeLessThanOrEqual(width);
+		}
+		const compact = plain(component.render(60))[1]!;
+		expect(compact).toContain("미충족");
+		if (compact.includes("↻")) expect(compact.indexOf("미충족")).toBeLessThan(compact.indexOf("↻"));
+		expect(visibleWidth(component.render(60)[1]!)).toBeLessThanOrEqual(60);
+		const metrics = plain(component.render(200))[1]!;
+		expect(metrics).toStartWith("› 🎯 API 검증 미충족 · 이행 1/2");
+		const narrow = plain(component.render(30))[0]!;
+		expect(narrow).toContain("미충족");
+		expect(visibleWidth(component.render(30)[0]!)).toBeLessThanOrEqual(30);
+
+		const nativeChips = metricChips(children(component.describe!(describeContext)!)[1]!);
+		expect(nativeProps(nativeChips[0]!).role).toBe("omp.storm.live.results");
+		expect(nativeProps(nativeChips[0]!).aria).toBe("결과 API 검증 (api) · 이행 1/2 · 미충족 1");
+
+		// The counters stay identical; only the ledger settles. The key must still repaint the widget.
+		const requests = host.requests.length;
+		live.show(host.ctx, {
+			...run,
+			results: [
+				{ id: "api", lane: "api", state: "accepted", reason: "응답 계약을 확인했습니다." },
+				{ id: "docs", lane: "api", state: "accepted", reason: "문서 갱신을 확인했습니다." },
+			],
+		});
+		expect(host.requests.length).toBeGreaterThan(requests);
+		expect(plain(component.render(200))[1]).toContain("API 검증 이행 2/2");
+		expect(plain(component.render(200))[1]).not.toContain("미충족");
+		live.clear();
+	});
+
+	test("an operator-excluded result is visibly listed but never counted in scope", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		const excluded = { id: "skip", state: "accepted", scope: "excluded-by-user" } as unknown as RunResult;
+		live.show(host.ctx, {
+			...RUN,
+			results: [{ id: "blocked", lane: "api", state: "unmet", reason: "검증이 막혔습니다." }, excluded],
+		});
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		const metrics = plain(component.render(200))[1]!;
+		expect(metrics).toContain("이행 0/1");
+		expect(metrics).toContain("제외 1");
+		expect(metrics).not.toContain("0/2");
+		const nativeChips = metricChips(children(component.describe!(describeContext)!)[1]!);
+		expect(nativeProps(nativeChips[0]!).aria).toBe("결과 blocked · 이행 0/1 · 미충족 1 · 사용자 제외 1");
 		live.clear();
 	});
 

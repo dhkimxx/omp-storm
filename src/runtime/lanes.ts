@@ -523,7 +523,7 @@ export class RunLanes {
 	/** Shared write scopes placed but not yet released; private/read-only work never appears here. */
 	readonly #writes = new Map<string, WriteReservation>();
 	/** Follow-up admission tokens; only a failed preflight releases the write/capacity reservations it created. */
-	readonly #followTokens = new Map<string, { key?: string; created: boolean; capacityKey?: string }>();
+	readonly #followTokens = new Map<string, { key?: string; created: boolean; capacityKey?: string; lane?: string }>();
 	#serial = 0;
 	#writeSerial = 0;
 	#tokenSerial = 0;
@@ -844,6 +844,27 @@ export class RunLanes {
 	}
 
 	/**
+	 * Whether a lane already has a pending placement, a delivery reservation, a follow-up in flight, or a running
+	 * admitted worker. A settled idle worker is not busy: only live work refuses a user exclusion or retry. Read-only
+	 * work never holds a write reservation, so the admitted-agent state and the follow-up token are checked as well.
+	 */
+	laneBusy(laneName: string, agents: readonly AgentEntry[] = [], now = Date.now()): boolean {
+		this.#pruneWrites(agents, now);
+		for (const assignment of this.#assigned.values()) if (assignment.lane === laneName) return true;
+		for (const entry of this.#followTokens.values()) if (entry.lane === laneName) return true;
+		for (const reservation of this.#writes.values()) {
+			if (reservation.lane !== laneName) continue;
+			if (reservation.agentId === undefined) return true;
+			const agent = agents.find(candidate => candidate.id === reservation.agentId);
+			if (agent === undefined || agent.state === "running") return true;
+		}
+		const latest = this.#agents.get(laneName);
+		if (latest === undefined) return false;
+		const agent = agents.find(candidate => candidate.id === latest);
+		return agent === undefined || agent.state === "running";
+	}
+
+	/**
 	 * Any message that can start a turn (including native quiet writes) passes the same admission rules:
 	 * the target lane's prerequisites must hold, and a shared write reserves its scope before omp delivers the turn.
 	 * Its own in-flight reservation never blocks the continuation.
@@ -909,7 +930,7 @@ export class RunLanes {
 			: undefined;
 		if (scope.kind === "read" || scope.kind === "private") {
 			if (slot !== undefined) reserveWorkerSlot(slot);
-			this.#followTokens.set(token, { created: false, ...(capacityKey === undefined ? {} : { capacityKey }) });
+			this.#followTokens.set(token, { created: false, ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
 			return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 		}
 		for (const reservation of this.#writes.values()) {
@@ -922,7 +943,7 @@ export class RunLanes {
 		const existing = this.#writes.get(key);
 		this.#writes.set(key, { scope, ...(lane === undefined ? {} : { lane: lane.name }), agentId: input.agentId, at: now });
 		if (slot !== undefined) reserveWorkerSlot(slot);
-		this.#followTokens.set(token, { key, created: existing === undefined, ...(capacityKey === undefined ? {} : { capacityKey }) });
+		this.#followTokens.set(token, { key, created: existing === undefined, ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
 		return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 	}
 

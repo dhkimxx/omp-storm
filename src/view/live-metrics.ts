@@ -5,9 +5,10 @@
 import { formatUsd } from "../policy/spawn.ts";
 import type { InfoTone, RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, type RunPhase } from "./appearance.ts";
+import { resultProgress, type ResultProgress } from "./results.ts";
 
-export type LiveMetricKey = "round" | "workers" | "cost" | "time";
-export type LiveMetricIcon = "icon.loop" | "icon.agents" | "icon.cost" | "icon.time";
+export type LiveMetricKey = "results" | "round" | "workers" | "cost" | "time";
+export type LiveMetricIcon = "icon.goal" | "icon.loop" | "icon.agents" | "icon.cost" | "icon.time";
 export type LiveMetricTone = InfoTone | "dim";
 /** Spend only: the run crossed the approved warning line, or the approved hard limit. */
 export type LiveSpendState = "warn" | "over";
@@ -32,7 +33,7 @@ export interface LiveMetricChip {
 
 export interface LiveMetricFacts {
 	readonly phase: { readonly label: string; readonly tone: LiveMetricTone };
-	/** In priority order: phase counters first, optional spend and elapsed last. */
+	/** In priority order: result progress first, then phase counters, optional spend, and elapsed last. */
 	readonly chips: readonly LiveMetricChip[];
 	/** The values the widget dedupes updates on; animation ticks never rebuild it. */
 	readonly key: string;
@@ -52,6 +53,35 @@ function spendState(run: RunRecord): LiveSpendState | undefined {
 
 function money(value: number, digits: number): string {
 	return Number.isFinite(value) ? `$${value.toFixed(digits)}` : "$?";
+}
+
+/**
+ * Official result progress, never a lane's model-supplied progress. The full form carries the focus criterion, its
+ * state, and the accepted/in-scope count; narrower forms keep the count and the state word so a small terminal still
+ * shows what is blocked rather than only worker telemetry.
+ */
+function resultChip(progress: ResultProgress): LiveMetricChip | undefined {
+	if (!progress.present) return undefined;
+	const counts = progress.counts;
+	const label = progress.focus?.label ?? "결과";
+	const focusState = progress.focus?.state;
+	const state = progress.focus?.excluded === true ? "사용자 제외" : (progress.focus?.stateLabel ?? "결과");
+	const excluded = counts.excluded === 0 ? "" : ` · 제외 ${counts.excluded}`;
+	const progressText = `이행 ${counts.accepted}/${counts.inScope}`;
+	const full = focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`;
+	const forms: LiveMetricForm[] =
+		counts.inScope > 0
+			? [
+					{ value: label, suffix: full },
+					{ value: `${counts.accepted}/${counts.inScope}`, suffix: ` ${state}${excluded}` },
+					{ value: `${counts.accepted}/${counts.inScope}` },
+				]
+			: [
+					{ value: label, suffix: ` 사용자 제외 ${counts.excluded}` },
+					{ value: `제외 ${counts.excluded}` },
+				];
+	const tone: LiveMetricTone = progress.tone === "muted" ? "dim" : progress.tone;
+	return { key: "results", icon: "icon.goal", forms, aria: progress.aria, tone };
 }
 
 function roundChip(run: RunRecord): LiveMetricChip {
@@ -118,10 +148,15 @@ function timeChip(run: RunRecord, now: number): LiveMetricChip {
 /** Shape the snapshot once per controller update; the same facts feed ANSI and native output. */
 export function liveMetricFacts(run: RunRecord, phase: RunPhase, now: number): LiveMetricFacts {
 	const look = RUN_APPEARANCE[phase];
-	const chips = [roundChip(run), workersChip(run), costChip(run), timeChip(run, now)];
+	const progress = resultProgress(run);
+	const results = resultChip(progress);
+	const chips = [results, roundChip(run), workersChip(run), costChip(run), timeChip(run, now)].filter(
+		(chip): chip is LiveMetricChip => chip !== undefined,
+	);
 	return {
 		phase: { label: look.label, tone: look.tone },
 		chips,
-		key: JSON.stringify([phase, chips.map(chip => [chip.key, chip.forms, chip.tone, chip.state, chip.aria])]),
+		// The ledger key includes the displayed result label/state/count: settlement repaints even if counters are stable.
+		key: JSON.stringify([phase, progress.key, chips.map(chip => [chip.key, chip.forms, chip.tone, chip.state, chip.aria])]),
 	};
 }

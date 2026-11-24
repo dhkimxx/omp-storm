@@ -137,39 +137,54 @@ function chipWidth(chip: LiveMetricChip, form: LiveMetricForm, theme: Theme): nu
 	return visibleWidth(`${lead}${form.value}${form.suffix ?? ""}${state}`);
 }
 
+interface ChipFitQuality {
+	resultForm: number;
+	primary: number;
+	value: number;
+	richness: number;
+}
+
+function chipFitQuality(chips: readonly FittedChip[]): ChipFitQuality {
+	let resultForm = Number.MAX_SAFE_INTEGER;
+	let primary = 0;
+	let value = 0;
+	let richness = 0;
+	for (const entry of chips) {
+		if (entry.chip.key === "results") resultForm = entry.formIndex;
+		if (entry.chip.key === "round" || entry.chip.key === "workers") primary++;
+		if (entry.chip.key !== "time") {
+			value++;
+			richness += entry.formIndex;
+		}
+	}
+	return { resultForm, primary, value, richness };
+}
+
+/** Preserve the fullest result form possible before trading it for telemetry. */
+function comparePrimary(a: ChipFitQuality, b: ChipFitQuality): number {
+	return b.resultForm - a.resultForm || a.primary - b.primary;
+}
+
+function compareDetail(a: ChipFitQuality, b: ChipFitQuality): number {
+	return a.value - b.value || b.richness - a.richness;
+}
+
 /**
- * Pick one whole form per chip for a prefix of the priority order. Primary counters win first, then the other
- * non-elapsed chips, then the longer form. Elapsed is the last chip and only breaks an otherwise exact tie, so it
- * can never displace the mark, a counter, or an intact cost/limit format.
+ * Pick one whole form per chip for a prefix of the priority order. Result progress wins first, then the phase
+ * counters and optional spend; elapsed only breaks an otherwise exact tie. The longer form wins only within the same
+ * chip set, so no chip is ever clipped to make room.
  */
 function fitChips(chips: readonly LiveMetricChip[], available: number, theme: Theme): FittedChip[] {
 	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
 	let best: FittedChip[] = [];
-	let bestPrimary = 0;
-	let bestValue = 0;
-	let bestRichness = 0;
+	let bestQuality = chipFitQuality([]);
 	const visit = (index: number, used: number, chosen: FittedChip[]): void => {
-		let primary = 0;
-		let value = 0;
-		let richness = 0;
-		for (const entry of chosen) {
-			if (entry.chip.key === "round" || entry.chip.key === "workers") primary++;
-			if (entry.chip.key !== "time") {
-				value++;
-				richness += entry.formIndex;
-			}
-		}
-		const wins =
-			primary > bestPrimary ||
-			(primary === bestPrimary &&
-				(value > bestValue ||
-					(value === bestValue &&
-						(richness < bestRichness || (richness === bestRichness && chosen.length > best.length)))));
+		const quality = chipFitQuality(chosen);
+		const order = comparePrimary(quality, bestQuality) || compareDetail(quality, bestQuality);
+		const wins = order > 0 || (order === 0 && chosen.length > best.length);
 		if (wins) {
 			best = [...chosen];
-			bestPrimary = primary;
-			bestValue = value;
-			bestRichness = richness;
+			bestQuality = quality;
 		}
 		if (index >= chips.length) return;
 		const chip = chips[index]!;
@@ -193,8 +208,8 @@ interface LiveLine {
 }
 
 /**
- * The single-row choice: keep the full mark while it does not cost a counter, otherwise trade the mark for
- * `phase word + more counters`, and finally truncate the phase word itself. Phase is never dropped for a chip.
+ * The single-row choice: keep the full mark while it does not cost a result or counter, otherwise trade the mark for
+ * `phase word + more chips`, and finally truncate the phase word itself. Phase is never dropped for a chip.
  */
 function chooseLine(facts: LiveMetricFacts, columns: number, theme: Theme): LiveLine | undefined {
 	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
@@ -208,34 +223,18 @@ function chooseLine(facts: LiveMetricFacts, columns: number, theme: Theme): Live
 		candidates.push({ fullHeader: false, chips: fitChips(facts.chips, columns - phaseWidth - sepWidth, theme) });
 	}
 	let best: LiveLine | undefined;
-	let bestPrimary = 0;
-	let bestValue = 0;
-	let bestRichness = 0;
+	let bestQuality = chipFitQuality([]);
 	for (const candidate of candidates) {
-		let primary = 0;
-		let value = 0;
-		let richness = 0;
-		for (const entry of candidate.chips) {
-			if (entry.chip.key === "round" || entry.chip.key === "workers") primary++;
-			if (entry.chip.key !== "time") {
-				value++;
-				richness += entry.formIndex;
-			}
-		}
-		const wins =
-			best === undefined ||
-			primary > bestPrimary ||
-			(primary === bestPrimary &&
-				(candidate.fullHeader !== best.fullHeader
-					? candidate.fullHeader
-					: value > bestValue ||
-						(value === bestValue &&
-							(richness < bestRichness || (richness === bestRichness && candidate.chips.length > best.chips.length)))));
+		const quality = chipFitQuality(candidate.chips);
+		const order = comparePrimary(quality, bestQuality);
+		const detail = compareDetail(quality, bestQuality);
+		const wins = best === undefined || order > 0 || (order === 0 &&
+			(candidate.fullHeader !== best.fullHeader
+				? candidate.fullHeader
+				: detail > 0 || (detail === 0 && candidate.chips.length > best.chips.length)));
 		if (wins) {
 			best = candidate;
-			bestPrimary = primary;
-			bestValue = value;
-			bestRichness = richness;
+			bestQuality = quality;
 		}
 	}
 	return best;

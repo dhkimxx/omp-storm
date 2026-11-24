@@ -786,6 +786,12 @@ export interface RunResult {
 	/** Assigned lane when one exists; changing it does not create a new requirement. */
 	lane?: string;
 	state: RunResultState;
+	/**
+	 * Orthogonal operator scope marker; never a state, evidence, or proof. `excluded-by-user` means the user directly
+	 * removed this requirement from the live run. The row keeps the state it had, never becomes accepted, and is
+	 * excluded from proof obligations and coverage once excluded. Absent means in scope.
+	 */
+	scope?: "excluded-by-user";
 	/** Short reason anchored in the current attempt when the requirement is pending or unmet. */
 	reason?: string;
 	/** Host-bound attempt this state was observed in; absent until an attempt is bound. */
@@ -822,6 +828,20 @@ export interface RunResult {
 	restoredFrom?: string;
 }
 
+/** One direct user steering action the runtime applied to a live run. Audit/ack only: no model tool creates one, and a
+ * later run never restores a pending retry from it. */
+export interface RunAdjustment {
+	kind: "exclude" | "retry";
+	/** Plan result id the action addressed. */
+	id: string;
+	/** Lane the result was assigned to when the action was applied. */
+	lane?: string;
+	/** ISO 8601 of the acknowledgement. */
+	at: string;
+	/** For a retry: ISO 8601 when a prepared attempt consumed the one-shot grant. */
+	takenAt?: string;
+}
+
 /** `<sessionDir>/state/runs/<runId>.json`: what one Storm run did and under which approval. */
 export interface RunRecord {
 	schema: "storm.run/v1";
@@ -851,6 +871,8 @@ export interface RunRecord {
 	jobs?: RunJob[];
 	/** One row per required result, keyed by the plan's stable id; written by the runtime, never by this schema. */
 	results?: RunResult[];
+	/** Direct user scope/retry actions this run acknowledged, oldest first. Never replayed on resume. */
+	adjustments?: RunAdjustment[];
 	spawns: SpawnRecord[];
 	/** Subagents seen during the run, from the agent ledger. */
 	agents?: AgentEntry[];

@@ -14,6 +14,7 @@ import {
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
 import type { RunJob, RunPlan, RunRecord, RunResult } from "../src/types.ts";
+import { plannedResultLabels } from "../src/view/results.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
 const draft = (over: Partial<CloseoutDraft> = {}): CloseoutDraft => ({
@@ -259,7 +260,7 @@ describe("required-result closeout rows", () => {
 		const card = closeoutCard(run, ["report"]);
 		expect(card.text).toContain("- 상태(공식): 끝남 · 변경 없음");
 		expect(card.text).toContain(
-			"- 미해결 필수 결과(공식): report-change [report] 미충족 — 사전 기준선 이후 바뀐 내용이 없습니다.",
+			"- 미해결 필수 결과(공식): report.json을 갱신 [report-change] [report] 미충족 — 사전 기준선 이후 바뀐 내용이 없습니다.",
 		);
 		expect(card.text).toContain(
 			"- 이행 필수 결과(공식): report-answer [read-report] 이행 — 기존 내용을 출처와 함께 확인했습니다.",
@@ -294,7 +295,7 @@ describe("required-result closeout rows", () => {
 		expect(card.text).toContain("- 상태(공식): 완료 · 필수 결과 이행");
 		expect(card.text).not.toContain("리뷰 통과");
 		expect(card.text).toContain(
-			"- 이행 필수 결과(공식): report-answer [read-report] 이행 · 시도: job:job-1:read-report — report.json:2에서 42를 확인했습니다.",
+			"- 이행 필수 결과(공식): states the total [report-answer] [read-report] 이행 · 시도: job:job-1:read-report — report.json:2에서 42를 확인했습니다.",
 		);
 		// No director draft is synthesized: the card says so and still recommends exactly the first of three choices.
 		expect(card.text).toContain("- 결과: 검증된 결과 브리프가 제출되지 않았습니다.");
@@ -325,10 +326,110 @@ describe("required-result closeout rows", () => {
 		expect(isSubstantiveRun(run)).toBe(true);
 		const card = closeoutCard(run, ["read-report"]);
 		expect(card.text).toContain(
-			"- 미해결 필수 결과(공식): report-answer [read-report] 미충족 — 인용한 출처가 답과 일치하지 않습니다.",
+			"- 미해결 필수 결과(공식): states the total [report-answer] [read-report] 미충족 — 인용한 출처가 답과 일치하지 않습니다.",
 		);
 		expect(card.text).not.toContain("- 이행 필수 결과");
 		expect(card.text).not.toContain("리뷰 통과");
+	});
+
+	test("a contract criterion outranks a stale plan criterion and the id stays a reference", () => {
+		const run = record({
+			status: "ended",
+			endReason: "no-changes",
+			plan: plan(
+				lane("api", "code", {
+					results: [{ id: "api-check", kind: "change", criterion: "예전 기준" }],
+				}),
+			),
+			results: [
+				{
+					id: "api-check",
+					lane: "api",
+					state: "unmet",
+					contract: { id: "api-check", kind: "change", criterion: "API 검증" },
+					reason: "응답 계약이 다릅니다.",
+				},
+			],
+		});
+		const card = closeoutCard(run);
+		expect(card.text).toContain("- 미해결 필수 결과(공식): API 검증 [api-check] [api] 미충족 — 응답 계약이 다릅니다.");
+		expect(card.text).not.toContain("예전 기준");
+	});
+
+	test("plannedResultLabels offers bounded plan criteria, not evidence", () => {
+		const run = record({
+			plan: plan(
+				lane("api", "code", {
+					results: [
+						{ id: "api-check", kind: "change", criterion: "API 검증" },
+						{ id: "docs-check", kind: "change", criterion: "문서 갱신" },
+					],
+				}),
+			),
+		});
+		expect(plannedResultLabels(run)).toEqual(["API 검증", "문서 갱신"]);
+	});
+
+	test("an operator-excluded requirement is listed but does not join the in-scope unfinished row", () => {
+		const run = record({
+			status: "ended",
+			endReason: "no-changes",
+			plan: plan(
+				lane("api", "code", {
+					results: [
+						{ id: "api-check", kind: "change", criterion: "API 검증", path: "src/api.ts" },
+					],
+				}),
+			),
+			results: [
+				{ id: "api-check", lane: "api", state: "accepted", reason: "응답 계약을 확인했습니다." },
+				{
+					id: "optional-check",
+					contract: { id: "optional-check", kind: "answer", criterion: "추가 조사" },
+					state: "pending",
+					reason: "사용자가 이번 범위에서 제외했습니다.",
+					scope: "excluded-by-user",
+				},
+			],
+		});
+		const card = closeoutCard(run);
+		expect(card.text).toContain(
+			"- 이행 필수 결과(공식): API 검증 [api-check] [api] 이행 — 응답 계약을 확인했습니다.",
+		);
+		expect(card.text).toContain(
+			"- 사용자 제외 필수 결과(공식): 추가 조사 [optional-check] — 사용자가 이번 범위에서 제외했습니다.",
+		);
+		expect(card.text).not.toMatch(/- 미해결 필수 결과\(공식\):.*optional-check/);
+		expect(card.text).not.toContain("- 미완료 레인:");
+		const acceptedAt = card.text.indexOf("- 이행 필수 결과(공식):");
+		const excludedAt = card.text.indexOf("- 사용자 제외 필수 결과(공식):");
+		expect(acceptedAt).toBeGreaterThanOrEqual(0);
+		expect(excludedAt).toBeGreaterThan(acceptedAt);
+	});
+
+	test("official result rows lead the card before missing-director prose and job receipts", () => {
+		const run = record({
+			status: "ended",
+			endReason: "no-changes",
+			results: [
+				{
+					id: "api-check",
+					lane: "api",
+					state: "unmet",
+					contract: { id: "api-check", kind: "change", criterion: "API 검증" },
+					reason: "응답 계약이 다릅니다.",
+				},
+			],
+			jobs: [{ lane: "api", name: "unit", status: "failed", exitCode: 1, startedAt: null, finishedAt: null }],
+		});
+		const card = closeoutCard(run);
+		const resultAt = card.text.indexOf("- 미해결 필수 결과(공식):");
+		const noteAt = card.text.indexOf("- 결과: 검증된 결과 브리프가 제출되지 않았습니다.");
+		const receiptAt = card.text.indexOf("- 잡 영수증(호스트):");
+		expect(resultAt).toBeGreaterThanOrEqual(0);
+		expect(noteAt).toBeGreaterThan(resultAt);
+		expect(receiptAt).toBeGreaterThan(noteAt);
+		expect(card.text).toContain("- 미해결 필수 결과(공식): API 검증 [api-check] [api] 미충족 — 응답 계약이 다릅니다.");
 	});
 
 	test("an accepted row without a reason or a safe reference shows only its state", () => {

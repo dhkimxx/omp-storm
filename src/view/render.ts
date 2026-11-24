@@ -6,6 +6,7 @@ import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, worke
 import { reviewLine } from "../runtime/review.ts";
 import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
+import { resultProgress, resultRowText, type ResultProgress } from "./results.ts";
 import type {
 	BudgetConfig,
 	InfoLine,
@@ -442,6 +443,33 @@ function runStatusParts(run: RunRecord, now: number): string[] {
 	return parts;
 }
 
+/** Icons for the result projection's approved tones; a result state never invents an error class. */
+const RESULT_ICON: Record<InfoTone, NonNullable<InfoLine["icon"]>> = {
+	accent: "status.running",
+	success: "status.success",
+	warning: "status.warning",
+	error: "status.error",
+	muted: "status.info",
+};
+
+/** The one official-result line every report reader shares; absent for a legacy run with no usable ledger. */
+function resultStatusLine(progress: ResultProgress, prefix = ""): string | undefined {
+	return progress.present ? `- ${prefix}결과(공식): ${progress.headline}` : undefined;
+}
+
+/** The rich form of `resultStatusLine`: the label and counts are toned by the official disposition, never by workers. */
+function pushResultInfo(info: InfoLine[] | undefined, index: number, progress: ResultProgress, prefix = ""): void {
+	if (info === undefined || !progress.present) return;
+	info.push({
+		index,
+		icon: RESULT_ICON[progress.tone],
+		spans: [
+			{ text: `- ${prefix}결과(공식): ` },
+			{ text: progress.headline, tone: progress.tone },
+		],
+	});
+}
+
 /** The round/agents/minutes part of the run details; spend has its own authoritative line and meter. */
 function runProgressParts(run: RunRecord, now: number): string[] {
 	const parts = [runRoundText(run)];
@@ -507,12 +535,23 @@ export function renderStatus(
 		out.push(safe.map((span) => span.text).join(""));
 		if (info) info.push({ index, spans: safe, ...(meter ? { meter } : {}), ...(icon ? { icon } : {}) });
 	};
-	/** Present-state details for the active run: the authoritative spend line, progress, then review totals. */
+	/** Present-state details for the active run: results first, then spend and worker telemetry. */
 	const runSection = (): void => {
 		const run = view.run;
 		if (!run) return;
 		out.push("");
 		heading("실행 중", undefined, "status.running");
+		const outcome = resultProgress(run);
+		const outcomeLine = resultStatusLine(outcome);
+		if (outcomeLine !== undefined) {
+			const index = out.length;
+			out.push(outcomeLine);
+			pushResultInfo(info, index, outcome);
+			if (!model) for (const row of outcome.rows) {
+				const tone: InfoTone = row.excluded ? "muted" : row.state === "accepted" ? "success" : row.state === "unmet" && !row.running ? "warning" : "accent";
+				styled([{ text: `- ${resultRowText(row, { includeScope: true })}`, tone }], undefined, RESULT_ICON[tone]);
+			}
+		}
 		styled(runLineSpans(run), runMeter(run), "status.running");
 		const progress = runProgressParts(run, now);
 		const index = out.length;
@@ -541,7 +580,7 @@ export function renderStatus(
 		if (!run) return;
 		out.push("");
 		heading("마지막 실행", undefined, "status.info");
-		const lines = lastRunLines(run);
+		const lines = lastRunLines(run, !model);
 		const index = out.length;
 		out.push(...lines);
 		if (info) {
@@ -753,6 +792,13 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 				...(meter ? { meter } : {}),
 			});
 		}
+		const outcome = resultProgress(run);
+		const outcomeLine = resultStatusLine(outcome);
+		if (outcomeLine !== undefined) {
+			const resultIndex = out.length;
+			out.push(outcomeLine);
+			pushResultInfo(info, resultIndex, outcome);
+		}
 		const progress = runProgressParts(run, now);
 		const progressIndex = out.length;
 		out.push(`- ${progress.join(" · ")}`);
@@ -792,6 +838,13 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 					{ text: ` · ${spendText(run.costUsd, run.budget)}`, ...(spend ? { tone: spend } : {}) },
 				],
 			});
+		}
+		const outcome = resultProgress(run);
+		const outcomeLine = resultStatusLine(outcome, "마지막 ");
+		if (outcomeLine !== undefined) {
+			const resultIndex = out.length;
+			out.push(outcomeLine);
+			pushResultInfo(info, resultIndex, outcome, "마지막 ");
 		}
 	}
 	const team = c.status === "ok" ? `팀 설정 ${shortHash(c.hash)}` : c.status === "missing" ? "팀 설정 없음" : "팀 설정 오류";
@@ -934,9 +987,11 @@ export function runStatusCounters(run: RunRecord, now: number): string {
 	return runStatusParts(run, now).join(" · ");
 }
 
-/** The status line while a run is on: the round in progress, its agents, spend against the budget, and whole minutes. */
+/** Plain fallback shows the same grounded result focus before the counters. */
 export function runStatusText(run: RunRecord, now: number): string {
-	return `storm ▶ ${runStatusCounters(run, now)}`;
+	const results = resultProgress(run);
+	const headline = results.present ? `결과 ${results.headline} · ` : "";
+	return `storm ▶ ${headline}${runStatusCounters(run, now)}`;
 }
 
 /** The head of the stored request (what resuming will send), why it stopped, its rounds and when. */
@@ -949,7 +1004,7 @@ export function resumeRunLine(run: RunRecord): string {
 	return `- 이어 갈 실행: ${head} · ${end} · ${rounds} · ${isoText(run.endedAt ?? run.updatedAt ?? run.startedAt)}`;
 }
 
-function lastRunLines(run: RunRecord): string[] {
+function lastRunLines(run: RunRecord, details: boolean): string[] {
 	const counts = new Map<SpawnRecord["outcome"], number>();
 	for (const s of run.spawns) counts.set(s.outcome, (counts.get(s.outcome) ?? 0) + 1);
 	const spawns = counts.size
@@ -958,7 +1013,13 @@ function lastRunLines(run: RunRecord): string[] {
 				.map((o) => `${OUTCOME[o]} ${counts.get(o)}`)
 				.join(", ")
 		: "없음";
-	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`, `- 스폰: ${spawns}`];
+	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`];
+	// The official result disposition leads a settled run; spawn receipts and plan shape follow it.
+	const progress = resultProgress(run);
+	const outcome = resultStatusLine(progress);
+	if (outcome !== undefined) out.push(outcome);
+	if (details) for (const row of progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
+	out.push(`- 스폰: ${spawns}`);
 	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
 	if (blocked?.reason) out.push(`- 첫 차단: ${visible(blocked.agent)} · ${visible(blocked.reason)}`);
 	if (run.plan) {
