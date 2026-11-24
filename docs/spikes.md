@@ -1,7 +1,7 @@
 # OMP Storm 스파이크 결과
 
 - omp의 실제 동작을 가짜 LLM으로 실측한 결과와, 거기서 나온 결정을 모은 문서다. 유료 모델 호출은 없다.
-- 끝난 실측은 그때의 omp 버전 기준이다. omp를 올리면 [재현](#재현)대로 다시 돌린다.
+- 당시 OMP 버전에서 확인한 기록이다. 현재 설계와 검증 명령은 [설계·개발](design.md)을 참고한다.
 
 | 스파이크 | 일시 | 확인한 것 | 하네스 |
 |---|---|---|---|
@@ -129,7 +129,7 @@
 - `ctx.sessionManager.getUsageStatistics().cost`는 끝난 task만 반영한다.
 - 진행 중 비용은 task의 `tool_execution_update` progress에서 보인다. eval 자식의 진행 중 비용 이벤트는 [미검증]이다.
 
-**결정:** 세 겹(스폰 차단 + 자체 누계 경고 + `--max-cost` 권고)으로 지킨다([design.md](design.md) 2장).
+**당시 결정:** 스폰 차단, 자체 누계 경고, `--max-cost` 권고를 함께 쓴다.
 - 비공개 설정 레지스트리로 상한을 쓰는 방법은 쓰지 않는다. 내부 API이고, "omp 설정을 바꾸지 않는다"는 원칙에도 어긋난다.
 - upstream에 읽기 전용 비용 상태와 세션 범위 상한 API를 제안한다.
 - config 형식은 `"budget": {"perRunUsd": 5, "warnAtUsd": 4, "onExceed": "block-spawns"}`로 하고(`onExceed`는 `"stop"`도 가능), 설정 해시에 포함한다.
@@ -148,7 +148,7 @@
 
 **에이전트 디렉터리:** `pi.pi.getAgentDir()`는 `--profile`/`OMP_PROFILE` > `PI_PROFILE` > `PI_CODING_AGENT_DIR` > `~/.omp/agent` 순서를 따랐다.
 
-**결정:** [design.md](design.md) 5장. P0 때 정한 승인 기록 예(0.10부터는 판정에 쓰는 필드만 쓴다. 예전 기록도 그대로 읽는다):
+**당시 승인 기록 예:** 0.10부터는 판정에 쓰는 필드만 썼다.
 
 ```json
 {
@@ -184,7 +184,7 @@
   - 대조군: 같은 내용을 정식 위치에 두면 반영됐다.
   - `.omp/storm/.gitignore`(`/state/`)만으로 state가 git에서 빠졌다.
 
-**결정:** `.omp/storm/` 구조를 확정한다([design.md](design.md) 7장). 역할 에이전트는 플러그인 `agents/`에만 둔다. `.omp/storm/agents/`는 탐색되지 않는다.
+**당시 결정:** `.omp/storm/` 구조를 쓴다. 역할 에이전트는 플러그인 `agents/`에 두며 `.omp/storm/agents/`는 탐색되지 않는다. 현재 Storm은 세션 프로필에 저장한다.
 
 ## Q8. 30~90일 사용 이력
 
@@ -200,7 +200,7 @@
 - **보존:** `omp gc --apply`가 30일 넘은 세션의 stats 행을 지운다(`cli/gc-cli.ts:1633,1920`).
 - **DB 특성:** WAL 모드라 읽기가 쓰기를 막지 않는다. 스키마 버전 번호는 따로 없지만, `messages` 테이블은 지금까지 컬럼을 더하는 마이그레이션만 있었다.
 
-**결정:** [design.md](design.md) 4장.
+**당시 결정:** `stats.db`를 읽기 전용으로 조회한다.
 - 경로는 `getStatsDbPath()`로 얻고 읽기 전용으로 연다. `immutable=1`은 쓰지 않는다.
 - 필수 컬럼을 검사한다. 분위수는 처음에 윈도우 함수로 구하기로 했으나, 구현은 단순 조회 뒤 TS에서 계산한다(`src/history/stats.ts`).
 - 결과에 데이터 기준 시각을 표시하고, 필요하면 `omp stats --summary`로 갱신한다.
@@ -371,16 +371,10 @@ v0.9 청소부가 열린 부모 세션 안의 끝난 하위 에이전트 기록�
 - `ctx.sessionModes`가 없는 호스트에서 goal·loop를 요청하면 기본 모드로 시작할지 묻는다.
 - 사용자의 `loop.mode`가 `reset`이면 loop 실행을 거절한다. 반복마다 새 세션이 되어 실행이 이어지지 않는다.
 - `session_stop` 이어 가기는 쓰지 않는다. 8번 한도가 있고 완료 신호를 따로 만들어야 한다.
-- 0.11이 이 결정을 대체했다: Storm은 omp 목표·반복 모드에 들어가지 않고 라운드를 직접 보낸다([design.md](design.md) 2장).
-
-## 남은 확인
-
-확인하지 못한 항목은 [next.md](next.md#확인하지-못한-것)에 모았다.
+- 0.11에서 이 결정을 대체했다. Storm은 OMP 목표·반복 모드에 들어가지 않고 자체 라운드를 보낸다.
 
 ## 재현
 
 - P0: 하네스는 지웠다. 같은 경로는 `npm run e2e`와 `npm run e2e:tui`가 확인한다.
 - B0: [spikes/b0/README.md](../spikes/b0/README.md)
 - M0: [spikes/m0/README.md](../spikes/m0/README.md)
-
-omp를 올린 뒤 같은 시나리오를 다시 돌리고, 결과가 바뀌면 이 문서와 설계 문서를 고친다.
