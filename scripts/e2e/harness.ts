@@ -97,11 +97,16 @@ export function prepare(name: string, defaultPort: number): E2eEnv {
 	// Storm calls `omp` by name for its own subcommands: the binary under test must be the first one on PATH, and
 	// the pinned bun runs it.
 	const path = [dirname(omp), join(ROOT, "node_modules", ".bin"), process.env.PATH ?? ""].join(delimiter);
-	const childEnv: Record<string, string | undefined> = { ...process.env, HOME: home, PATH: path, TERM: "xterm-256color" };
-	// Whatever would move omp's dirs away from HOME, or pick another profile, in the caller's environment.
-	for (const name of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"]) {
-		delete childEnv[name];
-	}
+	// A test profile must only discover the loopback models we register. An isolated HOME is not enough: inherited
+	// provider credentials and native EC2 metadata discovery can still make real models look available.
+	const childEnv: Record<string, string | undefined> = {
+		HOME: home,
+		PATH: path,
+		TERM: "xterm-256color",
+		LANG: process.env.LANG,
+		LC_ALL: process.env.LC_ALL,
+		AWS_EC2_METADATA_DISABLED: "true",
+	};
 	rmSync(work, { recursive: true, force: true });
 	for (const dir of [project, logs, sessionRoot, agentDir]) mkdirSync(dir, { recursive: true });
 	const git = Bun.spawnSync(["git", "init", "-q", project]);
