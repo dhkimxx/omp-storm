@@ -1,17 +1,45 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type Component, getThemeEpoch, matchesKey, parseKey, ScrollView, TabBar, type TUI, theme, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	type SelectItem,
+	SelectList,
+	type SelectListRenderItemContext,
+	getSelectListTheme,
+	getThemeEpoch,
+	matchesKey,
+	parseKey,
+	ScrollView,
+	type SgrMouseEvent,
+	TabBar,
+	type TUI,
+	theme,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
-import { editorKeys, FramedMessageComponent, getTabBarTheme, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
-import { col, keyed, node, span, text } from "@oh-my-pi/pi-tui/native/describe";
+import { editorKeys, FramedMessageComponent, getTabBarTheme, OverlayPanel, row, topBorder } from "@oh-my-pi/pi-tui/chrome";
+import { card, col, keyed, md, node, span, text } from "@oh-my-pi/pi-tui/native/describe";
 import { estimateRows } from "@oh-my-pi/pi-tui/native/measure";
 import type { DescribeContext, NativeNode, NativeScroll, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import { SelectListSheet } from "@oh-my-pi/pi-tui/native/picker";
 import type { ModelBrowserSource } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { type ModelPickerRegistry, ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { toModelInfo } from "./discovery/models.ts";
-import { EFFORTS, type Effort, type InfoLine, type ModelInfo, type StormModelPick, type UiPort } from "./types.ts";
+import {
+	EFFORTS,
+	type Effort,
+	type InfoLine,
+	type ModelInfo,
+	type StormModelPick,
+	type UiChoiceRow,
+	type UiContext,
+	type UiPort,
+} from "./types.ts";
 import { infoSymbol, infoSections, RichFrame } from "./view/info.ts";
+import { visible } from "./view/render.ts";
 
 const REPORT_TYPE = "storm-report";
 /**
@@ -26,7 +54,7 @@ const PANEL_KEY = "storm-panel";
 const SELECTOR_ROWS = 11;
 /** Offered when a choice's context does not fit above the selector, so nothing is decided unseen. */
 const FULL_VIEW = "전체 내용 보기";
-/** Share of the terminal a report overlay may take. */
+/** Share of the terminal a report or selector overlay may take. */
 const OVERLAY_SHARE = 0.85;
 const NOTICE_TITLE = { info: "알림", warning: "경고", error: "오류" } as const;
 const SCROLL_HINT = "↑↓ PgUp PgDn 스크롤 · Esc·Enter·q 닫기";
@@ -151,6 +179,187 @@ class PanelView implements Component {
 
 	invalidate(): void {
 		this.#cache = undefined;
+	}
+}
+
+/** A row's label and detail are config-derived text, so both cross this boundary on one safe line. */
+const rowText = (text: string): string => visible(text.replace(/[\r\n\t]+/g, " ")).trim();
+const FULL_VIEW_KEY = "storm-full-view";
+const FULL_VIEW_ESCAPE = Symbol("storm-full-view");
+type RowAnswer = string | typeof FULL_VIEW_ESCAPE | undefined;
+/** Rows a rows selector takes besides its options: the panel's top and bottom border. */
+const ROWS_CHROME = 2;
+/** Smallest context panel worth stacking above the list; below it the selector keeps the terminal. */
+const PANEL_MIN_ROWS = 6;
+
+/** The labels other hosts get: unique, human, and carrying the detail the TUI draws beside the label. */
+function offeredRowLabels(rows: readonly UiChoiceRow[]): { labels: string[]; values: Map<string, string> } {
+	const labels: string[] = [];
+	const values = new Map<string, string>();
+	for (const row of rows) {
+		const label = rowText(row.label) || rowText(row.value) || "항목";
+		const detail = row.description === undefined ? "" : rowText(row.description);
+		const base = detail.length > 0 ? `${label} — ${detail}` : label;
+		let offered = base;
+		for (let n = 2; values.has(offered); n++) offered = `${base} (${n})`;
+		labels.push(offered);
+		values.set(offered, row.value);
+	}
+	return { labels, values };
+}
+
+/**
+ * One choice list for the TUI, built from omp's own selector primitives. It is one surface: the optional compact
+ * context panel sits above the same list, never beside a second list. Descriptions are inline when the whole
+ * label+detail fits; on a narrow terminal the focused row wraps its complete detail underneath, while the native
+ * sheet always receives the same detail. Esc cancels, Enter chooses, and the native sheet adds its explicit Close.
+ */
+class RowSelectView extends OverlayPanel {
+	readonly #rows: readonly UiChoiceRow[];
+	readonly #context: Omit<UiContext, "consent"> | undefined;
+	readonly #panel: PanelView | undefined;
+	readonly #panelBudget: number;
+	readonly #list: SelectList;
+	readonly #sheet: SelectListSheet;
+	readonly #done: (answer: RowAnswer) => void;
+	#escape: boolean;
+	#fullView: SelectItem | undefined;
+	#panelRows = 0;
+
+	constructor(
+		tui: TUI,
+		title: string,
+		rows: readonly UiChoiceRow[],
+		context: Omit<UiContext, "consent"> | undefined,
+		done: (answer: RowAnswer) => void,
+	) {
+		super(title, "omp.overlay.storm-rows");
+		this.#rows = rows;
+		this.#context = context;
+		this.#done = done;
+		const overlayRows = Math.max(8, Math.floor(tui.terminal.rows * OVERLAY_SHARE));
+		// The focused row may wrap its detail onto more rows; reserve that room here so the list budget cannot clip it.
+		const widestDetail = rows.reduce((widest, row) => {
+			const detail = row.description === undefined ? "" : rowText(row.description);
+			const detailRows =
+				detail.length === 0 ? 1 : wrapTextWithAnsi(detail, Math.max(1, tui.terminal.columns - 6)).length;
+			return Math.max(widest, detailRows);
+		}, 1);
+		const wanted = rows.length + widestDetail + (context === undefined ? 0 : 1);
+		let listRows: number;
+		if (context === undefined) {
+			this.#panelBudget = 0;
+			listRows = Math.max(1, Math.min(wanted, overlayRows - ROWS_CHROME));
+		} else {
+			listRows = Math.max(1, Math.min(wanted, overlayRows - ROWS_CHROME - PANEL_MIN_ROWS));
+			this.#panelBudget = Math.max(PANEL_MIN_ROWS, overlayRows - listRows - ROWS_CHROME);
+			this.#panel = new PanelView(
+				tui,
+				context.title,
+				context.markdown,
+				tui.terminal.rows - this.#panelBudget,
+				context.info,
+			);
+			this.addChild(this.#panel);
+		}
+		this.#escape = this.#panel?.cut() ?? false;
+		this.#list = new SelectList(this.#items(), listRows, getSelectListTheme(), {
+			search: "never",
+			renderItem: (item) => this.#renderRow(item),
+		});
+		this.#list.onSelect = (item) => this.#choose(item);
+		this.#list.onCancel = () => this.#done(undefined);
+		this.addChild(this.#list);
+		this.#sheet = new SelectListSheet(this.#list, {
+			title,
+			icon: "list",
+			noun: "항목",
+			confirm: "선택",
+		});
+	}
+
+	#items(): SelectItem[] {
+		this.#fullView = undefined;
+		const items: SelectItem[] = this.#rows.map((row) => {
+			const description = row.description === undefined ? "" : rowText(row.description);
+			return {
+				value: row.value,
+				label: rowText(row.label) || rowText(row.value) || "항목",
+				...(description.length > 0 ? { description } : {}),
+			};
+		});
+		if (this.#escape) {
+			const fullView: SelectItem = { value: FULL_VIEW_KEY, label: FULL_VIEW };
+			this.#fullView = fullView;
+			items.push(fullView);
+		}
+		return items;
+	}
+
+	#choose(item: SelectItem): void {
+		if (item === this.#fullView) this.#done(FULL_VIEW_ESCAPE);
+		else this.#done(item.value);
+	}
+
+	/** A cut context gets one row in the same list, never a second list of prose. */
+	#syncEscape(): void {
+		if (this.#panel === undefined) return;
+		const cut = this.#panel.cut();
+		if (cut === this.#escape) return;
+		this.#escape = cut;
+		this.#list.setItems(this.#items());
+	}
+
+	#renderRow({ item, selected, hovered, width, theme: listTheme }: SelectListRenderItemContext): readonly string[] {
+		const cursor = listTheme.symbols?.cursor ?? ">";
+		const prefix = selected ? `${cursor} ` : " ".repeat(visibleWidth(cursor) + 1);
+		const room = Math.max(1, width - visibleWidth(prefix));
+		const label = item.label;
+		const detail = item.description ?? "";
+		if (detail.length > 0 && visibleWidth(`${label}  ${detail}`) <= room) {
+			if (selected) return [listTheme.selectedText(`${prefix}${label}  ${detail}`)];
+			const line = `${prefix}${label}${listTheme.description(`  ${detail}`)}`;
+			return [hovered ? (listTheme.hovered?.(line) ?? line) : line];
+		}
+		const head = `${prefix}${truncateToWidth(label, room)}`;
+		const lines = [selected ? listTheme.selectedText(head) : hovered ? (listTheme.hovered?.(head) ?? head) : head];
+		if (selected && detail.length > 0) {
+			const indent = " ".repeat(visibleWidth(prefix));
+			const wrapped = wrapTextWithAnsi(detail, Math.max(1, width - visibleWidth(indent)));
+			for (const part of wrapped) lines.push(listTheme.selectedText(`${indent}${part}`));
+		}
+		return lines;
+	}
+
+	override render(width: number): readonly string[] {
+		this.#syncEscape();
+		this.#panelRows = this.#panel?.render(width).length ?? 0;
+		return super.render(width);
+	}
+
+	override describe(cx: DescribeContext): NativeNode | null {
+		this.#syncEscape();
+		if (this.#context === undefined) {
+			return cx.supports("picker") ? this.#sheet.describe() : super.describe(cx);
+		}
+		const context =
+			this.#panel?.describe(cx) ??
+			col([md(this.#context.markdown)], { max: { h: `${this.#panelBudget}lines` } });
+		return card({ role: this.nativeRole, head: this.title }, [context, this.#list.describe(cx)]);
+	}
+
+	handleInput(data: string): void {
+		this.#list.handleInput(data);
+	}
+
+	handleNativeEvent(event: NativeUiEvent): void {
+		if (this.#context === undefined) this.#sheet.handle(event);
+		else this.#list.handleNativeEvent(event);
+	}
+
+	/** Overlay-local rows start below the top border and any context panel above them. */
+	routeMouse(event: SgrMouseEvent, line: number, col: number): void {
+		this.#list.routeMouse(event, line - 1 - this.#panelRows, col);
 	}
 }
 
@@ -623,6 +832,27 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 				// The whole approval stays in one linear view, regardless of the context's annotations.
 				await openReport(context.title, context.markdown, context.info, false);
 				seen = true;
+			}
+		},
+		selectRows: async (title, rows, context) => {
+			// An empty list has no answer; never open a surface that can only be cancelled.
+			if (rows.length === 0) return undefined;
+			if (!drawsComponents) {
+				// One plain select: labels carry the detail because other hosts draw no row descriptions.
+				const offered = offeredRowLabels(rows);
+				if (context) transcript(context.title, context.markdown);
+				const answer = await ctx.ui.select(title, offered.labels);
+				return answer === undefined ? undefined : offered.values.get(answer);
+			}
+			for (;;) {
+				const answer = await ctx.ui.custom<RowAnswer>(
+					(tui, _theme, _keys, done) => new RowSelectView(tui, title, rows, context, done),
+					{ overlay: true },
+				);
+				if (answer !== FULL_VIEW_ESCAPE) return answer;
+				// Only a cut context offers this row; the whole content stays one linear report, then the list returns.
+				if (context === undefined) return undefined;
+				await openReport(context.title, context.markdown, context.info, false);
 			}
 		},
 		// Outside the TUI a notification may go nowhere (ACP only logs it), and it is the only word on how a flow ended.

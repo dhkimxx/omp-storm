@@ -357,7 +357,7 @@ interface StatusState {
 }
 
 /** The team and consent state an idle status reports; a run's live phase takes precedence over both. */
-function statusState(view: StatusView, resume: boolean): StatusState {
+function statusState(view: StatusView, resume: boolean, resumeAction = true): StatusState {
 	if (view.run) {
 		const phase = view.runPhase ? RUN_APPEARANCE[view.runPhase] : undefined;
 		// Without a phase the record's status is all that is known; a phase name is never invented.
@@ -366,9 +366,10 @@ function statusState(view: StatusView, resume: boolean): StatusState {
 	const team = view.config.status === "missing" ? "missing" : view.config.status === "invalid" ? "invalid" : view.approval ? "approved" : "unapproved";
 	const auto = view.autoDelegation === "on" ? "on" : view.autoDelegation === "blocked" ? "blocked" : "off";
 	const state = idleAppearance({ team, auto, resume });
-	return team === "approved" && auto === "blocked" && view.autoModeProblem !== undefined
-		? { ...state, action: visible(view.autoModeProblem) }
-		: state;
+	if (team === "approved" && auto === "blocked" && view.autoModeProblem !== undefined) return { ...state, action: visible(view.autoModeProblem) };
+	// The hub already offers resume as an action row, so its head never points back at itself; another action stays.
+	if (!resumeAction && resume && team === "approved" && auto !== "blocked") return { label: state.label, tone: state.tone };
+	return state;
 }
 
 function autoStatusText(view: StatusView): string {
@@ -452,22 +453,27 @@ const RESULT_ICON: Record<InfoTone, NonNullable<InfoLine["icon"]>> = {
 	muted: "status.info",
 };
 
-/** The one official-result line every report reader shares; absent for a legacy run with no usable ledger. */
-function resultStatusLine(progress: ResultProgress, prefix = ""): string | undefined {
-	return progress.present ? `- ${prefix}결과(공식): ${progress.headline}` : undefined;
+interface ResultLine {
+	text: string;
+	spans: InfoSpan[];
+	icon: NonNullable<InfoLine["icon"]>;
 }
 
-/** The rich form of `resultStatusLine`: the label and counts are toned by the official disposition, never by workers. */
-function pushResultInfo(info: InfoLine[] | undefined, index: number, progress: ResultProgress, prefix = ""): void {
-	if (info === undefined || !progress.present) return;
-	info.push({
-		index,
+/**
+ * The one official-result line every report reader shares; absent for a legacy run with no usable ledger. Detailed
+ * rows repeat every criterion and id, so above them only the aggregate counts add information. Where no row follows
+ * (the compact brief, the plain widget and the model view), the focus name stays in this line.
+ */
+function resultLine(progress: ResultProgress, options: { prefix?: string; detailed?: boolean } = {}): ResultLine | undefined {
+	if (!progress.present) return undefined;
+	const prefix = options.prefix ?? "";
+	const body = options.detailed === true && progress.rows.length > 0 ? progress.parts.join(" · ") : progress.headline;
+	const label = `- ${prefix}결과(공식): `;
+	return {
+		text: `${label}${body}`,
+		spans: [{ text: label }, { text: body, tone: progress.tone }],
 		icon: RESULT_ICON[progress.tone],
-		spans: [
-			{ text: `- ${prefix}결과(공식): ` },
-			{ text: progress.headline, tone: progress.tone },
-		],
-	});
+	};
 }
 
 /** The round/agents/minutes part of the run details; spend has its own authoritative line and meter. */
@@ -542,11 +548,11 @@ export function renderStatus(
 		out.push("");
 		heading("실행 중", undefined, "status.running");
 		const outcome = resultProgress(run);
-		const outcomeLine = resultStatusLine(outcome);
+		const outcomeLine = resultLine(outcome, { detailed: !model });
 		if (outcomeLine !== undefined) {
 			const index = out.length;
-			out.push(outcomeLine);
-			pushResultInfo(info, index, outcome);
+			out.push(outcomeLine.text);
+			if (info) info.push({ index, icon: outcomeLine.icon, spans: outcomeLine.spans });
 			if (!model) for (const row of outcome.rows) {
 				const tone: InfoTone = row.excluded ? "muted" : row.state === "accepted" ? "success" : row.state === "unmet" && !row.running ? "warning" : "accent";
 				styled([{ text: `- ${resultRowText(row, { includeScope: true })}`, tone }], undefined, RESULT_ICON[tone]);
@@ -770,7 +776,7 @@ export function renderStatus(
 export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine[], resume = false): string {
 	const out: string[] = [];
 	// The hub has the same first line as the full user report: present state, then the next action when there is one.
-	pushStatusHead(out, info, statusState(view, resume), view.newerVersion);
+	pushStatusHead(out, info, statusState(view, resume, false), view.newerVersion);
 	const c = view.config;
 	out.push("");
 	if (view.run) {
@@ -793,11 +799,11 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			});
 		}
 		const outcome = resultProgress(run);
-		const outcomeLine = resultStatusLine(outcome);
+		const outcomeLine = resultLine(outcome);
 		if (outcomeLine !== undefined) {
 			const resultIndex = out.length;
-			out.push(outcomeLine);
-			pushResultInfo(info, resultIndex, outcome);
+			out.push(outcomeLine.text);
+			if (info) info.push({ index: resultIndex, icon: outcomeLine.icon, spans: outcomeLine.spans });
 		}
 		const progress = runProgressParts(run, now);
 		const progressIndex = out.length;
@@ -840,33 +846,26 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			});
 		}
 		const outcome = resultProgress(run);
-		const outcomeLine = resultStatusLine(outcome, "마지막 ");
+		const outcomeLine = resultLine(outcome, { prefix: "마지막 " });
 		if (outcomeLine !== undefined) {
 			const resultIndex = out.length;
-			out.push(outcomeLine);
-			pushResultInfo(info, resultIndex, outcome, "마지막 ");
+			out.push(outcomeLine.text);
+			if (info) info.push({ index: resultIndex, icon: outcomeLine.icon, spans: outcomeLine.spans });
 		}
 	}
 	const team = c.status === "ok" ? `팀 설정 ${shortHash(c.hash)}` : c.status === "missing" ? "팀 설정 없음" : "팀 설정 오류";
 	const approval = view.approval ? "승인됨" : "미승인";
 	const teamIcon: InfoLine["icon"] = view.approval ? "status.success" : c.status === "invalid" ? "status.error" : "status.warning";
 	const teamIndex = out.length;
-	out.push(`- ${team} · ${approval}${view.autoDelegation !== undefined ? ` · 자동 위임: ${autoStatusText(view)}` : ""}`);
+	// The auto state is an independent action row in the menu; this line keeps only the team hash and its approval.
+	out.push(`- ${team} · ${approval}`);
 	if (info) {
-		const auto = view.autoDelegation;
-		const autoTone: InfoTone | undefined = auto === "on" ? "success" : auto === "blocked" ? "warning" : auto === "off" ? "muted" : undefined;
 		info.push({
 			index: teamIndex,
 			icon: teamIcon,
 			spans: [
 				{ text: `- ${team} · ` },
 				{ text: approval, tone: view.approval ? "success" : c.status === "invalid" ? "error" : "warning" },
-				...(auto === undefined
-					? []
-					: [
-							{ text: " · 자동 위임: " },
-							{ text: autoStatusText(view), ...(autoTone !== undefined ? { tone: autoTone } : {}) },
-						]),
 			],
 		});
 	}
@@ -892,10 +891,6 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			});
 		}
 	}
-	const data = view.dataAsOf !== undefined ? `사용 데이터 기준: ${time(view.dataAsOf)} (${age(view.dataAsOf, now)}) · ` : "";
-	const footer = `- ${data}전체 현황은 /storm status`;
-	out.push(footer);
-	if (info) info.push({ index: out.length - 1, icon: "status.info", spans: [{ text: footer, tone: "muted" }] });
 	return out.join("\n");
 }
 
@@ -1016,17 +1011,19 @@ function lastRunLines(run: RunRecord, details: boolean): string[] {
 	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`];
 	// The official result disposition leads a settled run; spawn receipts and plan shape follow it.
 	const progress = resultProgress(run);
-	const outcome = resultStatusLine(progress);
-	if (outcome !== undefined) out.push(outcome);
+	const outcome = resultLine(progress, { detailed: details });
+	if (outcome !== undefined) out.push(outcome.text);
 	if (details) for (const row of progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
 	out.push(`- 스폰: ${spawns}`);
-	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason);
+	// An exception lane row already names the refusal of that exact spawn; only another block adds a reason here.
+	const isolated = isolationRowSpawns(run.plan, run);
+	const blocked = run.spawns.find((s) => s.outcome === "blocked" && s.reason && !isolated.has(s));
 	if (blocked?.reason) out.push(`- 첫 차단: ${visible(blocked.agent)} · ${visible(blocked.reason)}`);
 	if (run.plan) {
 		out.push(`- 계획: 레인 ${run.plan.lanes.length} (${planCounts(run.plan)})`);
-		const isolated = isolationLaneLines(run.plan, run);
+		const isolatedLanes = isolationLaneLines(run.plan, run);
 		const note = isolationNote(run.plan);
-		if (isolated.length) out.push(...isolated);
+		if (isolatedLanes.length) out.push(...isolatedLanes);
 		if (note !== undefined) out.push(note);
 	}
 	if (run.spawns.length > 0) out.push(reviewLine(run.agents ?? []));
@@ -1054,6 +1051,28 @@ function laneIsolationReason(lane: RunPlan["lanes"][number]): string | undefined
 	return reason === "" ? undefined : reason;
 }
 
+/** The latest spawn of each lane: the one an isolation row reports and the block dedup must match. */
+function latestLaneSpawns(run: RunRecord): ReadonlyMap<string, SpawnRecord> {
+	const latest = new Map<string, SpawnRecord>();
+	for (const spawn of run.spawns) {
+		if (spawn.lane !== undefined) latest.set(spawn.lane, spawn);
+	}
+	return latest;
+}
+
+/** The exact blocked spawns whose refusal an exception isolation row already shows; another spawn is not covered. */
+function isolationRowSpawns(plan: RunPlan | undefined, run: RunRecord): ReadonlySet<SpawnRecord> {
+	const shown = new Set<SpawnRecord>();
+	if (plan === undefined) return shown;
+	const latest = latestLaneSpawns(run);
+	for (const lane of plan.lanes) {
+		if (laneIsolationReason(lane) === undefined) continue;
+		const spawn = latest.get(lane.name);
+		if (spawn?.outcome === "blocked") shown.add(spawn);
+	}
+	return shown;
+}
+
 /**
  * The status lines for lanes whose plan keeps their work outside the parent tree. An ordinary plan adds none: sharing
  * the checkout is the default and is not worth a row. A lane is named with its reason and what actually happened,
@@ -1064,15 +1083,16 @@ export function isolationLaneLines(plan: RunPlan, run?: RunRecord): string[] {
 		const reason = laneIsolationReason(lane);
 		return reason === undefined ? [] : [{ lane, reason }];
 	});
+	const latest = run === undefined ? undefined : latestLaneSpawns(run);
 	return lanes.map(({ lane, reason }) => {
-		const latest = run?.spawns.filter(spawn => spawn.lane === lane.name).at(-1);
-		const refusal = latest?.reason?.trim();
+		const spawn = latest?.get(lane.name);
+		const refusal = spawn?.reason?.trim();
 		const state =
-			latest === undefined
+			spawn === undefined
 				? run === undefined || run.status === "running"
 					? "아직 시작 전"
 					: "시작하지 않음"
-				: latest.outcome === "blocked"
+				: spawn.outcome === "blocked"
 					? `시작하지 못함: ${visible(refusal ? refusal : "이유가 기록되지 않았습니다")}`
 					: "분리 체크아웃에서 시작함";
 		return `- 격리 레인: ${visible(lane.name)} — ${visible(reason)} · ${state}`;

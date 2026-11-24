@@ -571,6 +571,66 @@ describe("the live run widget", () => {
 		live.clear();
 	});
 
+	test("a long result criterion leads at 60 and leaves whole lower-priority chips to roomier rows", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		// The real acceptance criterion is long enough that its full result form owns a 60-column metrics row.
+		const criterion = "report what e2e-tracked.txt line 1 says";
+		const run: RunRecord = {
+			...RUN,
+			agents: [agentEntry({ id: "Impl", state: "running" })],
+			plan: {
+				lanes: [
+					{
+						name: "impl",
+						kind: "code",
+						role: "implementer",
+						results: [{ id: "impl-answer", kind: "answer", criterion }],
+					},
+				],
+				workers: { implementer: 1 },
+				submittedAt: "2026-11-20T09:00:00.000Z",
+			},
+			results: [{ id: "impl-answer", lane: "impl", state: "pending" }],
+		};
+		live.show(host.ctx, run, "workers");
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+
+		// Result-first is the whole row here: a shorter result form would fit more chips, but the criterion wins.
+		const compact = plain(component.render(60));
+		expect(compact).toHaveLength(2);
+		expect(compact[0]).toStartWith(`${STORM_MARK} · ${RUN_APPEARANCE.workers.label}`);
+		expect(compact[1]).toBe(`› 🎯 ${criterion} 대기 · 이행 0/1`);
+		expect(visibleWidth(component.render(60)[1]!)).toBeLessThanOrEqual(60);
+		const compactChips = metricChips(children(component.describe!({ ...describeContext, cols: 60 })!)[1]!);
+		expect(compactChips.map(chip => nativeProps(chip).role)).toEqual(["omp.storm.live.results"]);
+		expect(nativeProps(compactChips[0]!).aria).toBe(`결과 ${criterion} (impl-answer) · 이행 0/1 · 대기 1`);
+
+		// With room, the same result still leads; the round, active worker, spend and elapsed chips follow whole.
+		const wide = plain(component.render(120))[1]!;
+		expect(wide).toBe(`› 🎯 ${criterion} 대기 · 이행 0/1 · ↻ 1/4라운드 · 👥 1/1 · 💲 $0.1200/$5.00 · ⏱ 3분`);
+		expect(visibleWidth(component.render(120)[1]!)).toBeLessThanOrEqual(120);
+		const wideChips = metricChips(children(component.describe!({ ...describeContext, cols: 120 })!)[1]!);
+		expect(wideChips.map(chip => nativeProps(chip).role)).toEqual([
+			"omp.storm.live.results",
+			"omp.storm.live.round",
+			"omp.storm.live.workers",
+			"omp.storm.live.cost",
+			"omp.storm.live.time",
+		]);
+
+		// The ASCII preset keeps the same result-first row and readable ASCII cost; no Unicode fallback returns.
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		host.ui.theme = activeTheme;
+		expect(plain(component.render(60))[1]).toBe(`> ${criterion} 대기 · 이행 0/1`);
+		const asciiWide = plain(component.render(120))[1]!;
+		expect(asciiWide).toBe(`> ${criterion} 대기 · 이행 0/1 - loop 1/4라운드 - AG 1/1 - $0.1200/$5.00 - t: 3분`);
+		expect(asciiWide).not.toMatch(/[\u2801-\u28ff≋↻👥💲⏱›]/u);
+		expect(asciiWide).not.toContain("$ $");
+		live.clear();
+	});
+
 	test("an operator-excluded result is visibly listed but never counted in scope", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();

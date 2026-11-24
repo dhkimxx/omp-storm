@@ -19,10 +19,10 @@ import { BROWSE, FIELD, NONE } from "../src/setup/form.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { isApproved, loadProjectState } from "../src/state.ts";
 import type { RunRequestResult } from "../src/tool/host.ts";
-import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
+import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig, UiChoiceRow, UiPort } from "../src/types.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
-import { git, gitRepo, makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject, withSession } from "./support.ts";
+import { type Answer, git, gitRepo, makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject, withSession } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
@@ -42,7 +42,8 @@ const PRIMARY = "주 모델";
 const FALLBACK = "폴백";
 /** The old toggle labels are still the explicit-switch contract; the first approval default is separate. */
 const AUTO = { enable: "자동 위임 켜기", disable: "자동 위임 끄기" } as const;
-const AUTO_MENU = { on: "자동 위임 · 켜짐", off: "자동 위임 · 꺼짐" } as const;
+/** The hub's action label; its state is the row's description, never part of the action. */
+const AUTO_ROW = "자동 위임";
 const AUTO_DISCLOSURE = "승인하면 이 세션의 자동 위임이 켜집니다";
 
 /** An omp catalog row; the real recommender ranks these. */
@@ -69,6 +70,25 @@ beforeEach(async () => {
 	env = { ...project.env, registry: { getAll: () => CATALOG, getAvailable: () => CATALOG } };
 });
 afterEach(() => project.remove());
+
+/** A scripted UI that also answers through the hub's keyed rows and keeps each dialog's real rows. */
+interface RowsUi extends ScriptedUi {
+	rows: UiChoiceRow[][];
+}
+
+function rowsUi(answers: Answer[] = []): RowsUi {
+	const f = scriptedUi(answers);
+	const rows: UiChoiceRow[][] = [];
+	const ui: UiPort = {
+		...f.ui,
+		async selectRows(title, offered, context) {
+			rows.push([...offered]);
+			const answer = await f.ui.select(title, offered.map(row => row.label), context);
+			return offered.find(row => row.label === answer)?.value;
+		},
+	};
+	return { ...f, ui, rows };
+}
 
 /** Storm's own recommendation for this project, carrying over `current`. */
 async function recommended(current?: StormConfig): Promise<StormConfig> {
@@ -913,12 +933,13 @@ describe("automatic delegation", () => {
 
 	test("a team approved outside setup has no saved auto choice; the hub offers the ordinary switch, not a migration", async () => {
 		await approve(TEAM);
-		const f = scriptedUi(["닫기"]);
+		const f = rowsUi(["닫기"]);
 		await hubFlow(env, f.ui);
 		expect(await autoChoice()).toBe("unset");
 		const options = f.selects[0]!.options;
-		expect(options).toEqual(expect.arrayContaining(["팀 다시 설정", "모델 점검", AUTO_MENU.off, "닫기"]));
+		expect(options).toEqual(expect.arrayContaining(["팀 다시 설정", "모델 점검", AUTO_ROW, "닫기"]));
 		expect(options).not.toContain("자동 위임으로 전환");
+		expect(f.rows[0]?.find(row => row.label === AUTO_ROW)?.description).toBe("꺼짐");
 		expect(f.selects[0]?.markdown).not.toContain("결정하면 다시 묻지 않습니다");
 		// The status still says off; an absent choice is never turned into a yes by reading it.
 		const status = scriptedUi();
@@ -998,18 +1019,20 @@ describe("automatic delegation", () => {
 		}
 	});
 
-	test("the hub entry says whether it is on or off and opens the same consent", async () => {
+	test("the hub entry carries the state on its row and opens the same consent", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
-		const f = scriptedUi([THIRD, AUTO.enable]);
+		const f = rowsUi([THIRD, AUTO.enable]);
 		await hubFlow(env, f.ui);
-		expect(f.selects[0]?.options).toContain(AUTO_MENU.off);
+		expect(f.selects[0]?.options).toContain(AUTO_ROW);
+		expect(f.rows[0]?.find(row => row.label === AUTO_ROW)?.description).toBe("꺼짐");
 		expect(f.selects[1]?.options).toEqual([AUTO.enable, CANCEL]);
 		expect(await autoChoice()).toBe("on");
 
-		const g = scriptedUi([THIRD, AUTO.disable]);
+		const g = rowsUi([THIRD, AUTO.disable]);
 		await hubFlow(env, g.ui);
-		expect(g.selects[0]?.options).toContain(AUTO_MENU.on);
+		expect(g.selects[0]?.options).toContain(AUTO_ROW);
+		expect(g.rows[0]?.find(row => row.label === AUTO_ROW)?.description).toBe("켜짐");
 		expect(g.selects[1]?.options).toEqual([AUTO.disable, CANCEL]);
 		expect(await autoChoice()).toBe("off");
 	});
@@ -1176,9 +1199,10 @@ describe("status and agents", () => {
 		expect(full).toContain("켜짐 · 실행 차단");
 		const model = await statusText(blocked, { quota: false });
 		expect(model).not.toContain(reason);
-		const hub = scriptedUi(["닫기"]);
+		const hub = rowsUi(["닫기"]);
 		await hubFlow(blocked, hub.ui);
 		expect(hub.selects[0]?.markdown).toContain(`- 다음: ${reason}`);
+		expect(hub.rows[0]?.find(row => row.label === AUTO_ROW)?.description).toBe("켜짐 · 실행 차단");
 	});
 
 	test("an idle status puts the present state and its real next action before the team sections", async () => {
@@ -1205,12 +1229,14 @@ describe("/storm menu", () => {
 	test("an approved team: the status panel and the menu, with rollback only when an earlier approval exists", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
-		const f = scriptedUi([LAST]);
+		const f = rowsUi([LAST]);
 		expect(await hubFlow(env, f.ui)).toBe(false);
 		expect(f.selects[0]?.options).toHaveLength(6);
 		expect(f.selects[0]?.markdown).toContain(shortHash(configHash(TEAM)));
-		expect(f.selects[0]?.markdown).toContain("자동 위임: 꺼짐");
-		expect(f.selects[0]?.markdown).toContain("저장: Storm 데이터");
+		expect(f.rows[0]?.find(row => row.label === AUTO_ROW)?.description).toBe("꺼짐");
+		expect(f.rows[0]?.find(row => row.label === "전체 현황")?.description).toBe("/storm status");
+		// Storage belongs to /storm status, not this panel: the hub neither shows nor scans it.
+		expect(f.selects[0]?.markdown).not.toContain("저장:");
 		expect(f.selects[0]?.markdown).not.toContain("b/r");
 		// No resume pointer: the hub does not claim a resumable run.
 		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
@@ -1229,10 +1255,10 @@ describe("/storm menu", () => {
 
 	test("전체 현황 opens the full read-only status without deciding automatic delegation", async () => {
 		await approve(TEAM);
-		const f = scriptedUi(["전체 현황"]);
+		const f = rowsUi(["전체 현황"]);
 		await hubFlow(env, f.ui);
 		expect(f.selects).toHaveLength(1);
-		expect(f.selects[0]?.options).toContain("전체 현황");
+		expect(f.rows[0]?.find(row => row.label === "전체 현황")?.description).toBe("/storm status");
 		expect(f.reports).toHaveLength(1);
 		expect(f.reports[0]?.markdown).toContain("### 역할별 모델");
 		expect(f.reports[0]?.markdown).toContain("### 저장 공간");
@@ -1546,24 +1572,54 @@ describe("resuming the last run", () => {
 		};
 	};
 
-	test("a resumable last run is the menu's first option, with one panel line about it", async () => {
+	test("a resumable last run is the menu's first option, described once on its row", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
 		const run = resumable();
 		await plant(run);
 		const started: RunSpec[] = [];
-		const f = scriptedUi([FIRST]);
+		const f = rowsUi([FIRST]);
 		await hubFlow({ ...env, startRun: starter(started) }, f.ui);
 		// One option more than the menu without a resumable run, and it comes first.
 		expect(f.selects[0]?.options).toHaveLength(7);
 		expect(started).toEqual([{ task: run.request!, resumeOf: run.runId }]);
-		const about = f.selects[0]?.markdown?.split("\n").filter(line => line.includes("resume-unique-request")) ?? [];
-		expect(about).toHaveLength(1);
+		const resumeRow = f.rows[0]?.find(row => row.label === "끝나지 않은 실행 이어 가기");
+		expect(resumeRow?.description).toContain("resume-unique-request");
+		expect(resumeRow?.description).toContain("사용자가 중단");
+		// The same run is the latest finished one, so it is not repeated above the menu as last-run data.
+		expect(f.selects[0]?.markdown).not.toContain("resume-unique-request");
+		expect(f.selects[0]?.markdown).not.toContain(run.runId);
 		// The trusted resume candidate is the hub's present state; no second lookup invents it.
 		expect(f.selects[0]?.markdown?.split("\n")[0]).toStartWith(STORM_MARK);
 		expect(f.selects[0]?.markdown).toContain("이어가기 가능");
-		expect(f.selects[0]?.markdown).toContain("- 다음: `/storm`에서 이어가기");
 		expect(f.notices).toEqual([]);
+	});
+
+	test("a newer finished run stays visible when an older one is the resume candidate", async () => {
+		await approve(TEAM);
+		await settleAuto(false);
+		const older = resumable();
+		await plant(older);
+		const newer = runRecord({
+			runId: "run-20261119-120000-bbbb",
+			startedAt: "2026-11-19T12:00:00.000Z",
+			endedAt: "2026-11-19T12:30:00.000Z",
+			status: "done",
+			endReason: "verified",
+			turns: 3,
+			maxRounds: 4,
+			task: "newer-done",
+			request: "newer-done",
+		});
+		await writeRun((await load()).sessionDir, newer);
+		const f = rowsUi([LAST]);
+		await hubFlow({ ...env, startRun: starter([]) }, f.ui);
+		expect(f.selects[0]?.options).toHaveLength(7);
+		// The most recent finished run is shown, even though an older run is the one to continue.
+		expect(f.selects[0]?.markdown).toContain(newer.runId);
+		const resumeRow = f.rows[0]?.find(row => row.label === "끝나지 않은 실행 이어 가기");
+		expect(resumeRow?.description).toContain("resume-unique-request");
+		expect(resumeRow?.description).toContain("사용자가 중단");
 	});
 
 	test("a resume chosen or requested after a switch is not started", async () => {

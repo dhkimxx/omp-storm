@@ -79,6 +79,14 @@ export interface InfoLine {
 	emphasis?: "title" | "action";
 }
 
+/** One row of a rich choice list: a stable value, the human label, and the detail a person chooses by. */
+export interface UiChoiceRow {
+	/** Returned as-is when this row is chosen; never shown. */
+	value: string;
+	label: string;
+	description?: string;
+}
+
 /** Shown with a choice while it is open (TUI: a panel above the selector, gone once it closes); other hosts get a transcript message. */
 export interface UiContext {
 	title: string;
@@ -104,6 +112,18 @@ export interface StormModelPick {
 export interface UiPort {
 	/** Resolves to the chosen label, or undefined when cancelled or when no UI can answer. */
 	select(title: string, options: string[], context?: UiContext): Promise<string | undefined>;
+	/**
+	 * Selects one row and resolves to its stable `value`, never its label. TUI: omp's own list overlay with each row's
+	 * description (the focused row wraps its detail on a narrow terminal); other hosts: one `ctx.ui.select` over
+	 * unique human labels that include the descriptions. `context` is shown as the same panel a select shows; it is
+	 * for compact hub menus only and never carries consent. Optional so a test or alternate UI can fall back to
+	 * {@link select}; `createUiPort` always provides it.
+	 */
+	selectRows?(
+		title: string,
+		rows: readonly UiChoiceRow[],
+		context?: Omit<UiContext, "consent">,
+	): Promise<string | undefined>;
 	/** An outcome notice. TUI: omp's notification line; other hosts: a transcript message (never sent to the model). */
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 	/** A view to read and close. TUI: a scrollable overlay that leaves nothing in the transcript; other hosts: a transcript message. Resolves once closed. */

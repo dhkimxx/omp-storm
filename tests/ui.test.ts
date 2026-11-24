@@ -781,6 +781,83 @@ describe("TUI", () => {
 	});
 });
 
+describe("rich rows", () => {
+	const ROWS = [
+		{ value: "explorer:1", label: "탐색 · 폴백", description: "b/z · low" },
+		{ value: "explorer:0", label: "탐색 · 주 모델", description: "a/x · low" },
+	];
+
+	test("other hosts get unique labels that carry the detail, and the stable value comes back", async () => {
+		const host = fakeHost({ mode: "rpc", hasUI: true, answers: [options => options[1]] });
+		const ui = createUiPort(host.pi, host.ctx);
+		const rows = [...ROWS, { value: "explorer:2", label: "탐색 · 폴백", description: "b/z · low" }];
+		expect(await ui.selectRows?.("고르기", rows, CONTEXT)).toBe("explorer:0");
+		expect(host.selects).toHaveLength(1);
+		expect(host.selects[0]!.options).toEqual([
+			"탐색 · 폴백 — b/z · low",
+			"탐색 · 주 모델 — a/x · low",
+			"탐색 · 폴백 — b/z · low (2)",
+		]);
+		expect(host.sent).toHaveLength(1);
+		expect(String(host.sent[0]!.message.content)).toContain("two");
+		expect(host.panelSet()).toBe(false);
+	});
+
+	test("the TUI rows overlay chooses by value and Esc cancels", async () => {
+		for (const key of ["\r", "\x1b"]) {
+			const host = fakeHost({
+				mode: "tui",
+				hasUI: true,
+				rows: 24,
+				driveOverlay(view, lines) {
+					const text = stripTerminalSequences(lines.join("\n"));
+					expect(text).toContain("a/x · low");
+					expect(text).toContain("b/z · low");
+					view.handleInput?.(key);
+				},
+			});
+			const ui = createUiPort(host.pi, host.ctx);
+			expect(await ui.selectRows?.("고르기", ROWS)).toBe(key === "\r" ? "explorer:1" : undefined);
+			expect(host.sent).toEqual([]);
+		}
+	});
+
+	test("a narrow terminal wraps the focused row's complete detail instead of dropping it", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 16,
+			columns: 30,
+			driveOverlay(view, lines) {
+				const text = stripTerminalSequences(lines.join("\n"));
+				expect(text).toContain("example/");
+				expect(text).toContain("xhigh");
+				view.handleInput?.("\x1b");
+			},
+		});
+		const ui = createUiPort(host.pi, host.ctx);
+		const rows = [{ value: "explorer:0", label: "탐색 · 주 모델", description: "example/very-long-model · xhigh" }];
+		expect(await ui.selectRows?.("고르기", rows)).toBeUndefined();
+	});
+
+	test("a compact context sits once above the same rows", async () => {
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 30,
+			driveOverlay(view, lines) {
+				const text = stripTerminalSequences(lines.join("\n"));
+				expect(text).toContain("two");
+				expect(text).toContain("a/x · low");
+				view.handleInput?.("\x1b");
+			},
+		});
+		const ui = createUiPort(host.pi, host.ctx);
+		expect(await ui.selectRows?.("고르기", ROWS, CONTEXT)).toBeUndefined();
+		expect(host.sent).toEqual([]);
+	});
+});
+
 describe("rich metadata", () => {
 	const MARKDOWN = ["### 요약", "- 대기 중: 3개", "", "- 지출: $0.42 (예산 $5.00)", "일반 문단 **강조**"].join("\n");
 	const INFO: InfoLine[] = [

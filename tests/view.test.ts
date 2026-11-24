@@ -516,12 +516,96 @@ describe("status", () => {
 		const info: InfoLine[] = [];
 		const brief = renderStatusBrief(full, NOW, info);
 		expect(brief).toContain(shortHash(hash));
-		for (const part of ["실행 중: run-1", "마지막 실행: run-0", "승인됨", "자동 위임: 켜짐", "시험 사용 1건", "/storm status"]) expect(brief).toContain(part);
+		for (const part of ["실행 중: run-1", "마지막 실행: run-0", "승인됨", "시험 사용 1건"]) expect(brief).toContain(part);
 		for (const part of ["a/x → b/z", "컨텍스트 상한", "prov-q"]) expect(brief).not.toContain(part);
+		// The menu's auto row and its "전체 현황" action carry these; the panel keeps only the independent hash/approval.
+		expect(brief).not.toContain("자동 위임");
+		expect(brief).not.toContain("/storm status");
+		expect(brief).not.toContain("사용 데이터 기준");
 		expect(info[0]).toMatchObject({ index: 0, emphasis: "title" });
 		expect(info.every(line => line.section === undefined)).toBe(true);
 		expect(brief.split("\n").length).toBeLessThan(renderStatus(full, NOW).split("\n").length / 2);
 		expect(brief).not.toMatch(ISO_UTC);
+	});
+
+	test("the hub leaves auto state to its menu row and does not point back at itself for resume", () => {
+		const info: InfoLine[] = [];
+		const resume = renderStatusBrief(view({ autoDelegation: "off", dataAsOf: NOW - 60_000 }), NOW, info, true);
+		expect(resume).toContain("이어가기 가능");
+		expect(resume).not.toContain("- 다음:");
+		expect(info.some(line => line.emphasis === "action")).toBe(false);
+		// The menu already has the auto row and the full-status action; the panel repeats neither.
+		expect(resume).not.toContain("자동 위임");
+		expect(resume).not.toContain("사용 데이터 기준");
+		expect(resume).not.toContain("전체 현황은 /storm status");
+
+		// A blocked auto state is not the resume action, so its real reason survives; without a separate reason the
+		// status link stays as the actionable warning, never as a footer.
+		const blocked = renderStatusBrief(view({ autoDelegation: "blocked", autoModeProblem: "자동 위임을 막는 설정" }), NOW, undefined, true);
+		expect(blocked).toContain("- 다음: 자동 위임을 막는 설정");
+		expect(renderStatusBrief(view({ autoDelegation: "blocked" }), NOW, undefined, true)).toContain("- 다음: `/storm status`에서 이유 확인");
+		const unapproved = renderStatusBrief(view({ approval: undefined }), NOW, undefined, true);
+		expect(unapproved).toContain("- 다음: `/storm`에서 팀 승인");
+	});
+
+	test("a detailed result section states each criterion and id once; its summary above is only the aggregate", () => {
+		const results: NonNullable<RunRecord["results"]> = [
+			{ id: "api-check", lane: "api", state: "unmet", reason: "응답 계약이 다릅니다", contract: { id: "api-check", kind: "answer", criterion: "API 검증" } },
+			{ id: "docs", lane: "api", state: "accepted", contract: { id: "docs", kind: "answer", criterion: "API 문서" } },
+		];
+		const active = runRecord({ status: "running", results });
+		const settled = { ...active, runId: "run-0", status: "done" as const };
+		const info: InfoLine[] = [];
+		const md = renderStatus(view({ run: active }), NOW, "user", info);
+		expect(md).toContain("- 결과(공식): 이행 1/2 · 미충족 1");
+		expect(md).toContain("- API 검증 [api-check] [api] 미충족 — 응답 계약이 다릅니다");
+		expect(md).toContain("- API 문서 [docs] [api] 이행");
+		const summary = info.find(line => line.spans.some(span => span.text.includes("결과(공식)")))!;
+		expect(md.split("\n")[summary.index]).toBe(summary.spans.map(span => span.text).join(""));
+		expect(md.split("\n")[summary.index]).toBe("- 결과(공식): 이행 1/2 · 미충족 1");
+
+		const both = renderStatus(view({ run: active, lastRun: settled }), NOW);
+		// Once in the active row, once in the settled row; neither summary repeats the focus.
+		const activeSection = both.slice(both.indexOf("### 실행 중"), both.indexOf("### 마지막 실행"));
+		const settledSection = both.slice(both.indexOf("### 마지막 실행"));
+		for (const section of [activeSection, settledSection]) {
+			expect(section).toContain("- 결과(공식): 이행 1/2 · 미충족 1\n");
+		}
+		expect(activeSection.match(/API 검증/g)).toHaveLength(1);
+		expect(settledSection.match(/API 검증/g)).toHaveLength(1);
+		expect(both.match(/api-check/g)).toHaveLength(2);
+
+		// No rows follow in the model view, the brief or the plain widget, so each keeps the focus name once.
+		const model = renderStatus(view({ run: active, lastRun: settled }), NOW, "model");
+		expect(model.match(/API 검증 \(api-check\)/g)).toHaveLength(2);
+		expect(model).not.toContain("응답 계약이 다릅니다");
+		const brief = renderStatusBrief(view({ run: active, lastRun: settled }), NOW);
+		expect(brief).toContain("- 결과(공식): API 검증 (api-check) · 이행 1/2 · 미충족 1");
+		expect(brief).toContain("- 마지막 결과(공식): API 검증 (api-check) · 이행 1/2 · 미충족 1");
+		expect(brief).not.toContain("응답 계약이 다릅니다");
+		expect(runStatusText(active, NOW)).toContain("결과 API 검증 (api-check) · 이행 1/2 · 미충족 1");
+	});
+
+	test("a settled run drops a repeated refusal only when an exception lane row reports the same spawn", () => {
+		const lane = { name: "격리 실험", kind: "code" as const, role: "implementer", goal: "compare", isolationReason: "별도 체크아웃에서만 비교" };
+		const plan: RunPlan = { lanes: [lane], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		const covered = spawnRecord({ lane: lane.name, agent: "storm-implementer", outcome: "blocked", reason: "omp 격리가 꺼져 있습니다" });
+		const other = spawnRecord({ lane: "본선", agent: "storm-reviewer", outcome: "blocked", reason: "예산 상한을 넘었습니다" });
+		const md = renderStatus(view({ lastRun: runRecord({ status: "done", plan, spawns: [covered, other] }) }), NOW);
+		expect(md).toContain("- 격리 레인: 격리 실험 — 별도 체크아웃에서만 비교 · 시작하지 못함: omp 격리가 꺼져 있습니다");
+		expect(md.match(/omp 격리가 꺼져 있습니다/g)).toHaveLength(1);
+		expect(md).toContain("- 첫 차단: storm-reviewer · 예산 상한을 넘었습니다");
+		expect(md).toContain("- 스폰: 차단 2");
+
+		const only = renderStatus(view({ lastRun: runRecord({ status: "done", plan, spawns: [covered] }) }), NOW);
+		expect(only).not.toContain("첫 차단");
+		// A lane without its own isolation reason has no row to carry the refusal, so the block row stays.
+		const sharedLane = { name: lane.name, kind: lane.kind, role: lane.role, goal: lane.goal };
+		const shared = renderStatus(
+			view({ lastRun: runRecord({ status: "done", plan: { ...plan, lanes: [sharedLane] }, spawns: [covered] }) }),
+			NOW,
+		);
+		expect(shared).toContain("- 첫 차단: storm-implementer · omp 격리가 꺼져 있습니다");
 	});
 
 	test("the hub greens approval only when it exists and marks a real warning in the notes", () => {

@@ -161,22 +161,23 @@ async function stepEffort(tui: Tui, level: string): Promise<void> {
 	await tui.press(KEY.right, painted => pickerLevel(painted) === level, `the picker to show effort ${level}`, 10_000);
 }
 
-/** A replaced selector's unchanged footer may be absent from the PTY delta. The rows themselves are enough to pick. */
+/** Native rich menus can put the row description next to the label or below the focused row. */
+async function pickMenuRow(tui: Tui, from: number, title: string, label: string): Promise<number> {
+	let current = await tui.seen(from, text => text.includes(title) ? focused(text) : undefined, `the ${title} menu`, 15_000);
+	for (let move = 0; !current.startsWith(label); move++) {
+		if (move === 20) throw new Error(`${title} did not offer ${label}`);
+		const previous = current;
+		const mark = await tui.press(KEY.down, text => {
+			const next = focused(text);
+			return next !== undefined && next !== previous;
+		}, `the next row in ${title}`, 8_000);
+		current = focused(tui.text(mark))!;
+	}
+	return tui.send(KEY.enter);
+}
+
 async function openExplorerPrimary(tui: Tui, from: number): Promise<number> {
-	const slot = "탐색 · 주 모델";
-	const options = await tui.seen(
-		from,
-		text => {
-			const start = text.indexOf("바꿀 모델 슬롯을 고르세요");
-			if (start < 0) return undefined;
-			const rows = [...text.slice(start).matchAll(/^│ +(?:❯ +)?([^│\n]+?) +│/gm)].map(match => match[1]!.trim()).filter(Boolean);
-			const end = rows.indexOf(slot);
-			return end >= 0 ? rows.slice(0, end + 1) : undefined;
-		},
-		"the slot menu to list the explorer's primary model",
-		15_000,
-	);
-	return tui.pick(options, slot);
+	return pickMenuRow(tui, from, "바꿀 모델 슬롯을 고르세요", "탐색 · 주 모델");
 }
 
 /** A key typed into the focused field of a form, and the repaint that shows omp took it. */
@@ -270,9 +271,8 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 		if (background === "dark") {
 			const hub = await tui.submit("/storm");
-			const choices = await tui.selector(hub);
-			check("the narrow hub offers the full dashboard without putting model rows above the menu", choices.includes("전체 현황") && !tui.text(hub).includes("fake/general-b →"));
-			const full = await tui.pick(choices, "전체 현황");
+			const full = await pickMenuRow(tui, hub, "Storm 메뉴", "전체 현황");
+			check("the narrow hub reaches the dashboard without a second link above the menu", !tui.text(hub).includes("전체 현황은 /storm status"));
 			await tui.shows(OVERLAY_HINT, full);
 			const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the storage tab to show its actual inventory");
 			const storageReport = tui.text(storage);
@@ -296,7 +296,54 @@ async function asciiDashboard(): Promise<void> {
 	const original = readFileSync(profile, "utf8");
 	writeFileSync(profile, `${original.trimEnd()}\nsymbolPreset: ascii\n`);
 	const columns = 60;
-	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, resume: ownedSession.id, sessionDir: ownedSession.dir });
+	const resume = ownedSession;
+	const resultPrefix = `> report what ${TRACKED_FILE} line 1 says `;
+
+	/**
+	 * At 60 columns the result form intentionally owns the metrics row; the same run at 120 proves the ASCII round,
+	 * worker and spend chips while a worker is genuinely active. Both rows are measured at their real terminal width.
+	 */
+	async function asciiWideWorkerChips(): Promise<void> {
+		const wideColumns = 120;
+		const wide = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns: wideColumns, rows: 30, resume: resume.id, sessionDir: resume.dir });
+		try {
+			await readyForSubmission(wide);
+			const before = files.runIds();
+			const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "AsciiWide", say: `E2E-CHILD-DELAY 2500 ${readProbe}` }, { awaitChild: true }];
+			const started = await wide.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+			const chips = await wide.seen(started, text => {
+				const row = metricsRow(text, "ascii");
+				return row && /\bAG\s*1\/1\b/.test(row) && /\$0\.\d+\/\$0\.\d+\b/.test(row) ? row : undefined;
+			}, "the 120-column ASCII row with an active worker and spend", 20_000);
+			const parts = chips.split(" - ");
+			const result = parts[0]!;
+			const loop = parts[1];
+			const workers = parts[2];
+			const cost = parts[3];
+			const elapsed = parts[4];
+			check(
+				"the wider ASCII row leads with the result and keeps round, active workers and spend whole",
+				result.startsWith(resultPrefix) &&
+					/(?:(?:대기|진행 중|미충족|검토 가능) · )?이행 \d\/1$/.test(result.slice(resultPrefix.length)) &&
+					loop === "loop 1/4라운드" &&
+					workers === "AG 1/1" &&
+					cost !== undefined && /^\$0\.\d+\/\$0\.\d+$/.test(cost) &&
+					elapsed !== undefined && /^t: \d+분$/.test(elapsed),
+				chips,
+			);
+			check(
+				"the wider ASCII chips fit without Braille, emoji or a duplicated currency sign",
+				Bun.stringWidth(chips) <= wideColumns && !/[\u2800-\u28ff≋↻👥💲⏱›]/u.test(chips) && !/\$\s+\$/.test(chips),
+				chips,
+			);
+			await files.finishedRun(before, 30_000);
+		} finally {
+			await wide.close();
+		}
+	}
+
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, resume: resume.id, sessionDir: resume.dir });
+	let closed = false;
 	try {
 		await readyForSubmission(tui);
 		const before = files.runIds();
@@ -304,12 +351,26 @@ async function asciiDashboard(): Promise<void> {
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 		const displayed = await tui.seen(started, text => {
 			const state = text.split("\n").findLast(line => line.includes("STORM") && line.includes(RUN_APPEARANCE.workers.label));
-			const chips = metricsRow(text, "ascii");
-			return state && chips && /\bAG\s*1\/1\b/.test(chips) ? { state: state.trim(), chips } : undefined;
-		}, "the 60-column Storm phase and OMP ASCII count chips", 20_000);
-		check("the ASCII preset uses readable count chips and no Braille radar", !/[\u2800-\u28ff]/u.test(displayed.state) && !displayed.chips.includes("👥"), `${displayed.state} / ${displayed.chips}`);
+			const chips = text
+				.split("\n")
+				.map(line => line.trim())
+				.findLast(line => line.startsWith(resultPrefix) && /(?:(?:대기|진행 중) · 이행 0\/1|이행 1\/1)$/.test(line));
+			return state && chips ? { state: state.trim(), chips } : undefined;
+		}, "the 60-column Storm phase and result-first ASCII status", 20_000);
+		check(
+			"the 60-column ASCII row proves the result focus and official state without clipping a lower-priority chip",
+			displayed.chips.startsWith(resultPrefix) &&
+				/(?:(?:대기|진행 중) · 이행 0\/1|이행 1\/1)$/.test(displayed.chips.slice(resultPrefix.length)),
+			displayed.chips,
+		);
+		check(
+			"the ASCII preset uses its own mark, phase and radar without Braille",
+			displayed.state.startsWith(`~ STORM - ${RUN_APPEARANCE.workers.label}`) &&
+				!/[\u2800-\u28ff]/u.test(displayed.state) &&
+				/\[[ -~]{18}\]$/.test(displayed.state),
+			`${displayed.state} / ${displayed.chips}`,
+		);
 		check("the measured ASCII rows fit the actual terminal", [displayed.state, displayed.chips].every(line => Bun.stringWidth(line) <= columns), displayed.chips);
-		check("the ASCII cost chip uses one leading currency sign", /\$\s*0\.\d+\/\$\d/.test(displayed.chips) && !/\$\s+\$/.test(displayed.chips), displayed.chips);
 		const run = await files.finishedRun(before, 30_000);
 		check("the ASCII view run retains its answer without claiming the code check",
 			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes");
@@ -318,8 +379,12 @@ async function asciiDashboard(): Promise<void> {
 		const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the ASCII status storage tab");
 		check("the ASCII tab uses the host's warning symbol, not a Unicode glyph", /\[!\][^\n]*(측정 불가|집계 누락|일부 누락)/.test(tui.text(storage)));
 		tui.send(KEY.enter);
-	} finally {
 		await tui.close();
+		closed = true;
+		// The live chips do not fit behind this 60-column result; prove their ASCII values at a width that holds them.
+		await asciiWideWorkerChips();
+	} finally {
+		if (!closed) await tui.close();
 		writeFileSync(profile, original);
 	}
 }
@@ -448,15 +513,18 @@ async function main(): Promise<void> {
 		240_000,
 	);
 
-	await suite.step("one approved Storm slot can change effort without walking the interview", async () => {
+	await suite.step("setup: one approved Storm slot can change effort without walking the interview", async () => {
 		await session(async (tui, files) => {
 			const before = files.config();
 			const approvals = files.approvals().length;
 			const bytes = files.configBytes();
 			const llm = new LlmCursor(env);
-			const chooseDirect = await answer(tui, await tui.submit("/storm"), DIRECT_MODEL);
+			const hub = await tui.submit("/storm");
+			const chooseDirect = await pickMenuRow(tui, hub, "Storm 메뉴", DIRECT_MODEL);
 			const openSlot = async (from: number, level: string): Promise<void> => {
 				const opened = await openExplorerPrimary(tui, from);
+				const slot = tui.text(from).split("\n").find(line => line.includes("탐색 · 주 모델") && line.includes(OUTSIDE));
+				check("the model slot row carries its model and effective draft effort without a second list", slot !== undefined && slot.includes(level) && !tui.text(from).includes("지금 슬롯"), slot ?? tui.text(from).slice(-400));
 				await tui.seen(
 					opened,
 					text => (text.includes("Storm 모델 선택") && text.includes(OUTSIDE) && pickerLevel(text) === level ? true : undefined),

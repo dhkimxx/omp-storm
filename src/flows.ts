@@ -36,11 +36,11 @@ import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
 import { assertSessionStoreSafe, sessionStoreDir } from "./session-scope.ts";
 import { BROWSE, commonSettingsForm, effortForm, FIELD, type FormRetry, interviewRoles, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, setupConfig, subagentShares } from "./setup/form.ts";
-import { applySlotPick, entryForPick, modelSlots, slotCurrent } from "./setup/model-draft.ts";
+import { applySlotPick, entryForPick, modelSlotRows, slotCurrent } from "./setup/model-draft.ts";
 import { type ModelEntry } from "./selector.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult } from "./tool/host.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, Proposal, ProposalKind, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, Proposal, ProposalKind, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiChoiceRow, UiContext, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -426,27 +426,18 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
 	const kind: ProposalKind = isApproved(opts.state) ? "reselect" : "setup";
 	let draft = base;
 	while (true) {
-		const slots = modelSlots(draft);
+		const slots = modelSlotRows(draft);
 		if (!slots.length) {
 			ui.notify("바꿀 모델 슬롯이 없습니다.", "warning");
 			return false;
 		}
-		const choice = await ui.select("바꿀 모델 슬롯을 고르세요", [...slots.map((slot) => slot.label), CANCEL], {
-			title: `${STORM_MARK} · ${EDIT_MODELS}`,
-			markdown: [
-				"### 지금 슬롯",
-				...slots.map((slot) => {
-					const now = slotCurrent(draft.roles[slot.roleId], slot.index);
-					return visible(`- ${slot.label}: ${now ? [now.selector, ...(now.effort ? [now.effort] : [])].join(" · ") : "없음"}`);
-				}),
-			].join("\n"),
-		});
+		const choice = await selectChoiceRow(ui, "바꿀 모델 슬롯을 고르세요", [...slots, { value: "cancel", label: CANCEL }]);
 		if (stopIfStale(env, ui)) return false;
-		if (choice === undefined || choice === CANCEL) {
+		if (choice === undefined || choice === "cancel") {
 			ui.notify("모델·effort를 바꾸지 않았습니다.");
 			return false;
 		}
-		const slot = slots.find((candidate) => candidate.label === choice);
+		const slot = slots.find((candidate) => candidate.value === choice);
 		if (!slot) continue;
 		const picked = await pickModel(slot.label, slotCurrent(draft.roles[slot.roleId], slot.index));
 		if (stopIfStale(env, ui)) return false;
@@ -658,10 +649,11 @@ export async function autoDelegationFlow(env: FlowEnv, ui: UiPort): Promise<void
 
 /**
  * What the status shows. `user`: also what only the user's views need: omp settings advice and a newer installed
- * version (their fixes are commands for the user to run) and the storage line. Quota takes a CLI call, so only the
- * full report reads it. `trials` reuses views already computed.
+ * version (their fixes are commands for the user to run). `storage`: the read-only inventory, read only by the full
+ * report; the hub does not scan it. Quota also takes a CLI call, so only the full report reads that. `trials` reuses
+ * views already computed.
  */
-async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: boolean; user: boolean; trials?: TrialView[] }): Promise<StatusView> {
+async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: boolean; user: boolean; storage?: boolean; trials?: TrialView[] }): Promise<StatusView> {
 	const now = env.now();
 	const root = state.repo.root;
 	const config = state.config.status === "ok" ? state.config.config : undefined;
@@ -671,7 +663,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 		lastRun(state.sessionDir),
 		opts.trials ?? (config ? trialViews(env, state.sessionDir, config, now) : []),
 		opts.user ? env.ompSettings?.() : undefined,
-		opts.user
+		opts.storage
 			? readStorage(state.sessionDir, join(env.agentDir, "sessions"), {
 					...(env.ompSessionDir ? { ompSessionDir: env.ompSessionDir } : {}),
 					cleanup: config?.cleanup === true,
@@ -716,7 +708,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
  */
 async function statusMarkdown(env: FlowEnv, opts: { quota: boolean }, info?: InfoLine[]): Promise<string> {
 	const state = await loadProjectState(env);
-	const view = await statusView(env, state, { quota: opts.quota, user: opts.quota });
+	const view = await statusView(env, state, { quota: opts.quota, user: opts.quota, storage: opts.quota });
 	const body = renderStatus(view, env.now(), opts.quota ? "user" : "model", info);
 	return opts.quota ? `${body}\n\n### 적용 범위\n- ${targetScopeLine(state.repo.root)}` : body;
 }
@@ -917,14 +909,59 @@ const MENU = {
 	setup: "팀 다시 설정",
 	models: "모델 점검",
 	agents: "서브에이전트",
+	auto: "자동 위임",
 	status: "전체 현황",
 	rollback: "이전 승인으로 되돌리기",
 	reset: "초기화",
 	close: "닫기",
 } as const;
 
-/** The hub's automatic-delegation entry says whether it is on or off; both open the same flow. */
-const AUTO_MENU = { on: "자동 위임 · 켜짐", off: "자동 위임 · 꺼짐" } as const;
+/**
+ * The hub's actions, stable across label and description changes. A row's value is dispatched here; its label and
+ * description only say what the row does and show the state it acts on.
+ */
+const HUB = {
+	resume: "resume",
+	setup: "setup",
+	editModels: "edit-models",
+	models: "models",
+	agents: "agents",
+	auto: "auto",
+	rollback: "rollback",
+	reset: "reset",
+	status: "status",
+	close: "close",
+} as const;
+
+/** The automatic-delegation row's description: the saved choice and whether it can run now. It never toggles. */
+function autoRowText(view: StatusView): string {
+	if (view.autoDelegation === "on") return "켜짐";
+	if (view.autoDelegation !== "blocked") return "꺼짐";
+	return view.autoModeProblem === undefined ? "켜짐 · 팀 승인 대기" : "켜짐 · 실행 차단";
+}
+
+/**
+ * Use keyed rows on the native UI and map the simple selector's labels on ports without that surface.
+ */
+async function selectChoiceRow(
+	ui: UiPort,
+	title: string,
+	rows: readonly UiChoiceRow[],
+	context?: Omit<UiContext, "consent">,
+): Promise<string | undefined> {
+	if (ui.selectRows) return ui.selectRows(title, rows, context);
+	const chosen = await ui.select(title, rows.map(row => row.label), context);
+	return rows.find(row => row.label === chosen)?.value;
+}
+
+/**
+ * The hub's status projection. When the resume candidate is also the latest finished run, its last-run line is
+ * dropped here: the resume row already describes that one run, and the panel must not repeat it.
+ */
+function hubStatusView(view: StatusView, resume: RunRecord | undefined): StatusView {
+	const { lastRun, ...rest } = view;
+	return lastRun !== undefined && resume !== undefined && lastRun.runId === resume.runId ? rest : view;
+}
 
 /** This session's config does not validate: every error in view, and the ways out. Setup starts only when picked. */
 async function invalidFlow(env: FlowEnv, ui: UiPort, state: ProjectState, errors: readonly string[]): Promise<void> {
@@ -1023,38 +1060,43 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	}
 	// The trial dialog may already have reported a switch; never build or act on its menu afterwards.
 	if (!env.stillOwner()) return false;
-	const [view, rollbacks, resume, autoChoice] = await Promise.all([
+	const [view, rollbacks, resume] = await Promise.all([
 		statusView(env, state, { quota: false, user: true, ...(trials ? { trials } : {}) }),
 		rollbackOptions(state),
 		env.startRun ? findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }) : undefined,
-		savedAutoChoice(state),
 	]);
-	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, ...(ui.pickModel ? [EDIT_MODELS] : []), MENU.models];
+	const rows: UiChoiceRow[] = [];
+	// The trusted candidate from the same read as the panel decides whether a resume row exists at all.
+	if (resume) rows.push({ value: HUB.resume, label: MENU.resume, description: resumeRunLine(resume).replace(/^- /, "") });
+	rows.push({ value: HUB.setup, label: MENU.setup });
+	if (ui.pickModel) rows.push({ value: HUB.editModels, label: EDIT_MODELS });
+	rows.push({ value: HUB.models, label: MENU.models });
 	// The status view already read this session's agents; do not query the same trusted list again.
-	if (view.agents?.length) options.push(MENU.agents);
-	options.push(autoChoice === "on" ? AUTO_MENU.on : AUTO_MENU.off);
-	if (rollbacks.length) options.push(MENU.rollback);
-	options.push(MENU.reset, MENU.status, MENU.close);
-	// The trusted candidate from above, not a second lookup, decides whether the state says "resume".
+	if (view.agents?.length) rows.push({ value: HUB.agents, label: MENU.agents });
+	rows.push({ value: HUB.auto, label: MENU.auto, description: autoRowText(view) });
+	if (rollbacks.length) rows.push({ value: HUB.rollback, label: MENU.rollback });
+	rows.push({ value: HUB.reset, label: MENU.reset });
+	rows.push({ value: HUB.status, label: MENU.status, description: "/storm status" });
+	rows.push({ value: HUB.close, label: MENU.close });
 	const info: InfoLine[] = [];
-	const brief = renderStatusBrief(view, env.now(), info, resume !== undefined);
-	const choice = await ui.select("Storm 메뉴", options, {
+	const brief = renderStatusBrief(hubStatusView(view, resume), env.now(), info, resume !== undefined);
+	const choice = await selectChoiceRow(ui, "Storm 메뉴", rows, {
 		title: "Storm 현황",
-		markdown: [brief, resume ? resumeRunLine(resume) : undefined, view.storage, `- ${targetScopeLine(state.repo.root)}`].filter(Boolean).join("\n\n"),
+		markdown: [brief, `- ${targetScopeLine(state.repo.root)}`].join("\n\n"),
 		...(info.length ? { info } : {}),
 	});
 	if (stopIfStale(env, ui)) return false;
-	if (choice === MENU.resume && resume) await startResume(env, ui, resume);
-	else if (choice === MENU.setup) await setupFlow(env, ui);
-	else if (choice === EDIT_MODELS) {
+	if (choice === HUB.resume && resume) await startResume(env, ui, resume);
+	else if (choice === HUB.setup) await setupFlow(env, ui);
+	else if (choice === HUB.editModels) {
 		// The approved team as it is, never a recommendation: this change only replaces the picked slot.
 		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: EDIT_MODELS, context: targetScopeLine(state.repo.root) });
-	} else if (choice === MENU.models) await modelsFlow(env, ui);
-	else if (choice === MENU.agents) await agentsFlow(env, ui);
-	else if (choice === AUTO_MENU.on || choice === AUTO_MENU.off) await autoDelegationFlow(env, ui);
-	else if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
-	else if (choice === MENU.reset) return resetFlow(env, ui);
-	else if (choice === MENU.status) await statusFlow(env, ui);
+	} else if (choice === HUB.models) await modelsFlow(env, ui);
+	else if (choice === HUB.agents) await agentsFlow(env, ui);
+	else if (choice === HUB.auto) await autoDelegationFlow(env, ui);
+	else if (choice === HUB.rollback) await rollbackFlow(env, ui, state, rollbacks);
+	else if (choice === HUB.reset) return resetFlow(env, ui);
+	else if (choice === HUB.status) await statusFlow(env, ui);
 	return false;
 }
 

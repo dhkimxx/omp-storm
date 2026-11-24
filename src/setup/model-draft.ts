@@ -6,7 +6,8 @@
  */
 import { roleTitle } from "../roles.ts";
 import { entryEffort, formatModelEntry, type ModelEntry, parseModelEntry } from "../selector.ts";
-import type { Effort, RoleConfig, StormConfig, StormModelPick } from "../types.ts";
+import type { Effort, RoleConfig, StormConfig, StormModelPick, UiChoiceRow } from "../types.ts";
+import { visible } from "../view/render.ts";
 
 /** One editable position of the current draft: any configured model entry of a role. */
 export interface ModelSlot {
@@ -35,6 +36,22 @@ export function modelSlots(config: Pick<StormConfig, "roles">): ModelSlot[] {
 		}
 	}
 	return slots;
+}
+
+/**
+ * The same slots as rich selector rows, read from the draft the caller already holds: the stable value names the role
+ * and the entry's original index, and the description is that entry's canonical selector plus the effort it actually
+ * runs with, saying so explicitly when the model has no configured effort. No recommendation runs here.
+ */
+export function modelSlotRows(config: Pick<StormConfig, "roles">): Array<ModelSlot & UiChoiceRow> {
+	return modelSlots(config).map((slot) => {
+		const current = slotCurrent(config.roles[slot.roleId], slot.index);
+		return {
+			...slot,
+			value: `${slot.roleId}:${slot.index}`,
+			description: current ? `${visible(current.selector)} · ${current.effort ?? "기본 effort"}` : "없음",
+		};
+	});
 }
 
 /** A slot's current selector and effective effort, for the picker's current selection. */
