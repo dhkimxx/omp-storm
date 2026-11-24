@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
 import { readJsonl, serialized, writeTextAtomic } from "../src/fsutil.ts";
 import { ROLES, STORM_VERSION } from "../src/roles.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 import { summarizeRun } from "../src/runtime/controller.ts";
 import {
 	activeLedgerRun,
@@ -30,8 +31,12 @@ const config: StormConfig = teamOf(
 );
 
 let root: string;
+let sessionDir: string;
+/** A valid, separate session store beside the test repo root. */
+const otherSession = (name: string): string => sessionStoreDir(path.join(root, "profiles", name), "runtime-session");
 beforeEach(async () => {
 	root = await fs.mkdtemp(path.join(os.tmpdir(), "storm-runtime-"));
+	sessionDir = sessionStoreDir(path.join(root, "profile"), "runtime-session");
 	resetLedger();
 });
 afterEach(async () => {
@@ -39,10 +44,19 @@ afterEach(async () => {
 });
 
 describe("ledger", () => {
+	let sessionA: string;
+	let sessionB: string;
+	beforeEach(() => {
+		sessionA = path.join(root, "session-a");
+		sessionB = path.join(root, "session-b");
+	});
+
 	test("thresholds fire once each, with flags set first, and a throwing callback is harmless", () => {
 		const seen: Array<[string, boolean, boolean, number]> = [];
 		startLedgerRun({
 			runId: "run-a",
+			sessionId: "native-a",
+			sessionDir: sessionA,
 			repoId: "repo",
 			root,
 			budget: { perRunUsd: 1, warnAtUsd: 0.5, onExceed: "block-spawns" },
@@ -60,7 +74,7 @@ describe("ledger", () => {
 			["warn", true, false],
 			["limit", true, true],
 		]);
-		const run = activeLedgerRun(root);
+		const run = activeLedgerRun(sessionA);
 		expect(run?.costUsd).toBeCloseTo(1.8);
 		expect(run?.costByModel["openai/gpt-5.2"]).toBeCloseTo(0.6);
 		expect(run?.costByModel["google/gemini-flash"]).toBeCloseTo(1.2);
@@ -70,6 +84,8 @@ describe("ledger", () => {
 		const kinds: string[] = [];
 		startLedgerRun({
 			runId: "run-a",
+			sessionId: "native-a",
+			sessionDir: sessionA,
 			repoId: "repo",
 			root,
 			budget: { perRunUsd: 1, onExceed: "stop" },
@@ -81,6 +97,8 @@ describe("ledger", () => {
 		const both: string[] = [];
 		startLedgerRun({
 			runId: "run-b",
+			sessionId: "native-a",
+			sessionDir: sessionA,
 			repoId: "repo",
 			root,
 			budget: { perRunUsd: 1, warnAtUsd: 0.5, onExceed: "stop" },
@@ -90,12 +108,11 @@ describe("ledger", () => {
 		expect(both).toEqual(["warn", "limit"]);
 	});
 
-	test("linked worktrees can own independent runs and costs without sharing the approval key", () => {
+	test("sessions own independent runs and costs even on one target", () => {
 		expect(recordCost("unknown", "m", 1)).toBeUndefined();
-		const run: LedgerRun = startLedgerRun({ runId: "run-a", repoId: "repo", root });
-		expect(() => startLedgerRun({ runId: "run-b", repoId: "repo", root })).toThrow();
-		const linked = path.join(root, "linked");
-		const other = startLedgerRun({ runId: "run-c", repoId: "repo", root: linked });
+		const run: LedgerRun = startLedgerRun({ runId: "run-a", sessionId: "native-a", sessionDir: sessionA, repoId: "repo", root });
+		expect(() => startLedgerRun({ runId: "run-b", sessionId: "native-a", sessionDir: sessionA, repoId: "repo", root })).toThrow();
+		const other = startLedgerRun({ runId: "run-c", sessionId: "native-b", sessionDir: sessionB, repoId: "repo", root });
 		recordCost("run-a", "m", Number.NaN);
 		expect(bindLedgerChild("run-a", "Worker", "Main", "/session/a")).toBe(true);
 		expect(bindLedgerChild("run-c", "Worker", "Main", "/session/b")).toBe(true);
@@ -111,12 +128,12 @@ describe("ledger", () => {
 		expect(run.costUsd).toBe(0.25);
 		expect(other.costUsd).toBe(0);
 		expect(endLedgerRun("run-a")).toBe(run);
-		expect(activeLedgerRun(root)).toBeUndefined();
+		expect(activeLedgerRun(sessionA)).toBeUndefined();
 		expect(ledgerRunForChild("Worker", "Main", "/session/a")).toBeUndefined();
 		expect(ledgerRunForChild("Worker", "Main", "/session/b")).toBe(other);
-		expect(activeLedgerRun(linked)).toBe(other);
+		expect(activeLedgerRun(sessionB)).toBe(other);
 		expect(endLedgerRun("run-a")).toBeUndefined();
-		startLedgerRun({ runId: "run-d", repoId: "repo", root });
+		startLedgerRun({ runId: "run-d", sessionId: "native-a", sessionDir: sessionA, repoId: "repo", root });
 	});
 });
 
@@ -124,13 +141,27 @@ const record = (runId: string, startedAt: string, status: RunRecord["status"]): 
 
 describe("run files", () => {
 	test("paths and run ids", () => {
-		expect(stateDir("/r")).toBe(path.join("/r", ".omp", "storm", "state"));
-		expect(runsDir("/r")).toBe(path.join("/r", ".omp", "storm", "state", "runs"));
+		expect(stateDir("/r")).toBe(path.join("/r", "state"));
+		expect(runsDir("/r")).toBe(path.join("/r", "state", "runs"));
 		const id = newRunId(Date.parse("2026-11-20T15:30:12.000Z"));
 		expect(id).toMatch(/^run-20261120-153012-[0-9a-f]{4}$/);
 		const ids = new Set(Array.from({ length: 50 }, () => newRunId(0)));
 		expect(ids.size).toBeGreaterThan(45);
 		expect(newRunId(Date.parse("2026-11-20T15:30:13.000Z")) > id).toBe(true);
+	});
+
+	test("two session stores never see each other's run records or counters", async () => {
+		const other = otherSession("records");
+		const a = record("run-20261120-100000-aaaa", "2026-11-20T10:00:00.000Z", "done");
+		const b = record("run-20261120-110000-bbbb", "2026-11-20T11:00:00.000Z", "stopped");
+		await writeRun(sessionDir, a);
+		await writeRun(other, b);
+		await addQuotaMark(sessionDir, { provider: "anthropic", source: "user", markedAt: "2026-11-20T00:00:00.000Z", until: "2026-11-21T00:00:00.000Z" });
+		expect(await readRun(sessionDir, a.runId)).toEqual(a);
+		expect(await readRun(sessionDir, b.runId)).toBeUndefined();
+		expect(await readRun(other, b.runId)).toEqual(b);
+		expect(await readRun(other, a.runId)).toBeUndefined();
+		expect((await readQuotaMarks(other, 0)).length).toBe(0);
 	});
 
 	test("roundtrip, lastRun picks the newest finished run, unreadable files are skipped", async () => {
@@ -142,16 +173,16 @@ describe("run files", () => {
 			],
 		};
 		const c = record("run-20261120-120000-cccc", "2026-11-20T12:00:00.000Z", "running");
-		for (const r of [a, b, c]) await writeRun(root, r);
-		expect(await readRun(root, b.runId)).toEqual(b);
-		expect(await readRun(root, "run-missing")).toBeUndefined();
-		expect(await readRun(root, "../escape")).toBeUndefined();
-		await fs.writeFile(path.join(runsDir(root), "run-20261120-130000-dddd.json"), "{ not json");
-		expect((await lastRun(root))?.runId).toBe(b.runId);
-		expect(await lastRun(path.join(root, "nowhere"))).toBeUndefined();
-		const left = (await fs.readdir(runsDir(root))).filter(n => n.endsWith(".tmp"));
+		for (const r of [a, b, c]) await writeRun(sessionDir, r);
+		expect(await readRun(sessionDir, b.runId)).toEqual(b);
+		expect(await readRun(sessionDir, "run-missing")).toBeUndefined();
+		expect(await readRun(sessionDir, "../escape")).toBeUndefined();
+		await fs.writeFile(path.join(runsDir(sessionDir), "run-20261120-130000-dddd.json"), "{ not json");
+		expect((await lastRun(sessionDir))?.runId).toBe(b.runId);
+		expect(await lastRun(otherSession("nowhere"))).toBeUndefined();
+		const left = (await fs.readdir(runsDir(sessionDir))).filter(n => n.endsWith(".tmp"));
 		expect(left).toEqual([]);
-		await expect(writeRun(root, { ...a, runId: "../x" })).rejects.toThrow();
+		await expect(writeRun(sessionDir, { ...a, runId: "../x" })).rejects.toThrow();
 	});
 
 	test("an ended run record loads; a 0.11 record with the retired settled reason still loads and renders", async () => {
@@ -161,22 +192,22 @@ describe("run files", () => {
 			...runRecord({ runId: "run-20261120-150000-ffff", startedAt: "2026-11-20T15:00:00.000Z", status: "done" }),
 			endReason: "settled" as RunEndReason,
 		};
-		for (const run of [ended, old]) await writeRun(root, run);
-		expect(await readRun(root, ended.runId)).toEqual(ended);
-		expect(await readRun(root, old.runId)).toEqual(old);
+		for (const run of [ended, old]) await writeRun(sessionDir, run);
+		expect(await readRun(sessionDir, ended.runId)).toEqual(ended);
+		expect(await readRun(sessionDir, old.runId)).toEqual(old);
 		expect(summarizeRun(old)).toContain("settled");
 	});
 
 	test("pruneRuns keeps the newest files", async () => {
-		for (let i = 0; i < 5; i++) await writeRun(root, record(`run-20261120-10000${i}-aaaa`, `2026-11-20T10:00:0${i}.000Z`, "done"));
-		await fs.writeFile(path.join(runsDir(root), "notes.txt"), "keep me");
-		await pruneRuns(root, 2);
-		expect((await fs.readdir(runsDir(root))).sort()).toEqual([
+		for (let i = 0; i < 5; i++) await writeRun(sessionDir, record(`run-20261120-10000${i}-aaaa`, `2026-11-20T10:00:0${i}.000Z`, "done"));
+		await fs.writeFile(path.join(runsDir(sessionDir), "notes.txt"), "keep me");
+		await pruneRuns(sessionDir, 2);
+		expect((await fs.readdir(runsDir(sessionDir))).sort()).toEqual([
 			"notes.txt",
 			"run-20261120-100003-aaaa.json",
 			"run-20261120-100004-aaaa.json",
 		]);
-		await pruneRuns(path.join(root, "nowhere"));
+		await pruneRuns(otherSession("nowhere"));
 	});
 });
 
@@ -505,46 +536,47 @@ describe("fsutil", () => {
 describe("state files", () => {
 	test("quota marks: active only, one per provider, expired ones dropped", async () => {
 		const now = Date.parse("2026-11-20T12:00:00.000Z");
-		expect(await readQuotaMarks(root, now)).toEqual([]);
-		await addQuotaMark(root, { provider: "anthropic", source: "user", markedAt: "2026-11-20T00:00:00.000Z", until: "2026-11-20T06:00:00.000Z" });
-		await addQuotaMark(root, { provider: "openai", source: "usage", markedAt: "2026-11-20T00:00:00.000Z", until: "2026-11-21T00:00:00.000Z" });
-		expect((await readQuotaMarks(root, now)).map(m => m.provider)).toEqual(["openai"]);
-		await addQuotaMark(root, { provider: "openai", source: "user", markedAt: "2026-11-20T12:00:00.000Z", until: "2026-11-22T00:00:00.000Z" });
-		const marks = await readQuotaMarks(root, now);
+		expect(await readQuotaMarks(sessionDir, now)).toEqual([]);
+		await addQuotaMark(sessionDir, { provider: "anthropic", source: "user", markedAt: "2026-11-20T00:00:00.000Z", until: "2026-11-20T06:00:00.000Z" });
+		await addQuotaMark(sessionDir, { provider: "openai", source: "usage", markedAt: "2026-11-20T00:00:00.000Z", until: "2026-11-21T00:00:00.000Z" });
+		expect((await readQuotaMarks(sessionDir, now)).map(m => m.provider)).toEqual(["openai"]);
+		await addQuotaMark(sessionDir, { provider: "openai", source: "user", markedAt: "2026-11-20T12:00:00.000Z", until: "2026-11-22T00:00:00.000Z" });
+		const marks = await readQuotaMarks(sessionDir, now);
 		expect(marks).toEqual([{ provider: "openai", source: "user", markedAt: "2026-11-20T12:00:00.000Z", until: "2026-11-22T00:00:00.000Z" }]);
-		const raw = JSON.parse(await fs.readFile(path.join(stateDir(root), "quota-marks.json"), "utf8"));
+		const raw = JSON.parse(await fs.readFile(path.join(stateDir(sessionDir), "quota-marks.json"), "utf8"));
 		expect(raw.marks).toHaveLength(1);
 	});
 
 	test("corrupt or unreadable files read as empty", async () => {
-		await fs.mkdir(stateDir(root), { recursive: true });
-		await fs.writeFile(path.join(stateDir(root), "quota-marks.json"), "{ broken");
-		await fs.writeFile(path.join(stateDir(root), "trials.json"), JSON.stringify({ trials: { a: { id: "a", seen: "x" } } }));
-		expect(await readQuotaMarks(root, 0)).toEqual([]);
-		expect(await readTrialStates(root)).toEqual({});
-		await fs.mkdir(path.join(root, "dir-as-root", ".omp", "storm", "state", "trials.json"), { recursive: true });
-		expect(await readTrialStates(path.join(root, "dir-as-root"))).toEqual({});
+		await fs.mkdir(stateDir(sessionDir), { recursive: true });
+		await fs.writeFile(path.join(stateDir(sessionDir), "quota-marks.json"), "{ broken");
+		await fs.writeFile(path.join(stateDir(sessionDir), "trials.json"), JSON.stringify({ trials: { a: { id: "a", seen: "x" } } }));
+		expect(await readQuotaMarks(sessionDir, 0)).toEqual([]);
+		expect(await readTrialStates(sessionDir)).toEqual({});
+		const other = otherSession("corrupt-other");
+		await fs.mkdir(path.join(stateDir(other), "trials.json"), { recursive: true });
+		expect(await readTrialStates(other)).toEqual({});
 	});
 
 	test("concurrent trial updates lose no increment and leave no temp files", async () => {
 		await Promise.all(
 			Array.from({ length: 40 }, (_, i) =>
-				updateTrialState(root, i % 2 === 0 ? "a" : "b", s => ({ ...s, seen: s.seen + 1, routed: s.routed + (i % 4 === 0 ? 1 : 0), costUsd: s.costUsd + 0.5 })),
+				updateTrialState(sessionDir, i % 2 === 0 ? "a" : "b", s => ({ ...s, seen: s.seen + 1, routed: s.routed + (i % 4 === 0 ? 1 : 0), costUsd: s.costUsd + 0.5 })),
 			),
 		);
-		const states = await readTrialStates(root);
+		const states = await readTrialStates(sessionDir);
 		expect(states.a).toEqual({ id: "a", seen: 20, routed: 10, costUsd: 10 });
 		expect(states.b).toEqual({ id: "b", seen: 20, routed: 0, costUsd: 10 });
-		expect((await fs.readdir(stateDir(root))).sort()).toEqual(["trials.json"]);
+		expect((await fs.readdir(stateDir(sessionDir))).sort()).toEqual(["trials.json"]);
 	});
 
 	test("a failing update does not break the chain", async () => {
 		await expect(
-			updateTrialState(root, "a", () => {
+			updateTrialState(sessionDir, "a", () => {
 				throw new Error("boom");
 			}),
 		).rejects.toThrow("boom");
-		const next = await updateTrialState(root, "a", s => ({ ...s, seen: s.seen + 1 }));
+		const next = await updateTrialState(sessionDir, "a", s => ({ ...s, seen: s.seen + 1 }));
 		expect(next).toEqual({ id: "a", seen: 1, routed: 0, costUsd: 0 });
 	});
 });
@@ -582,23 +614,26 @@ describe("trials", () => {
 		expect(markTrialStop(trial, { ...routing, routed: 2 }, Date.parse(trial.endsAt)).stoppedAt).toBeUndefined();
 		expect(markTrialStop(undefined, { ...routing, routed: 2 }, NOW).stoppedAt).toBeUndefined();
 		// It survives the counter file.
-		await updateTrialState(root, "t1", current => markTrialStop(trial, { ...current, routed: 2 }, NOW));
-		expect((await readTrialStates(root)).t1).toEqual({ id: "t1", seen: 0, routed: 2, costUsd: 0, stoppedAt: at });
+		await updateTrialState(sessionDir, "t1", current => markTrialStop(trial, { ...current, routed: 2 }, NOW));
+		expect((await readTrialStates(sessionDir)).t1).toEqual({ id: "t1", seen: 0, routed: 2, costUsd: 0, stoppedAt: at });
 	});
 
-	test("a trial's budget is charged only by subagents whose spawn was routed to it, on the candidate model", () => {
+	test("a trial's budget is charged only by subagents whose spawn was routed to it, on the candidate model, in the same session", () => {
 		resetTrialSpawns();
 		const c: StormConfig = { ...config, trials: [trial] };
-		noteTrialSpawn("TrialImpl", trial.id);
-		expect(trialCharge("TrialImpl", "zai/glm-5", c)).toBe(trial.id);
+		const scope = "/profile/storm/sessions/owner-a";
+		noteTrialSpawn("TrialImpl", trial.id, scope);
+		expect(trialCharge("TrialImpl", "zai/glm-5", c, scope)).toBe(trial.id);
 		// The main session, another role's agent and a same-role agent that was not routed all run the candidate model for free.
-		for (const id of ["Main", "Scout", "PlainImpl"]) expect(trialCharge(id, "zai/glm-5", c)).toBeUndefined();
+		for (const id of ["Main", "Scout", "PlainImpl"]) expect(trialCharge(id, "zai/glm-5", c, scope)).toBeUndefined();
+		// A same-named agent of another native session or profile never charges this trial.
+		expect(trialCharge("TrialImpl", "zai/glm-5", c, "/profile/storm/sessions/owner-b")).toBeUndefined();
 		// A routed agent that fell back to the role's own model is not the candidate's spend.
-		expect(trialCharge("TrialImpl", "openai/gpt-5.2", c)).toBeUndefined();
+		expect(trialCharge("TrialImpl", "openai/gpt-5.2", c, scope)).toBeUndefined();
 		// The candidate's effort suffix in the config does not matter; a trial gone from the config charges nothing.
-		expect(trialCharge("TrialImpl", "zai/glm-5", { ...config, trials: [{ ...trial, model: "zai/glm-5:high" }] })).toBe(trial.id);
-		expect(trialCharge("TrialImpl", "zai/glm-5", config)).toBeUndefined();
-		expect(trialCharge("TrialImpl", "zai/glm-5", { ...config, trials: [{ ...trial, id: "other" }] })).toBeUndefined();
+		expect(trialCharge("TrialImpl", "zai/glm-5", { ...config, trials: [{ ...trial, model: "zai/glm-5:high" }] }, scope)).toBe(trial.id);
+		expect(trialCharge("TrialImpl", "zai/glm-5", config, scope)).toBeUndefined();
+		expect(trialCharge("TrialImpl", "zai/glm-5", { ...config, trials: [{ ...trial, id: "other" }] }, scope)).toBeUndefined();
 	});
 
 	test("share routes deterministically", () => {

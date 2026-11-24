@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, rmdir, symlink, utimes, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveRepo } from "../src/approval/repo.ts";
 import { findShadows, unapprovedShadows } from "../src/approval/shadow.ts";
 import { ApprovalStore } from "../src/approval/store.ts";
-import { validateConfig } from "../src/config/schema.ts";
-import { configPath } from "../src/config/store.ts";
-import { isApproved, loadProjectState } from "../src/state.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
+import { loadProjectState } from "../src/state.ts";
 import type { ApprovalRecord, Exec, RepoIdentity, ShadowInfo, StormConfig } from "../src/types.ts";
 import { DEAD_PROCESS, teamOf } from "./fixtures.ts";
 import { exec, git } from "./support.ts";
@@ -83,7 +83,13 @@ describe("resolveRepo", () => {
 			return exec(command, args, options);
 		};
 		await resolveRepo(repo, spy);
-		await loadProjectState({ cwd: repo, exec: spy, agentDir: path.join(tmp, "agent"), pluginAgentsDir: path.join(tmp, "plugin") });
+		await loadProjectState({
+			cwd: repo,
+			exec: spy,
+			agentDir: path.join(tmp, "agent"),
+			pluginAgentsDir: path.join(tmp, "plugin"),
+			sessionId: "native-session",
+		});
 		expect(calls).toHaveLength(2);
 		for (const call of calls) {
 			expect(call).toContain("rev-parse");
@@ -94,69 +100,107 @@ describe("resolveRepo", () => {
 });
 
 describe("ApprovalStore", () => {
-	const repo: RepoIdentity = { repoId: `git-test-${"0".repeat(24)}`, kind: "git-common-dir", root: "/nowhere/root" };
-	const repoDir = () => path.join(tmp, "approvals", repo.repoId);
+	/** The session store and target a test approval belongs to. */
+	const profile = (name = "profile") => path.join(tmp, name);
+	const sessionDir = (id = "native-session") => sessionStoreDir(profile(), id);
+	const target = (name = "target"): RepoIdentity => ({
+		repoId: `git-test-${"0".repeat(24)}`,
+		kind: "git-common-dir",
+		root: path.join(tmp, name),
+	});
+	const makeStore = (repo = target(), session = sessionDir()) => new ApprovalStore(session, repo);
+
 	/** Approves the hashes in order, one minute apart (the store stamps wall-clock time, which may tie). */
 	const approveInOrder = async (store: ApprovalStore, hashes: string[]): Promise<void> => {
 		for (const [i, hash] of hashes.entries()) {
 			await store.approve(approveInput(hash));
-			const file = path.join(repoDir(), "approved", `${hash.slice(11)}.json`);
+			const file = path.join(store.dir, "approved", `${hash.slice(11)}.json`);
 			const record = JSON.parse(await readFile(file, "utf8"));
 			await writeFile(file, JSON.stringify({ ...record, approvedAt: new Date(Date.UTC(2026, 10, 21, 0, i)).toISOString() }));
 		}
 	};
 
-	test("approve writes the record and the snapshot, and nothing else", async () => {
-		const store = new ApprovalStore(tmp, repo);
+	test("approve writes the target-bound record and snapshot, and nothing else", async () => {
+		const store = makeStore();
 		const rec = await store.approve(approveInput(HASH_A));
-		expect(Object.keys(rec).sort()).toEqual(["approvedAt", "configHash", "schema", "scope", "status"]);
+		expect(Object.keys(rec).sort()).toEqual(["approvedAt", "configHash", "schema", "scope", "status", "target"]);
+		expect(rec.target).toBe(store.targetKey);
 		expect(rec.scope).toEqual({ shadowedAgents: [] });
+		expect(store.dir).toBe(path.join(sessionDir(), "approvals", store.targetKey));
 		expect(await store.active(HASH_A)).toEqual(rec);
 		expect(await store.active(HASH_B)).toBeUndefined();
 		expect(await store.snapshot(HASH_A)).toEqual(config);
 		await store.approve(approveInput(HASH_B));
-		expect(await tree(repoDir())).toEqual([
+		expect(await tree(store.dir)).toEqual([
 			`approved/${"a".repeat(64)}.json`,
 			`approved/${"b".repeat(64)}.json`,
 			`snapshots/${"a".repeat(64)}.json`,
 			`snapshots/${"b".repeat(64)}.json`,
 		]);
+		expect(await readdir(sessionDir())).toEqual(["approvals"]);
 	});
 
 	test("list is newest first", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		const hashes = ["2", "1", "3"].map((c) => `jcs-sha256:${c.repeat(64)}`);
 		await approveInOrder(store, hashes);
 		expect((await store.list()).map((r) => r.configHash)).toEqual([...hashes].reverse());
 	});
 
 	test("a record copied under another hash's file name approves nothing", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		await store.approve(approveInput(HASH_A));
-		const text = await readFile(path.join(repoDir(), "approved", `${"a".repeat(64)}.json`), "utf8");
-		await writeFile(path.join(repoDir(), "approved", `${"b".repeat(64)}.json`), text);
+		const text = await readFile(path.join(store.dir, "approved", `${"a".repeat(64)}.json`), "utf8");
+		await writeFile(path.join(store.dir, "approved", `${"b".repeat(64)}.json`), text);
 		expect(await store.active(HASH_B)).toBeUndefined();
+		expect((await store.list()).map((r) => r.configHash)).toEqual([HASH_A]);
+	});
+
+	test("linked worktrees of one repo, and copies of a record, never grant each other approval", async () => {
+		const main = makeStore(target("main"));
+		const worktree = makeStore(target("worktree"));
+		expect(worktree.targetKey).not.toBe(main.targetKey);
+		await main.approve(approveInput(HASH_A));
+		expect(await worktree.active(HASH_A)).toBeUndefined();
+		expect(await worktree.list()).toEqual([]);
+
+		// Even a record copied into the other target's directory is not approval for that target.
+		await mkdir(path.join(worktree.dir, "approved"), { recursive: true });
+		const text = await readFile(path.join(main.dir, "approved", `${"a".repeat(64)}.json`), "utf8");
+		await writeFile(path.join(worktree.dir, "approved", `${"a".repeat(64)}.json`), text);
+		expect(await worktree.active(HASH_A)).toBeUndefined();
+		expect(await worktree.list()).toEqual([]);
+	});
+
+	test("two sessions in one profile never share approvals", async () => {
+		const one = makeStore(target(), sessionDir("session-one"));
+		const two = makeStore(target(), sessionDir("session-two"));
+		await one.approve(approveInput(HASH_A));
+		expect(await two.active(HASH_A)).toBeUndefined();
+		expect(await two.clear()).toBe(0);
+		expect(await one.active(HASH_A)).toBeDefined();
 	});
 
 	test("rejects hashes that could escape the store", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		await expect(store.active("jcs-sha256:../x")).rejects.toThrow();
 		await expect(store.approve(approveInput("jcs-sha256:../x"))).rejects.toThrow();
 		await expect(store.snapshot("jcs-sha256:../x")).rejects.toThrow();
 	});
 
 	test("concurrent approves both land with a clean directory", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		await Promise.all([store.approve(approveInput(HASH_A)), store.approve(approveInput(HASH_B))]);
 		expect(await store.active(HASH_A)).toBeDefined();
 		expect(await store.active(HASH_B)).toBeDefined();
-		expect((await tree(repoDir())).filter((f) => f.endsWith(".tmp") || path.basename(f) === ".lock")).toEqual([]);
+		expect((await tree(store.dir)).filter((f) => f.endsWith(".tmp") || path.basename(f) === ".lock")).toEqual([]);
 	});
 
 	test("stale lock does not block", async () => {
-		const store = new ApprovalStore(tmp, repo);
-		await mkdir(repoDir(), { recursive: true });
-		const lock = path.join(repoDir(), ".lock");
+		const store = makeStore();
+		const approvals = path.join(sessionDir(), "approvals");
+		await mkdir(approvals, { recursive: true });
+		const lock = path.join(approvals, ".lock");
 		await writeFile(lock, `${DEAD_PID} old\n`);
 		const old = new Date(Date.now() - 60_000);
 		await utimes(lock, old, old);
@@ -167,20 +211,26 @@ describe("ApprovalStore", () => {
 	});
 
 	test("a failed snapshot write leaves no approval", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		// A file where the snapshot directory should be makes the first write fail.
-		await mkdir(repoDir(), { recursive: true });
-		await writeFile(path.join(repoDir(), "snapshots"), "");
+		await mkdir(store.dir, { recursive: true });
+		await writeFile(path.join(store.dir, "snapshots"), "");
 		await expect(store.approve(approveInput(HASH_A))).rejects.toThrow();
 		expect(await store.active(HASH_A)).toBeUndefined();
 	});
 
-	test("a damaged record without its scope is no approval, and readers do not throw on it", async () => {
-		const store = new ApprovalStore(tmp, repo);
+	test("a damaged record without its scope or target is no approval, and readers do not throw on it", async () => {
+		const store = makeStore();
 		const rec = await store.approve(approveInput(HASH_A));
-		const file = path.join(repoDir(), "approved", `${"a".repeat(64)}.json`);
+		const file = path.join(store.dir, "approved", `${"a".repeat(64)}.json`);
 		const seen: ShadowInfo = { agent: "storm-reviewer", path: "/p/a.md", scope: "project", sha256: "1".repeat(64) };
-		for (const damaged of [{ ...rec, scope: undefined }, { ...rec, scope: {} }, { ...rec, scope: { shadowedAgents: "x" } }]) {
+		for (const damaged of [
+			{ ...rec, scope: undefined },
+			{ ...rec, scope: {} },
+			{ ...rec, scope: { shadowedAgents: "x" } },
+			{ ...rec, target: undefined },
+			{ ...rec, target: "other-target" },
+		]) {
 			await writeFile(file, JSON.stringify(damaged));
 			expect(await store.active(HASH_A)).toBeUndefined();
 			expect(await store.list()).toEqual([]);
@@ -188,91 +238,107 @@ describe("ApprovalStore", () => {
 		}
 	});
 
-	test("a waiter whose directory is removed under it (clear in another process) still gets the lock", async () => {
-		const store = new ApprovalStore(tmp, repo);
+	test("a waiter whose target directory is removed under it (clear in another process) still gets the lock", async () => {
+		const store = makeStore();
 		// Another process holds the lock.
-		await mkdir(repoDir(), { recursive: true });
-		await writeFile(path.join(repoDir(), ".lock"), `${DEAD_PID} held\n`);
+		const approvals = path.join(sessionDir(), "approvals");
+		await mkdir(approvals, { recursive: true });
+		const lock = path.join(approvals, ".lock");
+		await writeFile(lock, `${DEAD_PID} held\n`);
 		const waiting = store.approve(approveInput(HASH_A));
-		// What clear() in that process does next: it releases the lock, then removes the directory if nothing is left in it.
-		await rm(path.join(repoDir(), ".lock"));
-		await rmdir(repoDir()).catch(() => undefined);
+		// What clear() in that process does next: it releases the lock, then removes the emptied directories.
+		await rm(lock);
+		await rm(store.dir, { recursive: true, force: true });
 		await waiting;
 		expect(await store.active(HASH_A)).toBeDefined();
-		expect(await tree(repoDir())).toEqual([`approved/${"a".repeat(64)}.json`, `snapshots/${"a".repeat(64)}.json`]);
+		expect(await tree(store.dir)).toEqual([`approved/${"a".repeat(64)}.json`, `snapshots/${"a".repeat(64)}.json`]);
 	});
 
-	test("prune keeps the current hash and the newest others, and removes what 0.8/0.9 wrote and nobody read", async () => {
-		const store = new ApprovalStore(tmp, repo);
-		await writeStore08(repoDir(), repo.repoId);
+	test("prune keeps the current hash and the newest others, and never touches old stores", async () => {
+		const store = makeStore();
+		const legacy = path.join(tmp, "agent", "storm", "approvals", `git-old-${"0".repeat(24)}`);
+		await writeStore08(legacy, "git-old");
+		const legacyBefore = await tree(legacy);
+		const legacyBytes = await readFile(path.join(legacy, "log.jsonl"));
 		const hashes = ["1", "2", "3"].map((c) => `jcs-sha256:${c.repeat(64)}`);
-		await approveInOrder(store, hashes);
-		// Keep the 0.8 team (oldest) and one other: hashes 1 and 2 go (2 files each), plus evidence, log and repo.
-		expect(await store.prune(TEAM_08_HASH, 1)).toBe(7);
-		expect(await tree(repoDir())).toEqual(
+		await approveInOrder(store, [TEAM_08_HASH, ...hashes]);
+		// Keep the oldest (the fixture) and one other: hashes 1 and 2 go (2 files each), nothing else is touched.
+		expect(await store.prune(TEAM_08_HASH, 1)).toBe(4);
+		expect(await tree(store.dir)).toEqual(
 			[
 				`approved/${"3".repeat(64)}.json`,
 				`approved/${TEAM_08_HASH.slice(11)}.json`,
-				"runs.jsonl",
 				`snapshots/${"3".repeat(64)}.json`,
 				`snapshots/${TEAM_08_HASH.slice(11)}.json`,
 			].sort(),
 		);
 		expect(await store.prune(TEAM_08_HASH, 1)).toBe(0);
+		expect(await tree(legacy)).toEqual(legacyBefore);
+		expect(await readFile(path.join(legacy, "log.jsonl"))).toEqual(legacyBytes);
 	});
 
-	test("prune leaves a repo without approvals without a directory", async () => {
-		const store = new ApprovalStore(tmp, repo);
+	test("prune leaves a session without approvals without a directory", async () => {
+		const store = makeStore();
 		expect(await store.prune(null)).toBe(0);
-		expect(await readdir(tmp)).toEqual([]);
+		expect(existsSync(sessionDir())).toBe(false);
 	});
 
-	test("clear removes approvals, snapshots and the legacy files but keeps the run list", async () => {
-		const store = new ApprovalStore(tmp, repo);
-		await writeStore08(repoDir(), repo.repoId);
-		await store.approve(approveInput(HASH_A));
-		const runs = await readFile(path.join(repoDir(), "runs.jsonl"), "utf8");
-		expect(await store.clear()).toBe(2);
-		expect(await tree(repoDir())).toEqual(["runs.jsonl"]);
-		expect(await readFile(path.join(repoDir(), "runs.jsonl"), "utf8")).toBe(runs);
-		expect(await store.list()).toEqual([]);
+	test("clear removes every approval of this session across targets but keeps runs and other sessions", async () => {
+		const main = makeStore(target("main"));
+		const worktree = makeStore(target("worktree"));
+		const foreign = makeStore(target("main"), sessionStoreDir(profile("foreign-profile"), "native-session"));
+		await main.approve(approveInput(HASH_A));
+		await worktree.approve(approveInput(HASH_A));
+		await foreign.approve(approveInput(HASH_A));
+		await writeFile(path.join(main.dir, "runs.jsonl"), "keep\n");
+		const runs = await readFile(path.join(main.dir, "runs.jsonl"), "utf8");
+
+		expect(await main.clear()).toBe(2);
+		expect(existsSync(path.join(main.dir, "approved"))).toBe(false);
+		expect(existsSync(path.join(main.dir, "snapshots"))).toBe(false);
+		expect(await readFile(path.join(main.dir, "runs.jsonl"), "utf8")).toBe(runs);
+		expect(existsSync(worktree.dir)).toBe(false);
+		expect(await foreign.active(HASH_A)).toBeDefined();
+		expect(await main.list()).toEqual([]);
 	});
 
 	test("clear leaves no empty directory when there is no run list", async () => {
-		const store = new ApprovalStore(tmp, repo);
+		const store = makeStore();
 		await store.approve(approveInput(HASH_A));
 		expect(await store.clear()).toBe(1);
-		expect(await readdir(path.join(tmp, "approvals"))).toEqual([]);
+		expect(existsSync(path.join(sessionDir(), "approvals"))).toBe(false);
 		expect(await store.clear()).toBe(0);
 	});
 });
 
-describe("approvals written by 0.8/0.9 (principle 6)", () => {
-	test("the record still loads, lists and makes the 0.8 config approved", async () => {
+describe("approvals written before session stores (principle 6: no implicit import or cleanup)", () => {
+	test("old config and approvals are neither read nor removed, even by reset", async () => {
 		const root = path.join(tmp, "project");
 		const agentDir = path.join(tmp, "agent");
-		await mkdir(path.dirname(configPath(root)), { recursive: true });
-		await writeFile(configPath(root), TEAM_08);
-		const env = { cwd: root, exec, agentDir, pluginAgentsDir: path.join(tmp, "plugin") };
-		const before = await loadProjectState(env);
-		expect(before.config.status === "ok" && before.config.hash).toBe(TEAM_08_HASH);
-		expect(isApproved(before)).toBe(false);
+		const oldConfig = path.join(root, ".omp", "storm", "config.json");
+		const oldStore = path.join(agentDir, "storm", "approvals", `git-old-${"0".repeat(24)}`);
+		await mkdir(path.dirname(oldConfig), { recursive: true });
+		await writeFile(oldConfig, TEAM_08);
+		await writeStore08(oldStore, "git-old");
+		const beforeTree = await tree(oldStore);
+		const beforeLog = await readFile(path.join(oldStore, "log.jsonl"));
 
-		await writeStore08(before.store.dir, before.repo.repoId);
+		const env = { cwd: root, exec, agentDir, pluginAgentsDir: path.join(tmp, "plugin"), sessionId: "native-session" };
 		const state = await loadProjectState(env);
-		expect(state.approval?.configHash).toBe(TEAM_08_HASH);
-		expect(state.approval?.approvalId).toBe("apr_01KA7ZJ4W3Q8N6T5R2M9X0BCDE");
-		expect(isApproved(state)).toBe(true);
-		expect((await state.store.list()).map((r) => r.configHash)).toEqual([TEAM_08_HASH]);
-		expect(validateConfig(await state.store.snapshot(TEAM_08_HASH)).errors).toEqual([]);
-		// Reading changes nothing on disk: the user's file and the old record stay byte for byte.
-		expect(await readFile(configPath(root), "utf8")).toBe(TEAM_08);
-		expect(await tree(state.store.dir)).toContain("log.jsonl");
+		expect(state.config.status).toBe("missing");
+		expect(state.approval).toBeUndefined();
+		expect(await state.store.list()).toEqual([]);
+		expect(await readFile(oldConfig, "utf8")).toBe(TEAM_08);
+
+		expect(await state.store.clear()).toBe(0);
+		expect(await tree(oldStore)).toEqual(beforeTree);
+		expect(await readFile(path.join(oldStore, "log.jsonl"))).toEqual(beforeLog);
+		expect(await readFile(oldConfig, "utf8")).toBe(TEAM_08);
 	});
 
 	test("a shadowing definition the approval did not cover makes it unapproved", () => {
 		const seen: ShadowInfo = { agent: "storm-reviewer", path: "/p/a.md", scope: "project", sha256: "1".repeat(64) };
-		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: [seen] } };
+		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", target: "t", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: [seen] } };
 		expect(unapprovedShadows(approval, [seen])).toEqual([]);
 		expect(unapprovedShadows(approval, [{ ...seen, sha256: "2".repeat(64) }])).toHaveLength(1);
 		expect(unapprovedShadows(undefined, [seen])).toEqual([seen]);

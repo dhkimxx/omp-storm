@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { configHash } from "../src/config/canonical.ts";
+import type { AttemptReport } from "../src/runtime/attempt-report.ts";
 import { tokens } from "../src/report/agents.ts";
 import { directorRead, noteChildRead } from "../src/policy/reads.ts";
 import { listAgents, noteAgentParked, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
@@ -14,8 +15,9 @@ import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/ja
 import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
 import { HOLD_MS, ROUND_DELAY_MS, treeFingerprint } from "../src/runtime/rounds.ts";
 import { lastRun, readRun, runIds, runsDir, writeRun } from "../src/runtime/run.ts";
-import { trustedResume } from "../src/runtime/resume.ts";
+import { trustedResume, resumePointerFile, noteResumePointer } from "../src/runtime/resume.ts";
 import { readRunIndex } from "../src/runtime/run-index.ts";
+import { readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { RunPhase } from "../src/view/appearance.ts";
 import type { ProjectState } from "../src/state.ts";
@@ -88,16 +90,16 @@ describe("live run record", () => {
 	test("a running run is rewritten after spawns and spend: the record a crash leaves behind", async () => {
 		const h = session({ agents: [agent()] });
 		const runId = await h.start();
-		expect((await readRun(root, runId))?.spawns).toEqual([]);
+		expect((await readRun(h.sessionDir, runId))?.spawns).toEqual([]);
 
 		vi.useFakeTimers();
 		noteRunSpawn(runId, spawn);
 		recordCost(runId, "a/i", 1.25);
 		touchRun(runId);
 		vi.runAllTimers();
-		await until(async () => (await readRun(root, runId))?.updatedAt !== undefined);
+		await until(async () => (await readRun(h.sessionDir, runId))?.updatedAt !== undefined);
 
-		const live = await readRun(root, runId);
+		const live = await readRun(h.sessionDir, runId);
 		expect(live).toMatchObject({ status: "running", costUsd: 1.25, spawns: [{ spawnKey: "Impl" }], agents: [{ id: "Impl" }] });
 		await h.controller.finish("no-changes");
 	});
@@ -111,7 +113,7 @@ describe("live run record", () => {
 		touchRun(runId);
 		vi.runAllTimers();
 
-		const stored = await readRun(root, runId);
+		const stored = await readRun(h.sessionDir, runId);
 		expect(stored).toMatchObject({ status: "ended", spawns: [{ spawnKey: "Impl" }], agents: [{ id: "Impl", followUps: 2 }] });
 		expect(stored?.endedAt).toBe(final?.endedAt);
 		expect(stored?.updatedAt).toBeUndefined();
@@ -135,7 +137,7 @@ describe("live status line", () => {
 		await h.turn();
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
 		expect(calls.at(-1)).toBeUndefined();
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified" });
 	});
 
 	test("an interrupted end reports the end once", async () => {
@@ -145,7 +147,7 @@ describe("live status line", () => {
 		h.controller.onAgentStart();
 		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "interrupted" });
 	});
 
 	test("an end taken at the round timer reports the end once", async () => {
@@ -159,7 +161,7 @@ describe("live status line", () => {
 		h.timers.fire();
 		await until(() => calls.some(run => run === undefined));
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "time-limit" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "time-limit" });
 	});
 
 	test("a budget stop between turns reports the end once", async () => {
@@ -174,7 +176,7 @@ describe("live status line", () => {
 		recordCost(runId, "a/i", 2);
 		await until(() => calls.some(run => run === undefined));
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget" });
 	});
 
 	test("a live flush hands the hook the record as it is then", async () => {
@@ -196,7 +198,7 @@ describe("live status line", () => {
 			live: (_ctx, run) => {
 				if (run !== undefined) return;
 				// Read synchronously at the call: a record still saying running would be the one before the final write.
-				const stored = JSON.parse(readFileSync(path.join(runsDir(root), `${runId}.json`), "utf8")) as RunRecord;
+				const stored = JSON.parse(readFileSync(path.join(runsDir(h.sessionDir), `${runId}.json`), "utf8")) as RunRecord;
 				seen.push({ status: stored.status, ...(stored.endReason !== undefined ? { endReason: stored.endReason } : {}) });
 			},
 		});
@@ -217,7 +219,7 @@ describe("live status line", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		await h.turn();
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress" });
 		expect(h.summaries()).toBe(1);
 	});
 });
@@ -256,7 +258,7 @@ describe("live phase", () => {
 		// A settled turn drops a key its dialog never closed (an aborted prompt has no matching end event).
 		noteRunUserWait(runId, "ask:aborted", true);
 		await h.turn();
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended" });
 		expect(h.controller.phase()).toBeUndefined();
 	});
 
@@ -332,7 +334,7 @@ describe("live phase", () => {
 		expect(h.controller.phase()).toBe("stopping");
 		agents[0]!.state = "idle";
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.status !== "running");
+		await until(async () => (await readRun(h.sessionDir, runId))?.status !== "running");
 		expect(h.controller.phase()).toBeUndefined();
 	});
 
@@ -351,7 +353,7 @@ describe("live phase", () => {
 		expect(h.controller.phase()).toBe("between-rounds");
 		h.timers.fire();
 		await until(() => h.controller.phase() === "verifying");
-		await until(async () => (await readRun(root, runId))?.status !== "running");
+		await until(async () => (await readRun(h.sessionDir, runId))?.status !== "running");
 		expect(h.controller.phase()).toBeUndefined();
 	});
 });
@@ -364,8 +366,8 @@ describe("run start", () => {
 		if (!result.ok) throw new Error(result.reason);
 		expect(h.controller.directing()).toBe(true);
 		expect(h.controller.runId()).toBe(result.runId);
-		expect(activeLedgerRun(h.repo.root)?.runId).toBe(result.runId);
-		const record = await readRun(root, result.runId);
+		expect(activeLedgerRun(h.sessionDir)?.runId).toBe(result.runId);
+		const record = await readRun(h.sessionDir, result.runId);
 		expect(record).toMatchObject({ status: "running", configHash: configHash(SESSION_TEAM), task, process: processKey(), turns: 0 });
 		expect(record?.limits).toBeUndefined();
 		// Nothing of the retired keyword contract is written any more.
@@ -381,20 +383,20 @@ describe("run start", () => {
 	test("the record keeps the limits the user stated with the request", async () => {
 		const h = session();
 		const runId = await h.start({ task: "t", rounds: 5, minutes: 30 });
-		expect(await readRun(root, runId)).toMatchObject({ turns: 0, limits: { rounds: 5, minutes: 30 } });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ turns: 0, limits: { rounds: 5, minutes: 30 } });
 		await h.controller.finish("no-changes");
 		const one = session();
 		const only = await one.start({ task: "t", minutes: 1 });
-		expect((await readRun(root, only))?.limits).toEqual({ minutes: 1 });
+		expect((await readRun(one.sessionDir, only))?.limits).toEqual({ minutes: 1 });
 		await one.controller.finish("no-changes");
 	});
 
 	test("the record keeps the round bound fixed at its start; the index line does not carry it", async () => {
 		const h = session();
 		const runId = await h.start({ task: "t", rounds: 5 });
-		expect(await readRun(root, runId)).toMatchObject({ turns: 0, maxRounds: 5 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ turns: 0, maxRounds: 5 });
 		await h.turn();
-		const [line] = await readRunIndex(root);
+		const [line] = await readRunIndex(h.sessionDir);
 		expect(line).toMatchObject({ runId, turns: 1 });
 		expect(line && "maxRounds" in line).toBe(false);
 	});
@@ -406,7 +408,7 @@ describe("run start", () => {
 			expect(result.ok).toBe(false);
 			expect(h.sent).toEqual([]);
 			expect(h.controller.directing()).toBe(false);
-			expect(await runIds(root)).toEqual([]);
+			expect(await runIds(h.sessionDir)).toEqual([]);
 		}
 	});
 
@@ -414,7 +416,7 @@ describe("run start", () => {
 		for (const modes of [fakeModes({ goal: "paused" }), null]) {
 			const h = session({ modes });
 			const runId = await h.start(ask("t"));
-			expect((await readRun(root, runId))?.status).toBe("running");
+			expect((await readRun(h.sessionDir, runId))?.status).toBe("running");
 			await h.controller.finish("shutdown");
 		}
 	});
@@ -447,7 +449,7 @@ describe("run start", () => {
 		const task = "x".repeat(500);
 		const h = session();
 		const runId = await h.start(ask(task));
-		const record = await readRun(root, runId);
+		const record = await readRun(h.sessionDir, runId);
 		expect(record?.task).toHaveLength(200);
 		expect(record?.request).toBe(task);
 		expect(h.sent[0]).toContain(task);
@@ -458,7 +460,7 @@ describe("run start", () => {
 		const task = "y".repeat(20_500);
 		const h = session();
 		const runId = await h.start(ask(task));
-		expect((await readRun(root, runId))?.request).toHaveLength(20_000);
+		expect((await readRun(h.sessionDir, runId))?.request).toHaveLength(20_000);
 		await h.controller.finish("no-changes");
 	});
 
@@ -476,10 +478,11 @@ describe("run start", () => {
 				submittedAt: "2026-11-19T09:00:00.000Z",
 			},
 		});
-		await writeRun(root, old);
 		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
 		const runId = await h.start({ task: "carry on", resumeOf: old.runId });
-		expect(await readRun(root, runId)).toMatchObject({ request: "carry on", resumeOf: old.runId });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ request: "carry on", resumeOf: old.runId });
 		expect(h.sent[0]).toContain(old.runId);
 		expect(h.sent[0]).toContain("(interrupted)");
 		expect(h.sent[0]).toContain("- login (storm-implementer): fix the login");
@@ -489,7 +492,7 @@ describe("run start", () => {
 	test("a resumeOf with no readable record still starts, without a resume block", async () => {
 		const h = session();
 		const runId = await h.start({ task: "t", resumeOf: "run-20261119-000000-none" });
-		expect(await readRun(root, runId)).toMatchObject({ resumeOf: "run-20261119-000000-none" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ resumeOf: "run-20261119-000000-none" });
 		expect(h.sent[0]).not.toContain("Continues run");
 		await h.controller.finish("no-changes");
 	});
@@ -497,24 +500,25 @@ describe("run start", () => {
 	test("a start points this machine at its run; the pointer covers the request", async () => {
 		const h = session();
 		const runId = await h.start({ task: "the request" });
-		const record = await readRun(root, runId);
+		const record = await readRun(h.sessionDir, runId);
 		if (!record) throw new Error("the run record is missing");
-		expect(await trustedResume(h.state.store.dir, h.repo.root, record)).toBe(true);
+		const target = { repoId: h.repo.repoId, root: h.repo.root };
+		expect(await trustedResume(h.sessionDir, target, record)).toBe(true);
 		// A record edited after the start, or named as another run, is not what this machine started.
-		expect(await trustedResume(h.state.store.dir, h.repo.root, { ...record, request: "edited request" })).toBe(false);
-		expect(await trustedResume(h.state.store.dir, h.repo.root, { ...record, runId: "run-20261119-000000-other" })).toBe(false);
+		expect(await trustedResume(h.sessionDir, target, { ...record, request: "edited request" })).toBe(false);
+		expect(await trustedResume(h.sessionDir, target, { ...record, runId: "run-20261119-000000-other" })).toBe(false);
 		await h.controller.finish("no-changes");
 	});
 
 	test("a pointer that cannot be written does not stop the run", async () => {
 		const h = session();
-		// The approval store's directory exists as a file, so the atomic write below it fails.
-		await mkdir(path.dirname(h.state.store.dir), { recursive: true });
-		await writeFile(h.state.store.dir, "not a directory");
+		// The pointer path exists as a directory, so the atomic write of the resume pointer fails while the run record
+		// itself is still writable.
+		await mkdir(resumePointerFile(h.sessionDir), { recursive: true });
 		const runId = await h.start({ task: "t" });
 		expect(h.controller.directing()).toBe(true);
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
 		await h.controller.finish("no-changes");
 	});
 
@@ -528,13 +532,47 @@ describe("run start", () => {
 			task: "the earlier request",
 			plan: { lanes: "x" } as unknown as NonNullable<RunRecord["plan"]>,
 		});
-		await writeRun(root, old);
 		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
 		const runId = await h.start({ task: "carry on", resumeOf: old.runId });
 		expect(h.sent[0]).toContain(old.runId);
 		expect(h.sent[0]).not.toContain("Earlier plan:");
-		expect(await readRun(root, runId)).toMatchObject({ resumeOf: old.runId, status: "running" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ resumeOf: old.runId, status: "running" });
 		await h.controller.finish("no-changes");
+	});
+
+	test("a resume pointer recorded on one target cannot continue the run on another target", async () => {
+		const first = session();
+		const old = runRecord({
+			runId: "run-20261119-090000-tgt0",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			request: "the earlier request",
+		});
+		await writeRun(first.sessionDir, old);
+		await noteResumePointer(first.sessionDir, { repoId: first.repo.repoId, root: first.repo.root }, old);
+
+		// The same native session reopens its own store but the target is a different work tree.
+		const otherRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-other-target-")));
+		try {
+			const otherState = approvedState(otherRoot, SESSION_TEAM, { agentDir: first.agentDir, sessionId: first.sessionId });
+			const moved = fakeSession({
+				root: otherRoot,
+				agentDir: first.agentDir,
+				sessionId: first.sessionId,
+				loadState: async () => otherState,
+			});
+			expect(moved.sessionDir).toBe(first.sessionDir);
+			const result = await moved.controller.start(moved.ctx, { task: "carry on", resumeOf: old.runId });
+			expect(result.ok).toBe(false);
+			expect(result.ok ? "" : result.reason).toContain("작업 트리");
+			expect(await runIds(moved.sessionDir)).toEqual([old.runId]);
+			expect(moved.controller.active()).toBeUndefined();
+		} finally {
+			await rm(otherRoot, { recursive: true, force: true });
+		}
 	});
 
 	test("a resume handoff names the cut request limit and the user's note on one line", async () => {
@@ -547,14 +585,15 @@ describe("run start", () => {
 			request,
 			task: request.slice(0, 200),
 		});
-		await writeRun(root, old);
 		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
 		const runId = await h.start({ task: request, resumeOf: old.runId, resumeNote: "keep this\nand that" });
 		expect(h.sent[0]).toContain("20,000");
 		const note = h.sent[0].split("\n").filter(line => line.startsWith("On resuming the user said:"));
 		expect(note).toHaveLength(1);
 		expect(note[0]).toContain("keep this and that");
-		expect(await readRun(root, runId)).toMatchObject({ request });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ request });
 		await h.controller.finish("no-changes");
 	});
 
@@ -574,38 +613,50 @@ describe("run start", () => {
 			expect(result.ok).toBe(false);
 			if (!result.ok) reasons.add(result.reason);
 			expect(h.controller.directing()).toBe(false);
-			expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+			expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
 			expect(h.sent).toEqual([]);
 			// The refusal is not sticky: nothing is left starting or queued.
 			expect(h.controller.refusal()).toBeUndefined();
+			expect(await lastRun(h.sessionDir)).toBeUndefined();
 		}
-		expect(await lastRun(root)).toBeUndefined();
 		// Missing, invalid, unapproved (either way) and shadowed each say something different.
 		expect(reasons.size).toBe(4);
 	});
 
-	test("one run per session and per project", async () => {
+	test("a run refuses to start when the host exposes no session identity", async () => {
+		const h = session();
+		Object.assign(h.ctx, { sessionManager: { ...h.ctx.sessionManager, getSessionId: (() => undefined) as unknown as () => string } });
+		const result = await h.controller.start(h.ctx, ask("t"));
+		expect(result.ok).toBe(false);
+		expect(h.controller.directing()).toBe(false);
+		expect(await runIds(h.sessionDir)).toEqual([]);
+	});
+
+	test("one run per session; a different session may read the same target at the same time", async () => {
 		const first = session();
 		await first.start();
 		expect((await first.controller.start(first.ctx, ask("again"))).ok).toBe(false);
 		expect(first.controller.request(ask("again")).ok).toBe(false);
+		// Different native sessions own different stores and read claims: they do not refuse each other.
 		const second = session();
-		expect((await second.controller.start(second.ctx, ask("other session"))).ok).toBe(false);
-		expect(second.sent).toEqual([]);
-		expect(await runIds(root)).toHaveLength(1);
-		await first.controller.finish("no-changes");
 		expect((await second.controller.start(second.ctx, ask("other session"))).ok).toBe(true);
+		expect(second.sent).toHaveLength(1);
+		expect(await runIds(second.sessionDir)).toHaveLength(1);
+		expect(await runIds(first.sessionDir)).toHaveLength(1);
+		await first.controller.finish("no-changes");
 		await second.controller.finish("no-changes");
 	});
 
-	test("another session's run that starts while this one compacts wins: this start is refused and leaves nothing", async () => {
+	test("a different session's concurrent read run does not block this start", async () => {
 		const other = session();
 		const h = session({ usage: usage(200_000, 50), compact: async () => void (await other.start()) });
 		const result = await h.controller.start(h.ctx, ask("late"));
-		expect(result.ok).toBe(false);
-		expect(h.sent).toEqual([]);
-		expect(h.controller.directing()).toBe(false);
-		expect(await runIds(root)).toEqual([other.controller.runId() ?? ""]);
+		expect(result.ok).toBe(true);
+		expect(h.sent).toHaveLength(1);
+		expect(h.controller.directing()).toBe(true);
+		expect(await runIds(h.sessionDir)).toHaveLength(1);
+		expect(await runIds(other.sessionDir)).toHaveLength(1);
+		await h.controller.finish("no-changes");
 		await other.controller.finish("no-changes");
 	});
 
@@ -657,7 +708,7 @@ describe("run start", () => {
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]?.text).toContain("already compacting");
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
 		await h.controller.finish("no-changes");
 	});
 
@@ -697,7 +748,7 @@ describe("run start", () => {
 		await h.controller.onAgentEnd({ willContinue: true }, h.ctx);
 		await h.controller.onAgentEnd({ awaitingAsyncWork: true }, h.ctx);
 		expect(h.sent).toEqual([]);
-		expect(await runIds(root)).toEqual([]);
+		expect(await runIds(h.sessionDir)).toEqual([]);
 
 		await h.controller.onAgentEnd({}, h.ctx);
 		await until(() => h.sent.length > 0);
@@ -706,7 +757,7 @@ describe("run start", () => {
 		await h.controller.onAgentEnd({}, h.ctx);
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.sent).toHaveLength(1);
-		expect(await runIds(root)).toEqual([queued.runId]);
+		expect(await runIds(h.sessionDir)).toEqual([queued.runId]);
 		expect(h.notices.some(n => n.level !== "info")).toBe(false);
 		expect(h.controller.directing()).toBe(true);
 		await h.controller.finish("no-changes");
@@ -753,12 +804,12 @@ describe("run start", () => {
 		});
 		const runId = await h.start();
 		await until(() => h.notices.some(n => n.level === "error"));
-		await until(async () => (await readRun(root, runId))?.endReason === "start-failed");
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", turns: 0 });
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "start-failed");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", turns: 0 });
 		expect(h.controller.directing()).toBe(false);
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
 		// The detached stop also appends the index line and prunes: let it finish before the directory goes.
-		await until(async () => (await readRunIndex(root)).length === 1);
+		await until(async () => (await readRunIndex(h.sessionDir)).length === 1);
 	});
 });
 
@@ -778,9 +829,9 @@ describe("start with plan", () => {
 		expect(h.events).toEqual([]);
 		expect(h.ui.selects).toEqual([]);
 		// Bound before admission returned: a spawn decided now reads this plan from the ledger.
-		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(plan);
+		expect(activeLedgerRun(h.sessionDir)?.plan).toEqual(plan);
 		expect(h.controller.active()?.plan).toEqual(plan);
-		expect(await readRun(root, result.runId)).toMatchObject({ status: "running", turns: 0, plan });
+		expect(await readRun(h.sessionDir, result.runId)).toMatchObject({ status: "running", turns: 0, plan });
 		await h.controller.finish("no-changes");
 	});
 
@@ -798,11 +849,38 @@ describe("start with plan", () => {
 		completeLane(h, plan, agents);
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.controller.directing()).toBe(false);
-		expect(await readRun(root, result.runId)).toMatchObject({ turns: 1, endReason: "no-changes" });
+		expect(await readRun(h.sessionDir, result.runId)).toMatchObject({ turns: 1, endReason: "no-changes" });
 		expect(h.sent).toEqual([]);
 		expect(h.timers.pending()).toBe(0);
 		// A routine automatic end uses the live status line only, not a transcript summary.
 		expect(h.summaries()).toBe(0);
+	});
+
+	test("a write-capable plan holds the target write claim before admission; a read-only plan stays a reader", async () => {
+		const writer = session({ hold: { idle: false } });
+		const started = await writer.controller.startWithPlan(writer.ctx, ask("probe"), plan);
+		expect(started.ok).toBe(true);
+		expect(writer.leases.held[0]?.mode).toBe("write");
+		await writer.controller.finish("no-changes");
+
+		const reader = session({ hold: { idle: false } });
+		const readPlan: RunPlan = {
+			lanes: [{ name: "look", kind: "explore", role: "explorer" }],
+			workers: { explorer: 1 },
+			submittedAt: "2026-11-20T09:00:00.000Z",
+		};
+		expect((await reader.controller.startWithPlan(reader.ctx, ask("look"), readPlan)).ok).toBe(true);
+		expect(reader.leases.held[0]?.mode).toBe("read");
+		await reader.controller.finish("no-changes");
+
+		// A manual start begins safe; binding a write-capable plan upgrades before the plan becomes spawn authority.
+		const manual = session();
+		await manual.start();
+		expect(manual.leases.held[0]?.mode).toBe("read");
+		expect(await manual.controller.setPlan(manual.ctx, plan)).toEqual({ ok: true });
+		expect(manual.leases.held[0]?.mode).toBe("write");
+		expect((await manual.controller.ensureWrite(manual.ctx)).ok).toBe(true);
+		await manual.controller.finish("no-changes");
 	});
 
 	test("a refused admission leaves no run, record or ledger entry", async () => {
@@ -811,8 +889,8 @@ describe("start with plan", () => {
 		expect(result.ok).toBe(false);
 		expect(h.controller.directing()).toBe(false);
 		expect(h.controller.refusal()).toBeUndefined();
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
-		expect(await runIds(root)).toEqual([]);
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+		expect(await runIds(h.sessionDir)).toEqual([]);
 		expect(h.sent).toEqual([]);
 	});
 
@@ -840,8 +918,8 @@ describe("start with plan", () => {
 		expect(h.leases.acquired).toHaveLength(1);
 		expect(h.leases.released).toHaveLength(1);
 		expect(h.controller.directing()).toBe(false);
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
-		expect(await runIds(root)).toEqual([]);
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+		expect(await runIds(h.sessionDir)).toEqual([]);
 	});
 
 	test("a shutdown while admission waits leaves nothing for the next session", async () => {
@@ -862,8 +940,8 @@ describe("start with plan", () => {
 		expect(await start).toMatchObject({ ok: false });
 		expect(h.controller.directing()).toBe(false);
 		expect(h.controller.refusal()).toBeUndefined();
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
-		expect(await runIds(root)).toEqual([]);
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+		expect(await runIds(h.sessionDir)).toEqual([]);
 	});
 
 	test("a routine automatic end stays out of the transcript, but a blocked spawn is reported", async () => {
@@ -911,8 +989,8 @@ describe("lease, drain and required checks", () => {
 		const result = await h.controller.start(h.ctx, ask("task"));
 		expect(result).toMatchObject({ ok: false, reason: "다른 실행이 이 작업 트리를 쓰고 있습니다." });
 		expect(h.controller.directing()).toBe(false);
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
-		expect(await runIds(root)).toEqual([]);
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+		expect(await runIds(h.sessionDir)).toEqual([]);
 	});
 
 	test("a plan hash other than the approved team refuses before taking the lease", async () => {
@@ -921,7 +999,7 @@ describe("lease, drain and required checks", () => {
 		expect(result.ok).toBe(false);
 		expect(h.leases.acquired).toEqual([]);
 		expect(h.controller.directing()).toBe(false);
-		expect(await runIds(root)).toEqual([]);
+		expect(await runIds(h.sessionDir)).toEqual([]);
 	});
 
 	test("a no-change round with an open planned lane continues once, then ends no-progress", async () => {
@@ -936,7 +1014,7 @@ describe("lease, drain and required checks", () => {
 		await until(() => h.sent.length === 1);
 		expect(h.sent[0]).toContain('round="2/4"');
 		await h.turn();
-		expect(await readRun(root, result.runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		expect(await readRun(h.sessionDir, result.runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
 	});
 
 	test("stopping with a running owned worker keeps scope, lease and record until it settles", async () => {
@@ -946,11 +1024,11 @@ describe("lease, drain and required checks", () => {
 		expect(await h.controller.finish("no-changes")).toBeUndefined();
 		expect(getLedgerRun(runId)?.closing).toBe(true);
 		expect(h.leases.released).toEqual([]);
-		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
 		expect(h.timers.pending()).toBeGreaterThan(0);
 		agents[0]!.state = "idle";
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.status === "ended");
+		await until(async () => (await readRun(h.sessionDir, runId))?.status === "ended");
 		await until(() => h.leases.released.length === 1);
 		expect(h.leases.released).toEqual([runId]);
 		expect(getLedgerRun(runId)).toBeUndefined();
@@ -969,7 +1047,7 @@ describe("lease, drain and required checks", () => {
 		expect(h.leases.released).toEqual([]);
 		running = [];
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.status === "stopped");
+		await until(async () => (await readRun(h.sessionDir, runId))?.status === "stopped");
 		await until(() => h.leases.released.length === 1);
 		expect(h.leases.released).toEqual([runId]);
 	});
@@ -984,12 +1062,12 @@ describe("lease, drain and required checks", () => {
 		// The gate passed, but an owned worker was still running: finalization waits instead of recording verified.
 		expect(getLedgerRun(runId)?.closing).toBe(true);
 		expect(h.leases.released).toEqual([]);
-		expect(await readRun(root, runId)).toMatchObject({ status: "running" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
 		tree = treeOf("d2", "f0");
 		agents[2]!.state = "idle";
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.status !== "running");
-		expect(await readRun(root, runId)).toMatchObject({ endReason: "no-progress" });
+		await until(async () => (await readRun(h.sessionDir, runId))?.status !== "running");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ endReason: "no-progress" });
 		await until(() => h.leases.released.length === 1);
 		expect(h.leases.released).toEqual([runId]);
 	});
@@ -1016,9 +1094,9 @@ describe("lease, drain and required checks", () => {
 		expect(h.sent).toHaveLength(1);
 		expect(h.timers.pending()).toBe(1);
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
 		expect(h.sent).toHaveLength(1);
-		expect((await readRun(root, runId))?.checks).toEqual([{ name: "unit", status: "passed", exitCode: 0, tree: "d1:f0" }]);
+		expect((await readRun(h.sessionDir, runId))?.checks).toEqual([{ name: "unit", status: "passed", exitCode: 0, tree: "d1:f0" }]);
 	});
 
 	test("a failed verification-only check ends the last round honestly and does not retry", async () => {
@@ -1030,8 +1108,8 @@ describe("lease, drain and required checks", () => {
 		tree = treeOf("d1", "f0");
 		await h.turn();
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.status !== "running");
-		expect(await readRun(root, runId)).toMatchObject({ endReason: "round-limit", turns: 1 });
+		await until(async () => (await readRun(h.sessionDir, runId))?.status !== "running");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ endReason: "round-limit", turns: 1 });
 		expect(h.sent).toHaveLength(1);
 		expect(readFileSync(path.join(root, "check-count"), "utf8")).toBe("x\n");
 	});
@@ -1045,9 +1123,9 @@ describe("lease, drain and required checks", () => {
 		await h.turn();
 		agents.push(verdict(T0 + 1, true, "d1:f0"));
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
 		expect(readFileSync(path.join(root, "check-count"), "utf8")).toBe("x\n");
-		expect(((await readRun(root, runId)) as RunRecord).checks).toEqual([
+		expect(((await readRun(h.sessionDir, runId)) as RunRecord).checks).toEqual([
 			{ name: "unit", status: "passed", exitCode: 0, tree: "d1:f0" },
 		]);
 	});
@@ -1057,7 +1135,7 @@ describe("lease, drain and required checks", () => {
 		const runId = await h.start();
 		await h.turn();
 		expect(existsSync(path.join(root, "check-count"))).toBe(false);
-		expect(await readRun(root, runId)).toMatchObject({ endReason: "no-changes" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ endReason: "no-changes" });
 	});
 
 	test("a withdrawn approval withholds the pass without executing checks", async () => {
@@ -1073,7 +1151,7 @@ describe("lease, drain and required checks", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		expect(existsSync(path.join(root, "check-count"))).toBe(false);
-		expect((await readRun(root, runId))?.endReason).toBeUndefined();
+		expect((await readRun(h.sessionDir, runId))?.endReason).toBeUndefined();
 		await h.controller.finish("shutdown");
 	});
 });
@@ -1093,8 +1171,8 @@ describe("run end", () => {
 		h.controller.onAgentStart();
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.controller.directing()).toBe(false);
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended", turns: 1, endReason: "no-changes" });
-		expect(await readRunIndex(root)).toMatchObject([{ runId, turns: 1, endReason: "no-changes" }]);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended", turns: 1, endReason: "no-changes" });
+		expect(await readRunIndex(h.sessionDir)).toMatchObject([{ runId, turns: 1, endReason: "no-changes" }]);
 	});
 
 	test("a run ends once: one summary, one index line, the ledger closed, and later events change nothing", async () => {
@@ -1103,16 +1181,16 @@ describe("run end", () => {
 		noteRunSpawn(runId, spawn);
 		await h.turn();
 		expect(h.summaries()).toBe(1);
-		expect(h.ui.records[0]?.markdown).toBe(summarizeRun((await readRun(root, runId)) as RunRecord));
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
-		const ended = (await readRun(root, runId))?.endedAt;
+		expect(h.ui.records[0]?.markdown).toBe(summarizeRun((await readRun(h.sessionDir, runId)) as RunRecord));
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+		const ended = (await readRun(h.sessionDir, runId))?.endedAt;
 
 		await h.turn();
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(await h.controller.finish("shutdown")).toBeUndefined();
 		expect(h.summaries()).toBe(1);
-		expect(await readRunIndex(root)).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended", endReason: "no-changes", endedAt: ended as string });
+		expect(await readRunIndex(h.sessionDir)).toHaveLength(1);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended", endReason: "no-changes", endedAt: ended as string });
 		// The session is free again: the next request is taken.
 		expect(h.controller.request(ask("next")).ok).toBe(true);
 	});
@@ -1130,11 +1208,11 @@ describe("run end", () => {
 	});
 
 	test("ending a run keeps the project's newest 50 run records", async () => {
-		for (let n = 0; n < 55; n++) await writeRun(root, runRecord({ runId: `run-20261101-0000${String(n).padStart(2, "0")}-old0` }));
 		const h = session();
+		for (let n = 0; n < 55; n++) await writeRun(h.sessionDir, runRecord({ runId: `run-20261101-0000${String(n).padStart(2, "0")}-old0` }));
 		const runId = await h.start();
 		await h.turn();
-		const ids = await runIds(root);
+		const ids = await runIds(h.sessionDir);
 		expect(ids).toHaveLength(50);
 		expect(ids).toContain(runId);
 		expect(ids).not.toContain("run-20261101-000000-old0");
@@ -1142,17 +1220,18 @@ describe("run end", () => {
 
 	test("a session shutdown ends the run as stopped, without a summary and without cleaning anything", async () => {
 		let loads = 0;
-		const state = approvedState(root, SESSION_TEAM);
+		let state: ProjectState;
 		const h = session({
 			loadState: async () => {
 				loads++;
 				return state;
 			},
 		});
+		state = approvedState(root, SESSION_TEAM, { agentDir: h.agentDir, sessionId: h.sessionId });
 		const runId = await h.start();
 		expect(loads).toBe(1);
 		await h.controller.finish("shutdown");
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "shutdown" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "shutdown" });
 		expect(h.summaries()).toBe(0);
 		// The janitor needs the state in force; a shutdown does not wait for it.
 		expect(loads).toBe(1);
@@ -1161,11 +1240,11 @@ describe("run end", () => {
 	test("a run past its budget ends as budget-exceeded, whatever ended it", async () => {
 		const h = session({ config: { ...SESSION_TEAM, budget: { perRunUsd: 1, onExceed: "block-spawns" } } });
 		const runId = await h.start();
-		expect((await readRun(root, runId))?.budget).toEqual({ perRunUsd: 1, onExceed: "block-spawns" });
+		expect((await readRun(h.sessionDir, runId))?.budget).toEqual({ perRunUsd: 1, onExceed: "block-spawns" });
 		recordCost(runId, "a/i", 0.5);
-		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(false);
+		expect(activeLedgerRun(h.sessionDir)?.exceeded).toBe(false);
 		recordCost(runId, "a/i", 0.5);
-		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(true);
+		expect(activeLedgerRun(h.sessionDir)?.exceeded).toBe(true);
 		expect(await h.controller.finish("no-changes")).toMatchObject({ status: "budget-exceeded", endReason: "no-changes", costUsd: 1 });
 	});
 
@@ -1187,7 +1266,7 @@ describe("round loop", () => {
 		const runId = await h.start();
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended", endReason: "no-changes", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended", endReason: "no-changes", turns: 1 });
 	});
 
 	test("a writer with no verdict gets round 2; a correct verdict after the change then verifies it", async () => {
@@ -1205,7 +1284,7 @@ describe("round loop", () => {
 		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
 	});
 
 	test("an incorrect verdict and a round that changes and reviews nothing ends no-progress", async () => {
@@ -1217,7 +1296,7 @@ describe("round loop", () => {
 		await until(() => h.sent.length === 2);
 		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/4"');
 		await h.turn();
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
 	});
 
 	test("config extra rounds: progress every round but no verdict ends on the round limit after two rounds", async () => {
@@ -1232,7 +1311,7 @@ describe("round loop", () => {
 		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 2 }));
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 2 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 2 });
 	});
 
 	test("the request's own rounds limit of 1 ends the unverified first round at once", async () => {
@@ -1240,7 +1319,7 @@ describe("round loop", () => {
 		const runId = await h.start({ task: "t", rounds: 1 });
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 1 });
 	});
 
 	test("the request's minutes limit is checked when a round ends", async () => {
@@ -1250,7 +1329,7 @@ describe("round loop", () => {
 		clock += 11 * 60_000;
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "time-limit", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "time-limit", turns: 1 });
 	});
 
 	test("an aborted turn with unverified changes ends interrupted and sends nothing", async () => {
@@ -1259,7 +1338,7 @@ describe("round loop", () => {
 		h.controller.onAgentStart();
 		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
 	});
 
 	test("a held session waits: the delay look arms HOLD_MS until the draft is gone, and a turn clears the wait", async () => {
@@ -1316,9 +1395,9 @@ describe("round loop", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		agents.push(verdict(T0 + 1, true, F0));
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.endReason === "verified");
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
 	});
 
 	test("a turn that starts before the timer fires clears it, and its end decides again", async () => {
@@ -1333,7 +1412,7 @@ describe("round loop", () => {
 		agents.push(verdict(T0 + 1, true, F0));
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 1 });
 	});
 
 	test("a round message that cannot be sent ends the run no-progress with a warning", async () => {
@@ -1347,9 +1426,9 @@ describe("round loop", () => {
 		await h.turn();
 		// The agent_end handler has returned; the rejection arrives from the send the timer started.
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.endReason === "no-progress");
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "no-progress");
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 1 });
 	});
 
 	test("a round send that rejects after the run ended leaves the record alone", async () => {
@@ -1365,14 +1444,14 @@ describe("round loop", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		await h.controller.finish("shutdown");
-		const ended = await readRun(root, runId);
+		const ended = await readRun(h.sessionDir, runId);
 		const summaries = h.summaries();
 		const warnings = h.notices.filter(n => n.level === "warning").length;
 
 		send.reject(new Error("session closed"));
 		await until(() => h.notices.filter(n => n.level === "warning").length === warnings + 1);
 		expect(h.summaries()).toBe(summaries);
-		expect(await readRun(root, runId)).toEqual(ended);
+		expect(await readRun(h.sessionDir, runId)).toEqual(ended);
 	});
 
 	test("a send that never settles does not hold the round or the next turn", async () => {
@@ -1392,8 +1471,8 @@ describe("round loop", () => {
 		// The next turn starts and settles while that send is still pending.
 		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
-		await until(async () => (await readRun(root, runId))?.endReason === "verified");
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
 		pending.resolve();
 	});
 
@@ -1402,7 +1481,7 @@ describe("round loop", () => {
 		const runId = await h.start();
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended", endReason: "no-reviewer", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended", endReason: "no-reviewer", turns: 1 });
 	});
 
 	test("a run past a block-spawns budget with unverified changes ends budget and sends nothing", async () => {
@@ -1412,10 +1491,10 @@ describe("round loop", () => {
 		});
 		const runId = await h.start();
 		recordCost(runId, "a/i", 2);
-		expect(activeLedgerRun(h.repo.root)?.exceeded).toBe(true);
+		expect(activeLedgerRun(h.sessionDir)?.exceeded).toBe(true);
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
 	});
 
 	test("a quick agent's changes alone end unreviewed", async () => {
@@ -1423,7 +1502,7 @@ describe("round loop", () => {
 		const runId = await h.start();
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "ended", endReason: "unreviewed", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended", endReason: "unreviewed", turns: 1 });
 	});
 
 	test("a streaming session, queued messages and plan mode each hold the round", async () => {
@@ -1462,8 +1541,8 @@ describe("round loop", () => {
 			else await h.controller.finish("shutdown");
 			expect(h.controller.directing()).toBe(false);
 			expect(h.timers.pending()).toBe(0);
-			await until(async () => (await readRun(root, runId))?.status !== "running");
-			expect(await readRun(root, runId)).toMatchObject({ status: end === "budget" ? "budget-exceeded" : "stopped", endReason: end });
+			await until(async () => (await readRun(h.sessionDir, runId))?.status !== "running");
+			expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: end === "budget" ? "budget-exceeded" : "stopped", endReason: end });
 			h.timers.fire();
 			expect(h.sent).toHaveLength(1);
 		}
@@ -1497,7 +1576,7 @@ describe("changes seen through the work tree", () => {
 		agents.push(verdict(T0 + 1, true, "d1:f0"));
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
 	});
 
 	test("the run reads its main tree against the start commit at every decision", async () => {
@@ -1512,7 +1591,7 @@ describe("changes seen through the work tree", () => {
 		});
 		await h.start();
 		expect(calls).toEqual([{ root }]);
-		expect(activeLedgerRun(h.repo.root)?.base).toBe(BASE);
+		expect(activeLedgerRun(h.sessionDir)?.base).toBe(BASE);
 		tree = treeOf("d1", "f0");
 		await h.turn();
 		expect(calls.at(-1)).toEqual({ root, base: BASE });
@@ -1555,7 +1634,7 @@ describe("changes seen through the work tree", () => {
 		tree = treeOf("d3", "f0");
 		await h.turn();
 		expect(h.sent).toHaveLength(3);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
 	});
 
 	test("a team change after the re-review's verdict is not excused and gets another round", async () => {
@@ -1613,7 +1692,7 @@ describe("changes seen through the work tree", () => {
 		tree = treeOf("d2", "f0");
 		await h.turn();
 		expect(h.sent).toHaveLength(2);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
 	});
 
 	test("a tree read that fails after a known start counts as a change", async () => {
@@ -1652,7 +1731,7 @@ describe("changes seen through the work tree", () => {
 
 		agents.push(verdict(T0 + 2, true, "d2:f0", { id: "Rev2" }));
 		await h.turn();
-		expect(await readRun(root, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 3 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 3 });
 	});
 
 	test("a held look reads no tree until the hold clears", async () => {
@@ -1695,7 +1774,7 @@ describe("changes seen through the work tree", () => {
 		agents.push(verdict(T0 + 1, true));
 		await h.turn();
 		expect(h.controller.active()).toMatchObject({ status: "running", turns: 2 });
-		expect((await readRun(root, runId))?.endReason).toBeUndefined();
+		expect((await readRun(h.sessionDir, runId))?.endReason).toBeUndefined();
 		await h.controller.finish("shutdown");
 	});
 
@@ -1750,7 +1829,7 @@ describe("changes seen through the work tree", () => {
 		await settled;
 		expect(h.sent).toHaveLength(1);
 		expect(h.timers.pending()).toBe(0);
-		expect(await lastRun(root)).toMatchObject({ endReason: "shutdown" });
+		expect(await lastRun(h.sessionDir)).toMatchObject({ endReason: "shutdown" });
 	});
 
 	test("a look that resolves after a turn started is dropped", async () => {
@@ -1823,7 +1902,7 @@ describe("interrupted waits", () => {
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.sent).toHaveLength(1);
 		expect(h.timers.pending()).toBe(0);
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
 	});
 
 	test("an async wait that resumes with a new turn decides as usual", async () => {
@@ -1851,17 +1930,17 @@ describe("interrupted waits", () => {
 		const runId = await h.start();
 		await h.turn();
 		h.timers.fire();
-		await until(async () => (await readRun(root, runId))?.endReason === "interrupted");
-		expect(await readRun(root, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "interrupted");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "interrupted", turns: 1 });
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(0);
 	});
 });
 
 describe("run failures behind a timer", () => {
 	/** Leaves the run records unwritable: a `finish` from a timer or a rejected send then throws. */
-	const breakRecords = async (): Promise<void> => {
-		await rm(runsDir(root), { recursive: true, force: true });
-		await writeFile(runsDir(root), "not a directory");
+	const breakRecords = async (session: FakeSession): Promise<void> => {
+		await rm(runsDir(session.sessionDir), { recursive: true, force: true });
+		await writeFile(runsDir(session.sessionDir), "not a directory");
 	};
 
 	test("a look that cannot end the run reports the failure instead of leaving a rejected promise", async () => {
@@ -1870,7 +1949,7 @@ describe("run failures behind a timer", () => {
 		const runId = await h.start();
 		await h.turn();
 		agents.push(verdict(T0 + 1, true, F0));
-		await breakRecords();
+		await breakRecords(h);
 		h.timers.fire();
 		await until(() => h.notices.some(n => n.level === "error"));
 		await until(() => h.leases.released.includes(runId));
@@ -1886,7 +1965,7 @@ describe("run failures behind a timer", () => {
 		});
 		await h.start();
 		await h.turn();
-		await breakRecords();
+		await breakRecords(h);
 		h.timers.fire();
 		await until(() => h.notices.some(n => n.level === "error"));
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(1);
@@ -1912,8 +1991,8 @@ describe("budget", () => {
 		expect(h.controller.directing()).toBe(true);
 		await h.controller.onAgentEnd({}, h.ctx);
 		expect(h.controller.directing()).toBe(false);
-		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", costUsd: 3 });
-		expect(await readRunIndex(root)).toMatchObject([{ runId, status: "budget-exceeded" }]);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", costUsd: 3 });
+		expect(await readRunIndex(h.sessionDir)).toMatchObject([{ runId, status: "budget-exceeded" }]);
 	});
 
 	test("block-spawns: nothing is aborted and the run goes on to its own end", async () => {
@@ -1925,7 +2004,7 @@ describe("budget", () => {
 		expect(h.notices.filter(n => n.level === "warning")).toHaveLength(2);
 		expect(h.controller.directing()).toBe(true);
 		await h.controller.onAgentEnd({}, h.ctx);
-		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "no-changes" });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "budget-exceeded", endReason: "no-changes" });
 	});
 
 	test("a stop during a turn with unverified changes ends budget, not the aborted turn's interruption", async () => {
@@ -1937,7 +2016,7 @@ describe("budget", () => {
 		// omp marks the aborted turn's last assistant message; without the end decided earlier it would read interrupted.
 		await h.controller.onAgentEnd({ messages: [{ role: "assistant", stopReason: "aborted" }] }, h.ctx);
 		expect(h.sent).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "budget-exceeded", endReason: "budget", turns: 1 });
 	});
 
 	test("a stop between turns ends the run at once, before any next turn", async () => {
@@ -1949,8 +2028,8 @@ describe("budget", () => {
 		expect(h.aborts()).toBe(0);
 		expect(h.controller.directing()).toBe(false);
 		expect(h.timers.pending()).toBe(0);
-		await until(async () => (await readRun(root, runId))?.status === "budget-exceeded");
-		expect(await readRun(root, runId)).toMatchObject({ endReason: "budget", turns: 1 });
+		await until(async () => (await readRun(h.sessionDir, runId))?.status === "budget-exceeded");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ endReason: "budget", turns: 1 });
 	});
 
 	test("without a budget no spend warns or aborts", async () => {
@@ -1970,7 +2049,7 @@ describe("run-end cleanup", () => {
 	let artifacts: string;
 
 	beforeEach(async () => {
-		agentDir = path.join(root, "agent");
+		agentDir = path.join(path.dirname(root), `agent-${path.basename(root)}`);
 		artifacts = path.join(agentDir, "sessions", "proj", "sess");
 		await mkdir(artifacts, { recursive: true });
 		await writeFile(`${artifacts}.jsonl`, "");
@@ -1979,117 +2058,146 @@ describe("run-end cleanup", () => {
 	const recordOf = (id: string) => path.join(artifacts, `${id}.jsonl`);
 
 	/** Four earlier Storm runs on the trusted list, the oldest with one subagent whose omp record is on disk. */
-	async function seedOlderRuns(storeDir: string, owner: string, id = "Old"): Promise<void> {
+	async function seedOlderRuns(sessionDir: string, owner: string, id = "Old"): Promise<void> {
 		await writeFile(recordOf(id), "transcript");
 		await writeFile(path.join(artifacts, `${id}.md`), "output");
 		for (let n = 1; n <= 4; n++) {
-			await recordTrustedRun(storeDir, { runId: `run-old-${n}`, artifactsDir: artifacts, process: owner, agents: n === 1 ? [id] : [], endedAt: "t" });
+			await recordTrustedRun(sessionDir, { runId: `run-old-${n}`, artifactsDir: artifacts, process: owner, agents: n === 1 ? [id] : [], endedAt: "t" });
 		}
 	}
 
-	test("a finished run joins the trusted list with its artifacts dir, process and agents; a session without artifacts does not", async () => {
+	test("a finished run joins its own session's trusted list; another session's list stays separate", async () => {
 		const h = session({ agents: [agent({ id: "A" }), agent({ id: "B" })], artifactsDir: artifacts, agentDir, now: () => NOW });
 		const runId = await h.start();
-		expect((await readRun(root, runId))?.artifactsDir).toBe(artifacts);
-		expect(await readTrustedRuns(h.state.store.dir)).toEqual([]);
+		expect((await readRun(h.sessionDir, runId))?.artifactsDir).toBe(artifacts);
+		expect(await readTrustedRuns(h.sessionDir)).toEqual([]);
 		await h.turn();
-		expect(await readTrustedRuns(h.state.store.dir)).toEqual([
+		expect(await readTrustedRuns(h.sessionDir)).toEqual([
 			{ runId, artifactsDir: artifacts, process: processKey(), agents: ["A", "B"], endedAt: new Date(NOW).toISOString() },
 		]);
 
-		// A shutdown records the run too: its agents' records must be cleanable later.
-		const closing = session({ artifactsDir: artifacts, agentDir });
+		// Reopening the same native session records into the same store; a shutdown records the run too.
+		const closing = session({ sessionId: h.sessionId, artifactsDir: artifacts, agentDir });
 		const closed = await closing.start();
 		await closing.controller.finish("shutdown");
-		expect((await readTrustedRuns(h.state.store.dir)).map(run => run.runId)).toEqual([runId, closed]);
+		expect((await readTrustedRuns(h.sessionDir)).map(run => run.runId)).toEqual([runId, closed]);
 
-		const bare = session({ agentDir });
-		const unlisted = await bare.start();
-		expect((await readRun(root, unlisted))?.artifactsDir).toBeUndefined();
-		await bare.turn();
-		expect((await readTrustedRuns(h.state.store.dir)).map(run => run.runId)).toEqual([runId, closed]);
+		// A different native session without an artifacts dir records nothing, and never touches the first list.
+		const other = session({ agentDir });
+		const unlisted = await other.start();
+		expect((await readRun(other.sessionDir, unlisted))?.artifactsDir).toBeUndefined();
+		await other.turn();
+		expect(await readTrustedRuns(other.sessionDir)).toEqual([]);
+		expect((await readTrustedRuns(h.sessionDir)).map(run => run.runId)).toEqual([runId, closed]);
 	});
 
 	test("with consent at start and at the end, an older run's parked agent loses its omp record and keeps its output", async () => {
 		const h = session({ config: cleaning, artifactsDir: artifacts, agentDir, now: () => NOW });
-		await seedOlderRuns(h.state.store.dir, DEAD_PROCESS);
+		await seedOlderRuns(h.sessionDir, DEAD_PROCESS);
 		const runId = await h.start();
 		await h.turn();
 		expect(existsSync(recordOf("Old"))).toBe(false);
 		expect(existsSync(path.join(artifacts, "Old.md"))).toBe(true);
-		const record = await readRun(root, runId);
+		const record = await readRun(h.sessionDir, runId);
 		expect(record?.cleanup).toMatchObject({ agents: 1, files: 1, bytes: "transcript".length });
-		expect((await readRunIndex(root))[0]).toMatchObject({ runId });
-		expect((await readTrustedRuns(h.state.store.dir))[0]?.cleaned).toEqual(["Old"]);
+		expect((await readRunIndex(h.sessionDir))[0]).toMatchObject({ runId });
+		expect((await readTrustedRuns(h.sessionDir))[0]?.cleaned).toEqual(["Old"]);
 	});
 
 	test("the approval in force when the run ends decides: consent withdrawn, or the team unapproved, mid-run deletes nothing", async () => {
-		const withdrawn: Array<(state: ProjectState) => ProjectState> = [
-			() => approvedState(root, SESSION_TEAM),
-			() => approvedState(root, { ...cleaning, cleanup: false }),
-			state => ({ ...state, approval: undefined }),
-			state => ({ ...state, config: { status: "invalid", path: "x", errors: ["bad"] } }),
-		];
-		for (const atEnd of withdrawn) {
-			const atStart = approvedState(root, cleaning);
-			let current = atStart;
+		for (const variant of ["team", "cleanup-off", "unapproved", "invalid"] as const) {
+			let current: ProjectState;
 			const h = session({ config: cleaning, loadState: async () => current, artifactsDir: artifacts, agentDir });
-			await seedOlderRuns(atStart.store.dir, DEAD_PROCESS);
+			const owner = { agentDir: h.agentDir, sessionId: h.sessionId };
+			const atStart = approvedState(root, cleaning, owner);
+			current = atStart;
+			const atEnd = (state: ProjectState): ProjectState => {
+				if (variant === "team") return approvedState(root, SESSION_TEAM, owner);
+				if (variant === "cleanup-off") return approvedState(root, { ...cleaning, cleanup: false }, owner);
+				if (variant === "unapproved") return { ...state, approval: undefined };
+				return { ...state, config: { status: "invalid", path: "x", errors: ["bad"] } };
+			};
+			await seedOlderRuns(atStart.sessionDir, DEAD_PROCESS);
 			const runId = await h.start();
 			current = atEnd(atStart);
 			await h.turn();
 			expect(existsSync(recordOf("Old"))).toBe(true);
-			const record = await readRun(root, runId);
+			const record = await readRun(h.sessionDir, runId);
 			expect(record?.status).toBe("ended");
 			expect(record?.cleanup?.agents ?? 0).toBe(0);
-			await rm(atStart.store.dir, { recursive: true, force: true });
-			await rm(path.join(root, ".omp"), { recursive: true, force: true });
+			await rm(atStart.sessionDir, { recursive: true, force: true });
 		}
 	});
 
 	test("consent given only mid-run deletes nothing either: the run started without it", async () => {
-		const atStart = approvedState(root, SESSION_TEAM);
-		let current = atStart;
+		let current: ProjectState;
 		const h = session({ loadState: async () => current, artifactsDir: artifacts, agentDir });
-		await seedOlderRuns(atStart.store.dir, DEAD_PROCESS);
+		const owner = { agentDir: h.agentDir, sessionId: h.sessionId };
+		const atStart = approvedState(root, SESSION_TEAM, owner);
+		current = atStart;
+		await seedOlderRuns(atStart.sessionDir, DEAD_PROCESS);
 		await h.start();
-		current = approvedState(root, cleaning);
-		await h.turn();
-		expect(existsSync(recordOf("Old"))).toBe(true);
-	});
-
-	test("without a known omp agent dir nothing of omp's is deleted", async () => {
-		const h = session({ config: cleaning, artifactsDir: artifacts });
-		await seedOlderRuns(h.state.store.dir, DEAD_PROCESS);
-		await h.start();
+		current = approvedState(root, cleaning, owner);
 		await h.turn();
 		expect(existsSync(recordOf("Old"))).toBe(true);
 	});
 
 	test("agents of this process are judged by the process ledger: parked ones are cleaned and marked, live ones stay", async () => {
-		noteAgentStart({ id: "Parked", name: "storm-implementer", now: 1 });
-		noteAgentParked("Parked");
-		noteAgentStart({ id: "Live", name: "storm-implementer", now: 1 });
-		const h = session({ config: cleaning, artifactsDir: artifacts, agentDir, ledger: () => listAgents(), now: () => NOW });
-		await seedOlderRuns(h.state.store.dir, processKey(), "Parked");
+		const h = session({ config: cleaning, artifactsDir: artifacts, agentDir, ledger: () => listAgents({ scope: h.sessionDir }), now: () => NOW });
+		noteAgentStart({ id: "Parked", name: "storm-implementer", now: 1, scope: h.sessionDir });
+		noteAgentParked("Parked", h.sessionDir);
+		noteAgentStart({ id: "Live", name: "storm-implementer", now: 1, scope: h.sessionDir });
+		await seedOlderRuns(h.sessionDir, processKey(), "Parked");
 		await writeFile(recordOf("Live"), "transcript");
-		await recordTrustedRun(h.state.store.dir, { runId: "run-old-1", artifactsDir: artifacts, process: processKey(), agents: ["Parked", "Live"], endedAt: "t" });
+		await recordTrustedRun(h.sessionDir, { runId: "run-old-1", artifactsDir: artifacts, process: processKey(), agents: ["Parked", "Live"], endedAt: "t" });
 		await h.start();
 		await h.turn();
 		expect(existsSync(recordOf("Parked"))).toBe(false);
 		expect(existsSync(recordOf("Live"))).toBe(true);
-		const ledger = listAgents();
+		const ledger = listAgents({ scope: h.sessionDir });
 		expect(ledger.find(entry => entry.id === "Parked")?.cleanedAt).toBe(NOW);
 		expect(ledger.find(entry => entry.id === "Live")?.cleanedAt).toBeUndefined();
 	});
 
-	test("a crashed earlier run of the project is closed as stopped when this one ends", async () => {
-		const crashed = runRecord({ runId: "run-20261119-000000-dead", status: "running", process: DEAD_PROCESS, startedAt: "2026-11-19T00:00:00.000Z" });
-		await writeRun(root, crashed);
+	test("a run end never touches another session's records, trust list, counters or the repo", async () => {
 		const h = session();
+		const other = session();
+		const foreign = runRecord({
+			runId: "run-20261119-000000-oth0",
+			status: "running",
+			process: DEAD_PROCESS,
+			startedAt: "2026-11-19T00:00:00.000Z",
+		});
+		await writeRun(other.sessionDir, foreign);
+		await recordTrustedRun(other.sessionDir, {
+			runId: foreign.runId,
+			artifactsDir: path.join(root, "unused-artifacts"),
+			process: DEAD_PROCESS,
+			agents: [],
+			endedAt: "2026-11-19T01:00:00.000Z",
+		});
+		await updateTrialState(other.sessionDir, "other-trial", current => ({ ...current, seen: 1 }));
+
+		const runId = await h.start();
+		await h.turn();
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "ended" });
+
+		// The other session's record is not stopped, its trust list and counters are untouched, and nothing was written
+		// into the target work tree (no implicit `.omp/storm`, no `.gitignore`).
+		expect(await readRun(other.sessionDir, foreign.runId)).toEqual(foreign);
+		expect((await readTrustedRuns(other.sessionDir)).map(run => run.runId)).toEqual([foreign.runId]);
+		expect((await readTrialStates(other.sessionDir))["other-trial"]?.seen).toBe(1);
+		expect(existsSync(path.join(root, ".omp"))).toBe(false);
+		expect(existsSync(path.join(h.sessionDir, ".gitignore"))).toBe(false);
+	});
+
+	test("a crashed earlier run of the session is closed as stopped when this one ends", async () => {
+		const crashed = runRecord({ runId: "run-20261119-000000-dead", status: "running", process: DEAD_PROCESS, startedAt: "2026-11-19T00:00:00.000Z" });
+		const h = session();
+		await writeRun(h.sessionDir, crashed);
 		await h.start();
 		await h.turn();
-		expect(await readRun(root, crashed.runId)).toMatchObject({ status: "stopped", endedAt: crashed.startedAt });
+		expect(await readRun(h.sessionDir, crashed.runId)).toMatchObject({ status: "stopped", endedAt: crashed.startedAt });
 	});
 });
 
@@ -2136,7 +2244,7 @@ describe("director counters", () => {
 		expect(h.controller.active()?.reads).toEqual(reads);
 		const record = await h.controller.finish("no-changes");
 		expect(record?.reads).toEqual(reads);
-		expect((await readRunIndex(root)).find(s => s.runId === runId)?.reads).toEqual(reads);
+		expect((await readRunIndex(h.sessionDir)).find(s => s.runId === runId)?.reads).toEqual(reads);
 		// The summary carries the share that the 65% baseline is compared with.
 		expect(record && summarizeRun(record)).toContain("70%");
 	});
@@ -2369,17 +2477,17 @@ describe("run plan", () => {
 
 	test("setPlan needs an active run; the plan reaches the ledger, the live record and the final record", async () => {
 		const h = session();
-		expect(h.controller.setPlan(plan)).toMatchObject({ ok: false });
+		expect(await h.controller.setPlan(h.ctx, plan)).toMatchObject({ ok: false });
 		const runId = await h.start();
-		expect(activeLedgerRun(h.repo.root)?.plan).toBeUndefined();
-		expect(h.controller.setPlan(plan)).toEqual({ ok: true });
-		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(plan);
+		expect(activeLedgerRun(h.sessionDir)?.plan).toBeUndefined();
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		expect(activeLedgerRun(h.sessionDir)?.plan).toEqual(plan);
 		expect(h.controller.active()?.plan).toEqual(plan);
 		noteRunSpawn(runId, spawn);
 		expect(runSpawns(runId)).toEqual([spawn]);
 		const record = await h.controller.finish("no-changes");
 		expect(record).toMatchObject({ plan });
-		expect(activeLedgerRun(h.repo.root)).toBeUndefined();
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
 	});
 
 	test("a replan that changes a lane's identity is refused before the plan in force changes", async () => {
@@ -2390,17 +2498,17 @@ describe("run plan", () => {
 			workers: { implementer: 1 },
 			submittedAt: "2026-11-20T09:00:00.000Z",
 		};
-		expect(h.controller.setPlan(first)).toEqual({ ok: true });
+		expect(await h.controller.setPlan(h.ctx, first)).toEqual({ ok: true });
 		const drift: RunPlan = { ...first, lanes: [{ ...first.lanes[0]!, goal: "Build the web view" }] };
-		const refused = h.controller.setPlan(drift);
+		const refused = await h.controller.setPlan(h.ctx, drift);
 		expect(refused.ok).toBe(false);
 		expect(refused.ok ? "" : refused.reason).toContain("api");
-		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(first);
+		expect(activeLedgerRun(h.sessionDir)?.plan).toEqual(first);
 		expect(h.controller.active()?.plan).toEqual(first);
 		// A status update is not identity: the same lane keeps its evidence and may update progress.
 		const progress: RunPlan = { ...first, lanes: [{ ...first.lanes[0]!, progress: "half done" }] };
-		expect(h.controller.setPlan(progress)).toEqual({ ok: true });
-		expect(activeLedgerRun(h.repo.root)?.plan).toEqual(progress);
+		expect(await h.controller.setPlan(h.ctx, progress)).toEqual({ ok: true });
+		expect(activeLedgerRun(h.sessionDir)?.plan).toEqual(progress);
 		expect(await h.controller.finish("no-changes")).toMatchObject({ plan: progress });
 	});
 });
@@ -2413,38 +2521,34 @@ describe("closeout brief", () => {
 		next: ["문서 반영을 새 Storm 작업으로 맡기기", "API 경계를 다시 점검하는 좁은 작업", "변경 기록만 읽기 전용으로 확인하기"],
 		...over,
 	});
-	const sessionId = (h: FakeSession, id: string): void => {
-		Object.assign(h.ctx.sessionManager, { getSessionId: () => id });
-	};
 
 	test("stages on the active run without completing it and persists only the latest valid brief", async () => {
 		const h = session();
-		expect(h.controller.submitCloseout(brief())).toMatchObject({ ok: false });
+		expect(h.controller.submitCloseout(h.ctx, brief())).toMatchObject({ ok: false });
 		const runId = await h.start();
-		expect(h.controller.submitCloseout(brief())).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, brief())).toEqual({ ok: true });
 		const active = h.controller.active();
 		expect(active).toMatchObject({ status: "running" });
 		expect(active !== undefined && "endReason" in active).toBe(false);
 		expect(h.controller.directing()).toBe(true);
 		expect(h.summaries()).toBe(0);
 		const rejected = brief({ next: ["같은 방향", " 같은 방향 ", "다른 방향"] });
-		expect(h.controller.submitCloseout(rejected)).toMatchObject({ ok: false });
+		expect(h.controller.submitCloseout(h.ctx, rejected)).toMatchObject({ ok: false });
 		const latest = brief({ result: "최신 결과입니다." });
-		expect(h.controller.submitCloseout(latest)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, latest)).toEqual({ ok: true });
 		const record = await h.controller.finish("no-changes", h.ctx);
 		expect(record).toMatchObject({ status: "ended", endReason: "no-changes", closeout: latest });
-		expect(await readRun(root, runId)).toMatchObject({ closeout: latest });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: latest });
 		expect(h.summaries()).toBe(1);
 		expect(h.ui.records[0]?.markdown).toContain("- 결과(감독 보고): 최신 결과입니다.");
 		expect(h.ui.records[0]?.markdown).not.toContain("API를 추가했습니다.");
 	});
 
 	test("a settled substantive card is the only record, comes after the lease release, and resolves one choice", async () => {
-		const h = session({ artifactsDir: root });
-		sessionId(h, "session-closeout");
+		const h = session({ artifactsDir: root, sessionId: "session-closeout" });
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		let releasedAtRecord = -1;
 		const original = h.ui.ui.record.bind(h.ui.ui);
 		h.ui.ui.record = (title, markdown) => {
@@ -2465,8 +2569,8 @@ describe("closeout brief", () => {
 		expect(h.controller.runId()).toBeUndefined();
 		await h.controller.finish("verified", h.ctx);
 		expect(h.summaries()).toBe(1);
-		expect(await readRunIndex(root)).toHaveLength(1);
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRunIndex(h.sessionDir)).toHaveLength(1);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
 	test("a substantive run without a brief shows one conservative fallback card and never claims verification", async () => {
@@ -2487,50 +2591,39 @@ describe("closeout brief", () => {
 		const h = session();
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		expect(await h.controller.finish("shutdown")).toMatchObject({ status: "stopped", endReason: "shutdown" });
 		expect(h.summaries()).toBe(0);
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
 	test("a session switch ends as shutdown and opens no card even though a context is available", async () => {
 		const h = session();
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		expect(await h.controller.finish("shutdown", h.ctx)).toMatchObject({ status: "stopped", endReason: "shutdown" });
 		expect(h.summaries()).toBe(0);
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
 	test("a TUI card tells the user how to pick only when the choice is registered", async () => {
-		const h = session({ artifactsDir: root });
-		sessionId(h, "session-tui");
+		const h = session({ artifactsDir: root, sessionId: "session-tui" });
 		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		expect(await h.controller.finish("verified", tui)).toMatchObject({ status: "done" });
 		expect(h.ui.records[0]?.markdown).toContain(CLOSEOUT_CHOICE_HINT);
 		expect(takeCloseoutChoice(tui, "3")).toBe(draft.next[2]);
-
-		// Without a public session identity the card still shows, but no numeric affordance is offered.
-		const anonymous = session();
-		const anonymousTui: ExtensionContext = { ...anonymous.ctx, mode: "tui" };
-		await anonymous.start();
-		expect(anonymous.controller.submitCloseout(draft)).toEqual({ ok: true });
-		await anonymous.controller.finish("verified", anonymousTui);
-		expect(anonymous.ui.records[0]?.markdown).toContain("1. 추천 —");
-		expect(anonymous.ui.records[0]?.markdown).not.toContain(CLOSEOUT_CHOICE_HINT);
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
 	test("a stable session identity that differs from the directing session publishes no card or choice", async () => {
-		const h = session({ artifactsDir: root });
-		sessionId(h, "session-old");
+		const h = session({ artifactsDir: root, sessionId: "session-old" });
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		const other: ExtensionContext = Object.assign({}, h.ctx, {
 			sessionManager: { getSessionId: () => "session-new" },
 		});
@@ -2538,20 +2631,918 @@ describe("closeout brief", () => {
 		expect(h.summaries()).toBe(0);
 		expect(takeCloseoutChoice(h.ctx, "1")).toBeUndefined();
 		expect(takeCloseoutChoice(other, "1")).toBeUndefined();
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
 	test("a session manager changing in place cannot open a closeout in the new conversation", async () => {
-		const h = session({ artifactsDir: root });
+		const h = session({ artifactsDir: root, sessionId: "session-original" });
 		let active = "session-original";
 		Object.assign(h.ctx, { sessionManager: { ...h.ctx.sessionManager, getSessionId: () => active, getArtifactsDir: () => root } });
 		const runId = await h.start();
 		const draft = brief();
-		expect(h.controller.submitCloseout(draft)).toEqual({ ok: true });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		active = "session-switched";
 		await h.controller.finish("interrupted", h.ctx);
 		expect(h.summaries()).toBe(0);
 		expect(takeCloseoutChoice(h.ctx, "1")).toBeUndefined();
-		expect(await readRun(root, runId)).toMatchObject({ closeout: draft });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
+	});
+});
+
+describe("declared results", () => {
+	const REPORT = "report.json";
+	const REPORT_TEXT = '{\n  "total": 42,\n  "source": "user owns this file"\n}\n';
+
+	/** A report the adapter would accept for this run; tests override only the host facts they exercise. */
+	const report = (over: Partial<AttemptReport> & Pick<AttemptReport, "runId" | "spawnKey" | "attemptId">): AttemptReport => ({
+		schema: "storm.attempt-report/v1",
+		parentId: "main",
+		outcome: "success",
+		capture: "observed",
+		observedAt: T0 + 1,
+		version: "unknown",
+		artifacts: [],
+		observations: [],
+		...over,
+	});
+
+	const planFor = (lanes: RunPlan["lanes"], workers: Record<string, number>): RunPlan => ({
+		lanes,
+		workers,
+		submittedAt: new Date(T0).toISOString(),
+	});
+
+	/** Admits one planned lane the way the extension does, returning the host spawn key. */
+	function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneName: string): string {
+		const lane = plan.lanes.find(candidate => candidate.name === laneName);
+		if (lane === undefined) throw new Error(`no lane ${laneName}`);
+		const lanes = h.controller.runLanes();
+		if (lanes === undefined) throw new Error("the run has no lane matcher");
+		const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
+		const bound = lanes.assign({ name: lane.name, agent }, plan, h.config);
+		if (!bound.ok) throw new Error(bound.reason);
+		const spawnKey = (bound.input as Record<string, unknown>).name;
+		if (typeof spawnKey !== "string") throw new Error("the lane binding has no task name");
+		lanes.admit({ spawnKey, agent, outcome: "routed" });
+		agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: T0 + 1 }));
+		return spawnKey;
+	}
+
+	test("T01a: an existing user file and a no-op worker leave the named change unmet, not a quiet close", async () => {
+		await writeFile(path.join(root, REPORT), REPORT_TEXT);
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const runId = await h.start();
+		const plan = planFor(
+			[
+				{
+					name: "report",
+					kind: "code",
+					role: "implementer",
+					files: [REPORT],
+					goal: "Create or update report.json",
+					results: [{ id: "report-change", kind: "change", criterion: "the worker changed report.json", path: REPORT, contains: '"total": 42' }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "report");
+		expect(await h.controller.prepareAttempt({ runId, lane: "report", spawnKey, parentId: "main", dispatch: "d1", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "report",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d1",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `task:call-1:${spawnKey}` }),
+			citations: [],
+		});
+
+		const live = h.controller.active();
+		const row = live?.results?.find(item => item.id === "report-change");
+		expect(row).toMatchObject({ state: "unmet", lane: "report", attemptId: `task:call-1:${spawnKey}` });
+		expect(row?.reason).toBeTruthy();
+		expect(await Bun.file(path.join(root, REPORT)).text()).toBe(REPORT_TEXT);
+
+		// The first round cannot close quietly; the next round has no progress to report and stops honestly.
+		await h.turn();
+		expect(h.controller.directing()).toBe(true);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		await h.turn();
+		const run = await readRun(h.sessionDir, runId);
+		expect(run).toMatchObject({ status: "stopped", endReason: "no-progress" });
+		expect(run?.results?.find(item => item.id === "report-change")).toMatchObject({ state: "unmet", attemptId: `task:call-1:${spawnKey}` });
+		expect(await Bun.file(path.join(root, REPORT)).text()).toBe(REPORT_TEXT);
+	});
+
+	test("T01b: a witnessed answer is accepted on its native attempt and the read-only run ends no-changes", async () => {
+		await writeFile(path.join(root, REPORT), REPORT_TEXT);
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const runId = await h.start();
+		const plan = planFor(
+			[
+				{
+					name: "read-report",
+					kind: "explore",
+					role: "explorer",
+					goal: "Answer report.json's total",
+					results: [{ id: "report-answer", kind: "answer", criterion: "states the total and cites report.json", path: REPORT, contains: '"total": 42' }],
+				},
+			],
+			{ explorer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "read-report");
+		expect(await h.controller.prepareAttempt({ runId, lane: "read-report", spawnKey, parentId: "main", dispatch: "d2", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "read-report",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d2",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-1:${spawnKey}` }),
+			reportText: "The current report.json total is 42 (report.json:2).",
+			citations: [{ path: REPORT, line: 2 }],
+		});
+		await h.turn();
+
+		const run = await readRun(h.sessionDir, runId);
+		expect(run).toMatchObject({ status: "ended", endReason: "no-changes" });
+		expect(run?.results?.find(item => item.id === "report-answer")).toMatchObject({ state: "accepted", lane: "read-report", attemptId: `job:job-1:${spawnKey}` });
+		expect(run?.agents?.some(item => item.role === "reviewer")).not.toBe(true);
+	});
+
+	test("a structured config refusal marks the pending result blocked with its own unblock text", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const plan = planFor(
+			[
+				{
+					name: "report",
+					kind: "code",
+					role: "implementer",
+					files: [REPORT],
+					results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		noteRunSpawn(runId, {
+			...spawn,
+			agent: "storm-implementer",
+			spawnKey: "report",
+			outcome: "blocked",
+			code: "no-config",
+			reason: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+		const final = await h.controller.finish("no-progress");
+		expect(final?.results?.find(item => item.id === "report-change")).toMatchObject({
+			state: "pending",
+			remedy: "blocked",
+			unblock: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+	});
+
+	test("a same-role sibling or a capacity refusal never guesses a blocked result", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const plan = planFor(
+			[
+				{ name: "one", kind: "code", role: "implementer", files: ["one.txt"], results: [{ id: "r1", kind: "change", criterion: "one", path: "one.txt" }] },
+				{ name: "two", kind: "code", role: "implementer", files: ["two.txt"], results: [{ id: "r2", kind: "change", criterion: "two", path: "two.txt" }] },
+			],
+			{ implementer: 2 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		// The host key is not a lane name and two lanes share the role: the refusal cannot be attributed safely.
+		noteRunSpawn(runId, {
+			...spawn,
+			agent: "storm-implementer",
+			spawnKey: "generated-lane",
+			outcome: "blocked",
+			code: "no-config",
+			reason: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+		const final = await h.controller.finish("no-progress");
+		expect(final?.results?.every(row => row.remedy !== "blocked")).toBe(true);
+	});
+
+	test("a wrong-role spawn keyed like a lane does not block the planned role's result", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const plan = planFor(
+			[
+				{
+					name: "report",
+					kind: "code",
+					role: "implementer",
+					files: [REPORT],
+					results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		// The host key collides with the lane name, but another role owns this refused spawn: its reason cannot
+		// explain why the planned implementer requirement is open.
+		noteRunSpawn(runId, {
+			...spawn,
+			agent: "storm-quick",
+			role: "quick",
+			spawnKey: "report",
+			outcome: "blocked",
+			code: "no-config",
+			reason: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+		const final = await h.controller.finish("no-progress");
+		expect(final?.results?.find(item => item.id === "report-change")?.remedy).not.toBe("blocked");
+	});
+
+	test("a sole same-role spawn with a host key outside the lane name still attributes its refusal", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const plan = planFor(
+			[
+				{
+					name: "report",
+					kind: "code",
+					role: "implementer",
+					files: [REPORT],
+					results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		// One lane of this role exists, so the unkeyed refusal is attributable to its pending requirement.
+		noteRunSpawn(runId, {
+			...spawn,
+			agent: "storm-implementer",
+			spawnKey: "generated-lane",
+			outcome: "blocked",
+			code: "no-config",
+			reason: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+		const final = await h.controller.finish("no-progress");
+		expect(final?.results?.find(item => item.id === "report-change")).toMatchObject({
+			state: "pending",
+			remedy: "blocked",
+			unblock: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요.",
+		});
+	});
+
+	test("a capacity refusal is not a config blocker and a later admitted spawn clears the earlier one", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const plan = planFor(
+			[
+				{
+					name: "report",
+					kind: "code",
+					role: "implementer",
+					files: [REPORT],
+					results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		noteRunSpawn(runId, {
+			...spawn,
+			agent: "storm-implementer",
+			spawnKey: "report",
+			outcome: "blocked",
+			code: "parallelism",
+			reason: "동시 상한에 닿았습니다. 하나가 끝나기를 기다리세요.",
+		});
+		noteRunSpawn(runId, { ...spawn, agent: "storm-implementer", spawnKey: "report", outcome: "routed" });
+		const final = await h.controller.finish("no-progress");
+		expect(final?.results?.find(item => item.id === "report-change")?.remedy).toBeUndefined();
+	});
+
+	test("T06: a qualitative submission is reviewable, not verified, when no reviewer ran", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const target = "acceptance-qualitative.md";
+		const plan = planFor(
+			[
+				{
+					name: "submit",
+					kind: "code",
+					role: "implementer",
+					files: [target],
+					goal: "Submit prose for qualitative review",
+					results: [{ id: "qualitative-submission", kind: "change", criterion: "the prose explains why no rewrite is needed" }],
+				},
+				{ name: "review", kind: "review", role: "reviewer", goal: "Independent verdict" },
+			],
+			{ implementer: 1, reviewer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "submit");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "submit", spawnKey, parentId: "main", dispatch: "d3", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "nothing needs rewriting; the total 42 is already reported.\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "submit",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d3",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-3:${spawnKey}` }),
+			citations: [],
+		});
+		await h.turn();
+
+		const run = await readRun(h.sessionDir, runId);
+		expect(run?.endReason).not.toBe("verified");
+		expect(run).toMatchObject({ status: "stopped", endReason: "round-limit" });
+		expect(run?.results?.find(item => item.id === "qualitative-submission")).toMatchObject({
+			state: "reviewable",
+			lane: "submit",
+			attemptId: `job:job-3:${spawnKey}`,
+		});
+	});
+
+	test("T06: an incorrect current-tree verdict leaves the requirement unmet", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents, tree: () => treeAt() });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const target = "acceptance-incorrect.txt";
+		const plan = planFor(
+			[
+				{
+					name: "write",
+					kind: "code",
+					role: "implementer",
+					files: [target],
+					goal: "Submit a change for review",
+					results: [{ id: "incorrect-change", kind: "change", criterion: "ready for the reviewer's qualitative verdict" }],
+				},
+				{ name: "review", kind: "review", role: "reviewer", goal: "Independent verdict" },
+			],
+			{ implementer: 1, reviewer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		admit(h, plan, agents, "review");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch: "d4", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "change\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d4",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-4:${spawnKey}` }),
+			citations: [],
+		});
+		agents.push(verdict(T0 + 2, false, F0));
+		await h.turn();
+
+		const run = await readRun(h.sessionDir, runId);
+		expect(run?.endReason).not.toBe("verified");
+		const row = run?.results?.find(item => item.id === "incorrect-change");
+		expect(row).toMatchObject({ state: "unmet", lane: "write", origin: "review", attemptId: `job:job-4:${spawnKey}` });
+		expect(row?.reason).toContain("incorrect");
+	});
+
+	test("T06: a current correct verdict accepts a reviewable requirement even when the run is not verified", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents, tree: () => treeAt() });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const target = "acceptance-accepted.txt";
+		const plan = planFor(
+			[
+				{
+					name: "write",
+					kind: "code",
+					role: "implementer",
+					files: [target],
+					goal: "Submit a qualitative change",
+					results: [{ id: "accepted-change", kind: "change", criterion: "ready for the reviewer's qualitative verdict" }],
+				},
+				{ name: "review", kind: "review", role: "reviewer", goal: "Independent current-tree verdict" },
+			],
+			{ implementer: 1, reviewer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		admit(h, plan, agents, "review");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch: "d5", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "change\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d5",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-5:${spawnKey}` }),
+			citations: [],
+		});
+		agents.push(verdict(T0 + 2, true, F0));
+		await h.turn();
+
+		const run = await readRun(h.sessionDir, runId);
+		expect(run).toMatchObject({ status: "done", endReason: "verified" });
+		expect(run?.results?.find(item => item.id === "accepted-change")).toMatchObject({
+			state: "accepted",
+			lane: "write",
+			origin: "review",
+			reviewTree: F0,
+			attemptId: `job:job-5:${spawnKey}`,
+		});
+	});
+
+	test("T06: a verdict for an older tree does not accept the current submission", async () => {
+		const agents: AgentEntry[] = [];
+		let tree = treeOf("c0", "f0");
+		const h = session({ agents, tree: () => treeAt(tree) });
+		const runId = await h.start({ task: "t", rounds: 1 });
+		const target = "acceptance-stale.txt";
+		const plan = planFor(
+			[
+				{
+					name: "write",
+					kind: "code",
+					role: "implementer",
+					files: [target],
+					goal: "Submit a change for the current tree",
+					results: [{ id: "stale-change", kind: "change", criterion: "reviewed on the current tree before acceptance" }],
+				},
+				{ name: "review", kind: "review", role: "reviewer", goal: "Review the latest tree" },
+			],
+			{ implementer: 1, reviewer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		admit(h, plan, agents, "review");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch: "d6", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "change\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d6",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-6:${spawnKey}` }),
+			citations: [],
+		});
+		// The verdict certifies the tree the reviewer saw; a later write moves the tree Storm must judge.
+		const oldTree = treeFingerprint(tree);
+		agents.push(verdict(T0 + 2, true, oldTree));
+		tree = treeOf("c1", "f0");
+		await h.turn();
+
+		const run = await readRun(h.sessionDir, runId);
+		expect(run?.endReason).not.toBe("verified");
+		const row = run?.results?.find(item => item.id === "stale-change");
+		expect(row?.state).not.toBe("accepted");
+		expect(row).toMatchObject({ lane: "write", attemptId: `job:job-6:${spawnKey}` });
+	});
+
+	test("a replan cannot change or silently drop a required result", async () => {
+		const h = session({ agents: [] });
+		await h.start();
+		// A lane that started without a contract may be repaired by adding one; the new id starts pending.
+		const uncontracted = planFor([{ name: "report", kind: "code", role: "implementer", files: [REPORT] }], { implementer: 1 });
+		expect(await h.controller.setPlan(h.ctx, uncontracted)).toEqual({ ok: true });
+		expect(h.controller.active()?.results).toBeUndefined();
+		const first = planFor(
+			[{ name: "report", kind: "code", role: "implementer", files: [REPORT], results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, first)).toEqual({ ok: true });
+		expect(h.controller.active()?.results?.find(item => item.id === "report-change")).toMatchObject({ state: "pending", lane: "report" });
+
+		const narrowed = planFor(
+			[{ name: "report", kind: "code", role: "implementer", files: [REPORT], results: [{ id: "report-change", kind: "change", criterion: "a weaker statement", path: REPORT }] }],
+			{ implementer: 1 },
+		);
+		const refused = await h.controller.setPlan(h.ctx, narrowed);
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.reason).toContain("결과 id 'report-change'");
+		expect(h.controller.active()?.results?.find(item => item.id === "report-change")).toMatchObject({ state: "pending", lane: "report" });
+
+		const removed = planFor([{ name: "other-review", kind: "review", role: "reviewer", goal: "Review only" }], { reviewer: 1 });
+		expect(await h.controller.setPlan(h.ctx, removed)).toEqual({ ok: true });
+		const orphan = h.controller.active()?.results?.find(item => item.id === "report-change");
+		expect(orphan).toMatchObject({ state: "pending" });
+		expect(orphan?.lane).toBeUndefined();
+		expect(orphan?.reason).toContain("계획에서 빠진");
+	});
+
+	test("a result's approved check runs after the attempt and can accept the requirement", async () => {
+		const agents: AgentEntry[] = [];
+		const config: StormConfig = { ...SESSION_TEAM, requiredChecks: [{ name: "unit-result", argv: ["/bin/sh", "-c", "true"] }] };
+		const h = session({ agents, config, tree: () => treeAt() });
+		const runId = await h.start();
+		const target = "checked-result.txt";
+		const plan = planFor(
+			[
+				{
+					name: "write",
+					kind: "code",
+					role: "implementer",
+					files: [target],
+					results: [{ id: "checked-change", kind: "change", criterion: "the checked change is present", check: "unit-result" }],
+				},
+			],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch: "d8", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "checked\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d8",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-8:${spawnKey}` }),
+			citations: [],
+		});
+		// No approved check report exists yet: the row waits instead of failing or claiming acceptance.
+		expect(h.controller.active()?.results?.find(item => item.id === "checked-change")).toMatchObject({ state: "reviewable" });
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.controller.active()?.results?.find(item => item.id === "checked-change")?.state === "accepted");
+		const row = h.controller.active()?.results?.find(item => item.id === "checked-change");
+		expect(row).toMatchObject({ state: "accepted", lane: "write", attemptId: `job:job-8:${spawnKey}` });
+	});
+
+	test("a replan cannot rewrite an obligation under the same id; the refused plan leaves the old contract in force", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const runId = await h.start();
+		const first = planFor(
+			[{ name: "report", kind: "code", role: "implementer", files: [REPORT], results: [{ id: "shared-id", kind: "change", criterion: "old obligation", path: REPORT, contains: "old content" }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, first)).toEqual({ ok: true });
+		const spawnKey = admit(h, first, agents, "report");
+		expect(await h.controller.prepareAttempt({ runId, lane: "report", spawnKey, parentId: "main", dispatch: "d9", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		const originalIdentity = h.controller.active()?.results?.find(item => item.id === "shared-id")?.identity;
+		expect(originalIdentity).toBeTruthy();
+
+		// The same id in a new lane may only carry the exact same contract; a changed criterion is refused before the
+		// plan or the requirement ledger is touched.
+		const second = planFor(
+			[{ name: "rewritten", kind: "code", role: "implementer", files: ["other.json"], results: [{ id: "shared-id", kind: "change", criterion: "new obligation", path: "other.json" }] }],
+			{ implementer: 1 },
+		);
+		const refused = await h.controller.setPlan(h.ctx, second);
+		expect(refused.ok).toBe(false);
+		if (!refused.ok) expect(refused.reason).toContain("shared-id");
+		expect(h.controller.active()?.plan?.lanes.map(lane => lane.name)).toEqual(["report"]);
+		expect(h.controller.active()?.results?.find(item => item.id === "shared-id")).toMatchObject({
+			state: "pending",
+			lane: "report",
+			identity: originalIdentity,
+		});
+
+		// The pending attempt still belongs to that unchanged obligation, so its honest settlement is evaluated.
+		await writeFile(path.join(root, REPORT), "old content\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "report",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d9",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-9:${spawnKey}` }),
+			citations: [],
+		});
+		expect(h.controller.active()?.results?.find(item => item.id === "shared-id")).toMatchObject({
+			state: "accepted",
+			lane: "report",
+			attemptId: `job:job-9:${spawnKey}`,
+		});
+	});
+
+	test("a failed attempt is rejected before any file read, even when the required path exists", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start();
+		const target = "failed-attempt.txt";
+		const plan = planFor(
+			[{ name: "write", kind: "code", role: "implementer", files: [target], results: [{ id: "failed-change", kind: "change", criterion: "the file has the marker", path: target, contains: "MARKER" }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey: "SpawnF", parentId: "main", dispatch: "d10", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		// A directory at the required path: an evaluator read would say it cannot read a regular file. The host
+		// settlement must win before that read and keep the attempt id.
+		await mkdir(path.join(root, target));
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey: "SpawnF",
+			parentId: "main",
+			dispatch: "d10",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey: "SpawnF", attemptId: "job:job-f:SpawnF", outcome: "failure" }),
+			citations: [],
+		});
+		const row = h.controller.active()?.results?.find(item => item.id === "failed-change");
+		expect(row).toMatchObject({ state: "unmet", lane: "write", attemptId: "job:job-f:SpawnF" });
+		expect(row?.reason).toContain("실패");
+		expect(row?.reason).not.toContain("읽");
+	});
+
+	test("a cancelled attempt and an invalid structured result cannot accept a present answer", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start();
+		const plan = planFor(
+			[{ name: "read", kind: "explore", role: "explorer", results: [{ id: "answer", kind: "answer", criterion: "cite the source", path: REPORT, contains: '"total": 42' }] }],
+			{ explorer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		await writeFile(path.join(root, REPORT), REPORT_TEXT);
+		expect(await h.controller.prepareAttempt({ runId, lane: "read", spawnKey: "SpawnC", parentId: "main", dispatch: "d11", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "read",
+			spawnKey: "SpawnC",
+			parentId: "main",
+			dispatch: "d11",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey: "SpawnC", attemptId: "job:job-c:SpawnC", outcome: "cancel" }),
+			reportText: "The total is 42 (report.json:2).",
+			citations: [{ path: REPORT, line: 2 }],
+		});
+		const cancelled = h.controller.active()?.results?.find(item => item.id === "answer");
+		expect(cancelled).toMatchObject({ state: "unmet", attemptId: "job:job-c:SpawnC" });
+		expect(cancelled?.reason).toContain("취소");
+
+		// The adapter maps an explicitly invalid structured output to outcome failure; the row stays unmet either way.
+		expect(await h.controller.prepareAttempt({ runId, lane: "read", spawnKey: "SpawnC", parentId: "main", dispatch: "d12", followUp: true, artifactMode: "shared", startedAt: T0 + 2 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "read",
+			spawnKey: "SpawnC",
+			parentId: "main",
+			dispatch: "d12",
+			startedAt: T0 + 2,
+			observedAt: T0 + 3,
+			report: report({ runId, spawnKey: "SpawnC", attemptId: "job:job-c2:SpawnC", outcome: "failure", schemaStatus: "invalid" }),
+			reportText: "The total is 42 (report.json:2).",
+			citations: [{ path: REPORT, line: 2 }],
+		});
+		const invalid = h.controller.active()?.results?.find(item => item.id === "answer");
+		expect(invalid).toMatchObject({ state: "unmet", attemptId: "job:job-c2:SpawnC" });
+		expect(invalid?.reason).toContain("구조화");
+	});
+
+	test("a failed follow-up cannot keep an earlier accepted answer as accepted", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start();
+		const plan = planFor(
+			[{ name: "read", kind: "explore", role: "explorer", results: [{ id: "answer", kind: "answer", criterion: "cite the source", path: REPORT, contains: '"total": 42' }] }],
+			{ explorer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		await writeFile(path.join(root, REPORT), REPORT_TEXT);
+		expect(await h.controller.prepareAttempt({ runId, lane: "read", spawnKey: "SpawnA", parentId: "main", dispatch: "d13", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "read",
+			spawnKey: "SpawnA",
+			parentId: "main",
+			dispatch: "d13",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey: "SpawnA", attemptId: "job:job-a:SpawnA" }),
+			reportText: "The total is 42 (report.json:2).",
+			citations: [{ path: REPORT, line: 2 }],
+		});
+		expect(h.controller.active()?.results?.find(item => item.id === "answer")).toMatchObject({ state: "accepted" });
+
+		expect(await h.controller.prepareAttempt({ runId, lane: "read", spawnKey: "SpawnA", parentId: "main", dispatch: "d14", followUp: true, artifactMode: "shared", startedAt: T0 + 2 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "read",
+			spawnKey: "SpawnA",
+			parentId: "main",
+			dispatch: "d14",
+			startedAt: T0 + 2,
+			observedAt: T0 + 3,
+			report: report({ runId, spawnKey: "SpawnA", attemptId: "job:job-a2:SpawnA", outcome: "failure" }),
+			reportText: "The total is 42 (report.json:2).",
+			citations: [{ path: REPORT, line: 2 }],
+		});
+		const row = h.controller.active()?.results?.find(item => item.id === "answer");
+		expect(row).toMatchObject({ state: "unmet", attemptId: "job:job-a2:SpawnA" });
+		expect(row?.reason).toContain("실패");
+	});
+
+	test("a verified close cannot race an attempt whose terminal settlement never arrived", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start();
+		const plan = planFor(
+			[{ name: "write", kind: "code", role: "implementer", files: [REPORT], results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT, contains: '"total": 42' }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey: "SpawnP", parentId: "main", dispatch: "d15", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		// The terminal async delivery is still in flight when the run tries to close as verified.
+		const final = await h.controller.finish("verified");
+		expect(final).toMatchObject({ status: "stopped", endReason: "no-progress" });
+		const row = (await readRun(h.sessionDir, runId))?.results?.find(item => item.id === "report-change");
+		expect(row).toMatchObject({ state: "unmet" });
+		expect(row?.reason).toContain("확정되기 전에");
+		expect(row?.attemptId).toBeUndefined();
+
+		// A late settlement after the record is written changes nothing: the requirement is not resurrected.
+		const late = await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey: "SpawnP",
+			parentId: "main",
+			dispatch: "d15",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey: "SpawnP", attemptId: "job:job-p:SpawnP" }),
+			citations: [],
+		});
+		expect(late).toBeUndefined();
+		expect((await readRun(h.sessionDir, runId))?.results?.find(item => item.id === "report-change")).toMatchObject({ state: "unmet" });
+	});
+
+	test("a later correct independent review cannot promote a failed attempt", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents, tree: () => treeAt() });
+		const runId = await h.start({ task: "t" });
+		const target = "failed-review.txt";
+		const plan = planFor(
+			[
+				{ name: "write", kind: "code", role: "implementer", files: [target], results: [{ id: "failed-change", kind: "change", criterion: "ready for review" }] },
+				{ name: "review", kind: "review", role: "reviewer", goal: "Independent verdict" },
+			],
+			{ implementer: 1, reviewer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		admit(h, plan, agents, "review");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		expect(await h.controller.prepareAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch: "d16", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "present but not witnessed\n");
+		await h.controller.settleAttempt({
+			runId,
+			lane: "write",
+			spawnKey,
+			parentId: "main",
+			dispatch: "d16",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({ runId, spawnKey, attemptId: `job:job-16:${spawnKey}`, outcome: "failure" }),
+			citations: [],
+		});
+		expect(h.controller.active()?.results?.find(item => item.id === "failed-change")).toMatchObject({ state: "unmet" });
+
+		agents.push(verdict(T0 + 2, true, F0));
+		await h.turn();
+		const row = h.controller.active()?.results?.find(item => item.id === "failed-change");
+		expect(row).toMatchObject({ state: "unmet", origin: "attempt", attemptId: `job:job-16:${spawnKey}` });
+		expect(row?.reason).toContain("실패");
+	});
+
+	test("a missing host report keeps the requirement unmet without inventing an attempt id", async () => {
+		const h = session({ agents: [] });
+		const runId = await h.start();
+		const plan = planFor(
+			[{ name: "report", kind: "code", role: "implementer", files: [REPORT], results: [{ id: "report-change", kind: "change", criterion: "report.json changed", path: REPORT }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		expect(await h.controller.prepareAttempt({ runId, lane: "report", spawnKey: "Spawn0", parentId: "main", dispatch: "d7", followUp: false, artifactMode: "shared", startedAt: T0 })).toEqual({ ok: true });
+		const missing = report({ runId, spawnKey: "Spawn0", attemptId: "task:call-1:Spawn0" });
+		delete missing.attemptId;
+		missing.capture = "missing";
+		missing.captureError = "native-result-missing";
+		await h.controller.settleAttempt({
+			runId,
+			lane: "report",
+			spawnKey: "Spawn0",
+			parentId: "main",
+			dispatch: "d7",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: missing,
+			citations: [],
+		});
+		const row = h.controller.active()?.results?.find(item => item.id === "report-change");
+		expect(row).toMatchObject({ state: "unmet" });
+		expect(row?.attemptId).toBeUndefined();
+		expect(row?.reason).toContain("native-result-missing");
+	});
+
+	test("an isolated artifact prerequisite is usable only while its verified retained source exists", async () => {
+		const agents: AgentEntry[] = [];
+		const h = session({ agents });
+		const runId = await h.start();
+		const patchPath = path.join(os.tmpdir(), `storm-retained-${Date.now()}.patch`);
+		const patch = [
+			"diff --git a/experiment.txt b/experiment.txt",
+			"new file mode 100644",
+			"--- /dev/null",
+			"+++ b/experiment.txt",
+			"@@ -0,0 +1 @@",
+			"+experiment change",
+			"",
+		].join("\n");
+		await writeFile(patchPath, patch);
+		const plan = planFor(
+			[{
+				name: "experiment",
+				kind: "run",
+				role: "implementer",
+				files: ["experiment.txt"],
+				isolationReason: "result stays outside the parent",
+				results: [{ id: "experiment-patch", kind: "artifact", criterion: "the patch carries experiment change", path: "experiment.txt", contains: "experiment change" }],
+			}],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const lanes = h.controller.runLanes();
+		if (lanes === undefined) throw new Error("the run has no lane matcher");
+		const bound = lanes.assign({ name: "experiment", agent: "storm-implementer" }, plan, h.config, { host: { enabled: true, apply: false } });
+		if (!bound.ok) throw new Error(bound.reason);
+		const spawnKey = (bound.input as Record<string, unknown>).name;
+		if (typeof spawnKey !== "string") throw new Error("the lane binding has no task name");
+		lanes.admit({ spawnKey, agent: "storm-implementer", outcome: "routed" });
+		agents.push(agentEntry({ id: spawnKey, name: "storm-implementer", role: "implementer", state: "idle", requests: 1, lastActivityAt: T0 + 1 }));
+		expect(await h.controller.prepareAttempt({ runId, lane: "experiment", spawnKey, parentId: "main", dispatch: "artifact", followUp: false, artifactMode: "isolated", startedAt: T0 })).toEqual({ ok: true });
+		await h.controller.settleAttempt({
+			runId,
+			lane: "experiment",
+			spawnKey,
+			parentId: "main",
+			dispatch: "artifact",
+			startedAt: T0,
+			observedAt: T0 + 1,
+			report: report({
+				runId,
+				spawnKey,
+				attemptId: `job:job-artifact:${spawnKey}`,
+				artifacts: [{ kind: "patch", path: patchPath, bytes: Buffer.byteLength(patch), capturedAt: T0 + 1, source: "task-result" }],
+			}),
+			citations: [],
+		});
+		const accepted = await h.controller.laneReadiness(plan, new Set(["experiment"]));
+		const first = accepted.get("experiment")?.results[0];
+		expect(first).toMatchObject({ id: "experiment-patch", state: "accepted" });
+		expect(first?.retained?.path).toBe(await realpath(patchPath));
+		expect(first?.retained?.ref).toContain("experiment-patch@");
+		// Acceptance alone is not enough: the verified source must still exist at admission time.
+		await rm(patchPath, { force: true });
+		const missing = await h.controller.laneReadiness(plan, new Set(["experiment"]));
+		const second = missing.get("experiment")?.results[0];
+		expect(second).toMatchObject({ state: "unmet" });
+		expect(second?.reason).toContain("보존");
 	});
 });

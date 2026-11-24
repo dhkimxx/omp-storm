@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	CLOSEOUT_NEXT_MAX,
+	CLOSEOUT_RESULT_ENTRY_MAX,
 	CLOSEOUT_TEXT_MAX,
 	type CloseoutDraft,
 	closeoutCard,
@@ -11,7 +12,7 @@ import {
 	resetCloseoutChoices,
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
-import type { RunPlan, RunRecord } from "../src/types.ts";
+import type { RunPlan, RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
 const draft = (over: Partial<CloseoutDraft> = {}): CloseoutDraft => ({
@@ -192,6 +193,124 @@ describe("closeout card", () => {
 	});
 });
 
+describe("required-result closeout rows", () => {
+	test("T01: an unmet requirement keeps its id, lane and runtime reason while the official status stays unchanged", () => {
+		const accepted: RunResult = {
+			id: "report-answer",
+			lane: "read-report",
+			state: "accepted",
+			reason: "기존 내용을 출처와 함께 확인했습니다.",
+		};
+		const run = record({
+			status: "ended",
+			endReason: "no-changes",
+			task: "report.json 갱신",
+			plan: plan(
+				lane("report", "code", {
+					results: [{ id: "report-change", kind: "change", criterion: "report.json을 갱신", path: "report.json" }],
+				}),
+			),
+			agents: [agentEntry({ changes: 0 })],
+			results: [
+				{ id: "report-change", lane: "report", state: "unmet", reason: "사전 기준선 이후 바뀐 내용이 없습니다." },
+				accepted,
+			],
+		});
+		expect(isSubstantiveRun(run)).toBe(true);
+		expect(isSubstantiveRun({ ...run, results: [accepted] })).toBe(false);
+		const card = closeoutCard(run, ["report"]);
+		expect(card.text).toContain("- 상태(공식): 끝남 · 변경 없음");
+		expect(card.text).toContain(
+			"- 미해결 필수 결과(공식): report-change [report] 미충족 — 사전 기준선 이후 바뀐 내용이 없습니다.",
+		);
+		expect(card.text).not.toContain("report-answer");
+		expect(card.text).not.toContain("- 미완료 레인:");
+	});
+
+	test("T06: a reviewable qualitative submission is visible with its reason, without becoming unmet or verified", () => {
+		const run = record({
+			status: "ended",
+			endReason: "unreviewed",
+			results: [
+				{
+					id: "qualitative-submission",
+					lane: "review",
+					state: "reviewable",
+					reason: "출처를 확인했습니다. 답변의 자연어 판단이 필요합니다.",
+				},
+			],
+		});
+		const card = closeoutCard(run, ["review"]);
+		expect(card.text).toContain("- 상태(공식): 끝남 · 리뷰 없이 끝남");
+		expect(card.text).toContain(
+			"- 검토 가능 필수 결과(공식): qualitative-submission [review] — 출처를 확인했습니다. 답변의 자연어 판단이 필요합니다.",
+		);
+		expect(card.text).not.toContain("- 미해결 필수 결과");
+		expect(card.text).not.toContain("- 미완료 레인:");
+	});
+
+	test("a pending obligation is reported without rewriting the runtime's final status", () => {
+		const card = closeoutCard(
+			record({
+				status: "done",
+				endReason: "verified",
+				results: [
+					{ id: "final-review", lane: "review", state: "pending", reason: "자연어 판단이 아직 기록되지 않았습니다." },
+				],
+			}),
+		);
+		expect(card.text).toContain("- 상태(공식): 완료 · 리뷰 통과");
+		expect(card.text).toContain("final-review [review] 대기 — 자연어 판단이 아직 기록되지 않았습니다.");
+	});
+
+	test("a missing reason falls back to the state's plain meaning, never an invented cause", () => {
+		const card = closeoutCard(
+			record({
+				status: "ended",
+				endReason: "no-changes",
+				results: [
+					{ id: "change", state: "unmet" },
+					{ id: "later", lane: "build", state: "pending" },
+				],
+			}),
+		);
+		expect(card.text).toContain("change 미충족 — 미충족 사유가 기록되지 않았습니다.");
+		expect(card.text).toContain("later [build] 대기 — 아직 판정 근거가 기록되지 않았습니다.");
+	});
+
+	test("bounds a line's rows and sanitizes control characters instead of dumping raw text", () => {
+		const results: RunResult[] = Array.from({ length: CLOSEOUT_RESULT_ENTRY_MAX + 2 }, (_, index) => ({
+			id: index === 0 ? "req\u20280" : `req-${index}`,
+			lane: "work",
+			state: "unmet",
+			reason: index === 0 ? "reason\u0000 with\nlines" : `reason ${index}`,
+		}));
+		const card = closeoutCard(record({ status: "stopped", endReason: "no-progress", results }));
+		const rows = card.text.split("\n").find(text => text.startsWith("- 미해결 필수 결과(공식):"));
+		expect(rows).toBeDefined();
+		expect(rows).toContain("req 0 [work] 미충족 — reason with lines");
+		expect(rows).toContain(`req-${CLOSEOUT_RESULT_ENTRY_MAX - 1}`);
+		expect(rows).not.toContain(`req-${CLOSEOUT_RESULT_ENTRY_MAX}`);
+		expect(rows).toContain("외 2건");
+		expect(rows).not.toMatch(/[\u0000-\u001f\u007f\u2028\u2029]/);
+	});
+
+	test("legacy records without a results ledger keep the previous card text", () => {
+		const run = record({
+			status: "stopped",
+			endReason: "interrupted",
+			turns: 1,
+			maxRounds: 4,
+			task: "fix the parser",
+			checks: [{ name: "unit", status: "failed", exitCode: 1, tree: "t" }],
+		});
+		const legacy = closeoutCard(run, ["view"]);
+		expect(closeoutCard({ ...run, results: [] }, ["view"]).text).toBe(legacy.text);
+		expect(legacy.text).not.toContain("필수 결과");
+		expect(legacy.text).toContain("- 미완료 레인: view");
+	});
+});
+
 describe("closeout choice resolution", () => {
 	test("resolves 1..3 for the most recently shown same-session card exactly once", () => {
 		const session = ctx("session-a");
@@ -232,5 +351,65 @@ describe("closeout choice resolution", () => {
 		rememberCloseoutReport(session, "run-1", ["first", "second", "third"]);
 		resetCloseoutChoices(session);
 		expect(takeCloseoutChoice(session, "1")).toBeUndefined();
+	});
+});
+
+describe("closeout result remedies", () => {
+	test("a host retry exhaustion and a structured blocker keep their bounded cause and unblock", () => {
+		const card = closeoutCard(
+			record({
+				status: "stopped",
+				endReason: "no-progress",
+				results: [
+					{
+						id: "retry-result",
+						lane: "b-repair",
+						state: "unmet",
+						remedy: "retry",
+						reason: "호스트 자동 재시도가 소진되었습니다(시도 1).",
+					},
+					{
+						id: "blocked-result",
+						lane: "write",
+						state: "unmet",
+						remedy: "blocked",
+						unblock: "omp task.isolation.enabled를 켜고 팀을 다시 승인하세요.",
+						reason: "격리 설정이 꺼져 있어 레인을 시작하지 못했습니다.",
+					},
+					{
+						id: "review-blocked",
+						lane: "review",
+						state: "reviewable",
+						remedy: "blocked",
+						unblock: "승인된 리뷰어 역할을 켜세요.",
+						reason: "제출물을 판단할 리뷰어가 없습니다.",
+					},
+				],
+			}),
+		);
+		expect(card.text).toContain("retry-result [b-repair] 미충족 · 재시도 소진 — 호스트 자동 재시도가 소진되었습니다(시도 1).");
+		expect(card.text).toContain(
+			"blocked-result [write] 미충족 · 차단 — 격리 설정이 꺼져 있어 레인을 시작하지 못했습니다. · 해소: omp task.isolation.enabled를 켜고 팀을 다시 승인하세요.",
+		);
+		expect(card.text).toContain("review-blocked [review] · 차단 — 제출물을 판단할 리뷰어가 없습니다. · 해소: 승인된 리뷰어 역할을 켜세요.");
+	});
+
+	test("an accepted row never claims a stale remedy and an overlong unblock is bounded and sanitized", () => {
+		const card = closeoutCard(
+			record({
+				status: "done",
+				endReason: "verified",
+				results: [
+					{ id: "accepted", state: "accepted", remedy: "retry", unblock: "stale" },
+					{ id: "blocked", state: "unmet", remedy: "blocked", unblock: `${"x".repeat(200)}\nnext`, reason: "차단" },
+				],
+			}),
+		);
+		expect(card.text).not.toContain("accepted ·");
+		expect(card.text).not.toContain("stale");
+		const line = card.text.split("\n").find(text => text.includes("blocked 미충족")) ?? "";
+		expect(line).toContain("· 해소: ");
+		expect(line).not.toMatch(/[\u0000-\u001f\u007f\u2028\u2029]/);
+		expect(line.length).toBeLessThan(300);
 	});
 });

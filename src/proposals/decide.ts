@@ -29,9 +29,10 @@ export const NEEDS_APPROVAL =
 	"지금 팀 설정이 승인되지 않아 바꾸지 않았습니다. 사용자가 /storm 에서 먼저 승인(또는 이전 승인으로 되돌리기)해야 합니다.";
 
 /**
- * Whether the config file or the shadowing definitions changed between two reads (while a dialog was open).
- * A valid file is known by its config hash; a missing or invalid one by its status and bytes, so a file that
- * appears or is edited while still invalid counts too and is not overwritten.
+ * Whether the session, target, config file or shadowing definitions changed between two reads (while a dialog was
+ * open). A valid file is known by its config hash; a missing or invalid one by its status and bytes, so a file that
+ * appears or is edited while still invalid counts too and is not overwritten. Session and target are compared because
+ * an approval is authority for one session's store and one canonical worktree only.
  */
 export function movedSince(before: ProjectState, now: ProjectState): boolean {
 	const file = ({ config }: ProjectState) =>
@@ -41,7 +42,13 @@ export function movedSince(before: ProjectState, now: ProjectState): boolean {
 			.map((x) => `${x.path}\n${x.sha256}`)
 			.sort()
 			.join("\n");
-	return file(before) !== file(now) || shadows(before) !== shadows(now);
+	return (
+		before.sessionDir !== now.sessionDir ||
+		before.repo.kind !== now.repo.kind ||
+		before.repo.root !== now.repo.root ||
+		file(before) !== file(now) ||
+		shadows(before) !== shadows(now)
+	);
 }
 
 export async function decideProposal(

@@ -6,6 +6,7 @@ import { configHash } from "../src/config/canonical.ts";
 import { checkGate, type CheckReport, type RequiredChecksInput, runRequiredChecks } from "../src/runtime/checks.ts";
 import { renderConfigDiff, renderStatus } from "../src/view/render.ts";
 import type { ApprovalRecord, ConfigLoad, RequiredCheck, StatusView, StormConfig } from "../src/types.ts";
+import { approvalRecord } from "./fixtures.ts";
 import { TEAM } from "./support.ts";
 
 function loaded(config: StormConfig): Extract<ConfigLoad, { status: "ok" }> {
@@ -13,13 +14,7 @@ function loaded(config: StormConfig): Extract<ConfigLoad, { status: "ok" }> {
 }
 
 function approved(hash: string): ApprovalRecord {
-	return {
-		schema: "storm.approval/v1",
-		status: "active",
-		configHash: hash,
-		approvedAt: "2026-11-22T00:00:00.000Z",
-		scope: { shadowedAgents: [] },
-	};
+	return approvalRecord(hash, { approvedAt: "2026-11-22T00:00:00.000Z" });
 }
 
 const dirs: string[] = [];

@@ -443,8 +443,13 @@ function runProgressParts(run: RunRecord, now: number): string[] {
 	return parts;
 }
 
-/** The config file as the user finds it from the project root; the status never shows where that root is. */
-const CONFIG_FILE = ".omp/storm/config.json";
+/**
+ * The one target an approval covers, shown wherever a choice can approve or depend on it. The store is this session's
+ * profile directory, so there is no workspace config file to edit: a different target needs a fresh approval here.
+ */
+export function targetScopeLine(root: string): string {
+	return `이 세션의 팀 설정과 승인은 지금 작업 대상(${visible(root)})에만 적용됩니다. 대상을 바꾸면 팀 설정은 남지만 다시 승인해야 합니다.`;
+}
 
 /**
  * The whole status. For the user it leads with present state, version and a real next action, then the active and
@@ -546,7 +551,7 @@ export function renderStatus(
 	heading("팀 설정", "team");
 	if (c.status === "missing") styled([{ text: "- 없음 — /storm 으로 만드세요", tone: "warning" }], undefined, "status.warning");
 	else if (c.status === "invalid") {
-		styled([{ text: `- 오류 (\`${CONFIG_FILE}\`)`, tone: "error" }], undefined, "status.error");
+		styled([{ text: "- 오류 (이 세션의 팀 설정)", tone: "error" }], undefined, "status.error");
 		for (const e of c.errors) styled([{ text: `  - ${visible(e)}`, tone: "error" }]);
 	} else {
 		styled([

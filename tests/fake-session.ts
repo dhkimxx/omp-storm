@@ -1,13 +1,25 @@
 /** A main session as the run controller sees it: omp's session modes, a scripted UI and a fake ctx. */
 import type { AsyncJobSnapshot, ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import type { RunTimers } from "../src/runtime/controller.ts";
 import { RunController } from "../src/runtime/controller.ts";
-import type { AcquireRunLeaseResult, RunLease } from "../src/runtime/lease.ts";
+import type {
+	AcquireRunLeaseInput,
+	AcquireRunLeaseResult,
+	LeaseDeps,
+	LeaseMode,
+	LeaseRecord,
+	LeaseSnapshot,
+	RunLease,
+	UpgradeResult,
+	WriteScope,
+} from "../src/runtime/lease.ts";
 import type { TreeReading } from "../src/runtime/tree.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RunRecord, RunSpec, StormConfig } from "../src/types.ts";
-import { approvedState, teamOf } from "./fixtures.ts";
-import { type Answer, type ScriptedUi, scriptedUi } from "./support.ts";
+import { approvedState, fixtureSession, teamOf } from "./fixtures.ts";
+import { type Answer, type ScriptedUi, scriptedUi, testSessionId } from "./support.ts";
 
 /**
  * Resolves once `done()` holds; fails instead of hanging. Detached work (a queued start, a fired timer, a live write)
@@ -114,16 +126,210 @@ export function fakeTimers(): FakeTimers {
 	};
 }
 
-/** An in-memory execution lease for controller tests: no lock file, but the release path is observable. */
-function fakeLease(root: string, runId: string, onRelease: () => void): RunLease {
-	const owner = { token: `fake-${runId}`, pid: 1, host: "test", processStart: 0 };
-	return {
-		runId,
-		root,
-		path: `fake-lease-${runId}.lock`,
+type PathClaim = { ok: true; paths: readonly string[] | undefined } | { ok: false; reason: string };
+
+/** The real lease's accepted path form, so an upgrade in a test behaves like one on disk. */
+function claimOf(scope: WriteScope | undefined): PathClaim {
+	if (scope === undefined || scope.kind === "unbounded") return { ok: true, paths: undefined };
+	const unique = new Set<string>();
+	for (const value of scope.paths) {
+		if (
+			typeof value !== "string" ||
+			value.length === 0 ||
+			path.isAbsolute(value) ||
+			value.includes("\u0000") ||
+			value.includes("\\")
+		) {
+			return { ok: false, reason: `경로 범위 쓰기의 경로가 올바르지 않습니다: ${JSON.stringify(value)}` };
+		}
+		const segments = value.split("/");
+		if (segments.some(segment => segment === "" || segment === "." || segment === "..")) {
+			return { ok: false, reason: `경로 범위 쓰기의 경로가 올바르지 않습니다: ${JSON.stringify(value)}` };
+		}
+		unique.add(value.normalize("NFC"));
+	}
+	if (unique.size === 0) return { ok: false, reason: "경로 범위 쓰기는 하나 이상의 저장소 상대 경로가 필요합니다." };
+	return { ok: true, paths: Object.freeze([...unique].sort()) };
+}
+
+function samePaths(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * An in-memory execution lease for controller tests: no lock file, but every access fact and transition the real
+ * `RunLease` exposes is present, so `snapshot()`/`assertCurrent()`/`upgrade()`/`setWritePaths()` behave realistically.
+ * Tests that need actual inter-run arbitration inject a real lease through `SessionOptions.lease`.
+ */
+function fakeLease(input: AcquireRunLeaseInput, onRelease: () => void): RunLease {
+	const startedAt = new Date(0).toISOString();
+	const owner = Object.freeze({ token: randomUUID(), pid: process.pid, host: "test", processStart: 1 });
+	const initial = claimOf(input.mode === "write" ? input.scope : undefined);
+	let mode: LeaseMode = input.mode;
+	let paths: readonly string[] | undefined = initial.ok ? initial.paths : undefined;
+	let epoch = 0;
+	let released = false;
+	let releasePromise: Promise<void> | undefined;
+	const recordPath = path.join(path.dirname(input.sessionDir), "fake-leases", `${input.runId}.lock`);
+	const sessionPath = path.join(path.dirname(input.sessionDir), "fake-leases", `session-${input.runId}.lock`);
+	const snapshot = (): LeaseSnapshot =>
+		Object.freeze({
+			runId: input.runId,
+			sessionId: input.sessionId,
+			sessionDir: input.sessionDir,
+			root: input.root,
+			mode,
+			paths: paths === undefined ? undefined : Object.freeze([...paths]),
+			epoch,
+		});
+	const record = (): LeaseRecord => ({
+		schema: "storm.lease/v2",
+		kind: mode === "read" ? "read" : "write",
+		key: input.root,
+		root: input.root,
+		runId: input.runId,
+		sessionId: input.sessionId,
+		sessionDir: input.sessionDir,
 		owner,
-		record: { schema: "storm.lease/v1", worktree: root, root, runId, owner, acquiredAt: new Date(0).toISOString() },
-		release: async () => onRelease(),
+		acquiredAt: startedAt,
+		acquiredAtMs: 1,
+		...(paths !== undefined ? { paths: [...paths] } : {}),
+	});
+	const release = async (): Promise<void> => {
+		if (released) return;
+		released = true;
+		onRelease();
+	};
+	releasePromise = undefined;
+	const lease: RunLease = {
+		runId: input.runId,
+		sessionId: input.sessionId,
+		sessionDir: input.sessionDir,
+		root: input.root,
+		get mode(): LeaseMode {
+			return mode;
+		},
+		get paths(): readonly string[] | undefined {
+			return paths === undefined ? undefined : Object.freeze([...paths]);
+		},
+		get epoch(): number {
+			return epoch;
+		},
+		owner,
+		get record(): Readonly<LeaseRecord> {
+			return record();
+		},
+		get path(): string {
+			return recordPath;
+		},
+		sessionPath,
+		snapshot,
+		assertCurrent(snapshot: LeaseSnapshot): void {
+			if (
+				released ||
+				snapshot.runId !== input.runId ||
+				snapshot.sessionId !== input.sessionId ||
+				snapshot.sessionDir !== input.sessionDir ||
+				snapshot.root !== input.root ||
+				snapshot.mode !== mode ||
+				snapshot.epoch !== epoch ||
+				!samePaths(snapshot.paths, paths)
+			) {
+				throw new Error("실행 잠금의 접근 상태가 바뀌었습니다.");
+			}
+		},
+		async upgrade(over: { scope?: WriteScope } = {}): Promise<UpgradeResult> {
+			if (released) return { ok: false, reason: "이미 해제된 실행 잠금은 바꿀 수 없습니다." };
+			const claim = claimOf(over.scope);
+			if (!claim.ok) return { ok: false, reason: claim.reason };
+			if (mode === "read") {
+				mode = "write";
+				paths = claim.paths;
+				epoch++;
+				return { ok: true };
+			}
+			if (samePaths(paths, claim.paths)) return { ok: true };
+			paths = claim.paths;
+			epoch++;
+			return { ok: true };
+		},
+		async setWritePaths(next: readonly string[]): Promise<UpgradeResult> {
+			if (released) return { ok: false, reason: "이미 해제된 실행 잠금은 바꿀 수 없습니다." };
+			if (mode !== "write") return { ok: false, reason: "읽기 실행은 먼저 upgrade로 쓰기 실행이 되어야 합니다." };
+			const claim = claimOf({ kind: "paths", paths: next });
+			if (!claim.ok) return { ok: false, reason: claim.reason };
+			if (samePaths(paths, claim.paths)) return { ok: true };
+			paths = claim.paths;
+			epoch++;
+			return { ok: true };
+		},
+		release(): Promise<void> {
+			releasePromise ??= release();
+			return releasePromise;
+		},
+	};
+	return lease;
+}
+
+/**
+ * Wraps any lease — the default fake or a real one a test injected — so its lifetime is observable without changing
+ * its snapshot or transition behavior. Getters are forwarded, not copied, so a real lease stays authoritative.
+ */
+function tracedLease(lease: RunLease, onRelease: () => void): RunLease {
+	let released = false;
+	let releasePromise: Promise<void> | undefined;
+	const release = async (): Promise<void> => {
+		if (released) return;
+		released = true;
+		try {
+			await lease.release();
+		} finally {
+			onRelease();
+		}
+	};
+	return {
+		get runId() {
+			return lease.runId;
+		},
+		get sessionId() {
+			return lease.sessionId;
+		},
+		get sessionDir() {
+			return lease.sessionDir;
+		},
+		get root() {
+			return lease.root;
+		},
+		get mode() {
+			return lease.mode;
+		},
+		get paths() {
+			return lease.paths;
+		},
+		get epoch() {
+			return lease.epoch;
+		},
+		get owner() {
+			return lease.owner;
+		},
+		get record() {
+			return lease.record;
+		},
+		get path() {
+			return lease.path;
+		},
+		get sessionPath() {
+			return lease.sessionPath;
+		},
+		snapshot: () => lease.snapshot(),
+		assertCurrent: snapshot => lease.assertCurrent(snapshot),
+		upgrade: over => lease.upgrade(over),
+		setWritePaths: next => lease.setWritePaths(next),
+		release(): Promise<void> {
+			releasePromise ??= release();
+			return releasePromise;
+		},
 	};
 }
 
@@ -131,8 +337,10 @@ function fakeLease(root: string, runId: string, onRelease: () => void): RunLease
 export const SESSION_TEAM: StormConfig = teamOf({ explorer: "a/x", implementer: "a/i", reviewer: "a/r" });
 
 export interface SessionOptions {
-	/** The project root: run records are written below it. */
+	/** The actual target work tree: approvals are bound to it, but no Storm state is written under it. */
 	root: string;
+	/** A named native session identity, for a test that must reopen the same owner; a fresh one when absent. */
+	sessionId?: string;
 	/** The approved team; `SESSION_TEAM` when absent. */
 	config?: StormConfig;
 	/** Changes the approved state the controller loads (unapprove it, add a shadow). */
@@ -163,8 +371,8 @@ export interface SessionOptions {
 	artifactsDir?: string;
 	/** Receives the live status record: the run while it is on, `undefined` at its end. */
 	live?: (ctx: ExtensionContext, run: RunRecord | undefined) => void;
-	/** Lease acquisition. Defaults to an in-memory lease: tests never touch the real lock directory. */
-	lease?: (root: string, runId: string) => Promise<AcquireRunLeaseResult>;
+	/** Lease acquisition. Defaults to a realistic in-memory lease: tests never touch the real lock directory. */
+	lease?: (input: AcquireRunLeaseInput, deps?: LeaseDeps) => Promise<AcquireRunLeaseResult>;
 	/** What the fake main session reports as its running and recent async jobs. */
 	asyncJobs?: () => AsyncJobSnapshot | null;
 	now?: () => number;
@@ -177,6 +385,10 @@ export interface FakeSession {
 	config: StormConfig;
 	repo: ProjectState["repo"];
 	state: ProjectState;
+	/** This session's native identity and store; the target root is only `repo.root`. */
+	sessionId: string;
+	sessionDir: string;
+	agentDir: string;
 	modes: FakeModes | undefined;
 	ui: ScriptedUi;
 	/** Messages sent to the session. */
@@ -188,8 +400,8 @@ export interface FakeSession {
 	timers: FakeTimers;
 	/** What the session saw, in order: "select", "compact", "set:<mode>:<action>", "send". Notices and records are in `ui.events`. */
 	readonly events: string[];
-	/** Lease acquisitions and releases the controller requested, in order. */
-	leases: { acquired: string[]; released: string[] };
+	/** Lease lifetimes the controller requested: run ids acquired and released, and the wrappers still live. */
+	leases: { acquired: string[]; released: string[]; held: RunLease[] };
 	/** One main turn: it starts, and settles. */
 	turn(): Promise<void>;
 	/** Starts a run or fails the test with the refusal. */
@@ -201,7 +413,12 @@ export interface FakeSession {
 
 export function fakeSession(opts: SessionOptions): FakeSession {
 	const config = opts.config ?? SESSION_TEAM;
-	const approved = approvedState(opts.root, config);
+	const sessionId = opts.sessionId ?? testSessionId("fake-session");
+	const profile = fixtureSession(opts.root, {
+		...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
+		sessionId,
+	});
+	const approved = approvedState(opts.root, config, { agentDir: profile.agentDir, sessionId });
 	const state = opts.state ? opts.state(approved) : approved;
 	const modes = opts.modes === null ? undefined : (opts.modes ?? fakeModes());
 	const ui = scriptedUi(opts.answers ?? []);
@@ -209,24 +426,36 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 	const hold: SessionHold = { idle: opts.hold?.idle ?? true, pending: opts.hold?.pending ?? false, editor: opts.hold?.editor ?? "" };
 	const timers = fakeTimers();
 	let aborts = 0;
-	const leases: { acquired: string[]; released: string[] } = { acquired: [], released: [] };
-	const lease = async (root: string, runId: string): Promise<AcquireRunLeaseResult> => {
-		const acquired = opts.lease
-			? await opts.lease(root, runId)
-			: { ok: true as const, lease: fakeLease(root, runId, () => undefined) };
-		if (!acquired.ok) return acquired;
-		leases.acquired.push(runId);
-		const release = acquired.lease.release.bind(acquired.lease);
+	const leases: FakeSession["leases"] = { acquired: [], released: [], held: [] };
+
+	/** The controller may call the old `(root, runId)` shape in an in-flight build; both normalize to the real input. */
+	const leaseInput = (first: AcquireRunLeaseInput | string, second?: LeaseDeps | string): AcquireRunLeaseInput => {
+		if (typeof first === "string") {
+			return { sessionDir: state.sessionDir, sessionId, root: first, runId: typeof second === "string" ? second : "", mode: "write" };
+		}
 		return {
-			ok: true,
-			lease: {
-				...acquired.lease,
-				release: async () => {
-					leases.released.push(runId);
-					await release();
-				},
-			},
+			sessionDir: first.sessionDir || state.sessionDir,
+			sessionId: first.sessionId || sessionId,
+			root: first.root,
+			runId: first.runId,
+			mode: first.mode,
+			...(first.scope !== undefined ? { scope: first.scope } : {}),
 		};
+	};
+	const lease = async (first: AcquireRunLeaseInput | string, second?: LeaseDeps | string): Promise<AcquireRunLeaseResult> => {
+		const input = leaseInput(first, second);
+		const acquired = opts.lease
+			? await opts.lease(input)
+			: { ok: true as const, lease: fakeLease(input, () => undefined) };
+		if (!acquired.ok) return acquired;
+		leases.acquired.push(input.runId);
+		const held = tracedLease(acquired.lease, () => {
+			leases.released.push(input.runId);
+			const at = leases.held.indexOf(held);
+			if (at >= 0) leases.held.splice(at, 1);
+		});
+		leases.held.push(held);
+		return { ok: true, lease: held };
 	};
 	const controller = new RunController({
 		pi: {
@@ -245,7 +474,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		timers: timers.api,
 		lease,
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
-		...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}),
+		agentDir: profile.agentDir,
 		...(opts.live ? { live: opts.live } : {}),
 	});
 	// The controller hands ctx to its own deps and reads only these members of it.
@@ -264,7 +493,12 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		abort: () => {
 			aborts++;
 		},
-		...(opts.artifactsDir !== undefined ? { sessionManager: { getArtifactsDir: () => opts.artifactsDir } } : {}),
+		agent: { kind: "main", id: "main" },
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getArtifactsDir: () => opts.artifactsDir ?? "",
+			getSessionDir: () => "",
+		},
 		...(modes
 			? {
 					sessionModes: {
@@ -283,6 +517,9 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		config,
 		repo: state.repo,
 		state,
+		sessionId,
+		sessionDir: state.sessionDir,
+		agentDir: profile.agentDir,
 		modes,
 		ui,
 		sent,

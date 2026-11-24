@@ -26,13 +26,32 @@ const T0 = Date.parse("2026-11-20T09:00:00Z");
 const MIN = 60_000;
 const HOUR = 3_600_000;
 
+/** Every write in this file is owned by one attested test session; explicit scopes still win in the sibling test. */
+const LEDGER_SCOPE = "/profiles/test/storm/sessions/agents";
+type StartInput = Omit<Parameters<typeof noteAgentStart>[0], "scope"> & { scope?: string };
+type UsageInput = Omit<Parameters<typeof noteAgentUsage>[0], "scope"> & { scope?: string };
+type EndInput = Omit<Parameters<typeof noteAgentEnd>[0], "scope"> & { scope?: string };
+type RegistryInput = Omit<Parameters<typeof noteRegistryAgent>[0], "scope"> & { scope?: string };
+
+const start = (input: StartInput): void => noteAgentStart({ ...input, scope: input.scope ?? LEDGER_SCOPE });
+const usage = (input: UsageInput): void => noteAgentUsage({ ...input, scope: input.scope ?? LEDGER_SCOPE });
+const end = (input: EndInput): void => noteAgentEnd({ ...input, scope: input.scope ?? LEDGER_SCOPE });
+const run = (id: string, runId: string, scope = LEDGER_SCOPE): void => noteAgentRun(id, runId, scope);
+const followUp = (id: string, scope = LEDGER_SCOPE): void => noteAgentFollowUp(id, scope);
+const parked = (id: string, scope = LEDGER_SCOPE): void => noteAgentParked(id, scope);
+const review = (id: string, input: unknown, now: number, scope = LEDGER_SCOPE): void => noteAgentReview(id, input, now, scope);
+const verdictTree = (id: string, at: number, tree: string, scope = LEDGER_SCOPE): void => noteVerdictTree(id, at, tree, scope);
+const change = (id: string, now: number, scope = LEDGER_SCOPE): void => noteAgentChange(id, now, scope);
+const registry = (input: RegistryInput): void => noteRegistryAgent({ ...input, scope: input.scope ?? LEDGER_SCOPE });
+const cleaned = (ids: readonly string[], now: number, scope = LEDGER_SCOPE): void => markAgentsCleaned(ids, now, scope);
+
 describe("agent ledger", () => {
 	beforeEach(resetAgents);
 
 	test("start, usage and settle; later turns keep the entry and do not count as follow-ups", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", parentId: "Main", role: "implementer", runId: "r1", now: T0 });
-		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 10_000, costUsd: 0.01, now: T0 + 1_000 });
-		noteAgentUsage({ id: "A", model: "anthropic/sonnet", promptTokens: 12_000, costUsd: 0.02, now: T0 + 2_000 });
+		start({ id: "A", name: "storm-implementer", parentId: "Main", role: "implementer", runId: "r1", now: T0 });
+		usage({ id: "A", model: "anthropic/sonnet", promptTokens: 10_000, costUsd: 0.01, now: T0 + 1_000 });
+		usage({ id: "A", model: "anthropic/sonnet", promptTokens: 12_000, costUsd: 0.02, now: T0 + 2_000 });
 		let [a] = listAgents();
 		expect(a).toMatchObject({
 			id: "A",
@@ -51,78 +70,78 @@ describe("agent ledger", () => {
 		expect(a!.costUsd).toBeCloseTo(0.03);
 
 		// A turn that does not settle (more turns follow) keeps the agent running.
-		noteAgentEnd({ id: "A", now: T0 + 3_000, settled: false });
+		end({ id: "A", now: T0 + 3_000, settled: false });
 		expect(listAgents()[0]!.state).toBe("running");
-		noteAgentEnd({ id: "A", now: T0 + 4_000, settled: true });
+		end({ id: "A", now: T0 + 4_000, settled: true });
 		[a] = listAgents();
 		expect(a).toMatchObject({ state: "idle", lastActivityAt: T0 + 4_000 });
 
 		// A wake, a message turn or a revive is a turn, not a counted follow-up: those are the director's delivered writes.
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 60_000 });
-		noteAgentEnd({ id: "A", now: T0 + 70_000, settled: true });
-		noteAgentParked("A");
+		start({ id: "A", name: "storm-implementer", now: T0 + 60_000 });
+		end({ id: "A", now: T0 + 70_000, settled: true });
+		parked("A");
 		expect(listAgents()[0]).toMatchObject({ state: "parked", lastActivityAt: T0 + 70_000 });
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 600_000 });
+		start({ id: "A", name: "storm-implementer", now: T0 + 600_000 });
 		expect(listAgents()[0]).toMatchObject({ state: "running", followUps: 0, role: "implementer", startedAt: T0 });
 	});
 
 	test("follow-ups count delivered writes, one each, however many turns the agent takes", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 });
-		noteAgentEnd({ id: "A", now: T0 + 1, settled: true });
+		start({ id: "A", name: "storm-implementer", now: T0 });
+		end({ id: "A", now: T0 + 1, settled: true });
 		// 14 messages were sent in the 0.8 run and one was reported: every delivery counts.
-		for (let i = 0; i < 14; i++) noteAgentFollowUp("A");
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 2 });
+		for (let i = 0; i < 14; i++) followUp("A");
+		start({ id: "A", name: "storm-implementer", now: T0 + 2 });
 		expect(listAgents()[0]!.followUps).toBe(14);
-		noteAgentFollowUp("Nobody");
+		followUp("Nobody");
 		expect(listAgents()).toHaveLength(1);
 	});
 
 	test("an agent that takes a turn during a later run becomes that run's agent; a turn outside a run keeps its run", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r1", now: T0 });
-		noteAgentEnd({ id: "A", now: T0 + 1, settled: true });
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 + 2 });
+		start({ id: "A", name: "storm-implementer", runId: "r1", now: T0 });
+		end({ id: "A", now: T0 + 1, settled: true });
+		start({ id: "A", name: "storm-implementer", now: T0 + 2 });
 		expect(listAgents({ runId: "r1" }).map(e => e.id)).toEqual(["A"]);
-		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 3 });
+		start({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 3 });
 		expect(listAgents({ runId: "r1" })).toEqual([]);
 		expect(listAgents({ runId: "r2" }).map(e => e.id)).toEqual(["A"]);
 	});
 
 	test("noteAgentRun moves an entry to a run, starting its run-scoped fields over; the same run is a no-op", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", parentId: "Main", runId: "r1", now: T0 });
-		noteAgentChange("A", T0 + 1_000);
-		noteAgentReview("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
-		noteAgentRun("A", "r1");
+		start({ id: "A", name: "storm-implementer", role: "implementer", parentId: "Main", runId: "r1", now: T0 });
+		change("A", T0 + 1_000);
+		review("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
+		run("A", "r1");
 		expect(listAgents()[0]).toMatchObject({ runId: "r1", changes: 1, lastChangeAt: T0 + 1_000, lastVerdict: { at: T0 + 2_000, correct: true } });
-		noteAgentRun("A", "r2");
+		run("A", "r2");
 		expect(listAgents({ runId: "r2" })[0]).toMatchObject({ id: "A", name: "storm-implementer", role: "implementer", parentId: "Main", state: "running" });
 		expect(listAgents()[0]?.changes).toBeUndefined();
 		expect(listAgents()[0]?.lastChangeAt).toBeUndefined();
 		expect(listAgents()[0]?.lastVerdict).toBeUndefined();
 		expect(listAgents()[0]?.review).toBeUndefined();
-		noteAgentRun("X", "r2");
+		run("X", "r2");
 		expect(listAgents()).toHaveLength(1);
 	});
 
 	test("unknown ids are ignored", () => {
-		noteAgentUsage({ id: "X", model: "a/b", promptTokens: 1, costUsd: 0, now: T0 });
-		noteAgentEnd({ id: "X", now: T0, settled: true });
-		noteAgentParked("X");
+		usage({ id: "X", model: "a/b", promptTokens: 1, costUsd: 0, now: T0 });
+		end({ id: "X", now: T0, settled: true });
+		parked("X");
 		expect(listAgents()).toEqual([]);
 	});
 
 	test("listing returns copies", () => {
-		noteAgentStart({ id: "A", name: "task", now: T0 });
+		start({ id: "A", name: "task", now: T0 });
 		listAgents()[0]!.state = "parked";
 		expect(listAgents()[0]!.state).toBe("running");
 	});
 
 	test("ancestor filter follows parent links at any depth; run filter matches the run", () => {
-		noteAgentStart({ id: "C1", name: "task", parentId: "Main", runId: "r1", now: T0 });
-		noteAgentStart({ id: "G1", name: "task", parentId: "C1", now: T0 + 1 });
-		noteAgentStart({ id: "GG1", name: "task", parentId: "G1", now: T0 + 2 });
-		noteAgentStart({ id: "O1", name: "task", parentId: "Other", runId: "r2", now: T0 + 3 });
-		noteAgentStart({ id: "Loop1", name: "task", parentId: "Loop2", now: T0 + 4 });
-		noteAgentStart({ id: "Loop2", name: "task", parentId: "Loop1", now: T0 + 5 });
+		start({ id: "C1", name: "task", parentId: "Main", runId: "r1", now: T0 });
+		start({ id: "G1", name: "task", parentId: "C1", now: T0 + 1 });
+		start({ id: "GG1", name: "task", parentId: "G1", now: T0 + 2 });
+		start({ id: "O1", name: "task", parentId: "Other", runId: "r2", now: T0 + 3 });
+		start({ id: "Loop1", name: "task", parentId: "Loop2", now: T0 + 4 });
+		start({ id: "Loop2", name: "task", parentId: "Loop1", now: T0 + 5 });
 		const ids = (f: Parameters<typeof listAgents>[0]) => listAgents(f).map(e => e.id);
 		expect(ids({ ancestorId: "Main" })).toEqual(["C1", "G1", "GG1"]);
 		expect(ids({ ancestorId: "C1" })).toEqual(["G1", "GG1"]);
@@ -132,22 +151,64 @@ describe("agent ledger", () => {
 		expect(ids(undefined)).toHaveLength(6);
 	});
 
+	test("the same bare agent id in two owner sessions keeps separate spend, changes and ancestry", () => {
+		const one = "/profiles/a/storm/sessions/one";
+		const two = "/profiles/b/storm/sessions/two";
+		start({ id: "Impl", name: "storm-implementer", parentId: "Main", scope: one, runId: "run-one", now: T0 });
+		start({ id: "Impl", name: "storm-implementer", parentId: "Main", scope: two, runId: "run-two", now: T0 + 1 });
+		start({ id: "Child", name: "task", parentId: "Impl", scope: one, now: T0 + 2 });
+		start({ id: "Child", name: "task", parentId: "Impl", scope: two, now: T0 + 3 });
+
+		usage({ id: "Impl", model: "a/i", promptTokens: 10, costUsd: 0.1, scope: one, now: T0 + 4 });
+		usage({ id: "Impl", model: "b/i", promptTokens: 20, costUsd: 0.2, scope: two, now: T0 + 5 });
+		change("Impl", T0 + 6, one);
+		review("Impl", { data: { overall_correctness: "correct" } }, T0 + 7, one);
+
+		const scopedOne = listAgents({ scope: one });
+		const scopedTwo = listAgents({ scope: two });
+		expect(scopedOne.map(entry => entry.id)).toEqual(["Impl", "Child"]);
+		expect(scopedTwo.map(entry => entry.id)).toEqual(["Impl", "Child"]);
+		expect(scopedOne[0]).toMatchObject({ runId: "run-one", requests: 1, changes: 1, model: "a/i" });
+		expect(scopedTwo[0]).toMatchObject({ runId: "run-two", requests: 1, model: "b/i" });
+		expect(scopedTwo[0]?.changes).toBeUndefined();
+		expect(scopedTwo[0]?.review).toBeUndefined();
+		expect(scopedOne[0]?.review?.reviews).toBe(1);
+		// Ancestor links resolve inside one scope, never through the other session's same-named parent.
+		expect(listAgents({ scope: one, ancestorId: "Impl" }).map(entry => entry.id)).toEqual(["Child"]);
+		expect(listAgents({ scope: two, ancestorId: "Main" }).map(entry => entry.id)).toEqual(["Impl", "Child"]);
+		expect(listAgents({ runId: "run-one" }).map(entry => entry.id)).toEqual(["Impl"]);
+		// A late cleanup for one owner does not mark the other's same-id entry.
+		cleaned(["Impl"], T0 + 8, one);
+		expect(listAgents({ scope: one }).find(entry => entry.id === "Impl")?.cleanedAt).toBe(T0 + 8);
+		expect(listAgents({ scope: two }).find(entry => entry.id === "Impl")?.cleanedAt).toBeUndefined();
+	});
+
+	test("a write without an attested scope creates no global unowned entry", () => {
+		// @ts-expect-error the production API requires an attested owner session; unowned writes are refused.
+		noteAgentStart({ id: "A", name: "task", now: T0 });
+		// @ts-expect-error the production API requires an attested owner session; unowned writes are refused.
+		noteAgentUsage({ id: "A", model: "a/b", promptTokens: 10, costUsd: 0.1, now: T0 });
+		// A blank scope is not an owner either; the runtime guard refuses it even though the type accepts a string.
+		noteAgentStart({ id: "A", name: "task", scope: "", now: T0 });
+		expect(listAgents()).toEqual([]);
+	});
+
 	test("parked entries older than 24 h are dropped when a new agent arrives", () => {
-		noteAgentStart({ id: "Old", name: "task", now: T0 });
-		noteAgentEnd({ id: "Old", now: T0, settled: true });
-		noteAgentParked("Old");
-		noteAgentStart({ id: "IdleOld", name: "task", now: T0 });
-		noteAgentEnd({ id: "IdleOld", now: T0, settled: true });
-		noteAgentStart({ id: "Recent", name: "task", now: T0 + 20 * HOUR });
-		noteAgentEnd({ id: "Recent", now: T0 + 20 * HOUR, settled: true });
-		noteAgentParked("Recent");
-		noteAgentStart({ id: "New", name: "task", now: T0 + 25 * HOUR });
+		start({ id: "Old", name: "task", now: T0 });
+		end({ id: "Old", now: T0, settled: true });
+		parked("Old");
+		start({ id: "IdleOld", name: "task", now: T0 });
+		end({ id: "IdleOld", now: T0, settled: true });
+		start({ id: "Recent", name: "task", now: T0 + 20 * HOUR });
+		end({ id: "Recent", now: T0 + 20 * HOUR, settled: true });
+		parked("Recent");
+		start({ id: "New", name: "task", now: T0 + 25 * HOUR });
 		expect(listAgents().map(e => e.id)).toEqual(["IdleOld", "Recent", "New"]);
 	});
 
 	test("markAgentsCleaned marks ledger entries", () => {
-		noteAgentStart({ id: "A", name: "task", now: T0 });
-		markAgentsCleaned(["A", "Ghost"], T0 + 5);
+		start({ id: "A", name: "task", now: T0 });
+		cleaned(["A", "Ghost"], T0 + 5);
 		expect(listAgents()[0]!.cleanedAt).toBe(T0 + 5);
 	});
 });
@@ -227,14 +288,14 @@ describe("noteAgentReview", () => {
 	beforeEach(() => resetAgents());
 
 	test("accumulates a reviewer's yields on its own entry and ignores non-review yields", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: 0 });
-		noteAgentStart({ id: "Impl", name: "storm-implementer", now: 0 });
-		noteAgentReview("Impl", { data: { done: true } }, T0);
-		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 1);
-		noteAgentReview("Rev", { error: "x" }, T0 + 2);
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 3);
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 4);
-		noteAgentReview("Ghost", { data: { overall_correctness: "correct" } }, T0 + 5);
+		start({ id: "Rev", name: "storm-reviewer", now: 0 });
+		start({ id: "Impl", name: "storm-implementer", now: 0 });
+		review("Impl", { data: { done: true } }, T0);
+		review("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 1);
+		review("Rev", { error: "x" }, T0 + 2);
+		review("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 3);
+		review("Rev", { data: { overall_correctness: "correct" } }, T0 + 4);
+		review("Ghost", { data: { overall_correctness: "correct" } }, T0 + 5);
 		const [rev, impl] = listAgents();
 		expect(rev?.review).toEqual({ reviews: 2, passed: 1, failed: 1, findings: [1, 0, 0, 0] });
 		expect(impl?.review).toBeUndefined();
@@ -242,27 +303,27 @@ describe("noteAgentReview", () => {
 	});
 
 	test("keeps the latest verdict with the time it was given; a findings section leaves it alone", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: T0 });
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 1_000);
+		start({ id: "Rev", name: "storm-reviewer", now: T0 });
+		review("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 1_000);
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: false });
-		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 2_000);
+		review("Rev", { type: ["findings"], data: { priority: 0 } }, T0 + 2_000);
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: false });
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 3_000);
+		review("Rev", { data: { overall_correctness: "correct" } }, T0 + 3_000);
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 3_000, correct: true });
 	});
 
 	test("noteVerdictTree sets the matching verdict's tree and ignores an older time", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", now: T0 });
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
-		noteVerdictTree("Rev", T0, "tree-0");
+		start({ id: "Rev", name: "storm-reviewer", now: T0 });
+		review("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		verdictTree("Rev", T0, "tree-0");
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: true });
-		noteVerdictTree("Rev", T0 + 1_000, "tree-1");
+		verdictTree("Rev", T0 + 1_000, "tree-1");
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 1_000, correct: true, tree: "tree-1" });
 		// A newer verdict is not given the tree of the one it replaced.
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
-		noteVerdictTree("Rev", T0 + 1_000, "tree-2");
+		review("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
+		verdictTree("Rev", T0 + 1_000, "tree-2");
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 2_000, correct: false });
-		noteVerdictTree("Ghost", T0 + 2_000, "tree-3");
+		verdictTree("Ghost", T0 + 2_000, "tree-3");
 		expect(listAgents()).toHaveLength(1);
 	});
 });
@@ -271,9 +332,9 @@ describe("structured review evidence", () => {
 	beforeEach(() => resetAgents());
 
 	test("an incremental findings cycle and its verdict become one review, without body or log text", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
-		noteAgentReview("Rev", { type: ["findings"], data: { priority: 0, title: "x", body: "raw output" } }, T0 + 1_000);
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 1, kind: "code" }] } }, T0 + 2_000);
+		start({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		review("Rev", { type: ["findings"], data: { priority: 0, title: "x", body: "raw output" } }, T0 + 1_000);
+		review("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 1, kind: "code" }] } }, T0 + 2_000);
 		const [rev] = listAgents();
 		expect(reviewEvidenceOf(rev!)).toEqual({
 			complete: true,
@@ -282,33 +343,33 @@ describe("structured review evidence", () => {
 	});
 
 	test("a verdict's tree binds the review, and a later verdict keeps its own tree", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
-		noteVerdictTree("Rev", T0 + 1_000, "d1:f1");
+		start({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		review("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		verdictTree("Rev", T0 + 1_000, "d1:f1");
 		expect(reviewEvidenceOf(listAgents()[0]!)).toMatchObject({
 			records: [{ at: T0 + 1_000, correct: true, tree: "d1:f1" }],
 		});
-		noteAgentReview("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
-		noteVerdictTree("Rev", T0 + 2_000, "d2:f2");
+		review("Rev", { data: { overall_correctness: "incorrect" } }, T0 + 2_000);
+		verdictTree("Rev", T0 + 2_000, "d2:f2");
 		expect(reviewEvidenceOf(listAgents()[0]!).records.map(record => record.tree)).toEqual(["d1:f1", "d2:f2"]);
 		// An older time does not take the new verdict's tree.
-		noteVerdictTree("Rev", T0 + 1_000, "d3:f3");
+		verdictTree("Rev", T0 + 1_000, "d3:f3");
 		expect(listAgents()[0]?.lastVerdict).toEqual({ at: T0 + 2_000, correct: false, tree: "d2:f2" });
 	});
 
 	test("a new run clears the review evidence with the run-scoped fields", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", runId: "r1", now: T0 });
-		noteAgentReview("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
-		noteVerdictTree("Rev", T0 + 1_000, "d1:f1");
+		start({ id: "Rev", name: "storm-reviewer", role: "reviewer", runId: "r1", now: T0 });
+		review("Rev", { data: { overall_correctness: "correct" } }, T0 + 1_000);
+		verdictTree("Rev", T0 + 1_000, "d1:f1");
 		expect(reviewEvidenceOf(listAgents()[0]!).records).toHaveLength(1);
-		noteAgentRun("Rev", "r2");
+		run("Rev", "r2");
 		expect(reviewEvidenceOf(listAgents()[0]!)).toEqual({ records: [], complete: true });
 	});
 
 	test("a bounded log drops no P0 silently: overflow makes the evidence incomplete", () => {
-		noteAgentStart({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
+		start({ id: "Rev", name: "storm-reviewer", role: "reviewer", now: T0 });
 		for (let i = 0; i < 70; i++) {
-			noteAgentReview("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 0 }] } }, T0 + i);
+			review("Rev", { data: { overall_correctness: "incorrect", findings: [{ priority: 0 }] } }, T0 + i);
 		}
 		const ledger = reviewEvidenceOf(listAgents()[0]!);
 		expect(ledger.records.length).toBeLessThanOrEqual(64);
@@ -320,25 +381,25 @@ describe("noteAgentChange", () => {
 	beforeEach(() => resetAgents());
 
 	test("counts and dates changes on a known entry and ignores an unknown id", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", now: T0 });
-		noteAgentChange("A", T0 + 1_000);
-		noteAgentChange("A", T0 + 2_000);
-		noteAgentChange("Ghost", T0 + 3_000);
+		start({ id: "A", name: "storm-implementer", now: T0 });
+		change("A", T0 + 1_000);
+		change("A", T0 + 2_000);
+		change("Ghost", T0 + 3_000);
 		expect(listAgents()).toHaveLength(1);
 		expect(listAgents()[0]).toMatchObject({ changes: 2, lastChangeAt: T0 + 2_000, lastActivityAt: T0 + 2_000 });
 	});
 
 	test("another run starts the run-scoped fields over; the same run keeps them", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
-		noteAgentChange("A", T0 + 1_000);
-		noteAgentReview("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
-		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r1", now: T0 + 3_000 });
+		start({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
+		change("A", T0 + 1_000);
+		review("A", { data: { overall_correctness: "correct" } }, T0 + 2_000);
+		start({ id: "A", name: "storm-implementer", runId: "r1", now: T0 + 3_000 });
 		expect(listAgents()[0]).toMatchObject({
 			changes: 1,
 			lastChangeAt: T0 + 1_000,
 			lastVerdict: { at: T0 + 2_000, correct: true },
 		});
-		noteAgentStart({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 4_000 });
+		start({ id: "A", name: "storm-implementer", runId: "r2", now: T0 + 4_000 });
 		const [a] = listAgents();
 		expect(a?.runId).toBe("r2");
 		expect(a?.changes).toBeUndefined();
@@ -361,7 +422,13 @@ describe("worker-homed agents", () => {
 	});
 
 	test("a launch with no requests cannot finish its lane; real session usage from the process registry can", () => {
-		const run = startLedgerRun({ runId: "run-homed", repoId: "repo", root: "/repo" });
+		const run = startLedgerRun({
+			runId: "run-homed",
+			sessionId: "native-homed",
+			sessionDir: "/profile/storm/sessions/homed",
+			repoId: "repo",
+			root: "/repo",
+		});
 		const team = teamOf({ quick: { models: ["a/q"], workers: { min: 1, max: 1 } } });
 		const plan = {
 			lanes: [{ name: "experiment", kind: "run" as const, role: "quick", files: ["experiment.txt"], isolationReason: "independent result" }],
@@ -410,12 +477,12 @@ describe("worker-homed agents", () => {
 	});
 
 	test("child-session events outrank the registry; an aborted registry child never counts as settled work", () => {
-		noteAgentStart({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
-		noteAgentUsage({ id: "A", model: "a/i", promptTokens: 10, costUsd: 0.01, now: T0 + 1 });
-		noteRegistryAgent({ id: "A", runId: "r1", name: "storm-implementer", status: "idle", startedAt: T0, lastActivityAt: T0 + 2, requests: 9, costUsd: 1 });
+		start({ id: "A", name: "storm-implementer", role: "implementer", runId: "r1", now: T0 });
+		usage({ id: "A", model: "a/i", promptTokens: 10, costUsd: 0.01, now: T0 + 1 });
+		registry({ id: "A", runId: "r1", name: "storm-implementer", status: "idle", startedAt: T0, lastActivityAt: T0 + 2, requests: 9, costUsd: 1 });
 		expect(listAgents({ runId: "r1" })[0]).toMatchObject({ state: "running", requests: 1, costUsd: 0.01 });
 
-		noteRegistryAgent({ id: "B", runId: "r1", name: "storm-quick", status: "aborted", startedAt: T0, lastActivityAt: T0 + 3, requests: 2, costUsd: 0.02 });
+		registry({ id: "B", runId: "r1", name: "storm-quick", status: "aborted", startedAt: T0, lastActivityAt: T0 + 3, requests: 2, costUsd: 0.02 });
 		expect(listAgents({ runId: "r1" }).find(agent => agent.id === "B")).toMatchObject({ state: "parked", lastWorkFailed: true, requests: 2 });
 	});
 });

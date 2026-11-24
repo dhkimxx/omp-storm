@@ -44,7 +44,15 @@ const CONTEXT_TTL_MS = 2 * 60_000;
 
 /** This process's last `omp stats --summary` per DB path; `ok` is unset while it runs. */
 const statsSyncs = new Map<string, { at: number; done: Promise<boolean>; ok?: boolean }>();
-const contexts = new Map<string, { at: number; context: Promise<AnalysisContext> }>();
+/**
+ * One context per profile and target. The key carries the agent dir so two profiles opened in the same folder never
+ * share priors, settings or quota reads; the work tree alone is not an owner.
+ */
+const contexts = new Map<string, { cwd: string; at: number; context: Promise<AnalysisContext> }>();
+
+function contextKey(env: ContextEnv): string {
+	return `${env.agentDir}\0${env.cwd}\0${env.statsDb ?? ""}\0${env.ompBin}`;
+}
 
 /**
  * Usage over the `windowDays` ending at `to`. omp syncs its stats DB only when `omp stats` runs, so when the newest
@@ -163,18 +171,22 @@ async function buildContext(env: ContextEnv, ui: UiPort, now: number): Promise<A
  */
 export function prepareAnalysis(env: ContextEnv, ui: UiPort): Promise<AnalysisContext> {
 	const now = env.now();
-	const cached = contexts.get(env.cwd);
+	const key = contextKey(env);
+	const cached = contexts.get(key);
 	if (cached && now - cached.at < CONTEXT_TTL_MS) return cached.context;
 	const context = buildContext(env, ui, now);
-	contexts.set(env.cwd, { at: now, context });
+	contexts.set(key, { cwd: env.cwd, at: now, context });
 	context.catch(() => {
-		if (contexts.get(env.cwd)?.context === context) contexts.delete(env.cwd);
+		if (contexts.get(key)?.context === context) contexts.delete(key);
 	});
 	return context;
 }
 
-/** Drops the cached context of `cwd`, or of every project when omitted, so the next `prepareAnalysis` reads again. */
+/** Drops every profile's cached context for `cwd`, or all of them when omitted, so the next read is fresh. */
 export function invalidateAnalysis(cwd?: string): void {
-	if (cwd === undefined) contexts.clear();
-	else contexts.delete(cwd);
+	if (cwd === undefined) {
+		contexts.clear();
+		return;
+	}
+	for (const [key, entry] of contexts) if (entry.cwd === cwd) contexts.delete(key);
 }

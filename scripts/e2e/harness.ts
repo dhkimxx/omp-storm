@@ -11,12 +11,14 @@ import type { BunFile, Subprocess } from "bun";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { APPROVE } from "../../src/proposals/present.ts";
+import { sessionStoreDir } from "../../src/session-scope.ts";
 import type { Effort, RunSummary, RunRecord, StormConfig } from "../../src/types.ts";
 import { STORM_MARK } from "../../src/view/appearance.ts";
-import type { LlmEntry, Step } from "./fake-llm.ts";
+import type { LlmEntry, ScriptedTask, Step } from "./fake-llm.ts";
 
-export type { LlmEntry, Step };
+export type { LlmEntry, ScriptedTask, Step };
 /** A line of omp's RPC output; only the fields the drivers read are named. */
 export interface Frame {
 	type?: string;
@@ -25,7 +27,7 @@ export interface Frame {
 	title?: string;
 	options?: string[];
 	/** A session message on message frames, the text on a notice. */
-	message?: { customType?: string } | string;
+	message?: { customType?: string; content?: unknown; details?: unknown } | string;
 	notifyType?: string;
 	sessionSettled?: boolean;
 	toolName?: string;
@@ -33,6 +35,10 @@ export interface Frame {
 	args?: { path?: string };
 	result?: { details?: { action?: string; outcome?: string } };
 	isError?: boolean;
+	/** Response frames to a command Storm's driver sent; `get_state` carries `data.sessionId`. */
+	command?: string;
+	success?: boolean;
+	data?: { sessionId?: string; sessionFile?: string; messageCount?: number; cancelled?: boolean; [key: string]: unknown };
 	[key: string]: unknown;
 }
 
@@ -61,6 +67,8 @@ export interface E2eEnv {
 	project: string;
 	home: string;
 	agentDir: string;
+	/** Native omp transcript root; each driver process gets its own directory below it. */
+	sessionRoot: string;
 	logs: string;
 	llmLog: string;
 	/** Environment of every omp process: isolated HOME, pinned binaries first on PATH. */
@@ -84,6 +92,7 @@ export function prepare(name: string, defaultPort: number): E2eEnv {
 	const home = join(work, "home");
 	const project = join(work, "project");
 	const logs = join(work, "logs");
+	const sessionRoot = join(work, "sessions");
 	const agentDir = join(home, ".omp", "profiles", profile, "agent");
 	// Storm calls `omp` by name for its own subcommands: the binary under test must be the first one on PATH, and
 	// the pinned bun runs it.
@@ -94,7 +103,7 @@ export function prepare(name: string, defaultPort: number): E2eEnv {
 		delete childEnv[name];
 	}
 	rmSync(work, { recursive: true, force: true });
-	for (const dir of [project, logs, agentDir]) mkdirSync(dir, { recursive: true });
+	for (const dir of [project, logs, sessionRoot, agentDir]) mkdirSync(dir, { recursive: true });
 	const git = Bun.spawnSync(["git", "init", "-q", project]);
 	if (git.exitCode !== 0) throw new Error(`git init failed: ${git.stderr.toString()}`);
 	// The tree gate reads the commit a run started on: without a commit every tree read is undefined and git changes
@@ -119,7 +128,7 @@ export function prepare(name: string, defaultPort: number): E2eEnv {
 	if (version.exitCode !== 0) throw new Error(`${omp} --version failed (${version.exitCode}): ${version.stderr.toString()}`);
 	const ompVersion = version.stdout.toString().trim();
 	console.log(`omp ${ompVersion} (${omp}) · bun ${Bun.version} · port ${port} · profile ${profile} · work ${work}`);
-	return { omp, ompVersion, port, profile, work, project, home, agentDir, logs, llmLog: join(work, "llm.jsonl"), childEnv };
+	return { omp, ompVersion, port, profile, work, project, home, agentDir, sessionRoot, logs, llmLog: join(work, "llm.jsonl"), childEnv };
 }
 
 export function modelsYml(port: number, providers: Record<string, readonly ModelSpec[]>): string {
@@ -342,14 +351,45 @@ export const choose =
 	dialog =>
 		labels.find(label => dialog.options.includes(label));
 
+/** The native `/storm auto` switch labels; a scenario counting dialogs must not count a fixture's own approvals. */
+export const AUTO_ON_LABEL = "자동 위임 켜기";
+export const AUTO_OFF_LABEL = "자동 위임 끄기";
+
+/**
+ * Deliberate per-session fixture: approves the recommended team in THIS native session, so a scenario that needs an
+ * approved team does not depend on another session's files. Returns the dialogs it answered and removes them from
+ * `rpc.dialogs`, which then holds only what the scenario itself asked. Automatic delegation starts on with the first
+ * approval, so `auto: "off"` switches it off through the real command.
+ */
+export async function approveTeam(rpc: Rpc, auto: "on" | "off" = "off"): Promise<Dialog[]> {
+	const from = rpc.dialogs.length;
+	const answer = rpc.answer;
+	try {
+		rpc.answer = choose(APPROVE);
+		await rpc.prompt("/storm");
+		if (auto === "off") {
+			rpc.answer = choose(AUTO_OFF_LABEL);
+			await rpc.prompt("/storm auto");
+		}
+		return rpc.dialogs.slice(from);
+	} finally {
+		rpc.dialogs.splice(from);
+		rpc.answer = answer;
+	}
+}
+
 let launches = 0;
 
 export interface SessionOptions {
 	model: string;
 	/** Extra omp flags. */
 	flags?: string[];
-	/** Keep the session on disk (omp gives it an artifacts dir); in memory otherwise. */
-	persist?: boolean;
+	/** Native session id to open; absent starts a new session. */
+	resume?: string;
+	/** Native transcript directory; absent uses a fresh one below the work dir. */
+	sessionDir?: string;
+	/** Host-only probes: keep the session in memory (`--no-session`), so ephemeral artifact lifetime is unchanged. */
+	ephemeral?: boolean;
 	/** PTY columns; only the interactive driver reads it. */
 	columns?: number;
 	/** PTY rows; only the interactive driver reads it. */
@@ -360,12 +400,22 @@ export interface SessionOptions {
 
 const isSettled = (frame: Frame): boolean => frame.type === "session_settled" || (frame.type === "prompt_result" && frame.sessionSettled === true);
 
+/** What `get_state` says about the native session this process owns. */
+export interface HostSession {
+	sessionId: string;
+	sessionFile?: string;
+	messageCount?: number;
+}
+
 export class Rpc {
 	readonly frames: Frame[] = [];
 	readonly dialogs: Dialog[] = [];
+	/** The native transcript directory this process was started with; a resume needs the same one. */
+	readonly sessionDir: string;
 	readonly #proc: Subprocess<"pipe", "pipe", BunFile>;
 	readonly #log: string;
 	#seq = 0;
+	#session: HostSession | undefined;
 
 	/** Answers the select dialogs; replace it between prompts to answer the next ones differently. */
 	answer: Answer;
@@ -374,11 +424,41 @@ export class Rpc {
 		this.answer = answer;
 		const tag = `rpc-${String(++launches).padStart(3, "0")}`;
 		this.#log = join(env.logs, `${tag}.frames.jsonl`);
-		const args = [env.omp, "--mode", "rpc", ...sessionArgs(env, options)];
+		this.sessionDir = options.sessionDir ?? join(env.sessionRoot, tag);
+		mkdirSync(this.sessionDir, { recursive: true });
+		const args = [env.omp, "--mode", "rpc", ...sessionArgs(env, options, this.sessionDir)];
 		appendFileSync(join(env.logs, "launches.log"), `${tag} ${args.slice(1).join(" ")}\n`);
 		this.#proc = Bun.spawn(args, { cwd: env.project, env: env.childEnv, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(env.logs, `${tag}.stderr.log`)) });
 		open.add(this);
 		void this.#pump();
+	}
+
+	/** The host's own id for this process's session; available after `ready()`. */
+	get sessionId(): string {
+		if (this.#session === undefined) throw new Error("the rpc session has not been identified: await ready() first");
+		return this.#session.sessionId;
+	}
+
+	get sessionFile(): string | undefined {
+		return this.#session?.sessionFile;
+	}
+
+	/** Reads the native session identity through the host's public `get_state`, never by guessing a file name. */
+	async identify(): Promise<HostSession> {
+		const from = this.frames.length;
+		const id = this.send({ type: "get_state" });
+		const frame = await until(
+			() => this.frames.slice(from).find(candidate => candidate.type === "response" && candidate.id === id && candidate.command === "get_state"),
+			20_000,
+			"get_state",
+		);
+		const sessionId = frame.data?.sessionId;
+		if (frame.success !== true || typeof sessionId !== "string" || sessionId.trim() === "") throw new Error(`get_state gave no session id: ${JSON.stringify(frame).slice(0, 300)}`);
+		const session: HostSession = { sessionId };
+		if (typeof frame.data?.sessionFile === "string") session.sessionFile = frame.data.sessionFile;
+		if (typeof frame.data?.messageCount === "number") session.messageCount = frame.data.messageCount;
+		this.#session = session;
+		return session;
 	}
 
 	async #pump(): Promise<void> {
@@ -421,6 +501,7 @@ export class Rpc {
 
 	async ready(): Promise<void> {
 		await until(() => this.frames.find(frame => frame.type === "ready"), 40_000, "rpc ready");
+		await this.identify();
 	}
 
 	/** Sends a prompt and waits until omp has handled it (a slash command has run; a model turn has been accepted). */
@@ -463,11 +544,14 @@ export class Rpc {
 }
 
 /** Role models every session starts with: the fake provider only, so no agent ever asks for a real model. */
-function sessionArgs(env: E2eEnv, options: SessionOptions): string[] {
+function sessionArgs(env: E2eEnv, options: SessionOptions, sessionDir: string): string[] {
 	return [
 		"--profile",
 		env.profile,
-		...(options.persist ? [] : ["--no-session"]),
+		"--session-dir",
+		sessionDir,
+		...(options.ephemeral ? ["--no-session"] : []),
+		...(options.resume === undefined ? [] : ["--resume", options.resume]),
 		"--no-title",
 		"--auto-approve",
 		"--model",
@@ -531,17 +615,22 @@ export class Tui {
 	readonly background: "dark" | "light";
 	readonly #proc: Subprocess;
 	readonly #log: string;
-	readonly #model: string;
+	/** Native transcript directory: unique per interactive process unless the caller resumes one. */
+	readonly sessionDir: string;
+	#sessionId: string | undefined;
+	readonly #agentDir: string;
 
 	constructor(env: E2eEnv, options: SessionOptions) {
 		const tag = `tui-${String(++launches).padStart(3, "0")}`;
 		this.#log = join(env.logs, `${tag}.screen.log`);
-		this.#model = options.model.slice(options.model.indexOf("/") + 1);
+		this.#agentDir = env.agentDir;
+		this.sessionDir = options.sessionDir ?? join(env.sessionRoot, tag);
+		mkdirSync(this.sessionDir, { recursive: true });
 		this.columns = options.columns ?? 160;
 		this.rows = options.rows ?? 50;
 		this.background = options.background ?? "dark";
 		const decoder = new TextDecoder();
-		const args = [env.omp, ...sessionArgs(env, options)];
+		const args = [env.omp, ...sessionArgs(env, options, this.sessionDir)];
 		appendFileSync(join(env.logs, "launches.log"), `${tag} ${args.slice(1).join(" ")}\n`);
 		this.#proc = Bun.spawn(args, {
 			cwd: env.project,
@@ -577,9 +666,57 @@ export class Tui {
 		await this.seen(from, text => ((typeof needle === "string" ? text.includes(needle) : text.search(needle) >= 0) ? true : undefined), `the screen to show ${String(needle)}`, timeoutMs);
 	}
 
-	/** The first frame is drawn down to the status line, which names the model: the composer is up. */
+	/** The host's own id, learned from the session path it registered for this terminal; available after `ready()`. */
+	get sessionId(): string {
+		if (this.#sessionId === undefined) throw new Error("the TUI session has not been identified: await ready() first");
+		return this.#sessionId;
+	}
+
+	/**
+	 * The interactive host has no `get_state` line, so its native session is identified by the file it registers for
+	 * this terminal (the explicit `--session-dir` makes the directory ours). A process that has already written its
+	 * JSONL is read from there as well; both paths carry the host-minted id in the file name.
+	 */
+	async #identifySession(): Promise<string> {
+		return until(
+			() => {
+				const registry = join(this.#agentDir, "terminal-sessions");
+				if (existsSync(registry)) {
+					for (const name of readdirSync(registry)) {
+						const registered = readFileSync(join(registry, name), "utf8")
+							.split("\n")
+							.find(line => line.startsWith(this.sessionDir));
+						const id = registered === undefined ? undefined : /_([A-Za-z0-9_-]+)\.jsonl$/.exec(basename(registered))?.[1];
+						if (id !== undefined) return id;
+					}
+				}
+				for (const name of existsSync(this.sessionDir) ? readdirSync(this.sessionDir) : []) {
+					const id = /_([A-Za-z0-9_-]+)\.jsonl$/.exec(name)?.[1];
+					if (id !== undefined) return id;
+				}
+				return undefined;
+			},
+			40_000,
+			"the host to register this TUI session",
+		);
+	}
+
+	/**
+	 * The interactive terminal is ready when its composer row is drawn. That row is a box bottom (`╰─`, `+-` in an
+	 * ASCII preset) and appears at every width and theme; the model name deliberately disappears at 60 columns.
+	 * The next typed command still has to prove itself on screen: every caller waits for the actual dialog or report.
+	 */
 	async ready(): Promise<void> {
-		await this.shows(this.#model, 0, 90_000);
+		await this.seen(
+			0,
+			text => (text.split("\n").some(line => {
+				const row = line.trim();
+				return row === "╰─" || row === "+-";
+			}) ? true : undefined),
+			"the interactive composer",
+			90_000,
+		);
+		this.#sessionId = await this.#identifySession();
 	}
 
 	/**
@@ -662,23 +799,38 @@ export class Tui {
 
 // ── what Storm writes ───────────────────────────────────────────────────────────────────
 
-/** Readers of Storm's files in the project and the profile. */
+/**
+ * Readers of what one native session owns. Everything Storm persists lives under
+ * `<agentDir>/storm/sessions/<sha256(sessionId)>`: config at the top, run state under `state/`, automatic delegation
+ * beside the config, approvals under `approvals/<targetKey>/`. Nothing here is read from or written to the target
+ * worktree, and two sessions in the same checkout have unrelated readers.
+ */
 export class StormFiles {
+	readonly sessionId: string;
+	/** `<agentDir>/storm/sessions/<full sha256 id>`, the one Storm-owned directory for this session. */
+	readonly sessionDir: string;
 	readonly configFile: string;
+	/** `join(sessionDir, "auto-delegation.json")`, not inside a target's approval directory. */
+	readonly autoFile: string;
 	readonly stateDir: string;
 	readonly indexFile: string;
+	readonly approvalsRoot: string;
 
-	constructor(private readonly env: E2eEnv) {
-		this.configFile = join(env.project, ".omp", "storm", "config.json");
-		this.stateDir = join(env.project, ".omp", "storm", "state");
+	constructor(env: E2eEnv, sessionId: string) {
+		this.sessionId = sessionId;
+		this.sessionDir = sessionStoreDir(env.agentDir, sessionId);
+		this.configFile = join(this.sessionDir, "config.json");
+		this.autoFile = join(this.sessionDir, "auto-delegation.json");
+		this.stateDir = join(this.sessionDir, "state");
 		this.indexFile = join(this.stateDir, "runs", "index.jsonl");
+		this.approvalsRoot = join(this.sessionDir, "approvals");
 	}
 
 	config(): StormConfig {
 		return JSON.parse(readFileSync(this.configFile, "utf8")) as StormConfig;
 	}
 
-	/** Rewrites the config file by hand, as a user or a teammate's commit would: the result is unapproved. */
+	/** Rewrites this session's config by hand: the result is unapproved until Storm is asked again. */
 	editConfig(change: (config: StormConfig) => void): void {
 		const config = this.config();
 		change(config);
@@ -689,11 +841,14 @@ export class StormFiles {
 		return existsSync(this.configFile) ? new Bun.CryptoHasher("sha256").update(readFileSync(this.configFile)).digest("hex") : null;
 	}
 
-	/** This repo's approval store dir (`<agentDir>/storm/approvals/<repoId>`); undefined before the first approval. */
+	/** Every canonical target this session approved something for; normally exactly one. */
+	storeDirs(): string[] {
+		return existsSync(this.approvalsRoot) ? readdirSync(this.approvalsRoot, { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => join(this.approvalsRoot, entry.name)) : [];
+	}
+
+	/** This session's approval store for the current target; undefined before the first approval. */
 	storeDir(): string | undefined {
-		const base = join(this.env.agentDir, "storm", "approvals");
-		const repo = existsSync(base) ? readdirSync(base)[0] : undefined;
-		return repo === undefined ? undefined : join(base, repo);
+		return this.storeDirs()[0];
 	}
 
 	approvals(): string[] {
@@ -701,8 +856,9 @@ export class StormFiles {
 		return dir && existsSync(join(dir, "approved")) ? readdirSync(join(dir, "approved")) : [];
 	}
 
+	/** `<sessionDir>/state/runs.jsonl`: the trusted run list the janitor reads. */
 	trustedFile(): string {
-		return join(this.storeDir() ?? "missing", "runs.jsonl");
+		return join(this.stateDir, "runs.jsonl");
 	}
 
 	/** Run records, oldest first (run ids sort by start time). */

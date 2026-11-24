@@ -66,6 +66,58 @@ export function treeFingerprint(tree: TreeState): string {
 	return `${tree.diff}:${tree.files}`;
 }
 
+/** The latest file change by an agent whose work needs a review; `quick` work is self-contained. */
+export function lastWriterChangeAt(agents: readonly AgentEntry[]): number | undefined {
+	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick");
+	return writers.length ? Math.max(...writers.map(agent => agent.lastChangeAt ?? 0)) : undefined;
+}
+
+/** What the independent reviewer's latest verdict proves about one exact tree, or why it proves nothing. */
+export interface ReviewProof {
+	state: "none" | "current" | "incorrect" | "stale" | "unbound";
+	at?: number;
+	tree?: string;
+	/** Ledger id of the reviewer that gave the verdict, when one exists. */
+	author?: string;
+}
+
+/**
+ * The same approved-review binding the gate uses, exposed for requirement rows: only a structured verdict from the
+ * configured reviewer, after the last file change, on the exact current tree, with no open P0, is current proof.
+ * `incorrect` is reported only with the tree it judged, so a stale negative never overwrites a newer submission.
+ */
+export function reviewProof(
+	agents: readonly AgentEntry[],
+	config: StormConfig,
+	treeNow: string | undefined,
+	lastChangeAt: number | undefined,
+): ReviewProof {
+	const reviewer = usableRole(config, "reviewer");
+	if (reviewer === undefined) return { state: "none" };
+	const verdicts = agents.filter(agent => agent.role === "reviewer" && agent.name === reviewer.agent && (agent.changes ?? 0) === 0);
+	let latest: { author: AgentEntry; verdict: NonNullable<AgentEntry["lastVerdict"]> } | undefined;
+	for (const agent of verdicts) {
+		const verdict = agent.lastVerdict;
+		if (!verdict) continue;
+		if (latest === undefined || verdict.at > latest.verdict.at || (verdict.at === latest.verdict.at && !verdict.correct && latest.verdict.correct)) {
+			latest = { author: agent, verdict };
+		}
+	}
+	if (latest === undefined) return { state: "none" };
+	const verdict = latest.verdict;
+	const base: Omit<ReviewProof, "state"> = { at: verdict.at, ...(verdict.tree === undefined ? {} : { tree: verdict.tree }), author: latest.author.id };
+	if (lastChangeAt !== undefined && verdict.at <= lastChangeAt) return { ...base, state: "stale" };
+	if (!verdict.correct) return { ...base, state: "incorrect" };
+	if (treeNow === undefined || verdict.tree === undefined) return { ...base, state: "unbound" };
+	if (verdict.tree !== treeNow) return { ...base, state: "stale" };
+	const ledger = reviewEvidenceOf(latest.author);
+	if (!ledger.complete) return { ...base, state: "unbound" };
+	const record = ledger.records.findLast(entry => entry.correct !== undefined && entry.at === verdict.at);
+	if (!record || record.correct !== verdict.correct || record.tree !== treeNow) return { ...base, state: "unbound" };
+	if (p0Remains(verdicts, treeNow)) return { ...base, state: "unbound" };
+	return { ...base, state: "current" };
+}
+
 /**
  * A check's structured outcome. It maps directly from the check runner's evidence: only `passed` is proof, and a
  * report's `fingerprint`, `complete` and each entry's `finishedAt` are read without carrying any raw output.
@@ -91,6 +143,52 @@ export interface CoverageLane {
 	writes?: boolean;
 }
 
+/** The one bounded next action an open requirement admits, from the run's own evidence. */
+export type ResultRemedy = "work" | "replan" | "review" | "producer" | "retry" | "blocked";
+
+/** The media a required result is observed in; mirrors the plan's kind without importing plan types. */
+export type ResultKind = "change" | "artifact" | "answer";
+
+/** One declared requirement and how far the run's own evidence got; plan text alone never satisfies a row. */
+export interface CoverageResult {
+	/** Plan-wide stable id. */
+	id: string;
+	/** Assigned lane when one exists; a removed assignment keeps the requirement. */
+	lane?: string;
+	state: "pending" | "unmet" | "reviewable" | "accepted";
+	/** Short runtime reason for a non-accepted row. */
+	reason?: string;
+	/** The media the requirement is observed in; absent on legacy rows and rendered generically. */
+	kind?: ResultKind;
+	/** Host-bound attempt whose evidence set the current state; a short token, never a path or a claim. */
+	attempt?: string;
+	/**
+	 * Prerequisite lane whose result must change first, when missing input (not an implementation failure) is why the
+	 * row is open. The caller derives it from the plan's dependency edges and the prerequisite's current ledger state.
+	 */
+	blockedBy?: string;
+	/**
+	 * Explicit next action when the caller can classify the failure; absent is derived from state and `blockedBy`.
+	 * `replan` means the requirement still has no lane to run it (its producer left the plan): only assigning it again
+	 * under the same id, or the user explicitly changing scope, can clear it, and no review can stand in for that.
+	 */
+	remedy?: ResultRemedy;
+	/** What must change outside the team before a blocked row can continue; never a retry instruction. */
+	unblock?: string;
+	/**
+	 * Whether the approved reviewer's current-tree verdict can accept this submitted row. False for evidence the tree
+	 * cannot show (an answer's wording, an isolated artifact, or a requirement whose lane left the plan); such a row is
+	 * blocked, never sent to a reviewer who cannot judge it. Absent keeps the caller's old behavior (a change row
+	 * judged by the reviewer).
+	 */
+	judgeable?: boolean;
+	/**
+	 * Short content or dependency witness used only to decide whether another round made real progress (for example
+	 * the accepted content version, or the producer result version a consumer observed). Never proof, never rendered.
+	 */
+	evidence?: string;
+}
+
 /**
  * What a coordinator can prove about the run beyond its review: required checks and remaining lanes. Pure data, no
  * raw logs. Omitted, a positive review is unbound proof and cannot pass.
@@ -111,6 +209,16 @@ export interface CoverageInput {
 	 * means the caller has no plan lane state (a caller with a plan must pass it).
 	 */
 	lanes?: readonly CoverageLane[];
+	/**
+	 * Required results from `RunRecord.results`. A pending/unmet row blocks every ordinary close; a reviewable row is
+	 * submitted but still needs the run's real review before the run may pass. Absent on legacy work and plans without results.
+	 */
+	results?: readonly CoverageResult[];
+	/**
+	 * Whether the approved team has a usable reviewer. A reviewable row without one is blocked instead of buying
+	 * rounds that no verdict can end. Absent keeps the caller's old behavior.
+	 */
+	reviewer?: boolean;
 }
 
 export type Gate =
@@ -118,7 +226,7 @@ export type Gate =
 	| { state: "passed" }
 	| {
 			state: "unverified";
-			cause: "no-review" | "stale-review" | "incorrect" | "unbound" | "no-proof" | "p0" | "coverage" | "lanes";
+			cause: "no-review" | "stale-review" | "incorrect" | "unbound" | "no-proof" | "p0" | "coverage" | "lanes" | "results";
 			changes: number;
 			reviews: number;
 			requests: number;
@@ -132,12 +240,41 @@ export type Gate =
 			evidence?: CoverageEvidence;
 			/** The first unfinished lane; set with `cause: "lanes"`. */
 			lane?: string;
+			/** The first open required result; set with `cause: "results"`. */
+			result?: string;
+			/** How far that requirement got. */
+			resultState?: "pending" | "unmet" | "reviewable" | "accepted";
+			/** Lane currently responsible for it; absent for a requirement orphaned by replanning. */
+			resultLane?: string;
+			/** The media the requirement is observed in, when the caller knows it. */
+			resultKind?: ResultKind;
+			/** Short host-bound attempt reference; never a file path. */
+			resultAttempt?: string;
+			/** The one bounded next action the open requirement admits. */
+			resultRemedy?: ResultRemedy;
+			/** Prerequisite lane whose result must land first. */
+			resultBlockedBy?: string;
+			/** What must change outside the team before a blocked row can continue. */
+			resultUnblock?: string;
+			/** Stable requirement witness for no-progress: id, state, remedy and evidence, never activity or prose. */
+			resultProgress?: string;
+			/** The runtime's bounded reason for the open requirement. */
+			resultReason?: string;
 	  };
 
 /** The gate's unverified shape, the only one a round message is built from. */
 type Unverified = Extract<Gate, { state: "unverified" }>;
 type UnverifiedCause = Unverified["cause"];
-type UnverifiedExtra = { by?: "tree"; unread?: true; exhausted?: true; evidence?: CoverageEvidence; lane?: string };
+type UnverifiedExtra = {
+	by?: "tree";
+	unread?: true;
+	exhausted?: true;
+	evidence?: CoverageEvidence;
+	lane?: string;
+	result?: string;
+	resultState?: "pending" | "unmet" | "reviewable" | "accepted";
+	resultReason?: string;
+};
 
 /**
  * A P0 is cleared only by a later review that passed on the exact current tree and raised no P0. The clearing review
@@ -213,8 +350,96 @@ function coverageProblem(
 	return evidence === undefined ? undefined : { evidence };
 }
 
+/** Which open requirement the next round should act on: actionable work first, a hard blocker last. */
+const REMEDY_ORDER: Readonly<Record<ResultRemedy, number>> = { work: 0, replan: 1, review: 2, producer: 3, retry: 4, blocked: 5 };
+
+/**
+ * The next action one open requirement admits. The caller's explicit classification wins; otherwise a submitted row
+ * needs the approved reviewer only when that reviewer can judge it, a missing prerequisite needs its producer, and
+ * every other open row needs its own lane's work. A requirement whose lane left the plan has no one to work or review
+ * it, so it must be replanned; a review never stands in for a missing change, a retry never stands in for missing input,
+ * and a submission the tree cannot show is a blocker rather than a review loop.
+ */
+export function nextRemedy(row: CoverageResult, reviewer?: boolean): ResultRemedy {
+	if (row.remedy === "review" && (reviewer === false || row.judgeable === false)) return "blocked";
+	if (row.remedy !== undefined) return row.remedy;
+	if (row.state === "reviewable") return reviewer === false || row.judgeable === false ? "blocked" : "review";
+	if (row.blockedBy !== undefined) return "producer";
+	return "work";
+}
+
+/**
+ * The first open declared requirement, ordered by what can actually be done: work and review before a missing producer,
+ * and an external blocker or host retry last. A blocked row must not hide another row's bounded action. Ties keep plan
+ * order, so the same ledger always addresses the same requirement.
+ */
+function openResult(rows: readonly CoverageResult[] | undefined, reviewer?: boolean): CoverageResult | undefined {
+	if (rows === undefined) return undefined;
+	let best: CoverageResult | undefined;
+	let rank = Number.POSITIVE_INFINITY;
+	for (const row of rows) {
+		if (row.state === "accepted") continue;
+		const next = REMEDY_ORDER[nextRemedy(row, reviewer)];
+		if (next < rank) {
+			best = row;
+			rank = next;
+		}
+	}
+	return best;
+}
+
+/** A stable witness of one requirement's own evidence, never of activity: a new attempt alone is not progress. */
+function resultWitness(row: CoverageResult, remedy: ResultRemedy): string {
+	const safe = [row.id, row.blockedBy, row.evidence].map(value => (value ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, " ").slice(0, 64));
+	return [safe[0], row.state, remedy, safe[1], safe[2]].join("|");
+}
+
+/**
+ * Keeps ordinary closes honest about declared results. An open result is the concrete obligation, so it displaces an
+ * ordinary review/check/lane cause and names the repair that can clear it; the run still cannot pass until the review
+ * and checks bind to the current tree on a later decision. A P0 review finding, or a tree whose one re-review is
+ * already spent, stays first because no repair can be proven without addressing it. A no-change/unreviewed/no-reviewer
+ * close is replaced by the open requirement so a quiet end cannot erase it, and a passed gate is not allowed to pass
+ * over a requirement the controller could not accept. A reviewable row on a passed gate means the controller has not
+ * yet bound the reviewer's proof; the next decision must do that first.
+ *
+ * The replacement names the one requirement the next round can act on, its current state, its lane and host-bound
+ * attempt, and the bounded action; it never claims the run or its other requirements were verified.
+ */
+function withResults(gate: Gate, coverage: CoverageInput | undefined): Gate {
+	const open = openResult(coverage?.results, coverage?.reviewer);
+	if (open === undefined) return gate;
+	if (gate.state === "unverified" && (gate.cause === "p0" || gate.exhausted === true)) return gate;
+	const remedy = nextRemedy(open, coverage?.reviewer);
+	const counts = gate.state === "unverified" ? { changes: gate.changes, reviews: gate.reviews, requests: gate.requests } : { changes: 0, reviews: 0, requests: 0 };
+	return {
+		state: "unverified",
+		cause: "results",
+		...counts,
+		result: open.id,
+		resultState: open.state,
+		...(open.lane === undefined ? {} : { resultLane: open.lane }),
+		...(open.kind === undefined ? {} : { resultKind: open.kind }),
+		...(open.attempt === undefined ? {} : { resultAttempt: open.attempt }),
+		resultRemedy: remedy,
+		...(open.blockedBy === undefined ? {} : { resultBlockedBy: open.blockedBy }),
+		...(open.unblock === undefined ? {} : { resultUnblock: open.unblock }),
+		resultProgress: resultWitness(open, remedy),
+		...(open.reason === undefined ? {} : { resultReason: open.reason.slice(0, 200) }),
+	};
+}
+
 /** What the run's file changes, the work tree and review verdicts amount to: nothing to verify, verified, or unverified with why. */
 export function reviewGate(
+	agents: readonly AgentEntry[],
+	config: StormConfig,
+	tree?: { start?: TreeState; now?: TreeState; rereviewedAt?: number },
+	coverage?: CoverageInput,
+): Gate {
+	return withResults(gateCore(agents, config, tree, coverage), coverage);
+}
+
+function gateCore(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
 	tree?: { start?: TreeState; now?: TreeState; rereviewedAt?: number },
@@ -242,6 +467,9 @@ export function reviewGate(
 		if (extra.exhausted) gate.exhausted = true;
 		if (extra.evidence !== undefined) gate.evidence = extra.evidence;
 		if (extra.lane !== undefined) gate.lane = extra.lane;
+		if (extra.result !== undefined) gate.result = extra.result;
+		if (extra.resultState !== undefined) gate.resultState = extra.resultState;
+		if (extra.resultReason !== undefined) gate.resultReason = extra.resultReason;
 		return gate;
 	};
 	const pendingLane = coverage?.lanes?.find(lane => lane.state !== "done");
@@ -332,7 +560,7 @@ export function decideRound(input: {
 	elapsedMs: number;
 	minutes?: number;
 	/** The team's activity when Storm sent its last round message; absent before the first one. */
-	progressSince?: { changes: number; reviews: number; requests: number };
+	progressSince?: { changes: number; reviews: number; requests: number; result?: string };
 }): RoundDecision {
 	if (input.aborted) return { action: "end", reason: "interrupted" };
 	const gate = input.gate;
@@ -342,11 +570,30 @@ export function decideRound(input: {
 	// The one tree-only re-review is spent and the tree moved again. Another round cannot bind a verdict to it, so the
 	// honest end is no-progress (stopped), not verified and not another re-review.
 	if (gate.exhausted) return { action: "end", reason: "no-progress" };
+	// An explicit round or time limit reached before the remedy is reported as that limit, not as a new reason.
 	if (input.turns >= input.maxRounds) return { action: "end", reason: "round-limit" };
 	if (input.minutes !== undefined && input.elapsedMs >= input.minutes * 60_000) return { action: "end", reason: "time-limit" };
-	const since = input.progressSince;
-	if (since && since.changes === gate.changes && since.reviews === gate.reviews && since.requests === gate.requests) {
+	// A known external blocker gets no new model round: only a user/config change can clear it. Host retry exhaustion
+	// gets one directed round to replan onto a different approved route (never the same work), then repeated identical
+	// evidence stops below. This is not a new Storm retry: the host's configured retry/fallback already failed.
+	if (gate.cause === "results" && gate.resultRemedy === "blocked") {
 		return { action: "end", reason: "no-progress" };
+	}
+	const since = input.progressSince;
+	if (since) {
+		// A results gate compares the requirement's own witness: a new attempt with the same state, prerequisites and
+		// content is not progress even when its request count grew. A changed state, producer input or content is.
+		// Request counts never extend a contracted result; a new repair must change the requirement or its inputs.
+		const contracted = gate.cause === "results";
+		const witnessed = contracted && since.result !== undefined && gate.resultProgress !== undefined;
+		// A result first seen after a round that had no requirement witness is a new obligation to act on, not a
+		// count-only repeat. With the controller storing the witness, only that transition misses it once.
+		const firstContractRound = contracted && (since.result === undefined || gate.resultProgress === undefined);
+		const activityProgressed = contracted
+			? since.changes !== gate.changes || since.reviews !== gate.reviews
+			: since.changes !== gate.changes || since.reviews !== gate.reviews || since.requests !== gate.requests;
+		const witnessProgressed = contracted && witnessed && since.result !== gate.resultProgress;
+		if (!activityProgressed && !witnessProgressed && !firstContractRound) return { action: "end", reason: "no-progress" };
 	}
 	return { action: "continue", gate, round: input.turns + 1, maxRounds: input.maxRounds };
 }
@@ -361,6 +608,7 @@ const CAUSE: Record<UnverifiedCause, string> = {
 	p0: "A P0 finding from a review is still unresolved.",
 	coverage: "A required check is not proof: it is missing, failed, older than the last change, or from another tree.",
 	lanes: "The run plan still has an unfinished lane.",
+	results: "A declared required result is still open.",
 };
 
 /** The one-line reason a check entry is not proof; no command output or log text is carried. */
@@ -370,6 +618,89 @@ const CHECK_PROBLEM: Record<CoverageEvidence, string> = {
 	stale: "A required check finished before the last file change.",
 	mismatched: "A required check ran against another tree.",
 };
+
+/** Model-facing detail is one bounded line: no control characters and no absolute host path. */
+const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu;
+const ABSOLUTE_PATH = /(^|[\s("'=])(?:~\/[^\s)"']*|[A-Za-z]:[\\/][^\s)"']*|\/(?:[^\s/)"']+\/)[^\s)"']*)/gu;
+const ATTEMPT_REF = /^[A-Za-z0-9:._-]{1,64}$/;
+const DETAIL_MAX = 160;
+
+function detail(value: unknown, max = DETAIL_MAX): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const text = value.replace(UNSAFE_TEXT, " ").replace(/\s+/gu, " ").trim();
+	if (text === "") return undefined;
+	const redacted = text.replace(ABSOLUTE_PATH, "$1<path>");
+	return redacted.length > max ? `${redacted.slice(0, Math.max(1, max - 1))}…` : redacted;
+}
+
+/** The short, safe parts of an open requirement a round may name; an attempt is a token, never a path. */
+function resultTarget(gate: Unverified): { id?: string; lane?: string; attempt?: string } {
+	const id = detail(gate.result, 48);
+	const lane = detail(gate.resultLane, 40);
+	const attempt = gate.resultAttempt !== undefined && ATTEMPT_REF.test(gate.resultAttempt) ? gate.resultAttempt : undefined;
+	return { ...(id === undefined ? {} : { id }), ...(lane === undefined ? {} : { lane }), ...(attempt === undefined ? {} : { attempt }) };
+}
+
+/** One line naming the requirement, its current state, its lane and attempt, and the runtime's short reason. */
+function resultDetail(gate: Unverified): string {
+	const target = resultTarget(gate);
+	const where = [
+		target.lane === undefined ? undefined : `lane \`${target.lane}\``,
+		target.attempt === undefined ? undefined : `attempt \`${target.attempt}\``,
+	]
+		.filter((part): part is string => part !== undefined)
+		.join(", ");
+	const state = gate.resultState ?? "open";
+	const reason = detail(gate.resultReason);
+	const head = target.id === undefined ? "An open required result" : `Open required result \`${target.id}\``;
+	const sentence = reason === undefined ? "." : `: ${reason}${/[.!?。？！]$/u.test(reason) ? "" : "."}`;
+	return `${head} (${state}${where === "" ? "" : `, ${where}`})${sentence}`;
+}
+
+/**
+ * The one bounded next action for an open requirement. Implementation failure reruns only that lane's work, a missing
+ * prerequisite names its producer, a submission goes to the approved reviewer, and a host retry or external blocker
+ * gets no team action at all. The message never says the run or its other requirements were verified.
+ */
+function resultInstruction(gate: Unverified, reviewer?: string): string {
+	const target = resultTarget(gate);
+	const label = target.id === undefined ? "the open result" : `\`${target.id}\``;
+	const attempt = target.attempt === undefined ? "" : ` from attempt \`${target.attempt}\``;
+	const who = reviewer === undefined ? undefined : detail(reviewer, 40);
+	const remedy = gate.resultRemedy ?? (gate.resultState === "reviewable" ? "review" : gate.resultBlockedBy !== undefined ? "producer" : "work");
+	switch (remedy) {
+		case "replan":
+			return `Next: keep ${label} under the same id and replan it onto an approved lane, or record the user's explicit scope change; never send it for review and never rerun a lane the plan removed.`;
+		case "producer": {
+			const producer = detail(gate.resultBlockedBy, 40);
+			return producer === undefined
+				? `Next: complete the prerequisite result ${label} needs; do not rerun the consumer until that input lands.`
+				: `Next: have lane \`${producer}\` produce the input ${label} needs; do not rerun ${label} or spawn its replacement until that input lands.`;
+		}
+		case "review":
+			return who === undefined
+				? `Next: have an approved reviewer judge the submitted ${label} on the current tree; do not rerun its producing lane.`
+				: `Next: have \`${who}\` judge the submitted ${label} on the current tree; do not rerun its producing lane.`;
+		case "retry":
+			return `Next: do not respawn the same work for ${label}. The host's native retry/fallback is exhausted for the failing attempt${target.attempt === undefined ? "" : ` \`${target.attempt}\``}; Storm will not retry it automatically. Replan it to a different approved lane, role or model, or report the blocker.`;
+		case "blocked": {
+			const unblock = detail(gate.resultUnblock, DETAIL_MAX);
+			return `Next: stop retrying ${label}. ${unblock === undefined ? "Report the blocker and the condition that would unblock it." : `Unblock condition: ${unblock}.`}`;
+		}
+		default: {
+			const where = target.lane === undefined ? `assign ${label} to a lane and show it` : `fix or rerun only ${label} in lane \`${target.lane}\``;
+			const how =
+				gate.resultKind === "answer"
+					? " with its cited source"
+					: gate.resultKind === "artifact"
+						? " from the attempt's retained artifact"
+						: gate.resultKind === "change"
+							? " in the tree"
+							: "";
+			return `Next: ${where}${how}${attempt}; keep results already accepted and independent lanes as they are.`;
+		}
+	}
+}
 
 /** What the gate asks the main session to do; the cause decides, and the tree is always the one Storm sees now. */
 function roundInstruction(gate: Unverified, reviewer?: string): string {
@@ -382,6 +713,8 @@ function roundInstruction(gate: Unverified, reviewer?: string): string {
 			return "Use the planned worker to fix what made the required check fail; Storm runs the approved check on the new tree. Re-review only if the change requires it.";
 		case "lanes":
 			return "Finish the remaining plan lane through the team and let the lane's own role complete it. A review cannot stand in for a lane that never ran.";
+		case "results":
+			return resultInstruction(gate, reviewer);
 		case "unbound":
 			return `Have \`${reviewer}\` verify the exact current tree; Storm can count only a verdict it binds to that tree.`;
 		case "no-proof":
@@ -405,6 +738,7 @@ export function buildRoundMessage(input: {
 	const details: string[] = [];
 	if (input.gate.cause === "coverage" && input.gate.evidence !== undefined) details.push(CHECK_PROBLEM[input.gate.evidence]);
 	if (input.gate.cause === "lanes" && input.gate.lane !== undefined) details.push(`Unfinished lane: \`${input.gate.lane}\`.`);
+	if (input.gate.cause === "results" && (input.gate.result !== undefined || input.gate.resultState !== undefined)) details.push(resultDetail(input.gate));
 	if (input.gate.exhausted) details.push("The one tree-only re-review was already used; no further round can prove this tree.");
 	const lines = [
 		`<storm-run id="${input.runId}" round="${input.round}/${input.maxRounds}">`,

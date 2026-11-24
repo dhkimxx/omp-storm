@@ -1,10 +1,22 @@
 /**
  * Checks a director's run plan against the approved team. Errors reject the plan; gaps (a role past its
- * worker max, a disabled or missing role) need an approved config change before the plan applies.
+ * worker max, a disabled or missing role) need an approved config change before the plan applies. A fresh plan must
+ * declare at least one observable result on every deliverable lane; only a final review gate may omit them. Stored
+ * plans are decoded by the tolerant readers instead and are never re-validated into synthetic obligations.
  */
 import { isRecord } from "../config/schema.ts";
 import { LANE_ROLES, ROLE_STAND_INS, ROLES, workerRange } from "../roles.ts";
-import type { LaneKind, PlanLane, RoleId, RunPlan, StormConfig } from "../types.ts";
+import type {
+	LaneKind,
+	LaneNeed,
+	LaneResultKind,
+	PlanLane,
+	PlanLaneDependency,
+	PlanLaneResult,
+	RoleId,
+	RunPlan,
+	StormConfig,
+} from "../types.ts";
 
 export type PlanGap =
 	| { kind: "workers"; role: string; want: number; max: number }
@@ -21,11 +33,41 @@ export interface PlanCheck {
 export const MAX_LANES = 50;
 /** Lane goal and progress are one-line labels, not reports; both trim and share this bound. */
 export const MAX_LANE_TEXT = 200;
+/** A lane names a bounded set of required results; each is one observable claim, not a report. */
+export const MAX_LANE_RESULTS = 8;
+/** Stable ids are plan-wide identifiers, not prose: bounded and restricted so a typo cannot silently retarget one. */
+export const MAX_RESULT_ID = 64;
+export const MAX_RESULT_CRITERION = 300;
+export const MAX_RESULT_CONTAINS = 500;
+export const MAX_RESULT_PATH = 256;
+export const RESULT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const RESULT_KINDS = ["change", "artifact", "answer"] as const satisfies readonly LaneResultKind[];
+const RESULT_KEYS: Readonly<Record<string, true>> = {
+	id: true,
+	kind: true,
+	criterion: true,
+	path: true,
+	contains: true,
+	check: true,
+};
+/** A lane names a bounded set of prerequisites; one edge per prerequisite lane. */
+export const MAX_LANE_DEPENDENCIES = 8;
+/** The states a consumer may wait for. A prerequisite edge is plan input, never proof that its need holds. */
+export const LANE_NEEDS = ["result", "integrated", "reviewable"] as const satisfies readonly LaneNeed[];
+const DEPENDENCY_KEYS: Readonly<Record<string, true>> = { lane: true, need: true };
 const LANE_KINDS = Object.keys(LANE_ROLES) as LaneKind[];
 /** Lanes of these kinds change or occupy files; two of them on one file collide. */
 const WRITING_KINDS: readonly LaneKind[] = ["code", "run"];
+/**
+ * Lanes that owe the user a deliverable: a tree change, an artifact, or a sourced answer. A `review` lane is a
+ * gate over an already submitted integrated tree, not a deliverable, so it may omit results. Every other kind must
+ * declare at least one observable contract on a fresh plan; stored plans written before this rule stay readable.
+ */
+const DELIVERABLE_KINDS: readonly LaneKind[] = ["explore", "code", "run", "design"];
 /** A reason is one visible line: control characters, DEL and Unicode line separators would break that. */
 const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+/** Windows rejects these in file names, and a plan shared across hosts must not name a path one of them cannot open. */
+const UNSAFE_PATH = /[<>:"|?*]/;
 
 /** Goal and progress take the same shape: optional, trimmed, non-empty and bounded. */
 function laneText(value: unknown, path: string, errors: string[]): string | undefined {
@@ -65,6 +107,325 @@ function isolationText(value: unknown, path: string, errors: string[]): string |
 	return text;
 }
 
+/** A criterion: trimmed, non-empty, one visible line and bounded. */
+function resultCriterion(value: unknown, path: string, errors: string[]): string | undefined {
+	if (typeof value !== "string") {
+		errors.push(`${path}: 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (UNSAFE_LINE.test(value)) {
+		errors.push(`${path}: 제어 문자나 줄바꿈 없이 한 줄이어야 합니다`);
+		return undefined;
+	}
+	const text = value.trim();
+	if (!text) {
+		errors.push(`${path}: 비어 있지 않은 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (text.length > MAX_RESULT_CRITERION) {
+		errors.push(`${path}: ${MAX_RESULT_CRITERION}자 이하여야 합니다`);
+		return undefined;
+	}
+	return text;
+}
+
+/**
+ * `contains` is an exact literal: surrounding and internal whitespace is meaningful and kept as written, so the
+ * observed text is compared with the declared bytes rather than a trimmed approximation. It must still be non-blank,
+ * bounded, and free of NUL and non-printable controls (tab, newline and carriage return are allowed).
+ */
+function resultContains(value: unknown, path: string, errors: string[]): string | undefined {
+	if (typeof value !== "string") {
+		errors.push(`${path}: 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (value.trim() === "") {
+		errors.push(`${path}: 공백만으로는 안 됩니다`);
+		return undefined;
+	}
+	if (value.length > MAX_RESULT_CONTAINS) {
+		errors.push(`${path}: ${MAX_RESULT_CONTAINS}자 이하여야 합니다`);
+		return undefined;
+	}
+	if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value)) {
+		errors.push(`${path}: NUL이나 출력할 수 없는 제어 문자 없이 적어야 합니다`);
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * A plan result path is workspace-relative and stays inside the tree: no absolute, drive, home, backslash or
+ * traversal forms, and no character either a POSIX or Windows host would read as something other than a plain name.
+ * Storm's own `.git`/`.omp` segments are protected. The value is returned unchanged, never normalized: two spellings
+ * never silently become the same requirement.
+ */
+function resultPath(value: unknown, path: string, errors: string[]): string | undefined {
+	if (typeof value !== "string") {
+		errors.push(`${path}: 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (value.length > MAX_RESULT_PATH) {
+		errors.push(`${path}: ${MAX_RESULT_PATH}자 이하여야 합니다`);
+		return undefined;
+	}
+	if (!value || value.trim() !== value) {
+		errors.push(`${path}: 앞뒤 공백 없는 작업 트리 기준 상대 경로여야 합니다`);
+		return undefined;
+	}
+	if (UNSAFE_LINE.test(value) || UNSAFE_PATH.test(value) || value.includes("\\")) {
+		errors.push(`${path}: 제어 문자, 역슬래시, < > : " | ? * 없이 한 줄이어야 합니다`);
+		return undefined;
+	}
+	if (value.startsWith("/") || value.startsWith("~") || /^[A-Za-z]:/.test(value)) {
+		errors.push(`${path}: 작업 트리 기준 상대 경로여야 합니다`);
+		return undefined;
+	}
+	const segments = value.split("/");
+	if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+		errors.push(`${path}: 빈 세그먼트나 . 또는 .. 없이 정규화된 상대 경로여야 합니다`);
+		return undefined;
+	}
+	if (segments.some((segment) => segment === ".git" || segment === ".omp")) {
+		errors.push(`${path}: .git 또는 .omp 내부 경로는 결과로 지정할 수 없습니다`);
+		return undefined;
+	}
+	return value;
+}
+
+/** A result's check names one check already in the config that `validatePlan` was given; never a command line. */
+function resultCheck(config: StormConfig | undefined, value: unknown, path: string, errors: string[]): string | undefined {
+	if (typeof value !== "string") {
+		errors.push(`${path}: 문자열이어야 합니다`);
+		return undefined;
+	}
+	if (config === undefined) {
+		errors.push(`${path}: 검사 이름을 확인할 승인 설정이 없습니다`);
+		return undefined;
+	}
+	const checks = config.requiredChecks ?? [];
+	if (checks.length === 0) {
+		errors.push(`${path}: 이 설정에는 승인된 requiredChecks가 없습니다. 검사 이름을 빼거나 설정에서 검사를 승인하세요`);
+		return undefined;
+	}
+	const matches = checks.filter((check) => check.name === value).length;
+	if (matches !== 1) {
+		errors.push(`${path}: 승인된 requiredChecks 이름이어야 합니다 (사용 가능: ${checks.map((check) => check.name).join(", ")})`);
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * Reads one lane's result wire into normalized `PlanLaneResult`s and collects every error. `ids` carries plan-wide
+ * uniqueness: a requirement's id is its identity, so a second lane may not reuse one. Absent results stay absent.
+ */
+function readLaneResults(
+	config: StormConfig | undefined,
+	value: unknown,
+	path: string,
+	ids: Set<string>,
+	errors: string[],
+): PlanLaneResult[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length < 1 || value.length > MAX_LANE_RESULTS) {
+		errors.push(`${path}: 결과 1~${MAX_LANE_RESULTS}개 배열이어야 합니다`);
+		return undefined;
+	}
+	const results: PlanLaneResult[] = [];
+	value.forEach((raw: unknown, i) => {
+		const at = `${path}[${i}]`;
+		if (!isRecord(raw)) {
+			errors.push(`${at}: 객체여야 합니다`);
+			return;
+		}
+		const unknown = Object.keys(raw).filter((field) => RESULT_KEYS[field] !== true);
+		if (unknown.length > 0) {
+			errors.push(`${at}: 알 수 없는 필드입니다 (${unknown.join(", ")})`);
+			return;
+		}
+		const id = typeof raw.id === "string" ? raw.id : "";
+		if (!RESULT_ID_RE.test(id)) {
+			errors.push(`${at}.id: 영문·숫자로 시작하고 영문·숫자·. _ -만 쓰는 ${MAX_RESULT_ID}자 이하 id여야 합니다`);
+		} else if (ids.has(id)) {
+			errors.push(`${at}.id: 계획 안에서 중복된 결과 id입니다 (${id})`);
+		} else {
+			ids.add(id);
+		}
+		const kind = raw.kind;
+		if (typeof kind !== "string" || !(RESULT_KINDS as readonly string[]).includes(kind)) {
+			errors.push(`${at}.kind: ${RESULT_KINDS.join("|")} 중 하나여야 합니다`);
+			return;
+		}
+		const resultKind = kind as LaneResultKind;
+		if (raw.criterion === undefined) errors.push(`${at}.criterion: 필수입니다`);
+		const criterion = raw.criterion === undefined ? undefined : resultCriterion(raw.criterion, `${at}.criterion`, errors);
+		const result: PlanLaneResult = { id, kind: resultKind, criterion: criterion ?? "" };
+		if (raw.path !== undefined) {
+			const file = resultPath(raw.path, `${at}.path`, errors);
+			if (file !== undefined) result.path = file;
+		}
+		if (raw.contains !== undefined) {
+			const contains = resultContains(raw.contains, `${at}.contains`, errors);
+			if (contains !== undefined) result.contains = contains;
+		}
+		if (raw.check !== undefined) {
+			if (resultKind === "answer") {
+				errors.push(`${at}.check: answer 결과에는 검사를 붙일 수 없습니다`);
+			} else {
+				const check = resultCheck(config, raw.check, `${at}.check`, errors);
+				if (check !== undefined) result.check = check;
+			}
+		}
+		results.push(result);
+	});
+	return results;
+}
+
+export type LaneResultParse = { ok: true; results: PlanLaneResult[] } | { ok: false; errors: string[] };
+
+export interface ParseLaneResultsOptions {
+	/** The config whose `requiredChecks` a `check` may name; absent means a check reference cannot be validated. */
+	config?: StormConfig | undefined;
+	/** Prefix of every error; the plan validator passes the lane field path. */
+	path?: string | undefined;
+	/** Ids already used in the plan; valid ids are added to it. Callers parsing a single lane may omit it. */
+	ids?: Set<string> | undefined;
+}
+
+/**
+ * The single parser of the `lane.results` wire. Plan validation and runtime evidence share it: normalization, bounds,
+ * id rules, path containment and approved check names have one implementation. Absent results parse as no results:
+ * stored legacy plans stay readable and gain no obligation or proof. The fresh-plan boundary is separate: it refuses
+ * an omitted contract on every deliverable lane, so a newly authored plan cannot fall back to the legacy path.
+ */
+export function parseLaneResults(value: unknown, options: ParseLaneResultsOptions = {}): LaneResultParse {
+	const errors: string[] = [];
+	const results = readLaneResults(options.config, value, options.path ?? "results", options.ids ?? new Set<string>(), errors);
+	if (errors.length > 0) return { ok: false, errors };
+	return { ok: true, results: results ?? [] };
+}
+
+/**
+ * Reads one lane's `dependsOn` wire, collecting every entry-level error. Plan-wide checks (an unknown name, a self
+ * reference, a cycle, `result` against a lane with no declared results) need every lane and run in `validatePlan`.
+ * Absent dependencies stay absent: a legacy plan gains no edge and no obligation.
+ */
+function readLaneDependencies(value: unknown, path: string, errors: string[]): PlanLaneDependency[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.length < 1 || value.length > MAX_LANE_DEPENDENCIES) {
+		errors.push(`${path}: 선행 1~${MAX_LANE_DEPENDENCIES}개 배열이어야 합니다`);
+		return undefined;
+	}
+	const dependencies: PlanLaneDependency[] = [];
+	const seen = new Set<string>();
+	value.forEach((raw: unknown, i) => {
+		const at = `${path}[${i}]`;
+		if (!isRecord(raw)) {
+			errors.push(`${at}: 객체여야 합니다`);
+			return;
+		}
+		const unknown = Object.keys(raw).filter((field) => DEPENDENCY_KEYS[field] !== true);
+		if (unknown.length > 0) {
+			errors.push(`${at}: 알 수 없는 필드입니다 (${unknown.join(", ")})`);
+			return;
+		}
+		const lane = typeof raw.lane === "string" ? raw.lane.trim() : "";
+		let validLane = false;
+		if (!lane) {
+			errors.push(`${at}.lane: 비어 있지 않은 레인 이름이어야 합니다`);
+		} else if (UNSAFE_LINE.test(lane)) {
+			errors.push(`${at}.lane: 제어 문자나 줄바꿈 없이 한 줄이어야 합니다`);
+		} else if (lane.length > MAX_LANE_TEXT) {
+			errors.push(`${at}.lane: ${MAX_LANE_TEXT}자 이하여야 합니다`);
+		} else if (seen.has(lane)) {
+			errors.push(`${at}.lane: 같은 선행 레인을 중복 참조했습니다 (${lane})`);
+		} else {
+			seen.add(lane);
+			validLane = true;
+		}
+		const need = raw.need;
+		if (typeof need !== "string" || !(LANE_NEEDS as readonly string[]).includes(need)) {
+			errors.push(`${at}.need: ${LANE_NEEDS.join("|")} 중 하나여야 합니다`);
+			return;
+		}
+		if (validLane) dependencies.push({ lane, need: need as LaneNeed });
+	});
+	return dependencies;
+}
+
+export type LaneDependencyParse = { ok: true; dependsOn: PlanLaneDependency[] } | { ok: false; errors: string[] };
+
+export interface ParseLaneDependenciesOptions {
+	/** Prefix of every error; the plan validator passes the lane field path. */
+	path?: string | undefined;
+}
+
+/**
+ * The single parser of the `lane.dependsOn` wire, for callers reading a plan without `validatePlan`. It checks entry
+ * shape, bounds, duplicate prerequisite names and `need`; name resolution, self references and cycles need every lane
+ * and stay in `validatePlan`. Absent input parses as no dependencies, so legacy records stay readable.
+ */
+export function parseLaneDependencies(value: unknown, options: ParseLaneDependenciesOptions = {}): LaneDependencyParse {
+	const errors: string[] = [];
+	const dependsOn = readLaneDependencies(value, options.path ?? "dependsOn", errors);
+	if (errors.length > 0) return { ok: false, errors };
+	return { ok: true, dependsOn: dependsOn ?? [] };
+}
+
+/**
+ * Plan-wide checks of the dependency graph: every edge names another lane of this plan, no lane waits on itself, no
+ * prerequisite is repeated, and no cycle makes a start condition unreachable. A `result` edge must name a lane that
+ * declares results, or the consumer would wait for a result the plan never promises. Nothing here reads evidence.
+ */
+function dependencyGraphErrors(lanes: readonly PlanLane[]): string[] {
+	const errors: string[] = [];
+	const byName = new Map(lanes.map((lane) => [lane.name, lane]));
+	lanes.forEach((lane, i) => {
+		(lane.dependsOn ?? []).forEach((dependency, j) => {
+			const at = `plan.lanes[${i}].dependsOn[${j}]`;
+			if (dependency.lane === lane.name) {
+				errors.push(`${at}.lane: 자기 자신을 선행으로 참조할 수 없습니다 (${lane.name})`);
+				return;
+			}
+			const producer = byName.get(dependency.lane);
+			if (producer === undefined) {
+				errors.push(`${at}.lane: 계획에 없는 레인입니다 (${dependency.lane})`);
+				return;
+			}
+			if (dependency.need === "result" && producer.results === undefined) {
+				errors.push(`${at}.lane: '${dependency.lane}' 레인이 필수 결과(results)를 선언하지 않아 result 선행을 제공할 수 없습니다`);
+			}
+		});
+	});
+	// A cycle is reported once with its path: without this the lanes on it would wait forever for one another.
+	const state = new Map<string, "visiting" | "done">();
+	const stack: string[] = [];
+	const visit = (name: string): string[] | undefined => {
+		if (state.get(name) === "done") return undefined;
+		if (state.get(name) === "visiting") return [...stack.slice(stack.indexOf(name)), name];
+		state.set(name, "visiting");
+		stack.push(name);
+		for (const dependency of byName.get(name)?.dependsOn ?? []) {
+			const producer = byName.get(dependency.lane);
+			if (producer === undefined || producer.name === name) continue;
+			const cycle = visit(producer.name);
+			if (cycle !== undefined) return cycle;
+		}
+		stack.pop();
+		state.set(name, "done");
+		return undefined;
+	};
+	for (const lane of lanes) {
+		const cycle = visit(lane.name);
+		if (cycle !== undefined) {
+			errors.push(`plan.lanes: 선행 관계에 순환이 있습니다 (${cycle.join(" → ")})`);
+			break;
+		}
+	}
+	return errors;
+}
+
 export function validatePlan(config: StormConfig, input: unknown, now: number): PlanCheck {
 	const errors: string[] = [];
 	const outOfBounds: PlanGap[] = [];
@@ -77,6 +438,8 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 
 	const lanes: PlanLane[] = [];
 	const names = new Set<string>();
+	/** Result ids identify requirements across the whole plan, not just within their lane. */
+	const resultIds = new Set<string>();
 	const gapRoles = new Set<string>();
 	raw.forEach((l: unknown, i) => {
 		const path = `plan.lanes[${i}]`;
@@ -133,8 +496,25 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		}
 		const progress = laneText(l.progress, `${path}.progress`, errors);
 		if (progress !== undefined) lane.progress = progress;
+		const results = readLaneResults(config, l.results, `${path}.results`, resultIds, errors);
+		if (results !== undefined) lane.results = results;
+		// A fresh plan owes an observable contract for every lane that delivers something. Only an omitted field is
+		// this error: a present but malformed list already failed above and keeps its own precise message.
+		if (l.results === undefined && DELIVERABLE_KINDS.includes(kind as LaneKind)) {
+			const laneId = name ? `'${name}' ` : `${i}번째 `;
+			errors.push(
+				`${path}.results: ${laneId}레인(${kind})은 필수 결과(results: id, kind, criterion)를 하나 이상 선언해야 합니다. ` +
+					"결과 없는 레인은 완료 근거가 없습니다. 검토 전용 review 레인만 생략할 수 있습니다",
+			);
+		}
+		const dependsOn = readLaneDependencies(l.dependsOn, `${path}.dependsOn`, errors);
+		if (dependsOn !== undefined) lane.dependsOn = dependsOn;
 		lanes.push(lane);
 	});
+
+	// The graph needs every lane: an unknown name, a self reference, a repeated edge, a cycle or a `result` edge
+	// against a lane without declared results rejects the plan before it can apply. Entry-level errors come first.
+	if (errors.length === 0) errors.push(...dependencyGraphErrors(lanes));
 
 	const used = [...new Set(lanes.map((l) => l.role))];
 	const asked = input.workers;

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmodSync, type Dirent } from "node:fs";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
@@ -8,7 +8,7 @@ import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
-import { agentsFlow, approveAndSave, autoDelegationFlow, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { agentsFlow, approveAndSave, autoDelegationFlow, type FlowEnv, exportFlow, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
 import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation } from "../src/approval/auto.ts";
 import { ROLES, roleTitle } from "../src/roles.ts";
 import { writeRun } from "../src/runtime/run.ts";
@@ -22,7 +22,7 @@ import type { RunRequestResult } from "../src/tool/host.ts";
 import type { FormData, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
-import { git, gitRepo, makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { git, gitRepo, makeProject, model, pick, type ScriptedUi, scriptedUi, TEAM, type TestProject, withSession } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
 
 const NOW = Date.parse("2026-11-20T09:30:00Z");
@@ -43,9 +43,7 @@ const FALLBACK = "폴백";
 /** The old toggle labels are still the explicit-switch contract; the first approval default is separate. */
 const AUTO = { enable: "자동 위임 켜기", disable: "자동 위임 끄기" } as const;
 const AUTO_MENU = { on: "자동 위임 · 켜짐", off: "자동 위임 · 꺼짐" } as const;
-const AUTO_DISCLOSURE = "승인하면 자동 위임이 켜집니다";
-const AUTO_MIGRATION = { switch: "자동 위임으로 전환", stay: "직접 작업 유지" } as const;
-const AUTO_MIGRATION_DISCLOSURE = "메인 세션이 이 저장소의 작업을 직접 하지 않습니다";
+const AUTO_DISCLOSURE = "승인하면 이 세션의 자동 위임이 켜집니다";
 
 /** An omp catalog row; the real recommender ranks these. */
 const row = (provider: string, id: string, input: number, int: number, efforts = ["low", "medium", "high"]) => ({
@@ -127,18 +125,18 @@ function defaultPages(team: StormConfig): string[] {
 const load = () => loadProjectState(env);
 const approve = async (config: StormConfig) => approveAndSave(await load(), config, { shadowedAgents: [] });
 /** The saved choice as the rest of Storm reads it, from this profile's store for this repository. */
-const autoChoice = async () => readAutoDelegationChoice((await load()).store.dir);
+const autoChoice = async () => readAutoDelegationChoice((await load()).sessionDir);
 /** Seed a decided choice for tests about later flows; only an absent path can be initialized. */
 const settleAuto = async (enabled: boolean): Promise<void> => {
 	const state = await load();
-	expect(await initializeAutoDelegation(state.store.dir, enabled)).toBe(true);
+	expect(await initializeAutoDelegation(state.sessionDir, enabled)).toBe(true);
 };
 /** A teammate's (or a hand) edit: the file changes, nobody approves it on this machine. */
 const editByHand = async (text: string) => {
-	await mkdir(path.dirname(configPath(project.root)), { recursive: true });
-	await writeFile(configPath(project.root), text);
+	await mkdir(path.dirname(configPath(project.sessionDir)), { recursive: true });
+	await writeFile(configPath(project.sessionDir), text);
 };
-const fileText = () => readFile(configPath(project.root), "utf8");
+const fileText = () => readFile(configPath(project.sessionDir), "utf8");
 async function expectEmptySetup(): Promise<void> {
 	const state = await load();
 	expect(state.config.status).toBe("missing");
@@ -245,7 +243,9 @@ describe("/storm without an approved team", () => {
 		await mkdir(env.agentDir, { recursive: true });
 		await writeFile(path.join(env.agentDir, "storm"), "");
 		await expect(approveAndSave(state, TEAM, { shadowedAgents: [] })).rejects.toThrow();
-		expect((await load()).config.status).toBe("missing");
+		// The unusable store is refused as a whole (never redirected elsewhere), and no config was written.
+		await expect(loadProjectState(env)).rejects.toThrow();
+		await expect(readFile(configPath(state.sessionDir), "utf8")).rejects.toThrow();
 	});
 
 	test("a file changed while the approval dialog is open is not approved", async () => {
@@ -275,19 +275,29 @@ describe("/storm without an approved team", () => {
 		expect((await state.store.list()).map(r => r.configHash)).toEqual([configHash(TEAM)]);
 	});
 
-	test("a team approved by 0.8 opens the menu at once", async () => {
-		await editByHand(TEAM_08);
+	test("old workspace and profile-scope Storm files are neither read nor imported, and stay byte-untouched", async () => {
+		const oldStorm = path.join(project.root, ".omp", "storm");
+		await mkdir(oldStorm, { recursive: true });
+		const oldConfig = path.join(oldStorm, "config.json");
+		await writeFile(oldConfig, TEAM_08);
 		const before = await load();
-		await writeStore08(before.store.dir, before.repo.repoId);
-		// The 0.8 approval predates the choice; this test is about opening the menu, not the migration prompt.
-		await initializeAutoDelegation(before.store.dir, false);
-		const f = scriptedUi([LAST]);
+		const oldApprovals = path.join(project.agentDir, "storm", "approvals", before.repo.repoId);
+		await writeStore08(oldApprovals, before.repo.repoId);
+		const oldRecord = path.join(oldApprovals, "approved", `${TEAM_08_HASH.slice("jcs-sha256:".length)}.json`);
+		const oldBytes = await readFile(oldRecord, "utf8");
+
+		// A fresh session sees no team: the old config and approval are not a fallback.
+		expect(before.config.status).toBe("missing");
+		expect(isApproved(before)).toBe(false);
+		const f = scriptedUi([CANCEL]);
 		await hubFlow(env, f.ui);
-		expect(f.selects).toHaveLength(1);
-		expect(f.selects[0]?.options).toHaveLength(6);
-		expect(f.selects[0]?.options).not.toContain(APPROVE);
-		expect(f.selects[0]?.markdown).toContain(shortHash(TEAM_08_HASH));
-		expect(await fileText()).toBe(TEAM_08);
+		const after = await load();
+		expect(after.sessionDir).not.toBe(oldApprovals);
+		expect(after.config.status).toBe("missing");
+		expect(isApproved(after)).toBe(false);
+		// Nothing was migrated, deleted or rewritten.
+		expect(await readFile(oldConfig, "utf8")).toBe(TEAM_08);
+		expect(await readFile(oldRecord, "utf8")).toBe(oldBytes);
 	});
 });
 
@@ -524,7 +534,7 @@ describe("setup", () => {
 		// One brand heading, after the first-approval disclosure, replaces the summary row rather than pushing it down.
 		expect(f.selects[0]?.markdown?.split(STORM_MARK)).toHaveLength(2);
 		expect(f.selects[0]!.markdown!.indexOf(STORM_MARK)).toBeGreaterThan(f.selects[0]!.markdown!.indexOf(AUTO_DISCLOSURE));
-		for (const part of ["이 프로필과 이 저장소", "프로젝트 도구를 직접 쓰지 않", "작은 수정도", "일반 대화", "/storm auto"]) {
+		for (const part of ["이 OMP 세션에만", "프로젝트 도구를 직접 쓰지 않", "작은 수정도", "일반 대화", "/storm auto"]) {
 			expect(f.selects[0]?.markdown).toContain(part);
 		}
 		const state = await load();
@@ -837,14 +847,14 @@ describe("automatic delegation", () => {
 				base.ui.notify(message, level);
 				if (!denied && message.includes("승인하고 저장했습니다")) {
 					denied = true;
-					chmodSync(state.store.dir, 0o500);
+					chmodSync(state.sessionDir, 0o500);
 				}
 			},
 		};
 		try {
 			await setupFlow(env, ui);
 		} finally {
-			chmodSync(state.store.dir, 0o700);
+			chmodSync(state.sessionDir, 0o700);
 		}
 		expect(denied).toBe(true);
 		expect(isApproved(await load())).toBe(true);
@@ -871,7 +881,7 @@ describe("automatic delegation", () => {
 		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
 		expect(await autoChoice()).toBe("off");
 
-		await rm(path.dirname(configPath(project.root)), { recursive: true, force: true });
+		await rm(configPath(project.sessionDir), { force: true });
 		const recreated = scriptedUi([APPROVE]);
 		await setupFlow(env, recreated.ui);
 		expect(recreated.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
@@ -893,7 +903,7 @@ describe("automatic delegation", () => {
 		expect(reapproved.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
 		expect(await autoChoice()).toBe("on");
 
-		await rm(path.dirname(configPath(project.root)), { recursive: true, force: true });
+		await rm(configPath(project.sessionDir), { force: true });
 		const recreated = scriptedUi([APPROVE]);
 		await setupFlow(env, recreated.ui);
 		expect(recreated.selects.some(s => s.markdown?.includes(AUTO_DISCLOSURE))).toBe(false);
@@ -901,85 +911,27 @@ describe("automatic delegation", () => {
 		expect(isApproved(await load())).toBe(true);
 	});
 
-	test("an existing approved team with an unset choice stays off; bare /storm offers both migration actions beside normal ones", async () => {
+	test("a team approved outside setup has no saved auto choice; the hub offers the ordinary switch, not a migration", async () => {
 		await approve(TEAM);
 		const f = scriptedUi(["닫기"]);
 		await hubFlow(env, f.ui);
 		expect(await autoChoice()).toBe("unset");
 		const options = f.selects[0]!.options;
-		expect(options).toEqual(expect.arrayContaining(["팀 다시 설정", "모델 점검", AUTO_MIGRATION.switch, AUTO_MIGRATION.stay, "닫기"]));
-		expect(f.selects[0]?.markdown).toContain(AUTO_MIGRATION_DISCLOSURE);
-		expect(f.selects[0]?.markdown).toContain("작은 수정도");
-		expect(f.selects[0]?.markdown).toContain("결정하면 다시 묻지 않습니다");
-		// The status still says off; no action other than the two exact ones writes.
+		expect(options).toEqual(expect.arrayContaining(["팀 다시 설정", "모델 점검", AUTO_MENU.off, "닫기"]));
+		expect(options).not.toContain("자동 위임으로 전환");
+		expect(f.selects[0]?.markdown).not.toContain("결정하면 다시 묻지 않습니다");
+		// The status still says off; an absent choice is never turned into a yes by reading it.
 		const status = scriptedUi();
 		await statusFlow(env, status.ui);
 		expect(status.selects).toEqual([]);
 		expect(status.reports[0]?.markdown).toContain("자동 위임: 꺼짐");
 		expect(await autoChoice()).toBe("unset");
-
-		const on = scriptedUi([AUTO_MIGRATION.switch]);
-		await hubFlow(env, on.ui);
-		expect(await autoChoice()).toBe("on");
-		expect(on.notices.at(-1)?.text).toContain("전환했습니다");
-
-		const next = scriptedUi(["닫기"]);
-		await hubFlow(env, next.ui);
-		expect(next.selects[0]?.options).not.toContain(AUTO_MIGRATION.switch);
-		expect(next.selects[0]?.markdown).not.toContain(AUTO_MIGRATION_DISCLOSURE);
 	});
 
-	test("the exact keep action stores an explicit off and removes the prompt", async () => {
-		await approve(TEAM);
-		const f = scriptedUi([AUTO_MIGRATION.stay]);
-		await hubFlow(env, f.ui);
-		expect(await autoChoice()).toBe("off");
-		expect(f.notices.at(-1)?.text).toContain("직접 작업");
-
-		const next = scriptedUi(["닫기"]);
-		await hubFlow(env, next.ui);
-		expect(next.selects[0]?.options).not.toContain(AUTO_MIGRATION.stay);
-		expect(next.selects[0]?.markdown).not.toContain(AUTO_MIGRATION_DISCLOSURE);
-	});
-
-	test("a concurrent choice wins for both migration actions", async () => {
-		await approve(TEAM);
-		let dir = (await load()).store.dir;
-		const switched = scriptedUi([async () => {
-			await writeAutoDelegation(dir, false);
-			return AUTO_MIGRATION.switch;
-		}]);
-		await hubFlow(env, switched.ui);
-		expect(await autoChoice()).toBe("off");
-		expect(switched.notices.at(-1)?.text).toContain("다른 선택");
-
-		await rm(path.join(dir, "auto-delegation.json"), { force: true });
-		dir = (await load()).store.dir;
-		const kept = scriptedUi([async () => {
-			await writeAutoDelegation(dir, true);
-			return AUTO_MIGRATION.stay;
-		}]);
-		await hubFlow(env, kept.ui);
-		expect(await autoChoice()).toBe("on");
-		expect(kept.notices.at(-1)?.text).toContain("다른 선택");
-	});
-
-	test("migration checks the exact approved team again before switching on", async () => {
-		await approve(TEAM);
-		const f = scriptedUi([async () => {
-			await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
-			return AUTO_MIGRATION.switch;
-		}]);
-		await hubFlow(env, f.ui);
-		expect(await autoChoice()).toBe("unset");
-		expect(f.notices.at(-1)?.level).toBe("warning");
-		expect(f.notices.at(-1)?.text).toContain("바뀌어");
-	});
-
-	test("an invalid saved auto file is untouched by setup or migration; explicit /storm auto repairs it", async () => {
+	test("an invalid saved auto file is untouched by setup; explicit /storm auto repairs it", async () => {
 		const state = await load();
-		await mkdir(state.store.dir, { recursive: true });
-		const file = path.join(state.store.dir, "auto-delegation.json");
+		await mkdir(state.sessionDir, { recursive: true });
+		const file = path.join(state.sessionDir, "auto-delegation.json");
 		const invalid = "{ not json";
 		await writeFile(file, invalid);
 
@@ -991,7 +943,6 @@ describe("automatic delegation", () => {
 
 		const hub = scriptedUi(["닫기"]);
 		await hubFlow(env, hub.ui);
-		expect(hub.selects[0]?.options).not.toContain(AUTO_MIGRATION.switch);
 		expect(await readFile(file, "utf8")).toBe(invalid);
 
 		const repair = scriptedUi([AUTO.enable]);
@@ -1014,7 +965,7 @@ describe("automatic delegation", () => {
 		expect(off.selects[0]?.options).toEqual([AUTO.disable, CANCEL]);
 		expect(await autoChoice()).toBe("off");
 
-		await rm(path.join((await load()).store.dir, "auto-delegation.json"), { force: true });
+		await rm(path.join((await load()).sessionDir, "auto-delegation.json"), { force: true });
 		const stale = scriptedUi([async () => {
 			await editByHand(serializeConfig({ ...TEAM, parallelism: 9 }));
 			return AUTO.enable;
@@ -1063,7 +1014,7 @@ describe("automatic delegation", () => {
 		expect(await autoChoice()).toBe("off");
 	});
 
-	test("linked worktrees share the choice while each worktree keeps its own team approval", async () => {
+	test("the same session keeps its team across a worktree switch but needs a new target approval; auto stays session-owned", async () => {
 		await gitRepo(project.root);
 		const other = path.join(project.tmp, "other-worktree");
 		await git(project.root, "worktree", "add", "-b", "other", other);
@@ -1071,14 +1022,32 @@ describe("automatic delegation", () => {
 		await approve(TEAM);
 		const f = scriptedUi([AUTO.enable]);
 		await autoDelegationFlow(env, f.ui);
-		const otherState = await loadProjectState(otherEnv);
-		expect(otherState.store.dir).toBe((await load()).store.dir);
-		expect(await readAutoDelegationChoice(otherState.store.dir)).toBe("on");
-		// No config in the other worktree: no approved team, but the shared choice can still be turned off.
-		expect(otherState.config.status).toBe("missing");
+		const [before, otherState] = await Promise.all([load(), loadProjectState(otherEnv)]);
+		// One native session: the team and the consent belong to it, wherever it works.
+		expect(otherState.sessionDir).toBe(before.sessionDir);
+		expect(otherState.config.status).toBe("ok");
+		expect(await readAutoDelegationChoice(otherState.sessionDir)).toBe("on");
+		// But the approval is bound to the target: the switch needs an explicit approval of the same team.
+		expect(otherState.store.dir).not.toBe(before.store.dir);
+		expect(isApproved(otherState)).toBe(false);
+		expect(isApproved(before)).toBe(true);
+		const approveHere = scriptedUi([APPROVE]);
+		await hubFlow(otherEnv, approveHere.ui);
+		expect(isApproved(await loadProjectState(otherEnv))).toBe(true);
+		// The old target's approval was not revoked or inherited by the new one.
+		expect(isApproved(await load())).toBe(true);
 		const off = scriptedUi([AUTO.disable]);
 		await autoDelegationFlow(otherEnv, off.ui);
 		expect(await autoChoice()).toBe("off");
+	});
+
+	test("another native session in the same profile and worktree starts with no team, approval or consent", async () => {
+		await approve(TEAM);
+		const sibling = await loadProjectState(withSession(project, "session-sibling"));
+		expect(sibling.sessionDir).not.toBe((await load()).sessionDir);
+		expect(sibling.config.status).toBe("missing");
+		expect(isApproved(sibling)).toBe(false);
+		expect(await readAutoDelegationChoice(sibling.sessionDir)).toBe("unset");
 	});
 });
 
@@ -1111,11 +1080,12 @@ describe("status and agents", () => {
 	}
 	const sections = (md: string) => md.split("\n").filter(line => line.startsWith("### ")).length;
 
-	test("the user's status is what /storm status shows: every section, the commands that fix things, and no repo id or root path", async () => {
+	test("the user's status is what /storm status shows: every section, the commands that fix things, and the one target it covers", async () => {
 		const busy = await busyEnv();
 		const text = await statusText(busy.env, { quota: true });
 		expect(text).toContain(shortHash(configHash(TEAM)));
-		expect(text).not.toContain(project.root);
+		expect(text).toContain("### 적용 범위");
+		expect(text).toContain(project.root);
 		expect(text).not.toContain((await load()).repo.repoId);
 		for (const part of ["omp config set task.maxConcurrency", "99.0.0", "--max-cost", path.join(".omp", "agents", "shadow-file.md")]) expect(text).toContain(part);
 		expect(busy.calls.settings).toBe(1);
@@ -1145,7 +1115,7 @@ describe("status and agents", () => {
 		await mkdir(artifactsDir, { recursive: true });
 		await writeFile(`${artifactsDir}.jsonl`, "parent");
 		await writeFile(path.join(artifactsDir, "Legacy.jsonl"), "legacy");
-		const scoped: FlowEnv = { ...env, sessionDir: projectDir };
+		const scoped: FlowEnv = { ...env, ompSessionDir: projectDir };
 		const full = await statusText(scoped, { quota: true });
 		expect(full).toContain("소유 미상");
 		expect(full).toContain("자동 삭제하지 않음");
@@ -1195,7 +1165,7 @@ describe("status and agents", () => {
 
 	test("a current OMP mode explains why an approved team's automatic delegation is blocked", async () => {
 		await approve(TEAM);
-		await writeAutoDelegation((await load()).store.dir, true);
+		await writeAutoDelegation((await load()).sessionDir, true);
 		const reason = "omp 계획 모드가 켜져 있습니다. 계획 모드를 끝낸 뒤 다시 요청하세요.";
 		const blocked = { ...env, autoModeProblem: () => reason };
 		const full = await statusText(blocked, { quota: true });
@@ -1391,6 +1361,155 @@ describe("ended trials", () => {
 	});
 });
 
+describe("stale dialog owner", () => {
+	test("a setup approval after a switch writes no config, approval or auto consent", async () => {
+		await approve(TEAM);
+		let live = true;
+		const f = scriptedUi([
+			options => {
+				live = false;
+				return options[0]!;
+			},
+		]);
+		await setupFlow({ ...env, stillOwner: () => live }, f.ui);
+		const after = await load();
+		expect(after.config.status === "ok" && after.config.hash).toBe(configHash(TEAM));
+		expect((await after.store.list()).map(record => record.configHash)).toEqual([configHash(TEAM)]);
+		expect(isApproved(after)).toBe(true);
+		expect(await autoChoice()).toBe("unset");
+		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+	});
+
+	test("an unapproved team's approval dialog after a switch approves nothing", async () => {
+		await approve(TEAM);
+		const edited = { ...TEAM, parallelism: 9 };
+		await editByHand(serializeConfig(edited));
+		let live = true;
+		const f = scriptedUi([
+			options => {
+				live = false;
+				return options[0]!;
+			},
+		]);
+		await hubFlow({ ...env, stillOwner: () => live }, f.ui);
+		const after = await load();
+		expect(after.config.status === "ok" && after.config.hash).toBe(configHash(edited));
+		expect(after.approval).toBeUndefined();
+		expect((await after.store.list()).map(record => record.configHash)).toEqual([configHash(TEAM)]);
+		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+	});
+
+	test("an auto consent dialog after a switch writes no choice", async () => {
+		await approve(TEAM);
+		let live = true;
+		const f = scriptedUi([
+			() => {
+				live = false;
+				return AUTO.enable;
+			},
+		]);
+		await autoDelegationFlow({ ...env, stillOwner: () => live }, f.ui);
+		expect(await autoChoice()).toBe("unset");
+		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+	});
+
+	test("a rollback confirmed after a switch restores nothing", async () => {
+		await approve(TEAM);
+		const newer = { ...TEAM, parallelism: 2 };
+		await approve(newer);
+		let live = true;
+		const f = scriptedUi([
+			"이전 승인으로 되돌리기",
+			FIRST,
+			options => {
+				live = false;
+				return options[0]!;
+			},
+		]);
+		await hubFlow({ ...env, stillOwner: () => live }, f.ui);
+		const after = await load();
+		expect(after.config.status === "ok" && after.config.hash).toBe(configHash(newer));
+		expect((await after.store.list()).length).toBe(2);
+		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+	});
+});
+
+describe("team export", () => {
+	/** Every regular file below `dir` and its bytes, so "writes nothing" is checked on the whole tree. */
+	async function snapshot(dir: string): Promise<Map<string, string>> {
+		const out = new Map<string, string>();
+		const walk = async (current: string): Promise<void> => {
+			let entries: Dirent[];
+			try {
+				entries = await readdir(current, { withFileTypes: true });
+			} catch {
+				return;
+			}
+			for (const entry of entries) {
+				const file = path.join(current, entry.name);
+				if (entry.isDirectory()) await walk(file);
+				else if (entry.isFile()) out.set(path.relative(dir, file), await readFile(file, "utf8"));
+			}
+		};
+		await walk(dir);
+		return out;
+	}
+
+	test("renders only shareable team options, writes nothing, and leaves approval, hashes, checks and paths out", async () => {
+		const secret = {
+			...TEAM,
+			requiredChecks: [{ name: "private-check /Users/dhkim", argv: ["/Users/dhkim/bin/secret", "TOKEN=abcdef"] }],
+			trials: [
+				{
+					id: "trial-export",
+					role: "implementer",
+					model: "pa/alpha-big",
+					share: 0.5,
+					maxSpawns: 3,
+					startsAt: "2026-11-20T09:00:00.000Z",
+					endsAt: "2026-11-30T09:00:00.000Z",
+					budgetUsd: 1,
+				},
+			],
+			unknownCredential: "SECRET-VALUE",
+		} as unknown as StormConfig;
+		await approve(secret);
+		const before = await snapshot(project.tmp);
+		const f = scriptedUi();
+		await exportFlow(env, f.ui);
+		expect(f.selects).toEqual([]);
+		expect(f.reports).toHaveLength(1);
+		expect(f.reports[0]?.title).toBe("Storm 팀 템플릿");
+		const markdown = f.reports[0]!.markdown;
+		expect(markdown).toContain('"version": 1');
+		expect(markdown).toContain('"implementer"');
+		expect(markdown).toContain('"models"');
+		expect(markdown).not.toContain("requiredChecks");
+		expect(markdown).not.toContain("argv");
+		expect(markdown).not.toContain("private-check");
+		expect(markdown).not.toContain("TOKEN=abcdef");
+		expect(markdown).not.toContain("trials");
+		expect(markdown).not.toContain("trial-export");
+		expect(markdown).not.toContain("unknownCredential");
+		expect(markdown).not.toContain("SECRET-VALUE");
+		expect(markdown).not.toContain("jcs-sha256");
+		expect(markdown).not.toContain(project.root);
+		expect(markdown).not.toContain(env.agentDir);
+		// A report, never a file: every byte under the temp profile and target is unchanged.
+		expect(await snapshot(project.tmp)).toEqual(before);
+	});
+
+	test("without a valid team it says so and still writes nothing", async () => {
+		const before = await snapshot(project.tmp);
+		const f = scriptedUi();
+		await exportFlow(env, f.ui);
+		expect(f.reports).toEqual([]);
+		expect(f.notices.at(-1)?.level).toBe("warning");
+		expect(f.notices.at(-1)?.text).toContain("내보낼 승인된 팀 설정");
+		expect(await snapshot(project.tmp)).toEqual(before);
+	});
+});
+
 describe("resuming the last run", () => {
 	const resumable = (over: Partial<RunRecord> = {}): RunRecord =>
 		runRecord({
@@ -1405,11 +1524,16 @@ describe("resuming the last run", () => {
 			request: "resume-unique-request",
 			...over,
 		});
-	const storeDir = async (): Promise<string> => (await load()).store.dir;
-	/** The record and this machine's pointer to it: what a real start leaves behind. */
+	/** The representative target of this project: approval and resume authority, never a storage key. */
+	const target = async () => {
+		const state = await load();
+		return { repoId: state.repo.repoId, root: state.repo.root };
+	};
+	/** The record and this session's target entry for it: what a real start leaves behind. */
 	const plant = async (run: RunRecord): Promise<void> => {
-		await writeRun(project.root, run);
-		await noteResumePointer(await storeDir(), project.root, run);
+		const state = await load();
+		await writeRun(state.sessionDir, run);
+		await noteResumePointer(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }, run);
 	};
 	/** A start that records its spec and answers with `result`. */
 	const starter = (started: RunSpec[], result: RunRequestResult = { ok: true, runId: "run-new" }) => {
@@ -1439,6 +1563,28 @@ describe("resuming the last run", () => {
 		expect(f.notices).toEqual([]);
 	});
 
+	test("a resume chosen or requested after a switch is not started", async () => {
+		await approve(TEAM);
+		await settleAuto(false);
+		await plant(resumable());
+		const started: RunSpec[] = [];
+		let live = true;
+		const f = scriptedUi([
+			options => {
+				live = false;
+				return options[0]!;
+			},
+		]);
+		await hubFlow({ ...env, startRun: starter(started), stillOwner: () => live }, f.ui);
+		expect(started).toEqual([]);
+		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+
+		const g = scriptedUi();
+		await resumeFlow({ ...env, startRun: starter(started), stillOwner: () => false }, g.ui);
+		expect(started).toEqual([]);
+		expect(g.notices.at(-1)?.text).toContain("대화가 바뀌어");
+	});
+
 	test("a start refusal from the menu is a warning", async () => {
 		await approve(TEAM);
 		await settleAuto(false);
@@ -1457,7 +1603,7 @@ describe("resuming the last run", () => {
 			["run-20261119-100000-aaaa", { status: "done", endReason: "verified" }],
 			["run-20261119-100001-aaaa", { status: "ended", endReason: "no-changes" }],
 		] as const) {
-			await writeRun(project.root, resumable({ runId, ...over }));
+			await writeRun((await load()).sessionDir, resumable({ runId, ...over }));
 			const started: RunSpec[] = [];
 			const f = scriptedUi([LAST]);
 			await hubFlow({ ...env, startRun: starter(started) }, f.ui);
@@ -1465,7 +1611,7 @@ describe("resuming the last run", () => {
 			expect(started).toEqual([]);
 		}
 		// A resumable run, but this caller cannot start one.
-		await writeRun(project.root, resumable({ runId: "run-20261119-110000-aaaa" }));
+		await writeRun((await load()).sessionDir, resumable({ runId: "run-20261119-110000-aaaa" }));
 		const f = scriptedUi([LAST]);
 		await hubFlow(env, f.ui);
 		expect(f.selects[0]?.options).toHaveLength(6);
@@ -1475,7 +1621,7 @@ describe("resuming the last run", () => {
 		await approve(TEAM);
 		await settleAuto(false);
 		const run = resumable();
-		await writeRun(project.root, run);
+		await writeRun((await load()).sessionDir, run);
 		/** Neither the menu nor the classifier path starts anything. */
 		const notOffered = async (): Promise<void> => {
 			const started: RunSpec[] = [];
@@ -1490,11 +1636,11 @@ describe("resuming the last run", () => {
 		};
 		await notOffered();
 		// The pointer names a different run.
-		await noteResumePointer(await storeDir(), project.root, resumable({ runId: "run-20261119-095000-bbbb" }));
+		await noteResumePointer((await load()).sessionDir, await target(), resumable({ runId: "run-20261119-095000-bbbb" }));
 		await notOffered();
 		// The pointer is right but the request was rewritten after the run.
-		await noteResumePointer(await storeDir(), project.root, run);
-		await writeRun(project.root, resumable({ request: "edited-request", task: "edited-request" }));
+		await noteResumePointer((await load()).sessionDir, await target(), run);
+		await writeRun((await load()).sessionDir, resumable({ request: "edited-request", task: "edited-request" }));
 		await notOffered();
 	});
 
@@ -1539,34 +1685,36 @@ describe("resuming the last run", () => {
 		expect(f.notices).toEqual([]);
 	});
 
-	test("/storm reset removes the resume pointer; the approval prune keeps it", async () => {
+	test("/storm reset removes this session's resume pointer; the approval prune keeps it", async () => {
 		await approve(TEAM);
-		const store = (await load()).store;
+		const state = await load();
 		const run = resumable();
-		await noteResumePointer(store.dir, project.root, run);
-		await store.prune(configHash(TEAM));
-		expect(await readFile(resumePointerFile(store.dir, project.root), "utf8")).toContain(run.runId);
+		await noteResumePointer(state.sessionDir, await target(), run);
+		await state.store.prune(configHash(TEAM));
+		expect(await readFile(resumePointerFile(state.sessionDir), "utf8")).toContain(run.runId);
 		const f = scriptedUi([FIRST]);
 		await resetFlow(env, f.ui);
-		await expect(readFile(resumePointerFile(store.dir, project.root), "utf8")).rejects.toThrow();
+		await expect(readFile(resumePointerFile(state.sessionDir), "utf8")).rejects.toThrow();
 	});
 
-	test("resume pointers are per work tree: reset removes only this tree's pointer", async () => {
+	test("resume entries are per target and per session: reset removes only this session's store", async () => {
 		await approve(TEAM);
-		const store = (await load()).store;
+		const state = await load();
 		const run = resumable();
 		const otherRoot = path.join(project.tmp, "other-worktree");
 		const other = resumable({ runId: "run-20261119-095500-bbbb" });
-		await noteResumePointer(store.dir, project.root, run);
-		await noteResumePointer(store.dir, otherRoot, other);
-		expect(resumePointerFile(store.dir, project.root)).not.toBe(resumePointerFile(store.dir, otherRoot));
-		// Another tree's start leaves this tree's candidate alone.
-		expect((await resumeCandidate(store.dir, project.root, run))?.runId).toBe(run.runId);
-		expect(await resumeCandidate(store.dir, project.root, other)).toBeUndefined();
+		await noteResumePointer(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }, run);
+		await noteResumePointer(state.sessionDir, { repoId: "git-other-000000000000000000000000", root: otherRoot }, other);
+		// One session store, but a run is offered only to the target that started it.
+		expect((await resumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }, run))?.runId).toBe(run.runId);
+		expect(await resumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }, other)).toBeUndefined();
+		// A sibling session has its own pointer and is not touched by this session's reset.
+		const sibling = await loadProjectState(withSession(project, "session-sibling-resume"));
+		await noteResumePointer(sibling.sessionDir, { repoId: sibling.repo.repoId, root: sibling.repo.root }, other);
 
 		const f = scriptedUi([FIRST]);
 		await resetFlow(env, f.ui);
-		await expect(readFile(resumePointerFile(store.dir, project.root), "utf8")).rejects.toThrow();
-		expect(await readFile(resumePointerFile(store.dir, otherRoot), "utf8")).toContain(other.runId);
+		await expect(readFile(resumePointerFile(state.sessionDir), "utf8")).rejects.toThrow();
+		expect(await readFile(resumePointerFile(sibling.sessionDir), "utf8")).toContain(other.runId);
 	});
 });

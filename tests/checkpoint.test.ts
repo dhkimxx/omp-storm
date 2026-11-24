@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CHECKPOINT_INSTRUCTIONS, checkpointGuidance, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
-import type { AgentEntry, RunRecord } from "../src/types.ts";
+import type { AgentEntry, RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
 const MIN = 60_000;
@@ -105,6 +105,78 @@ describe("workingState", () => {
 		expect(lines.at(-1)).toMatch(/2\D+1\D+4$/);
 	});
 
+	test("carries requirement ids, states and plan dependency edges after compaction", () => {
+		const lines = workingState(
+			run({
+				plan: {
+					lanes: [
+						{
+							name: "write",
+							kind: "code",
+							role: "implementer",
+							results: [{ id: "a-change", kind: "change", criterion: "a is GOOD", path: "a.txt" }],
+						},
+						{
+							name: "compare",
+							kind: "code",
+							role: "implementer",
+							dependsOn: [{ lane: "write", need: "result" }],
+						},
+						{
+							name: "build",
+							kind: "code",
+							role: "implementer",
+							dependsOn: [{ lane: "compare", need: "integrated" }],
+						},
+					],
+					workers: {},
+					submittedAt: "x",
+				},
+				results: [
+					{ id: "a-change", lane: "write", state: "accepted", attemptId: "job:1:Impl" },
+					{ id: "b-change", lane: "compare", state: "unmet", reason: `${"x".repeat(180)}TAIL` },
+					{ id: "c-answer", state: "pending" },
+				],
+			}),
+			[],
+		);
+		const text = lines.join("\n");
+		expect(text).toContain("필수 결과 3개");
+		expect(text).toContain("a-change = 수용 · 레인 write · 시도 job:1:Impl");
+		expect(text).toContain("b-change = 미충족 · 레인 compare");
+		expect(text).toContain("c-answer = 대기 · 미배정");
+		// The requirement-ledger line is bounded; the tail of a long reason is not replayed.
+		expect(text).not.toContain("TAIL");
+		expect(text).not.toContain("x".repeat(101));
+		// Dependency edges stay plan facts with stable lane names, not a second copy of their goals.
+		expect(text).toContain("계획 선행 의존 2개");
+		expect(text).toContain("compare→write(결과)");
+		expect(text).toContain("build→compare(통합)");
+	});
+
+	test("counts requirement rows and dependency edges past their ledger caps", () => {
+		const results: RunResult[] = Array.from({ length: 30 }, (_, i) => ({
+			id: `r${i}-change`,
+			lane: `lane-${i}`,
+			state: "unmet",
+			reason: "s".repeat(150),
+		}));
+		const lanes = Array.from({ length: 20 }, (_, i) => ({
+			name: `lane-${i}`,
+			kind: "code" as const,
+			role: "implementer",
+			...(i === 0 ? {} : { dependsOn: [{ lane: `lane-${i - 1}`, need: "result" as const }] }),
+		}));
+		const lines = workingState(run({ results, plan: { lanes, workers: {}, submittedAt: "x" } }), []);
+		const text = lines.join("\n");
+		expect(text).toContain("필수 결과 30개");
+		expect(text).toContain("외 18개 (실행 기록 참조)");
+		expect(text).toContain("계획 선행 의존 19개");
+		expect(text).toContain("외 11개");
+		expect(text).not.toContain("r29-change");
+		expect(text.length).toBeLessThanOrEqual(6_000);
+	});
+
 	test("without a plan, agents or reviews it still reports the blocks, as zeros", () => {
 		const lines = workingState(run(), []);
 		expect(lines).toHaveLength(4);
@@ -150,7 +222,7 @@ describe("workingState", () => {
 		expect(text).toContain("only the login form");
 		expect(text).toContain("남은 결정: 세션 저장소를 유지한다");
 		// A cut request points at the stable run record instead of replaying the whole request.
-		expect(text).toContain(".omp/storm/state/runs/run-20261120-100000-abcd.json");
+		expect(text).toContain("state/runs/run-20261120-100000-abcd.json");
 		expect(text.length).toBeLessThanOrEqual(6_000);
 	});
 

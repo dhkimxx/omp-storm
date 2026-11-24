@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { agentRecordFiles, bytesText, formatStorage, formatStorageDetail, storageDetailLines, type JanitorInput, processKey, readStorage, readTrustedRuns, recordTrustedRun, runJanitor } from "../src/runtime/janitor.ts";
 import { appendRunIndex, readRunIndex, summarizeForIndex } from "../src/runtime/run-index.ts";
 import { pruneRuns, readRun, writeRun } from "../src/runtime/run.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 import { pruneTrialStates, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import type { AgentEntry, RunRecord, StormConfig } from "../src/types.ts";
 import { agentEntry, DEAD_PROCESS, runRecord, teamOf } from "./fixtures.ts";
@@ -15,14 +16,14 @@ let tmp: string;
 let root: string;
 let sessions: string;
 let artifacts: string;
-let storeDir: string;
+let sessionDir: string;
 
 beforeEach(async () => {
 	tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-life-")));
 	root = path.join(tmp, "project");
 	sessions = path.join(tmp, "agent", "sessions");
 	artifacts = path.join(sessions, "proj", "sess");
-	storeDir = path.join(tmp, "agent", "storm", "approvals", "git-x");
+	sessionDir = sessionStoreDir(path.join(tmp, "agent"), "owner");
 	await mkdir(root);
 	await mkdir(artifacts, { recursive: true });
 	await writeFile(`${artifacts}.jsonl`, "");
@@ -54,8 +55,7 @@ function run(n: number, extra: Partial<RunRecord> = {}): RunRecord {
 /** The janitor at the end of run 5 in this process, cleanup approved in both configs, unless overridden. */
 function jan(over: Partial<JanitorInput>) {
 	return runJanitor({
-		root,
-		storeDir,
+		sessionDir,
 		sessionsRoot: sessions,
 		config: config({ cleanup: true }),
 		startConfig: config({ cleanup: true }),
@@ -100,17 +100,17 @@ describe("run index", () => {
 			reads: { director: 5, directorChars: 5000, duplicateChars: 2000, blocked: 1 },
 		});
 		for (let i = 1; i <= 5; i++) {
-			await writeRun(root, run(i));
-			await appendRunIndex(root, summarizeForIndex(run(i)), 3);
+			await writeRun(sessionDir, run(i));
+			await appendRunIndex(sessionDir, summarizeForIndex(run(i)), 3);
 		}
-		expect((await readRunIndex(root)).map(x => x.task)).toEqual(["task 3", "task 4", "task 5"]);
-		await pruneRuns(root, 1);
-		expect(await readRun(root, run(1).runId)).toBeUndefined();
-		expect((await readRunIndex(root)).length).toBe(3);
+		expect((await readRunIndex(sessionDir)).map(x => x.task)).toEqual(["task 3", "task 4", "task 5"]);
+		await pruneRuns(sessionDir, 1);
+		expect(await readRun(sessionDir, run(1).runId)).toBeUndefined();
+		expect((await readRunIndex(sessionDir)).length).toBe(3);
 	});
 
 	test("missing index reads empty", async () => {
-		expect(await readRunIndex(root)).toEqual([]);
+		expect(await readRunIndex(sessionDir)).toEqual([]);
 	});
 });
 
@@ -140,7 +140,7 @@ describe("janitor omp records", () => {
 	/** Trusted runs 1..n in order; run n is the one that just ended. */
 	async function trust(runs: Array<{ process: string; agents: string[]; artifactsDir?: string }>): Promise<void> {
 		for (const [i, r] of runs.entries()) {
-			await recordTrustedRun(storeDir, { runId: run(i + 1).runId, artifactsDir: r.artifactsDir ?? artifacts, process: r.process, agents: r.agents, endedAt: "t" });
+			await recordTrustedRun(sessionDir, { runId: run(i + 1).runId, artifactsDir: r.artifactsDir ?? artifacts, process: r.process, agents: r.agents, endedAt: "t" });
 		}
 	}
 
@@ -155,7 +155,7 @@ describe("janitor omp records", () => {
 			{ process: dead, agents: [] },
 			{ process: me, agents: [] },
 		]);
-		await writeRun(root, run(1, { agents: [agent("Old")] }));
+		await writeRun(sessionDir, run(1, { agents: [agent("Old")] }));
 		await touch(path.join(artifacts, "local", "local.jsonl"));
 		// Anna (from a dead-process run) is live here now; Nest has a live child.
 		const ledger = [agent("P"), agent("Live", { state: "idle" }), agent("Anna", { state: "idle" }), agent("Nest.Kid", { state: "running" })];
@@ -173,14 +173,14 @@ describe("janitor omp records", () => {
 		}
 		for (const kept of ["Live.jsonl", "Recent.jsonl", "Anna.jsonl", "Nest.jsonl", path.join("local", "local.jsonl")]) expect(left).toContain(kept);
 		expect(result.bytes).toBeGreaterThan(0);
-		const trusted = await readTrustedRuns(storeDir);
+		const trusted = await readTrustedRuns(sessionDir);
 		expect(trusted[0]?.cleaned).toEqual(["Old"]);
 		expect(trusted[1]?.cleaned?.sort()).toEqual(["Gone", "P"]);
-		expect((await readRun(root, run(1).runId))?.agents?.[0]?.cleanedAt).toBe(42);
+		expect((await readRun(sessionDir, run(1).runId))?.agents?.[0]?.cleanedAt).toBe(42);
 
 		// Re-recording a run keeps its cleaned ids, and a second pass finds nothing more.
-		await recordTrustedRun(storeDir, { runId: run(1).runId, artifactsDir: artifacts, process: dead, agents: ["Old"], endedAt: "t" });
-		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toEqual(["Old"]);
+		await recordTrustedRun(sessionDir, { runId: run(1).runId, artifactsDir: artifacts, process: dead, agents: ["Old"], endedAt: "t" });
+		expect((await readTrustedRuns(sessionDir))[0]?.cleaned).toEqual(["Old"]);
 		const again = await jan({ ledger, now: 50 });
 		expect(again.cleaned).toEqual([]);
 		expect(again.result.agents).toBe(0);
@@ -189,7 +189,7 @@ describe("janitor omp records", () => {
 	test("deletion paths come only from the trusted list, never from repo run records", async () => {
 		const victim = path.join(tmp, "repo-files");
 		await touch(path.join(victim, "package.json"));
-		for (let n = 1; n <= 5; n++) await writeRun(root, run(n, { artifactsDir: victim, process: dead, agents: [agent("package")] }));
+		for (let n = 1; n <= 5; n++) await writeRun(sessionDir, run(n, { artifactsDir: victim, process: dead, agents: [agent("package")] }));
 		const { result } = await jan({});
 		expect(result.agents).toBe(0);
 		expect(existsSync(path.join(victim, "package.json"))).toBe(true);
@@ -251,7 +251,7 @@ describe("janitor omp records", () => {
 		expect(live.cleaned).toEqual(["Mine"]);
 		expect(live.result.agents).toBe(1);
 		expect(existsSync(path.join(artifacts, "Theirs.jsonl"))).toBe(true);
-		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toBeUndefined();
+		expect((await readTrustedRuns(sessionDir))[0]?.cleaned).toBeUndefined();
 
 		const gone = await jan({ alive: () => false });
 		expect(gone.result.agents).toBe(1);
@@ -259,7 +259,7 @@ describe("janitor omp records", () => {
 		expect(gone.cleaned).toEqual([]);
 		expect(existsSync(path.join(artifacts, "Theirs.jsonl"))).toBe(false);
 		expect(existsSync(path.join(artifacts, "Theirs.md"))).toBe(true);
-		expect((await readTrustedRuns(storeDir))[0]?.cleaned).toEqual(["Theirs"]);
+		expect((await readTrustedRuns(sessionDir))[0]?.cleaned).toEqual(["Theirs"]);
 	});
 
 	test("never follows symlinks out of the artifacts dir and rejects path-like ids", async () => {
@@ -286,7 +286,7 @@ describe("janitor omp records", () => {
 	test("the run that just ended is never cleaned, even when the list records it as old", async () => {
 		await seedAgent("Mine");
 		// Run 5 was first recorded long ago (a resumed session re-records in place), with four newer runs after it.
-		await recordTrustedRun(storeDir, { runId: run(5).runId, artifactsDir: artifacts, process: dead, agents: ["Mine"], endedAt: "t" });
+		await recordTrustedRun(sessionDir, { runId: run(5).runId, artifactsDir: artifacts, process: dead, agents: ["Mine"], endedAt: "t" });
 		await trust([{ process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }, { process: dead, agents: [] }]);
 		const { result } = await jan({});
 		expect(result.agents).toBe(0);
@@ -307,7 +307,7 @@ describe("janitor omp records", () => {
 			// What could be removed was, and is counted: every record but the one in the locked directory.
 			expect(first.result.files).toBe(4);
 			expect(existsSync(path.join(locked, "Old.sub.jsonl"))).toBe(true);
-			expect((await readTrustedRuns(storeDir))[0]?.cleaned).toBeUndefined();
+			expect((await readTrustedRuns(sessionDir))[0]?.cleaned).toBeUndefined();
 		} finally {
 			await chmod(locked, 0o755);
 		}
@@ -318,15 +318,15 @@ describe("janitor omp records", () => {
 	});
 
 	test("a trusted line with a relative artifacts dir is not trusted", async () => {
-		await recordTrustedRun(storeDir, { runId: "run-abs", artifactsDir: artifacts, process: me, agents: [], endedAt: "t" });
+		await recordTrustedRun(sessionDir, { runId: "run-abs", artifactsDir: artifacts, process: me, agents: [], endedAt: "t" });
 		const line = JSON.stringify({ runId: "run-rel", artifactsDir: "sessions/proj/sess", process: me, agents: ["A"], endedAt: "t" });
-		await writeFile(path.join(storeDir, "runs.jsonl"), `${line}\n{ torn\n`, { flag: "a" });
-		expect((await readTrustedRuns(storeDir)).map(r => r.runId)).toEqual(["run-abs"]);
+		await writeFile(path.join(sessionDir, "state", "runs.jsonl"), `${line}\n{ torn\n`, { flag: "a" });
+		expect((await readTrustedRuns(sessionDir)).map(r => r.runId)).toEqual(["run-abs"]);
 	});
 
 	test("the trusted list keeps its newest 200 runs", async () => {
-		for (let n = 0; n < 205; n++) await recordTrustedRun(storeDir, { runId: `run-${n}`, artifactsDir: artifacts, process: me, agents: [], endedAt: "t" });
-		const runs = await readTrustedRuns(storeDir);
+		for (let n = 0; n < 205; n++) await recordTrustedRun(sessionDir, { runId: `run-${n}`, artifactsDir: artifacts, process: me, agents: [], endedAt: "t" });
+		const runs = await readTrustedRuns(sessionDir);
 		expect(runs.length).toBe(200);
 		expect(runs[0]?.runId).toBe("run-5");
 	});
@@ -334,8 +334,8 @@ describe("janitor omp records", () => {
 	test("storage line counts distinct records, the last cleanup, and labels protection", async () => {
 		await seedAgent("Old");
 		await trust([{ process: dead, agents: ["Old"] }]);
-		await writeRun(root, run(2, { cleanup: { agents: 3, files: 9, bytes: 3 * 1024 * 1024, stormFiles: 2 } }));
-		const view = await readStorage(root, storeDir, sessions, { cleanup: true });
+		await writeRun(sessionDir, run(2, { cleanup: { agents: 3, files: 9, bytes: 3 * 1024 * 1024, stormFiles: 2 } }));
+		const view = await readStorage(sessionDir, sessions, { cleanup: true });
 		// Old.jsonl + Old/Old.sub.jsonl; the .json and .jsonl.tombstone + Old.sub.x.json are sidecars. ".md"/other are not records.
 		expect(view.total).toEqual({ transcripts: { files: 2, bytes: 6 }, sidecars: { files: 3, bytes: 11 } });
 		// The only trusted run is among the newest three: all of its records are protected, none is a candidate.
@@ -367,7 +367,7 @@ describe("storage inventory", () => {
 
 	async function trustRuns(runs: Array<{ process: string; agents: string[]; artifactsDir?: string }>): Promise<void> {
 		for (const [i, r] of runs.entries()) {
-			await recordTrustedRun(storeDir, { runId: run(i + 1).runId, artifactsDir: r.artifactsDir ?? artifacts, process: r.process, agents: r.agents, endedAt: "t" });
+			await recordTrustedRun(sessionDir, { runId: run(i + 1).runId, artifactsDir: r.artifactsDir ?? artifacts, process: r.process, agents: r.agents, endedAt: "t" });
 		}
 	}
 
@@ -397,7 +397,7 @@ describe("storage inventory", () => {
 			{ process: dead, agents: ["Recent"] },
 			{ process: dead, agents: ["Recent"] },
 		]);
-		const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj"), alive: () => false });
+		const view = await readStorage(sessionDir, sessions, { cleanup: true, ompSessionDir: path.join(sessions, "proj"), alive: () => false });
 		expect(view.total).toEqual({ transcripts: { files: 6, bytes: 216 }, sidecars: { files: 3, bytes: 18 } });
 		expect(view.groups.recent).toEqual({ transcripts: { files: 1, bytes: 20 }, sidecars: { files: 1, bytes: 5 } });
 		expect(view.groups.candidate).toEqual({ transcripts: { files: 3, bytes: 180 }, sidecars: { files: 1, bytes: 10 } });
@@ -431,13 +431,13 @@ describe("storage inventory", () => {
 			{ process: dead, agents: [] },
 			{ process: dead, agents: [] },
 		]);
-		const on = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj"), alive: key => key === live });
+		const on = await readStorage(sessionDir, sessions, { cleanup: true, ompSessionDir: path.join(sessions, "proj"), alive: key => key === live });
 		expect(on.groups.live.transcripts).toEqual({ files: 1, bytes: 10 });
 		expect(on.groups.unclassified.transcripts).toEqual({ files: 1, bytes: 20 });
 		expect(on.groups.candidate.transcripts).toEqual({ files: 1, bytes: 30 });
 		expect(on.unclassifiedReasons).toEqual({ sameProcess: 1, cleaned: 0, other: 0 });
 		// The two live/same-process protections remain; with cleanup off the older dead run is unclassified too.
-		const off = await readStorage(root, storeDir, sessions, { cleanup: false, sessionDir: path.join(sessions, "proj"), alive: key => key === live });
+		const off = await readStorage(sessionDir, sessions, { cleanup: false, ompSessionDir: path.join(sessions, "proj"), alive: key => key === live });
 		expect(off.groups.live.transcripts.files).toBe(1);
 		expect(off.groups.candidate.transcripts.files).toBe(0);
 		expect(off.groups.unclassified.transcripts.files).toBe(2);
@@ -453,7 +453,7 @@ describe("storage inventory", () => {
 			{ process: dead, agents: [] },
 			{ process: dead, agents: [] },
 		]);
-		const view = await readStorage(root, storeDir, sessions, { cleanup: false, sessionDir: path.join(sessions, "proj") });
+		const view = await readStorage(sessionDir, sessions, { cleanup: false, ompSessionDir: path.join(sessions, "proj") });
 		const tags = storageDetailLines(view, false);
 		const pending = tags.find(entry => entry.text.startsWith("판단 보류"))!;
 		expect(pending.text).toContain("정리 꺼짐");
@@ -471,7 +471,7 @@ describe("storage inventory", () => {
 			{ process: dead, agents: [], artifactsDir: missing },
 			{ process: dead, agents: [], artifactsDir: outside },
 		]);
-		const stale = await readStorage(root, storeDir, sessions, { cleanup: true });
+		const stale = await readStorage(sessionDir, sessions, { cleanup: true });
 		expect(stale.gaps.trustRoots).toBe(2);
 		expect(stale.gaps.currentSession).toBe("unnamed");
 		expect(stale.gaps.scanned).toBe(0);
@@ -486,7 +486,7 @@ describe("storage inventory", () => {
 		expect(tags.find(entry => entry.text.startsWith("omp 자식 기록: 측정 불가"))?.warning).toBe(true);
 		expect(tags.find(entry => entry.text.startsWith("마지막 정리 없음"))?.warning).toBeUndefined();
 
-		const noRoot = await readStorage(root, storeDir, path.join(tmp, "agent", "absent"), { cleanup: true });
+		const noRoot = await readStorage(sessionDir, path.join(tmp, "agent", "absent"), { cleanup: true });
 		expect(noRoot.gaps.sessionsRoot).toBe(true);
 		expect(formatStorage(noRoot, true)).toContain("측정 불가");
 	});
@@ -495,7 +495,7 @@ describe("storage inventory", () => {
 		await rm(`${artifacts}.jsonl`);
 		await writeRecord("Old.jsonl", "x");
 		await trustRuns([{ process: dead, agents: ["Old"] }]);
-		const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj") });
+		const view = await readStorage(sessionDir, sessions, { cleanup: true, ompSessionDir: path.join(sessions, "proj") });
 		expect(view.gaps.trustRoots).toBe(1);
 		expect(view.gaps.staleSessions).toBe(1);
 		expect(view.gaps.currentSession).toBeUndefined();
@@ -520,7 +520,7 @@ describe("storage inventory", () => {
 		await writeRecord("Blocked/Blocked.child.jsonl", "b".repeat(8));
 		await chmod(path.join(artifacts, "Blocked"), 0o000);
 		try {
-			const view = await readStorage(root, storeDir, sessions, { cleanup: true, sessionDir: path.join(sessions, "proj") });
+			const view = await readStorage(sessionDir, sessions, { cleanup: true, ompSessionDir: path.join(sessions, "proj") });
 			expect(view.total.transcripts).toEqual({ files: 1, bytes: 4 });
 			expect(view.gaps.trustRoots).toBe(1);
 			expect(view.gaps.entries).toBe(1);
@@ -542,28 +542,28 @@ describe("stale run records", () => {
 	};
 
 	test("a running record whose process is gone becomes stopped, ended at its last live write; live ones stay", async () => {
-		await writeRun(root, running(1, { process: other, updatedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 }));
-		await writeRun(root, running(2, { process: "4343:1" }));
-		await writeRun(root, running(3, { process: "4444:1" }));
+		await writeRun(sessionDir, running(1, { process: other, updatedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 }));
+		await writeRun(sessionDir, running(2, { process: "4343:1" }));
+		await writeRun(sessionDir, running(3, { process: "4444:1" }));
 		// The run that is ending now is still `running` on disk: the janitor leaves it to its controller.
-		await writeRun(root, running(5, { process: processKey() }));
+		await writeRun(sessionDir, running(5, { process: processKey() }));
 		await jan({ config: config(), startConfig: config(), alive: key => key === "4444:1" });
-		expect(await readRun(root, run(1).runId)).toMatchObject({ status: "stopped", endedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 });
+		expect(await readRun(sessionDir, run(1).runId)).toMatchObject({ status: "stopped", endedAt: "2026-11-20T09:10:00.000Z", costUsd: 1.5 });
 		// Never rewritten live: it ended, as far as anyone knows, when it started.
-		expect(await readRun(root, run(2).runId)).toMatchObject({ status: "stopped", endedAt: run(2).startedAt });
-		expect((await readRun(root, run(3).runId))?.status).toBe("running");
-		expect((await readRun(root, run(5).runId))?.status).toBe("running");
+		expect(await readRun(sessionDir, run(2).runId)).toMatchObject({ status: "stopped", endedAt: run(2).startedAt });
+		expect((await readRun(sessionDir, run(3).runId))?.status).toBe("running");
+		expect((await readRun(sessionDir, run(5).runId))?.status).toBe("running");
 	});
 
 	test("an older running record of this very process, or one without a process, is stale too; finished records are untouched", async () => {
 		const { process: _process, ...unowned } = running(2, {});
-		await writeRun(root, running(1, { process: processKey() }));
-		await writeRun(root, unowned);
-		await writeRun(root, run(3, { process: other }));
+		await writeRun(sessionDir, running(1, { process: processKey() }));
+		await writeRun(sessionDir, unowned);
+		await writeRun(sessionDir, run(3, { process: other }));
 		await jan({ config: config(), startConfig: config(), alive: () => true });
-		expect((await readRun(root, run(1).runId))?.status).toBe("stopped");
-		expect((await readRun(root, run(2).runId))?.status).toBe("stopped");
-		expect(await readRun(root, run(3).runId)).toEqual(run(3, { process: other }));
+		expect((await readRun(sessionDir, run(1).runId))?.status).toBe("stopped");
+		expect((await readRun(sessionDir, run(2).runId))?.status).toBe("stopped");
+		expect(await readRun(sessionDir, run(3).runId)).toEqual(run(3, { process: other }));
 	});
 });
 
@@ -582,31 +582,40 @@ describe("Storm limits", () => {
 	});
 
 	test("trial counters outside both configs' trials are removed", async () => {
-		for (const id of ["keep", "gone", "start"]) await updateTrialState(root, id, s => ({ ...s, seen: 1 }));
+		for (const id of ["keep", "gone", "start"]) await updateTrialState(sessionDir, id, s => ({ ...s, seen: 1 }));
 		// Counters of trials in either the start config or the config in force stay.
 		const trial = (id: string) => ({ id, role: "implementer", model: "a/x" }) as unknown as NonNullable<StormConfig["trials"]>[number];
 		const { result } = await jan({ config: config({ trials: [trial("keep")] }), startConfig: config({ trials: [trial("start")] }) });
 		expect(result.stormFiles).toBe(1);
-		expect(Object.keys(await readTrialStates(root)).sort()).toEqual(["keep", "start"]);
-		expect(await pruneTrialStates(root, ["keep", "start"])).toBe(0);
+		expect(Object.keys(await readTrialStates(sessionDir)).sort()).toEqual(["keep", "start"]);
+		expect(await pruneTrialStates(sessionDir, ["keep", "start"])).toBe(0);
 	});
 
-	test("directories of retired features are removed: deferred proposals and the usage archive", async () => {
+	test("old .omp/storm, legacy profile approvals and the usage archive are never read, cleaned or touched", async () => {
 		const agentDir = path.join(tmp, "agent");
 		const proposals = path.join(root, ".omp", "storm", "state", "proposals");
 		const usage = path.join(agentDir, "storm", "usage");
+		const legacyApprovals = path.join(agentDir, "storm", "approvals", "git-x");
+		const legacyRuns = path.join(root, ".omp", "storm", "state", "runs", "run-old.json");
 		await touch(path.join(proposals, "p1.json"));
 		await touch(path.join(usage, "2026-10.jsonl"));
-		await touch(path.join(agentDir, "storm", "approvals", "git-x", "runs.jsonl"), "");
-		// Without the agent dir only the project's own leftovers go.
-		expect((await jan({})).result.stormFiles).toBe(1);
-		expect(existsSync(proposals)).toBe(false);
+		await touch(path.join(legacyApprovals, "runs.jsonl"), "legacy");
+		await touch(legacyRuns, "legacy");
+		const before = await Promise.all(
+			[path.join(proposals, "p1.json"), path.join(usage, "2026-10.jsonl"), path.join(legacyApprovals, "runs.jsonl"), legacyRuns].map(file =>
+				readFile(file, "utf8"),
+			),
+		);
+		expect((await jan({})).result.stormFiles).toBe(0);
+		expect(existsSync(proposals)).toBe(true);
 		expect(existsSync(usage)).toBe(true);
-		expect((await jan({ agentDir })).result.stormFiles).toBe(1);
-		expect(existsSync(usage)).toBe(false);
-		expect(existsSync(path.join(agentDir, "storm", "approvals", "git-x", "runs.jsonl"))).toBe(true);
-		// Nothing left: nothing counted, nothing created.
-		expect((await jan({ agentDir })).result.stormFiles).toBe(0);
-		expect(existsSync(proposals)).toBe(false);
+		expect(existsSync(legacyApprovals)).toBe(true);
+		expect(
+			await Promise.all(
+				[path.join(proposals, "p1.json"), path.join(usage, "2026-10.jsonl"), path.join(legacyApprovals, "runs.jsonl"), legacyRuns].map(file =>
+					readFile(file, "utf8"),
+				),
+			),
+		).toEqual(before);
 	});
 });

@@ -3,6 +3,10 @@ import type { BudgetConfig, RunPlan } from "../types.ts";
 /** Spend and dispatch authority of one run, shared with its children inside this process. */
 export interface LedgerRun {
 	runId: string;
+	/** The native main session id captured at admission; never re-read from ambient state. */
+	sessionId: string;
+	/** The profile's session store directory for that session; includes the profile and is the owner key. */
+	sessionDir: string;
 	repoId: string;
 	/** The run's main work tree: subagent sessions of the run fingerprint it, whichever tree they work in. */
 	root: string;
@@ -21,8 +25,8 @@ export interface LedgerRun {
 	onThreshold?: (kind: "warn" | "limit", run: LedgerRun) => void;
 }
 
-// Root lookup is for ownership checks. Cost and child events must use the actual run id, never just cwd.
-const worktrees = new Map<string, LedgerRun>();
+// The owner key is the profile's session directory, not a worktree or a bare native id: one profile/session owns one run.
+const sessions = new Map<string, LedgerRun>();
 const runs = new Map<string, LedgerRun>();
 // OMP agent ids are unique within an artifact tree, not within the entire process.
 const children = new Map<string, string>();
@@ -32,19 +36,32 @@ function childKey(id: string, parentId: string | undefined, artifactsDir: string
 	return `${artifactsDir ?? ""}\0${parentId ?? ""}\0${id}`;
 }
 
+function requireIdentity(value: unknown, field: string): string {
+	if (typeof value !== "string" || value.trim() === "" || value.includes("\u0000")) {
+		throw new Error(`Storm 실행의 ${field}가 올바르지 않습니다.`);
+	}
+	return value;
+}
+
 export function startLedgerRun(init: {
 	runId: string;
+	sessionId: string;
+	sessionDir: string;
 	repoId: string;
 	root: string;
 	base?: string;
 	budget?: BudgetConfig;
 	onThreshold?: LedgerRun["onThreshold"];
 }): LedgerRun {
-	const current = worktrees.get(init.root);
-	if (current) throw new Error(`Storm 실행이 이미 진행 중입니다(${current.runId}).`);
+	const sessionId = requireIdentity(init.sessionId, "세션 id");
+	const sessionDir = requireIdentity(init.sessionDir, "세션 디렉터리");
+	const current = sessions.get(sessionDir);
+	if (current) throw new Error(`이 세션에서 Storm 실행이 이미 진행 중입니다(${current.runId}).`);
 	if (runs.has(init.runId)) throw new Error(`Storm 실행 ID가 중복됐습니다(${init.runId}).`);
 	const run: LedgerRun = {
 		runId: init.runId,
+		sessionId,
+		sessionDir,
 		repoId: init.repoId,
 		root: init.root,
 		costUsd: 0,
@@ -56,13 +73,19 @@ export function startLedgerRun(init: {
 	if (init.budget) run.budget = init.budget;
 	if (init.base !== undefined) run.base = init.base;
 	if (init.onThreshold) run.onThreshold = init.onThreshold;
-	worktrees.set(run.root, run);
+	sessions.set(run.sessionDir, run);
 	runs.set(run.runId, run);
 	return run;
 }
 
-export function activeLedgerRun(worktreeRoot: string): LedgerRun | undefined {
-	return worktrees.get(worktreeRoot);
+/** The run owned by this profile/session directory; a different session in the same worktree is a different run. */
+export function activeLedgerRun(sessionDir: string): LedgerRun | undefined {
+	return sessions.get(sessionDir);
+}
+
+/** Whether this exact session directory owns a live run; the admission authority, never a process-wide flag. */
+export function hasLedgerRun(sessionDir: string): boolean {
+	return sessions.has(sessionDir);
 }
 
 export function getLedgerRun(runId: string | undefined): LedgerRun | undefined {
@@ -121,7 +144,7 @@ export function endLedgerRun(runId: string): LedgerRun | undefined {
 	const run = runs.get(runId);
 	if (run) {
 		runs.delete(runId);
-		worktrees.delete(run.root);
+		if (sessions.get(run.sessionDir) === run) sessions.delete(run.sessionDir);
 		const keys = childKeysByRun.get(runId);
 		if (keys) for (const key of keys) children.delete(key);
 		childKeysByRun.delete(runId);
@@ -158,7 +181,7 @@ export function recordCost(runId: string, selector: string, usd: number): Ledger
 
 export function resetLedger(): void {
 	runs.clear();
-	worktrees.clear();
+	sessions.clear();
 	children.clear();
 	childKeysByRun.clear();
 }

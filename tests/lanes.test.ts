@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { replanConflict, RunLanes } from "../src/runtime/lanes.ts";
+import { PENDING_WRITE_MS, replanConflict, RunLanes } from "../src/runtime/lanes.ts";
+import type { LanePolicy } from "../src/policy/capability.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
@@ -107,6 +108,8 @@ test("a batch-wide isolated shorthand cannot leak into shared items", () => {
 	if (!plain.ok) return;
 	expect(plain.input).not.toHaveProperty("isolated");
 	expect((plain.input.tasks as Array<Record<string, unknown>>)[0]).not.toHaveProperty("isolated");
+	// The first placement never became a worker; release its write scope before placing the same lane again.
+	work.cancel("api");
 
 	const selected = plan(lane("api", "Implement API"), { ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent" });
 	const placed = work.place(
@@ -178,6 +181,106 @@ test("a legacy isolated team isolates every lane including the final reviewer, a
 	expect(blocked.ok).toBe(false);
 });
 
+test("a planned batch requires one concrete lane per item before any reservation, including team isolation", () => {
+	const work = new RunLanes("run-atomic");
+	const p = plan(lane("A", "Implement A"), lane("B", "Implement B"), lane("C", "Implement C"));
+	// A whole-team-isolated request is not an exemption: the unassigned second item fails before item A reserves.
+	const isolated = teamOf({ implementer: "fake/dev" }, { isolation: "isolated" });
+	const mixed = work.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "A", task: "A" },
+				{ agent: "storm-implementer", task: "Missing" },
+			],
+		},
+		p,
+		isolated,
+		{ host: { enabled: true, apply: true } },
+	);
+	expect(mixed.ok).toBe(false);
+	// The refused batch left A free: the same approved batch can run as a whole and puts both items in isolation.
+	const good = work.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "A", task: "A" },
+				{ agent: "storm-implementer", name: "B", task: "B" },
+				{ agent: "storm-implementer", name: "C", task: "C" },
+			],
+		},
+		p,
+		isolated,
+		{ host: { enabled: true, apply: true } },
+	);
+	expect(good.ok).toBe(true);
+	if (good.ok) {
+		const tasks = good.input.tasks as Array<Record<string, unknown>>;
+		expect(tasks[0]).toMatchObject({ isolated: true });
+		expect(tasks[1]).toMatchObject({ isolated: true });
+		expect(tasks[2]).toMatchObject({ isolated: true });
+	}
+
+	// A planned isolated item must name the lane its claim belongs to. Unplanned, duplicate and wrong-role items all
+	// fail before the earlier valid item can reserve its write scope.
+	const selected = plan(
+		{ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" },
+		lane("api", "Implement API"),
+		lane("extra", "Implement Extra"),
+	);
+	const shared = new RunLanes("run-atomic-shared");
+	const unplanned = shared.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "api", task: "API" },
+				{ agent: "storm-implementer", task: "Stray", isolated: true },
+			],
+		},
+		selected,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(unplanned.ok).toBe(false);
+	if (!unplanned.ok) expect(unplanned.reason).toContain("계획에 없는");
+	const duplicate = shared.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "probe", task: "Probe", isolated: true },
+				{ agent: "storm-implementer", name: "probe", task: "Probe", isolated: true },
+			],
+		},
+		selected,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(duplicate.ok).toBe(false);
+	if (!duplicate.ok) expect(duplicate.reason).toContain("이미 사용");
+	const wrongRole = shared.place(
+		{ tasks: [{ agent: "storm-explorer", name: "probe", task: "Probe", isolated: true }] },
+		selected,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(wrongRole.ok).toBe(false);
+	if (!wrongRole.ok) expect(wrongRole.reason).toContain("역할");
+	// The same batch is accepted after the atomic refusals: probe reserves its isolated lane and api its shared one.
+	const approved = shared.place(
+		{
+			tasks: [
+				{ agent: "storm-implementer", name: "probe", task: "Probe" },
+				{ agent: "storm-implementer", name: "api", task: "API" },
+			],
+		},
+		selected,
+		team,
+		{ host: { enabled: true, apply: false } },
+	);
+	expect(approved.ok).toBe(true);
+	if (approved.ok) {
+		const tasks = approved.input.tasks as Array<Record<string, unknown>>;
+		expect(tasks[0]).toMatchObject({ isolated: true });
+		expect(tasks[1]).not.toHaveProperty("isolated");
+	}
+});
+
 test("an unbound direct task cannot claim an isolated lane, and a rejected batch reserves nothing", () => {
 	const work = new RunLanes("run-reserve");
 	const p = plan({ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
@@ -245,5 +348,266 @@ test("replanConflict rejects changing a lane's stable identity under the same na
 	expect(replanConflict(base, plan({ ...lane("api", "Implement API"), kind: "run" }))).toContain("kind");
 	expect(replanConflict(base, plan({ ...lane("api", "Implement API"), role: "reviewer" }))).toContain("role");
 	expect(replanConflict(base, plan({ ...lane("api", "Implement API"), files: ["a.ts"] }))).toContain("files");
+	// A prerequisite edge is plan input, not evidence identity: T04 replans rewrite the review's edges under its name.
+	expect(replanConflict(base, plan({ ...lane("api", "Implement API"), files: ["b.ts", "a.ts"], dependsOn: [{ lane: "view", need: "reviewable" }] }))).toBeUndefined();
 	expect(replanConflict(base, plan({ ...lane("api", "Other work"), kind: "run" }))).toContain("goal, kind");
+});
+
+/** A prerequisite lane's ledger facts as the controller would hand them to admission. */
+function readinessOf(state: "pending" | "unmet" | "reviewable" | "accepted", integrated = false, running = false) {
+	return new Map([
+		[
+			"producer",
+			{
+				results: [{ id: "r1", state, integrated, version: "0123456789abcdef", path: "out.txt" }],
+				settled: state !== "pending",
+				integrated,
+				running,
+			},
+		],
+	]);
+}
+
+const producer: PlanLane = {
+	name: "producer",
+	kind: "code",
+	role: "implementer",
+	files: ["out.txt"],
+	results: [{ id: "r1", kind: "change", criterion: "out.txt holds ok", path: "out.txt", contains: "ok" }],
+};
+
+function consumer(need: "result" | "integrated" | "reviewable"): PlanLane {
+	return {
+		name: "consumer",
+		kind: "explore",
+		role: "explorer",
+		results: [{ id: "c1", kind: "answer", criterion: "report the producer result" }],
+		dependsOn: [{ lane: "producer", need }],
+	};
+}
+
+test("a consumer is refused until its declared prerequisite state holds, and missing facts fail closed", () => {
+	const work = new RunLanes("run-dep");
+	const consumerPlan = plan(producer, consumer("result"));
+	const place = () => work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team, { readiness: readinessOf("accepted") });
+	const missing = work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team);
+	expect(missing.ok).toBe(false);
+	if (!missing.ok) expect(missing.code).toBe("lane-dependency");
+	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team, { readiness: readinessOf("pending") }).ok).toBe(false);
+	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team, { readiness: readinessOf("reviewable") }).ok).toBe(false);
+	const accepted = place();
+	expect(accepted.ok).toBe(true);
+	// A producer that is running again may still change the result: an accepted old row is not final input.
+	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team, { readiness: readinessOf("accepted", false, true) }).ok).toBe(false);
+	// The accepted reference is short, versioned and path-bearing; a host path or model prose never appears.
+	if (accepted.ok) expect(String(accepted.input.task)).toContain("r1=accepted@01234567 out.txt");
+	// An `integrated` edge additionally needs the current parent, not just an accepted artifact.
+	const integratedPlan = plan(producer, consumer("integrated"));
+	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Build" }, integratedPlan, team, { readiness: readinessOf("accepted", false) }).ok).toBe(false);
+	const ok = work.place({ agent: "storm-explorer", name: "consumer", task: "Build" }, integratedPlan, team, { readiness: readinessOf("accepted", true) });
+	expect(ok.ok).toBe(true);
+	if (ok.ok) expect(String(ok.input.task)).toContain("r1=accepted·통합@01234567 out.txt");
+	// `reviewable` admits a submission to judge, including one whose result is only reviewable.
+	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Review" }, plan(producer, consumer("reviewable")), team, { readiness: readinessOf("reviewable") }).ok).toBe(true);
+});
+
+test("a shared-write batch is all-or-nothing and a settled worker frees its scope", () => {
+	const shared = plan(
+		{ name: "W0", kind: "run", role: "quick", files: ["shared.txt"] },
+		{ name: "X0", kind: "code", role: "quick", files: ["shared.txt"] },
+		{ name: "X1", kind: "code", role: "quick", files: ["other.txt"] },
+	);
+	const work = new RunLanes("run-write");
+	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
+	work.admit({ spawnKey: "W0", agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
+	const running = [agentEntry({ id: "W0", name: "storm-quick", role: "quick", state: "running" })];
+	const refused = work.place(
+		{
+			tasks: [
+				{ agent: "storm-quick", name: "X0", task: "Conflict" },
+				{ agent: "storm-quick", name: "X1", task: "Independent" },
+			],
+		},
+		shared,
+		team,
+		{ agents: running },
+	);
+	expect(refused.ok).toBe(false);
+	if (!refused.ok) expect(refused.code).toBe("lane-write");
+	// No reservation leaked from the refused batch: the disjoint item alone is admitted, even while W0 writes.
+	expect(work.place({ agent: "storm-quick", name: "X1", task: "Independent" }, shared, team, { agents: running }).ok).toBe(true);
+	// The writer's own scope is still held; settling it frees the conflicting item.
+	expect(work.place({ agent: "storm-quick", name: "X0", task: "Conflict" }, shared, team, { agents: running }).ok).toBe(false);
+	work.releaseAgent("W0");
+	expect(work.place({ agent: "storm-quick", name: "X0", task: "Conflict" }, shared, team, { agents: running }).ok).toBe(true);
+});
+
+test("unknown writable scopes serialize while read-only and private outputs run in parallel", () => {
+	const unknown = plan(
+		{ name: "U0", kind: "code", role: "implementer", goal: "Undeclared scope" },
+		{ name: "U1", kind: "code", role: "implementer", files: ["other.txt"], goal: "Other" },
+	);
+	const work = new RunLanes("run-unknown");
+	expect(work.place({ agent: "storm-implementer", name: "U0", task: "Work" }, unknown, team).ok).toBe(true);
+	expect(work.place({ agent: "storm-implementer", name: "U1", task: "Work" }, unknown, team).ok).toBe(false);
+
+	const read = plan(
+		{ name: "R0", kind: "explore", role: "explorer", goal: "Read" },
+		{ name: "R1", kind: "explore", role: "explorer", goal: "Read" },
+	);
+	expect(
+		work.place({ tasks: [{ agent: "storm-explorer", name: "R0", task: "Read" }, { agent: "storm-explorer", name: "R1", task: "Read" }] }, read, team).ok,
+	).toBe(true);
+
+	const isolated = plan(
+		{ name: "AB0", kind: "run", role: "quick", files: ["parallel.txt"], isolationReason: "independent A" },
+		{ name: "AB1", kind: "run", role: "quick", files: ["parallel.txt"], isolationReason: "independent B" },
+	);
+	expect(
+		work.place(
+			{ tasks: [{ agent: "storm-quick", name: "AB0", task: "A" }, { agent: "storm-quick", name: "AB1", task: "B" }] },
+			isolated,
+			team,
+			{ host: { enabled: true, apply: false } },
+		).ok,
+	).toBe(true);
+});
+
+test("a cancelled placement releases its write and a work follow-up passes the same gate", () => {
+	const shared = plan(
+		{ name: "H0", kind: "code", role: "implementer", files: ["shared.txt"] },
+		{ name: "W0", kind: "run", role: "quick", files: ["shared.txt"] },
+		{ name: "R0", kind: "explore", role: "explorer", goal: "Read" },
+	);
+	const work = new RunLanes("run-follow");
+	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
+	work.cancel("W0");
+	expect(work.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, team).ok).toBe(true);
+	work.admit({ spawnKey: "H0", agent: "storm-implementer", outcome: "routed" }, { plan: shared, config: team });
+	const running = [agentEntry({ id: "H0", state: "running" })];
+	expect(work.checkFollowUp({ agentId: "X0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: running }).ok).toBe(false);
+	expect(work.checkFollowUp({ agentId: "R0", agent: "storm-explorer", role: "explorer", lane: shared.lanes[2]!, isolated: false, agents: running }).ok).toBe(true);
+	const own = work.checkFollowUp({ agentId: "H0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: running });
+	expect(own.ok).toBe(true);
+	if (own.ok) work.finishFollowUp(own.token, true);
+	work.releaseAgent("H0");
+	expect(work.checkFollowUp({ agentId: "X0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: [] }).ok).toBe(true);
+});
+
+test("capability policies allow disjoint manual paths but serialize overlapping paths and every auto writer", () => {
+	const paths = (value: string): LanePolicy => ({ kind: "paths", paths: [value], reason: "path-only manual writer" });
+	const shared = plan(
+		{ name: "A", kind: "code", role: "quick", files: ["a"] },
+		{ name: "B", kind: "code", role: "quick", files: ["b"] },
+	);
+	const disjoint = new Map([
+		["A", paths("a")],
+		["B", paths("b")],
+	]);
+	const manual = new RunLanes("run-canonical");
+	expect(manual.place({ agent: "storm-quick", name: "A", task: "A" }, shared, team, { policies: disjoint }).ok).toBe(true);
+	expect(manual.place({ agent: "storm-quick", name: "B", task: "B" }, shared, team, { policies: disjoint }).ok).toBe(true);
+
+	const nested = plan(
+		{ name: "A", kind: "code", role: "quick", files: ["src"] },
+		{ name: "B", kind: "code", role: "quick", files: ["src/a.ts"] },
+	);
+	const overlapping = new Map([
+		["A", paths("src")],
+		["B", paths("src/a.ts")],
+	]);
+	const nestedWork = new RunLanes("run-nested");
+	expect(nestedWork.place({ agent: "storm-quick", name: "A", task: "A" }, nested, team, { policies: overlapping }).ok).toBe(true);
+	expect(nestedWork.place({ agent: "storm-quick", name: "B", task: "B" }, nested, team, { policies: overlapping }).ok).toBe(false);
+
+	const autoWork = new RunLanes("run-auto-paths");
+	expect(autoWork.assign({ agent: "storm-quick", name: "A", task: "A" }, shared, team, { policies: disjoint }).ok).toBe(true);
+	expect(autoWork.assign({ agent: "storm-quick", name: "B", task: "B" }, shared, team, { policies: disjoint }).ok).toBe(false);
+});
+
+test("a delayed host start cannot bypass a writer that reserved the expired scope", () => {
+	const shared = plan(
+		{ name: "W0", kind: "run", role: "quick", files: ["shared.txt"] },
+		{ name: "X0", kind: "code", role: "quick", files: ["shared.txt"] },
+	);
+	const work = new RunLanes("run-late");
+	const at = 1_000_000;
+	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team, { now: at }).ok).toBe(true);
+	// The pending window expires and a new writer takes the same scope.
+	expect(work.place({ agent: "storm-quick", name: "X0", task: "Write" }, shared, team, { now: at + 31_000 }).ok).toBe(true);
+	const late = work.admitChecked({ spawnKey: "W0", agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
+	expect(late.ok).toBe(false);
+	if (!late.ok) expect(late.code).toBe("lane-write");
+});
+
+test("a work follow-up passes the same prerequisite gate as a task", () => {
+	const work = new RunLanes("run-follow-dep");
+	const consumerLane = consumer("result");
+	const consumerPlan = plan(producer, consumerLane);
+	const blocked = work.checkFollowUp({
+		agentId: "C0",
+		agent: "storm-explorer",
+		role: "explorer",
+		lane: consumerLane,
+		plan: consumerPlan,
+		isolated: false,
+		readiness: readinessOf("pending"),
+	});
+	expect(blocked.ok).toBe(false);
+	if (!blocked.ok) expect(blocked.code).toBe("lane-dependency");
+	const ready = work.checkFollowUp({
+		agentId: "C0",
+		agent: "storm-explorer",
+		role: "explorer",
+		lane: consumerLane,
+		plan: consumerPlan,
+		isolated: false,
+		readiness: readinessOf("accepted"),
+	});
+	expect(ready.ok).toBe(true);
+});
+
+test("approved capability policies drive read-only, path and blocked scopes; a late spawn cannot bypass a new writer", () => {
+	const work = new RunLanes("run-policy");
+	const readLane: PlanLane = { name: "review", kind: "review", role: "reviewer", goal: "Judge only" };
+	const writerLane: PlanLane = { name: "write", kind: "code", role: "implementer", files: ["a.ts"] };
+	const both = plan(readLane, writerLane);
+	const policies = new Map([
+		["review", { kind: "read" as const, tools: ["read"], reason: "approved read-only tools" }],
+		["write", { kind: "paths" as const, paths: ["a.ts"], reason: "approved path-only writer" }],
+	]);
+	// A read-only reviewer reserves nothing, so it may sit in the same batch as the shared writer.
+	const batch = work.place(
+		{
+			tasks: [
+				{ agent: "storm-reviewer", name: "review", task: "Judge" },
+				{ agent: "storm-implementer", name: "write", task: "Write" },
+			],
+		},
+		both,
+		team,
+		{ policies, canonicalFiles: new Map([["write", ["a.ts"]]]) },
+	);
+	expect(batch.ok).toBe(true);
+	// A policy that blocks the lane refuses the whole call before any reservation.
+	const blocked = work.place({ agent: "storm-implementer", name: "write", task: "Write" }, both, team, {
+		policies: new Map([["write", { kind: "blocked" as const, reason: "write tool unavailable" }]]),
+	});
+	expect(blocked.ok).toBe(false);
+	if (!blocked.ok) expect(blocked.code).toBe("lane-capability");
+
+	// An unbound reservation expires; a later writer now owns the path. The late spawn must not slip past it.
+	const scheduling = teamOf({ implementer: "fake/dev", quick: "fake/quick" });
+	const lateLane: PlanLane = { name: "late", kind: "code", role: "implementer", files: ["shared.ts"] };
+	const nextLane: PlanLane = { name: "next", kind: "code", role: "quick", files: ["shared.ts"] };
+	const paths = plan(lateLane, nextLane);
+	const late = work.place({ agent: "storm-implementer", name: "late", task: "Late" }, paths, scheduling, { now: 0 });
+	expect(late.ok).toBe(true);
+	const next = work.place({ agent: "storm-quick", name: "next", task: "Next" }, paths, scheduling, { now: PENDING_WRITE_MS + 1 });
+	expect(next.ok).toBe(true);
+	const nextAdmit = work.admitChecked({ spawnKey: "next", agent: "storm-quick", outcome: "routed" }, { plan: paths, config: scheduling });
+	expect(nextAdmit).toEqual({ ok: true, lane: "next" });
+	const lateAdmit = work.admitChecked({ spawnKey: "late", agent: "storm-implementer", outcome: "routed" }, { plan: paths, config: scheduling });
+	expect(lateAdmit.ok).toBe(false);
+	if (!lateAdmit.ok) expect(lateAdmit.code).toBe("lane-write");
 });

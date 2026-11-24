@@ -1,17 +1,19 @@
 /**
- * Run summary index: `<root>/.omp/storm/state/runs/index.jsonl`, one `storm.run-summary/v1` line per finished run.
- * It outlives the run records `pruneRuns` removes (that only touches `run-*.json`) and keeps its newest lines.
+ * Run summary index: `<sessionDir>/state/runs/index.jsonl`, one `storm.run-summary/v1` line per finished run. It
+ * belongs to one native session's own store, outlives the run records `pruneRuns` removes (that only touches
+ * `run-*.json`) and keeps its newest lines.
  */
 import * as path from "node:path";
 import { readJsonl, serialized, writeTextAtomic } from "../fsutil.ts";
 import type { RunRecord, RunSummary } from "../types.ts";
+import { assertSessionPathSafe } from "../session-scope.ts";
 import { reviewTotals } from "./review.ts";
 import { runsDir } from "./run.ts";
 
 export const RUN_INDEX_MAX = 1000;
 
-export function runIndexFile(root: string): string {
-	return path.join(runsDir(root), "index.jsonl");
+export function runIndexFile(sessionDir: string): string {
+	return path.join(runsDir(sessionDir), "index.jsonl");
 }
 
 /** The comparable numbers of one run: cost, director share and context, reviews, blocks, reads, compactions, cleanup. */
@@ -51,15 +53,18 @@ function isSummary(value: unknown): value is RunSummary {
 }
 
 /** Summaries oldest first; a missing index is empty and torn or foreign lines are skipped. */
-export function readRunIndex(root: string): Promise<RunSummary[]> {
-	return readJsonl(runIndexFile(root), isSummary);
+export async function readRunIndex(sessionDir: string): Promise<RunSummary[]> {
+	const file = runIndexFile(sessionDir);
+	await assertSessionPathSafe(sessionDir, file);
+	return readJsonl(file, isSummary);
 }
 
 /** Appends one summary and keeps the newest `max` lines. */
-export function appendRunIndex(root: string, summary: RunSummary, max = RUN_INDEX_MAX): Promise<void> {
-	const file = path.resolve(runIndexFile(root));
+export function appendRunIndex(sessionDir: string, summary: RunSummary, max = RUN_INDEX_MAX): Promise<void> {
+	const file = path.resolve(runIndexFile(sessionDir));
 	return serialized(file, async () => {
-		const kept = [...(await readRunIndex(root)), summary].slice(-Math.max(1, max));
+		const kept = [...(await readRunIndex(sessionDir)), summary].slice(-Math.max(1, max));
+		await assertSessionPathSafe(sessionDir, file);
 		await writeTextAtomic(file, kept.map(line => `${JSON.stringify(line)}\n`).join(""));
 	});
 }

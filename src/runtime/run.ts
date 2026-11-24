@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { isRecord } from "../config/schema.ts";
 import { shortHash } from "../config/canonical.ts";
 import { readJson, writeJsonAtomic } from "../fsutil.ts";
+import { assertSessionPathSafe, sessionStateDir } from "../session-scope.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
 import { LANE_ROLES, ROLE_STAND_INS, roleTitle, workerRange } from "../roles.ts";
@@ -30,12 +31,13 @@ function laneRoles(config: StormConfig): string {
 		.join(", ");
 }
 
-export function stateDir(root: string): string {
-	return path.join(root, ".omp", "storm", "state");
+/** Storm's own state under one native session's captured store: `<sessionDir>/state`. Never the target work tree. */
+export function stateDir(sessionDir: string): string {
+	return sessionStateDir(sessionDir);
 }
 
-export function runsDir(root: string): string {
-	return path.join(stateDir(root), "runs");
+export function runsDir(sessionDir: string): string {
+	return path.join(stateDir(sessionDir), "runs");
 }
 
 const pad = (n: number): string => String(n).padStart(2, "0");
@@ -57,13 +59,13 @@ export function isRunId(value: string): boolean {
 	return RUN_ID.test(value);
 }
 
-/** The repository-relative run record path, for text that must point at a record without copying it. */
+/** The session-store-relative run record path, for text that must point at a record without copying it. */
 export function runRecordRef(runId: string): string | undefined {
-	return isRunId(runId) ? `.omp/storm/state/runs/${runId}.json` : undefined;
+	return isRunId(runId) ? `state/runs/${runId}.json` : undefined;
 }
 
-function runFile(root: string, runId: string): string | undefined {
-	return isRunId(runId) ? path.join(runsDir(root), `${runId}.json`) : undefined;
+function runFile(sessionDir: string, runId: string): string | undefined {
+	return isRunId(runId) ? path.join(runsDir(sessionDir), `${runId}.json`) : undefined;
 }
 
 const RUN_STATUSES: readonly string[] = ["running", "done", "ended", "budget-exceeded", "stopped"];
@@ -82,23 +84,27 @@ function isRunRecord(value: unknown): value is RunRecord {
 	);
 }
 
-export async function writeRun(root: string, run: RunRecord): Promise<void> {
-	const file = runFile(root, run.runId);
+export async function writeRun(sessionDir: string, run: RunRecord): Promise<void> {
+	const file = runFile(sessionDir, run.runId);
 	if (!file) throw new Error(`잘못된 실행 id입니다: ${run.runId}`);
+	await assertSessionPathSafe(sessionDir, file);
 	await writeJsonAtomic(file, run);
 }
 
-export async function readRun(root: string, runId: string): Promise<RunRecord | undefined> {
-	const file = runFile(root, runId);
+export async function readRun(sessionDir: string, runId: string): Promise<RunRecord | undefined> {
+	const file = runFile(sessionDir, runId);
 	if (!file) return undefined;
+	await assertSessionPathSafe(sessionDir, file);
 	const value = await readJson(file);
 	return isRunRecord(value) && value.runId === runId ? value : undefined;
 }
 
 /** Ids of the run records on disk, oldest first (run ids sort by start time). */
-export async function runIds(root: string): Promise<string[]> {
+export async function runIds(sessionDir: string): Promise<string[]> {
+	const dir = runsDir(sessionDir);
+	await assertSessionPathSafe(sessionDir, dir);
 	try {
-		const names = await fs.readdir(runsDir(root));
+		const names = await fs.readdir(dir);
 		return names.flatMap(n => (n.endsWith(".json") && RUN_ID.test(n.slice(0, -5)) ? [n.slice(0, -5)] : [])).sort();
 	} catch {
 		return [];
@@ -106,8 +112,8 @@ export async function runIds(root: string): Promise<string[]> {
 }
 
 /** Newest finished run by startedAt; unreadable files are skipped. */
-export async function lastRun(root: string): Promise<RunRecord | undefined> {
-	const runs = await Promise.all((await runIds(root)).map(id => readRun(root, id)));
+export async function lastRun(sessionDir: string): Promise<RunRecord | undefined> {
+	const runs = await Promise.all((await runIds(sessionDir)).map(id => readRun(sessionDir, id)));
 	let best: RunRecord | undefined;
 	let bestAt = Number.NEGATIVE_INFINITY;
 	for (const run of runs) {
@@ -127,20 +133,21 @@ export const RUN_KEEP = 50;
 
 /**
  * Keeps the newest `keep` run files. A record still marked running is never deleted by retention, and neither is an id
- * the caller protects: a run-end caller with the approval store passes `protectedResumeRunIds(storeDir, root)` from
- * `resume.ts` so trusted unfinished runs stay. Only `run-*.json` files are candidates: other files in `runs/` are left
- * alone.
+ * the caller protects: a run-end caller passes `protectedResumeRunIds(sessionDir, target)` from `resume.ts` so
+ * trusted unfinished runs stay. Only `run-*.json` files are candidates: other files in `runs/` are left alone.
  */
-export async function pruneRuns(root: string, keep = RUN_KEEP, protect: readonly string[] = []): Promise<void> {
-	const ids = (await runIds(root)).reverse();
+export async function pruneRuns(sessionDir: string, keep = RUN_KEEP, protect: readonly string[] = []): Promise<void> {
+	const ids = (await runIds(sessionDir)).reverse();
 	const guarded = new Set(protect);
 	await Promise.all(
 		ids.slice(Math.max(0, keep)).map(async id => {
 			if (guarded.has(id)) return;
 			// A run whose process is still alive cannot be known to be finished here: keep its record until it stops.
-			const run = await readRun(root, id);
+			const run = await readRun(sessionDir, id);
 			if (run?.status === "running") return;
-			await fs.rm(path.join(runsDir(root), `${id}.json`), { force: true });
+			const file = path.join(runsDir(sessionDir), `${id}.json`);
+			await assertSessionPathSafe(sessionDir, file);
+			await fs.rm(file, { force: true });
 		}),
 	);
 }
@@ -186,7 +193,7 @@ interface ResumeLane {
 	isolationReason?: string;
 }
 
-/** A stored plan is repository data: only an array of objects with a string name is a plan. */
+/** A stored plan is session-store data: only an array of objects with a string name is a plan. */
 function resumeLanes(plan: unknown): ResumeLane[] | undefined {
 	if (!isRecord(plan) || !Array.isArray(plan.lanes)) return undefined;
 	const out: ResumeLane[] = [];
@@ -208,7 +215,7 @@ function resumeLane(config: StormConfig, lane: ResumeLane): string {
 	const head = agent === undefined ? `- ${lane.name}` : `- ${lane.name} (${agent})`;
 	const isolated = lane.isolationReason === undefined ? "" : ` [separate checkout: ${lane.isolationReason}]`;
 	const line = lane.goal ? `${head}${isolated}: ${lane.goal}` : `${head}${isolated}`;
-	// A stored plan is repository data: keep control characters and line breaks from adding lines the bounds above do not cover.
+	// A stored plan is session-store data: keep control characters and line breaks from adding lines the bounds above do not cover.
 	return line.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").replace(/\s+/g, " ").slice(0, RESUME_LANE_CHARS);
 }
 
@@ -226,7 +233,7 @@ function resumeBlock(config: StormConfig, resume: ResumeInfo): string[] {
 	const lanes = allLanes.slice(0, RESUME_LANES);
 	const turns = resume.turns ?? 0;
 	const rounds = Number.isFinite(turns) ? Math.max(0, Math.trunc(turns)) : 0;
-	// Both came from a repository file: an id that is not a run id or a reason this version does not know is not shown.
+	// Both came from the session store: an id that is not a run id or a reason this version does not know is not shown.
 	const subject = RUN_ID.test(resume.runId) ? `run ${resume.runId}` : "the earlier run";
 	const reason =
 		resume.endReason !== undefined && Object.hasOwn(END_STATUS, resume.endReason) ? ` (${resume.endReason})` : "";
@@ -269,15 +276,15 @@ export function buildHandoff(input: {
 	const isolated = config.isolation === "isolated";
 	const rules = [
 		"- Delegate all changes; your own file edits are blocked.",
-		`- Before spawning use \`storm plan\`. Lane kinds: ${laneRoles(config)}.`,
-		"- Replan: keep goal/kind/role/files; use `progress` for updates, a new name for changed scope.",
-		"- Cite file:line or command/exit/log; verify relevant ranges.",
+		`- Before spawning use \`storm plan\`; non-review lanes need \`results\`. Kinds: ${laneRoles(config)}.`,
+		"- Replan: keep goal/kind/role/files/results; `progress`=status, new name=scope.",
+		"- Cite file:line or command/exit/log; verify ranges.",
 		isolated
 			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. For follow-up, a new agent reads `agent://<id>`."
 			: "- Share this checkout, reviewer too; sequence overlapping edits. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
 		`- Resolve \`incorrect\` reviews and open P0s${docsEnabled(config) ? ", including doc findings" : ""}.`,
 		"- Finish every lane or report its blocker.",
-		"- Stage `storm brief` from evidence for substantial work, best next first. Storm reports after it settles.",
+		"- Stage `storm brief` from evidence, best next first; Storm reports after it settles.",
 	];
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {

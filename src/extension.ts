@@ -8,10 +8,9 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext, SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
-import { loadConfig } from "./config/store.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { liveIsolationSettings, readExplicitSettings } from "./discovery/settings.ts";
@@ -19,6 +18,7 @@ import {
 	agentsFlow,
 	approveAndSave,
 	autoDelegationFlow,
+	exportFlow,
 	type FlowEnv,
 	hubFlow,
 	modelsFlow,
@@ -33,11 +33,22 @@ import { execPort, ompBinary } from "./omp.ts";
 import { changesFiles, pathOf } from "./policy/director.ts";
 import { docPromptFor } from "./policy/docs.ts";
 import { deliveredFollowUp, followUpAgent } from "./policy/followup.ts";
+import {
+	canonicalScope,
+	effectiveAgentTools,
+	lanePolicy,
+	pathWriteTool,
+	readOnlyIntent,
+	readOnlyTool,
+	targetWithinScope,
+	toolWriteTargets,
+	type LanePolicy,
+} from "./policy/capability.ts";
 import { directorRead, noteChildRead } from "./policy/reads.ts";
 import { activeAgents, blockedSpawn, blockText, deadline, decideSpawn, failClosed, SPAWN_DECISION_MS, usableRole } from "./policy/spawn.ts";
 import { supervisorToolBlock } from "./policy/supervisor.ts";
 import { decideToolCall } from "./policy/toolcall.ts";
-import { PACKAGE_JSON, ROLE_AGENT_PREFIX, STORM_VERSION } from "./roles.ts";
+import { PACKAGE_JSON, ROLE_AGENT_PREFIX, ROLES, STORM_VERSION } from "./roles.ts";
 import {
 	listAgents,
 	noteAgentChange,
@@ -51,11 +62,12 @@ import {
 	noteVerdictTree,
 } from "./runtime/agents.ts";
 import { workingState } from "./runtime/checkpoint.ts";
+import { AttemptCollector } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
-import { replanConflict, type TaskIsolationHost } from "./runtime/lanes.ts";
+import { replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
-import { resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
+import { closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
@@ -65,18 +77,20 @@ import { treeAgainst, type TreeReading } from "./runtime/tree.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
+import { sessionStoreDir } from "./session-scope.ts";
 import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
 import type {
-	ConfigLoad,
 	ExplicitSettings,
 	Exec,
 	InfoTone,
+	PlanLane,
 	RepoIdentity,
 	RunPlan,
 	RunRecord,
 	RunSpec,
+	ShadowInfo,
 	SpawnDecision,
 	StormConfig,
 	UiPort,
@@ -85,6 +99,15 @@ import { createUiPort, registerReportRenderer } from "./ui.ts";
 import { isLiveTui, LiveStatus } from "./view/live.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./view/appearance.ts";
 import { runStatusText } from "./view/render.ts";
+import {
+	activeWorkerRunInTree,
+	endWorkerAdmission,
+	persistWorkerAdmission,
+	readWorkerAdmission,
+	resolveWorkerAdmission,
+	revokeWorkerAdmissions,
+	type WorkerAdmissionRecord,
+} from "./worker-admission.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 /**
@@ -96,12 +119,96 @@ const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
 const SHORTCUTS = [
 	{ value: "status", label: "status", description: "현황만 보기(메뉴 없음)" },
 	{ value: "models", label: "models", description: "모델 점검" },
-	{ value: "auto", label: "auto", description: "자동 위임 켜기/끄기(이 프로필·저장소)" },
+	{ value: "auto", label: "auto", description: "자동 위임 켜기/끄기(이 세션)" },
+	{ value: "export", label: "export", description: "팀 옵션을 복사용으로 내보내기(사람만)" },
 	{ value: "setup", label: "setup", description: "팀 다시 설정" },
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
 const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.value);
-const CONFIG_TTL_MS = 5_000;
+/**
+ * How long a single fresh task/follow-up may wait for a conflicting shared writer to settle before the admission is
+ * refused. It is a wait, not a queue: a long-running writer still leaves the call blocked, and no reservation leaks.
+ */
+const WRITE_WAIT_MS = 1_500;
+const WRITE_WAIT_STEP_MS = 50;
+
+/** A bounded local pause; no host channel is polled. */
+async function pause(ms: number): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setTimeout(resolve, ms);
+	return promise;
+}
+
+/** One Storm worker's approved write authority; the root is the shared tree (or its claimed private checkout). */
+interface AgentAuthority {
+	policy: LanePolicy;
+	/** Shared target root, or the claimed private checkout when `checkout` is present. */
+	root: string;
+	/** Physical private checkout of an isolated lane; path writes must stay inside it. */
+	checkout?: string;
+	/** Planned lane name for a compact refusal; absent for an unplanned child. */
+	lane?: string;
+}
+
+/** Workers admitted by this process's Storm runs (same native id across follow-ups), scoped by artifact tree. */
+const agentAuthorities = new Map<string, AgentAuthority>();
+
+/** OMP agent ids are unique inside one artifact tree, not across profiles or sessions. */
+function authorityKey(artifacts: string | undefined, agentId: string): string {
+	return `${artifacts ?? ""}\0${agentId}`;
+}
+
+/** Resolve the effective definition's tools and enforce the lane's approved capability; a blocked policy stops a spawn. */
+async function authorityFor(input: {
+	agent: string;
+	lane: PlanLane | undefined;
+	shadows: readonly ShadowInfo[];
+	config: StormConfig;
+	root: string;
+	auto: boolean;
+}): Promise<{ ok: true; authority: AgentAuthority } | { ok: false; reason: string }> {
+	const tools = effectiveAgentTools(input.agent, input.shadows, PLUGIN_AGENTS_DIR);
+	const policy = lanePolicy({
+		lane: input.lane,
+		tools,
+		// Team-global isolation and one lane's explicit experiment are both a private checkout; a selective lane must
+		// never be persisted as a shared writer just because the team itself is shared.
+		isolated: input.config.isolation === "isolated" || input.lane?.isolationReason !== undefined,
+		auto: input.auto,
+	});
+	if (policy.kind === "blocked") return { ok: false, reason: policy.reason };
+	if (policy.kind !== "paths") {
+		return { ok: true, authority: { policy, root: input.root, ...(input.lane === undefined ? {} : { lane: input.lane.name }) } };
+	}
+	const canonical = await canonicalScope(input.root, policy.paths);
+	if (canonical === undefined) {
+		return { ok: false, reason: `'${input.lane?.name ?? input.agent}' 레인의 쓰기 경로를 작업 트리 안에서 확인하지 못했습니다(symlink 또는 경로 이탈).` };
+	}
+	return {
+		ok: true,
+		authority: { policy: { ...policy, paths: canonical }, root: input.root, ...(input.lane === undefined ? {} : { lane: input.lane.name }) },
+	};
+}
+
+async function policiesForPlan(
+	plan: RunPlan,
+	config: StormConfig,
+	shadows: readonly ShadowInfo[],
+	root: string,
+	auto: boolean,
+): Promise<{ ok: true; policies: Map<string, LanePolicy>; canonicalFiles: Map<string, readonly string[]> } | { ok: false; reason: string }> {
+	const policies = new Map<string, LanePolicy>();
+	const canonicalFiles = new Map<string, readonly string[]>();
+	for (const lane of plan.lanes) {
+		const agent = config.roles[lane.role]?.agent ?? ROLES.find(role => role.id === lane.role)?.agent;
+		if (agent === undefined) return { ok: false, reason: `'${lane.name}' 레인의 역할 '${lane.role}'에 실행할 에이전트가 없습니다.` };
+		const authority = await authorityFor({ agent, lane, shadows, config, root, auto });
+		if (!authority.ok) return { ok: false, reason: authority.reason };
+		policies.set(lane.name, authority.authority.policy);
+		if (authority.authority.policy.kind === "paths") canonicalFiles.set(lane.name, authority.authority.policy.paths);
+	}
+	return { ok: true, policies, canonicalFiles };
+}
 
 /** The session's personal automatic-delegation policy, refreshed from the approval store. */
 interface AutoStatus {
@@ -179,6 +286,16 @@ function autoRefusal(problem: string | undefined, detail: string | undefined): s
  */
 function needsIsolationHost(plan: RunPlan | undefined, config: StormConfig): boolean {
 	return config.isolation === "isolated" || (plan?.lanes.some(lane => lane.isolationReason !== undefined) ?? false);
+}
+
+/**
+ * Whether starting work under `plan` may write the target. An unplanned manual spawn is treated as a writer; a plan
+ * whose every lane declares read-only intent (and no files) stays a reader, so concurrent read-only runs stay
+ * independent. This mirrors the controller's own upgrade rule; the lease, not this predicate, is the authority.
+ */
+function planMayWrite(plan: RunPlan | undefined): boolean {
+	if (plan === undefined) return true;
+	return plan.lanes.some(lane => !readOnlyIntent(lane) || (lane.files?.length ?? 0) > 0);
 }
 
 /** The same refusal during an active automatic run: the run is already open, so the work belongs to its workers. */
@@ -338,19 +455,11 @@ async function bindReviewerVerdict(exec: Exec, ctx: ExtensionContext, run: Ledge
 	]);
 	if (!fresh || fresh.state.incomplete || fingerprintOf(fresh) !== baseline.tree) return;
 	if (!shared && (!reviewed || reviewed.state.incomplete || fingerprintOf(reviewed) !== baseline.tree)) return;
-	noteVerdictTree(ctx.agent.id, at, baseline.tree);
+	noteVerdictTree(ctx.agent.id, at, baseline.tree, run.sessionDir);
 }
 
+/** Target resolution only: a repository identity is evidence about the worktree, never session or team authority. */
 const repoByCwd = new Map<string, Promise<RepoIdentity>>();
-const configByRoot = new Map<string, { at: number; load: Promise<ConfigLoad> }>();
-
-function cachedConfig(root: string): Promise<ConfigLoad> {
-	const hit = configByRoot.get(root);
-	if (hit && Date.now() - hit.at < CONFIG_TTL_MS) return hit.load;
-	const load = loadConfig(root);
-	configByRoot.set(root, { at: Date.now(), load });
-	return load;
-}
 
 interface AssistantUsage {
 	selector: string;
@@ -452,32 +561,97 @@ export default function storm(pi: ExtensionAPI): void {
 		ctx.ui.setStatus("storm", `${runStatusText(run, Date.now())} · ${label}`);
 	};
 	const stateCache = createStateCache();
+	/**
+	 * Bumped whenever this host's native conversation identity changes (start, switch, clear, branch, shutdown). A
+	 * delayed callback carries the generation it started under and refuses to act once it is no longer current; the
+	 * mutable session manager is never reread later as authority.
+	 */
+	let sessionGeneration = 0;
+	/** The authoritative native main-session id; a child's own id is never a Storm session. */
+	const mainSessionId = (ctx: ExtensionContext): string | undefined =>
+		ctx.agent.kind === "main" ? closeoutSessionId(ctx) : undefined;
+	const requireSessionId = (ctx: ExtensionContext): string => {
+		const id = mainSessionId(ctx);
+		if (id === undefined) {
+			throw new Error("Storm이 이 세션의 id를 확인하지 못했습니다. 새 대화를 연 뒤 다시 시도하세요. 아무것도 저장하지 않았습니다.");
+		}
+		return id;
+	};
+	/** This main session's Storm store; the target root is only the worktree the state describes. */
 	const projectEnv = (ctx: ExtensionContext): ProjectEnv => ({
 		cwd: ctx.cwd,
 		exec,
 		agentDir: pi.pi.getAgentDir(),
 		pluginAgentsDir: PLUGIN_AGENTS_DIR,
+		sessionId: requireSessionId(ctx),
 	});
-	/** A subagent in an isolated worktree still runs under the main worktree's approved config. */
-	const runEnv = (ctx: ExtensionContext, root: string): ProjectEnv => ({ ...projectEnv(ctx), cwd: root });
+	/** A run's state is read under the session that admitted it, at the target the run was started on. */
+	const runEnv = (run: LedgerRun): ProjectEnv => ({
+		cwd: run.root,
+		exec,
+		agentDir: pi.pi.getAgentDir(),
+		pluginAgentsDir: PLUGIN_AGENTS_DIR,
+		sessionId: run.sessionId,
+	});
+	/** A snapshot of one session's state, for delayed work that must not read whichever session is live later. */
+	const envForSession = (sessionId: string, cwd: string): ProjectEnv => ({
+		cwd,
+		exec,
+		agentDir: pi.pi.getAgentDir(),
+		pluginAgentsDir: PLUGIN_AGENTS_DIR,
+		sessionId,
+	});
 	/**
-	 * This session's personal automatic-delegation policy. Consent is loaded at session start and refreshed on a
-	 * user turn, a session switch and every command; a failed refresh keeps the last enabled guard rather than
-	 * unfencing direct tools. The request text is the host's already-normalized prompt for this turn.
+	 * One native session's personal automatic-delegation policy, keyed by its own identity. A refresh that completes
+	 * after the conversation changed writes nothing: the entry (and the map) it started on is gone.
 	 */
-	const auto: AutoStatus & { task: string | undefined } = { enabled: false, problem: undefined, task: undefined };
+	interface AutoEntry extends AutoStatus {
+		task: string | undefined;
+		epoch: number;
+	}
+	const autos = new Map<string, AutoEntry>();
+	let autoEpoch = 0;
+	const autoFor = (sessionId: string): AutoEntry => {
+		const hit = autos.get(sessionId);
+		if (hit) return hit;
+		const entry: AutoEntry = { enabled: false, problem: undefined, task: undefined, epoch: ++autoEpoch };
+		autos.set(sessionId, entry);
+		return entry;
+	};
+	const autoOf = (ctx: ExtensionContext): AutoEntry | undefined => {
+		const id = mainSessionId(ctx);
+		return id === undefined ? undefined : autos.get(id);
+	};
+	/** What a tool host bound to `sessionId` reports, even after another conversation became live. */
+	const autoSnapshot = (sessionId: string): { enabled: boolean; blocked?: string; task?: string } => {
+		const entry = autos.get(sessionId);
+		if (entry === undefined) return { enabled: false };
+		return {
+			enabled: entry.enabled,
+			...(entry.problem !== undefined ? { blocked: entry.problem } : {}),
+			...(entry.task !== undefined ? { task: entry.task } : {}),
+		};
+	};
 	const refreshAuto = async (ctx: ExtensionContext, load?: () => Promise<ProjectState>): Promise<void> => {
+		const sessionId = mainSessionId(ctx);
+		if (sessionId === undefined) return;
+		const entry = autoFor(sessionId);
+		const epoch = entry.epoch;
+		const current = (): boolean => autos.get(sessionId) === entry && entry.epoch === epoch;
 		let state: ProjectState;
 		try {
 			state = await (load ? load() : loadProjectState(projectEnv(ctx)));
 		} catch {
-			// A failed load cannot prove the user withdrew consent: keep the last enabled guard.
-			if (auto.enabled) auto.problem = "팀 설정을 확인하지 못했습니다. /storm 으로 확인하세요.";
+			// A failed load cannot prove consent was withdrawn for the same conversation; on a changed one the entry is
+			// already gone and this writes nothing.
+			if (current() && entry.enabled) entry.problem = "팀 설정을 확인하지 못했습니다. /storm 으로 확인하세요.";
 			return;
 		}
-		auto.problem = teamProblem(state) ?? modeProblem(ctx);
+		if (!current()) return;
+		entry.problem = teamProblem(state) ?? modeProblem(ctx);
 		try {
-			auto.enabled = await readAutoDelegation(state.store.dir);
+			const enabled = await readAutoDelegation(state.sessionDir);
+			if (current()) entry.enabled = enabled;
 		} catch {
 			// An unreadable consent file is not an opt-out. Keep the last enabled guard.
 		}
@@ -489,6 +663,36 @@ export default function storm(pi: ExtensionAPI): void {
 		repoByCwd.set(ctx.cwd, repo);
 		repo.catch(() => repoByCwd.delete(ctx.cwd));
 		return repo;
+	};
+	/**
+	 * The scope the agents ledger uses to keep one conversation's workers apart. Main: the run's captured store when
+	 * one is live, else this session's own store. Child: only the run its parent admitted; undefined never falls back.
+	 */
+	const agentScope = (ctx: ExtensionContext): string | undefined => {
+		if (ctx.agent.kind === "sub") return childLedger(ctx)?.sessionDir;
+		const id = mainSessionId(ctx);
+		if (id === undefined) return undefined;
+		// A run that has not finished draining may still be this controller's, but it is authority only for the
+		// session that admitted it. A switched conversation reads its own store, never the old run's scope.
+		const run = getLedgerRun(runs.runId());
+		if (run !== undefined && run.sessionId === id) return run.sessionDir;
+		try {
+			return sessionStoreDir(pi.pi.getAgentDir(), id);
+		} catch {
+			return undefined;
+		}
+	};
+	/**
+	 * The session state behind an event: a main session reads its own store, a child only the run its parent admitted.
+	 * A bare child has no Storm session; undefined is a fail-closed answer, never a cwd or "most recent session" guess.
+	 */
+	const stateForEvent = (ctx: ExtensionContext): Promise<ProjectState | undefined> => {
+		if (ctx.agent.kind === "main") {
+			const id = mainSessionId(ctx);
+			return id === undefined ? Promise.resolve(undefined) : stateCache.get(envForSession(id, ctx.cwd));
+		}
+		const ledger = childLedger(ctx);
+		return ledger === undefined ? Promise.resolve(undefined) : stateCache.get(runEnv(ledger));
 	};
 
 	/** Read on every use: these settings may change during a session, and only status and setup ask. */
@@ -516,26 +720,168 @@ export default function storm(pi: ExtensionAPI): void {
 		return load;
 	};
 
+	/** Profile dir for the persisted worker admission bridge; a host failure is a closed failure, not a fallback. */
+	const workerAdmissionAgentDir = (): string => pi.pi.getAgentDir();
+	const revokeWorkerAdmissionsFor = async (match: { runId?: string; sessionId?: string }): Promise<void> => {
+		try {
+			await revokeWorkerAdmissions(workerAdmissionAgentDir(), match);
+		} catch {
+			// Revocation is defensive; the child's next write still fails closed if the store is unreadable.
+		}
+	};
+	const policyFromAdmission = (record: WorkerAdmissionRecord): LanePolicy => {
+		switch (record.policy.kind) {
+			case "paths":
+				return { kind: "paths", paths: [...record.policy.paths], reason: record.policy.reason };
+			case "read":
+				return { kind: "read", reason: record.policy.reason };
+			case "private":
+				return { kind: "private", reason: record.policy.reason };
+			case "unknown":
+				return { kind: "unknown", reason: record.policy.reason };
+			case "blocked":
+				return { kind: "blocked", reason: record.policy.reason };
+		}
+	};
+	const authorityFromAdmission = (record: WorkerAdmissionRecord, checkout?: string): AgentAuthority => ({
+		policy: policyFromAdmission(record),
+		root: checkout ?? record.targetRoot,
+		...(checkout === undefined ? {} : { checkout }),
+		...(record.lane === undefined ? {} : { lane: record.lane }),
+	});
+	/**
+	 * A child's actual authority. The persisted admission is authoritative for every non-read tool, so a rebound
+	 * module and a worker-homed child enforce the same policy as the parent; an invalid/revoked record denies, a
+	 * genuinely absent one leaves unrelated native work alone.
+	 */
+	const childWorkerAuthority = async (
+		ctx: ExtensionContext,
+	): Promise<{ kind: "unmanaged" } | { kind: "authorized"; authority: AgentAuthority } | { kind: "denied"; reason: string }> => {
+		const artifacts = artifactsOf(ctx);
+		const workerKey = authorityKey(artifacts, ctx.agent.id);
+		const inMemory = agentAuthorities.get(workerKey);
+		try {
+			const resolved = await resolveWorkerAdmission({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: artifacts,
+				parentId: ctx.agent.parentId,
+				childId: ctx.agent.id,
+				childSessionId: closeoutSessionId(ctx),
+				childCwd: ctx.cwd,
+			});
+			if (resolved.kind === "authorized") {
+				const authority = authorityFromAdmission(resolved.record, resolved.checkout);
+				agentAuthorities.set(workerKey, authority);
+				return { kind: "authorized", authority };
+			}
+			if (resolved.kind === "denied") return { kind: "denied", reason: resolved.reason };
+			// Without the persisted record a private lane has no exact checkout to bind; the in-memory target root is
+			// the integrated tree, so using it would permit parent writes. Fail closed instead.
+			if (inMemory === undefined) return { kind: "unmanaged" };
+			if (inMemory.policy.kind === "private") {
+				return { kind: "denied", reason: "격리 워커의 체크아웃 권한 기록을 확인하지 못했습니다" };
+			}
+			return { kind: "authorized", authority: inMemory };
+		} catch {
+			return { kind: "denied", reason: "자식 실행 권한을 확인하지 못했습니다" };
+		}
+	};
+	/** The child's own settled turn/switch closes its current attempt; a follow-up admission opens the next one. */
+	const closeChildWorkerAdmission = async (ctx: ExtensionContext): Promise<void> => {
+		try {
+			const read = await readWorkerAdmission({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: artifactsOf(ctx),
+				parentId: ctx.agent.parentId,
+				childId: ctx.agent.id,
+			});
+			if (read.kind !== "record") return;
+			await endWorkerAdmission(
+				workerAdmissionAgentDir(),
+				read.key,
+				read.record.attempt,
+				closeoutSessionId(ctx),
+			);
+		} catch {
+			// A failed close leaves the record for the parent's run-end revocation.
+		}
+	};
+	/** Parent side: write the exact admission before returning from the spawn hook. */
+	const persistChildAdmission = async (input: {
+		ctx: ExtensionContext;
+		run: LedgerRun;
+		artifacts: string | undefined;
+		childId: string;
+		lane?: PlanLane;
+		authority: AgentAuthority;
+	}): Promise<void> => {
+		await persistWorkerAdmission({
+			agentDir: workerAdmissionAgentDir(),
+			artifactRoot: input.artifacts,
+			parentId: input.ctx.agent.id,
+			childId: input.childId,
+			runId: input.run.runId,
+			sessionId: input.run.sessionId,
+			sessionDir: input.run.sessionDir,
+			repoId: input.run.repoId,
+			targetRoot: input.run.root,
+			...(input.lane === undefined ? {} : { lane: input.lane.name }),
+			policy: input.authority.policy,
+		});
+	};
+
+	/** The last run shown live; its child admissions close when finalization reports no run. */
+	let liveRunId: string | undefined;
 	const runs = new RunController({
 		pi,
 		ui: ctx => createUiPort(pi, ctx),
 		loadState: async ctx => loadProjectState(projectEnv(ctx)),
 		now: Date.now,
-		agents: runId => listAgents({ runId }),
+		agents: (runId, sessionDir) => listAgents({ runId, scope: sessionDir }),
 		tree: (root, base) => treeAgainst(exec, root, base),
-		ledger: () => listAgents(),
+		// Cleanup inventory only: the janitor passes the session it is sweeping, never a process-wide view.
+		ledger: sessionDir => listAgents({ scope: sessionDir }),
 		agentDir: pi.pi.getAgentDir(),
 		live: (ctx, run) => {
 			if (run) {
+				liveRunId = run.runId;
 				showRunStatus(ctx, run, runs.phase());
 				return;
 			}
+			const ended = liveRunId;
+			liveRunId = undefined;
+			if (ended !== undefined) void revokeWorkerAdmissionsFor({ runId: ended });
 			liveStatus.clear();
 			// Finalization already dropped the controller's keys; the session's records only existed to close them.
 			openWaits.clear();
 			void syncSession(ctx).catch(() => undefined);
 		},
 	});
+
+	/**
+	 * Host-attested attempt capture for this session. The controller keeps the lane contract, pre-write baseline and
+	 * RunRecord.results; the collector only binds native ids and captures exact host-named artifacts. It subscribes to
+	 * the process-global AgentRegistry lazily on the first contract-bearing lane and stops with the run.
+	 */
+	const attempts = new AttemptCollector({
+		port: {
+			prepare: input => runs.prepareAttempt(input),
+			settle: input => runs.settleAttempt(input),
+		},
+		registry: () => AgentRegistry.global(),
+	});
+
+	/**
+	 * The current facts of every lane some plan edge waits on. Only those lanes are read; an empty set never touches the
+	 * ledger. A dependency whose state is missing fails closed in the gate instead of guessing from the plan.
+	 */
+	const readinessFor = async (plan: RunPlan | undefined): Promise<LaneReadinessView | undefined> => {
+		if (plan === undefined) return undefined;
+		const needed = new Set<string>();
+		for (const lane of plan.lanes) for (const dependency of lane.dependsOn ?? []) needed.add(dependency.lane);
+		if (needed.size === 0) return undefined;
+		return runs.laneReadiness(plan, needed);
+	};
 
 	/**
 	 * The run a session's dialog blocks. A main-session dialog belongs to the run it directs; a child's belongs to the
@@ -588,25 +934,38 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 	pi.on("tool_approval_resolved", (event, ctx) => closeWait(ctx, "approval", event.toolCallId));
 
-	const flowEnv = (ctx: ExtensionContext, startRun?: (spec: RunSpec) => Promise<RunRequestResult>): FlowEnv => ({
-		...projectEnv(ctx),
-		ompBin: ompBinary(),
-		registry: ctx.modelRegistry,
-		activeTools: pi.getActiveTools(),
-		now: Date.now,
-		activeRun: () => runs.active(),
-		activePhase: () => runs.phase(),
-		autoModeProblem: () => modeProblem(ctx),
-		agents: () => listAgents({ ancestorId: ctx.agent.id }),
-		ompSettings,
-		newerVersion,
-		// This conversation's own session directory, from the public session manager; empty where the host has none.
-		sessionDir: sessionDirOf(ctx),
-		...(startRun ? { startRun } : {}),
-	});
+	const flowEnv = (ctx: ExtensionContext, startRun?: (spec: RunSpec) => Promise<RunRequestResult>): FlowEnv => {
+		const env = projectEnv(ctx);
+		const generation = sessionGeneration;
+		// A dialog can outlive a switch, a fork, or a host move. The closure is evaluated by the flow just before
+		// its write: it must still name this session, this generation and this physical target. A mutable "current
+		// session" is never consulted.
+		const target = ctx.cwd;
+		return {
+			...env,
+			ompBin: ompBinary(),
+			registry: ctx.modelRegistry,
+			activeTools: pi.getActiveTools(),
+			now: Date.now,
+			activeRun: () => runs.active(),
+			activePhase: () => runs.phase(),
+			autoModeProblem: () => modeProblem(ctx),
+			agents: () => {
+				const scope = agentScope(ctx);
+				return scope === undefined ? [] : listAgents({ ancestorId: ctx.agent.id, scope });
+			},
+			ompSettings,
+			newerVersion,
+			// The HOST's transcript/artifact store; Storm's own session store is ProjectState.sessionDir.
+			ompSessionDir: ompSessionDirOf(ctx),
+			stillOwner: () =>
+				generation === sessionGeneration && mainSessionId(ctx) === env.sessionId && sameWorkTree(ctx.cwd, target),
+			...(startRun ? { startRun } : {}),
+		};
+	};
 
-	/** The session's own directory from the public session manager; empty when a host keeps its sessions in memory. */
-	const sessionDirOf = (ctx: ExtensionContext): string => {
+	/** The host's own session directory (transcripts, artifacts); empty when the host keeps its sessions in memory. */
+	const ompSessionDirOf = (ctx: ExtensionContext): string => {
 		try {
 			return ctx.sessionManager?.getSessionDir() ?? "";
 		} catch {
@@ -614,23 +973,38 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 	};
 
-	/** The approval path's host, and what a team change needs besides. Saving drops the caches the spawn hook reads. */
-	const actionHost = (ctx: ExtensionContext, ui: UiPort): ActionHost => ({
-		ui,
-		now: Date.now,
-		loadState: () => loadProjectState(projectEnv(ctx)),
-		prepare: () => prepareAnalysis(flowEnv(ctx), ui),
-		approveAndSave: async (state, config, scope) => {
-			try {
-				return await approveAndSave(state, config, scope);
-			} finally {
-				stateCache.clear();
-				configByRoot.clear();
-			}
-		},
-		addQuotaMark: async mark => addQuotaMark((await repoFor(ctx)).root, mark),
-		quota: () => readQuota(exec, ompBinary()),
-	});
+	/**
+	 * The approval path's host, and what a team change needs besides. Every read and write is bound to the session
+	 * that opened the dialog; if the conversation changes before it is answered, nothing is loaded or saved.
+	 */
+	const actionHost = (ctx: ExtensionContext, ui: UiPort): ActionHost => {
+		const env = projectEnv(ctx);
+		const generation = sessionGeneration;
+		const stillOwner = (): boolean => generation === sessionGeneration && closeoutSessionId(ctx) === env.sessionId;
+		const movedOn = new Error("대화가 바뀌어 이전 세션의 작업을 저장하지 않았습니다. 새 대화에서 다시 시도하세요.");
+		return {
+			ui,
+			now: Date.now,
+			loadState: async () => {
+				if (!stillOwner()) throw movedOn;
+				return loadProjectState(env);
+			},
+			prepare: () => prepareAnalysis(flowEnv(ctx), ui),
+			approveAndSave: async (state, config, scope) => {
+				if (!stillOwner()) throw movedOn;
+				try {
+					return await approveAndSave(state, config, scope, stillOwner);
+				} finally {
+					stateCache.clear();
+				}
+			},
+			addQuotaMark: async mark => {
+				if (!stillOwner()) return;
+				await addQuotaMark((await loadProjectState(env)).sessionDir, mark);
+			},
+			quota: () => readQuota(exec, ompBinary()),
+		};
+	};
 
 	/** One counter for Storm's own tool dialogs; the key only has to differ while a dialog waits. */
 	let toolDialogs = 0;
@@ -663,6 +1037,14 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 
 	const toolHost = (ctx: ExtensionContext): StormToolHost => {
+		const env = projectEnv(ctx);
+		const generation = sessionGeneration;
+		const sessionId = env.sessionId;
+		/** A tool call that began in one conversation never acts on the one that replaced it. */
+		const stillOwner = (): boolean => generation === sessionGeneration && closeoutSessionId(ctx) === sessionId;
+		const stale = "대화가 바뀌어 이 호출은 적용하지 않았습니다. 새 대화에서 다시 시도하세요.";
+		const flow = flowEnv(ctx);
+		const scope = agentScope(ctx);
 		const { ui, now, loadState, prepare, approveAndSave: save } = actionHost(ctx, observingUi(ctx, createUiPort(pi, ctx)));
 		return {
 			ui,
@@ -670,19 +1052,19 @@ export default function storm(pi: ExtensionAPI): void {
 			loadState,
 			prepare,
 			approveAndSave: save,
-			statusText: opts => statusText(flowEnv(ctx), opts),
-			auto: () => ({
-				enabled: auto.enabled,
-				...(auto.problem !== undefined ? { blocked: auto.problem } : {}),
-				...(auto.task !== undefined ? { task: auto.task } : {}),
-			}),
+			statusText: opts => {
+				if (!stillOwner()) throw new Error(stale);
+				return statusText(flow, opts);
+			},
+			auto: () => autoSnapshot(sessionId),
 			runtime: {
-				requestRun: spec => runs.request(spec),
-				replanConflict: plan => replanConflict(getLedgerRun(runs.runId())?.plan, plan),
-				setRunPlan: plan => runs.setPlan(plan),
-				submitCloseout: draft => runs.submitCloseout(draft),
-				runActive: () => runs.runId() !== undefined,
+				requestRun: spec => (stillOwner() ? runs.request(spec) : { ok: false, reason: stale }),
+				replanConflict: plan => (stillOwner() ? replanConflict(getLedgerRun(runs.runId())?.plan, plan) : undefined),
+				setRunPlan: plan => (stillOwner() ? runs.setPlan(ctx, plan) : { ok: false, reason: stale }),
+				submitCloseout: draft => (stillOwner() ? runs.submitCloseout(ctx, draft) : { ok: false, reason: stale }),
+				runActive: () => stillOwner() && runs.runId() !== undefined,
 				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) => {
+					if (!stillOwner()) return { ok: false, reason: stale };
 					// Public plan mode means the user is still planning; an automatic run may not start there.
 					const modes = ctx.sessionModes;
 					if (modes !== undefined) {
@@ -703,7 +1085,7 @@ export default function storm(pi: ExtensionAPI): void {
 					if (started.ok) runs.startAutoCheckpoint();
 					return started;
 				},
-				agents: () => listAgents({ ancestorId: ctx.agent.id }),
+				agents: () => (stillOwner() && scope !== undefined ? listAgents({ ancestorId: ctx.agent.id, scope }) : []),
 			},
 		};
 	};
@@ -746,12 +1128,15 @@ export default function storm(pi: ExtensionAPI): void {
 
 	// A decision that fails or outlasts omp's handler budget blocks storm-* agents and any agent during a run: omp
 	// would otherwise run the spawn on its own model, unrecorded and uncounted.
-	pi.on("before_subagent_spawn", (event, ctx) => {
+	pi.on("before_subagent_spawn", async (event, ctx) => {
+		const generation = sessionGeneration;
+		const mainId = mainSessionId(ctx);
+		const auto = autoOf(ctx);
 		// Automatic delegation never lets the main session spawn its way around the plan: before the first plan
 		// opens a run, every spawn is refused. This is checked before any state read, so it also holds when the
 		// team config or approval cannot be read; subagent sessions are not fenced by this session's policy.
-		if (ctx.agent.kind === "main" && auto.enabled && runs.runId() === undefined) {
-			return { block: true, reason: autoRefusal(auto.problem, AUTO_SPAWN_REASON) };
+		if (ctx.agent.kind === "main" && auto?.enabled === true && runs.runId() === undefined) {
+			return { block: true, reason: autoRefusal(auto?.problem, AUTO_SPAWN_REASON) };
 		}
 		const limit = deadline(SPAWN_DECISION_MS);
 		let timedOut = false;
@@ -762,18 +1147,38 @@ export default function storm(pi: ExtensionAPI): void {
 		// The admitted run is fixed for this spawn: a later start in the same tree must not receive its record.
 		const captured = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
 		const capturedRunId = captured?.runId;
-		// A child that once worked in a run but has no current binding is scope-uncertain: its nested spawn must not
-		// attach to whatever run happens to be active in the same tree.
-		if (ctx.agent.kind === "sub" && captured === undefined && listAgents().some(agent => agent.id === ctx.agent.id && agent.runId !== undefined)) {
+		// A separate native child has no Storm session: only the run its parent admitted can route it. There is no
+		// unscoped ledger lookup here, so a same-id worker of another session is never consulted. If its artifact tree
+		// still has a live managed run, even a non-Storm name is an unattributed nested spawn and fails closed.
+		if (ctx.agent.kind === "sub" && captured === undefined) {
+			let managed = false;
+			try {
+				managed = await activeWorkerRunInTree(pi.pi.getAgentDir(), artifacts);
+			} catch {
+				managed = event.agent.startsWith(ROLE_AGENT_PREFIX);
+			}
+			if (!managed && !event.agent.startsWith(ROLE_AGENT_PREFIX)) return undefined;
 			return {
 				block: true,
-				reason: blockText({ code: "internal", reason: "이 서브에이전트의 실행 소속을 확인하지 못해 새 스폰을 막았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." }),
+				reason: blockText({
+					code: "internal",
+					reason: managed
+						? "관리 실행 중인 트리에서 부모 실행을 특정하지 못한 중첩 스폰은 허용하지 않았습니다. 감독 세션에서 계획된 레인으로 스폰하세요."
+						: "이 서브에이전트의 부모 실행을 확인하지 못해 Storm 역할 스폰을 허용하지 않았습니다. 감독 세션에서 다시 스폰하세요.",
+				}),
 			};
 		}
 		const closed = (): SpawnDecision => ({
 			block: true,
 			reason: blockText({ code: "internal", reason: "Storm 실행 원장이 끝났거나 닫혀 이 스폰을 허용하지 않았습니다. 실행 상태를 다시 확인하세요." }),
 		});
+		const moved = (): SpawnDecision => ({
+			block: true,
+			reason: blockText({ code: "internal", reason: "대화가 바뀌어 이 스폰을 허용하지 않았습니다. 새 대화에서 다시 시도하세요." }),
+		});
+		const stillOwn = (): boolean =>
+			ctx.agent.kind !== "main" || (generation === sessionGeneration && mainSessionId(ctx) === mainId);
+		const autoOn = auto?.enabled === true;
 		const ledgerBlock = (reason: string, run: LedgerRun, now: number): SpawnDecision => {
 			const block = { code: "internal" as const, reason };
 			if (getLedgerRun(run.runId) === run) noteRunSpawn(run.runId, blockedSpawn(event, block, now));
@@ -785,23 +1190,27 @@ export default function storm(pi: ExtensionAPI): void {
 			// Recheck the captured run rather than a repo or cwd match; a close or a new run is not this spawn's owner.
 			const run = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
 			if (capturedRunId !== undefined && (run === undefined || run.closing)) return closed();
-			if (ctx.agent.kind === "main" && auto.enabled && runs.runId() === undefined) {
-				return { block: true, reason: autoRefusal(auto.problem, AUTO_SPAWN_REASON) };
+			if (ctx.agent.kind === "main" && auto?.enabled === true && runs.runId() === undefined) {
+				return { block: true, reason: autoRefusal(auto?.problem, AUTO_SPAWN_REASON) };
 			}
 			// Outside a run only storm-* agents are Storm's business.
 			if (!event.agent.startsWith(ROLE_AGENT_PREFIX) && capturedRunId === undefined) return undefined;
-			// An isolated child still routes by the main worktree's approved team.
-			const state = await stateCache.get(run ? runEnv(ctx, run.root) : projectEnv(ctx));
+			// A run carries its originating session; a bare main session must have its own. A child's own id is never used.
+			const env = run === undefined ? (ctx.agent.kind === "main" && mainId !== undefined ? envForSession(mainId, ctx.cwd) : undefined) : undefined;
+			if (run === undefined && env === undefined) return moved();
+			const state = await stateCache.get(run === undefined ? env! : runEnv(run));
 			if (timedOut) return closed();
+			if (ctx.agent.kind === "main" && (generation !== sessionGeneration || mainSessionId(ctx) !== mainId)) return moved();
 			if (run !== undefined && state.repo.root !== run.root) return closed();
-			const root = state.repo.root;
-			// One decision at a time per project, so parallel spawns never read the same trial counters or live counts.
-			return serialized(`spawn:${root}`, async () => {
+			// One decision at a time per session, so parallel spawns never read the same trial counters or live counts;
+			// different sessions on the same target stay independent.
+			return serialized(`spawn:${state.sessionDir}`, async () => {
 				if (timedOut) return closed();
 				const now = Date.now();
 				const current = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
 				if (capturedRunId !== undefined && (current === undefined || current.closing)) return closed();
-				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(root, now), readTrialStates(root)]);
+				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(state.sessionDir, now), readTrialStates(state.sessionDir)]);
+				if (!stillOwn()) return moved();
 				const outcome = decideSpawn(
 					event,
 					{ config: state.config, approval: state.approval, shadows: state.shadows },
@@ -816,7 +1225,7 @@ export default function storm(pi: ExtensionAPI): void {
 										costUsd: current.costUsd,
 										...(current.budget ? { budget: current.budget } : {}),
 										...(current.plan ? { plan: current.plan } : {}),
-										active: activeAgents(runSpawns(current.runId), listAgents({ runId: current.runId }), now),
+										active: activeAgents(runSpawns(current.runId), listAgents({ runId: current.runId, scope: current.sessionDir }), now),
 									},
 								}
 							: {}),
@@ -829,26 +1238,38 @@ export default function storm(pi: ExtensionAPI): void {
 					if (record?.trialId) {
 						const trialId = record.trialId;
 						const routed = record.outcome === "trial" ? 1 : 0;
-						if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId);
+						if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId, state.sessionDir);
 						const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
 						// The decision stands even when the counter file cannot be written.
-						await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
+						await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
 					}
 					if (record && current) noteRunSpawn(current.runId, record);
 					return outcome.decision;
 				}
 				if (timedOut) return closed();
+				if (!stillOwn()) return moved();
 				if (current !== undefined) {
 					const config = state.config.status === "ok" ? state.config.config : undefined;
+					// A managed run without a readable team cannot attest a child's capability; admitting it anyway would
+					// be an unverifiable writer on another thread.
+					if (config === undefined) {
+						return ledgerBlock("실행의 승인된 팀 설정을 확인하지 못해 자식 스폰을 허용하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요.", current, now);
+					}
 					const plan = current.plan;
 					// The director's task call was rewritten to a reserved lane before the host allocated this spawn.
 					if (ctx.agent.kind === "main" && plan !== undefined && config !== undefined) {
 						if (record === undefined) {
-							if (auto.enabled) return ledgerBlock("스폰 기록을 만들지 못해 자동 위임 레인을 확인할 수 없습니다. 다시 스폰하세요.", current, now);
+							if (autoOn || plan !== undefined) {
+								return ledgerBlock("스폰 기록을 만들지 못해 승인된 레인을 확인할 수 없습니다. 다시 스폰하세요.", current, now);
+							}
 						} else {
-							const lane = runs.runLanes()?.admit(record, auto.enabled ? undefined : { plan, config });
+							const admission = runs.runLanes()?.admitChecked(record, autoOn ? undefined : { plan, config });
+							if (admission !== undefined && !admission.ok) return ledgerBlock(admission.reason, current, now);
+							const lane = admission?.ok ? admission.lane : undefined;
 							if (lane !== undefined) record.lane = lane;
-							else if (auto.enabled) return ledgerBlock("자동 위임에서 레인 배정을 확인하지 못해 스폰을 막았습니다. plan을 다시 제출하고 레인의 역할과 이름을 맞추세요.", current, now);
+							else if (plan !== undefined) {
+								return ledgerBlock("승인된 계획의 구체적인 레인에 속하지 않은 자식이라 스폰을 허용하지 않았습니다. 레인 이름과 역할을 맞춰 다시 계획하세요.", current, now);
+							}
 						}
 					}
 					const spawnKey = event.spawnKey;
@@ -858,62 +1279,149 @@ export default function storm(pi: ExtensionAPI): void {
 					if (!bindLedgerChild(current.runId, spawnKey, ctx.agent.id, artifacts)) {
 						return ledgerBlock("자식 실행을 원장에 결속하지 못했습니다. 실행 상태를 확인한 뒤 다시 스폰하세요.", current, now);
 					}
+					// The lane's approved capability is decided before the child starts: a read-only intent is enforced by
+					// restricting tools, and a write-capable intent never becomes a shared writer by role label alone.
+					if (config !== undefined) {
+						const lane = record?.lane === undefined ? undefined : plan?.lanes.find(candidate => candidate.name === record.lane);
+						const authority = await authorityFor({
+							agent: event.agent,
+							lane,
+							shadows: state.shadows,
+							config,
+							root: current.root,
+							auto: autoOn,
+						});
+						if (!authority.ok) return ledgerBlock(authority.reason, current, now);
+						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority.authority);
+						// Persist before returning: a pooled/rebound child has no access to this thread's map. A failure
+						// here blocks the spawn rather than allowing an unverifiable writer.
+						try {
+							await persistChildAdmission({
+								ctx,
+								run: current,
+								artifacts,
+								childId: spawnKey,
+								...(lane === undefined ? {} : { lane }),
+								authority: authority.authority,
+							});
+						} catch {
+							return ledgerBlock("자식 실행 권한을 프로필에 저장하지 못해 스폰을 허용하지 않았습니다. 프로필 경로와 권한을 확인하세요.", current, now);
+						}
+					}
+					// The lane's required results need their pre-write state before the child starts. This runs after every
+					// existing refusal and the ledger binding, so a failed baseline is the only new block here.
+					if (ctx.agent.kind === "main" && record?.lane !== undefined && plan !== undefined && config !== undefined) {
+						const lane = plan.lanes.find(candidate => candidate.name === record.lane);
+						if (lane !== undefined) {
+							const artifactMode = lane.isolationReason !== undefined || config.isolation === "isolated" ? "isolated" : "shared";
+							const admitted = await attempts.admitSpawn({
+								runId: current.runId,
+								parentId: ctx.agent.id,
+								spawnKey,
+								lane,
+								artifactMode,
+								startedAt: Date.now(),
+							});
+							if (!admitted.ok) return ledgerBlock(admitted.reason, current, Date.now());
+						}
+					}
 				}
 				if (timedOut) return closed();
+				if (!stillOwn()) return moved();
 				if (record?.trialId) {
 					const trialId = record.trialId;
 					const routed = record.outcome === "trial" ? 1 : 0;
-					if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId);
+					if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId, state.sessionDir);
 					const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
-					await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
+					await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
 				}
 				if (record && current) noteRunSpawn(current.runId, record);
 				return outcome.decision;
 			});
 		};
-		return failClosed(event.agent, () => capturedRunId !== undefined || auto.enabled || anyLedgerRun(), decide, {
+		return failClosed(event.agent, () => capturedRunId !== undefined || autoOn || anyLedgerRun(), decide, {
 			expired: limit.expired,
 			onBlock: block => {
 				// Only the run captured at entry may receive the blocked record: never a fresh run in the same tree.
 				const run = getLedgerRun(capturedRunId);
 				if (run) noteRunSpawn(run.runId, blockedSpawn(event, block, Date.now()));
 			},
-		}).finally(limit.cancel);
+		}).finally(limit.cancel).then(decision => {
+			// A refused spawn must not keep its lane/write reservation or its enforced authority: another writer may start.
+			if (decision !== undefined && "block" in decision && event.spawnKey !== undefined) {
+				runs.runLanes()?.cancel(event.spawnKey);
+				agentAuthorities.delete(authorityKey(artifacts, event.spawnKey));
+			}
+			return decision;
+		});
 	});
 
 	pi.on("message_end", async (event, ctx) => {
+		// A finished background task is a custom `async-result` message on the parent, not an assistant turn. Observe it
+		// before the usage guard, which has no usage to read for that message.
+		if (ctx.agent.kind === "main") {
+			const runId = runs.runId();
+			if (runId !== undefined) {
+				await attempts.observeMessage({ runId, parentId: ctx.agent.id, message: event.message, observedAt: Date.now() });
+			}
+		}
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
 		const ledger = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
-		if (ctx.agent.kind === "sub" && ledger) noteAgentRun(ctx.agent.id, ledger.runId);
-		if (ctx.agent.kind === "main" && usage.promptTokens > 0) runs.noteMainContext(usage.promptTokens);
-		if (ctx.agent.kind === "sub" && usage.promptTokens > 0) {
-			noteAgentUsage({
-				id: ctx.agent.id,
-				model: usage.selector,
-				promptTokens: usage.promptTokens,
-				costUsd: usage.usd,
-				now: Date.now(),
-			});
+		if (ctx.agent.kind === "sub") {
+			// A bare child has no attested Storm owner: its own native session is never substituted.
+			if (ledger === undefined) return;
+			noteAgentRun(ctx.agent.id, ledger.runId, ledger.sessionDir);
+			if (usage.promptTokens > 0) {
+				noteAgentUsage({
+					id: ctx.agent.id,
+					model: usage.selector,
+					promptTokens: usage.promptTokens,
+					costUsd: usage.usd,
+					now: Date.now(),
+					scope: ledger.sessionDir,
+				});
+			}
+		} else if (usage.promptTokens > 0) {
+			runs.noteMainContext(usage.promptTokens);
 		}
 		if (usage.usd <= 0) return;
 		if (ctx.agent.kind === "main") runs.noteMainSpend(usage.usd);
 		const run = ledger === undefined ? undefined : recordCost(ledger.runId, usage.selector, usage.usd);
 		if (run) touchRun(run.runId);
-		// A trial's budget counts what the subagents routed to its candidate spend on that candidate.
-		if (ctx.agent.kind !== "sub") return;
-		const repo = await repoFor(ctx);
-		const root = ledger?.root ?? repo.root;
-		const load = await cachedConfig(root);
-		const trialId = load.status === "ok" ? trialCharge(ctx.agent.id, usage.selector, load.config) : undefined;
+		// A trial's budget counts what the subagents routed to its candidate spend on that candidate. Only the run its
+		// parent admitted supplies the session store; a bare child's own native session is never a Storm session.
+		if (ctx.agent.kind !== "sub" || ledger === undefined) return;
+		const state = await stateCache.get(runEnv(ledger));
+		const load = state.config;
+		const trialId = load.status === "ok" ? trialCharge(ctx.agent.id, usage.selector, load.config, ledger.sessionDir) : undefined;
 		if (trialId === undefined) return;
 		const trial = load.status === "ok" ? load.config.trials?.find(t => t.id === trialId) : undefined;
-		await updateTrialState(root, trialId, current => markTrialStop(trial, { ...current, costUsd: current.costUsd + usage.usd }, Date.now()));
+		await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, costUsd: current.costUsd + usage.usd }, Date.now()));
+	});
+
+	// Native task/follow-up progress carries the host's retry count before an async delivery names its failure. The
+	// collector binds it only to the exact run/parent/tool call it already tracks; no new retry or model parsing.
+	pi.on("tool_execution_update", async (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		const runId = runs.runId();
+		if (runId === undefined || (event.toolName !== "task" && event.toolName !== "write")) return;
+		attempts.observeProgress({
+			runId,
+			parentId: ctx.agent.id,
+			toolCallId: event.toolCallId,
+			partialResult: event.partialResult,
+			observedAt: Date.now(),
+		});
 	});
 
 	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind === "main") {
+			// Without a native session identity there is no Storm policy to apply; the ordinary conversation is untouched.
+			const sessionId = mainSessionId(ctx);
+			if (sessionId === undefined) return undefined;
+			const auto = autoFor(sessionId);
 			// Only an ordinary prompt carries a user request. A revive has no prompt, and Storm's own run messages
 			// are generated continuations: neither may capture or replace the task a plan opens.
 			if (event.reason !== "prompt") return undefined;
@@ -928,33 +1436,35 @@ export default function storm(pi: ExtensionAPI): void {
 				// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
 				// reminders and steers must not replace it; a prompt while this session directs is run context.
 				if (runs.runId() === undefined && auto.task === undefined) auto.task = prompt;
-				await refreshAuto(ctx, () => stateCache.get(projectEnv(ctx)));
+				const env = envForSession(sessionId, ctx.cwd);
+				await refreshAuto(ctx, () => stateCache.get(env));
 			}
-			if (!auto.enabled || event.systemPrompt.includes(AUTO_INSTRUCTION)) return undefined;
+			if (autos.get(sessionId) !== auto || !auto.enabled || event.systemPrompt.includes(AUTO_INSTRUCTION)) return undefined;
 			// Append only: the prompt itself is the host's, and this block is stable between turns.
 			return { systemPrompt: [...event.systemPrompt, AUTO_INSTRUCTION] };
 		}
+		const ledger = childLedger(ctx);
+		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
+		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd.
+		if (ledger === undefined) return undefined;
 		const { id, name, parentId } = ctx.agent;
 		const artifacts = artifactsOf(ctx);
 		childWorkTrees.set(reviewerBaselineKey(artifacts, id), ctx.cwd);
-		const ledger = childLedger(ctx);
-		const runId = ledger?.runId;
+		const runId = ledger.runId;
 		noteAgentStart({
 			id,
 			name,
 			...(parentId ? { parentId } : {}),
 			...(name.startsWith(ROLE_AGENT_PREFIX) ? { role: name.slice(ROLE_AGENT_PREFIX.length) } : {}),
-			...(runId ? { runId } : {}),
+			runId,
+			scope: ledger.sessionDir,
 			now: Date.now(),
 		});
-		if (runId) touchRun(runId);
+		touchRun(runId);
 		const roleChild = name.startsWith(ROLE_AGENT_PREFIX);
-		// Outside a run, only Storm roles need the team (docs); a child in a run may also be the approved reviewer.
-		if (!ledger && !roleChild) return undefined;
-		// An isolated child still reads the main worktree's approved team for docs and reviewer identity.
-		const state = await stateCache.get(ledger ? runEnv(ctx, ledger.root) : projectEnv(ctx));
+		const state = await stateCache.get(runEnv(ledger));
 		const approvedConfig = state.config.status === "ok" && isApproved(state) ? state.config.config : undefined;
-		if (ledger && name === approvedReviewer(approvedConfig)) {
+		if (name === approvedReviewer(approvedConfig)) {
 			// Snapshot before the reviewer's first provider request. On an isolated team this also fingerprints the
 			// reviewer's own checkout: its verdict can certify the parent only while both copies still match exactly.
 			await recordReviewerBaseline(exec, artifacts, id, ledger, ctx.cwd);
@@ -968,35 +1478,152 @@ export default function storm(pi: ExtensionAPI): void {
 	// Director mode: blocking the call instead of swapping the tool list keeps the main session's prompt cache intact.
 	pi.on("tool_call", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
+			const ledger = childLedger(ctx);
+			const boundRunId = ledger?.runId;
+			let authority = agentAuthorities.get(authorityKey(artifactsOf(ctx), ctx.agent.id));
+			let managed = authority !== undefined || boundRunId !== undefined;
+			let denied: string | undefined;
+			// The in-memory map is thread-local. For every non-read tool, the persisted parent admission is the truth,
+			// so a worker-homed child after a module rebind enforces the same path/read policy. A managed run with no
+			// record for this child is denied instead of silently becoming ordinary.
+			if (!readOnlyTool(event.toolName)) {
+				const resolved = await childWorkerAuthority(ctx);
+				if (resolved.kind === "authorized") {
+					authority = resolved.authority;
+					managed = true;
+				} else if (resolved.kind === "denied") {
+					denied = resolved.reason;
+					managed = true;
+				} else {
+					managed = managed || authority !== undefined;
+				}
+			}
+			// A nested spawn would bypass the director's plan and this worker's authority. The fence is tied to this
+			// process's Storm workers/run binding or the persisted admission, so an unrelated concurrent subagent
+			// session keeps its own task tool.
+			if (event.toolName === "task" && managed) {
+				return {
+					block: true,
+					reason: "[storm:lane-nested] 중첩 task는 실행의 레인 배정과 쓰기 권한을 우회하므로 막았습니다. 감독이 계획한 레인으로 직접 스폰하고, 이 워커는 맡은 결과만 보고하세요.",
+				};
+			}
+			if (denied !== undefined) {
+				return { block: true, reason: `[storm:authority] ${denied} 승인된 레인 권한을 확인할 수 없어 쓰기·실행·중첩 호출을 허용하지 않았습니다.` };
+			}
+			if (authority !== undefined) {
+				const { policy, root, lane } = authority;
+				const who = lane === undefined ? ctx.agent.id : `'${lane}' 레인(${ctx.agent.id})`;
+				// An unplanned worker has no concrete lane: it may read, but it never gains shared write or exec
+				// powers merely because it lives in the same tree as an approved writer.
+				if (policy.kind === "blocked" || (policy.kind === "unknown" && lane === undefined)) {
+					if (!readOnlyTool(event.toolName)) {
+						return {
+							block: true,
+							reason: `[storm:lane] ${who}은 승인된 계획의 구체적인 레인에 속하지 않아 '${event.toolName}' 쓰기·실행 권한을 받지 못했습니다. 감독이 레인을 계획해야 합니다.`,
+						};
+					}
+				}
+				if (policy.kind === "read" && !readOnlyTool(event.toolName)) {
+					return {
+						block: true,
+						reason: `[storm:lane-capability] ${who}은 읽기 전용으로 승인되어 '${event.toolName}' 도구를 쓸 수 없습니다. 읽기·검색·검증 도구만 쓰고, 변경이 필요하면 감독에게 쓰기 레인을 요청하세요.`,
+					};
+				}
+				if (policy.kind === "private" && pathWriteTool(event.toolName) && !readOnlyTool(event.toolName)) {
+					// A private checkout is not a license to write the parent or an arbitrary cwd: bind path tools to
+					// the exact host-attested checkout that this attempt claimed.
+					const checkout = authority.checkout ?? authority.root;
+					const targets = toolWriteTargets(event.toolName, event.input);
+					const outside = targets.filter(target => !targetWithinScope(target, ["."], checkout));
+					if (targets.length === 0 || outside.length > 0) {
+						return {
+							block: true,
+							reason: `[storm:lane-scope] ${who}의 격리 체크아웃 밖으로 나가는 쓰기는 허용하지 않았습니다. ${targets.length === 0 ? "대상 경로를 확인할 수 없는 쓰기" : `체크아웃 밖 경로: ${outside.join(", ")}`}`,
+						};
+					}
+				}
+				if (policy.kind === "paths") {
+					if (!readOnlyTool(event.toolName)) {
+						if (!pathWriteTool(event.toolName)) {
+							return {
+								block: true,
+								reason: `[storm:lane-capability] ${who}은 승인된 경로 쓰기 도구만 쓸 수 있고 '${event.toolName}'은 임의 실행/알 수 없는 쓰기입니다. 감독이 실행 권한을 가진 레인으로 다시 배정해야 합니다.`,
+							};
+						}
+						const targets = toolWriteTargets(event.toolName, event.input);
+						const outside = targets.filter(target => !targetWithinScope(target, policy.paths, root));
+						if (targets.length === 0 || outside.length > 0) {
+							return {
+								block: true,
+								reason: `[storm:lane-scope] ${who}의 쓰기 경로는 ${policy.paths.join(", ")}입니다. ${targets.length === 0 ? "대상 경로를 확인할 수 없는 쓰기" : `경로 이탈: ${outside.join(", ")}`}는 허용하지 않았습니다. 승인된 범위 안에서 쓰거나 감독에게 새 레인을 요청하세요.`,
+							};
+						}
+					}
+				}
+			}
 			// A subagent's reads are indexed under the run its parent admitted; no cwd or repo match is trusted.
 			if (event.toolName !== "read") return undefined;
-			const ledger = childLedger(ctx);
 			if (!ledger) return undefined;
 			const runId = ledger.runId;
-			noteAgentRun(ctx.agent.id, runId);
+			noteAgentRun(ctx.agent.id, runId, ledger.sessionDir);
 			noteChildRead(runId, ctx.agent.id, pathOf(event.input), ctx.cwd);
 			return undefined;
 		}
+		const auto = autoOf(ctx);
+		const autoOn = auto?.enabled === true;
+		const generation = sessionGeneration;
+		const mainId = mainSessionId(ctx);
 		const runId = runs.runId();
 		if (runId === undefined) {
 			// Automatic delegation: the main session may orchestrate and inspect worker results, but every repository
 			// tool and every direct spawn is refused until the first plan opens this turn's run.
-			if (!auto.enabled || event.toolName === "storm") return undefined;
+			if (!autoOn || event.toolName === "storm") return undefined;
 			const detail =
 				event.toolName === "task" ? AUTO_SPAWN_REASON : supervisorToolBlock(event.toolName, event.input);
 			if (detail === undefined) return undefined;
-			return { block: true, reason: autoRefusal(auto.problem, detail) };
+			return { block: true, reason: autoRefusal(auto?.problem, detail) };
+		}
+		// A live run must name the session that owns it: without that, no direct tool is safe to allow.
+		if (mainId === undefined) {
+			return { block: true, reason: "[storm:session] 이 세션의 id를 확인하지 못해 Storm 실행 도구를 막았습니다. 새 대화에서 다시 시도하세요." };
 		}
 		// Automatic delegation keeps the strict supervisor gate during the run too: bash, eval, unknown tools and
 		// every repository file read stay refused, while task and published worker results remain reachable. The
 		// legacy director checks (follow-up caps, wide re-reads, edits) still run after this narrower gate.
-		if (auto.enabled) {
+		if (autoOn) {
 			const strict = supervisorToolBlock(event.toolName, event.input);
 			if (strict !== undefined) return { block: true, reason: autoRunRefusal(strict) };
 		}
-		const config = runs.runConfig();
-		if (!config) return undefined;
-		const block = decideToolCall({ toolName: event.toolName, input: event.input, cwd: ctx.cwd, runId, config, agents: listAgents() });
+		// An eval turn can start several children without a native task batch; during a run every worker must come
+		// through a planned task lane, so eval's unplanned spawn path is refused before any child starts.
+		if (event.toolName === "eval" && runId !== undefined) {
+			return { block: true, reason: "[storm:lane] 실행 중에는 eval로 에이전트를 스폰할 수 없습니다. 승인된 계획의 레인을 task로 호출하세요." };
+		}
+		const config = runs.runConfig(ctx);
+		if (!config) {
+			// A live run whose owning session cannot be proven is not a reason to let direct tools through.
+			return { block: true, reason: "[storm:session] 실행의 세션 소유권을 확인하지 못해 이 도구 호출을 막았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." };
+		}
+		// Every judgment below is the run's own: its ledger names the session whose workers and limits apply.
+		const runLedger = getLedgerRun(runId);
+		const runScope = runLedger?.sessionDir;
+		if (runScope === undefined) {
+			return { block: true, reason: "[storm:session] 실행의 세션 저장소를 확인하지 못해 이 도구 호출을 막았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." };
+		}
+		// Shell, eval and unknown/MCP tools can write without naming a path: under a read lease they must claim the
+		// target's write authority first. Path write tools are already bounded by the director rule below.
+		if (
+			!readOnlyTool(event.toolName) &&
+			!pathWriteTool(event.toolName) &&
+			event.toolName !== "task" &&
+			event.toolName !== "ask" &&
+			event.toolName !== "wait" &&
+			event.toolName !== "storm"
+		) {
+			const writable = await runs.ensureWrite(ctx);
+			if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
+		}
+		const block = decideToolCall({ toolName: event.toolName, input: event.input, cwd: ctx.cwd, runId, config, agents: listAgents({ scope: runScope }) });
 		if (block) {
 			if (block.code === "director-edit") runs.noteBlockedEdit();
 			else if (block.code === "read-large") runs.noteBlockedRead();
@@ -1013,21 +1640,147 @@ export default function storm(pi: ExtensionAPI): void {
 				return { block: true, reason: "[storm:isolation] 이 실행의 레인 배정을 확인하지 못해 task를 막았습니다. 실행 상태를 확인한 뒤 다시 스폰하세요." };
 			}
 			const host = needsIsolationHost(plan, config) ? await isolationHost(runId) : undefined;
-			const options = host === undefined ? {} : { host };
-			if (auto.enabled && plan === undefined) {
+			const readiness = await readinessFor(plan);
+			const ledgerRun = getLedgerRun(runId);
+			const planRoot = plan === undefined ? undefined : ledgerRun?.root ?? (await repoFor(ctx)).root;
+			const planEnv = planRoot === undefined ? undefined : ledgerRun !== undefined ? runEnv(ledgerRun) : envForSession(mainId, planRoot);
+			const planState = planEnv === undefined ? undefined : await stateCache.get(planEnv);
+			const policyView = plan !== undefined && planRoot !== undefined && planState !== undefined
+				? await policiesForPlan(plan, config, planState.shadows, planRoot, autoOn)
+				: undefined;
+			if (policyView !== undefined && !policyView.ok) return { block: true, reason: `[storm:lane-capability] ${policyView.reason}` };
+			{
+				const problem = taskLaneProblem(event.input, plan, config);
+				if (problem !== undefined) return { block: true, reason: `[storm:${problem.code}] ${problem.reason}` };
+			}
+			if (autoOn && plan === undefined) {
 				return { block: true, reason: "[storm:auto] 계획을 확인하지 못해 task를 막았습니다. plan을 다시 제출하세요." };
 			}
-			const placed =
-				auto.enabled && plan !== undefined
-					? lanes.assign(event.input, plan, config, options)
-					: lanes.place(event.input, plan, config, options);
-			if (!placed.ok) return { block: true, reason: `${auto.enabled ? "[storm:auto]" : "[storm:isolation]"} ${placed.reason}` };
+			// The awaits above may have outlived the conversation that asked for this placement.
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			// A spawn that may write claims the target's write lease before any name, lane or worker exists. Read-only
+			// spawns keep their read lease so concurrent reading runs stay independent.
+			if (planMayWrite(plan)) {
+				const writable = await runs.ensureWrite(ctx);
+				if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
+				if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+					return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+				}
+			}
+			const placeOnce = () => {
+				const now = {
+					...(host === undefined ? {} : { host }),
+					...(readiness === undefined ? {} : { readiness }),
+					...(policyView === undefined || !policyView.ok ? {} : { policies: policyView.policies, canonicalFiles: policyView.canonicalFiles }),
+					agents: listAgents({ runId, scope: runScope }),
+					now: Date.now(),
+				};
+				return autoOn && plan !== undefined
+					? lanes.assign(event.input, plan, config, now)
+					: lanes.place(event.input, plan, config, now);
+			};
+			let placed = placeOnce();
+			const waitUntil = Date.now() + WRITE_WAIT_MS;
+			// A single fresh item waits briefly for a writer that is settling (a native task often returns before its
+			// worker starts). A batch never waits: a conflicting batch refuses before any item is reserved or started.
+			// A batch-internal overlap never waits because no host event can clear it.
+			const oneItem = !Array.isArray(event.input.tasks) || event.input.tasks.length === 1;
+			while (oneItem && !placed.ok && placed.retry === true && Date.now() < waitUntil) {
+				await pause(WRITE_WAIT_STEP_MS);
+				placed = placeOnce();
+			}
+			if (!placed.ok) {
+				const tag = placed.code !== undefined ? `[storm:${placed.code}]` : autoOn ? "[storm:auto]" : "[storm:isolation]";
+				return { block: true, reason: `${tag} ${placed.reason}` };
+			}
+			// The wait above may have outlived the conversation that asked for this spawn.
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			// The exact toolCallId is host-issued; admitted sync children later carry it into their attempt id.
+			attempts.observeTaskCall({ runId, parentId: ctx.agent.id, toolCallId: event.toolCallId, input: placed.input, startedAt: Date.now() });
 			return placed.input === event.input ? undefined : { input: placed.input };
 		}
-		// A follow-up to a reused reviewer starts new work: take both tree baselines before the write executes. A
-		// reused isolated reviewer is certified only when its checkout matches the parent at that same moment.
+		// A work-bearing follow-up is not a new spawn, but it starts a new turn that may write: it passes the same
+		// prerequisite and shared-write gate as a task. A `?progress` note never reaches here (`deliveredFollowUp`
+		// excludes it), so a status note reserves nothing and waits for no lane.
 		const followTarget = deliveredFollowUp(event.toolName, event.input, false);
-		const followAgent = followTarget === undefined ? undefined : followUpAgent(listAgents(), followTarget);
+		const followAgent = followTarget === undefined ? undefined : followUpAgent(listAgents({ scope: runScope }), followTarget);
+		const followLanes = runs.runLanes();
+		let followToken: string | undefined;
+		let followLane: PlanLane | undefined;
+		if (followAgent !== undefined && followLanes !== undefined) {
+			// A work-bearing follow-up starts a new turn that may write: prove the target's write lease first.
+			const writable = await runs.ensureWrite(ctx);
+			if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
+			const run = getLedgerRun(runId);
+			if (run === undefined) {
+				return { block: true, reason: "[storm:session] 실행 원장을 확인하지 못해 후속 지시를 적용하지 않았습니다. 실행 상태를 확인하세요." };
+			}
+			const plan = run.plan;
+			const laneName = runSpawns(runId).find(spawn => spawn.spawnKey === followAgent.id && spawn.outcome !== "blocked")?.lane;
+			// A reused live agent has no spawn row in this run; it may still be bound to the plan only when exactly one
+			// lane of its role is authorized. Ambiguous same-role lanes never guess.
+			const byRole = plan?.lanes.filter(candidate => candidate.role === followAgent.role) ?? [];
+			const lane = laneName !== undefined ? plan?.lanes.find(candidate => candidate.name === laneName) : byRole.length === 1 ? byRole[0] : undefined;
+			// An unplanned non-reviewer worker has no authorized write target for more work. A read-only reviewer in a
+			// run with no plan can still deliver a verdict: it gets no write admission, and its tools are read-only.
+			if (lane === undefined && followAgent.role !== "reviewer") {
+				return { block: true, reason: "[storm:lane] 이 워커는 승인된 계획의 구체적인 레인에 속하지 않아 후속 작업을 보내지 않았습니다. 레인을 다시 계획하세요." };
+			}
+			followLane = lane;
+			let authority: AgentAuthority | undefined;
+			if (lane !== undefined) {
+				// A reused agent must keep its enforced capability; recompute if this session did not see its spawn.
+				const workerKey = authorityKey(artifactsOf(ctx), followAgent.id);
+				authority = agentAuthorities.get(workerKey);
+				if (authority === undefined) {
+					const state = await stateCache.get(runEnv(run));
+					const currentConfig = state.config.status === "ok" ? state.config.config : config;
+					const computed = await authorityFor({
+						agent: followAgent.name,
+						lane,
+						shadows: state.shadows,
+						config: currentConfig,
+						root: run.root,
+						auto: autoOn,
+					});
+					if (!computed.ok) return { block: true, reason: `[storm:lane-capability] ${computed.reason}` };
+					authority = computed.authority;
+					agentAuthorities.set(workerKey, authority);
+				}
+			}
+			const readiness = await readinessFor(plan);
+			// A lease upgrade, a state read and a readiness probe are all awaits; the conversation may have changed.
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 후속 지시를 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			const gate = followLanes.checkFollowUp({
+				agentId: followAgent.id,
+				agent: followAgent.name,
+				...(followAgent.role === undefined ? {} : { role: followAgent.role }),
+				...(lane === undefined ? {} : { lane }),
+				...(plan === undefined ? {} : { plan }),
+				isolated: config.isolation === "isolated",
+				...(readiness === undefined ? {} : { readiness }),
+				agents: listAgents({ runId, scope: runScope }),
+				now: Date.now(),
+			});
+			if (!gate.ok) return { block: true, reason: `[storm:${gate.code}] ${gate.reason}` };
+			followToken = gate.token;
+			// The reused worker's next turn runs in its own module (possibly another thread): refresh the exact
+			// admission with a new attempt before the delivery can execute.
+			if (lane !== undefined && authority !== undefined) {
+				try {
+					await persistChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority });
+				} catch {
+					followLanes.finishFollowUp(followToken, false);
+					return { block: true, reason: "[storm:authority] 후속 작업의 자식 실행 권한을 저장하지 못해 전달하지 않았습니다. 프로필 경로와 권한을 확인하세요." };
+				}
+			}
+		}
 		if (followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
 			const run = getLedgerRun(runId);
 			const key = reviewerBaselineKey(artifactsOf(ctx), followAgent.id);
@@ -1035,33 +1788,82 @@ export default function storm(pi: ExtensionAPI): void {
 			if (run !== undefined && cwd !== undefined) await recordReviewerBaseline(exec, artifactsOf(ctx), followAgent.id, run, cwd);
 			else reviewerBaselines.delete(key);
 		}
+		// A follow-up turn is new work: capture its lane's pre-write baseline before the write executes. A child this
+		// run never admitted is left alone; the collector only tracks lanes with declared results.
+		if (followAgent !== undefined && followLane !== undefined) {
+			const artifactMode = followLane.isolationReason !== undefined || config.isolation === "isolated" ? "isolated" : "shared";
+			const admitted = await attempts.admitFollowUp({
+				runId,
+				parentId: ctx.agent.id,
+				spawnKey: followAgent.id,
+				lane: followLane,
+				artifactMode,
+				toolCallId: event.toolCallId,
+				startedAt: Date.now(),
+			});
+			if (!admitted.ok) {
+				if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
+				return { block: true, reason: blockText({ code: "internal", reason: admitted.reason }) };
+			}
+		}
+		if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+			if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
+			return { block: true, reason: "[storm:session] 대화가 바뀌어 이 후속 지시를 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+		}
+		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
 		return undefined;
 	});
 
 	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run.
 	pi.on("session.compacting", () => {
 		const run = runs.active();
-		return run ? { context: workingState(run, listAgents()) } : undefined;
+		const scope = run === undefined ? undefined : getLedgerRun(run.runId)?.sessionDir;
+		return run !== undefined && scope !== undefined ? { context: workingState(run, listAgents({ runId: run.runId, scope })) } : undefined;
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
-			// The parent admitted this id before the spawn returned: no cwd or repo match is trusted here.
+			// The parent admitted this id before the spawn returned: no cwd or repo match is trusted here, and an
+			// unbound child writes nothing into any ledger.
 			const ledger = childLedger(ctx);
-			if (ledger) noteAgentRun(ctx.agent.id, ledger.runId);
+			if (ledger === undefined) return undefined;
+			noteAgentRun(ctx.agent.id, ledger.runId, ledger.sessionDir);
 			// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
 			const now = Date.now();
 			if (event.toolName === "yield" && !event.isError) {
-				noteAgentReview(ctx.agent.id, event.input, now);
+				noteAgentReview(ctx.agent.id, event.input, now, ledger.sessionDir);
 				// Await the bounded snapshot before the turn can settle: the gate never reads a tree this verdict forgot.
-				if (ledger !== undefined && verdictOf(event.input) !== undefined) await bindReviewerVerdict(exec, ctx, ledger, now);
+				if (verdictOf(event.input) !== undefined) await bindReviewerVerdict(exec, ctx, ledger, now);
 			}
 			// The review gate reads what the team changed; a file-changing call that failed changed nothing.
-			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now);
+			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now, ledger.sessionDir);
 			return undefined;
 		}
 		const runId = runs.runId();
-		if (!runId || event.isError) return undefined;
+		if (!runId) return undefined;
+		// The sync task envelope is read before the isError return: a failed call still carries host results, and a
+		// missing item must stay an unmet requirement instead of disappearing.
+		if (event.toolName === "task") {
+			await attempts.observeTaskResult({
+				runId,
+				parentId: ctx.agent.id,
+				toolCallId: event.toolCallId,
+				details: event.details,
+				content: event.content,
+				observedAt: Date.now(),
+			});
+		}
+		// A native `wait` consumes completed background jobs, so its terminal task rows are deliveries even though no
+		// `async-result` message follows. The collector accepts only exact admitted rows with a real deliverable.
+		if (event.toolName === "wait") {
+			await attempts.observeWaitResult({
+				runId,
+				parentId: ctx.agent.id,
+				details: event.details,
+				observedAt: Date.now(),
+			});
+		}
+		if (event.isError) return undefined;
 		if (event.toolName === "read") {
 			// What the director's read returned, and whether a subagent of the run had read that file too.
 			const read = directorRead({ runId, path: pathOf(event.input), cwd: ctx.cwd });
@@ -1072,10 +1874,18 @@ export default function storm(pi: ExtensionAPI): void {
 		// A follow-up counts when its write was delivered, for the agent omp resolved it to. That delivery also admits
 		// a reused live agent into this run, and gives a reused reviewer a fresh baseline before its next turn.
 		const target = deliveredFollowUp(event.toolName, event.input, event.isError);
-		const agent = target === undefined ? undefined : followUpAgent(listAgents(), target);
-		if (!agent) return undefined;
-		noteAgentFollowUp(agent.id);
+		const targetRun = getLedgerRun(runId);
+		const agent =
+			target === undefined || targetRun === undefined
+				? undefined
+				: followUpAgent(listAgents({ scope: targetRun.sessionDir }), target);
+		if (!agent || targetRun === undefined) return undefined;
+		noteAgentFollowUp(agent.id, targetRun.sessionDir);
 		bindLedgerChild(runId, agent.id, agent.parentId ?? ctx.agent.id, artifactsOf(ctx));
+		// The follow-up's next async job is already in this parent session's own snapshot. Its exact id (not a guessed
+		// name) is what lets the first delivery bind to this turn instead of looking stale.
+		const snapshot = ctx.getAsyncJobSnapshot?.();
+		if (snapshot) attempts.bindFollowUpJobs({ runId, spawnKey: agent.id, jobs: [...snapshot.running, ...snapshot.recent] });
 		return undefined;
 	});
 
@@ -1086,28 +1896,46 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("agent_end", async (event, ctx) => {
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
-			if (ledger) noteAgentRun(ctx.agent.id, ledger.runId);
 			const settled = !(event.willContinue || event.awaitingAsyncWork);
-			const failed = settled ? terminalWorkFailed(event.messages) ?? listAgents().find(agent => agent.id === ctx.agent.id)?.lastWorkFailed : undefined;
-			noteAgentEnd({
-				id: ctx.agent.id,
-				now: Date.now(),
-				settled,
-				...(settled && failed !== undefined ? { failed } : {}),
-			});
-			// After the ledger says settled: the run's phase reads it, so touching the run before the update would
-			// leave the last worker or reviewer looking active until another event.
-			if (ledger) touchRun(ledger.runId);
+			// An unbound child has no owned run: writing an unscoped ledger entry is refused. Its persisted admission
+			// (worker-homed child) is still closed below.
+			if (ledger !== undefined) {
+				noteAgentRun(ctx.agent.id, ledger.runId, ledger.sessionDir);
+				const failed = settled
+					? terminalWorkFailed(event.messages) ??
+						listAgents({ scope: ledger.sessionDir }).find(agent => agent.id === ctx.agent.id)?.lastWorkFailed
+					: undefined;
+				noteAgentEnd({
+					id: ctx.agent.id,
+					now: Date.now(),
+					settled,
+					...(settled && failed !== undefined ? { failed } : {}),
+					scope: ledger.sessionDir,
+				});
+				// After the ledger says settled: the run's phase reads it, so touching the run before the update would
+				// leave the last worker or reviewer looking active until another event.
+				touchRun(ledger.runId);
+			}
+			// A settled turn is over: the lane's shared-write reservation ends with it, not when the next spawn asks.
+			// The persisted authority is closed for this attempt as well; a follow-up reopens it before delivery.
+			if (settled) {
+				runs.runLanes()?.releaseAgent(ctx.agent.id);
+				await closeChildWorkerAdmission(ctx);
+			}
 			return;
 		}
+		// Snapshot the identity before any await: the host may mutate the session manager when the conversation changes.
+		const eventSessionId = mainSessionId(ctx);
 		// Paused on async subagents: the moment to shed context before their results arrive. Both manual and automatic
 		// runs use the same background handoff, so the recorded ledger is identical.
 		if (event.awaitingAsyncWork) runs.startCheckpoint();
 		// Ends the run when the session settles; a queued run starts detached from this handler.
 		await runs.onAgentEnd(event, ctx);
 		if (!event.willContinue) {
-			// The user turn is over, including a paused async wait: the next prompt must supply its own task.
-			auto.task = undefined;
+			// The user turn is over, including a paused async wait: the next prompt must supply its own task. Only the
+			// entry this event started under may be cleared, never a conversation that replaced it.
+			const auto = eventSessionId === undefined ? undefined : autos.get(eventSessionId);
+			if (auto !== undefined) auto.task = undefined;
 		}
 		if (!event.willContinue && !event.awaitingAsyncWork) {
 			// A plugin update installed meanwhile shows up on the status line without waiting for /storm.
@@ -1117,28 +1945,66 @@ export default function storm(pi: ExtensionAPI): void {
 
 	// omp itself left a model after provider errors: its provider goes behind the approved fallbacks for a while.
 	pi.on("retry_fallback_applied", async (event, ctx) => {
-		const repo = await repoFor(ctx);
-		if ((await cachedConfig(repo.root)).status === "missing") return;
+		const state = await stateForEvent(ctx);
+		if (state === undefined || state.config.status === "missing") return;
 		const mark = fallbackQuotaMark(event.from, Date.now());
-		if (mark) await addQuotaMark(repo.root, mark);
+		if (mark) await addQuotaMark(state.sessionDir, mark);
 		if (ctx.hasUI) ctx.ui.notify(quotaNotice(event.from, event.to, mark?.provider), "warning");
 	});
 
 	// One disabled credential need not mean the provider is out (other accounts may remain): notice only.
 	pi.on("credential_disabled", async (event, ctx) => {
-		if (!ctx.hasUI || (await cachedConfig((await repoFor(ctx)).root)).status === "missing") return;
+		if (!ctx.hasUI) return;
+		const state = await stateForEvent(ctx);
+		if (state === undefined || state.config.status === "missing") return;
 		ctx.ui.notify(credentialNotice(event.provider), "warning");
 	});
+
+	/** The closure's in-memory view of one conversation is dropped at every identity boundary. */
+	const forgetConversation = (ctx: ExtensionContext): void => {
+		const id = mainSessionId(ctx);
+		if (id !== undefined) autos.delete(id);
+		stateCache.clear();
+		attempts.stop();
+		liveStatus.beginSession();
+		openWaits.clear();
+		resetCloseoutChoices(ctx);
+	};
+	/**
+	 * Every host transition that replaces the conversation (new, resume, fork, branch, context clear) shares this:
+	 * delayed work from the old identity is invalidated first, its run ends, and only then is the new identity read.
+	 */
+	const conversationChanged = async (ctx: ExtensionContext): Promise<void> => {
+		if (ctx.agent.kind !== "main") {
+			// A child's own session change ends the turn's admitted authority; the next follow-up reopens a new attempt.
+			agentAuthorities.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
+			await closeChildWorkerAdmission(ctx);
+			return;
+		}
+		sessionGeneration++;
+		forgetConversation(ctx);
+		const active = getLedgerRun(runs.runId());
+		if (active !== undefined) await revokeWorkerAdmissionsFor({ runId: active.runId });
+		await runs.finish("shutdown", ctx);
+		await syncSession(ctx).catch(() => undefined);
+	};
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
 		if (ctx.agent.kind === "sub") {
-			noteAgentParked(ctx.agent.id);
+			const scope = childLedger(ctx)?.sessionDir;
+			if (scope !== undefined) noteAgentParked(ctx.agent.id, scope);
+			runs.runLanes()?.releaseAgent(ctx.agent.id);
+			agentAuthorities.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
 			reviewerBaselines.delete(key);
 			childWorkTrees.delete(key);
+			await closeChildWorkerAdmission(ctx);
 		} else {
-			resetCloseoutChoices(ctx);
+			sessionGeneration++;
+			forgetConversation(ctx);
+			const active = getLedgerRun(runs.runId());
+			if (active !== undefined) await revokeWorkerAdmissionsFor({ runId: active.runId });
 		}
 		// No status load or widget from before the shutdown may land after it.
 		liveStatus.beginSession();
@@ -1146,17 +2012,10 @@ export default function storm(pi: ExtensionAPI): void {
 		await runs.finish("shutdown");
 	});
 
-	// /new, /resume or a fork puts another conversation in this session: the run's handoff is not in it.
-	pi.on("session_switch", async (_event, ctx) => {
-		if (ctx.agent.kind !== "main") return;
-		liveStatus.beginSession();
-		openWaits.clear();
-		resetCloseoutChoices(ctx);
-		auto.task = undefined;
-		await runs.finish("shutdown", ctx);
-		// The same profile and repository keep the policy, but a fresh conversation gets the durable consent file.
-		await syncSession(ctx).catch(() => undefined);
-	});
+	// /new, /resume, a fork or a branch puts another conversation in this session: the run's handoff is not in it.
+	pi.on("session_switch", async (_event, ctx) => conversationChanged(ctx));
+	pi.on("session_clear", async (_event, ctx) => conversationChanged(ctx));
+	pi.on("session_branch", async (_event, ctx) => conversationChanged(ctx));
 
 	const tool = createStormTool(pi.zod, ctx => toolHost(ctx));
 	const activateTool = async (): Promise<void> => {
@@ -1207,18 +2066,31 @@ export default function storm(pi: ExtensionAPI): void {
 		return { handled: true };
 	});
 
-	/** Refreshes the status line and turns the storm tool on once the project has a Storm config. */
+	/** Refreshes the status line and turns the storm tool on once this session has a Storm config. */
 	const syncSession = async (ctx: ExtensionContext, loaded?: ProjectState): Promise<void> => {
+		const sessionId = mainSessionId(ctx);
+		if (sessionId === undefined) {
+			// The host can no longer say whose state this is: leave no Storm surface from another conversation.
+			autos.clear();
+			stateCache.clear();
+			liveStatus.clear();
+			await deactivateTool();
+			return;
+		}
+		const generation = sessionGeneration;
 		const epoch = liveStatus.epoch();
 		const state = loaded ?? (await loadProjectState(projectEnv(ctx)));
 		// The durable consent file is read on every session refresh: a session switch or a command sees an external
 		// change at once, and a failed read keeps the last enabled guard instead of unfencing direct tools.
 		await refreshAuto(ctx, async () => state);
-		if (!liveStatus.isCurrent(epoch)) return;
+		if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;
+		const auto = autos.get(sessionId);
 		// A missing config needs no tool normally; under automatic delegation the plan must be reachable to report
-		// the missing team as an actionable refusal instead of leaving the main session to direct tools.
-		if (state.config.status !== "missing" || auto.enabled) await activateTool();
-		if (!liveStatus.isCurrent(epoch)) return;
+		// the missing team as an actionable refusal instead of leaving the main session to direct tools. A fresh
+		// conversation also loses the tool the previous one activated: the tool's schema is session surface too.
+		if (state.config.status !== "missing" || auto?.enabled === true) await activateTool();
+		else await deactivateTool();
+		if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;
 		if (!ctx.hasUI) {
 			liveStatus.clear();
 			return;
@@ -1229,28 +2101,46 @@ export default function storm(pi: ExtensionAPI): void {
 			showRunStatus(ctx, run, runs.phase());
 			return;
 		}
-		const resumable = isApproved(state) && (await findResumeCandidate(state.store.dir, state.repo.root)) !== undefined;
+		const resumable =
+			isApproved(state) &&
+			(await findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root })) !== undefined;
 		// The await above may have outlasted a switch, or a queued run may have started meanwhile.
-		if (!liveStatus.isCurrent(epoch)) return;
+		if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;
 		const started = runs.active();
 		if (started) {
 			showRunStatus(ctx, started, runs.phase());
 			return;
 		}
 		liveStatus.clear();
-		ctx.ui.setStatus("storm", idleStatusText(ctx, state, resumable, auto));
+		const consent = auto ?? { enabled: false, problem: undefined };
+		ctx.ui.setStatus("storm", idleStatusText(ctx, state, resumable, consent));
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Subagents never manage the team: no tool, no status line.
 		if (ctx.agent.kind !== "main") return;
+		// A host without a native session id gets no Storm tool or footer: there is nowhere to keep this session's
+		// state. The ordinary unconfigured conversation keeps working.
+		const sessionId = mainSessionId(ctx);
+		if (sessionId === undefined) {
+			autos.clear();
+			stateCache.clear();
+			liveStatus.clear();
+			await deactivateTool();
+			return;
+		}
+		sessionGeneration++;
+		autos.delete(sessionId);
+		stateCache.clear();
+		const generation = sessionGeneration;
 		const epoch = liveStatus.beginSession();
 		resetCloseoutChoices(ctx);
 		try {
 			const state = await loadProjectState(projectEnv(ctx));
+			if (generation !== sessionGeneration) return;
 			// A run whose process died stays `running` until a later run ends; here it becomes the last run and resumable.
-			await stopDeadRuns({ root: state.repo.root });
-			if (!liveStatus.isCurrent(epoch)) return;
+			await stopDeadRuns({ sessionDir: state.sessionDir });
+			if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;
 			await syncSession(ctx, state);
 		} catch {
 			// The status line and the tool are conveniences; /storm reports the actual error.
@@ -1269,39 +2159,54 @@ export default function storm(pi: ExtensionAPI): void {
 		},
 		handler: async (args, ctx) => {
 			const ui = createUiPort(pi, ctx);
+			const sessionId = mainSessionId(ctx);
+			if (sessionId === undefined) {
+				ui.notify("Storm은 이 세션의 id를 확인하지 못해 아무것도 저장하지 않습니다. 새 대화를 연 뒤 다시 시도하세요.", "warning");
+				return;
+			}
+			const generation = sessionGeneration;
+			/** A command dialog may outlive the conversation that opened it; its write and start paths refuse then. */
+			const stillOwner = (): boolean => generation === sessionGeneration && mainSessionId(ctx) === sessionId;
 			// What the user runs sees the registry, quota and settings as they are now (a provider login just made);
 			// the flows inside this command and the model's tool calls share one analysis.
 			invalidateAnalysis(ctx.cwd);
 			/** Starts a run in this session, as a request does: refused while one is active, started once the session is idle. */
 			const startRun = async (spec: RunSpec): Promise<RunRequestResult> => {
+				if (!stillOwner()) return { ok: false, reason: "대화가 바뀌어 이전 세션의 작업을 시작하지 않았습니다. 새 대화에서 다시 시도하세요." };
 				// Refused before waiting: during a run the session is busy until that run ends.
 				const reason = runs.refusal();
 				if (reason !== undefined) return { ok: false, reason };
 				await ctx.waitForIdle();
+				if (!stillOwner()) return { ok: false, reason: "대화가 바뀌어 이전 세션의 작업을 시작하지 않았습니다. 새 대화에서 다시 시도하세요." };
 				return startUserRun(ctx, spec);
 			};
-			const env = flowEnv(ctx, startRun);
 			const input = args.trim();
-			/** Bare /storm: the hub, or just the status where no dialog can be answered. */
-			const menu = async (): Promise<void> => {
-				if (!ctx.hasUI) await statusFlow(env, ui);
-				else if (await hubFlow(env, ui)) await deactivateTool();
-			};
 			try {
+				const env = flowEnv(ctx, startRun);
+				/** Bare /storm: the hub, or just the status where no dialog can be answered. */
+				const menu = async (): Promise<void> => {
+					if (!ctx.hasUI) await statusFlow(env, ui);
+					else if (await hubFlow(env, ui)) await deactivateTool();
+				};
 				if (input === "") await menu();
 				else if (input === "status") await statusFlow(env, ui);
 				else if (input === "models") await modelsFlow(env, ui);
 				else if (input === "auto") await autoDelegationFlow(env, ui);
+				else if (input === "export") await exportFlow(env, ui);
 				else if (SHORTCUT_NAMES.includes(input)) {
 					if (!ctx.hasUI) ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm 으로 현황은 볼 수 있습니다.", "warning");
 					else if (input === "setup") await setupFlow(env, ui);
-					else if (await resetFlow(env, ui)) await deactivateTool();
+					else if (await resetFlow(env, ui)) {
+						// Reset removes this session's store; every persisted worker admission for it must die with it.
+						await revokeWorkerAdmissionsFor({ sessionId: env.sessionId });
+						await deactivateTool();
+					}
 				} else {
 					// A request: Storm decides what it is off the transcript; only a run reaches the session.
 					const side = sideTurn(ctx);
 					await routeRequest(input, {
 						ui,
-						loadState: () => loadProjectState(projectEnv(ctx)),
+						loadState: () => loadProjectState(env),
 						...(side ? { sideTurn: side } : {}),
 						handlers: {
 							run: spec => startRun(spec),
@@ -1318,7 +2223,6 @@ export default function storm(pi: ExtensionAPI): void {
 				ui.notify(`Storm 오류: ${error instanceof Error ? error.message : String(error)}`, "error");
 			} finally {
 				stateCache.clear();
-				configByRoot.clear();
 				try {
 					await syncSession(ctx);
 				} catch {

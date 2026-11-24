@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deliveredFollowUp, followUpAgent, followUpBlock } from "../src/policy/followup.ts";
+import { deliveredFollowUp, followUpAgent, followUpBlock, followUpProgress } from "../src/policy/followup.ts";
 import {
 	activeAgents,
 	blockedSpawn,
@@ -62,6 +62,16 @@ const state = (over: Partial<SpawnState> = {}): SpawnState => ({ config: ok, app
 const runtime = (over: Partial<SpawnRuntime> = {}): SpawnRuntime => ({ now: NOW, quotaMarks: [], trials: {}, ...over });
 const PLAN: RunPlan = {
 	lanes: [{ name: "lane", kind: "code", role: "reviewer" }],
+	workers: { reviewer: 2, explorer: 2, implementer: 2 },
+	submittedAt: "2026-11-20T11:00:00.000Z",
+};
+/** A plan with one lane for each role a built-in maps to, so lane binding has a real owner. */
+const FULL_PLAN: RunPlan = {
+	lanes: [
+		{ name: "lane", kind: "review", role: "reviewer" },
+		{ name: "look", kind: "explore", role: "explorer" },
+		{ name: "build", kind: "code", role: "implementer" },
+	],
 	workers: { reviewer: 2, explorer: 2, implementer: 2 },
 	submittedAt: "2026-11-20T11:00:00.000Z",
 };
@@ -169,9 +179,9 @@ describe("decideSpawn: storm agents", () => {
 
 	test("a spent run budget blocks storm and other agents alike, approved model or not", () => {
 		const spent = { costUsd: 5, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun(spent)))).toBe("budget");
-		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), inRun(spent)))).toBe("budget");
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ ...spent, costUsd: 4.99 })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), inRun(spent)))).toBe("budget");
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"], "T"), state(), inRun(spent)))).toBe("budget");
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), inRun({ ...spent, costUsd: 4.99 })))).toBeUndefined();
 	});
 });
 
@@ -211,21 +221,31 @@ describe("decideSpawn: trials", () => {
 });
 
 describe("decideSpawn: other agents during a run", () => {
-	test("an approved model (effort ignored, trial candidates included) passes untouched and is recorded", () => {
-		const out = decideSpawn(ev("custom", ["anthropic/claude-x:max"]), state(), inRun());
-		expect(out.decision).toBeUndefined();
-		expect(out.record?.outcome).toBe("allowed");
-		const trial = withConfig({ ...config, trials: [baseTrial] });
-		expect(decideSpawn(ev("custom", ["zai/glm-5"]), trial, inRun()).record?.outcome).toBe("allowed");
+	test("a mapped built-in passes an approved model untouched; an unmapped native agent is refused", () => {
+		const scout = decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), inRun({ plan: FULL_PLAN }));
+		expect(scout.decision).toBeUndefined();
+		expect(scout.record).toMatchObject({ outcome: "allowed", role: "explorer" });
+		const reviewer = decideSpawn(ev("reviewer", ["anthropic/claude-x:max"], "lane"), state(), inRun({ plan: FULL_PLAN }));
+		expect(reviewer.decision).toBeUndefined();
+		expect(reviewer.record?.outcome).toBe("allowed");
+		// No role mapping means no lane, cap or capability decision: never an ordinary spawn during a run.
+		for (const agent of ["custom", "sonic"]) {
+			expect(code(decideSpawn(ev(agent, ["anthropic/claude-x:max"]), state(), inRun({ plan: FULL_PLAN })))).toBe("unmapped-agent");
+		}
 	});
 
-	test("an unapproved model gets the fallback role's models; without a usable fallback it is unapproved", () => {
+	test("an unapproved model on a mapped built-in gets the fallback role's models; an unmapped agent stays refused", () => {
 		const fallback = withConfig({ ...config, fallbackRole: "explorer" });
-		const out = decideSpawn(ev("custom", ["x/unknown"]), fallback, inRun());
+		const out = decideSpawn(ev("scout", ["x/unknown"], "look"), fallback, inRun({ plan: FULL_PLAN }));
 		expect(models(out.decision)).toEqual(["google/gemini-flash"]);
 		expect(out.record).toMatchObject({ outcome: "substituted", role: "explorer" });
-		expect(code(decideSpawn(ev("custom", ["x/unknown"]), state(), inRun()))).toBe("unapproved");
-		expect(code(decideSpawn(ev("custom", []), withConfig({ ...config, fallbackRole: "ghost" }), inRun()))).toBe("unapproved");
+		// `task` maps to implementer, which this team does not have; the fallback still speaks for that role.
+		const task = decideSpawn(ev("task", ["x/unknown"], "build"), withConfig({ ...config, fallbackRole: "reviewer" }), inRun({ plan: FULL_PLAN }));
+		expect(task.record).toMatchObject({ outcome: "substituted", role: "reviewer" });
+		// A custom agent cannot borrow the fallback: it has no lane to attribute the substituted work to.
+		expect(code(decideSpawn(ev("custom", ["x/unknown"]), fallback, inRun({ plan: FULL_PLAN })))).toBe("unmapped-agent");
+		// A mapped built-in with no usable role and no fallback is unapproved.
+		expect(code(decideSpawn(ev("task", ["x/unknown"], "build"), state(), inRun({ plan: FULL_PLAN })))).toBe("unapproved");
 	});
 
 	test("an unapproved config blocks every agent during a run", () => {
@@ -233,24 +253,85 @@ describe("decideSpawn: other agents during a run", () => {
 	});
 
 	test("a built-in agent gets its mapped role's models; unmapped roles fall back", () => {
-		const scout = decideSpawn(ev("scout", ["x/unknown"]), state(), inRun());
+		const scout = decideSpawn(ev("scout", ["x/unknown"], "look"), state(), inRun({ plan: FULL_PLAN }));
 		expect(models(scout.decision)).toEqual(["google/gemini-flash"]);
 		expect(scout.record).toMatchObject({ outcome: "substituted", role: "explorer" });
 		// `task` maps to implementer, which this team does not have.
-		const task = decideSpawn(ev("task", ["x/unknown"]), withConfig({ ...config, fallbackRole: "reviewer" }), inRun());
+		const task = decideSpawn(ev("task", ["x/unknown"], "build"), withConfig({ ...config, fallbackRole: "reviewer" }), inRun({ plan: FULL_PLAN }));
 		expect(task.record).toMatchObject({ outcome: "substituted", role: "reviewer" });
 	});
 
+	test("a read-only explore plan cannot admit an unmapped native agent; mapped built-ins need their role lane", () => {
+		const readPlan: RunPlan = {
+			lanes: [{ name: "look", kind: "explore", role: "explorer" }],
+			workers: { explorer: 1 },
+			submittedAt: "2026-11-20T11:00:00.000Z",
+		};
+		const readRun = inRun({ plan: readPlan });
+		for (const agent of ["sonic", "custom"]) {
+			expect(code(decideSpawn(ev(agent, ["google/gemini-flash"]), state(), readRun))).toBe("unmapped-agent");
+		}
+		// eval() spawns go through the same decision; an unmapped writer is refused there too.
+		expect(code(decideSpawn({ agent: "sonic", invocationKind: "eval", patterns: ["google/gemini-flash"] }, state(), readRun))).toBe("unmapped-agent");
+		// `task` maps implementer, but this plan has no implementer lane.
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), readRun))).toBe("role-not-in-plan");
+		// `scout` maps explorer and the plan has its lane; extension must still bind it to that lane and its read tools.
+		expect(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), readRun).record).toMatchObject({ outcome: "allowed", role: "explorer" });
+		// Native unrelated work outside Storm is unaffected, even with an unreadable/unapproved team.
+		const outside = runtime();
+		for (const agent of ["sonic", "custom", "task", "scout"]) {
+			const unevaluated = decideSpawn(ev(agent, ["x/anything"], "own"), state({ approval: undefined }), outside);
+			expect(unevaluated.decision).toBeUndefined();
+			expect(unevaluated.record).toBeUndefined();
+		}
+	});
+
+	test("a role spawn needs a plan lane and a host key; several lanes defer exact assignment to admission", () => {
+		const c = withConfig({
+			...config,
+			roles: { ...config.roles, implementer: { agent: "storm-implementer", models: ["a/i"] } },
+		});
+		const plan: RunPlan = {
+			lanes: [
+				{ name: "api", kind: "code", role: "implementer" },
+				{ name: "web", kind: "code", role: "implementer" },
+			],
+			workers: { implementer: 2 },
+			submittedAt: "2026-11-20T11:00:00.000Z",
+		};
+		const rt = inRun({ plan });
+		// The extension's lane admission resolves the exact lane from its reservation, so a host key is enough here.
+		expect(code(decideSpawn(ev("storm-implementer", [], "api"), c, rt))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-implementer", [], "run-1-lane-2"), c, rt))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-implementer"), c, rt))).toBe("unassigned-lane");
+		// A plan that claims the role's workers but has no lane for it cannot own the child.
+		const laneLess = inRun({ plan: { ...plan, lanes: [] } });
+		expect(code(decideSpawn(ev("storm-implementer", [], "api"), c, laneLess))).toBe("unassigned-lane");
+	});
+
+	test("an approved shadow role definition spawns through its approved lane", () => {
+		const approved = state({
+			shadows: [shadow],
+			approval: approval({}, [shadow]),
+		});
+		const out = decideSpawn(ev("storm-reviewer", [], "lane"), approved, inRun({ plan: FULL_PLAN }));
+		expect(models(out.decision)).toEqual(["openai/gpt-5.2:high", "anthropic/claude-x:low", "openrouter/qwen/qwen3:high"]);
+		expect(out.record).toMatchObject({ outcome: "routed", role: "reviewer" });
+		// The same shadow without its approval remains blocked before any lane/cap decision.
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state({ shadows: [shadow] }), inRun({ plan: FULL_PLAN })))).toBe("shadow");
+	});
+
 	test("a built-in agent mapped to a role counts against that role's cap, whatever model it asked for", () => {
-		const full = inRun({ plan: { ...PLAN, workers: { explorer: 1, reviewer: 2 } }, active: { total: 1, byRole: { explorer: 1 } } });
-		expect(code(decideSpawn(ev("scout", ["x/unknown"]), state(), full))).toBe("role-cap");
-		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"]), state(), full))).toBe("role-cap");
+		const capPlan = { ...FULL_PLAN, workers: { explorer: 1, reviewer: 2 } };
+		const full = inRun({ plan: capPlan, active: { total: 1, byRole: { explorer: 1 } } });
+		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), full))).toBe("role-cap");
+		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), full))).toBe("role-cap");
 		// With a slot free it runs, and its record names the role so it takes the slot.
-		const free = inRun({ plan: { ...PLAN, workers: { explorer: 1, reviewer: 2 } }, active: { total: 0, byRole: {} } });
-		expect(decideSpawn(ev("scout", ["google/gemini-flash"]), state(), free).record).toMatchObject({ outcome: "allowed", role: "explorer" });
+		const free = inRun({ plan: capPlan, active: { total: 0, byRole: {} } });
+		expect(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), free).record).toMatchObject({ outcome: "allowed", role: "explorer" });
 		// A role the plan has no lane for cannot spawn through its built-in either.
 		const noLane = inRun({ plan: { ...PLAN, workers: { reviewer: 2 } } });
-		expect(code(decideSpawn(ev("scout", ["x/unknown"]), state(), noLane))).toBe("role-not-in-plan");
+		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), noLane))).toBe("role-not-in-plan");
 	});
 });
 
@@ -281,10 +362,17 @@ describe("decideSpawn: role states", () => {
 	});
 
 	test("a stand-in spawn counts against the role it asked for", () => {
-		const plan: RunPlan = { ...PLAN, workers: { quick: 1, implementer: 2 } };
+		const plan: RunPlan = {
+			...PLAN,
+			lanes: [
+				{ name: "quick", kind: "run", role: "quick" },
+				{ name: "impl", kind: "code", role: "implementer" },
+			],
+			workers: { quick: 1, implementer: 2 },
+		};
 		const busy = inRun({ plan, active: { total: 1, byRole: { quick: 1 } } });
-		expect(code(decideSpawn(ev("storm-quick"), withConfig({ ...team, parallelism: 4 }), busy))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-implementer"), withConfig({ ...team, parallelism: 4 }), busy))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-quick", [], "quick"), withConfig({ ...team, parallelism: 4 }), busy))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-implementer", [], "impl"), withConfig({ ...team, parallelism: 4 }), busy))).toBeUndefined();
 	});
 });
 
@@ -297,8 +385,10 @@ describe("decideSpawn: run plan and live caps", () => {
 		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), runtime({ run: noPlan })))).toBe("no-plan");
 		const full = { total: 2, byRole: { reviewer: 2 } };
 		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ active: full })))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ active: full })))).toBe("parallelism");
-		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ active: full })))).toBe("parallelism");
+		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("parallelism");
+		// An unmapped native agent is refused before the team-wide parallelism check.
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("unmapped-agent");
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"], "build"), state(), inRun({ plan: FULL_PLAN, active: full })))).toBe("parallelism");
 	});
 
 	test("a role absent from the plan cannot spawn; outside a run no plan is needed", () => {
@@ -310,8 +400,8 @@ describe("decideSpawn: run plan and live caps", () => {
 	test("the role cap is the plan's workers for the role", () => {
 		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1, explorer: 1 } };
 		const wide = withConfig({ ...config, parallelism: 8 });
-		expect(code(decideSpawn(ev("storm-reviewer"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } })))).toBe("role-cap");
-		expect(code(decideSpawn(ev("storm-reviewer"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } })))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } })))).toBeUndefined();
 	});
 });
 
@@ -507,5 +597,11 @@ describe("follow-ups", () => {
 		expect(deliveredFollowUp("write", { path: "agent://Rev?progress", content: "x" }, false)).toBeUndefined();
 		expect(deliveredFollowUp("write", { path: "src/a.ts", content: "x" }, false)).toBeUndefined();
 		expect(deliveredFollowUp("read", { path: "agent://Rev" }, false)).toBeUndefined();
+		// The native progress form is identifiable on its own, so the scheduler can keep it out of the work gate.
+		expect(followUpProgress("write", { path: "agent://Rev?progress", content: "x" })).toBe(true);
+		expect(followUpProgress("write", { path: "agent://Rev?x=1&progress", content: "x" })).toBe(true);
+		expect(followUpProgress("write", write("Rev"))).toBe(false);
+		expect(followUpProgress("read", { path: "agent://Rev?progress" })).toBe(false);
+		expect(followUpProgress("write", { path: "src/a.ts?progress", content: "x" })).toBe(false);
 	});
 });

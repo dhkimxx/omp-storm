@@ -32,16 +32,18 @@ export function rollbackLabels(options: readonly RollbackOption[], current: Stor
 /** Picks an earlier approval and confirms it with the full diff in view; undefined when the user backs out. */
 export async function runRollback(
 	ui: UiPort,
-	input: { options: readonly RollbackOption[]; current?: StormConfig },
+	input: { options: readonly RollbackOption[]; current?: StormConfig; scope?: string; stillOwner?: () => boolean },
 ): Promise<RollbackOption | undefined> {
 	const labels = rollbackLabels(input.options, input.current);
 	const picked = await ui.select("되돌릴 팀 설정", [...labels, CANCEL]);
+	if (input.stillOwner?.() === false) return undefined;
 	const option = picked === undefined ? undefined : input.options[labels.indexOf(picked)];
 	if (!option) return undefined;
 	const answer = await ui.select("이 팀 설정으로 되돌릴까요?", [ROLL_BACK, CANCEL], {
 		title: "되돌릴 팀 설정",
 		consent: [ROLL_BACK],
-		markdown: renderConfigDiff(input.current, option.config),
+		markdown: [input.scope, renderConfigDiff(input.current, option.config)].filter(Boolean).join("\n\n"),
 	});
+	if (input.stillOwner?.() === false) return undefined;
 	return answer === ROLL_BACK ? option : undefined;
 }

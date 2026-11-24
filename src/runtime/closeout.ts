@@ -5,12 +5,18 @@
  * selection made in another session can never resolve this session's card.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { AgentEntry, RunRecord } from "../types.ts";
+import type { AgentEntry, RunRecord, RunResult, RunResultState } from "../types.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
 
 /** Bounded fields: a brief is a card, not a report. */
 export const CLOSEOUT_TEXT_MAX = 400;
 export const CLOSEOUT_NEXT_MAX = 240;
+/** How many required-result rows one card line names before the rest become a count. */
+export const CLOSEOUT_RESULT_ENTRY_MAX = 3;
+const RESULT_ID_MAX = 40;
+const RESULT_LANE_MAX = 30;
+const RESULT_REASON_MAX = 100;
+const RESULT_UNBLOCK_MAX = 120;
 
 /** The staged summary of one settled run, as the director submitted it. */
 export interface CloseoutDraft {
@@ -92,6 +98,81 @@ function lanesLine(pending: readonly string[]): string | undefined {
 	return `- 미완료 레인: ${pending.map(name => clean(name, 40)).join(", ")}`;
 }
 
+const RESULT_STATE_LABEL: Readonly<Record<RunResultState, string>> = {
+	pending: "대기",
+	unmet: "미충족",
+	reviewable: "검토 가능",
+	accepted: "이행",
+};
+
+/** State semantics only: when the record has no reason, say what the state means rather than invent a cause. */
+const RESULT_FALLBACK_REASON: Readonly<Record<RunResultState, string>> = {
+	pending: "아직 판정 근거가 기록되지 않았습니다.",
+	unmet: "미충족 사유가 기록되지 않았습니다.",
+	reviewable: "판단할 제출물이 기록되었습니다.",
+	accepted: "",
+};
+
+/** One compact row: stable id, optional lane, state, reason, and a known block/retry remedy. */
+function resultEntry(result: RunResult, includeState: boolean): string {
+	const id = typeof result.id === "string" ? clean(result.id, RESULT_ID_MAX) : "";
+	const lane = typeof result.lane === "string" ? clean(result.lane, RESULT_LANE_MAX) : "";
+	const state = RESULT_STATE_LABEL[result.state] ?? "미확인";
+	const rawReason = typeof result.reason === "string" ? clean(result.reason, RESULT_REASON_MAX) : "";
+	const reason = rawReason === "" ? (RESULT_FALLBACK_REASON[result.state] ?? "사유 미기재") : rawReason;
+	// Only a controller-classified row carries these; accepted rows never claim a pending remedy.
+	const remedy = result.state === "accepted" ? undefined : result.remedy;
+	const marker = remedy === "blocked" ? " · 차단" : remedy === "retry" ? " · 재시도 소진" : "";
+	const unblock =
+		result.state === "accepted" || typeof result.unblock !== "string" || result.unblock.trim() === ""
+			? ""
+			: ` · 해소: ${clean(result.unblock, RESULT_UNBLOCK_MAX)}`;
+	return `${id === "" ? "(id 없음)" : id}${lane === "" ? "" : ` [${lane}]`}${includeState ? ` ${state}` : ""}${marker} — ${reason}${unblock}`;
+}
+
+function resultLine(
+	header: string,
+	entries: readonly RunResult[],
+	shownLanes: Set<string>,
+	includeState: boolean,
+): string | undefined {
+	if (entries.length === 0) return undefined;
+	const shown = entries.slice(0, CLOSEOUT_RESULT_ENTRY_MAX);
+	for (const result of shown) {
+		if (typeof result.lane === "string" && result.lane.trim() !== "") shownLanes.add(result.lane);
+	}
+	const parts = shown.map(result => resultEntry(result, includeState));
+	const omitted = entries.length - shown.length;
+	if (omitted > 0) parts.push(`외 ${omitted}건`);
+	return `${header}${parts.join(" · ")}`;
+}
+
+interface ResultBrief {
+	lines: string[];
+	/** Lanes already named on a result line: the pending-lane line must not repeat them. */
+	lanes: ReadonlySet<string>;
+}
+
+/**
+ * The official ledger's still-open requirements. Unmet/pending obligations keep their id and runtime reason; reviewable
+ * submissions stay on their own line and are never called verified. Accepted rows are not claimed here: only the
+ * runtime's status line can say whether the run itself is done/verified.
+ */
+function resultBrief(run: RunRecord): ResultBrief {
+	const results = (Array.isArray(run.results) ? run.results : []).filter(
+		(result): result is RunResult => typeof result === "object" && result !== null,
+	);
+	const unresolved = results.filter(result => result.state !== "accepted" && result.state !== "reviewable");
+	const reviewable = results.filter(result => result.state === "reviewable");
+	const lanes = new Set<string>();
+	const lines: string[] = [];
+	const unmet = resultLine("- 미해결 필수 결과(공식): ", unresolved, lanes, true);
+	if (unmet !== undefined) lines.push(unmet);
+	const pending = resultLine("- 검토 가능 필수 결과(공식): ", reviewable, lanes, false);
+	if (pending !== undefined) lines.push(pending);
+	return { lines, lanes };
+}
+
 /** Three distinct conservative directions that never presume a resume or claim work Storm did not verify. */
 function fallbackNext(run: RunRecord, pending: readonly string[]): readonly [string, string, string] {
 	const reason = run.endReason !== undefined ? endLabel(run.endReason) : (STATUS_LABEL[run.status] ?? run.status);
@@ -115,6 +196,8 @@ export interface CloseoutCard {
 /** Whether a settled run left work worth a closeout card: a submitted brief, several lanes, or real non-quick work. */
 export function isSubstantiveRun(run: RunRecord): boolean {
 	if (run.closeout !== undefined) return true;
+	// An open requirement is worth the card even when its lane changed nothing and the run ended quietly (T01).
+	if ((run.results ?? []).some(result => result.state !== "accepted")) return true;
 	const agents = run.agents ?? [];
 	const lanes = run.plan?.lanes ?? [];
 	if (lanes.length > 1) return true;
@@ -154,7 +237,10 @@ export function closeoutCard(
 	}
 	const checks = checksLine(run, requiredChecks);
 	if (checks !== undefined) lines.push(checks);
-	const unfinished = lanesLine(pending);
+	const results = resultBrief(run);
+	lines.push(...results.lines);
+	// A lane already named by an open requirement is the same obligation; print it once, on the result row.
+	const unfinished = lanesLine(pending.filter(name => !results.lanes.has(name)));
 	if (unfinished !== undefined) lines.push(unfinished);
 	lines.push("", "다음으로 무엇을 할까요?", `1. 추천 — ${options[0]}`, `2. ${options[1]}`, `3. ${options[2]}`);
 	return { text: lines.join("\n"), options };

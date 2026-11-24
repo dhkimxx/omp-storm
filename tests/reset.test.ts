@@ -1,151 +1,164 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import * as os from "node:os";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { initializeAutoDelegation, readAutoDelegationChoice } from "../src/approval/auto.ts";
 import { approveAndSave, type FlowEnv, resetFlow } from "../src/flows.ts";
-import { loadProjectState } from "../src/state.ts";
 import { appendRunIndex, readRunIndex } from "../src/runtime/run-index.ts";
-import type { RunSummary } from "../src/types.ts";
+import { writeRun } from "../src/runtime/run.ts";
+import { loadProjectState, type ProjectState } from "../src/state.ts";
 import { runRecord } from "./fixtures.ts";
-import { SESSION_TEAM as config } from "./fake-session.ts";
-import { exec, git, pick, type ScriptedUi, scriptedUi } from "./support.ts";
+import { exec, gitRepo, makeProject, pick, scriptedUi, TEAM, type TestProject, withSession } from "./support.ts";
 
-/** The reset dialog's options by position: reset first, cancel last, and "reset and drop the run index" between them when there is an index. */
+/** The reset dialog's options by position: reset first, cancel last. */
 const RESET = pick(0);
-const RESET_WITH_INDEX = pick(1);
 const CANCEL = pick(-1);
 
-let tmp: string;
-let project: string;
+const summary = (runId: string) => ({
+	schema: "storm.run-summary/v1" as const,
+	runId,
+	startedAt: "2026-11-20T09:00:00.000Z",
+	status: "done" as const,
+	task: "t",
+	costUsd: 1,
+	agents: 0,
+	spawns: { total: 0, blocked: 0 },
+});
+
+let project: TestProject;
 let env: FlowEnv;
 
 beforeEach(async () => {
-	tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-reset-")));
-	project = path.join(tmp, "project");
-	await mkdir(project);
-	await git(project, "init", "-q");
-	env = {
-		cwd: project,
-		exec,
-		agentDir: path.join(tmp, "agent"),
-		pluginAgentsDir: path.join(tmp, "plugin-agents"),
-		ompBin: "omp",
-		registry: { getAll: () => [], getAvailable: () => [] },
-		activeTools: [],
-		now: Date.now,
-	};
+	project = await makeProject();
+	env = project.env;
+	await gitRepo(project.root);
 });
 
 afterEach(async () => {
-	await rm(tmp, { recursive: true, force: true });
+	await project.remove();
 });
 
-const stormDir = () => path.join(project, ".omp", "storm");
-
-/** An approved team plus an unrelated file under .omp/; returns this repo's approval directory. */
-async function seed(): Promise<string> {
-	const state = await loadProjectState(env);
-	await approveAndSave(state, config, { shadowedAgents: [] });
-	await writeFile(path.join(project, ".omp", "other.txt"), "keep\n");
-	return state.store.dir;
+/** An approved session with consent, one run and its index; returns the loaded owner. */
+async function seed(target: FlowEnv = env): Promise<ProjectState> {
+	const state = await loadProjectState(target);
+	await approveAndSave(state, TEAM, { shadowedAgents: [] });
+	await initializeAutoDelegation(state.sessionDir, true);
+	await writeRun(state.sessionDir, runRecord({ runId: "run-20261120-090000-aaaa", status: "done", endReason: "verified" }));
+	await appendRunIndex(state.sessionDir, summary("run-20261120-090000-aaaa"));
+	return state;
 }
 
-async function approvals(): Promise<number> {
-	return (await (await loadProjectState(env)).store.list()).length;
+async function approvals(target: FlowEnv = env): Promise<number> {
+	return (await (await loadProjectState(target)).store.list()).length;
 }
 
 describe("/storm reset", () => {
-	test("one confirmation deletes .omp/storm and this repo's approvals; other repos and other .omp files stay", async () => {
-		const dir = await seed();
-		const other = path.join(path.dirname(dir), "git-other-000000000000000000000000");
-		await mkdir(path.join(other, "approved"), { recursive: true });
-		await writeFile(path.join(other, "approved", "x.json"), "{}");
+	test("one confirmation deletes only this session's Storm store; the work tree and old files stay byte-untouched", async () => {
+		const before = await seed();
+		await mkdir(path.join(project.root, ".omp", "storm"), { recursive: true });
+		const oldConfig = path.join(project.root, ".omp", "storm", "config.json");
+		await writeFile(oldConfig, "old-team\n");
+		await writeFile(path.join(project.root, ".omp", "other.txt"), "keep\n");
+		const statusBefore = await exec("git", ["-C", project.root, "status", "--porcelain"]);
 		const f = scriptedUi([RESET]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
 		expect(f.selects.map(s => s.options.length)).toEqual([2]);
-		expect(existsSync(stormDir())).toBe(false);
-		expect(existsSync(dir)).toBe(false);
-		expect(existsSync(path.join(other, "approved", "x.json"))).toBe(true);
-		expect(existsSync(path.join(project, ".omp", "other.txt"))).toBe(true);
+		expect(existsSync(before.sessionDir)).toBe(false);
+		expect(await readFile(oldConfig, "utf8")).toBe("old-team\n");
+		expect(await readFile(path.join(project.root, ".omp", "other.txt"), "utf8")).toBe("keep\n");
+		// No checkout write: the target's porcelain status is exactly what it was before the reset.
+		expect((await exec("git", ["-C", project.root, "status", "--porcelain"])).stdout).toBe(statusBefore.stdout);
+		// No gitignore and no new checkout files: the session store lives in the profile.
+		expect(existsSync(path.join(project.root, ".omp", "storm", ".gitignore"))).toBe(false);
 		expect(await approvals()).toBe(0);
 	});
 
-	test("the list of Storm runs beside the approvals survives, and the dialog names it", async () => {
-		const dir = await seed();
-		const runs = `${JSON.stringify({ runId: "run-a", artifactsDir: "/s/x", agents: ["a1"] })}\n`;
-		await writeFile(path.join(dir, "runs.jsonl"), runs);
+	test("reset A while session B has an active run removes only A; B keeps its team, approval, consent and history", async () => {
+		const a = await seed();
+		const bEnv = withSession(project, "session-b-reset");
+		const b = await seed(bEnv);
+		// The flows receive the run of their own session; B's active run is not A's.
+		const bActive: FlowEnv = { ...bEnv, activeRun: () => runRecord({ runId: "run-b-active", status: "running" }) };
 		const f = scriptedUi([RESET]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
-		expect(f.selects[0]?.markdown).toContain("runs.jsonl");
-		expect(await readFile(path.join(dir, "runs.jsonl"), "utf8")).toBe(runs);
-		expect(existsSync(path.join(dir, "approved"))).toBe(false);
-		expect(existsSync(path.join(dir, "snapshots"))).toBe(false);
-		// Only the run list is left: a second reset has nothing to do.
-		const again = scriptedUi([RESET]);
-		expect(await resetFlow(env, again.ui)).toBe(false);
-		expect(again.selects).toEqual([]);
+		expect(existsSync(a.sessionDir)).toBe(false);
+		expect(existsSync(b.sessionDir)).toBe(true);
+		expect(await approvals(bEnv)).toBe(1);
+		expect(await readAutoDelegationChoice(b.sessionDir)).toBe("on");
+		expect((await readRunIndex(b.sessionDir)).map(s => s.runId)).toEqual(["run-20261120-090000-aaaa"]);
+		// B's own reset is refused while its run is active.
+		const blocked = scriptedUi();
+		expect(await resetFlow(bActive, blocked.ui)).toBe(false);
+		expect(blocked.selects).toEqual([]);
+		expect(blocked.notes[0]).toContain("run-b-active");
+		expect(existsSync(b.sessionDir)).toBe(true);
 	});
 
-	test("nothing is deleted unless the reset option itself is chosen", async () => {
-		await seed();
-		for (const answer of [undefined, CANCEL, "yes"]) {
-			const f = scriptedUi([answer]);
-			expect(await resetFlow(env, f.ui)).toBe(false);
-			expect(existsSync(path.join(stormDir(), "config.json"))).toBe(true);
+	test("A→B stale reset cancels and leaves both sessions intact; A→B→A stays cancelled too", async () => {
+		const a = await seed();
+		const bEnv = withSession(project, "session-b-stale-reset");
+		const beforeB = await loadProjectState(bEnv);
+		expect(beforeB.config.status).toBe("missing");
+		for (const switchTo of ["B", "A again"]) {
+			let generation = 0;
+			const f = scriptedUi([
+				options => {
+					// A real switch bumps the host generation on every entry, so even returning to A is a new owner.
+					generation = switchTo === "B" ? 1 : 2;
+					return options[0];
+				},
+			]);
+			expect(await resetFlow({ ...env, stillOwner: () => generation === 0 }, f.ui)).toBe(false);
+			expect(f.selects).toHaveLength(1);
+			expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+			expect(existsSync(a.sessionDir)).toBe(true);
+			expect((await loadProjectState(env)).config.status).toBe("ok");
+			expect(await approvals()).toBe(1);
+			expect((await loadProjectState(bEnv)).config.status).toBe("missing");
+			expect(existsSync(beforeB.sessionDir)).toBe(false);
+		}
+	});
+
+	test("a switch after the dialog but before the lease or guard completes still deletes nothing", async () => {
+		const a = await seed();
+		// Calls: entry, after the dialog, after the lease, after the fresh load, after the safety guard.
+		// Cutting the predicate off at the post-lease and post-guard checks both must stop before rm.
+		for (const allowedThrough of [2, 4]) {
+			let calls = 0;
+			const f = scriptedUi([options => options[0]]);
+			expect(
+				await resetFlow(
+					{
+						...env,
+						stillOwner: () => {
+							calls++;
+							return calls <= allowedThrough;
+						},
+					},
+					f.ui,
+				),
+			).toBe(false);
+			expect(calls).toBeGreaterThan(allowedThrough);
+			expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
+			expect(existsSync(a.sessionDir)).toBe(true);
+			expect((await loadProjectState(env)).config.status).toBe("ok");
 			expect(await approvals()).toBe(1);
 		}
 	});
 
-	test("the run summary index stays by default; only the exact delete option removes it", async () => {
-		const summary = (runId: string): RunSummary => ({
-			schema: "storm.run-summary/v1",
-			runId,
-			startedAt: "2026-11-20T09:00:00.000Z",
-			status: "done",
-			task: "t",
-			costUsd: 1,
-			agents: 0,
-			spawns: { total: 0, blocked: 0 },
-		});
-		await seed();
-		await appendRunIndex(project, summary("run-a"));
-		const keep = scriptedUi([RESET]);
-		expect(await resetFlow(env, keep.ui)).toBe(true);
-		expect(keep.selects[0]?.options).toHaveLength(3);
-		expect(existsSync(path.join(stormDir(), "config.json"))).toBe(false);
-		expect((await readRunIndex(project)).map(s => s.runId)).toEqual(["run-a"]);
-		expect(await readFile(path.join(stormDir(), ".gitignore"), "utf8")).toBe("/state/\n");
-
-		await seed();
-		const drop = scriptedUi([RESET_WITH_INDEX]);
-		expect(await resetFlow(env, drop.ui)).toBe(true);
-		expect(existsSync(stormDir())).toBe(false);
-		expect(await readRunIndex(project)).toEqual([]);
-	});
-
-	test("approval records left after .omp/storm was deleted by hand are still cleared", async () => {
-		const dir = await seed();
-		await rm(stormDir(), { recursive: true });
-		const f = scriptedUi([RESET]);
-		expect(await resetFlow(env, f.ui)).toBe(true);
-		expect(existsSync(dir)).toBe(false);
-	});
-
-	test("refuses while a run is active, before asking anything", async () => {
-		await seed();
+	test("refuses while this session has an active run, before asking anything", async () => {
+		const state = await seed();
 		const run = runRecord({ runId: "run-x", status: "running" });
-		const f = scriptedUi([RESET]);
+		const f = scriptedUi();
 		expect(await resetFlow({ ...env, activeRun: () => run }, f.ui)).toBe(false);
 		expect(f.selects).toEqual([]);
 		expect(f.notes).toHaveLength(1);
 		expect(f.notes[0]).toContain("run-x");
-		expect(existsSync(stormDir())).toBe(true);
-		expect(await approvals()).toBe(1);
+		expect(existsSync(state.sessionDir)).toBe(true);
 	});
 
 	test("a run that starts while the dialog is open stops the reset before anything is deleted", async () => {
-		await seed();
+		const state = await seed();
 		const run = runRecord({ runId: "run-late", status: "running" });
 		let started = false;
 		const f = scriptedUi([
@@ -158,23 +171,67 @@ describe("/storm reset", () => {
 		expect(f.selects).toHaveLength(1);
 		expect(f.notes).toHaveLength(1);
 		expect(f.notes[0]).toContain("run-late");
-		expect(existsSync(stormDir())).toBe(true);
-		expect(await approvals()).toBe(1);
+		expect(existsSync(state.sessionDir)).toBe(true);
 	});
 
-	test("calls out a committed config and other worktrees that share the approvals", async () => {
+	test("the dialog names what goes and what stays, including other sessions and old workspace files", async () => {
 		await seed();
-		const plain = scriptedUi([CANCEL]);
-		await resetFlow(env, plain.ui);
-		await git(project, "add", ".omp/storm/config.json");
-		await git(project, "commit", "-qm", "storm");
-		await git(project, "worktree", "add", path.join(tmp, "wt"));
+		await mkdir(path.join(project.root, ".omp"), { recursive: true });
+		await writeFile(path.join(project.root, ".omp", "keep.txt"), "x");
+		const f = scriptedUi([CANCEL]);
+		await resetFlow(env, f.ui);
+		const markdown = f.selects[0]?.markdown ?? "";
+		expect(markdown).toContain("이 OMP 세션만");
+		expect(markdown).toContain("다른 OMP 세션");
+		expect(markdown).toContain("예전 `.omp/storm/`");
+		expect(markdown).toContain("OMP 대화 기록");
+		expect(markdown).toContain(project.root);
+		expect(markdown).not.toContain("worktree");
+	});
+
+	test("nothing is deleted unless the reset option itself is chosen", async () => {
+		const state = await seed();
+		for (const answer of [undefined, CANCEL, "yes"]) {
+			const f = scriptedUi([answer]);
+			expect(await resetFlow(env, f.ui)).toBe(false);
+			expect(existsSync(path.join(state.sessionDir, "config.json"))).toBe(true);
+			expect(await approvals()).toBe(1);
+		}
+	});
+
+	test("the run summary index is part of this session and goes with it", async () => {
+		const state = await seed();
+		expect((await readRunIndex(state.sessionDir)).map(s => s.runId)).toEqual(["run-20261120-090000-aaaa"]);
 		const f = scriptedUi([RESET]);
 		expect(await resetFlow(env, f.ui)).toBe(true);
-		const lines = (s: ScriptedUi) => s.selects[0]?.markdown?.split("\n") ?? [];
-		// Two more lines than a project with nothing committed and no other worktree: one names the tracked file.
-		expect(lines(f)).toHaveLength(lines(plain).length + 2);
-		expect(lines(f).some(line => line.includes(".omp/storm/config.json"))).toBe(true);
+		expect(existsSync(state.sessionDir)).toBe(false);
+		expect(await readRunIndex(state.sessionDir)).toEqual([]);
+	});
+
+	test("a session whose config was deleted by hand is still clearable through its approvals", async () => {
+		const state = await seed();
+		await rm(path.join(state.sessionDir, "config.json"));
+		const f = scriptedUi([RESET]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(existsSync(state.sessionDir)).toBe(false);
+	});
+
+	test("consent and run state are cleared with the team", async () => {
+		const state = await seed();
+		expect(await readAutoDelegationChoice(state.sessionDir)).toBe("on");
+		const f = scriptedUi([RESET]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(await readAutoDelegationChoice(state.sessionDir)).toBe("unset");
+	});
+
+	test("old profile-scope approvals outside the session store are not touched", async () => {
+		const state = await seed();
+		const legacy = path.join(project.agentDir, "storm", "approvals", state.repo.repoId, "approved", "x.json");
+		await mkdir(path.dirname(legacy), { recursive: true });
+		await writeFile(legacy, "legacy\n");
+		const f = scriptedUi([RESET]);
+		expect(await resetFlow(env, f.ui)).toBe(true);
+		expect(await readFile(legacy, "utf8")).toBe("legacy\n");
 	});
 
 	test("nothing to reset: says so without asking", async () => {

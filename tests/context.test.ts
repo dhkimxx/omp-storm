@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ContextEnv, invalidateAnalysis, loadUsageBetween, prepareAnalysis } from "../src/context.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 import { updateTrialState } from "../src/runtime/state-files.ts";
 import { trialViews } from "../src/runtime/views.ts";
 import type { StormConfig, TrialConfig, UiPort } from "../src/types.ts";
@@ -15,6 +16,8 @@ const MINUTE = 60_000;
 const START = new Date(2026, 10, 20, 12).getTime();
 
 let tmp: string;
+/** A valid session store for the trial counters these tests read and write. */
+const trialSession = (): string => sessionStoreDir(join(tmp, "agent"), "trial");
 let db: Database;
 /** The injected clock. */
 let now: number;
@@ -143,6 +146,19 @@ describe("prepareAnalysis context cache", () => {
 		expect(await prepareAnalysis(env(other), ui)).not.toBe(b);
 	});
 
+	test("the same target in another profile does not share the cached context", async () => {
+		insertMessage(db, { timestamp: START - HOUR });
+		const first = await prepareAnalysis(env(), ui);
+		const other: ContextEnv = { ...env(), agentDir: join(tmp, "other-agent") };
+		const second = await prepareAnalysis(other, ui);
+		expect(second).not.toBe(first);
+		// Each profile keeps its own entry until a target-wide invalidation names the folder.
+		expect(await prepareAnalysis(env(), ui)).toBe(first);
+		invalidateAnalysis(tmp);
+		expect(await prepareAnalysis(env(), ui)).not.toBe(first);
+		expect(await prepareAnalysis(other, ui)).not.toBe(second);
+	});
+
 	test("a failed build is not cached", async () => {
 		const broken: ContextEnv = { ...env(), registry: { getAll: () => { throw new Error("registry down"); }, getAvailable: () => [] } };
 		await expect(prepareAnalysis(broken, ui)).rejects.toThrow("registry down");
@@ -181,7 +197,7 @@ describe("trial comparison", () => {
 		now = START + DAY;
 		const views = await trialViews(
 			env(),
-			tmp,
+			trialSession(),
 			config([
 				trial("first", "anthropic/cand-1", START - 7 * DAY, START - 4 * DAY),
 				trial("second", "anthropic/cand-2", START - 3 * DAY, START),
@@ -200,7 +216,7 @@ describe("trial comparison", () => {
 	test("a trial that just ended syncs omp's stats first, so its last requests are counted", async () => {
 		subagent(START - 2 * DAY);
 		stats.sync = () => subagent(START - HOUR, "cand-1");
-		const views = await trialViews(env(), tmp, config([trial("t", "anthropic/cand-1", START - 3 * DAY, START)]), now);
+		const views = await trialViews(env(), trialSession(), config([trial("t", "anthropic/cand-1", START - 3 * DAY, START)]), now);
 		expect(statsRuns()).toBe(1);
 		expect(views[0]?.comparison?.candidate.requests).toBe(1);
 		expect(views[0]?.comparison?.current.requests).toBe(1);
@@ -214,13 +230,13 @@ describe("trial comparison", () => {
 		subagent(START - HOUR);
 		const early = config([trial("t", "anthropic/cand-1", START - 3 * DAY, START + 4 * DAY)]);
 		const requests = async () => {
-			const [view] = await trialViews(env(), tmp, early, now);
+			const [view] = await trialViews(env(), trialSession(), early, now);
 			return [view?.phase, view?.endReason, view?.comparison?.current.requests, view?.comparison?.candidate.requests];
 		};
-		await updateTrialState(tmp, "t", current => ({ ...current, seen: 10, routed: 5 }));
+		await updateTrialState(trialSession(), "t", current => ({ ...current, seen: 10, routed: 5 }));
 		// Counters that recorded no stop time (written before 0.10): the window runs to now.
 		expect(await requests()).toEqual(["ended", "spawns", 3, 1]);
-		await updateTrialState(tmp, "t", current => ({ ...current, stoppedAt: new Date(START - DAY).toISOString() }));
+		await updateTrialState(trialSession(), "t", current => ({ ...current, stoppedAt: new Date(START - DAY).toISOString() }));
 		expect(await requests()).toEqual(["ended", "spawns", 1, 1]);
 	});
 
@@ -243,11 +259,11 @@ describe("trial comparison", () => {
 		const end = START + 5 * MINUTE;
 		now = START + 6 * MINUTE;
 		stats.sync = () => subagent(end - MINUTE, "cand-1");
-		const views = await trialViews(env(), tmp, config([trial("t", "anthropic/cand-1", START - HOUR, end)]), now);
+		const views = await trialViews(env(), trialSession(), config([trial("t", "anthropic/cand-1", START - HOUR, end)]), now);
 		expect(statsRuns()).toBe(2);
 		expect(views[0]?.comparison?.candidate.requests).toBe(1);
 		// That sync ran after the trial's end, so it keeps answering for it.
-		await trialViews(env(), tmp, config([trial("t", "anthropic/cand-1", START - HOUR, end)]), now + HOUR);
+		await trialViews(env(), trialSession(), config([trial("t", "anthropic/cand-1", START - HOUR, end)]), now + HOUR);
 		expect(statsRuns()).toBe(2);
 	});
 });

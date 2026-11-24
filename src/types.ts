@@ -514,6 +514,13 @@ export interface ApprovalRecord {
 	status: "active";
 	/** Only on records written before 0.10; never read. */
 	repoId?: string;
+	/**
+	 * Canonical target binding of a session-scoped store: full sha256 hex of `<kind>\0<resolved root>`. A record
+	 * without the exact binding of the store reading it is not an approval, so copying one between worktrees cannot
+	 * carry commands or shadow coverage. Required for every record this version writes or accepts; pre-session
+	 * records lack it and are never read.
+	 */
+	target: string;
 	configHash: string;
 	/** ISO 8601. */
 	approvedAt: string;
@@ -548,6 +555,8 @@ export type SpawnBlockCode =
 	| "disabled-role"
 	| "no-plan"
 	| "role-not-in-plan"
+	| "unmapped-agent"
+	| "unassigned-lane"
 	| "role-cap"
 	| "parallelism"
 	| "budget"
@@ -722,7 +731,67 @@ export interface RunCheckEvidence {
 	tree: string;
 }
 
-/** `<root>/.omp/storm/state/runs/<runId>.json`: what one Storm run did and under which approval. */
+/**
+ * How far one required result got. `reviewable` means a submission can be judged, not that a qualitative review
+ * passed; `accepted` means this requirement alone was met, never that the run is `done/verified`.
+ */
+export type RunResultState = "pending" | "unmet" | "reviewable" | "accepted";
+
+/**
+ * One prerequisite result version a consuming attempt started from. `version` is the producer's content-only version
+ * when it has one, else its host attempt id, and `missing` when no usable submission existed at attempt start. A new
+ * attempt that produces unchanged content keeps the same version, so a status-only replan reopens nothing.
+ */
+export interface ResultInputVersion {
+	/** Producer result id. */
+	id: string;
+	version: string;
+}
+
+/**
+ * One requirement of a run, keyed by the plan's stable result id. The id survives reassignment and lane renames; the
+ * lane is only where it is currently assigned. `attemptId` is the host's reference to an observed attempt, never a
+ * worker-provided claim; `reason` explains an unmet/pending state in a short line. This ledger is not evidence itself.
+ */
+export interface RunResult {
+	/** Plan result id; run + id is the requirement's identity. */
+	id: string;
+	/** Assigned lane when one exists; changing it does not create a new requirement. */
+	lane?: string;
+	state: RunResultState;
+	/** Short reason anchored in the current attempt when the requirement is pending or unmet. */
+	reason?: string;
+	/** Host-bound attempt this state was observed in; absent until an attempt is bound. */
+	attemptId?: string;
+	/** Content identity of the contract this row was observed for; a changed contract invalidates the row. */
+	identity?: string;
+	/**
+	 * Bounded copy of the contract this id was first observed for. It survives the producing lane leaving the plan, so
+	 * an accepted row can still be re-located at its current source; a changed contract under the same id replaces it
+	 * together with every piece of old evidence. Never reconstructed from plan or model text after the fact.
+	 */
+	contract?: PlanLaneResult;
+	/** Content-only version of the observed evidence, stable across a new attempt while the content is unchanged. */
+	contentVersion?: string;
+	/** Producer result versions this evidence was observed against; absent when the lane declared no prerequisites. */
+	consumed?: ResultInputVersion[];
+	/**
+	 * Trusted next action for a non-accepted row: a native terminal retry/fallback (the host already exhausted its
+	 * configured path), a missing producer, ordinary work, a submitted review, or a known structured refusal. Absent
+	 * keeps the round's normal derivation from state and `blockedBy`; never inferred from error text.
+	 */
+	remedy?: "work" | "producer" | "review" | "retry" | "blocked";
+	/** What must change outside the team before a `blocked` row continues; only from a known structured refusal. */
+	unblock?: string;
+	/** Fingerprint of the lane route whose native retry was exhausted; a same-route respawn stays blocked. */
+	retryRoute?: string;
+	/** Which authority last set `state`: the plan alone, the lane's attempt evidence, or an independent review. */
+	origin?: "plan" | "attempt" | "review";
+	/** Tree fingerprint an `origin: "review"` state was bound to; another tree makes that review state stale. */
+	reviewTree?: string;
+}
+
+/** `<sessionDir>/state/runs/<runId>.json`: what one Storm run did and under which approval. */
 export interface RunRecord {
 	schema: "storm.run/v1";
 	runId: string;
@@ -747,6 +816,8 @@ export interface RunRecord {
 	costByModel: Record<string, number>;
 	budget?: BudgetConfig;
 	checks?: RunCheckEvidence[];
+	/** One row per required result, keyed by the plan's stable id; written by the runtime, never by this schema. */
+	results?: RunResult[];
 	spawns: SpawnRecord[];
 	/** Subagents seen during the run, from the agent ledger. */
 	agents?: AgentEntry[];
@@ -812,7 +883,7 @@ export interface CleanupResult {
 	stormFiles: number;
 }
 
-/** `<root>/.omp/storm/state/runs/index.jsonl`: one line per finished run, kept after the run record is pruned. */
+/** `<sessionDir>/state/runs/index.jsonl`: one line per finished run, kept after the run record is pruned. */
 export interface RunSummary {
 	schema: "storm.run-summary/v1";
 	runId: string;
@@ -839,6 +910,50 @@ export interface RunSummary {
 /** Kinds of work a run plan's lanes do; each defaults to a role (`LANE_ROLES`). */
 export type LaneKind = "explore" | "code" | "run" | "review" | "design";
 
+/**
+ * What a lane's required result is observed in: a change to the shared tree, an artifact of an isolated attempt, or
+ * an answer to a question. Plan input only: a result states what an attempt must show, never that it did.
+ */
+export type LaneResultKind = "change" | "artifact" | "answer";
+
+/**
+ * One required, observable result of a lane. Its `id` is the requirement's stable identity across replans; `criterion`
+ * says what to check and the optional fields narrow how. None of it is evidence or proof until a run observes an
+ * attempt; a plan alone never satisfies a result.
+ */
+export interface PlanLaneResult {
+	/** Stable plan-wide id; same id on a replan keeps the same requirement. */
+	id: string;
+	kind: LaneResultKind;
+	/** What must be shown, as one visible line. Never proof by itself. */
+	criterion: string;
+	/**
+	 * Workspace-relative path the result is observed at. Optional: a change without a path relies on the lane's
+	 * authorized `files`, and an artifact without one only on evidence bound to the observed attempt. On `answer`, a
+	 * source file the answer must cite. Never absolute or outside the tree.
+	 */
+	path?: string | undefined;
+	/**
+	 * Exact content the result must exhibit, whitespace included; optional on every kind. For `change`/`artifact` it
+	 * is matched in the observed content; for `answer` it is matched in the cited source, not in the answer's wording.
+	 */
+	contains?: string | undefined;
+	/** Name of a check in the approved config's `requiredChecks`; never a command line or an unreviewed check. */
+	check?: string | undefined;
+}
+
+/** What a dependent lane waits for from its prerequisite: its required result, the integrated tree, or a submission to review. */
+export type LaneNeed = "result" | "integrated" | "reviewable";
+
+/**
+ * One prerequisite edge of a lane. `lane` names another lane of the same plan by its validated name; `need` says which
+ * state of that lane must hold before this lane may start. Plan input only: never evidence that the need was met.
+ */
+export interface PlanLaneDependency {
+	lane: string;
+	need: LaneNeed;
+}
+
 /** One lane of a run plan: a piece of work with its kind, the role that does it, and the files it may change. */
 export interface PlanLane {
 	name: string;
@@ -856,6 +971,13 @@ export interface PlanLane {
 	isolationReason?: string;
 	/** The lane's status as the director reports it. Never evidence, proof, write scope, or part of its evidence key. */
 	progress?: string;
+	/** Required results the lane must show; absent on plans written before the contract and never synthesized. */
+	results?: PlanLaneResult[] | undefined;
+	/**
+	 * Prerequisite lanes this lane waits for; absent on plans written before dependencies and never synthesized.
+	 * A dependency is plan input, not proof that the prerequisite submitted or that its change was integrated.
+	 */
+	dependsOn?: PlanLaneDependency[] | undefined;
 }
 
 /**
@@ -880,7 +1002,7 @@ export interface QuotaMark {
 	until: string;
 }
 
-/** Counters of one trial, kept in `<root>/.omp/storm/state/trials.json` by trial id. */
+/** Counters of one trial, kept in `<sessionDir>/state/trials.json` by trial id. */
 export interface TrialState {
 	id: string;
 	/** Spawns of the trial's role decided while the trial was active. */
@@ -989,6 +1111,9 @@ export interface PlanRequest {
 		/** Only for an independent experiment kept outside the parent tree; omitted lanes share the tree. */
 		isolationReason?: string | undefined;
 		progress?: string | undefined;
+		results?: PlanLaneResult[] | undefined;
+		/** Prerequisite lanes by name and the state of each that must hold; omitted keeps the lane unconstrained. */
+		dependsOn?: PlanLaneDependency[] | undefined;
 	}>;
 	workers?: Record<string, number> | undefined;
 	note?: string | undefined;

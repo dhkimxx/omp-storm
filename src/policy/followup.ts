@@ -50,12 +50,21 @@ export function followUpBlock(
 }
 
 /**
+ * A native `?progress` note on an `agent://` handle. omp treats it as a status write, not a new work turn: it never
+ * needs a write reservation or a prerequisite gate, and it is not counted as a follow-up.
+ */
+export function followUpProgress(toolName: string, input: unknown): boolean {
+	if (toolName !== "write") return false;
+	const path = pathOf(input);
+	return path !== undefined && path.startsWith(AGENT_URL) && /[?&]progress\b/.test(path);
+}
+
+/**
  * The agent id a finished `write agent://<id>` reached, for the follow-up count: delivered (or queued for a starting
  * agent) means the tool did not fail. `?progress` notes are not follow-ups.
  */
 export function deliveredFollowUp(toolName: string, input: unknown, isError: boolean): string | undefined {
 	if (isError) return undefined;
-	const path = pathOf(input);
-	if (path !== undefined && /[?&]progress\b/.test(path)) return undefined;
+	if (followUpProgress(toolName, input)) return undefined;
 	return followUpTarget(toolName, input);
 }

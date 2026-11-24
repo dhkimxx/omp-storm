@@ -4,6 +4,7 @@ import { ApprovalStore } from "../src/approval/store.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { configPath } from "../src/config/store.ts";
 import type { TreeState } from "../src/runtime/tree.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, ApprovalRecord, RepoIdentity, RoleConfig, RunRecord, ShadowInfo, SpawnRecord, StormConfig } from "../src/types.ts";
 
@@ -83,20 +84,64 @@ export function spawnRecord(over: Partial<SpawnRecord> = {}): SpawnRecord {
 	};
 }
 
+/** A syntactically valid target binding no store owns; callers reading a store pass its exact targetKey instead. */
+export const FIXTURE_TARGET = "0".repeat(64);
+
 /** An approval record as 0.10 writes it, plus whatever older fields a test adds. */
 export function approvalRecord(hash: string, over: Partial<ApprovalRecord> = {}, shadowedAgents: ShadowInfo[] = []): ApprovalRecord {
-	return { schema: "storm.approval/v1", status: "active", configHash: hash, approvedAt: "2026-11-20T00:00:00.000Z", scope: { shadowedAgents }, ...over };
+	return {
+		schema: "storm.approval/v1",
+		status: "active",
+		target: FIXTURE_TARGET,
+		configHash: hash,
+		approvedAt: "2026-11-20T00:00:00.000Z",
+		scope: { shadowedAgents },
+		...over,
+	};
 }
 
-/** The project state of `config` approved as it is, in a repo at `root` whose approval store lives under `<root>/agent`. */
-export function approvedState(root: string, config: StormConfig, repoId = "git-test-000000000000000000000000"): ProjectState {
-	const repo: RepoIdentity = { repoId, kind: "git-common-dir", root };
+/** The named session a bare `approvedState(root, config)` fixture belongs to. Only fixtures that do not care use it. */
+export const FIXTURE_SESSION_ID = "fixture-session";
+
+/**
+ * A fixture profile outside `root` and the store of one named native session in it. The profile name includes the
+ * work-tree directory's own name so unrelated temp projects never share a store; the session id itself is a caller
+ * choice, never derived from the target path.
+ */
+export function fixtureSession(
+	root: string,
+	over: { agentDir?: string; sessionId?: string } = {},
+): { agentDir: string; sessionId: string; sessionDir: string } {
+	const agentDir = over.agentDir ?? path.join(path.dirname(root), `agent-${path.basename(root)}`);
+	const sessionId = over.sessionId ?? FIXTURE_SESSION_ID;
+	return { agentDir, sessionId, sessionDir: sessionStoreDir(agentDir, sessionId) };
+}
+
+export interface ApprovedStateOptions {
+	/** A named native session, for a test that must reopen the same owner. */
+	sessionId?: string;
+	/** A profile agent dir outside the work tree; a fixture sibling of `root` when absent. */
+	agentDir?: string;
+	/** The canonical repository identity's stable id; the work tree root is always the real `root`. */
+	repoId?: string;
+}
+
+/**
+ * The project state of `config` approved as it is in a repo at `root`, for one native session in a profile outside
+ * that work tree. Its config and approvals live under `sessionDir`; `repo.root` is only the approval target.
+ */
+export function approvedState(root: string, config: StormConfig, opts: ApprovedStateOptions = {}): ProjectState {
+	const repo: RepoIdentity = { repoId: opts.repoId ?? "git-test-000000000000000000000000", kind: "git-common-dir", root };
+	const sessionDir = fixtureSession(root, { ...(opts.agentDir !== undefined ? { agentDir: opts.agentDir } : {}), ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}) }).sessionDir;
+	const store = new ApprovalStore(sessionDir, repo);
 	const hash = configHash(config);
 	return {
 		repo,
-		config: { status: "ok", path: configPath(root), config, hash, warnings: [] },
-		approval: approvalRecord(hash),
+		sessionDir,
+		config: { status: "ok", path: configPath(sessionDir), config, hash, warnings: [] },
+		// The in-memory approval carries the store's exact target binding, like one written to disk.
+		approval: approvalRecord(hash, { target: store.targetKey }),
 		shadows: [],
-		store: new ApprovalStore(path.join(root, "agent"), repo),
+		store,
 	};
 }

@@ -9,12 +9,12 @@ import { trialPhase } from "./trials.ts";
  * Trials of the config with counters and phase. An ended trial gets the measured comparison over its own period:
  * start to scheduled end, or to the moment it reached its spawn cap or budget (to now for counters that recorded no
  * such moment), so both sides cover the same requests; omp's stats DB is synced first when it ends before that
- * period does.
+ * period does. Counters come only from this native session's store.
  */
-export async function trialViews(env: StatsEnv, root: string, config: StormConfig, now: number): Promise<TrialView[]> {
+export async function trialViews(env: StatsEnv, sessionDir: string, config: StormConfig, now: number): Promise<TrialView[]> {
 	const trials = config.trials ?? [];
 	if (trials.length === 0) return [];
-	const states = await readTrialStates(root);
+	const states = await readTrialStates(sessionDir);
 	const views: TrialView[] = [];
 	for (const trial of trials) {
 		const state = states[trial.id];

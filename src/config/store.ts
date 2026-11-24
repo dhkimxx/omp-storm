@@ -1,20 +1,30 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { writeTextAtomic } from "../fsutil.ts";
+import { assertSessionStoreSafe } from "../session-scope.ts";
 import type { ConfigLoad, StormConfig } from "../types.ts";
 import { configHash, formatJson, parseStrictJson, sha256Hex } from "./canonical.ts";
 import { validateConfig } from "./schema.ts";
 
-export function configPath(root: string): string {
-	return path.join(root, ".omp", "storm", "config.json");
+/**
+ * This session's team config, inside its own Storm store. It is never written to the target worktree and never
+ * read from `.omp/storm/` there: files an older Storm wrote stay byte-untouched, and a new or forked session starts
+ * without a team.
+ */
+export function configPath(sessionDir: string): string {
+	if (typeof sessionDir !== "string" || sessionDir.trim() === "") {
+		throw new Error("세션 저장소 디렉터리가 없습니다");
+	}
+	return path.join(sessionDir, "config.json");
 }
 
 function errorCode(error: unknown): string | undefined {
 	return (error as NodeJS.ErrnoException | undefined)?.code;
 }
 
-export async function loadConfig(root: string): Promise<ConfigLoad> {
-	const file = configPath(root);
+export async function loadConfig(sessionDir: string, targetRoot?: string): Promise<ConfigLoad> {
+	await assertSessionStoreSafe(sessionDir, targetRoot);
+	const file = configPath(sessionDir);
 	let raw: Uint8Array;
 	try {
 		raw = await fs.readFile(file);
@@ -48,14 +58,17 @@ export function serializeConfig(config: StormConfig): string {
 	return `${formatJson(config, "  ")}\n`;
 }
 
-/** Saves a team Storm built. Never used to migrate a file the user wrote: that one is only ever read. */
-export async function writeConfig(root: string, config: StormConfig): Promise<{ path: string; hash: string }> {
-	const file = configPath(root);
+/**
+ * Saves a team Storm built into this session's own store. It never migrates, edits or deletes a config the user wrote
+ * in the target, and it writes no `.gitignore`: the session directory lives inside the profile, not the workspace.
+ */
+export async function writeConfig(
+	sessionDir: string,
+	config: StormConfig,
+	targetRoot?: string,
+): Promise<{ path: string; hash: string }> {
+	await assertSessionStoreSafe(sessionDir, targetRoot);
+	const file = configPath(sessionDir);
 	await writeTextAtomic(file, serializeConfig(config));
-	try {
-		await fs.writeFile(path.join(path.dirname(file), ".gitignore"), "/state/\n", { flag: "wx" });
-	} catch (error) {
-		if (errorCode(error) !== "EEXIST") throw error;
-	}
 	return { path: file, hash: configHash(config) };
 }

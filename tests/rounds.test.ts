@@ -7,8 +7,10 @@ import {
 	type CoverageCheck,
 	type CoverageInput,
 	type CoverageLane,
+	type CoverageResult,
 	type Gate,
 	maxRounds,
+	nextRemedy,
 	reviewGate,
 	STATUS_LABEL,
 	treeFingerprint,
@@ -826,5 +828,366 @@ describe("buildRoundMessage", () => {
 
 	test("the last-round sentence appears only in the last round", () => {
 		expect(message(4, 4).split("\n").length).toBe(message(3, 4).split("\n").length + 1);
+	});
+});
+
+describe("declared results", () => {
+	const result = (state: "pending" | "unmet" | "reviewable" | "accepted", over: { id?: string; reason?: string } = {}) => ({
+		id: over.id ?? "r1",
+		state,
+		lane: "work",
+		...(over.reason === undefined ? {} : { reason: over.reason }),
+	});
+
+	test("an open requirement overrides every ordinary close", () => {
+		for (const state of ["pending", "unmet", "reviewable"] as const) {
+			const gate = reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { lanes: [{ name: "work", state: "done" }], results: [result(state, { reason: "아직" })] });
+			const remedy = state === "reviewable" ? "review" : "work";
+			expect(gate).toEqual({
+				state: "unverified",
+				cause: "results",
+				changes: 0,
+				reviews: 0,
+				requests: 0,
+				result: "r1",
+				resultState: state,
+				resultLane: "work",
+				resultRemedy: remedy,
+				resultProgress: `r1|${state}|${remedy}||`,
+				resultReason: "아직",
+			});
+		}
+		// A run with nothing to review closes only when no requirement is open.
+		expect(reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { lanes: [], results: [result("accepted")] })).toEqual({ state: "none", why: "no-changes" });
+	});
+
+	test("an open result displaces an ordinary review cause so the round names the repair", () => {
+		const known = reviewGate([writer()], TEAM, undefined, { lanes: [], results: [result("unmet")] });
+		expect(known).toMatchObject({ state: "unverified", cause: "results", result: "r1" });
+	});
+
+	test("a P0 review or an exhausted tree re-review stays first", () => {
+		const p0 = passing([writer({ lastChangeAt: T0 }), reviewer(T0 + 2, true, { tree: NOW, findings: findings(0) })], { results: [result("unmet")] });
+		expect(p0).toMatchObject({ cause: "p0" });
+		const old = reviewer(T0 + 2, true, { tree: "d0:f0" });
+		const exhausted = reviewGate([writer({ lastChangeAt: T0 }), old], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 1 }, { checks: [check()], lanes: [], results: [result("unmet")] });
+		expect(exhausted).toMatchObject({ cause: "stale-review", by: "tree", exhausted: true });
+	});
+
+	test("an open result outranks a waiting lane it may unblock", () => {
+		const gate = reviewGate([], TEAM, { start: CLEAN, now: CLEAN }, { lanes: [{ name: "review", state: "pending" }], results: [result("unmet")] });
+		expect(gate).toMatchObject({ state: "unverified", cause: "results", result: "r1", resultLane: "work" });
+	});
+
+	test("a quiet end cannot hide an open requirement", () => {
+		// Quick-only work and a team without a reviewer are ordinary close candidates too.
+		const quick = reviewGate([agentEntry({ role: "quick", changes: 1, lastChangeAt: T0 })], TEAM, undefined, { lanes: [], results: [result("unmet")] });
+		expect(quick).toMatchObject({ state: "unverified", cause: "results" });
+		const unreviewed = reviewGate([writer()], NO_REVIEWER, undefined, { lanes: [], results: [result("unmet")] });
+		expect(unreviewed).toMatchObject({ state: "unverified", cause: "results" });
+	});
+
+	test("a passed gate cannot pass over an unaccepted requirement", () => {
+		const agents = [writer({ lastChangeAt: T0 }), reviewer(T0 + 2, true, { tree: NOW })];
+		expect(passing(agents, { results: [result("accepted")] })).toEqual({ state: "passed" });
+		expect(passing(agents, { results: [result("unmet")] })).toMatchObject({ state: "unverified", cause: "results", result: "r1" });
+		expect(passing(agents, { results: [result("reviewable")] })).toMatchObject({ state: "unverified", cause: "results", result: "r1" });
+	});
+
+	test("the round message names the open id, lane, state and bounded reason", () => {
+		const gate = reviewGate([], TEAM, undefined, { lanes: [], results: [result("unmet", { reason: "바뀐 내용이 없습니다." })] });
+		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
+		const message = buildRoundMessage({ runId: "run-1", round: 2, maxRounds: 4, gate });
+		expect(message).toContain("`r1` (unmet, lane `work`): 바뀐 내용이 없습니다.");
+		expect(message.match(/Next:/g) ?? []).toHaveLength(1);
+		expect(message).not.toContain("verified");
+	});
+});
+
+describe("S3 directed result feedback", () => {
+	const openRow = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "r1", lane: "work", state: "unmet", ...over });
+	const gateOf = (rows: readonly CoverageResult[], over: Partial<CoverageInput> = {}): Unverified => {
+		const gate = reviewGate([], TEAM, undefined, { lanes: [], ...over, results: rows });
+		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
+		return gate;
+	};
+	const messageOf = (gate: Unverified, reviewer?: string): string =>
+		buildRoundMessage({ runId: "run-3", round: 2, maxRounds: 4, gate, ...(reviewer === undefined ? {} : { reviewer }) });
+
+	test("the next action follows evidence, not a habit", () => {
+		expect(nextRemedy(openRow())).toBe("work");
+		expect(nextRemedy(openRow({ state: "reviewable" }))).toBe("review");
+		expect(nextRemedy(openRow({ state: "reviewable" }), false)).toBe("blocked");
+		expect(nextRemedy(openRow({ state: "pending", blockedBy: "producer" }))).toBe("producer");
+		expect(nextRemedy(openRow({ remedy: "retry" }))).toBe("retry");
+		expect(nextRemedy(openRow({ remedy: "blocked", unblock: "credentials" }))).toBe("blocked");
+	});
+
+	test("a gate carries the requirement's lane, attempt, media and stable witness", () => {
+		const gate = gateOf(
+			[openRow({ kind: "change", attempt: "job:A0:A0", reason: "사전 기준선 이후 바뀐 내용이 없습니다.", evidence: "v1" })],
+			{ reviewer: true },
+		);
+		expect(gate).toMatchObject({
+			cause: "results",
+			result: "r1",
+			resultState: "unmet",
+			resultLane: "work",
+			resultKind: "change",
+			resultAttempt: "job:A0:A0",
+			resultRemedy: "work",
+			resultProgress: "r1|unmet|work||v1",
+		});
+	});
+
+	test("an actionable row is addressed before a blocked one", () => {
+		const gate = gateOf([
+			openRow({ id: "blocked", remedy: "blocked", unblock: "provider login" }),
+			openRow({ id: "fixable" }),
+		]);
+		expect(gate.result).toBe("fixable");
+		expect(gateOf([openRow({ id: "blocked", remedy: "blocked" })]).resultRemedy).toBe("blocked");
+	});
+
+	test("work names only the requirement, its lane, attempt and media", () => {
+		const gate = gateOf([openRow({ kind: "change", attempt: "job:A0:A0", reason: "바뀐 내용이 없습니다 /tmp/storm/secret/report.json" })]);
+		const message = messageOf(gate, "storm-reviewer");
+		expect(message).toContain("`r1` (unmet, lane `work`, attempt `job:A0:A0`)");
+		expect(message).not.toContain("stop retrying");
+		expect(message).not.toContain("/tmp/");
+		expect(message).toContain("<path>");
+		expect(message.match(/Next:/g) ?? []).toHaveLength(1);
+		expect(message).not.toContain("verified");
+	});
+
+	test("missing input names the producer, not the consumer or the reviewer", () => {
+		const gate = gateOf([openRow({ state: "pending", blockedBy: "build", reason: "선행 결과가 아직 없습니다" })]);
+		const message = messageOf(gate, "storm-reviewer");
+		expect(message).toContain("`build`");
+		expect(message).toContain("`r1`");
+		expect(message).not.toContain("fix or rerun");
+		expect(message).not.toContain("judge the submitted");
+	});
+
+	test("a reviewable submission asks the approved reviewer and never reruns its lane", () => {
+		const gate = gateOf([openRow({ state: "reviewable", kind: "answer", attempt: "job:Submit0:Submit0" })], { reviewer: true });
+		const message = messageOf(gate, "storm-reviewer");
+		expect(message).toContain("storm-reviewer");
+		expect(message).toContain("`r1`");
+		expect(message).not.toContain("fix or rerun");
+	});
+
+	test("a reviewable row without an approved reviewer is a blocker, not a round loop", () => {
+		const gate = gateOf([openRow({ state: "reviewable" })], { reviewer: false });
+		expect(gate.resultRemedy).toBe("blocked");
+		expect(gate.resultUnblock).toBeUndefined();
+		const message = messageOf(gate);
+		expect(message).not.toContain("have `storm-reviewer`");
+		expect(message).not.toContain("fix or rerun");
+		expect(decideRound({ turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, gate })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+	});
+
+	test("an external blocker and a host retry are rendered as no team action", () => {
+		const blockedGate = gateOf([openRow({ remedy: "blocked", unblock: "credentials in /home/dev/.config", reason: "인증이 없습니다" })]);
+		expect(blockedGate.resultRemedy).toBe("blocked");
+		expect(blockedGate.resultUnblock).toBe("credentials in /home/dev/.config");
+		const blocked = messageOf(blockedGate);
+		expect(blocked).toContain("credentials in <path>");
+		expect(blocked).not.toContain("/home/dev");
+		expect(blocked).not.toContain("fix or rerun");
+		const retryGate = gateOf([openRow({ remedy: "retry", attempt: "job:A0:A0" })]);
+		expect(retryGate.resultRemedy).toBe("retry");
+		expect(retryGate.resultAttempt).toBe("job:A0:A0");
+		const retry = messageOf(retryGate);
+		expect(retry).toContain("job:A0:A0");
+		expect(retry).not.toContain("fix or rerun");
+		expect(retry).not.toContain("judge the submitted");
+	});
+
+	test("an attempt that is not a short token is omitted rather than shown as a path", () => {
+		const gate = gateOf([openRow({ attempt: "/tmp/storm/attempt" })]);
+		expect(gate.resultAttempt).toBe("/tmp/storm/attempt");
+		const message = messageOf(gate);
+		expect(message).not.toContain("/tmp/");
+		expect(message).not.toContain("attempt `");
+	});
+
+	test("a blocked requirement ends; retry exhaustion gets one directed route-repair round", () => {
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		expect(decideRound({ ...base, gate: gateOf([openRow({ remedy: "blocked" })]), progressSince: { changes: 1, reviews: 1, requests: 1 } })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+		const retry = gateOf([openRow({ remedy: "retry", attempt: "job:A0:A0" })]);
+		expect(decideRound({ ...base, gate: retry })).toMatchObject({ action: "continue" });
+		expect(
+			decideRound({ ...base, gate: retry, progressSince: { changes: 0, reviews: 0, requests: 1, result: retry.resultProgress ?? "" } }),
+		).toEqual({ action: "end", reason: "no-progress" });
+	});
+
+	test("an unmet requirement with an attempt is work, never a review", () => {
+		const gate = gateOf([openRow({ attempt: "job:A0:A0", reason: "시도가 실패로 끝나 필수 결과를 수용하지 않았습니다." })]);
+		expect(gate.resultRemedy).toBe("work");
+		expect(messageOf(gate, "storm-reviewer")).not.toContain("judge the submitted");
+	});
+
+	test("a repeated identical result is no progress even when requests grew; changed evidence is", () => {
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		const gate = gateOf([openRow({ attempt: "job:A1:A1" })]);
+		const current = "r1|unmet|work||";
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1, result: "r1|unmet|work||v2" } })).toMatchObject({ action: "continue" });
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 9, result: current } })).toEqual({ action: "end", reason: "no-progress" });
+		expect(
+			decideRound({ ...base, gate: gateOf([openRow({ state: "reviewable", attempt: "job:A2:A2" })]), progressSince: { changes: 0, reviews: 0, requests: 1, result: current } }),
+		).toMatchObject({ action: "continue" });
+	});
+
+	test("a contracted result never treats request count alone as progress", () => {
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		const gate = gateOf([openRow()]);
+		const witness = "r1|unmet|work||";
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 0, result: witness } })).toEqual({ action: "end", reason: "no-progress" });
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 4, result: witness } })).toEqual({ action: "end", reason: "no-progress" });
+		// Real activity and a changed requirement still continue.
+		expect(decideRound({ ...base, gate, progressSince: { changes: 1, reviews: 0, requests: 0, result: witness } })).toMatchObject({ action: "continue" });
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 1, requests: 0, result: witness } })).toMatchObject({ action: "continue" });
+	});
+
+	test("a result first seen after a round without a result witness gets its action round", () => {
+		const base = { turns: 3, maxRounds: 5, aborted: false, overBudget: false, elapsedMs: 0 };
+		const gate = gateOf([openRow({ state: "unmet", evidence: "b-result@v1" })]);
+		// Round 3 ended with a plain review cause, so no requirement witness was stored; round 4 must be able to act
+		// on the producer content change that invalidated A instead of stopping on counts alone.
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 2 } })).toMatchObject({ action: "continue", round: 4 });
+	});
+
+	test("a reached round limit is reported before a later blocker", () => {
+		const base = { turns: 4, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		expect(decideRound({ ...base, gate: gateOf([openRow({ remedy: "blocked" })]) })).toEqual({ action: "end", reason: "round-limit" });
+	});
+
+	test("a submitted row the tree cannot show is blocked, not sent to a reviewer", () => {
+		const gate = gateOf([openRow({ state: "reviewable", kind: "answer", judgeable: false })], { reviewer: true });
+		expect(gate.resultRemedy).toBe("blocked");
+		const message = messageOf(gate, "storm-reviewer");
+		expect(message).not.toContain("judge the submitted");
+		expect(message).toContain("Report the blocker");
+		expect(nextRemedy(openRow({ state: "reviewable", judgeable: false }), true)).toBe("blocked");
+		expect(nextRemedy(openRow({ remedy: "review", judgeable: false }), true)).toBe("blocked");
+		expect(decideRound({ turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, gate })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+	});
+
+	test("accepted requirements never bypass a stale final review or a check from another tree", () => {
+		const accepted = openRow({ state: "accepted" });
+		const staleReview = [writer({ lastChangeAt: T0 }), reviewer(T0 + 2, true, { tree: "d0:f0" })];
+		expect(reviewGate(staleReview, TEAM, { start: CLEAN, now: CHANGED }, { checks: [check({ tree: "d0:f0" })], lanes: [], results: [accepted] })).toMatchObject({
+			state: "unverified",
+			cause: "stale-review",
+		});
+		const currentReview = [writer({ lastChangeAt: T0 }), reviewer(T0 + 2, true, { tree: NOW })];
+		expect(reviewGate(currentReview, TEAM, { start: CLEAN, now: CHANGED }, { checks: [check({ tree: "d0:f0" })], lanes: [], results: [accepted] })).toMatchObject({
+			state: "unverified",
+			cause: "coverage",
+			evidence: "mismatched",
+		});
+	});
+});
+
+describe("S3 native failure categories", () => {
+	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+	const openRow = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "r1", lane: "work", state: "unmet", ...over });
+	const gateOf = (row: CoverageResult): Unverified => {
+		const gate = reviewGate([], TEAM, undefined, { lanes: [], reviewer: true, results: [row] });
+		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
+		return gate;
+	};
+	const messageOf = (gate: Unverified): string => buildRoundMessage({ runId: "run-f", round: 2, maxRounds: 4, gate, reviewer: "storm-reviewer" });
+
+	test("exhausted host retry is no new Storm retry and names the exhausted attempt", () => {
+		const gate = gateOf(openRow({ remedy: "retry", attempt: "job:T4DB0:T4DB0", reason: "호스트 자동 재시도가 소진되었습니다." }));
+		expect(gate.resultRemedy).toBe("retry");
+		expect(gate.resultAttempt).toBe("job:T4DB0:T4DB0");
+		const message = messageOf(gate);
+		expect(message).toContain("`r1`");
+		expect(message).toContain("job:T4DB0:T4DB0");
+		expect(message).not.toContain("fix or rerun");
+		expect(message).not.toContain("judge the submitted");
+		expect(decideRound({ ...base, gate })).toMatchObject({ action: "continue" });
+		expect(
+			decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 0, result: gate.resultProgress ?? "" } }),
+		).toEqual({ action: "end", reason: "no-progress" });
+	});
+
+	test("a structured config/auth blocker carries its truthful unblock condition", () => {
+		const unblock = "omp task.isolation.enabled를 켜고 팀을 다시 승인한 뒤 새 실행으로 맡기세요.";
+		const gate = gateOf(
+			openRow({
+				remedy: "blocked",
+				unblock,
+				reason: "격리 설정이 꺼져 있어 레인을 시작하지 못했습니다(isolation).",
+			}),
+		);
+		expect(gate.resultRemedy).toBe("blocked");
+		expect(gate.resultUnblock).toBe(unblock);
+		const message = messageOf(gate);
+		expect(message).toContain("omp task.isolation.enabled");
+		expect(message).not.toContain("fix or rerun");
+		expect(decideRound({ ...base, gate })).toEqual({ action: "end", reason: "no-progress" });
+	});
+
+	test("a missing retained artifact is ordinary work, bounded by repeated-evidence stopping", () => {
+		const gate = gateOf(
+			openRow({ remedy: "work", kind: "artifact", attempt: "job:T4TRepair0:T4TRepair0", reason: "보존 산출물을 찾을 수 없습니다(patch-artifact-missing)." }),
+		);
+		expect(gate.resultRemedy).toBe("work");
+		const message = messageOf(gate);
+		expect(message).toContain("`r1`");
+		expect(message).toContain("job:T4TRepair0:T4TRepair0");
+		expect(message).toContain("patch-artifact-missing");
+		expect(message).not.toContain("stop retrying");
+		// First appearance after a non-result round may act once.
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 3 } })).toMatchObject({ action: "continue" });
+		// The same open row and witness again is a repeated failure, not unlimited retry.
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 3, result: "r1|unmet|work||" } })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+	});
+
+	test("a cancelled attempt or an unavailable schema stays ordinary work, not a guessed provider blocker", () => {
+		for (const reason of ["시도가 취소되어 필수 결과를 수용하지 않았습니다.", "구조화 결과가 유효하지 않아 필수 결과를 수용하지 않았습니다."]) {
+			const gate = gateOf(openRow({ reason }));
+			expect(gate.resultRemedy).toBe("work");
+			const message = messageOf(gate);
+			expect(message).not.toContain("stop retrying");
+			expect(message).not.toContain("retry/fallback is exhausted");
+		}
+	});
+});
+
+describe("S3 retry route witness", () => {
+	const openRow = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "r1", lane: "b-repair", state: "unmet", ...over });
+	const gateOf = (row: CoverageResult): Unverified => {
+		const gate = reviewGate([], TEAM, undefined, { lanes: [], reviewer: true, results: [row] });
+		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
+		return gate;
+	};
+	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+
+	test("the same exhausted route cannot buy a second allowance; a genuinely different route can", () => {
+		const gate = gateOf(openRow({ remedy: "retry", attempt: "job:T4DB0:T4DB0", evidence: "retry:5774345db23d" }));
+		const same = gate.resultProgress ?? "";
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1, result: same } })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+		const moved = "r1|unmet|retry||retry:0123456789ab";
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1, result: moved } })).toMatchObject({ action: "continue" });
 	});
 });

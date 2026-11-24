@@ -21,7 +21,7 @@ import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
 import { priorityLabel } from "../../src/view/render.ts";
-import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, price, PROFILE_CONFIG, prepare, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui, until } from "./harness.ts";
+import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, price, PROFILE_CONFIG, prepare, Rpc, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, TRACKED_FILE, TRACKED_TEXT, Tui, until, cancelAll } from "./harness.ts";
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
 const PICK_BY_ROLE = "역할별로 고르기";
@@ -31,7 +31,7 @@ const FULL_VIEW = "전체 내용 보기";
 /** Key hints of Storm's report overlay, which Enter closes. */
 const OVERLAY_HINT = "PgDn";
 /** The disclosure a first team approval carries, and the setup-time question this change removed. */
-const TURNS_AUTO_ON = "승인하면 자동 위임이 켜집니다";
+const TURNS_AUTO_ON = "승인하면 이 세션의 자동 위임이 켜집니다";
 const OLD_PROMPT = "자동 위임을 켤까요?";
 /** The head of omp's form panel (answered and total fields) and the label of its last stop. */
 const FORM_HEAD = /Ask · (\d+) of (\d+) answered/g;
@@ -39,12 +39,26 @@ const FORM_SUBMIT = "Submit";
 
 const env = prepare("storm-e2e-tui", 18559);
 const suite = new Suite("E2E (tui)", env);
-const files = new StormFiles(env);
 const check = suite.check.bind(suite);
+
+/**
+ * The native TUI session every scenario opens: created once through the public RPC host (so its id and transcript are
+ * real and materialized), then resumed with `--resume <id>` for each interactive scenario. Storm's per-session store
+ * is therefore the one this suite builds up; a different session would start with no team.
+ */
+let ownedSession: { id: string; dir: string } | undefined;
 
 const b64 = (value: unknown): string => `b64:${Buffer.from(JSON.stringify(value)).toString("base64")}`;
 const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "main");
-const plan = (name: string, kind: string): Step => ({ storm: { action: "plan", plan: { lanes: [{ name, kind }] } } });
+/**
+ * The read-only probes in this TUI file deliver one sourced observation: the child reads the tracked file and cites
+ * its exact line, so every probing lane has a real, observable result instead of merely ending.
+ */
+const TRACKED_LINE = TRACKED_TEXT.trim();
+const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
+const trackedAnswer = (id: string): Record<string, unknown> => ({ id, kind: "answer", criterion: `report what ${TRACKED_FILE} line 1 says`, path: TRACKED_FILE, contains: TRACKED_LINE });
+const readProbe = `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
+const plan = (name: string, kind: string): Step => ({ storm: { action: "plan", plan: { lanes: [{ name, kind, results: [trackedAnswer(`${name}-answer`)] }] } } });
 const primary = (config: StormConfig | undefined, role: string): string | undefined => modelId(config?.roles[role]?.models[0]);
 const OUTSIDE = "interview-outside";
 /** The calm footer an approved team with automatic delegation shows when no run is live. */
@@ -93,18 +107,19 @@ function idleFooter(line: string | undefined): boolean {
 	});
 }
 
-async function session<T>(body: (tui: Tui) => Promise<T>, model = "fake/general-b", flags: string[] = []): Promise<T> {
-	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags] });
+async function session<T>(body: (tui: Tui, files: StormFiles) => Promise<T>, model = "fake/general-b", flags: string[] = []): Promise<T> {
+	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags], resume: ownedSession.id, sessionDir: ownedSession.dir });
 	try {
 		await tui.ready();
-		return await body(tui);
+		return await body(tui, new StormFiles(env, tui.sessionId));
 	} finally {
 		await tui.close();
 	}
 }
 
 /** Types a command that starts a Storm run and waits until the run has ended and everything about it is written. */
-async function runOf(tui: Tui, command: string, timeoutMs: number): Promise<RunRecord> {
+async function runOf(tui: Tui, files: StormFiles, command: string, timeoutMs: number): Promise<RunRecord> {
 	const before = files.runIds();
 	await tui.submit(command);
 	return files.finishedRun(before, timeoutMs);
@@ -187,10 +202,24 @@ async function submitForm(tui: Tui, from: number, heading: string, fields: numbe
 	return tui.send(KEY.enter);
 }
 
+/**
+ * The setup cases build the approved team this session's later screens read. `E2E_ONLY` selects one case, so a
+ * stateful screen selected on its own would open the fixture's correctly blank session and fail far from the cause.
+ * Name the missing prerequisite before launching the TUI rather than weakening the screen assertion.
+ */
+function requireApprovedTeam(files: StormFiles, name: string): void {
+	if (!existsSync(files.configFile) || files.approvals().length === 0) {
+		throw new Error(`${name} needs the approved team built by the setup cases; run the suite without E2E_ONLY (a single E2E_ONLY selector skips that setup)`);
+	}
+}
+
 /** The narrow, motion-off run in one terminal appearance; the light variant proves no theme assumption. */
 async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
+	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+	const files = new StormFiles(env, ownedSession.id);
+	requireApprovedTeam(files, `${background}: narrow motion-off`);
 	const columns = 60;
-	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, background });
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, background, resume: ownedSession.id, sessionDir: ownedSession.dir });
 	const named = (name: string): string => `${background}: ${name}`;
 	try {
 		await tui.ready();
@@ -199,7 +228,7 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 		check(named("the narrow footer uses the shared mark and an idle state"), idleFooter(idle), idle ?? "no status line");
 		check(named("the narrow footer fits the terminal"), Bun.stringWidth(idle ?? "") <= columns, `${Bun.stringWidth(idle ?? "")} > ${columns}: ${idle}`);
 		const before = files.runIds();
-		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-DELAY 3000" }, { awaitChild: true }];
+		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-DELAY 3000 ${readProbe}` }, { awaitChild: true }];
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 		await tui.seen(started, text => (phaseRow(text, "workers") !== undefined ? true : undefined), named("workers phase"), 30_000);
 		const active = await tui.seen(started, text => {
@@ -234,12 +263,12 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 			check("the narrow hub offers the full dashboard without putting model rows above the menu", choices.includes("전체 현황") && !tui.text(hub).includes("fake/general-b →"));
 			const full = await tui.pick(choices, "전체 현황");
 			await tui.shows(OVERLAY_HINT, full);
-			const storage = await tui.press("4", text => text.includes("Storm 데이터"), "the storage tab to show its actual inventory");
+			const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the storage tab to show its actual inventory");
 			const storageReport = tui.text(storage);
 			check("a storage coverage gap has the OMP warning icon and a readable reason", /⚠[^\n]*(측정 불가|집계 누락|일부 누락)/u.test(storageReport));
 			const runtime = await tui.press("\x1b[D", text => text.includes("서브에이전트") && text.includes("컨텍스트") && text.includes("후속 지시"), "Left to show readable worker details on the runtime tab");
 			check("the narrow runtime view keeps worker metrics out of a wrapped table", !tui.text(runtime).includes("┌──"));
-			check("the storage tab is reachable directly at 60 columns", tui.text(storage).includes("Storm 데이터"));
+			check("the storage tab is reachable directly at 60 columns", tui.text(storage).includes("Storm 세션 데이터") || tui.text(storage).includes("저장 공간"));
 			tui.send(KEY.enter);
 		}
 	} finally {
@@ -249,15 +278,18 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 
 /** OMP's ASCII setting, not a separate Storm switch. Change only the isolated fixture for this session. */
 async function asciiDashboard(): Promise<void> {
+	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+	const files = new StormFiles(env, ownedSession.id);
+	requireApprovedTeam(files, "the ASCII dashboard");
 	const profile = join(env.agentDir, "config.yml");
 	const original = readFileSync(profile, "utf8");
 	writeFileSync(profile, `${original.trimEnd()}\nsymbolPreset: ascii\n`);
 	const columns = 60;
-	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30 });
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, resume: ownedSession.id, sessionDir: ownedSession.dir });
 	try {
 		await tui.ready();
 		const before = files.runIds();
-		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Ascii", say: "E2E-CHILD-DELAY 2500" }, { awaitChild: true }];
+		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Ascii", say: `E2E-CHILD-DELAY 2500 ${readProbe}` }, { awaitChild: true }];
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 		const displayed = await tui.seen(started, text => {
 			const state = text.split("\n").findLast(line => line.includes("STORM") && line.includes(RUN_APPEARANCE.workers.label));
@@ -271,7 +303,7 @@ async function asciiDashboard(): Promise<void> {
 		check("the ASCII worker run settles normally", run.endReason === "no-changes");
 		const status = await tui.submit("/storm status");
 		await tui.shows(OVERLAY_HINT, status);
-		const storage = await tui.press("4", text => text.includes("Storm 데이터"), "the ASCII status storage tab");
+		const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the ASCII status storage tab");
 		check("the ASCII tab uses the host's warning symbol, not a Unicode glyph", /\[!\][^\n]*(측정 불가|집계 누락|일부 누락)/.test(tui.text(storage)));
 		tui.send(KEY.enter);
 	} finally {
@@ -287,11 +319,24 @@ async function main(): Promise<void> {
 	for (const [name, content] of Object.entries({ "note.txt": "e2e note\n", "note2.txt": "e2e second note\n", "note3.txt": "e2e third note\n" })) writeFileSync(join(env.project, name), content);
 	linkPlugin(env);
 
+	// One real native session for the whole interactive suite: created through RPC so its id is public and its
+	// transcript materialized, then resumed by every TUI scenario below. Storm's store for it starts empty.
+	const seed = new Rpc(env, cancelAll, { model: "fake/general-b" });
+	try {
+		await seed.ready();
+		await seed.turn("hello");
+		await seed.identify();
+		if (seed.sessionFile === undefined || !existsSync(seed.sessionFile)) throw new Error("the TUI fixture session wrote no transcript");
+		ownedSession = { id: seed.sessionId, dir: seed.sessionDir };
+	} finally {
+		await seed.close();
+	}
+
 	await suite.step(
 		"setup: edit the first recommendation, then approve",
 		async () => {
 			const llm = new LlmCursor(env);
-			await session(async tui => {
+			await session(async (tui, files) => {
 				const typed = await tui.submit("/storm");
 				const offered = await tui.selector(typed);
 				check("the first team offers direct model editing before anything is saved", offered.includes(PICK_BY_ROLE) && offered.includes(DIRECT_MODEL) && !existsSync(files.configFile), JSON.stringify(offered));
@@ -307,11 +352,10 @@ async function main(): Promise<void> {
 				check("the edited proposal still discloses that approval turns automatic delegation on", tui.text(review).includes(TURNS_AUTO_ON), tui.text(review).slice(-400));
 				// Storm writes the approval and the config, then the personal choice the approval now implies.
 				await suite.eventually("approve saves the config and one approval", () => existsSync(files.configFile) && files.approvals().length === 1, () => `approvals=${files.approvals().length}`);
-				const store = files.storeDir();
-				if (store === undefined) throw new Error("the approval store is missing");
+				if (files.storeDir() === undefined) throw new Error("the approval store is missing");
 				const deadline = Date.now() + 15_000;
-				while (Date.now() < deadline && (await readAutoDelegationChoice(store)) !== "on") await Bun.sleep(50);
-				check("the single team approval persisted automatic delegation on", (await readAutoDelegationChoice(store)) === "on", await readAutoDelegationChoice(store));
+				while (Date.now() < deadline && (await readAutoDelegationChoice(files.sessionDir)) !== "on") await Bun.sleep(50);
+				check("the single team approval persisted automatic delegation on", (await readAutoDelegationChoice(files.sessionDir)) === "on", await readAutoDelegationChoice(files.sessionDir));
 				check("no separate automatic-delegation prompt followed approval", !tui.text(approved).includes(OLD_PROMPT), tui.text(approved).slice(-400));
 				// The composer answers rather than a hidden prompt taking the keys.
 				const status = await tui.submit("/storm status");
@@ -336,10 +380,12 @@ async function main(): Promise<void> {
 	await suite.step(
 		"setup: role pages with the native model picker and effort",
 		async () => {
+			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+			const files = new StormFiles(env, ownedSession.id);
 			const before = files.config();
 			const approvals = files.approvals().length;
 			const llm = new LlmCursor(env);
-			await session(async tui => {
+			await session(async (tui, files) => {
 				let mark = await answer(tui, await tui.submit("/storm setup"), PICK_BY_ROLE);
 				const browse = option("O", "OMP에서 다른 모델 선택");
 				for (const { id, agent } of ROLES) {
@@ -370,11 +416,10 @@ async function main(): Promise<void> {
 					return role?.models[0] === `fake/${OUTSIDE}:low` && typeof role.workers === "object" && role.workers.max === 3 && files.approvals().length === approvals + 1;
 				});
 				check("the other roles keep their models", primary(files.config(), "implementer") === primary(before, "implementer"));
-				const choiceStore = files.storeDir();
 				check(
 					"re-setup neither asks the automatic-delegation question nor turns it off",
-					choiceStore !== undefined && (await readAutoDelegationChoice(choiceStore)) === "on" && !tui.text(settings).includes(OLD_PROMPT),
-					choiceStore === undefined ? "no store" : await readAutoDelegationChoice(choiceStore),
+					(await readAutoDelegationChoice(files.sessionDir)) === "on" && !tui.text(settings).includes(OLD_PROMPT),
+					await readAutoDelegationChoice(files.sessionDir),
 				);
 				check("setup made no model request", llm.all().filter(entry => entry.who !== "side").length === 0);
 				const ordinary = new LlmCursor(env);
@@ -387,7 +432,7 @@ async function main(): Promise<void> {
 	);
 
 	await suite.step("one approved Storm slot can change effort without walking the interview", async () => {
-		await session(async tui => {
+		await session(async (tui, files) => {
 			const before = files.config();
 			const approvals = files.approvals().length;
 			const bytes = files.configBytes();
@@ -433,9 +478,9 @@ async function main(): Promise<void> {
 		"a plain request ends without changes",
 		async () => {
 			const llm = new LlmCursor(env);
-			await session(async tui => {
-				const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"] }];
-				const run = await runOf(tui, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 150_000);
+			await session(async (tui, files) => {
+				const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: readProbe }];
+				const run = await runOf(tui, files, `/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`, 150_000);
 				check("one side turn routed it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
 				check("one turn, ended with no changes", run.turns === 1 && run.endReason === "no-changes" && run.status === "ended", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
@@ -448,11 +493,13 @@ async function main(): Promise<void> {
 
 	await suite.step("a substantial automatic run hands back three choices without starting another run", async () => {
 		const llm = new LlmCursor(env);
-		await session(async tui => {
-			const scope = { name: "scope", kind: "explore", goal: "Locate the first input boundary" };
-			const compare = { name: "compare", kind: "code", goal: "Compare the current evidence without changing files" };
+		await session(async (tui, files) => {
+			const scope = { name: "scope", kind: "explore", goal: "Locate the first input boundary", results: [trackedAnswer("scope-answer")] };
+			const compare = { name: "compare", kind: "code", goal: "Compare the current evidence without changing files", results: [trackedAnswer("compare-answer")] };
 			const setPlan = (...lanes: Array<typeof scope & { progress?: string }>): Step => ({ storm: { action: "plan", plan: { lanes } } });
-			const chosen = `E2E-NEXT E2E-STEPS ${b64([plan("probe", "explore"), { task: ["storm-explorer"], as: "probe" }])}`;
+			// The next direction must fit the brief's 240-character limit; a pure review gate is the compact authorized
+			// run that still proves the one-shot choice opens a real plan and spawns its worker.
+			const chosen = `E2E-NEXT E2E-STEPS ${b64([{ storm: { action: "plan", plan: { lanes: [{ name: "gate", kind: "review" }] } } }, { task: ["storm-reviewer"], as: "gate", say: "E2E-CHILD-VERDICT correct" }])}`;
 			const brief = {
 				result: "E2E-BRIEF-RESULT: the current comparison has one unresolved boundary.",
 				verification: "E2E-BRIEF-EVIDENCE: two local records were compared.",
@@ -461,12 +508,10 @@ async function main(): Promise<void> {
 			};
 			const steps: Step[] = [
 				setPlan(scope),
-				{ task: ["storm-explorer"], as: "scope" },
-				{ wait: true },
+				{ task: ["storm-explorer"], as: "scope", say: readProbe },
 				setPlan({ ...scope, goal: "Located the first input boundary (완료)" }, compare),
 				setPlan({ ...scope, progress: "Located the first input boundary (완료)" }, compare),
-				{ task: ["storm-implementer"], as: "compare" },
-				{ wait: true },
+				{ task: ["storm-implementer"], as: "compare", say: readProbe },
 				{ storm: { action: "brief", brief } },
 			];
 			const before = files.runIds();
@@ -490,11 +535,15 @@ async function main(): Promise<void> {
 			const selected = await tui.submit("1");
 			const next = await files.finishedRun(withCompleted, 60_000);
 			check("the chosen direction starts one new authorized Storm run", next.runId !== run.runId && next.task.startsWith("E2E-NEXT") && next.spawns.some(spawn => spawn.outcome === "routed"));
-			const after = files.runIds().size;
+			// The chosen run gets its own settled card; any ordinary text consumes it, and a later number is model input.
+			await tui.shows("다음으로 무엇을 할까요?", selected, 20_000);
 			const ordinary = new LlmCursor(env);
+			await tui.submit("a routine follow-up after the chosen run");
+			await until(() => mains(ordinary.all()).find(entry => entry.lastUser.includes("a routine follow-up after the chosen run")), 15_000, "ordinary text after the chosen run");
+			const after = files.runIds().size;
 			await tui.submit("1");
-			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 15_000, "an ordinary number after the one-shot choice");
-			check("the routine follow-up asks no question and does not reopen the choices", !tui.text(selected).includes("다음으로 무엇을 할까요?") && files.runIds().size === after);
+			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 15_000, "an ordinary number after the one-shot card");
+			check("a number after the one-shot card is ordinary model input and starts no run", files.runIds().size === after);
 		});
 	}, 180_000);
 
@@ -502,8 +551,8 @@ async function main(): Promise<void> {
 		"a native ask pauses the run and its answer resumes it",
 		async () => {
 			const llm = new LlmCursor(env);
-			await session(async tui => {
-				const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { task: ["storm-explorer"], as: "Scan", say: "E2E-CHILD-DELAY 1200" }, { awaitChild: true }];
+			await session(async (tui, files) => {
+				const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { task: ["storm-explorer"], as: "Scan", say: `E2E-CHILD-DELAY 1200 ${readProbe}` }, { awaitChild: true }];
 				const before = files.runIds();
 				const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 				await tui.seen(
@@ -582,8 +631,10 @@ async function main(): Promise<void> {
 	await suite.step(
 		"a run is sent back until its changes are reviewed",
 		async () => {
+			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
 			const changed = join(env.project, "e2e-rounded.txt");
 			const llm = new LlmCursor(env);
+			const files = new StormFiles(env, ownedSession.id);
 			const approvals = files.approvals().length;
 			files.editConfig(config => {
 				config.budget = { perRunUsd: 0.01, onExceed: "block-spawns" };
@@ -591,7 +642,7 @@ async function main(): Promise<void> {
 				config.requiredChecks = [{ name: "e2e-verify-hold", argv: [process.execPath, "-e", "setTimeout(() => process.exit(0), 4000)"] }];
 			});
 			try {
-				await session(async tui => {
+				await session(async (tui, files) => {
 					await answer(tui, await tui.submit("/storm"), APPROVE);
 					await suite.eventually(
 						"the budget and the required check are approved",
@@ -600,7 +651,22 @@ async function main(): Promise<void> {
 						30_000,
 					);
 					const steps: Step[] = [
-						{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code" }, { name: "review", kind: "review" }] } } },
+						{
+							storm: {
+								action: "plan",
+								plan: {
+									lanes: [
+										{
+											name: "impl",
+											kind: "code",
+											results: [{ id: "impl-change", kind: "change", criterion: "the implementer wrote the change under review", path: "e2e-rounded.txt", contains: "storm child change" }],
+										},
+										// A final review gate judges the integrated tree and owes no separate result of its own.
+										{ name: "review", kind: "review" },
+									],
+								},
+							},
+						},
 						{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-WRITE e2e-rounded.txt" },
 						{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
 					];
@@ -691,7 +757,7 @@ async function main(): Promise<void> {
 	await suite.step("the OMP ASCII preset keeps the live chips and status usable", asciiDashboard, 90_000);
 
 	await suite.step("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
-		await session(async tui => {
+		await session(async (tui, files) => {
 			const before = files.runIds();
 			const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { awaitChild: true }];
 			const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
@@ -718,8 +784,10 @@ async function main(): Promise<void> {
 	await suite.step(
 		"shutdown while an ask waits ends the run and leaves it resumable",
 		async () => {
+			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+			const files = new StormFiles(env, ownedSession.id);
 			const before = files.runIds();
-			const tui = new Tui(env, { model: "fake/general-b" });
+			const tui = new Tui(env, { model: "fake/general-b", resume: ownedSession.id, sessionDir: ownedSession.dir });
 			let runId: string | undefined;
 			try {
 				await tui.ready();

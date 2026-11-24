@@ -1,5 +1,8 @@
+import { realpathSync } from "node:fs";
 import { mkdir, open, readdir, rm, rmdir, stat } from "node:fs/promises";
 import * as path from "node:path";
+import { sha256Hex } from "../config/canonical.ts";
+import { assertSessionStoreSafe } from "../session-scope.ts";
 import { serializeConfig } from "../config/store.ts";
 import { readJson, writeJsonAtomic, writeTextAtomic } from "../fsutil.ts";
 import type { ApprovalRecord, ApprovalScope, RepoIdentity, StormConfig } from "../types.ts";
@@ -9,8 +12,8 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_CODES: readonly unknown[] = ["EEXIST", "ENOENT", "EINVAL"];
 const LOCK_TIMEOUT_MS = 10_000;
 const HEX_FILE_RE = /^[0-9a-f]{64}\.json$/;
-/** Written by Storm before 0.10 and read by nothing; `prune` and `clear` remove them. */
-const LEGACY = ["evidence", "log.jsonl", "repo.json"] as const;
+/** A target directory is named by the full hash of its canonical identity; a copied legacy directory cannot match. */
+const TARGET_DIR_RE = /^[0-9a-f]{64}$/;
 
 function hexOf(configHash: string): string {
 	const hex = configHash.startsWith(HASH_PREFIX) ? configHash.slice(HASH_PREFIX.length) : "";
@@ -32,6 +35,24 @@ async function hexFiles(dir: string): Promise<string[]> {
 	}
 }
 
+async function dirExists(dir: string): Promise<boolean> {
+	try {
+		await stat(dir);
+		return true;
+	} catch (e) {
+		if (errCode(e) === "ENOENT") return false;
+		throw e;
+	}
+}
+
+async function removeIfEmpty(dir: string): Promise<void> {
+	try {
+		await rmdir(dir);
+	} catch (e) {
+		if (errCode(e) !== "ENOENT" && errCode(e) !== "ENOTEMPTY") throw e;
+	}
+}
+
 /**
  * Records of every Storm version: 0.8/0.9 wrote more fields (approvalId, repoId, versions, expiresAt: null, ...), which
  * are ignored. A damaged record (no scope) is no approval, so its readers never meet a half-shaped one.
@@ -42,35 +63,46 @@ function isApproval(value: unknown): value is ApprovalRecord {
 	return (
 		r.schema === "storm.approval/v1" &&
 		r.status === "active" &&
+		typeof r.target === "string" &&
 		typeof r.configHash === "string" &&
 		typeof r.approvedAt === "string" &&
 		Array.isArray(r.scope?.shadowedAgents)
 	);
 }
 
-/** Files under a legacy path (a file or a directory), removed; returns how many files went. */
-async function removeLegacy(target: string): Promise<number> {
-	let count: number;
-	try {
-		count = (await stat(target)).isDirectory() ? (await readdir(target)).length : 1;
-	} catch (e) {
-		if (errCode(e) === "ENOENT") return 0;
-		throw e;
-	}
-	await rm(target, { recursive: true, force: true });
-	return count;
-}
-
 /**
- * Approvals of one repo under `<baseDir>/approvals/<repoId>/`: `approved/<hex>.json` (the record) and
- * `snapshots/<hex>.json` (the approved config, for rollback and diffs). The run janitor keeps its `runs.jsonl`
- * in the same directory; this class never touches it.
+ * Approvals of one native session for one canonical target: `<sessionDir>/approvals/<targetKey>/` holds
+ * `approved/<hex>.json` (the record) and `snapshots/<hex>.json` (the approved config, for rollback and diffs).
+ *
+ * The target key is the full SHA-256 of the target's kind and canonical worktree root. Two linked worktrees of the
+ * same repository therefore never see each other's approvals, and no approval, snapshot or shadow carries across a
+ * target change. The store never reads or removes a pre-session layout under the profile: old approvals are neither
+ * imported nor deleted, including by `clear()`.
  */
 export class ApprovalStore {
+	/** The profile-level session store this approval belongs to. */
+	readonly sessionDir: string;
+	/** Canonical target binding: `<kind>\0<resolved root>` hashed whole. */
+	readonly targetKey: string;
+	/** `<sessionDir>/approvals/<targetKey>`; only approvals for this session and this target. */
 	readonly dir: string;
+	private readonly approvalsRoot: string;
+	private readonly targetRoot: string;
 
-	constructor(baseDir: string, repo: RepoIdentity) {
-		this.dir = path.join(baseDir, "approvals", repo.repoId);
+	constructor(sessionDir: string, repo: RepoIdentity) {
+		if (typeof sessionDir !== "string" || sessionDir.trim() === "") throw new Error("세션 저장소 디렉터리가 없습니다");
+		if (typeof repo?.root !== "string" || repo.root.trim() === "") throw new Error("승인 대상 작업 트리가 없습니다");
+		this.sessionDir = sessionDir;
+		let root: string;
+		try {
+			root = realpathSync(repo.root);
+		} catch {
+			root = path.resolve(repo.root);
+		}
+		this.targetKey = sha256Hex(`${repo.kind}\0${root}`);
+		this.targetRoot = root;
+		this.approvalsRoot = path.join(sessionDir, "approvals");
+		this.dir = path.join(this.approvalsRoot, this.targetKey);
 	}
 
 	private approvedPath(hex: string): string {
@@ -81,24 +113,25 @@ export class ApprovalStore {
 		return path.join(this.dir, "snapshots", `${hex}.json`);
 	}
 
-	private async exists(): Promise<boolean> {
-		try {
-			await stat(this.dir);
-			return true;
-		} catch (e) {
-			if (errCode(e) === "ENOENT") return false;
-			throw e;
-		}
+	/** Fails closed before any read or write if the physical store or this target moved outside its approved scope. */
+	private async guard(): Promise<void> {
+		await assertSessionStoreSafe(this.sessionDir, this.targetRoot, [
+			this.dir,
+			path.join(this.dir, "approved"),
+			path.join(this.dir, "snapshots"),
+		]);
 	}
 
 	private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-		const lockPath = path.join(this.dir, ".lock");
+		// One lock for the whole session store: reset must not interleave with an approval of another target in the
+		// same session, and the lock outlives the target directories it may remove.
+		const lockPath = path.join(this.approvalsRoot, ".lock");
 		const deadline = Date.now() + LOCK_TIMEOUT_MS;
 		for (;;) {
 			if (Date.now() >= deadline) throw new Error("승인 저장소 잠금을 얻지 못했습니다");
 			try {
 				// Inside the loop: `clear()` in another process removes the directory once it is empty, also while this one waits.
-				await mkdir(this.dir, { recursive: true });
+				await mkdir(this.approvalsRoot, { recursive: true });
 				const fh = await open(lockPath, "wx");
 				try {
 					await fh.writeFile(`${process.pid} ${new Date().toISOString()}\n`);
@@ -130,19 +163,22 @@ export class ApprovalStore {
 		}
 	}
 
-	/** The approval of exactly this config hash, if the user gave one. */
+	/** The approval of exactly this config hash for this session and target, if the user gave one. */
 	async active(configHash: string): Promise<ApprovalRecord | undefined> {
+		await this.guard();
 		const value = await readJson(this.approvedPath(hexOf(configHash)));
-		// A record copied under another hash's name must not approve that hash.
-		return isApproval(value) && value.configHash === configHash ? value : undefined;
+		// A record copied under another hash's name or another target's file must not approve this target.
+		return isApproval(value) && value.target === this.targetKey && value.configHash === configHash ? value : undefined;
 	}
 
 	async approve(input: { configHash: string; config: StormConfig; scope: ApprovalScope }): Promise<ApprovalRecord> {
 		const hex = hexOf(input.configHash);
+		await this.guard();
 		return this.withLock(async () => {
 			const record: ApprovalRecord = {
 				schema: "storm.approval/v1",
 				status: "active",
+				target: this.targetKey,
 				configHash: input.configHash,
 				approvedAt: new Date().toISOString(),
 				scope: { shadowedAgents: input.scope.shadowedAgents },
@@ -153,13 +189,15 @@ export class ApprovalStore {
 		});
 	}
 
-	/** Every approval, newest first. */
+	/** Every approval of this session and target, newest first. */
 	async list(): Promise<ApprovalRecord[]> {
+		await this.guard();
 		const dir = path.join(this.dir, "approved");
 		const out: ApprovalRecord[] = [];
 		for (const name of await hexFiles(dir)) {
 			const value = await readJson(path.join(dir, name));
-			if (isApproval(value)) out.push(value);
+			const hash = `${HASH_PREFIX}${name.slice(0, -5)}`;
+			if (isApproval(value) && value.target === this.targetKey && value.configHash === hash) out.push(value);
 		}
 		return out.sort((a, b) => {
 			if (a.approvedAt !== b.approvedAt) return a.approvedAt < b.approvedAt ? 1 : -1;
@@ -168,19 +206,21 @@ export class ApprovalStore {
 	}
 
 	async snapshot(configHash: string): Promise<StormConfig | undefined> {
+		await this.guard();
 		const value = await readJson(this.snapshotPath(hexOf(configHash)));
 		return typeof value === "object" && value !== null ? (value as StormConfig) : undefined;
 	}
 
 	/**
-	 * Storm limits: keeps the record and snapshot of `keepHash` plus the newest `keep` other hashes (by approval time,
-	 * file time for a snapshot without a record), and removes what Storm wrote here before 0.10 and never read.
-	 * Returns how many files it removed.
+	 * Keeps the record and snapshot of `keepHash` plus the newest `keep` other hashes for this target, and removes
+	 * Storm's empty target directories. It never reads or removes a pre-session layout and never touches files it did
+	 * not write itself. Returns how many files it removed.
 	 */
 	async prune(keepHash: string | null, keep = 20): Promise<number> {
 		const keepHex = keepHash === null ? undefined : hexOf(keepHash);
-		// withLock creates the dir; a repo without approvals must stay without one.
-		if (!(await this.exists())) return 0;
+		await this.guard();
+		// withLock creates the root; a session without approvals must stay without one.
+		if (!(await dirExists(this.dir))) return 0;
 		return this.withLock(async () => {
 			const rank = new Map<string, number>();
 			for (const kind of ["approved", "snapshots"] as const) {
@@ -213,24 +253,37 @@ export class ApprovalStore {
 					}
 				}
 			}
-			for (const name of LEGACY) removed += await removeLegacy(path.join(this.dir, name));
+			for (const kind of ["approved", "snapshots"] as const) await removeIfEmpty(path.join(this.dir, kind));
+			await removeIfEmpty(this.dir);
 			return removed;
 		});
 	}
 
 	/**
-	 * `/storm reset`: deletes this repo's approvals and snapshots and returns how many approvals there were.
-	 * `runs.jsonl` stays: it is the janitor's only proof of which omp records belong to Storm runs.
+	 * `/storm reset`: deletes every approval and snapshot of THIS session, across its targets, and returns how many
+	 * approvals there were. Other sessions, session state/history (`<sessionDir>/state`), unknown files and every
+	 * pre-session approval directory stay byte-untouched: old data is never read, imported or deleted.
 	 */
 	async clear(): Promise<number> {
-		if (!(await this.exists())) return 0;
+		await this.guard();
+		if (!(await dirExists(this.approvalsRoot))) return 0;
 		const count = await this.withLock(async () => {
-			const approvals = (await this.list()).length;
-			for (const name of ["approved", "snapshots", ...LEGACY]) await rm(path.join(this.dir, name), { recursive: true, force: true });
+			let approvals = 0;
+			for (const entry of await readdir(this.approvalsRoot, { withFileTypes: true })) {
+				if (!entry.isDirectory() || !TARGET_DIR_RE.test(entry.name)) continue;
+				const dir = path.join(this.approvalsRoot, entry.name);
+				for (const name of await hexFiles(path.join(dir, "approved"))) {
+					const record = await readJson(path.join(dir, "approved", name));
+					const hash = `${HASH_PREFIX}${name.slice(0, -5)}`;
+					if (isApproval(record) && record.target === entry.name && record.configHash === hash) approvals++;
+				}
+				for (const kind of ["approved", "snapshots"] as const) await rm(path.join(dir, kind), { recursive: true, force: true });
+				await removeIfEmpty(dir);
+			}
 			return approvals;
 		});
 		// Nothing left to keep: leave no empty directory behind.
-		await rmdir(this.dir).catch(() => undefined);
+		await removeIfEmpty(this.approvalsRoot);
 		return count;
 	}
 }

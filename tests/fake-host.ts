@@ -9,6 +9,9 @@ import { type Answer, fakeCtx, scriptedUi, TEAM } from "./support.ts";
 
 export const NOW = Date.parse("2026-11-20T09:00:00Z");
 export const repo: RepoIdentity = { repoId: "dir-test-000000000000000000000000", kind: "dir", root: "/repo" };
+/** An in-memory session store outside the target; the fake host never writes it. */
+const sessionDir = "/profile/storm/sessions/fake-host";
+const store = new ApprovalStore(sessionDir, repo);
 /** What the fake `statusText` returns; the tool passes it through. */
 export const STATUS_TEXT = "status-text";
 
@@ -50,16 +53,17 @@ export function fakeHost(opts: FakeHostOptions = {}) {
 		const hash = config ? configHash(config) : null;
 		return {
 			repo,
+			sessionDir,
 			config:
 				config && hash
-					? { status: "ok", path: "/repo/.omp/storm/config.json", config: structuredClone(config), hash, warnings: [] }
-					: { status: "missing", path: "/repo/.omp/storm/config.json" },
+					? { status: "ok", path: `${sessionDir}/config.json`, config: structuredClone(config), hash, warnings: [] }
+					: { status: "missing", path: `${sessionDir}/config.json` },
 			approval:
 				approval && approval.hash === hash
-					? { schema: "storm.approval/v1", status: "active", repoId: repo.repoId, configHash: approval.hash, approvedAt: "2026-11-20T00:00:00.000Z", scope: { shadowedAgents: approval.shadows } }
+					? { schema: "storm.approval/v1", status: "active", repoId: repo.repoId, target: store.targetKey, configHash: approval.hash, approvedAt: "2026-11-20T00:00:00.000Z", scope: { shadowedAgents: approval.shadows } }
 					: undefined,
 			shadows: [...shadows],
-			store: new ApprovalStore("/nonexistent", repo),
+			store,
 		};
 	};
 	const host: StormToolHost & ActionHost = {

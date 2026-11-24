@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FlowEnv } from "../src/flows.ts";
 import { ROLES } from "../src/roles.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 import type { AnalysisContext, Candidate, Exec, MetricValue, ModelInfo, Priority, RoleId, RoleRecommendation, StormConfig, UiPort } from "../src/types.ts";
 
 export const exec: Exec = async (command, args, options) => {
@@ -31,32 +32,67 @@ export async function gitRepo(root: string): Promise<void> {
 
 export interface TestProject {
 	tmp: string;
-	/** The project directory (not a git repo unless the test makes it one). */
+	/** The project directory (not a git repo unless the test makes it one): only ever an approval target. */
 	root: string;
+	/** The profile's agent dir; it lives outside `root`, never in the work tree. */
+	agentDir: string;
+	/** The one native session this project starts with. */
+	sessionId: string;
+	/** `<agentDir>/storm/sessions/<sha256(sessionId)>`: the only place Storm persists this session's own data. */
+	sessionDir: string;
 	env: FlowEnv;
 	remove(): Promise<void>;
+}
+
+/** Optional overrides for a test project; both default to values unique to the temp directory. */
+export interface ProjectOptions {
+	/** A named native session identity, for a test that must reopen the same owner. */
+	sessionId?: string;
+	/** A profile agent dir outside the project; `<tmp>/agent` when absent. */
+	agentDir?: string;
+}
+
+let sessionSerial = 0;
+
+/** A deterministic, process-local native session id. Unrelated projects and helpers must not share one. */
+export function testSessionId(prefix = "session"): string {
+	return `${prefix}-${++sessionSerial}`;
 }
 
 /**
  * A temp project with its own omp agent dir and an absent stats DB. Only `git` really runs; every other command
  * (the `omp` CLI) fails, so nothing outside `tmp` is read or written and no model is "available".
+ *
+ * The profile (and therefore the session store) is outside the project: the work tree is only an approval target.
+ * A second logical session of the same profile opts into a named id with `withSession`, never by reusing the cwd.
  */
-export async function makeProject(now: () => number = Date.now): Promise<TestProject> {
+export async function makeProject(now: () => number = Date.now, opts: ProjectOptions = {}): Promise<TestProject> {
 	const tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-test-")));
 	const root = path.join(tmp, "project");
 	await Bun.write(path.join(root, ".keep"), "");
+	const agentDir = opts.agentDir ?? path.join(tmp, "agent");
+	const sessionId = opts.sessionId ?? testSessionId();
+	const sessionDir = sessionStoreDir(agentDir, sessionId);
 	const env: FlowEnv = {
 		cwd: root,
 		exec: (command, args, options) => (command === "git" ? exec(command, args, options) : Promise.resolve({ stdout: "", stderr: "", code: 1 })),
-		agentDir: path.join(tmp, "agent"),
+		agentDir,
 		pluginAgentsDir: path.join(tmp, "plugin-agents"),
+		sessionId,
 		ompBin: "omp",
 		statsDb: path.join(tmp, "no-stats.db"),
 		registry: { getAll: () => [], getAvailable: () => [] },
 		activeTools: [],
 		now,
+		// The native owner is live for a test's whole run unless the test narrows this predicate.
+		stillOwner: () => true,
 	};
-	return { tmp, root, env, remove: () => rm(tmp, { recursive: true, force: true }) };
+	return { tmp, root, agentDir, sessionId, sessionDir, env, remove: () => rm(tmp, { recursive: true, force: true }) };
+}
+
+/** The same profile under another explicit native session: a fork or a second conversation has its own store. */
+export function withSession(project: TestProject, sessionId: string): FlowEnv {
+	return { ...project.env, sessionId };
 }
 
 /** An answer, or a hook run when the dialog opens (to change state underneath) that then answers. */

@@ -6,7 +6,7 @@
  */
 import { tokens } from "../report/agents.ts";
 import { roleTitle } from "../roles.ts";
-import type { AgentEntry, AgentLiveState, RunRecord } from "../types.ts";
+import type { AgentEntry, AgentLiveState, LaneNeed, RunRecord, RunResultState } from "../types.ts";
 import { reviewTotals } from "./review.ts";
 import { runRecordRef } from "./run.ts";
 
@@ -24,6 +24,12 @@ const REQUEST_TAIL_BYTES = 512;
 /** One lane goal is a constraint too; the plan's note may carry the remaining decisions. */
 const MAX_LANE_GOAL = 120;
 const MAX_PLAN_NOTE = 300;
+/** Requirement rows and plan dependency edges listed; the rest are counted, never replayed. */
+const MAX_RESULTS = 12;
+const MAX_DEPENDENCIES = 8;
+const MAX_RESULT_REASON = 100;
+const MAX_ATTEMPT = 64;
+const MAX_EDGE_NAME = 60;
 /** Hard cap on the whole ledger; longer text points at the run record instead of replaying it. */
 const MAX_STATE_BYTES = 6_000;
 
@@ -61,6 +67,17 @@ export function shouldCheckpoint(input: {
 }
 
 const STATE_LABEL: Record<AgentLiveState, string> = { running: "실행 중", idle: "유휴", parked: "보관" };
+const RESULT_STATE_LABEL: Readonly<Record<RunResultState, string>> = {
+	pending: "대기",
+	unmet: "미충족",
+	reviewable: "검토 가능",
+	accepted: "수용",
+};
+const DEPENDENCY_NEED_LABEL: Readonly<Record<LaneNeed, string>> = {
+	result: "결과",
+	integrated: "통합",
+	reviewable: "검토",
+};
 
 /** Model text becomes one ledger line: whitespace collapsed, bounded, with an ellipsis when cut. */
 function oneLine(text: string, max: number): string {
@@ -119,9 +136,10 @@ function boundedState(lines: string[]): string[] {
 
 /**
  * Storm's ledger of a run for a compaction of its directing session: the request's constraints, plan lanes and their
- * goals, the run's agents with their `agent://` handles, the review tally and what Storm blocked. Compact Korean
- * lines from record metadata only; no file contents, command output or logs. Long lists and text are cut, counted or
- * pointed to by `runRecordRef`. `agents` may hold other runs' agents; only those of `run` are listed.
+ * goals, the required-result ledger and dependency edges, the run's agents with their `agent://` handles, the review
+ * tally and what Storm blocked. Compact Korean lines from record metadata only; no file contents, command output or
+ * logs. Long lists and text are cut, counted or pointed to by `runRecordRef`. `agents` may hold other runs' agents;
+ * only those of `run` are listed.
  */
 export function workingState(run: RunRecord, agents: readonly AgentEntry[]): string[] {
 	const out = [`Storm 실행 ${run.runId} 장부 (압축 뒤에도 유지할 상태). 요청: ${oneLine(run.task, MAX_TASK)}`];
@@ -141,6 +159,29 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 			out.push(`- ${oneLine(l.name, MAX_NAME)} (${l.kind}, ${roleTitle(l.role)})${goal}`);
 		}
 		if (lanes.length > MAX_LANES) out.push(`- 외 ${lanes.length - MAX_LANES}개`);
+	}
+
+	const results = run.results ?? [];
+	if (results.length > 0) {
+		out.push(`필수 결과 ${results.length}개 (요구 id는 재계획에도 유지):`);
+		for (const row of results.slice(0, MAX_RESULTS)) {
+			const lane = row.lane === undefined ? "미배정" : `레인 ${oneLine(row.lane, MAX_NAME)}`;
+			const attempt = row.attemptId === undefined ? "" : ` · 시도 ${oneLine(row.attemptId, MAX_ATTEMPT)}`;
+			const reason = row.reason === undefined ? "" : ` · ${oneLine(row.reason, MAX_RESULT_REASON)}`;
+			out.push(`- ${oneLine(row.id, MAX_NAME)} = ${RESULT_STATE_LABEL[row.state]} · ${lane}${attempt}${reason}`);
+		}
+		if (results.length > MAX_RESULTS) {
+			const ref = runRecordRef(run.runId);
+			out.push(`- 외 ${results.length - MAX_RESULTS}개 (${ref ?? "실행 기록 참조"})`);
+		}
+	}
+
+	const edges = lanes.flatMap(lane => (lane.dependsOn ?? []).map(dependency => ({ from: lane.name, to: dependency.lane, need: dependency.need })));
+	if (edges.length > 0) {
+		const shown = edges
+			.slice(0, MAX_DEPENDENCIES)
+			.map(edge => `${oneLine(edge.from, MAX_EDGE_NAME)}→${oneLine(edge.to, MAX_EDGE_NAME)}(${DEPENDENCY_NEED_LABEL[edge.need]})`);
+		out.push(`계획 선행 의존 ${edges.length}개: ${shown.join(", ")}${edges.length > MAX_DEPENDENCIES ? ` 외 ${edges.length - MAX_DEPENDENCIES}개` : ""}`);
 	}
 
 	const mine = agents.filter(a => a.runId === run.runId);

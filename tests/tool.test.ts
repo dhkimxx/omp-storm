@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as zod from "@oh-my-pi/omptype/zod";
-import { MAX_LANE_TEXT } from "../src/plan/validate.ts";
+import { MAX_LANE_DEPENDENCIES, MAX_LANE_RESULTS, MAX_LANE_TEXT, MAX_RESULT_CRITERION, MAX_RESULT_ID } from "../src/plan/validate.ts";
 import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../src/proposals/present.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
@@ -13,6 +13,25 @@ import { agentEntry as ledgerEntry } from "./fixtures.ts";
 import { TEAM as base } from "./support.ts";
 
 const run = (f: { host: StormToolHost }, params: StormToolInput) => runStormTool(f.host, params);
+
+/** The fresh-plan contract the tool boundary requires for a change or answer lane. */
+const coreLane = {
+	name: "core",
+	kind: "code" as const,
+	files: ["src/a.ts"],
+	results: [{ id: "core-change", kind: "change" as const, criterion: "src/a.ts carries the change", path: "src/a.ts" }],
+};
+const scanLane = {
+	name: "scan",
+	kind: "explore" as const,
+	results: [{ id: "scan-answer", kind: "answer" as const, criterion: "the scan reports what the tree contains" }],
+};
+const probeLane = {
+	name: "probe",
+	kind: "run" as const,
+	isolationReason: "compare parser backends",
+	results: [{ id: "probe-artifact", kind: "artifact" as const, criterion: "the retained experiment patch exists" }],
+};
 
 const agentEntry = (over: Partial<AgentEntry> = {}): AgentEntry =>
 	ledgerEntry({ id: "A1", model: "a/i", startedAt: NOW - 600_000, lastActivityAt: NOW - 60_000, contextTokens: 30_000, requests: 4, costUsd: 0.1, ...over });
@@ -27,10 +46,11 @@ describe("tool definition", () => {
 		for (const action of gone) expect(tool.parameters.safeParse({ action }).success).toBe(false);
 	});
 
-	test("the description fits in 900 characters and names the brief and progress", () => {
+	test("the description fits in 900 characters and names the brief, progress and dependencies", () => {
 		expect(tool.description.length).toBeLessThanOrEqual(900);
 		expect(tool.description).toContain("brief");
 		expect(tool.description).toContain("progress");
+		expect(tool.description).toContain("dependsOn");
 	});
 
 	test("the schema has exactly action, task, plan and brief", () => {
@@ -61,6 +81,28 @@ describe("tool definition", () => {
 		expect(tool.parameters.safeParse(lane("isolationReason", MAX_LANE_TEXT + 1)).success).toBe(false);
 		const isolated = tool.parameters.parse({ action: "plan", plan: { lanes: [{ name: "probe", kind: "run", isolationReason: "compare parser backends" }] } });
 		expect(isolated.plan?.lanes[0]?.isolationReason).toBe("compare parser backends");
+		// Required results are bounded and strict: an unknown field never degrades into a weaker result.
+		const result = { id: "report", kind: "change", criterion: "report changes", path: "out/report.json", contains: "ok", check: "test" };
+		const withResults = (results: unknown) => ({ action: "plan", plan: { lanes: [{ name: "core", kind: "code", results }] } });
+		expect(tool.parameters.safeParse(withResults([result])).success).toBe(true);
+		expect(tool.parameters.safeParse(withResults([{ ...result, contians: "typo" }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withResults([])).success).toBe(false);
+		expect(tool.parameters.safeParse(withResults(Array.from({ length: MAX_LANE_RESULTS + 1 }, (_, i) => ({ ...result, id: `r${i}` })))).success).toBe(false);
+		expect(tool.parameters.safeParse(withResults([{ ...result, id: "x".repeat(MAX_RESULT_ID + 1) }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withResults([{ ...result, id: "has space" }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withResults([{ ...result, criterion: "x".repeat(MAX_RESULT_CRITERION + 1) }])).success).toBe(false);
+		// Dependencies are strict too: a typo, an empty list or an unknown need never degrades into no prerequisite.
+		const withDeps = (dependsOn: unknown) => ({ action: "plan", plan: { lanes: [{ name: "consume", kind: "explore", dependsOn }] } });
+		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: "result" }])).success).toBe(true);
+		expect(tool.parameters.safeParse(withDeps([{ lane: " produce ", need: "integrated" }])).success).toBe(true);
+		expect(tool.parameters.safeParse(withDeps([])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: "done" }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: true }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: "result", optional: true }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "", need: "result" }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "x".repeat(MAX_LANE_TEXT + 1), need: "result" }])).success).toBe(false);
+		const many = Array.from({ length: MAX_LANE_DEPENDENCIES + 1 }, (_, i) => ({ lane: `p${i}`, need: "reviewable" }));
+		expect(tool.parameters.safeParse(withDeps(many)).success).toBe(false);
 		const longBrief = { result: "x".repeat(CLOSEOUT_TEXT_MAX + 1), verification: "v", next: ["a", "b", "c"] };
 		expect(tool.parameters.safeParse({ action: "brief", brief: longBrief }).success).toBe(false);
 		const longNext = { result: "r", verification: "v", next: ["a", "b", "x".repeat(CLOSEOUT_NEXT_MAX + 1)] };
@@ -102,10 +144,7 @@ describe("read actions", () => {
 });
 
 describe("plan", () => {
-	const lanes = [
-		{ name: "core", kind: "code" as const, files: ["src/a.ts"] },
-		{ name: "scan", kind: "explore" as const },
-	];
+	const lanes = [coreLane, scanLane];
 
 	test("within bounds applies at once with no dialog", async () => {
 		const f = fakeHost({ runActive: true });
@@ -118,11 +157,79 @@ describe("plan", () => {
 		expect(f.plans[0]!.lanes.map(l => l.role)).toEqual(["implementer", "explorer"]);
 	});
 
+	test("an asynchronous plan application is awaited before the reply claims it applied", async () => {
+		const f = fakeHost({ runActive: true });
+		let applied = false;
+		f.host.runtime.setRunPlan = async plan => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+			f.plans.push(plan);
+			applied = true;
+			return { ok: true };
+		};
+		const r = await run(f, { action: "plan", plan: { lanes, workers: { implementer: 2 } } });
+		expect(applied).toBe(true);
+		expect(r.outcome).toBe("ok");
+		expect(r.text).toContain("실행 계획을 적용했습니다");
+	});
+
+	test("a fresh plan that omits one lane's results is refused with that lane id before saving", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, { action: "plan", plan: { lanes: [coreLane, { name: "writer", kind: "run" }] } });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("'writer'");
+		expect(r.text).toContain("results");
+		expect(f.plans).toEqual([]);
+		expect(f.saved).toEqual([]);
+		expect(f.selects).toEqual([]);
+	});
+
+	test("a review-only plan is a gate, not a deliverable, and needs no results", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "gate", kind: "review" }] } });
+		expect(r.outcome).toBe("ok");
+		expect(f.plans).toHaveLength(1);
+		expect(f.plans[0]!.lanes[0]).not.toHaveProperty("results");
+	});
+
 	test("lane progress is status carried through the plan, not a new lane identity", async () => {
 		const f = fakeHost({ runActive: true });
-		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", goal: "ship it", progress: "절반" }] } });
+		const r = await run(f, { action: "plan", plan: { lanes: [{ ...coreLane, goal: "ship it", progress: "절반" }] } });
 		expect(r.outcome).toBe("ok");
 		expect(f.plans[0]!.lanes[0]).toMatchObject({ name: "core", kind: "code", goal: "ship it", progress: "절반" });
+	});
+
+	test("required results are carried and normalized; the plan alone proves none of them", async () => {
+		const f = fakeHost({ runActive: true });
+		const results = [
+			{ id: "report-json", kind: "change" as const, criterion: "  report.json changes  ", path: "out/report.json", contains: "  ok  " },
+			{ id: "probe", kind: "artifact" as const, criterion: "patch exists", path: "patches/a.patch" },
+		];
+		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", results }] } });
+		expect(r.outcome).toBe("ok");
+		expect(f.plans[0]!.lanes[0]!.results).toEqual([
+			{ id: "report-json", kind: "change", criterion: "report.json changes", path: "out/report.json", contains: "  ok  " },
+			{ id: "probe", kind: "artifact", criterion: "patch exists", path: "patches/a.patch" },
+		]);
+	});
+
+	test("a results contract that cannot be observed is refused before the plan applies", async () => {
+		const f = fakeHost({ runActive: true });
+		const bad = async (results: unknown) => run(f, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", results } as never] } });
+		expect((await bad([{ id: "x", kind: "change", criterion: "changed", path: "../escape.ts" }])).outcome).toBe("rejected");
+		expect((await bad([{ id: "x", kind: "answer", criterion: "answered", contains: "yes", check: "test" }])).outcome).toBe("rejected");
+		expect((await bad([{ id: "x", kind: "change", criterion: "changed", path: "a.ts", check: "bun test" }])).outcome).toBe("rejected");
+		expect(f.plans).toEqual([]);
+		expect(f.selects).toEqual([]);
+		// A pathless change is allowed as a qualitative obligation, not as an automatic pass.
+		expect((await bad([{ id: "x", kind: "change", criterion: "changed" }])).outcome).toBe("ok");
+		expect(f.plans[0]!.lanes[0]!.results).toEqual([{ id: "x", kind: "change", criterion: "changed" }]);
+		const checked = { ...structuredClone(base), requiredChecks: [{ name: "test", argv: ["bun", "test"] }] };
+		const g = fakeHost({ config: checked, runActive: true });
+		const ok = await run(g, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", results: [{ id: "x", kind: "change", criterion: "changed", path: "a.ts", check: "test" }] }] } });
+		expect(ok.outcome).toBe("ok");
+		expect(g.plans[0]!.lanes[0]!.results![0]!.check).toBe("test");
 	});
 
 	test("selective isolation persists on its lane and adds one display line only for that exception", async () => {
@@ -130,10 +237,7 @@ describe("plan", () => {
 		const r = await run(f, {
 			action: "plan",
 			plan: {
-				lanes: [
-					{ name: "core", kind: "code", files: ["src/a.ts"] },
-					{ name: "probe", kind: "run", isolationReason: "compare parser backends" },
-				],
+				lanes: [coreLane, probeLane],
 			},
 		});
 		expect(r.outcome).toBe("ok");
@@ -152,7 +256,7 @@ describe("plan", () => {
 
 	test("a checked-only plan still shows the isolation exception once", async () => {
 		const f = fakeHost();
-		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "probe", kind: "run", isolationReason: "compare parser backends" }] } });
+		const r = await run(f, { action: "plan", plan: { lanes: [probeLane] } });
 		expect(r.outcome).toBe("ok");
 		expect(f.plans).toEqual([]);
 		expect(r.text).toContain("검증만 했습니다");
@@ -164,10 +268,7 @@ describe("plan", () => {
 		const r = await run(f, {
 			action: "plan",
 			plan: {
-				lanes: [
-					{ name: "core", kind: "code", files: ["src/a.ts"] },
-					{ name: "probe", kind: "run", isolationReason: "compare parser backends" },
-				],
+				lanes: [coreLane, probeLane],
 				workers: { implementer: 5 },
 			},
 		});
@@ -185,6 +286,49 @@ describe("plan", () => {
 		expect(f.selects).toEqual([]);
 	});
 
+	test("a plan with dependencies applies them and shows every edge to the director", async () => {
+		const f = fakeHost({ runActive: true });
+		const r = await run(f, {
+			action: "plan",
+			plan: {
+				lanes: [
+					{ name: "produce", kind: "code", results: [{ id: "p", kind: "change", criterion: "a.ts changes", path: "a.ts" }] },
+					{ ...scanLane, name: "consume", dependsOn: [{ lane: "produce", need: "result" }] },
+				],
+			},
+		});
+		expect(r.outcome).toBe("ok");
+		expect(r.text).toContain("- 선행: consume ← produce(result)");
+		expect(f.plans[0]!.lanes[1]!.dependsOn).toEqual([{ lane: "produce", need: "result" }]);
+	});
+
+	test("an invalid dependency rejects before any dialog, save or applied plan", async () => {
+		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+		const r = await run(f, {
+			action: "plan",
+			plan: { lanes: [{ ...coreLane, dependsOn: [{ lane: "gone", need: "result" }] }], workers: { implementer: 5 } },
+		});
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("없는 레인");
+		expect(f.selects).toEqual([]);
+		expect(f.plans).toEqual([]);
+		expect(f.saved).toEqual([]);
+	});
+
+	test("the approval dialog shows the dependency edges of the plan it asks to widen", async () => {
+		const f = fakeHost({ runActive: true, answers: [APPROVE] });
+		const r = await run(f, {
+			action: "plan",
+			plan: {
+				lanes: [coreLane, { ...scanLane, name: "consume", dependsOn: [{ lane: "core", need: "reviewable" }] }],
+				workers: { implementer: 4 },
+			},
+		});
+		expect(r.outcome).toBe("approved");
+		expect(f.selects[0]!.markdown).toContain("- 선행: consume ← core(reviewable)");
+		expect(f.plans[0]!.lanes[1]!.dependsOn).toEqual([{ lane: "core", need: "reviewable" }]);
+	});
+
 	test("a replan conflict is refused before an out-of-bounds plan can open a proposal", async () => {
 		const f = fakeHost({ runActive: true, answers: [APPROVE] });
 		const host: StormToolHost = {
@@ -194,7 +338,7 @@ describe("plan", () => {
 				replanConflict: plan => `계획 레인 '${plan.lanes[0]!.name}'의 goal 항목이 바뀌었습니다.`,
 			},
 		};
-		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code", goal: "new" }], workers: { implementer: 5 } } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [{ ...coreLane, goal: "new" }], workers: { implementer: 5 } } });
 		expect(r).toEqual({ outcome: "rejected", text: "계획을 적용하지 않았습니다. 계획 레인 'core'의 goal 항목이 바뀌었습니다." });
 		expect(f.selects).toEqual([]);
 		expect(f.saved).toEqual([]);
@@ -212,7 +356,7 @@ describe("plan", () => {
 
 	test("past the bounds of an unapproved config: refused, nothing asked, nothing saved", async () => {
 		const f = fakeHost({ approved: false, runActive: true });
-		const r = await run(f, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }], workers: { implementer: 9 } } });
+		const r = await run(f, { action: "plan", plan: { lanes: [coreLane], workers: { implementer: 9 } } });
 		expect(r).toEqual({ outcome: "rejected", text: NEEDS_APPROVAL });
 		expect(f.selects).toEqual([]);
 		expect(f.prepares()).toBe(0);
@@ -400,7 +544,7 @@ describe("automatic delegation", () => {
 
 	test("a plan opens the run with this turn's request and the validated plan already bound", async () => {
 		const { f, host, starts } = autoHost({ task: "  fix the login bug " });
-		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
 		expect(r.outcome).toBe("ok");
 		expect(r.text).toContain("run-auto");
 		expect(starts).toHaveLength(1);
@@ -412,7 +556,7 @@ describe("automatic delegation", () => {
 
 	test("without a captured user request it refuses instead of writing a plan", async () => {
 		const { f, host, starts } = autoHost();
-		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
 		expect(r.outcome).toBe("rejected");
 		expect(r.text).toContain("사용자 요청");
 		expect(starts).toEqual([]);
@@ -421,14 +565,14 @@ describe("automatic delegation", () => {
 
 	test("an automatic start refusal is passed back unchanged", async () => {
 		const { host, starts } = autoHost({ task: "fix it", start: { ok: false, reason: "team approval is stale" } });
-		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
 		expect(r).toEqual({ outcome: "rejected", text: "team approval is stale" });
 		expect(starts).toHaveLength(1);
 	});
 
 	test("an active run keeps the existing setRunPlan path, not a second start", async () => {
 		const { f, host, starts } = autoHost({ task: "fix it", active: true });
-		const r = await run({ host }, { action: "plan", plan: { lanes: [{ name: "core", kind: "code" }] } });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
 		expect(r.outcome).toBe("ok");
 		expect(f.plans).toHaveLength(1);
 		expect(starts).toEqual([]);

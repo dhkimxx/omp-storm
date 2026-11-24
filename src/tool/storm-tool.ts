@@ -7,16 +7,29 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/p
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, teamPriority } from "../config/schema.ts";
 import { planChange } from "../plan/change.ts";
-import { MAX_LANE_TEXT, type PlanGap, validatePlan } from "../plan/validate.ts";
+import {
+	LANE_NEEDS,
+	MAX_LANE_DEPENDENCIES,
+	MAX_LANE_RESULTS,
+	MAX_LANE_TEXT,
+	MAX_RESULT_CONTAINS,
+	MAX_RESULT_CRITERION,
+	MAX_RESULT_ID,
+	MAX_RESULT_PATH,
+	type PlanGap,
+	RESULT_ID_RE,
+	RESULT_KINDS,
+	validatePlan,
+} from "../plan/validate.ts";
 import { modelWarnings } from "../proposals/build.ts";
 import { NEEDS_APPROVAL } from "../proposals/decide.ts";
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { type ActionOutcome, type ActionReply, NO_CONFIG, propose } from "../request/actions.ts";
 import { runSpec } from "../request/args.ts";
 import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
-import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, parseCloseout } from "../runtime/closeout.ts";
+import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, closeoutSessionId, parseCloseout } from "../runtime/closeout.ts";
 import { isApproved, type ProjectState } from "../state.ts";
-import type { LaneKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
+import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { StormToolHost } from "./host.ts";
 
 type Zod = ExtensionAPI["zod"];
@@ -37,14 +50,16 @@ export type StormToolInput = { action: StormToolAction } & {
 const ACTIONS = ["run", "plan", "brief", "status", "agents"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
+const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
+const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
 
-const DESCRIPTION = `OMP Storm: hand work to the team and direct a run.
-- run {task}: user wants team work; task verbatim, then end reply: Storm starts after this turn.
-- plan {plan}: required before spawns. lanes [{name, kind, role?, files?, goal?, progress?, isolationReason?}]; workers per role. Lanes share the parent tree: reviews see dirty changes, overlaps are sequenced, never isolated. isolationReason (one safe line) only for an independent experiment kept outside the parent tree, never final review. Replan: same name/kind/role/files/goal; progress is status, new scope needs a name. Past bounds: approval.
-- brief {brief}: once after substantial work: result, verification, remaining?, 3 directions (first recommended). Stages only; Storm shows the menu. Skip trivial.
-- status: team, approval, runs, trials, subagents.
-- agents: session subagents: context cap, follow-up allowance.
-Team changes: /storm.`;
+const DESCRIPTION = `OMP Storm: hand work to the team, direct a run.
+- run {task}: team work; task verbatim; end reply; Storm starts after the turn.
+- plan {plan}: before spawns. lanes [{name,kind,role?,files?,goal?,progress?,isolationReason?,results,dependsOn?}], workers per role. Review: dirty tree; overlaps sequence. isolationReason: isolated experiment only; no review. results [{id,kind,criterion,path?,contains?,check?}]: required on every non-review lane, not proof; check=approved check. dependsOn [{lane,need:result|integrated|reviewable}]: wait; not proof. Replan: same name/kind/role/files/goal; progress=status; scope=new name. Past bounds: approval.
+- brief {brief}: once after work: result, verification, remaining?, 3 next (first recommended). Stages only; menu after run; skip trivial.
+- status: team, approval, runs, trials, agents.
+- agents: subagents: context cap, follow-up allowance.
+Team: /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
@@ -66,6 +81,56 @@ function stormParams(z: Zod): StormToolSchema {
 								.optional()
 								.describe("Only for an independent experiment preserved outside the parent tree; one safe line. Omit to share the tree"),
 							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Lane status only; a real scope change needs a new name"),
+							results: z
+								.array(
+									z
+										.object({
+											id: z
+												.string()
+												.max(MAX_RESULT_ID)
+												.regex(RESULT_ID_RE, "id: 영문·숫자로 시작하고 영문·숫자·. _ -만 쓰는 64자 이하 id")
+												.describe("Stable plan-wide result id; same id on replan keeps the requirement"),
+											kind: z.enum(RESULT_KIND_IDS).describe("change|artifact|answer: where the result is observed"),
+											criterion: z
+												.string()
+												.max(MAX_RESULT_CRITERION)
+												.describe("What the attempt must show, as one visible line; never proof by itself"),
+											path: z
+												.string()
+												.max(MAX_RESULT_PATH)
+												.optional()
+												.describe("Safe workspace-relative path; pathless change uses lane.files; answer may cite a source"),
+											contains: z
+												.string()
+												.max(MAX_RESULT_CONTAINS)
+												.optional()
+												.describe("Exact literal, whitespace kept; on answer it is matched in the cited source; optional"),
+											check: z
+												.string()
+												.optional()
+												.describe("Name of a check in the approved requiredChecks; never a command line"),
+										})
+										.strict(),
+								)
+								.min(1)
+								.max(MAX_LANE_RESULTS)
+								.optional()
+								.describe("Required on every non-review lane: observable outcomes; plan input, not evidence"),
+							dependsOn: z
+								.array(
+									z
+										.object({
+											lane: z.string().min(1).max(MAX_LANE_TEXT).describe("Prerequisite lane name in this plan"),
+											need: z
+												.enum(LANE_NEED_IDS)
+												.describe("result|integrated|reviewable: the state that must hold before this lane starts"),
+										})
+										.strict(),
+								)
+								.min(1)
+								.max(MAX_LANE_DEPENDENCIES)
+								.optional()
+								.describe("Prerequisite lanes; plan input, not proof that the need holds"),
 						}),
 					)
 					.describe("1-50 lanes"),
@@ -109,6 +174,17 @@ export function createStormTool(
 		// Reports change nothing; a run, a plan or a staged brief does.
 		approval: (args) => (isRecord(args) && (args.action === "status" || args.action === "agents") ? "read" : "write"),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Storm data belongs to one native main session. A child's own session is never a Storm session, and a host
+			// that exposes no identity has nowhere to keep the team: both fail closed without touching the conversation.
+			const refusal =
+				ctx.agent.kind !== "main"
+					? "Storm 도구는 메인 세션에서만 쓸 수 있습니다. 이 서브에이전트의 부모 실행을 통해 결과만 보고하세요."
+					: closeoutSessionId(ctx) === undefined
+						? "Storm이 이 세션의 id를 확인하지 못해 아무것도 저장하지 않았습니다. 새 대화를 연 뒤 다시 시도하세요."
+						: undefined;
+			if (refusal !== undefined) {
+				return { content: [{ type: "text", text: refusal }], details: { action: params.action, outcome: "rejected" } };
+			}
 			const reply = await runStormTool(hostFor(ctx), params);
 			return { content: [{ type: "text", text: reply.text }], details: { action: params.action, outcome: reply.outcome } };
 		},
@@ -187,6 +263,14 @@ function isolationLine(plan: RunPlan): string | undefined {
 	return isolated.length === 0 ? undefined : `- 격리(부모 트리 밖 보존): ${isolated.join(" · ")}`;
 }
 
+/** The one plan line for prerequisites; a plan whose lanes declare none adds no line. */
+function dependencyLine(plan: RunPlan): string | undefined {
+	const edges = plan.lanes.flatMap((lane) =>
+		(lane.dependsOn ?? []).map((dependency) => `${lane.name} ← ${dependency.lane}(${dependency.need})`),
+	);
+	return edges.length === 0 ? undefined : `- 선행: ${edges.join(" · ")}`;
+}
+
 /** Lanes and workers of a plan per role, as the director and the dialog read them. */
 function planLines(config: StormConfig, plan: RunPlan): string[] {
 	const out: string[] = [];
@@ -196,6 +280,8 @@ function planLines(config: StormConfig, plan: RunPlan): string[] {
 	}
 	const isolation = isolationLine(plan);
 	if (isolation !== undefined) out.push(isolation);
+	const dependencies = dependencyLine(plan);
+	if (dependencies !== undefined) out.push(dependencies);
 	return out;
 }
 
@@ -238,10 +324,12 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 		const fit = `승인된 범위 안으로 계획을 줄여 다시 제출하세요(${maxima || "설정된 역할만 쓰세요"}).`;
 		if ("error" in built) return rejected(`계획이 승인된 범위를 넘습니다.\n${gapLines(gaps).join("\n")}\n${built.error}\n${fit}`);
 		const isolation = isolationLine(check.plan);
+		const dependencies = dependencyLine(check.plan);
 		const context = [
 			"### 실행 계획",
 			...check.plan.lanes.map((l) => `- ${l.name} (${l.kind} → ${roleTitle(l.role)})${l.files?.length ? `: ${l.files.join(", ")}` : ""}`),
 			...(isolation === undefined ? [] : [isolation]),
+			...(dependencies === undefined ? [] : [dependencies]),
 			"",
 			"### 범위를 넘는 것",
 			...gapLines(gaps),
@@ -283,7 +371,7 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 			text: [...head, `자동 위임 실행(${started.runId})을 열고 계획을 적용했습니다. 이 계획 범위 안에서 승인된 팀 워커를 스폰하세요.`, ...body].join("\n"),
 		};
 	}
-	const set = host.runtime.setRunPlan(plan);
+	const set = await host.runtime.setRunPlan(plan);
 	if (!set.ok) {
 		const saved = head.length ? " 승인한 범위 변경은 저장했습니다." : "";
 		return { outcome: head.length ? "approved" : "ok", text: [...head, `실행 중이 아니라 계획을 저장하지 않았습니다(검증만 했습니다).${saved} ${set.reason}`, ...body].join("\n") };

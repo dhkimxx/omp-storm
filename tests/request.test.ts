@@ -397,7 +397,7 @@ describe("changes: approval gate", () => {
 			const edited = structuredClone(base);
 			edited.roles.implementer!.models = ["z/teammate"];
 			edited.parallelism = 9;
-			await writeFile(configPath(project.root), serializeConfig(edited));
+			await writeFile(configPath(project.sessionDir), serializeConfig(edited));
 			const f = scriptedUi([]);
 			const host: ActionHost = { ...fakeHost().host, ui: f.ui, loadState: load, approveAndSave };
 			const reply = await runChange(host, { action: "workers", role: "explorer", max: 3 });
@@ -406,7 +406,7 @@ describe("changes: approval gate", () => {
 			const after = await load();
 			expect(after.approval).toBeUndefined();
 			expect((await after.store.list()).map(r => r.configHash)).toEqual([configHash(base)]);
-			expect(await readFile(configPath(project.root), "utf8")).toBe(serializeConfig(edited));
+			expect(await readFile(configPath(project.sessionDir), "utf8")).toBe(serializeConfig(edited));
 
 			// Once the user has approved the file through /storm, the same change goes through.
 			await after.store.approve({ configHash: configHash(edited), config: edited, scope: { shadowedAgents: [] } });

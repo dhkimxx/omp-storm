@@ -10,19 +10,24 @@ import {
 	writeAutoDelegation,
 } from "../src/approval/auto.ts";
 import { supervisorToolBlock } from "../src/policy/supervisor.ts";
+import { sessionStoreDir } from "../src/session-scope.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "storm-auto-policy-")));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
+/** One valid session store of an ephemeral profile; the auto file lives directly inside it. */
+const session = (profileName: string, id = "native-session"): string =>
+	sessionStoreDir(join(root, "profiles", profileName), id);
+
 async function store(name: string): Promise<string> {
-	const dir = join(root, name);
+	const dir = session(name);
 	await mkdir(dir, { recursive: true });
 	return dir;
 }
 
 describe("auto delegation consent", () => {
 	test("missing, malformed, wrong-version and non-boolean states are off", async () => {
-		expect(await readAutoDelegation(join(root, "missing"))).toBe(false);
+		expect(await readAutoDelegation(session("missing"))).toBe(false);
 
 		const dir = await store("invalid");
 		const file = join(dir, "auto-delegation.json");
@@ -78,7 +83,7 @@ describe("auto delegation consent", () => {
 	});
 
 	test("the choice separates unset, explicit off, on and invalid content", async () => {
-		expect(await readAutoDelegationChoice(join(root, "choice-missing"))).toBe("unset");
+		expect(await readAutoDelegationChoice(session("choice-missing"))).toBe("unset");
 		expect(await readAutoDelegationChoice("")).toBe("invalid");
 		expect(await readAutoDelegationChoice("   ")).toBe("invalid");
 
@@ -117,7 +122,7 @@ describe("auto delegation consent", () => {
 		await writeAutoDelegation(reference, true);
 		const published = await readFile(join(reference, "auto-delegation.json"), "utf8");
 
-		const dir = join(root, "init-nested", "store");
+		const dir = session("init-nested");
 		expect(await initializeAutoDelegation(dir, true)).toBe(true);
 		expect(await readAutoDelegationChoice(dir)).toBe("on");
 		expect(await readFile(join(dir, "auto-delegation.json"), "utf8")).toBe(published);

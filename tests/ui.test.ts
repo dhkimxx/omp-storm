@@ -10,7 +10,7 @@ import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
 import { ensureThemeSync, getSymbolPresetOverride, setSymbolPreset } from "@oh-my-pi/pi-tui/theme/theme";
 import { readAutoDelegation } from "../src/approval/auto.ts";
 import { configHash } from "../src/config/canonical.ts";
-import { serializeConfig } from "../src/config/store.ts";
+import { configPath, serializeConfig } from "../src/config/store.ts";
 import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../src/flows.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { ROLES } from "../src/roles.ts";
@@ -1075,13 +1075,13 @@ describe("accepting on a small terminal", () => {
 		await createUiPort(host.pi, host.ctx).select(dialog.title, dialog.options, dialog.context);
 		const panel = host.selects[0]!.panel!;
 		expect(panel.length).toBeLessThanOrEqual(30 - dialog.options.length);
-		expect(panel.join("\n")).toContain("승인하면 자동 위임이 켜집니다");
+		expect(panel.join("\n")).toContain("승인하면 이 세션의 자동 위임이 켜집니다");
 		expect(dialog.context.markdown).toContain("실행이 끝나면 정리");
 		expect(dialog.context.markdown).toContain("/repo/.omp/agents/shadow-file.md");
 		// One brand heading, after the first-approval default and the shadow warning; the narrow consent is unchanged.
 		const markAt = dialog.context.markdown.indexOf(STORM_MARK);
 		expect(dialog.context.markdown.split(STORM_MARK)).toHaveLength(2);
-		expect(markAt).toBeGreaterThan(dialog.context.markdown.indexOf("승인하면 자동 위임이 켜집니다"));
+		expect(markAt).toBeGreaterThan(dialog.context.markdown.indexOf("승인하면 이 세션의 자동 위임이 켜집니다"));
 		expect(markAt).toBeGreaterThan(dialog.context.markdown.indexOf("가림 정의"));
 		expect(dialog.context.consent).toEqual([APPROVE]);
 		expect(host.selects[0]?.options).not.toContain(APPROVE);
@@ -1131,24 +1131,25 @@ describe("accepting on a small terminal", () => {
 		expect(host.overlays).toBe(1);
 		expect(host.selects).toHaveLength(3);
 		expect(host.selects.at(-1)?.options).toContain(APPROVE);
-		expect(await readAutoDelegation(state.store.dir)).toBe(true);
+		expect(await readAutoDelegation(state.sessionDir)).toBe(true);
 	});
 
 	test("every dialog that approves, restores or deletes names the options that do", async () => {
-		// Unapproved config: only the approval.
-		await Bun.write(path.join(project.root, ".omp", "storm", "config.json"), serializeConfig(TEAM));
+		// Unapproved session config: only the approval.
+		const seeded = await loadProjectState(env);
+		await Bun.write(configPath(seeded.sessionDir), serializeConfig(TEAM));
 		const unapproved = recordingUi();
 		await hubFlow(env, unapproved.ui);
 		expect(unapproved.dialogs[0]?.context.consent).toEqual([APPROVE]);
 
-		// The legacy hub marks switching on as consent. Its ordinary rollback item needs consent on the next screen.
+		// The ordinary rollback item needs consent on the next screen; the menu itself changes nothing.
 		const state = await loadProjectState(env);
 		await approveAndSave(state, TEAM, { shadowedAgents: state.shadows });
 		await approveAndSave(await loadProjectState(env), { ...TEAM, parallelism: 2 }, { shadowedAgents: state.shadows });
 		const rollback = recordingUi(["이전 승인으로 되돌리기", 0]);
 		await hubFlow(env, rollback.ui);
 		const [menu, confirm] = rollback.dialogs;
-		expect(menu?.context.consent).toEqual(["자동 위임으로 전환"]);
+		expect(menu?.context.consent).toBeUndefined();
 		expect(confirm?.context.consent).toEqual([confirm!.options[0]!]);
 
 		// Reset: everything but the cancel deletes.

@@ -337,25 +337,30 @@ describe("validateConfig", () => {
 	});
 });
 
+/** The session store this test profile would derive for one native session. */
+const sessionOf = (root: string) => path.join(root, "profile", "storm", "sessions", "a".repeat(64));
+
 describe("config store", () => {
-	test("write → load round-trips with the same hash and creates the storm .gitignore only", async () => {
+	test("write → load round-trips with the same hash and writes only this session's config.json", async () => {
 		const root = await tempRoot();
-		const written = await writeConfig(root, base);
-		expect(written.path).toBe(configPath(root));
-		const loaded = await loadConfig(root);
+		const session = sessionOf(root);
+		const written = await writeConfig(session, base);
+		expect(written.path).toBe(configPath(session));
+		const loaded = await loadConfig(session);
 		expect(loaded.status).toBe("ok");
 		if (loaded.status !== "ok") return;
 		expect(loaded.hash).toBe(written.hash);
 		expect(loaded.hash).toBe(configHash(base));
 		expect(loaded.config).toEqual(base);
-		expect(await Bun.file(path.join(root, ".omp/storm/.gitignore")).text()).toBe("/state/\n");
-		expect(await Bun.file(path.join(root, ".gitignore")).exists()).toBe(false);
-		const leftovers = (await fs.readdir(path.join(root, ".omp/storm"))).filter(f => f.endsWith(".tmp"));
+		expect(await fs.readdir(session)).toEqual(["config.json"]);
+		// Nothing in the target: no .omp/storm, no .gitignore, no config.
+		expect(await fs.readdir(root)).toEqual(["profile"]);
+		const leftovers = (await fs.readdir(session)).filter(f => f.endsWith(".tmp"));
 		expect(leftovers).toEqual([]);
 	});
 
 	test("requiredChecks round-trips in order with the same hash, ready for snapshots and rollback", async () => {
-		const root = await tempRoot();
+		const session = sessionOf(await tempRoot());
 		const config: StormConfig = {
 			...base,
 			requiredChecks: [
@@ -363,9 +368,9 @@ describe("config store", () => {
 				{ name: "types", argv: ["bunx", "tsc", "--noEmit"] },
 			],
 		};
-		const written = await writeConfig(root, config);
+		const written = await writeConfig(session, config);
 		expect(written.hash).toBe(configHash(config));
-		const loaded = await loadConfig(root);
+		const loaded = await loadConfig(session);
 		expect(loaded.status).toBe("ok");
 		if (loaded.status !== "ok") return;
 		expect(loaded.hash).toBe(written.hash);
@@ -373,12 +378,17 @@ describe("config store", () => {
 		expect(serializeConfig(loaded.config)).toBe(serializeConfig(config));
 	});
 
-	test("does not overwrite an existing storm .gitignore", async () => {
+	test("never writes into the target and leaves an old .omp/storm byte-untouched", async () => {
 		const root = await tempRoot();
-		await fs.mkdir(path.join(root, ".omp/storm"), { recursive: true });
-		await fs.writeFile(path.join(root, ".omp/storm/.gitignore"), "custom\n");
-		await writeConfig(root, base);
-		expect(await Bun.file(path.join(root, ".omp/storm/.gitignore")).text()).toBe("custom\n");
+		const old = path.join(root, ".omp", "storm");
+		await fs.mkdir(old, { recursive: true });
+		const legacyConfig = path.join(old, "config.json");
+		const legacyIgnore = path.join(old, ".gitignore");
+		await fs.writeFile(legacyConfig, '{"legacy":true}\n');
+		await fs.writeFile(legacyIgnore, "custom\n");
+		await writeConfig(sessionOf(root), base);
+		expect(await Bun.file(legacyConfig).text()).toBe('{"legacy":true}\n');
+		expect(await Bun.file(legacyIgnore).text()).toBe("custom\n");
 	});
 
 	test("serializeConfig output is stable regardless of input key order", () => {
@@ -391,14 +401,14 @@ describe("config store", () => {
 	});
 
 	test("reformatting the file keeps the hash; unknown fields change it", async () => {
-		const root = await tempRoot();
-		const { hash } = await writeConfig(root, base);
-		await fs.writeFile(configPath(root), `\uFEFF${JSON.stringify(base, null, "\t")}`);
-		const reformatted = await loadConfig(root);
+		const session = sessionOf(await tempRoot());
+		const { hash } = await writeConfig(session, base);
+		await fs.writeFile(configPath(session), `\uFEFF${JSON.stringify(base, null, "\t")}`);
+		const reformatted = await loadConfig(session);
 		expect(reformatted.status === "ok" && reformatted.hash).toBe(hash);
 
-		await fs.writeFile(configPath(root), JSON.stringify({ ...base, note: "x" }));
-		const extra = await loadConfig(root);
+		await fs.writeFile(configPath(session), JSON.stringify({ ...base, note: "x" }));
+		const extra = await loadConfig(session);
 		expect(extra.status).toBe("ok");
 		if (extra.status !== "ok") return;
 		expect(extra.hash).not.toBe(hash);
@@ -406,24 +416,24 @@ describe("config store", () => {
 	});
 
 	test("missing and invalid files", async () => {
-		const root = await tempRoot();
-		expect((await loadConfig(root)).status).toBe("missing");
+		const session = sessionOf(await tempRoot());
+		expect((await loadConfig(session)).status).toBe("missing");
 
-		await fs.mkdir(path.dirname(configPath(root)), { recursive: true });
-		await fs.writeFile(configPath(root), '{"version":1,"version":1}');
-		const dup = await loadConfig(root);
+		await fs.mkdir(path.dirname(configPath(session)), { recursive: true });
+		await fs.writeFile(configPath(session), '{"version":1,"version":1}');
+		const dup = await loadConfig(session);
 		expect(dup.status).toBe("invalid");
 		if (dup.status === "invalid") {
 			expect(dup.errors).toHaveLength(1);
 			expect(dup.rawSha256).toMatch(/^[0-9a-f]{64}$/);
 		}
 
-		await fs.writeFile(configPath(root), JSON.stringify({ ...base, parallelism: 99 }));
-		const bad = await loadConfig(root);
+		await fs.writeFile(configPath(session), JSON.stringify({ ...base, parallelism: 99 }));
+		const bad = await loadConfig(session);
 		expect(bad.status === "invalid" && paths(bad.errors)).toEqual(["parallelism"]);
 
-		await fs.writeFile(configPath(root), new Uint8Array([0x7b, 0xff, 0x7d]));
-		expect((await loadConfig(root)).status).toBe("invalid");
+		await fs.writeFile(configPath(session), new Uint8Array([0x7b, 0xff, 0x7d]));
+		expect((await loadConfig(session)).status).toBe("invalid");
 	});
 });
 
@@ -518,17 +528,17 @@ describe("text that could forge or hide rows in the approval dialog", () => {
 	});
 
 	test("a config file with escaped controls loads as invalid, and JSON errors quote the file escaped", async () => {
-		const root = await tempRoot();
-		await fs.mkdir(path.dirname(configPath(root)), { recursive: true });
+		const session = sessionOf(await tempRoot());
+		await fs.mkdir(path.dirname(configPath(session)), { recursive: true });
 		// Valid JSON whose strings decode to ESC and a right-to-left override.
-		await fs.writeFile(configPath(root), JSON.stringify({ ...base, contract: "x" }).replace('"x"', '"\\u001b[2Kok\\u202e"'));
-		const hostile = await loadConfig(root);
+		await fs.writeFile(configPath(session), JSON.stringify({ ...base, contract: "x" }).replace('"x"', '"\\u001b[2Kok\\u202e"'));
+		const hostile = await loadConfig(session);
 		expect(hostile.status).toBe("invalid");
 		expect(hostile.status === "invalid" && paths(hostile.errors)).toEqual(["contract"]);
 
 		for (const text of ['{"a\u202e":1,"a\u202e":2}', "{\u202e}"]) {
-			await fs.writeFile(configPath(root), text);
-			const broken = await loadConfig(root);
+			await fs.writeFile(configPath(session), text);
+			const broken = await loadConfig(session);
 			expect(broken.status).toBe("invalid");
 			expect(broken.status === "invalid" && clean(broken.errors)).toBe(true);
 		}

@@ -5,7 +5,7 @@
  */
 import { shortHash } from "../config/canonical.ts";
 import { isRecord, teamPriority } from "../config/schema.ts";
-import { time } from "../view/render.ts";
+import { targetScopeLine, time } from "../view/render.ts";
 import {
 	type Built,
 	buildBudget,
@@ -79,7 +79,9 @@ export async function propose(
 	opts: { warnings?: readonly string[]; context?: string } = {},
 ): Promise<ActionReply> {
 	if ("error" in built) return rejected(built.error);
-	const decision = await decideProposal(host, state, { kind, summary: built.summary, config: built.config }, opts);
+	// A team change applies to this session at the current target; a run plan names its own target in its context.
+	const context = [kind === "plan" ? "" : targetScopeLine(state.repo.root), opts.context ?? ""].filter(Boolean).join("\n\n");
+	const decision = await decideProposal(host, state, { kind, summary: built.summary, config: built.config }, { ...opts, context });
 	switch (decision.outcome) {
 		case "approved":
 			return { outcome: "approved", text: `${built.summary}\n승인하고 저장했습니다(${shortHash(decision.hash)}).` };

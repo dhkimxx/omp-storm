@@ -26,7 +26,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, wr
 import { join, sep } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
-import type { RunRecord } from "../../src/types.ts";
+import type { PlanLaneResult, RunRecord } from "../../src/types.ts";
 import {
 	type Answer,
 	cancelAll,
@@ -56,8 +56,9 @@ const MAIN = "fake/general-b";
 
 const env = prepare("storm-e2e-isolation", 18557);
 const suite = new Suite("E2E (selective isolation)", env);
-const files = new StormFiles(env);
 const check = suite.check.bind(suite);
+/** The one native session this file drives; every later scenario resumes it with its approved team. */
+let owned: { id: string; dir: string } | undefined;
 const profileFile = join(env.agentDir, "config.yml");
 const modelsFile = join(env.agentDir, "models.yml");
 const exitCodes: number[] = [];
@@ -70,21 +71,43 @@ function hostSettings(settings: { enabled: boolean; apply?: boolean }): void {
 }
 
 /** One omp RPC process: started, used and closed; its exit code is checked at the end. */
-async function session<T>(answer: Answer, body: (rpc: Rpc) => Promise<T>): Promise<T> {
-	const rpc = new Rpc(env, answer, { model: MAIN });
+async function session<T>(answer: Answer, body: (rpc: Rpc, files: StormFiles) => Promise<T>): Promise<T> {
+	const rpc = new Rpc(env, answer, { model: MAIN, ...(owned === undefined ? {} : { resume: owned.id, sessionDir: owned.dir }) });
 	try {
 		await rpc.ready();
-		return await body(rpc);
+		return await body(rpc, new StormFiles(env, rpc.sessionId));
 	} finally {
 		exitCodes.push(await rpc.close());
+		if (owned === undefined) owned = { id: rpc.sessionId, dir: rpc.sessionDir };
 	}
 }
 
 const startRun = (sequence: Step[]): string => `/storm E2E-ROUTE ${JSON.stringify({ action: "run" })} E2E-STEPS ${JSON.stringify(sequence)}`;
 const plan = (lanes: unknown[], workers?: Record<string, number>): Step => ({ storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } } });
 
+/**
+ * The shared lane's deliverable is a sourced observation of the parent's dirty line: the child reads the file and
+ * cites that exact line, so the result is real evidence rather than the lane merely ending.
+ */
+const sharedClaim = (marker: string): string => `${marker} is line 2 of ${TRACKED_FILE} (${TRACKED_FILE}:2)`;
+const sharedResult = (marker: string): PlanLaneResult => ({
+	id: "shared-observation",
+	kind: "answer",
+	criterion: `report the parent's ${marker} line in ${TRACKED_FILE} with its source`,
+	path: TRACKED_FILE,
+	contains: marker,
+});
+/** The experiment's deliverable lives in the retained patch/directory, not in the parent tree. */
+const experimentResult = (): PlanLaneResult => ({
+	id: "experiment-artifact",
+	kind: "artifact",
+	criterion: "the retained experiment carries experiment.txt",
+	path: "experiment.txt",
+	contains: "experiment change",
+});
+
 /** The run record, the frames of the turn that started it, and where that turn began. */
-async function runOf(rpc: Rpc, message: string): Promise<{ run: RunRecord; frames: Frame[]; from: number }> {
+async function runOf(rpc: Rpc, files: StormFiles, message: string): Promise<{ run: RunRecord; frames: Frame[]; from: number }> {
 	const before = files.runIds();
 	const from = rpc.frames.length;
 	await rpc.prompt(message, 90_000);
@@ -93,13 +116,12 @@ async function runOf(rpc: Rpc, message: string): Promise<{ run: RunRecord; frame
 }
 
 /** Waits for the durable automatic-delegation choice a slash command writes before it returns. */
-async function waitAuto(expected: "on" | "off", timeoutMs = 10_000): Promise<void> {
-	const dir = files.storeDir();
-	if (dir === undefined) throw new Error("Storm approval did not create a store");
+async function waitAuto(files: StormFiles, expected: "on" | "off", timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	for (;;) {
-		if ((await readAutoDelegationChoice(dir)) === expected) return;
-		if (Date.now() > deadline) throw new Error(`automatic-delegation choice is ${await readAutoDelegationChoice(dir)}, expected ${expected}`);
+		const choice = await readAutoDelegationChoice(files.sessionDir);
+		if (choice === expected) return;
+		if (Date.now() > deadline) throw new Error(`automatic-delegation choice is ${choice}, expected ${expected}`);
 		await Bun.sleep(50);
 	}
 }
@@ -173,12 +195,15 @@ function readMarker(dir: string, name: string): string {
 	return existsSync(path) ? readFileSync(path, "utf8").trim() : "";
 }
 interface MixedLaneDirs {
-	shared: string;
 	experiment: string;
 }
 interface MixedLaneCommands {
-	shared: string;
 	experiment: string;
+}
+/** The host's own cwd line in a scripted child's request: the physical checkout that child ran in. */
+function childCwd(llm: LlmCursor, marker: string): string {
+	const prompt = llm.of("child").find(entry => entry.lastUser.includes(marker))?.lastUser ?? "";
+	return /current working directory: '([^']+)'/.exec(prompt)?.[1] ?? "";
 }
 /**
  * The native output must be recoverable when Storm finishes, not a path to a transient checkout: a patch file has to
@@ -217,17 +242,25 @@ function checkMixedLaneRun(
 	const isolatedLane = run.plan?.lanes.find(lane => lane.name === "experiment");
 	check(`${prefix}: the validated plan persisted the exceptional lane's reason`, isolatedLane?.isolationReason === REASON, JSON.stringify(run.plan));
 	const users = children(llm);
+	const sharedMark = sharedClaim(dirty);
 	check(
 		`${prefix}: both scripted workers reached the provider`,
-		users.some(user => user.includes(b64(commands.shared))) && users.some(user => user.includes(b64(commands.experiment))),
+		users.some(user => user.includes(sharedMark)) && users.some(user => user.includes(b64(commands.experiment))),
 		`children=${users.length}`,
 	);
-	const sharedCwd = readMarker(dirs.shared, "cwd");
-	const seen = readMarker(dirs.shared, "seen");
-	// The experiment proof carries its own cwd; the shared lane writes only the cwd marker.
+	// The read-only shared lane cannot record a bash marker: the host's own prompt cwd and the read tool result are
+	// the physical proof that it ran in the parent checkout and saw the dirty line there.
+	const sharedCwd = childCwd(llm, sharedMark);
+	const sharedRead = llm
+		.of("child")
+		.filter(entry => entry.lastUser.includes(sharedMark))
+		.map(entry => entry.lastTool)
+		.join("\n");
+	// The experiment proof carries its own cwd and written file.
 	const isolatedCwd = readMarker(dirs.experiment, "proof").split("|")[0] ?? "";
 	check(`${prefix}: the ordinary lane ran in the parent checkout`, sharedCwd !== "" && real(sharedCwd) === real(env.project), `cwd=${sharedCwd} parent=${env.project}`);
-	check(`${prefix}: the ordinary lane saw the parent's dirty edit`, seen.includes(dirty), seen.slice(0, 120));
+	const sharedLines = sharedRead.split("\n").map(line => line.trim());
+	check(`${prefix}: the ordinary lane saw the parent's dirty edit`, sharedLines.includes(dirty), sharedRead.slice(0, 200));
 	check(
 		`${prefix}: the exceptional lane ran in a different native checkout outside the parent`,
 		isolatedCwd !== "" && outsideProject(isolatedCwd),
@@ -263,21 +296,15 @@ function checkMixedLaneRun(
 	return outputPath;
 }
 
-/** A shell command that records the child's real cwd and what it can see there. */
-function probeCommand(dir: string, options: { experiment?: boolean } = {}): string {
+/** A shell command that records the experiment child's real cwd and the file it wrote there. */
+function probeCommand(dir: string): string {
 	const cwdFile = join(dir, "cwd");
-	const seenFile = join(dir, "seen");
 	const proofFile = join(dir, "proof");
-	const parts = [`pwd -P > ${shq(cwdFile)}`];
-	if (options.experiment) {
-		parts.push(
-			`printf 'experiment change\\n' > experiment.txt`,
-			`{ printf '%s|' "$(pwd -P)"; cat experiment.txt; } > ${shq(proofFile)}`,
-		);
-	} else {
-		parts.push(`cat ${shq(TRACKED_FILE)} > ${shq(seenFile)}`);
-	}
-	return parts.join("; ");
+	return [
+		`pwd -P > ${shq(cwdFile)}`,
+		`printf 'experiment change\\n' > experiment.txt`,
+		`{ printf '%s|' "$(pwd -P)"; cat experiment.txt; } > ${shq(proofFile)}`,
+	].join("; ");
 }
 
 async function main(): Promise<void> {
@@ -290,7 +317,7 @@ async function main(): Promise<void> {
 		"fixture: approved shared team and host isolation settings",
 		async () => {
 			hostSettings({ enabled: true, apply: false });
-			await session(cancelAll, async rpc => {
+			await session(cancelAll, async (rpc, files) => {
 				await rpc.prompt("/storm");
 				rpc.answer = choose(APPROVE);
 				await rpc.prompt("/storm");
@@ -306,9 +333,10 @@ async function main(): Promise<void> {
 				check("the hand-edited shared team is approved again", files.config().isolation === "shared" && files.config().parallelism === 4, JSON.stringify({ isolation: files.config().isolation, parallelism: files.config().parallelism }));
 				rpc.answer = choose(LABEL.autoOff);
 				await rpc.prompt("/storm auto");
-				await waitAuto("off");
-				const store = files.storeDir();
-				check("automatic delegation is off for the manual plan/task path", store !== undefined && (await readAutoDelegationChoice(store)) === "off", store === undefined ? "no store" : await readAutoDelegationChoice(store));
+				await waitAuto(files, "off");
+				check("automatic delegation is off for the manual plan/task path", (await readAutoDelegationChoice(files.sessionDir)) === "off", await readAutoDelegationChoice(files.sessionDir));
+				// A real turn materializes the native transcript so later scenarios can resume this exact session.
+				await rpc.turn("hello");
 			});
 		},
 		120_000,
@@ -317,7 +345,7 @@ async function main(): Promise<void> {
 
 	await suite.step("host native isolation places a plain task child outside the project", async () => {
 		const dir = markerDir("host-baseline");
-		const command = probeCommand(dir, { experiment: true });
+		const command = probeCommand(dir);
 		await session(cancelAll, async rpc => {
 			const llm = new LlmCursor(env);
 			await rpc.turn(`E2E-STEPS ${JSON.stringify([{ task: ["task"], as: "HostIso", isolated: [true], say: `E2E-CHILD-SH ${b64(command)}` }])}`, 90_000);
@@ -336,36 +364,34 @@ async function main(): Promise<void> {
 	});
 
 	await suite.step("selective isolation: shared lane sees the dirty parent, experiment lane stays apart", async () => {
-		// Each child records into its own directory: two concurrent children must not overwrite each other's cwd proof.
-		const sharedDir = markerDir("selective-shared");
+		// The read-only shared lane has no bash probe; the experiment keeps its own marker directory.
 		const experimentDir = markerDir("selective-experiment");
-		const sharedCommand = probeCommand(sharedDir);
-		const experimentCommand = probeCommand(experimentDir, { experiment: true });
+		const experimentCommand = probeCommand(experimentDir);
 		const tracked = join(env.project, TRACKED_FILE);
 		writeFileSync(tracked, `${TRACKED_TEXT}E2E-PARENT-DIRTY\n`);
 		try {
-			await session(cancelAll, async rpc => {
+			await session(cancelAll, async (rpc, files) => {
 				const llm = new LlmCursor(env);
 				const request = startRun([
 					plan(
 						[
-							{ name: "shared-read", kind: "code", role: "implementer", goal: "Read the parent checkout" },
-							{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON },
+							{ name: "shared-read", kind: "explore", role: "explorer", goal: "Read the parent checkout", results: [sharedResult("E2E-PARENT-DIRTY")] },
+							{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON, results: [experimentResult()] },
 						],
-						{ implementer: 1, quick: 1 },
+						{ explorer: 1, quick: 1 },
 					),
-					{ task: ["storm-implementer"], as: "Shared", say: `E2E-CHILD-SH ${b64(sharedCommand)}` },
+					{ task: ["storm-explorer"], as: "Shared", say: `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${sharedClaim("E2E-PARENT-DIRTY")}` },
 					{ task: ["storm-quick"], as: "Experiment", say: `E2E-CHILD-SH ${b64(experimentCommand)}` },
 				]);
-				const { run, frames, from } = await runOf(rpc, request);
+				const { run, frames, from } = await runOf(rpc, files, request);
 				const report = await reportOf(rpc, run.runId, from);
 				const artifactPath = checkMixedLaneRun(
 					"manual mixed lanes",
 					run,
 					frames,
 					llm,
-					{ shared: sharedDir, experiment: experimentDir },
-					{ shared: sharedCommand, experiment: experimentCommand },
+					{ experiment: experimentDir },
+					{ experiment: experimentCommand },
 					report,
 					"E2E-PARENT-DIRTY",
 				);
@@ -398,29 +424,27 @@ async function main(): Promise<void> {
 
 	await suite.step("selective isolation: automatic delegation keeps mixed lane placement native", async () => {
 		hostSettings({ enabled: true, apply: false });
-		const sharedDir = markerDir("auto-shared");
 		const experimentDir = markerDir("auto-experiment");
-		const sharedCommand = probeCommand(sharedDir);
-		const experimentCommand = probeCommand(experimentDir, { experiment: true });
+		const experimentCommand = probeCommand(experimentDir);
 		const tracked = join(env.project, TRACKED_FILE);
 		writeFileSync(tracked, `${TRACKED_TEXT}E2E-AUTO-PARENT-DIRTY\n`);
 		try {
-			await session(cancelAll, async rpc => {
+			await session(cancelAll, async (rpc, files) => {
 				rpc.answer = choose(LABEL.autoOn);
 				await rpc.prompt("/storm auto");
-				await waitAuto("on");
+				await waitAuto(files, "on");
 				const llm = new LlmCursor(env);
 				const before = files.runIds();
 				const from = rpc.frames.length;
 				const prompt = `E2E-STEPS ${JSON.stringify([
 					plan(
 						[
-							{ name: "shared-read", kind: "code", role: "implementer", goal: "Read the parent checkout" },
-							{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON },
+							{ name: "shared-read", kind: "explore", role: "explorer", goal: "Read the parent checkout", results: [sharedResult("E2E-AUTO-PARENT-DIRTY")] },
+							{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON, results: [experimentResult()] },
 						],
-						{ implementer: 1, quick: 1 },
+						{ explorer: 1, quick: 1 },
 					),
-					{ task: ["storm-implementer"], as: "AutoShared", say: `E2E-CHILD-SH ${b64(sharedCommand)}` },
+					{ task: ["storm-explorer"], as: "AutoShared", say: `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${sharedClaim("E2E-AUTO-PARENT-DIRTY")}` },
 					{ task: ["storm-quick"], as: "AutoExperiment", say: `E2E-CHILD-SH ${b64(experimentCommand)}` },
 				])}`;
 				await rpc.turn(prompt, 90_000);
@@ -437,8 +461,8 @@ async function main(): Promise<void> {
 					run,
 					frames,
 					llm,
-					{ shared: sharedDir, experiment: experimentDir },
-					{ shared: sharedCommand, experiment: experimentCommand },
+					{ experiment: experimentDir },
+					{ experiment: experimentCommand },
 					report,
 					"E2E-AUTO-PARENT-DIRTY",
 				);
@@ -446,7 +470,7 @@ async function main(): Promise<void> {
 				check("auto mixed lanes: the plan response names the exceptional lane and its reason", planText.includes("experiment") && planText.includes(REASON), planText.slice(0, 600));
 				rpc.answer = choose(LABEL.autoOff);
 				await rpc.prompt("/storm auto");
-				await waitAuto("off");
+				await waitAuto(files, "off");
 			});
 		} finally {
 			writeFileSync(tracked, TRACKED_TEXT);
@@ -457,13 +481,14 @@ async function main(): Promise<void> {
 	await suite.step("selective isolation: disabled host isolation blocks instead of sharing", async () => {
 		hostSettings({ enabled: false, apply: false });
 		const dir = markerDir("disabled");
-		const command = probeCommand(dir, { experiment: true });
-		await session(cancelAll, async rpc => {
+		const command = probeCommand(dir);
+		await session(cancelAll, async (rpc, files) => {
 			const llm = new LlmCursor(env);
 			const { run, frames } = await runOf(
 				rpc,
+				files,
 				startRun([
-					plan([{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON }]),
+					plan([{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON, results: [experimentResult()] }]),
 					{ task: ["storm-quick"], as: "Experiment", say: `E2E-CHILD-SH ${b64(command)}` },
 				]),
 			);
@@ -483,13 +508,14 @@ async function main(): Promise<void> {
 		// No `apply` key: the host default is true, so an isolated result would be applied to the parent.
 		hostSettings({ enabled: true });
 		const dir = markerDir("apply");
-		const command = probeCommand(dir, { experiment: true });
-		await session(cancelAll, async rpc => {
+		const command = probeCommand(dir);
+		await session(cancelAll, async (rpc, files) => {
 			const llm = new LlmCursor(env);
 			const { run, frames } = await runOf(
 				rpc,
+				files,
 				startRun([
-					plan([{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON }]),
+					plan([{ name: "experiment", kind: "run", role: "quick", files: ["experiment.txt"], goal: "Keep an independent experiment", isolationReason: REASON, results: [experimentResult()] }]),
 					{ task: ["storm-quick"], as: "Experiment", say: `E2E-CHILD-SH ${b64(command)}` },
 				]),
 			);
@@ -507,13 +533,12 @@ async function main(): Promise<void> {
 
 	await suite.step("plan contract: a final review lane cannot be reason-marked", async () => {
 		hostSettings({ enabled: true, apply: false });
-		await session(cancelAll, async rpc => {
-			const frames = await rpc.turn(
-				`E2E-TOOL ${JSON.stringify({
-					action: "plan",
-					plan: { lanes: [{ name: "isolated-review", kind: "review", role: "reviewer", isolationReason: REASON }] },
-				})}`,
-			);
+		await session(cancelAll, async (rpc, files) => {
+			const planArgs = {
+				action: "plan",
+				plan: { lanes: [{ name: "isolated-review", kind: "review", role: "reviewer", isolationReason: REASON }] },
+			};
+			const frames = await rpc.turn(`E2E-STEPS ${JSON.stringify([{ storm: planArgs }])}`);
 			const outcomes = frames
 				.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "storm")
 				.map(frame => frame.result?.details?.outcome);

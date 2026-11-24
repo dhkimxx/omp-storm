@@ -180,8 +180,8 @@ describe("decideProposal", () => {
 		await approveAndSave(await loadProjectState(project.env), config, { shadowedAgents: [] });
 	};
 	/** A teammate's (or a hand) edit: the file changes, nobody approves it here. */
-	const editByHand = (config: StormConfig) => writeFile(configPath(project.root), serializeConfig(config));
-	const onDisk = async () => configHash(JSON.parse(await readFile(configPath(project.root), "utf8")));
+	const editByHand = (config: StormConfig) => writeFile(configPath(project.sessionDir), serializeConfig(config));
+	const onDisk = async () => configHash(JSON.parse(await readFile(configPath(project.sessionDir), "utf8")));
 
 	test("승인 on a change to an approved config saves it approved", async () => {
 		await approve(base);
@@ -272,7 +272,7 @@ describe("decideProposal", () => {
 	});
 
 	test("a file that appears or changes while still invalid during a setup dialog is not overwritten", async () => {
-		const file = configPath(project.root);
+		const file = configPath(project.sessionDir);
 		const writeRaw = async (text: string) => {
 			await mkdir(path.dirname(file), { recursive: true });
 			await writeFile(file, text);

@@ -1,21 +1,23 @@
 /**
  * /storm flows: setup (the recommended team, a one-slot model edit from the native picker, or the role-by-role
  * interview), status, approval of a config changed by hand, rollback, trial decisions, automatic-delegation consent,
- * reset. None of them calls a model or sends a message. A config is approved only by the exact "승인" in Storm's
- * dialog; the first such approval initializes automatic delegation, later changes need its own exact choice, and reset
- * deletes only after the single exact "초기화" choice.
+ * template export and reset. None of them calls a model or sends a message. Everything they persist belongs to the
+ * current native OMP session under its profile (`ProjectState.sessionDir`); the current work tree is only the target
+ * an approval is bound to, never a storage key. A config is approved only by the exact "승인" in Storm's dialog; the
+ * first such approval initializes automatic delegation, later changes need its own exact choice, and reset deletes
+ * only this session's data after the single exact "초기화" choice.
  */
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { readdir, rm, stat } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation } from "./approval/auto.ts";
 import { configHash, shortHash } from "./config/canonical.ts";
 import { teamPriority, validateConfig } from "./config/schema.ts";
-import { configPath, writeConfig } from "./config/store.ts";
+import { configPath, serializeConfig, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
 import { STORM_MARK, type RunPhase } from "./view/appearance.ts";
-import { renderStatus, renderStatusBrief, renderTrial, resumeRunLine, visible } from "./view/render.ts";
+import { renderStatus, renderStatusBrief, renderTrial, resumeRunLine, targetScopeLine, visible } from "./view/render.ts";
 import { runRollback } from "./view/review.ts";
 import { recommendedConfig } from "./view/setup.ts";
 import { buildTrialEnd, modelWarnings } from "./proposals/build.ts";
@@ -25,20 +27,20 @@ import { agentRows, renderAgentRows } from "./report/agents.ts";
 import { renderModelCheck } from "./report/models.ts";
 import { ompSettingsAdvice } from "./report/omp-settings.ts";
 import { roleTitle } from "./roles.ts";
-import { activeLedgerRun } from "./runtime/ledger.ts";
-import { acquireRunLease } from "./runtime/lease.ts";
+import { acquireSessionLease } from "./runtime/lease.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
-import { findResumeCandidate, resumePointerFile, resumeSpec } from "./runtime/resume.ts";
+import { findResumeCandidate, resumeSpec } from "./runtime/resume.ts";
 import { formatStorage, readStorage, storageDetailLines } from "./runtime/janitor.ts";
-import { readRunIndex, runIndexFile } from "./runtime/run-index.ts";
+import { readRunIndex } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
 import { trialViews } from "./runtime/views.ts";
+import { assertSessionStoreSafe, sessionStoreDir } from "./session-scope.ts";
 import { BROWSE, commonSettingsForm, effortForm, FIELD, type FormRetry, interviewRoles, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, setupConfig, subagentShares } from "./setup/form.ts";
 import { applySlotPick, entryForPick, modelSlots, slotCurrent } from "./setup/model-draft.ts";
 import { type ModelEntry } from "./selector.ts";
 import { isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult } from "./tool/host.ts";
-import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, ProposalKind, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
+import type { AgentEntry, AnalysisContext, ApprovalScope, ConfigLoad, ExplicitSettings, FormData, InfoLine, ModelInfo, Proposal, ProposalKind, RoleId, RollbackOption, RunRecord, RunSpec, StatusView, StormConfig, TrialView, UiPort } from "./types.ts";
 
 export interface FlowEnv extends ProjectEnv {
 	ompBin: string;
@@ -55,32 +57,114 @@ export interface FlowEnv extends ProjectEnv {
 	autoModeProblem?: () => string | undefined;
 	/** Subagents under this session, for status. */
 	agents?: () => AgentEntry[];
-	/** The current project's OMP session dir (the project-level folder), for the storage inventory; absent/empty → unnamed. */
-	sessionDir?: string;
+	/** The host's own transcript/artifact folder for this session, used only by the storage inventory; absent/empty → unnamed. */
+	ompSessionDir?: string;
 	/** omp settings as configured (concurrency, fallbacks, isolation); fields are undefined when unreadable. */
 	ompSettings?: () => Promise<ExplicitSettings>;
 	/** A newer Storm installed on disk than the one this process runs. */
 	newerVersion?: () => string | undefined;
+	/**
+	 * Required live native-owner predicate, captured by the host: true only while the exact native main session
+	 * (generation, id and canonical target) that opened this flow is still current. It must stay false after a
+	 * switch, branch or A→B→A; a flow never re-authorizes by reloading its captured env.
+	 */
+	stillOwner: () => boolean;
 	/** Starts a run in this session; absent where the caller cannot start one. */
 	startRun?: (spec: RunSpec) => Promise<RunRequestResult>;
 }
 
 type OkState = ProjectState & { config: Extract<ConfigLoad, { status: "ok" }> };
+type DecideOptions = { warnings?: readonly string[]; context?: string; notes?: string; notesInfo?: readonly InfoLine[]; extraOptions?: readonly string[] };
 
-/** Writes the approval first, then the file, so the config never exists unapproved after a successful save. */
-export async function approveAndSave(state: ProjectState, config: StormConfig, scope: ApprovalScope): Promise<string> {
+const STALE_ACTION = "대화가 바뀌어 이전 세션의 작업을 적용하지 않았습니다. 새 대화에서 다시 시도하세요.";
+
+/** A delayed read or write is refused because its native owner is no longer live. */
+class StaleOwnerError extends Error {
+	constructor() {
+		super(STALE_ACTION);
+		this.name = "StaleOwnerError";
+	}
+}
+
+/** True when the flow's native owner changed; says so once and lets the caller stop before any side effect. */
+function stopIfStale(env: FlowEnv, ui: UiPort): boolean {
+	if (env.stillOwner()) return false;
+	ui.notify(STALE_ACTION, "warning");
+	return true;
+}
+
+/** Writes the approval first, then the session config, so the file never exists unapproved after a successful save. */
+export async function approveAndSave(state: ProjectState, config: StormConfig, scope: ApprovalScope, live?: () => boolean): Promise<string> {
 	const hash = configHash(config);
+	await assertSessionStoreSafe(state.sessionDir, state.repo.root);
+	if (live !== undefined && !live()) throw new StaleOwnerError();
 	await state.store.approve({ configHash: hash, config, scope });
-	await writeConfig(state.repo.root, config);
+	// A switch while the approval was being written must not add a config for an owner that is already gone.
+	if (live !== undefined && !live()) throw new StaleOwnerError();
+	await writeConfig(state.sessionDir, config);
 	return hash;
 }
 
 function decideHost(env: FlowEnv, ui: UiPort): DecideHost {
-	return { ui, loadState: () => loadProjectState(env), approveAndSave };
+	return {
+		ui,
+		loadState: async () => {
+			// The post-dialog read is the first chance to catch a switch; the captured env alone would still return A.
+			if (!env.stillOwner()) throw new StaleOwnerError();
+			return loadProjectState(env);
+		},
+		approveAndSave: async (state, config, scope) => {
+			if (!env.stillOwner()) throw new StaleOwnerError();
+			return approveAndSave(state, config, scope, env.stillOwner);
+		},
+	};
 }
 
-/** Said when the config file or the shadowing definitions changed while a dialog was open: the newer file is never overwritten. */
-const MOVED = "창이 열려 있는 사이 팀 설정이나 가림 정의가 바뀌어 저장하지 않았습니다. /storm 으로 다시 확인하세요.";
+/** Saves an already-approved change; a switch after its guard cancels before the config write. */
+async function saveOwned(
+	env: FlowEnv,
+	ui: UiPort,
+	state: ProjectState,
+	config: StormConfig,
+	scope: ApprovalScope,
+): Promise<string | undefined> {
+	try {
+		return await approveAndSave(state, config, scope, env.stillOwner);
+	} catch (error) {
+		if (!(error instanceof StaleOwnerError)) throw error;
+		ui.notify(STALE_ACTION, "warning");
+		return undefined;
+	}
+}
+
+/** Runs one proposal through its dialog; a stale owner cancels it before any approval or config write. */
+async function decideOwned(
+	env: FlowEnv,
+	ui: UiPort,
+	state: ProjectState,
+	proposal: Proposal,
+	opts: DecideOptions = {},
+): Promise<Decision | undefined> {
+	if (!env.stillOwner()) {
+		ui.notify(STALE_ACTION, "warning");
+		return undefined;
+	}
+	try {
+		return await decideProposal(decideHost(env, ui), state, proposal, opts);
+	} catch (error) {
+		if (!(error instanceof StaleOwnerError)) throw error;
+		ui.notify(STALE_ACTION, "warning");
+		return undefined;
+	}
+}
+
+/** The session or the target changed while a dialog was open: never apply the choice to either one. */
+function ownerMoved(before: ProjectState, now: ProjectState): boolean {
+	return now.sessionDir !== before.sessionDir || now.repo.root !== before.repo.root || movedSince(before, now);
+}
+
+/** Said when the session, target, config or shadowing definitions changed while a dialog was open: neither is overwritten. */
+const MOVED = "창이 열려 있는 사이 세션·작업 대상·팀 설정이나 가림 정의가 바뀌어 저장하지 않았습니다. /storm 으로 다시 확인하세요.";
 
 const PICK_BY_ROLE = "역할별로 고르기";
 /** The direct one-slot edit: a native model pick becomes a real diff through the ordinary approval dialog. */
@@ -102,30 +186,22 @@ const INVALID_FORM = "폼의 값이 계속 올바르지 않아 팀을 설정하�
 /** The explicit switch labels: the first approval initializes the choice, these change it later. */
 const AUTO = { enable: "자동 위임 켜기", disable: "자동 위임 끄기" } as const;
 
-/** A choice this flow can read. `unset` is not a decision yet; `invalid` is a file setup and migration never rewrite. */
+/** A choice this flow can read. `unset` is not a decision yet; `invalid` is a file setup never rewrites. */
 type AutoChoice = "on" | "off" | "unset" | "invalid";
 
 /** Shown first in the approval that carries the first local approval's default. */
 const AUTO_DISCLOSURE = [
-	"승인하면 자동 위임이 켜집니다",
+	"승인하면 이 세션의 자동 위임이 켜집니다",
 	"",
-	"- 승인한 팀이 이 저장소의 작업을 맡습니다. 메인 세션은 프로젝트 도구를 직접 쓰지 않고, 작은 수정도 팀 작업으로 넘깁니다.",
+	"- 승인한 팀이 이 작업 대상의 작업을 맡습니다. 메인 세션은 프로젝트 도구를 직접 쓰지 않고, 작은 수정도 팀 작업으로 넘깁니다.",
 	"- 일반 대화는 지금처럼 메인 세션에서 이어집니다. 역할별 워커 수, 실행 한도, OMP의 승인 절차는 바뀌지 않습니다.",
-	"- 이 프로필과 이 저장소에만 적용됩니다. 끄려면 `/storm auto`를 실행하세요.",
-].join("\n");
-
-/** The one-time choice added to the hub for a team approved before this default existed. */
-const AUTO_MIGRATION = { switch: "자동 위임으로 전환", stay: "직접 작업 유지" } as const;
-const AUTO_MIGRATION_NOTICE = [
-	"자동 위임으로 전환하면 메인 세션이 이 저장소의 작업을 직접 하지 않습니다. 작은 수정도 Storm 팀이 맡습니다.",
-	"일반 대화는 지금처럼 메인 세션에서 이어지고, 역할별 워커 수와 실행 한도, OMP의 승인 절차는 바뀌지 않습니다. 이 프로필과 이 저장소에만 적용되며, 끄려면 /storm auto 를 실행합니다.",
-	`「${AUTO_MIGRATION.switch}」를 고르면 지금부터 적용하고, 「${AUTO_MIGRATION.stay}」를 고르면 지금처럼 직접 작업합니다. 결정하면 다시 묻지 않습니다.`,
+	"- 이 OMP 세션에만 적용됩니다. 다른 세션이나 다른 작업 트리에는 적용되지 않으며, 끄려면 `/storm auto`를 실행하세요.",
 ].join("\n");
 
 /** `on`/`off` are saved choices; `unset` has no file; `invalid` is an unreadable file, never turned into a yes here. */
 async function savedAutoChoice(state: ProjectState): Promise<AutoChoice> {
 	try {
-		return await readAutoDelegationChoice(state.store.dir);
+		return await readAutoDelegationChoice(state.sessionDir);
 	} catch {
 		// Fail closed: an unreadable choice is not the user's yes.
 		return "invalid";
@@ -133,18 +209,21 @@ async function savedAutoChoice(state: ProjectState): Promise<AutoChoice> {
 }
 
 /**
- * The default-on disclosure and its activation belong to the first approval on this machine: no earlier approval
- * in this profile's store and no saved choice. A missing config alone does not make a re-setup a first approval.
+ * The default-on disclosure and its activation belong to the first approval in this session for this target: no
+ * earlier approval in the session's target store and no saved choice. A new or forked session starts here again;
+ * the same native session keeps its earlier choice.
  */
 async function firstLocalApproval(state: ProjectState): Promise<boolean> {
 	return (await state.store.list()).length === 0 && (await savedAutoChoice(state)) === "unset";
 }
 
 /** Called only after the team's own approval was written; a failed or refused write leaves the team saved. */
-async function activateAutoAfterApproval(state: ProjectState, ui: UiPort, first: boolean): Promise<void> {
+async function activateAutoAfterApproval(env: FlowEnv, state: ProjectState, ui: UiPort, first: boolean): Promise<void> {
 	if (!first) return;
 	try {
-		if (await initializeAutoDelegation(state.store.dir, true)) {
+		await assertSessionStoreSafe(state.sessionDir, state.repo.root);
+		if (stopIfStale(env, ui)) return;
+		if (await initializeAutoDelegation(state.sessionDir, true)) {
 			ui.notify("자동 위임을 켰습니다. 끄려면 /storm auto 를 실행하세요.");
 			return;
 		}
@@ -155,9 +234,11 @@ async function activateAutoAfterApproval(state: ProjectState, ui: UiPort, first:
 }
 
 /** An explicit choice overwrites the saved file, including an invalid one; a failed write changes nothing. */
-async function saveAutoChoice(state: ProjectState, ui: UiPort, enabled: boolean, done: string): Promise<void> {
+async function saveAutoChoice(env: FlowEnv, state: ProjectState, ui: UiPort, enabled: boolean, done: string): Promise<void> {
 	try {
-		await writeAutoDelegation(state.store.dir, enabled);
+		await assertSessionStoreSafe(state.sessionDir, state.repo.root);
+		if (stopIfStale(env, ui)) return;
+		await writeAutoDelegation(state.sessionDir, enabled);
 		ui.notify(done);
 	} catch {
 		ui.notify("자동 위임 상태를 저장하지 못했습니다. 바뀐 것이 없습니다.", "warning");
@@ -165,41 +246,42 @@ async function saveAutoChoice(state: ProjectState, ui: UiPort, enabled: boolean,
 }
 
 /**
- * What automatic delegation changes, shown wherever it is offered or inspected. Settings live in this profile's
- * approval directory for this repository (`state.store.dir`), so linked worktrees share the choice while each
- * worktree's team config is still approved separately. Nothing here is a reason to fall back to direct tools.
+ * What automatic delegation changes, shown wherever it is offered or inspected. The consent file belongs to this
+ * native session alone (`state.sessionDir`); the team approval beside it is bound to the target shown below. No
+ * other session and no other work tree reads either one.
  */
-function autoDelegationDoc(state: { enabled: boolean; approved: boolean }): string {
+function autoDelegationDoc(state: { enabled: boolean; approved: boolean }, target: string): string {
 	const now = state.enabled
 		? state.approved
 			? "- 지금 켜져 있고, 승인된 팀에서 동작합니다. 끄려면 「자동 위임 끄기」를 고르세요."
-			: "- 지금 켜져 있지만 팀 설정이 승인되지 않아 동작하지 않습니다. 끄기는 지금도 할 수 있습니다."
+			: "- 지금 켜져 있지만 이 대상의 팀 설정이 승인되지 않아 동작하지 않습니다. 끄기는 지금도 할 수 있습니다."
 		: state.approved
 			? "- 지금은 꺼져 있습니다. 켜려면 「자동 위임 켜기」를 고르세요."
-			: "- 팀 설정이 승인되어 있지 않아 지금은 켤 수 없습니다. `/storm` 으로 팀을 승인한 뒤 다시 `/storm auto` 를 실행하세요.";
+			: "- 이 대상의 팀 설정이 승인되어 있지 않아 지금은 켤 수 없습니다. `/storm` 으로 팀을 승인한 뒤 다시 `/storm auto` 를 실행하세요.";
 	return [
 		"### 적용 범위",
-		"- 이 설정은 이 프로필과 이 저장소에만 적용됩니다. 이 저장소의 연결된 worktree는 이 선택을 함께 쓰고, 각 worktree의 팀 설정은 그곳에서 따로 승인합니다.",
+		`- 이 선택은 이 OMP 세션에만 저장되고, 승인된 팀은 지금 작업 대상(${target})에만 적용됩니다.`,
+		"- 같은 프로필의 다른 세션과 다른 작업 트리는 각자의 선택과 승인을 따로 씁니다. 대상을 바꾸면 팀 설정은 남지만 다시 승인해야 합니다.",
 		"",
 		"### 켜면",
-		"- 메인 세션은 프로젝트 도구를 직접 쓰지 않습니다. 작은 수정도 Storm 팀 작업으로 넘깁니다.",
+		"- 메인 세션은 이 대상의 프로젝트 도구를 직접 쓰지 않습니다. 작은 수정도 Storm 팀 작업으로 넘깁니다.",
 		"- 프로젝트와 무관한 일반 대화는 지금처럼 메인 세션에서 이어집니다.",
 		"- 역할별 워커 수와 실행 한도, OMP의 승인 절차는 바뀌지 않습니다.",
 		"- 승인을 기다리는 동안 메인 세션이 직접 처리하는 식으로 대신하지 않습니다.",
 		"",
-		"첫 팀 승인은 자동 위임을 켜는 것이 기본이고, 저장된 선택은 다시 설정해도 그대로입니다.",
+		"이 세션의 첫 팀 승인은 자동 위임을 켜는 것이 기본이고, 저장된 선택은 다시 설정해도 그대로입니다.",
 		"",
 		now,
 	].join("\n");
 }
 
-function autoDelegationMarkdown(state: { enabled: boolean; approved: boolean; invalid?: boolean }): string {
+function autoDelegationMarkdown(state: { enabled: boolean; approved: boolean; invalid?: boolean }, target: string): string {
 	return [
 		`- 상태: **${state.enabled ? "켜짐" : "꺼짐"}**`,
 		`- 팀 설정: ${state.approved ? "승인됨" : "승인되지 않음 — 자동 위임은 동작하지 않습니다."}`,
 		...(state.invalid ? ["- 저장된 선택을 읽을 수 없어 꺼진 것으로 봅니다. 여기서 고르면 새 선택으로 고쳐집니다."] : []),
 		"",
-		autoDelegationDoc(state),
+		autoDelegationDoc(state, target),
 	].join("\n");
 }
 
@@ -213,6 +295,7 @@ async function pickByRole(
 	input: SetupFormInput,
 	firstApproval: boolean,
 ): Promise<boolean> {
+	if (stopIfStale(env, ui)) return false;
 	const pickModel = ui.pickModel?.bind(ui);
 	const browse = pickModel !== undefined;
 	const roles = interviewRoles(input, browse);
@@ -249,6 +332,7 @@ async function pickByRole(
 		while (true) {
 			const answers = await form(roleForm(input, id, browse, index + 1, roles.length, retry));
 			if (!answers) return cancelled();
+			if (stopIfStale(env, ui)) return false;
 			const choices = readRoleChoices(input, id, browse, answers);
 			if ("errors" in choices) {
 				if (++invalid >= FORM_TRIES) {
@@ -266,10 +350,12 @@ async function pickByRole(
 			let primary: ModelEntry;
 			if (choices.primary === BROWSE) {
 				const picked = await native(`${title} · 주 모델`, id, 0);
+				if (stopIfStale(env, ui)) return false;
 				if (picked === "cancel" || picked === "invalid") continue;
 				primary = picked;
 			} else {
 				const entry = await chooseEffort(id, "주 모델", choices.primary);
+				if (stopIfStale(env, ui)) return false;
 				if (!entry) return cancelled();
 				primary = entry;
 			}
@@ -278,10 +364,12 @@ async function pickByRole(
 				let entry: ModelEntry | undefined;
 				if (choices.fallback === BROWSE) {
 					const picked = await native(`${title} · 폴백`, id, 1);
+					if (stopIfStale(env, ui)) return false;
 					if (picked === "cancel" || picked === "invalid") continue;
 					entry = picked;
 				} else if (choices.fallback !== primary.selector) {
 					entry = await chooseEffort(id, "폴백", choices.fallback);
+					if (stopIfStale(env, ui)) return false;
 					if (!entry) return cancelled();
 				}
 				// The form says the same model in both slots means no fallback.
@@ -295,15 +383,17 @@ async function pickByRole(
 	for (let attempt = 0; attempt < FORM_TRIES; attempt++) {
 		const answers = await form(commonSettingsForm(input, retry));
 		if (!answers) return cancelled();
+		if (stopIfStale(env, ui)) return false;
 		const built = setupConfig(input, selected, answers);
 		if ("errors" in built) {
 			retry = { answers, errors: built.errors };
 			continue;
 		}
-		const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary: "역할별로 고른 팀", config: built.config }, {
+		const decision = await decideOwned(env, ui, state, { kind: "setup", summary: "역할별로 고른 팀", config: built.config }, {
 			warnings: [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...built.warnings, ...modelWarnings(built.config, ctx)],
-			...(firstApproval ? { context: AUTO_DISCLOSURE } : {}),
+			context: [...(firstApproval ? [AUTO_DISCLOSURE] : []), targetScopeLine(state.repo.root)].join("\n\n"),
 		});
+		if (!decision) return false;
 		// No extra option was offered.
 		if (decision.outcome !== "extra") notifySetup(ui, decision);
 		return decision.outcome === "approved";
@@ -330,6 +420,7 @@ interface SlotEditOptions {
  * approval in `decideProposal` writes, and a stale config or an approval that is no longer there is refused there.
  */
 async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts: SlotEditOptions): Promise<boolean> {
+	if (stopIfStale(env, ui)) return false;
 	const pickModel = ui.pickModel?.bind(ui);
 	if (!pickModel) return false;
 	const kind: ProposalKind = isApproved(opts.state) ? "reselect" : "setup";
@@ -350,6 +441,7 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
 				}),
 			].join("\n"),
 		});
+		if (stopIfStale(env, ui)) return false;
 		if (choice === undefined || choice === CANCEL) {
 			ui.notify("모델·effort를 바꾸지 않았습니다.");
 			return false;
@@ -357,6 +449,7 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
 		const slot = slots.find((candidate) => candidate.label === choice);
 		if (!slot) continue;
 		const picked = await pickModel(slot.label, slotCurrent(draft.roles[slot.roleId], slot.index));
+		if (stopIfStale(env, ui)) return false;
 		// A cancelled picker is not an invalid pick: it goes back to the slot list.
 		if (!picked) continue;
 		const applied = applySlotPick(draft, slot, picked);
@@ -364,11 +457,12 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
 			ui.notify(applied.error, "warning");
 			continue;
 		}
-		const decision = await decideProposal(decideHost(env, ui), opts.state, { kind, summary: opts.summary, config: applied.config }, {
+		const decision = await decideOwned(env, ui, opts.state, { kind, summary: opts.summary, config: applied.config }, {
 			...(opts.warnings ? { warnings: opts.warnings(applied.config) } : {}),
 			...(opts.context ? { context: opts.context } : {}),
 			extraOptions: [KEEP_EDITING],
 		});
+		if (!decision) return false;
 		if (decision.outcome === "approved") {
 			ui.notify(`모델·effort를 승인하고 저장했습니다(${shortHash(decision.hash)}).`);
 			return true;
@@ -397,6 +491,7 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
  */
 export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
+	if (stopIfStale(env, ui)) return;
 	/** Not "missing config": re-setup after a deleted config is still a later approval when an approval exists. */
 	const firstApproval = await firstLocalApproval(state);
 	const ctx = await prepareAnalysis(env, ui);
@@ -421,8 +516,9 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 				title: `${STORM_MARK} · 팀 제안`,
 				markdown: checked.errors.map((error) => `- ${error}`).join("\n"),
 			});
+			if (stopIfStale(env, ui)) return;
 			if (choice === PICK_BY_ROLE && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
-				await activateAutoAfterApproval(state, ui, firstApproval);
+				await activateAutoAfterApproval(env, state, ui, firstApproval);
 			}
 		} else {
 			ui.notify(`지금 쓸 수 있는 모델로는 팀을 추천할 수 없습니다(${checked.errors.join("; ")}). omp에서 Provider에 로그인한 뒤 다시 /storm 을 실행하세요.`, "warning");
@@ -436,8 +532,9 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 			: "";
 	const context = [
 		firstApproval ? AUTO_DISCLOSURE : "",
+		targetScopeLine(state.repo.root),
 		cleanupNotice,
-		state.config.status === "invalid" ? "지금 팀 설정 파일에 오류가 있어 새로 만듭니다." : "",
+		state.config.status === "invalid" ? "이 세션의 팀 설정에 오류가 있어 새로 만듭니다." : "",
 		form
 			? ""
 			: canPick
@@ -451,17 +548,18 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const summary = current ? "Storm 추천 팀으로 다시 설정" : "Storm 추천 팀";
 	const warnings = (config: StormConfig) => [...ctx.detection(env.activeTools).warnings, ...ctx.analysis.warnings, ...modelWarnings(config, ctx)];
 	const extras = [...(canPick ? [EDIT_MODELS] : []), ...(form ? [PICK_BY_ROLE] : [])];
-	const decision = await decideProposal(decideHost(env, ui), state, { kind: "setup", summary, config: proposed }, {
+	const decision = await decideOwned(env, ui, state, { kind: "setup", summary, config: proposed }, {
 		warnings: warnings(proposed),
 		context,
 		notes,
 		notesInfo,
 		...(extras.length ? { extraOptions: extras } : {}),
 	});
+	if (!decision) return;
 	/** Both direct-edit routes approve through the ordinary dialog; only the exact approval turns auto on. */
 	const edit = async (): Promise<void> => {
 		if (await editModelSlots(env, ui, proposed, { state, summary, context, warnings })) {
-			await activateAutoAfterApproval(state, ui, firstApproval);
+			await activateAutoAfterApproval(env, state, ui, firstApproval);
 		}
 	};
 	if (decision.outcome === "unchanged") {
@@ -476,15 +574,16 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 			markdown: notes,
 			info: notesInfo,
 		});
+		if (stopIfStale(env, ui)) return;
 		if (choice === EDIT_MODELS) await edit();
 		else if (choice === PICK_BY_ROLE && form && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
-			await activateAutoAfterApproval(state, ui, firstApproval);
+			await activateAutoAfterApproval(env, state, ui, firstApproval);
 		}
 		return;
 	}
 	if (decision.outcome !== "extra") {
 		notifySetup(ui, decision);
-		if (decision.outcome === "approved") await activateAutoAfterApproval(state, ui, firstApproval);
+		if (decision.outcome === "approved") await activateAutoAfterApproval(env, state, ui, firstApproval);
 		return;
 	}
 	if (decision.extra === EDIT_MODELS) {
@@ -492,39 +591,42 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		return;
 	}
 	if (decision.extra === PICK_BY_ROLE && form && (await pickByRole(env, ui, form, state, ctx, input, firstApproval))) {
-		await activateAutoAfterApproval(state, ui, firstApproval);
+		await activateAutoAfterApproval(env, state, ui, firstApproval);
 	}
 }
 
 /**
- * `/storm auto` and the hub entry: the personal automatic-delegation consent for this profile and repository, shown
- * with its scope and changed only by an explicit choice. Turning on needs an approved team; turning off stays
+ * `/storm auto` and the hub entry: this native session's automatic-delegation consent, shown with its target and
+ * changed only by an explicit choice. Turning on needs an approved team for the current target; turning off stays
  * possible while the config is stale, invalid or unapproved, and an explicit choice repairs an invalid saved file.
  * A host that cannot answer changes nothing.
  */
 export async function autoDelegationFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
+	if (stopIfStale(env, ui)) return;
 	const choice = await savedAutoChoice(state);
 	const approved = state.config.status === "ok" && isApproved(state);
-	const markdown = autoDelegationMarkdown({ enabled: choice === "on", approved, ...(choice === "invalid" ? { invalid: true } : {}) });
+	const markdown = autoDelegationMarkdown({ enabled: choice === "on", approved, ...(choice === "invalid" ? { invalid: true } : {}) }, visible(state.repo.root));
 	if (choice === "on") {
 		const answer = await ui.select("자동 위임", [AUTO.disable, CANCEL], { title: "자동 위임", markdown });
+		if (stopIfStale(env, ui)) return;
 		if (answer !== AUTO.disable) {
 			ui.notify("자동 위임을 그대로 둡니다.");
 			return;
 		}
-		await saveAutoChoice(state, ui, false, "자동 위임을 껐습니다. 메인 세션이 프로젝트 작업을 직접 처리합니다.");
+		await saveAutoChoice(env, state, ui, false, "자동 위임을 껐습니다. 메인 세션이 프로젝트 작업을 직접 처리합니다.");
 		return;
 	}
 	if (!approved) {
 		// Enabling needs approval; an unreadable saved file can still be repaired to an explicit off.
 		if (choice === "invalid") {
 			const answer = await ui.select("자동 위임", [AUTO.disable, CANCEL], { title: "자동 위임", markdown });
+			if (stopIfStale(env, ui)) return;
 			if (answer !== AUTO.disable) {
 				ui.notify("저장된 자동 위임 상태를 바꾸지 않았습니다.");
 				return;
 			}
-			await saveAutoChoice(state, ui, false, "자동 위임을 꺼진 상태로 저장했습니다.");
+			await saveAutoChoice(env, state, ui, false, "자동 위임을 꺼진 상태로 저장했습니다.");
 			return;
 		}
 		await ui.report("자동 위임", markdown);
@@ -536,8 +638,9 @@ export async function autoDelegationFlow(env: FlowEnv, ui: UiPort): Promise<void
 		consent: [AUTO.enable],
 		markdown,
 	});
+	if (stopIfStale(env, ui)) return;
 	if (answer === AUTO.disable) {
-		await saveAutoChoice(state, ui, false, "자동 위임을 꺼진 상태로 저장했습니다.");
+		await saveAutoChoice(env, state, ui, false, "자동 위임을 꺼진 상태로 저장했습니다.");
 		return;
 	}
 	if (answer !== AUTO.enable) {
@@ -545,11 +648,12 @@ export async function autoDelegationFlow(env: FlowEnv, ui: UiPort): Promise<void
 		return;
 	}
 	const current = await loadProjectState(env);
-	if (current.repo.root !== state.repo.root || !isApproved(current) || movedSince(state, current)) {
-		ui.notify("선택하는 사이 팀 설정이나 승인이 바뀌어 자동 위임을 켜지 않았습니다. /storm 으로 다시 확인하세요.", "warning");
+	if (stopIfStale(env, ui)) return;
+	if (ownerMoved(state, current) || !isApproved(current)) {
+		ui.notify("선택하는 사이 세션·작업 대상·팀 설정이나 승인이 바뀌어 자동 위임을 켜지 않았습니다. /storm 으로 다시 확인하세요.", "warning");
 		return;
 	}
-	await saveAutoChoice(current, ui, true, "자동 위임을 켰습니다. 이 프로필과 저장소에만 적용됩니다.");
+	await saveAutoChoice(env, current, ui, true, "자동 위임을 켰습니다. 이 OMP 세션에서만 적용됩니다.");
 }
 
 /**
@@ -563,11 +667,16 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 	const config = state.config.status === "ok" ? state.config.config : undefined;
 	const [quota, quotaMarks, last, trials, settings, storage, autoChoice] = await Promise.all([
 		opts.quota ? readQuota(env.exec, env.ompBin) : undefined,
-		readQuotaMarks(root, now),
-		lastRun(root),
-		opts.trials ?? (config ? trialViews(env, root, config, now) : []),
+		readQuotaMarks(state.sessionDir, now),
+		lastRun(state.sessionDir),
+		opts.trials ?? (config ? trialViews(env, state.sessionDir, config, now) : []),
 		opts.user ? env.ompSettings?.() : undefined,
-		opts.user ? readStorage(root, state.store.dir, join(env.agentDir, "sessions"), { ...(env.sessionDir ? { sessionDir: env.sessionDir } : {}), cleanup: config?.cleanup === true }) : undefined,
+		opts.user
+			? readStorage(state.sessionDir, join(env.agentDir, "sessions"), {
+					...(env.ompSessionDir ? { ompSessionDir: env.ompSessionDir } : {}),
+					cleanup: config?.cleanup === true,
+				})
+			: undefined,
 		opts.user ? savedAutoChoice(state) : undefined,
 	]);
 	const usage = readUsage({ dbPath: env.statsDb ?? statsDbPath(), windowDays: 1, now });
@@ -602,12 +711,14 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 
 /**
  * The status as text from one project read. `info` collects the TUI's semantic spans for the same Markdown; the
- * storm tool's model view still passes none, so its payload is unchanged.
+ * storm tool's model view still passes none, so its payload is unchanged and names no path. The user's full status
+ * ends by naming the one target this session's approval covers, so a target change is visible before acting.
  */
 async function statusMarkdown(env: FlowEnv, opts: { quota: boolean }, info?: InfoLine[]): Promise<string> {
 	const state = await loadProjectState(env);
 	const view = await statusView(env, state, { quota: opts.quota, user: opts.quota });
-	return renderStatus(view, env.now(), opts.quota ? "user" : "model", info);
+	const body = renderStatus(view, env.now(), opts.quota ? "user" : "model", info);
+	return opts.quota ? `${body}\n\n### 적용 범위\n- ${targetScopeLine(state.repo.root)}` : body;
 }
 
 /**
@@ -640,6 +751,72 @@ export async function modelsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	await ui.report("Storm 모델 점검", renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined));
 }
 
+/**
+ * Only the team options a person may share: known config fields with no unknown fields, no session or target path,
+ * no approval/hash/history/queue, no trial experiment and no required-check argv (which is target-bound and may name
+ * a private path). The result is serialized as text; nothing here is read back by Storm.
+ */
+function exportableTeam(config: StormConfig): StormConfig {
+	const roles: StormConfig["roles"] = {};
+	for (const [id, role] of Object.entries(config.roles)) {
+		roles[id] = {
+			agent: role.agent,
+			models: [...role.models],
+			...(role.effort !== undefined ? { effort: role.effort } : {}),
+			...(role.workers !== undefined ? { workers: typeof role.workers === "number" ? role.workers : { ...role.workers } } : {}),
+			...(role.contextCap !== undefined ? { contextCap: role.contextCap } : {}),
+		};
+	}
+	return {
+		version: config.version,
+		priority: config.priority,
+		roles,
+		parallelism: config.parallelism,
+		isolation: config.isolation,
+		...(config.budget
+			? {
+					budget: {
+						perRunUsd: config.budget.perRunUsd,
+						...(config.budget.warnAtUsd !== undefined ? { warnAtUsd: config.budget.warnAtUsd } : {}),
+						onExceed: config.budget.onExceed,
+					},
+				}
+			: {}),
+		...(config.fallbackRole !== undefined ? { fallbackRole: config.fallbackRole } : {}),
+		...(config.disabledRoles?.length ? { disabledRoles: [...config.disabledRoles] } : {}),
+		...(config.contextCap !== undefined ? { contextCap: config.contextCap } : {}),
+		...(config.cleanup !== undefined ? { cleanup: config.cleanup } : {}),
+		...(config.docs !== undefined ? { docs: config.docs } : {}),
+		...(config.rounds !== undefined ? { rounds: config.rounds } : {}),
+	};
+}
+
+/**
+ * `/storm export`: a human-only, explicit copy of this session's team options for sharing by hand. It writes nothing
+ * and is not offered to the model or the storm tool; the text excludes approval, hashes, history, queues, credentials,
+ * checks and every path. No import or inheritance exists on the other side.
+ */
+export async function exportFlow(env: FlowEnv, ui: UiPort): Promise<void> {
+	const state = await loadProjectState(env);
+	if (state.config.status !== "ok" || !isApproved(state)) {
+		ui.notify("내보낼 승인된 팀 설정이 없습니다. /storm 에서 팀을 설정하고 승인한 뒤 다시 실행하세요.", "warning");
+		return;
+	}
+	const template = serializeConfig(exportableTeam(state.config.config)).trimEnd();
+	const markdown = [
+		"### 복사용 팀 옵션",
+		"",
+		"- 모델·effort·워커·병렬도·예산·실행 설정처럼 나눌 수 있는 값만 담았습니다.",
+		"- 승인 기록, 설정 해시, 실행·시험 기록, 자동 위임 선택, 필수 검사 명령, 자격 증명, 세션·작업 대상 경로는 들어 있지 않습니다.",
+		"- Storm은 이 내용을 읽어 들이거나 자동으로 물려받지 않습니다. 필요하면 사람이 직접 비교해 옮겨 적으세요.",
+		"",
+		"```json",
+		template,
+		"```",
+	].join("\n");
+	await ui.report("Storm 팀 템플릿", markdown);
+}
+
 const TRIAL = { adopt: "후보로 교체", keep: "지금 모델 유지", later: "나중에" } as const;
 
 /**
@@ -648,6 +825,7 @@ const TRIAL = { adopt: "후보로 교체", keep: "지금 모델 유지", later: 
  * approval dialog. Returns true when the config changed.
  */
 async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: OkState, trials: readonly TrialView[]): Promise<boolean> {
+	if (stopIfStale(env, ui)) return false;
 	const config = state.config.config;
 	for (const view of trials) {
 		if (view.phase !== "ended" || !config.roles[view.trial.role]) continue;
@@ -657,23 +835,28 @@ async function offerTrialDecisions(env: FlowEnv, ui: UiPort, state: OkState, tri
 			consent: [TRIAL.adopt, TRIAL.keep],
 			markdown: renderTrial(view),
 		});
+		if (stopIfStale(env, ui)) return false;
 		if (choice !== TRIAL.adopt && choice !== TRIAL.keep) continue;
 		const built = buildTrialEnd(config, trial, choice === TRIAL.adopt);
 		if ("error" in built) continue;
 		if (choice === TRIAL.keep) {
-			if (movedSince(state, await loadProjectState(env))) {
+			if (stopIfStale(env, ui)) return false;
+			if (ownerMoved(state, await loadProjectState(env))) {
 				ui.notify(MOVED, "warning");
 				return false;
 			}
 			// No new model enters the team and the shadows are the approved ones, so there is nothing more to show.
-			const hash = await approveAndSave(state, built.config, { shadowedAgents: state.shadows });
+			const hash = await saveOwned(env, ui, state, built.config, { shadowedAgents: state.shadows });
+			if (hash === undefined) return false;
 			ui.notify(`${built.summary}. 저장했습니다(${shortHash(hash)}).`);
 			return true;
 		}
 		const ctx = await prepareAnalysis(env, ui);
-		const decision = await decideProposal(decideHost(env, ui), state, { kind: "reselect", summary: built.summary, config: built.config }, {
+		const decision = await decideOwned(env, ui, state, { kind: "reselect", summary: built.summary, config: built.config }, {
 			warnings: modelWarnings(built.config, ctx),
+			context: targetScopeLine(state.repo.root),
 		});
+		if (!decision) return false;
 		if (decision.outcome === "approved") ui.notify(`${built.summary}. 승인하고 저장했습니다(${shortHash(decision.hash)}).`);
 		else ui.notify(decision.outcome === "rejected" ? decision.reason : "바꾸지 않았습니다. 시험 사용 결과는 다음 /storm 에서 다시 묻습니다.");
 		return decision.outcome === "approved";
@@ -701,17 +884,32 @@ async function rollbackOptions(state: ProjectState): Promise<RollbackOption[]> {
 
 /** Puts an earlier approved config back. Its approval record is still there, so nothing new is approved. */
 async function rollbackFlow(env: FlowEnv, ui: UiPort, state: ProjectState, options: readonly RollbackOption[]): Promise<void> {
+	if (stopIfStale(env, ui)) return;
 	const current = state.config.status === "ok" ? state.config.config : undefined;
-	const option = await runRollback(ui, { options, ...(current ? { current } : {}) });
+	const option = await runRollback(ui, {
+		options,
+		...(current ? { current } : {}),
+		scope: targetScopeLine(state.repo.root),
+		stillOwner: env.stillOwner,
+	});
+	if (stopIfStale(env, ui)) return;
 	if (!option) {
 		ui.notify("되돌리지 않았습니다.");
 		return;
 	}
-	if (movedSince(state, await loadProjectState(env))) {
+	if (stopIfStale(env, ui)) return;
+	if (ownerMoved(state, await loadProjectState(env))) {
 		ui.notify(MOVED, "warning");
 		return;
 	}
-	await writeConfig(state.repo.root, option.config);
+	try {
+		await assertSessionStoreSafe(state.sessionDir, state.repo.root);
+	} catch (error) {
+		ui.notify(`되돌리지 않았습니다: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		return;
+	}
+	if (stopIfStale(env, ui)) return;
+	await writeConfig(state.sessionDir, option.config);
 	ui.notify(`이전에 승인한 팀 설정으로 되돌렸습니다(${shortHash(option.hash)}).`);
 }
 
@@ -729,31 +927,39 @@ const MENU = {
 /** The hub's automatic-delegation entry says whether it is on or off; both open the same flow. */
 const AUTO_MENU = { on: "자동 위임 · 켜짐", off: "자동 위임 · 꺼짐" } as const;
 
-/** A config file that does not validate: every error in view, and the ways out. Setup starts only when the user picks it. */
-async function invalidFlow(env: FlowEnv, ui: UiPort, state: ProjectState, errors: readonly string[], path: string): Promise<void> {
+/** This session's config does not validate: every error in view, and the ways out. Setup starts only when picked. */
+async function invalidFlow(env: FlowEnv, ui: UiPort, state: ProjectState, errors: readonly string[]): Promise<void> {
 	const rollbacks = await rollbackOptions(state);
+	if (stopIfStale(env, ui)) return;
 	// The errors quote the file (keys, values), so each one is shown as a single line.
-	const markdown = [`\`${path}\``, "", ...errors.map(error => `- ${visible(error)}`), "", "파일을 직접 고쳐도 됩니다. 고칠 때까지 Storm 스폰은 막힙니다."].join("\n");
-	const choice = await ui.select("팀 설정 파일에 오류가 있습니다", [...(rollbacks.length ? [MENU.rollback] : []), MENU.setup, CANCEL], {
+	const markdown = [
+		...errors.map(error => `- ${visible(error)}`),
+		"",
+		`이 오류가 있는 동안 Storm 스폰은 막힙니다. \`/storm\`에서 팀을 새로 설정하거나 이전 승인으로 되돌리세요. 예전 작업 트리의 \`.omp/storm/\`은 읽지도 고치지도 않습니다.`,
+	].join("\n");
+	const choice = await ui.select("이 세션의 팀 설정에 오류가 있습니다", [...(rollbacks.length ? [MENU.rollback] : []), MENU.setup, CANCEL], {
 		title: `${STORM_MARK} · 팀 설정 오류`,
 		markdown,
 	});
+	if (stopIfStale(env, ui)) return;
 	if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
 	else if (choice === MENU.setup) await setupFlow(env, ui);
 }
 
 /**
- * A valid config nobody approved on this machine (changed by hand, pulled from a teammate) or new shadowing
- * definitions: the dialog shows everything "승인" covers, against the latest approved config.
+ * A valid team this session holds no approval for at the current target: the target changed, the session config
+ * changed without an approval, or the approval was cleared. The dialog shows everything "승인" covers, against the
+ * latest approval for this target.
  */
 async function unapprovedFlow(env: FlowEnv, ui: UiPort, state: OkState): Promise<void> {
 	const { config, hash, warnings } = state.config;
 	const [records, rollbacks, ctx, firstApproval] = await Promise.all([state.store.list(), rollbackOptions(state), prepareAnalysis(env, ui), firstLocalApproval(state)]);
+	if (stopIfStale(env, ui)) return;
 	// A snapshot that no longer validates is not diffed against: the whole team is shown instead.
 	const previous = records[0] ? await approvedSnapshot(state, records[0].configHash) : undefined;
 	const info: InfoLine[] = [];
 	const markdown = renderApproval(undefined, previous, config, {
-		...(firstApproval ? { context: AUTO_DISCLOSURE } : {}),
+		context: [...(firstApproval ? [AUTO_DISCLOSURE] : []), targetScopeLine(state.repo.root)].join("\n\n"),
 		warnings: [...warnings, ...modelWarnings(config, ctx)],
 		shadows: state.shadows,
 	}, info);
@@ -763,96 +969,71 @@ async function unapprovedFlow(env: FlowEnv, ui: UiPort, state: OkState): Promise
 		markdown,
 		info,
 	});
+	if (stopIfStale(env, ui)) return;
 	if (choice === MENU.rollback) return rollbackFlow(env, ui, state, rollbacks);
 	if (choice === MENU.setup) return setupFlow(env, ui);
 	if (choice !== APPROVE) {
 		ui.notify("승인하지 않았습니다. Storm 스폰은 계속 막힙니다.");
 		return;
 	}
-	if (movedSince(state, await loadProjectState(env))) {
-		ui.notify("승인하는 사이 팀 설정이나 가림 정의가 바뀌어 승인하지 않았습니다. /storm 으로 다시 확인하세요.", "warning");
+	// The live owner is checked before the captured env is reloaded; the reload alone would still return A.
+	if (stopIfStale(env, ui)) return;
+	if (ownerMoved(state, await loadProjectState(env))) {
+		ui.notify("승인하는 사이 세션·작업 대상·팀 설정이나 가림 정의가 바뀌어 승인하지 않았습니다. /storm 으로 다시 확인하세요.", "warning");
 		return;
 	}
-	// The user's file is approved as it is; Storm does not rewrite it. The auto choice is initialized only after this succeeds.
+	if (stopIfStale(env, ui)) return;
+	// The session's file is approved as it is; Storm does not rewrite it. The auto choice is initialized only after this succeeds.
+	try {
+		await assertSessionStoreSafe(state.sessionDir, state.repo.root);
+	} catch (error) {
+		ui.notify(`승인하지 않았습니다: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		return;
+	}
+	if (stopIfStale(env, ui)) return;
 	await state.store.approve({ configHash: hash, config, scope: { shadowedAgents: state.shadows } });
 	ui.notify(`승인했습니다(${shortHash(hash)}).`);
-	await activateAutoAfterApproval(state, ui, firstApproval);
+	await activateAutoAfterApproval(env, state, ui, firstApproval);
 }
 
 /**
- * The one-time choice for a team approved before the default existed. Both actions use the exclusive initialize so a
- * choice saved from another process wins; only the exact labels write, and only the switch rechecks the team.
- */
-async function migrateAutoDelegation(env: FlowEnv, ui: UiPort, before: OkState, choice: string): Promise<void> {
-	if (choice === AUTO_MIGRATION.switch) {
-		const fresh = await loadProjectState(env);
-		// The same repo, config hash and approval (shadows included): nothing moved while the menu was open.
-		if (
-			fresh.repo.root !== before.repo.root ||
-			fresh.config.status !== "ok" ||
-			fresh.config.hash !== before.config.hash ||
-			!isApproved(fresh) ||
-			movedSince(before, fresh)
-		) {
-			ui.notify("선택하는 사이 팀 설정이나 승인이 바뀌어 자동 위임으로 전환하지 않았습니다. /storm 으로 다시 확인하세요.", "warning");
-			return;
-		}
-		try {
-			if (await initializeAutoDelegation(fresh.store.dir, true)) {
-				ui.notify("자동 위임으로 전환했습니다. 끄려면 /storm auto 를 실행하세요.");
-				return;
-			}
-			ui.notify("다른 선택이 이미 저장되어 자동 위임으로 전환하지 않았습니다. /storm auto 에서 확인하세요.", "warning");
-		} catch {
-			ui.notify("자동 위임으로 전환하지 못했습니다. /storm auto 에서 다시 확인하세요.", "warning");
-		}
-		return;
-	}
-	try {
-		if (await initializeAutoDelegation(before.store.dir, false)) ui.notify("직접 작업을 유지합니다. 자동 위임은 꺼진 상태로 저장했습니다.");
-		else ui.notify("다른 선택이 이미 저장되어 바꾸지 않았습니다. /storm auto 에서 확인하세요.", "warning");
-	} catch {
-		ui.notify("자동 위임 선택을 저장하지 못했습니다. /storm auto 에서 다시 확인하세요.", "warning");
-	}
-}
-
-/**
- * Bare `/storm`: sets up a project without a config, shows the errors of an invalid one, asks for approval while
- * something is unapproved, and otherwise opens the menu with the status in view. Returns true when the user reset Storm.
+ * Bare `/storm`: sets up this session without a config, shows the errors of an invalid one, asks for approval while
+ * something is unapproved for the current target, and otherwise opens the menu with the status in view. Returns true
+ * when the user reset this session's Storm data.
  */
 export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	let state = await loadProjectState(env);
+	if (stopIfStale(env, ui)) return false;
 	if (state.config.status === "missing") {
 		await setupFlow(env, ui);
 		return false;
 	}
 	if (state.config.status === "invalid") {
-		await invalidFlow(env, ui, state, state.config.errors, state.config.path);
+		await invalidFlow(env, ui, state, state.config.errors);
 		return false;
 	}
 	if (!isApproved(state)) {
 		await unapprovedFlow(env, ui, state as OkState);
 		return false;
 	}
-	let trials: TrialView[] | undefined = await trialViews(env, state.repo.root, state.config.config, env.now());
+	let trials: TrialView[] | undefined = await trialViews(env, state.sessionDir, state.config.config, env.now());
 	if (await offerTrialDecisions(env, ui, state as OkState, trials)) {
 		// The panel must show the config as it is now.
 		state = await loadProjectState(env);
 		trials = undefined;
 	}
+	// The trial dialog may already have reported a switch; never build or act on its menu afterwards.
+	if (!env.stillOwner()) return false;
 	const [view, rollbacks, resume, autoChoice] = await Promise.all([
 		statusView(env, state, { quota: false, user: true, ...(trials ? { trials } : {}) }),
 		rollbackOptions(state),
-		env.startRun ? findResumeCandidate(state.store.dir, state.repo.root) : undefined,
+		env.startRun ? findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }) : undefined,
 		savedAutoChoice(state),
 	]);
-	/** An approved team from before the default: offer the transition once, beside every normal action. */
-	const migrate = autoChoice === "unset";
 	const options: string[] = [...(resume ? [MENU.resume] : []), MENU.setup, ...(ui.pickModel ? [EDIT_MODELS] : []), MENU.models];
 	// The status view already read this session's agents; do not query the same trusted list again.
 	if (view.agents?.length) options.push(MENU.agents);
 	options.push(autoChoice === "on" ? AUTO_MENU.on : AUTO_MENU.off);
-	if (migrate) options.push(AUTO_MIGRATION.switch, AUTO_MIGRATION.stay);
 	if (rollbacks.length) options.push(MENU.rollback);
 	options.push(MENU.reset, MENU.status, MENU.close);
 	// The trusted candidate from above, not a second lookup, decides whether the state says "resume".
@@ -860,20 +1041,18 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const brief = renderStatusBrief(view, env.now(), info, resume !== undefined);
 	const choice = await ui.select("Storm 메뉴", options, {
 		title: "Storm 현황",
-		markdown: [brief, migrate ? AUTO_MIGRATION_NOTICE : undefined, resume ? resumeRunLine(resume) : undefined, view.storage].filter(Boolean).join("\n\n"),
+		markdown: [brief, resume ? resumeRunLine(resume) : undefined, view.storage, `- ${targetScopeLine(state.repo.root)}`].filter(Boolean).join("\n\n"),
 		...(info.length ? { info } : {}),
-		// Only the switch accepts the migration notice; every normal action and "직접 작업 유지" stay available when it is cut.
-		...(migrate ? { consent: [AUTO_MIGRATION.switch] } : {}),
 	});
+	if (stopIfStale(env, ui)) return false;
 	if (choice === MENU.resume && resume) await startResume(env, ui, resume);
 	else if (choice === MENU.setup) await setupFlow(env, ui);
 	else if (choice === EDIT_MODELS) {
 		// The approved team as it is, never a recommendation: this change only replaces the picked slot.
-		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: EDIT_MODELS, context: "" });
+		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: EDIT_MODELS, context: targetScopeLine(state.repo.root) });
 	} else if (choice === MENU.models) await modelsFlow(env, ui);
 	else if (choice === MENU.agents) await agentsFlow(env, ui);
 	else if (choice === AUTO_MENU.on || choice === AUTO_MENU.off) await autoDelegationFlow(env, ui);
-	else if (migrate && (choice === AUTO_MIGRATION.switch || choice === AUTO_MIGRATION.stay)) await migrateAutoDelegation(env, ui, state as OkState, choice);
 	else if (choice === MENU.rollback) await rollbackFlow(env, ui, state, rollbacks);
 	else if (choice === MENU.reset) return resetFlow(env, ui);
 	else if (choice === MENU.status) await statusFlow(env, ui);
@@ -892,6 +1071,7 @@ async function startResume(env: FlowEnv, ui: UiPort, run: RunRecord & { request:
 	}
 	const start = env.startRun;
 	if (!start) return;
+	if (stopIfStale(env, ui)) return;
 	const started = await start(spec.spec);
 	if (!started.ok) ui.notify(`Storm 실행을 시작하지 못했습니다: ${started.reason}`, "warning");
 }
@@ -902,12 +1082,13 @@ async function startResume(env: FlowEnv, ui: UiPort, run: RunRecord & { request:
  */
 export async function resumeFlow(env: FlowEnv, ui: UiPort, said?: string): Promise<void> {
 	const state = await loadProjectState(env);
-	const resume = await findResumeCandidate(state.store.dir, state.repo.root);
+	const resume = await findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root });
 	if (!resume) {
 		ui.notify("이어 갈 실행이 없습니다.");
 		return;
 	}
 	if (!env.startRun) return;
+	if (stopIfStale(env, ui)) return;
 	await startResume(env, ui, resume, said);
 }
 
@@ -929,54 +1110,50 @@ async function countJson(dir: string): Promise<number> {
 	}
 }
 
-/** Files under `dir` that git tracks; deleting them leaves a change in the work tree. */
-async function trackedFiles(env: FlowEnv, root: string, dir: string): Promise<string[]> {
-	const result = await env.exec("git", ["-C", root, "ls-files", "--", relative(root, dir)]).catch(() => undefined);
-	return result?.code === 0 ? result.stdout.split("\n").filter(Boolean) : [];
+/** Whether a directory exists and holds at least one entry; absence is not an error. */
+async function hasEntries(dir: string): Promise<boolean> {
+	try {
+		return (await readdir(dir)).length > 0;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
 }
-
-/** Other worktrees of this repo; they share its approval records. */
-async function otherWorktrees(env: FlowEnv, root: string): Promise<number> {
-	const result = await env.exec("git", ["-C", root, "worktree", "list", "--porcelain"]).catch(() => undefined);
-	if (result?.code !== 0) return 0;
-	return Math.max(0, result.stdout.split("\n").filter(line => line.startsWith("worktree ")).length - 1);
-}
-
-const RESET_WITH_INDEX = "초기화하고 실행 요약 색인도 지우기";
 
 /**
- * `/storm reset`: deletes the project's `.omp/storm/` and this repo's approvals in one go, after one exact "초기화".
- * Two things stay: the run summary index (unless the user picks the exact option that deletes it too) and the list of
- * Storm runs beside the approvals, without which the omp records of earlier runs could never be cleaned up.
- * Refuses while a run is active. Returns true when something was deleted.
+ * `/storm reset`: deletes only this native session's Storm store below the profile, after one exact "초기화". It
+ * never reads, edits or removes the target's `.omp/storm/`, another session's store, the OMP transcript, project
+ * files or omp settings; the session-owned config, approvals, run history, trials, quota marks, resume marker and
+ * automatic-delegation choice all go together. Refuses while this session has an active run and holds the session
+ * lease across the deletion so a run cannot start under it. Returns true when something was deleted.
  */
 export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	const state = await loadProjectState(env);
-	/** Fast check inside this process; the worktree lease below closes the cross-process race. */
+	const expected = sessionStoreDir(env.agentDir, env.sessionId);
+	if (state.sessionDir !== expected) {
+		ui.notify("이 세션의 Storm 저장 위치를 확인하지 못해 초기화하지 않았습니다.", "warning");
+		return false;
+	}
+	if (stopIfStale(env, ui)) return false;
+	/** Fast check inside this process; the session lease below closes the cross-process race. */
 	const blockedByRun = (): boolean => {
-		const running = env.activeRun?.() ?? activeLedgerRun(state.repo.root);
+		const running = env.activeRun?.();
 		if (running) ui.notify(`Storm 실행(${running.runId})이 진행 중이라 초기화하지 않습니다. 실행이 끝난 뒤 다시 하세요.`, "warning");
 		return running !== undefined;
 	};
 	if (blockedByRun()) return false;
-	const root = state.repo.root;
-	const local = dirname(configPath(root));
-	const [hasLocal, hasPointer, approvals, autoChoice] = await Promise.all([
-		pathExists(local),
-		pathExists(resumePointerFile(state.store.dir, root)),
-		state.store.list(),
-		savedAutoChoice(state),
-	]);
-	if (!hasLocal && !hasPointer && approvals.length === 0) {
-		ui.notify("초기화할 Storm 팀 설정이나 기록이 없습니다.");
+	const sessionDir = state.sessionDir;
+	if (!(await hasEntries(sessionDir))) {
+		ui.notify("초기화할 Storm 세션 데이터가 없습니다.");
 		return false;
 	}
-	const git = state.repo.kind === "git-common-dir";
-	const [runs, tracked, worktrees, index] = await Promise.all([
-		countJson(runsDir(root)),
-		hasLocal && git ? trackedFiles(env, root, local) : Promise.resolve([]),
-		approvals.length && git ? otherWorktrees(env, root) : Promise.resolve(0),
-		readRunIndex(root),
+	const [hasConfig, approvals, autoChoice, runs, index] = await Promise.all([
+		pathExists(configPath(sessionDir)),
+		state.store.list(),
+		savedAutoChoice(state),
+		countJson(runsDir(sessionDir)),
+		// A damaged index must not block removing the session it belongs to; the whole store goes anyway.
+		readRunIndex(sessionDir).catch(() => []),
 	]);
 	const c = state.config;
 	const configLine =
@@ -985,63 +1162,58 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 			: c.status === "invalid"
 				? "팀 설정(오류)"
 				: "팀 설정 없음";
-	const lines = ["### 지울 것"];
-	if (hasLocal) lines.push(`- \`${relative(root, local)}/\`: ${configLine}, 실행 기록 ${runs}개, 시험 사용 카운터, 쿼터 소진 표시`);
-	if (approvals.length) lines.push(`- 승인 기록 ${approvals.length}건과 승인한 팀 설정 사본: \`${state.store.dir}\``);
-	if (tracked.length) {
-		lines.push(`- 주의: git에 커밋된 파일 ${tracked.length}개(${tracked.join(", ")})는 지우면 변경 사항으로 남습니다. 커밋은 직접 하세요.`);
-	}
-	if (worktrees > 0) lines.push(`- 주의: 이 저장소의 다른 worktree ${worktrees}개도 이 승인 기록을 씁니다. 그쪽 팀 설정은 다시 승인해야 합니다.`);
+	const lines = ["### 지울 것 (이 OMP 세션만)"];
+	if (hasConfig) lines.push(`- ${configLine}`);
+	if (approvals.length) lines.push(`- 이 대상의 승인 기록 ${approvals.length}건과 승인한 팀 설정 사본`);
+	if (runs) lines.push(`- 실행 기록 ${runs}개`);
+	if (index.length) lines.push(`- 실행 요약 색인 ${index.length}줄`);
+	lines.push("- 시험 사용 카운터, 쿼터 소진 표시, 이어 가기 표시");
+	if (autoChoice !== "unset") lines.push("- 자동 위임 선택");
 	lines.push(
 		"",
 		"### 그대로 두는 것",
-		"- `.omp/`의 다른 파일, omp 설정",
-		"- Storm 실행 목록(`runs.jsonl`): 어떤 omp 기록이 Storm 실행의 것인지 아는 유일한 근거라, 지우면 지난 실행의 서브에이전트 기록을 정리할 수 없습니다.",
+		"- 같은 프로필의 다른 OMP 세션 Storm 데이터",
+		"- 이 작업 트리의 예전 `.omp/storm/` 파일(읽지도 지우지도 않습니다)",
+		"- OMP 대화 기록과 프로젝트 파일, omp 설정과 API 키",
+		"",
+		`대상: ${visible(state.repo.root)}`,
 	);
-	if (index.length) lines.push(`- 실행 요약 색인 ${index.length}줄: 기본으로 남깁니다. 지우려면 "${RESET_WITH_INDEX}"를 고르세요.`);
-	if (autoChoice === "on") lines.push("- 자동 위임 선택(켜짐): 지우지 않습니다. 팀 설정이 없어도 `/storm auto` 로 끌 수 있습니다.");
-	const choice = await ui.select(
-		"Storm 팀 설정과 기록을 모두 지울까요? 되돌릴 수 없습니다.",
-		index.length ? ["초기화", RESET_WITH_INDEX, CANCEL] : ["초기화", CANCEL],
-		{ title: "Storm 초기화", markdown: lines.join("\n"), consent: ["초기화", RESET_WITH_INDEX] },
-	);
-	if (choice !== "초기화" && !(index.length && choice === RESET_WITH_INDEX)) {
+	const choice = await ui.select("이 Storm 세션의 팀 설정과 기록을 지울까요? 되돌릴 수 없습니다.", ["초기화", CANCEL], {
+		title: "Storm 초기화",
+		markdown: lines.join("\n"),
+		consent: ["초기화"],
+	});
+	if (stopIfStale(env, ui)) return false;
+	if (choice !== "초기화") {
 		ui.notify("초기화하지 않았습니다.");
 		return false;
 	}
-	// Use the same lease as run admission so a second OMP process cannot start while reset removes its state.
 	if (blockedByRun()) return false;
-	const ownership = await acquireRunLease(root, "reset");
+	// One owner per profile+session: no sibling session and no new run can be attributed to what is being removed.
+	const ownership = await acquireSessionLease({ sessionDir, sessionId: env.sessionId, runId: "reset" });
 	if (!ownership.ok) {
 		ui.notify(`Storm 초기화를 하지 않았습니다: ${ownership.reason}`, "warning");
 		return false;
 	}
 	try {
+		// The dialog's owner and the lease are both held: a switch from here must not delete the warmed store.
+		if (stopIfStale(env, ui)) return false;
 		const fresh = await loadProjectState(env);
-		if (movedSince(state, fresh)) {
+		if (stopIfStale(env, ui)) return false;
+		if (ownerMoved(state, fresh)) {
 			ui.notify(MOVED, "warning");
 			return false;
 		}
-		const keptIndex = index.length && choice === "초기화" ? await readFile(runIndexFile(root), "utf8").catch(() => undefined) : undefined;
-		await rm(local, { recursive: true, force: true });
-		if (keptIndex !== undefined) {
-			// Keep state out of Git when recreating the directory for its retained index.
-			await mkdir(dirname(runIndexFile(root)), { recursive: true });
-			await writeFile(join(local, ".gitignore"), "/state/\n");
-			await writeFile(runIndexFile(root), keptIndex);
+		try {
+			await assertSessionStoreSafe(sessionDir, fresh.repo.root);
+		} catch (error) {
+			ui.notify(`Storm 초기화를 하지 않았습니다: ${error instanceof Error ? error.message : String(error)}`, "warning");
+			return false;
 		}
-		// The trust collection and team are removed; deliberate personal consent is not silently changed.
-		await rm(resumePointerFile(state.store.dir, root), { force: true });
-		const removed = await state.store.clear();
-		ui.notify(
-			[
-				`Storm 팀 설정과 기록을 지웠습니다(승인 ${removed}건 포함). 다시 쓰려면 /storm 으로 팀을 설정하세요.`,
-				tracked.length ? "git에서 지워진 파일은 직접 커밋하세요." : "",
-				keptIndex !== undefined ? "실행 요약 색인은 남겼습니다." : "",
-			]
-				.filter(Boolean)
-				.join(" "),
-		);
+		// Recheck after the awaited guard, immediately before the only destructive call.
+		if (stopIfStale(env, ui)) return false;
+		await rm(sessionDir, { recursive: true, force: true });
+		ui.notify("이 OMP 세션의 Storm 팀 설정과 기록을 지웠습니다. 다른 세션과 이 작업 트리의 예전 `.omp/storm/` 파일은 그대로입니다. 다시 쓰려면 /storm 으로 팀을 설정하세요.");
 		return true;
 	} finally {
 		await ownership.lease.release();

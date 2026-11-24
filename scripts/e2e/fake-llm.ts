@@ -24,6 +24,15 @@
  *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
+ *   E2E-CHILD-YIELD {json}  yield that exact value as `data` when the child has an output schema (a strict schema
+ *                           violation then fails the run in the host, not in the text)
+ *   E2E-CHILD-YIELD-ERROR <text>
+ *                           yield that failure reason instead of data
+ *   E2E-CHILD-CLAIM <text>  final assistant text (the whole result without a schema; ignored by a yielding run)
+ *   E2E-CHILD-BIG <chars>    final assistant text with that many varied characters, for spill/limit probes
+ *   E2E-CHILD-429-ONCE <key>
+ *                           fail this child's first provider request with a retryable 429, once per key, so a retry
+ *                           can be watched without duplicating its native job/result
  *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
  *                           observed deterministically while the child really runs
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
@@ -60,13 +69,27 @@ interface Message {
 	content?: unknown;
 	tool_calls?: ToolCall[];
 }
+/** One item of a scripted task batch: the exact name and assignment a probe needs, not a generated `W<n>`. */
+export interface ScriptedTask {
+	name?: string;
+	agent: string;
+	task?: string;
+	/** Appended to this item's assignment, e.g. an E2E-CHILD directive. */
+	say?: string;
+	solutionSpace?: string;
+	isolated?: boolean;
+	outputSchema?: unknown;
+	schemaMode?: "permissive" | "strict";
+}
+
 /**
  * One step of a scripted main turn: a storm tool call, a task batch (`as` prefixes the children's names, `say` is
- * appended to each assignment, e.g. an E2E-CHILD directive), a file write, a shell command, a follow-up to a
- * subagent, a read, a native `ask` form (`ask` is one HTML `<form>`), or `awaitChild`: a text reply (it ends the
- * turn, so it belongs last) held until a child of the last task call has made its first request, so the turn ends
- * with that child known to be running. `isolated[i]` marks task item i `isolated: true`; the host's native task
- * isolation places that child, and only probes that deliberately bypass Storm use it.
+ * appended to each assignment, e.g. an E2E-CHILD directive; `tasks` gives every item its own name and assignment),
+ * a file write, a shell command, a follow-up to a subagent, a read, a native `ask` form (`ask` is one HTML `<form>`),
+ * or `awaitChild`: a text reply (it ends the turn, so it belongs last) held until a child of the last task call has
+ * made its first request, so the turn ends with that child known to be running. `isolated[i]` marks task item i
+ * `isolated: true`; the host's native task isolation places that child, and only probes that deliberately bypass
+ * Storm use it.
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
@@ -74,9 +97,10 @@ interface Message {
 export type Step = (
 	| { storm: Record<string, unknown> }
 	| { task: string[]; as?: string; say?: string; isolated?: boolean[] }
+	| { tasks: ScriptedTask[]; context?: string }
 	| { edit: string }
 	| { bash: string }
-	| { followUp: string }
+	| { followUp: string; content?: string }
 	| { read: string }
 	| { ask: string }
 	| { wait: true }
@@ -161,6 +185,8 @@ const HOLD_MAX_MS = 60_000;
 const seen = { children: 0, childrenAtTask: 0, compactions: 0 };
 /** Keys whose one-time hold is spent: a resumed request must not hold again or it could never finish. */
 const heldOnce = new Set<string>();
+/** Keys whose one-time retryable 429 is spent. */
+const failedOnce = new Set<string>();
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -226,6 +252,18 @@ function payload(text: string, marker: string): unknown {
 	return undefined;
 }
 
+/** The last instead of the first directive: a follow-up message overrides the assignment that started the child. */
+function lastPayload(text: string, marker: string): unknown {
+	const at = text.lastIndexOf(marker);
+	return at < 0 ? undefined : payload(text.slice(at), marker);
+}
+
+/** Last capture of a scalar directive; see {@link lastPayload}. */
+function lastCapture(text: string, pattern: RegExp): string | undefined {
+	const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+	return [...text.matchAll(new RegExp(pattern.source, flags))].at(-1)?.[1];
+}
+
 function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say?: string, isolated?: boolean[]): Decision {
 	const item = (agent: string, index: number) => ({
 		name: `${prefix}${index}`,
@@ -237,6 +275,26 @@ function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say
 	const batch = Boolean(schemaOf(tools, "task")?.properties?.tasks);
 	const args = batch ? { context: "OMP Storm E2E", tasks: agents.map(item) } : item(agents[0] ?? "task", 0);
 	return { kind: "tool", name: "task", args };
+}
+
+/** A batch whose items carry their own names and assignments; the child marker keeps `classify` treating them as children. */
+function taskItemsCall(tools: Tool[] | undefined, items: ScriptedTask[], context: string): Decision {
+	const batch = Boolean(schemaOf(tools, "task")?.properties?.tasks);
+	const item = (script: ScriptedTask, index: number) => {
+		const task = `${script.task ?? "Reply with OK"} (${CHILD_MARK} ${index})${script.say ? ` ${script.say}` : ""}`;
+		return {
+			name: script.name ?? `W${index}`,
+			agent: script.agent,
+			task,
+			solutionSpace: script.solutionSpace ?? "e2e: fixed reply",
+			...(script.isolated === true ? { isolated: true } : {}),
+			...(script.outputSchema !== undefined ? { outputSchema: script.outputSchema } : {}),
+			...(script.schemaMode !== undefined ? { schemaMode: script.schemaMode } : {}),
+		};
+	};
+	if (batch) return { kind: "tool", name: "task", args: { context, tasks: items.map(item) } };
+	const single = items[0];
+	return { kind: "tool", name: "task", args: single ? item(single, 0) : { name: "W0", agent: "task", task: "Reply with OK (e2e child 0)", solutionSpace: "e2e: fixed reply" } };
 }
 
 function readCall(tools: Tool[] | undefined, path: string): Decision {
@@ -324,10 +382,11 @@ async function hold(open: () => boolean): Promise<void> {
 function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("storm" in step) return extensionCall(tools, "storm", step.storm);
 	if ("task" in step) return taskCall(tools, step.task, step.as, step.say, step.isolated);
+	if ("tasks" in step) return taskItemsCall(tools, step.tasks, step.context ?? "OMP Storm E2E");
 	if ("read" in step) return readCall(tools, step.read);
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
 	if ("bash" in step) return bashCall(tools, step.bash);
-	if ("followUp" in step) return writeCall(step.followUp, "follow-up");
+	if ("followUp" in step) return writeCall(step.followUp, step.content ?? "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
 	if ("wait" in step) return extensionCall(tools, "wait", {});
 	return { kind: "text", text: "waiting", awaitChild: true };
@@ -361,23 +420,42 @@ function scriptedSteps(messages: Message[], tools: Tool[] | undefined): Decision
 function childDecision(request: ChatRequest): Decision {
 	const messages = request.messages;
 	const text = userText(messages);
-	const reads = (/E2E-CHILD-READ[ \t]+(\S+)/.exec(text)?.[1] ?? "").split(",").filter(Boolean);
-	const write = /E2E-CHILD-WRITE[ \t]+(\S+)/.exec(text)?.[1];
-	const bash = /E2E-CHILD-BASH[ \t]+(\S+)/.exec(text)?.[1];
-	const sh = /E2E-CHILD-SH[ \t]+(\S+)/.exec(text)?.[1];
-	const commit = /E2E-CHILD-COMMIT[ \t]+(\S+)/.exec(text)?.[1];
-	const correct = /E2E-CHILD-VERDICT[ \t]+correct\b/.test(text);
+	const reads = (lastCapture(text, /E2E-CHILD-READ[ \t]+(\S+)/) ?? "").split(",").filter(Boolean);
+	const write = lastCapture(text, /E2E-CHILD-WRITE[ \t]+(\S+)/);
+	const bash = lastCapture(text, /E2E-CHILD-BASH[ \t]+(\S+)/);
+	const sh = lastCapture(text, /E2E-CHILD-SH[ \t]+(\S+)/);
+	const commit = lastCapture(text, /E2E-CHILD-COMMIT[ \t]+(\S+)/);
+	const correct = lastCapture(text, /E2E-CHILD-VERDICT[ \t]+(correct)\b/) === "correct";
+	const report = lastPayload(text, "E2E-CHILD-YIELD");
+	const yieldError = lastCapture(text, /E2E-CHILD-YIELD-ERROR[ \t]+([^\n]+)/);
+	const claim = lastCapture(text, /E2E-CHILD-CLAIM[ \t]+([^\n]+)/);
+	const big = Number(lastCapture(text, /E2E-CHILD-BIG[ \t]+(\d+)/) ?? 0);
 	const calls = callNames(messages);
 	const done = calls.filter(name => name === "read").length;
 	const last = messages.at(-1);
-	if (last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: "done" };
+	// An explicit report repeats until the host accepts or gives up; a rejected yield must not turn into text.
+	if (report === undefined && yieldError === undefined && last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: claim ?? "done" };
 	if (done < reads.length) return readCall(request.tools, reads[done] ?? "");
 	if (commit !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${commit} && git commit -qam storm-e2e-commit`);
 	if (sh !== undefined && !calls.includes("bash")) return bashCall(request.tools, Buffer.from(sh, "base64").toString("utf8"));
 	if (bash !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${bash}`);
 	if (write !== undefined && !calls.includes("write")) return writeCall(write, "storm child change\n");
 	const yieldSchema = schemaOf(request.tools, "yield");
-	return yieldSchema ? yieldCall(yieldSchema, correct) : { kind: "text", text: "OK" };
+	if (yieldSchema) {
+		if (yieldError !== undefined) return { kind: "tool", name: "yield", args: { error: yieldError } };
+		if (report !== undefined) return { kind: "tool", name: "yield", args: { data: report } };
+	}
+	if (yieldSchema) return yieldCall(yieldSchema, correct);
+	if (big > 0) {
+		const lines: string[] = [];
+		for (let at = 0, index = 0; at < big; index++) {
+			const line = `E2E child line ${String(index).padStart(6, "0")} ${"x".repeat(index % 23)}`;
+			lines.push(line);
+			at += line.length + 1;
+		}
+		return { kind: "text", text: lines.join("\n").slice(0, big) };
+	}
+	return { kind: "text", text: claim ?? "OK" };
 }
 
 function decide(request: ChatRequest, who: Who): Decision {
@@ -508,6 +586,14 @@ Bun.serve({
 			record(request, who, { kind: "text", text: "429 insufficient_quota" });
 			const error = { message: "You exceeded your current quota, please check your plan and billing details.", type: "insufficient_quota", code: "insufficient_quota" };
 			return Response.json({ error }, { status: 429, headers: { "x-should-retry": "false" } });
+		}
+		// A child's first request fails retryably once, so a retry can be watched on the same native job.
+		const retryKey = who === "child" ? /E2E-CHILD-429-ONCE[ \t]+(\S+)/.exec(userText(request.messages))?.[1] : undefined;
+		if (retryKey !== undefined && !failedOnce.has(retryKey) && !request.messages.some(message => message.role === "assistant")) {
+			failedOnce.add(retryKey);
+			record(request, who, { kind: "text", text: "429 retry once" });
+			const error = { message: "Temporary rate limit.", type: "rate_limit_error", code: "rate_limit" };
+			return Response.json({ error }, { status: 429, headers: { "x-should-retry": "true", "retry-after-ms": "1" } });
 		}
 		const compactionsBefore = seen.compactions;
 		if (who === "child") seen.children++;

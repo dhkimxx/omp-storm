@@ -16,20 +16,26 @@ import { formatUsd, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts
 import { tokens } from "../report/agents.ts";
 import { directorCap, PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
+import { assertSessionStoreSafe } from "../session-scope.ts";
 import type { RunRequestResult } from "../tool/host.ts";
 import type {
 	AgentEntry,
+	PlanLaneResult,
+	ResultInputVersion,
 	RunCheckpoint,
 	RunCheckEvidence,
 	RunEndReason,
 	RunPlan,
 	RunRecord,
+	RunResult,
 	RunSpec,
 	SpawnBlockCode,
 	SpawnRecord,
 	StormConfig,
 	UiPort,
 } from "../types.ts";
+import { attemptUsable, type AttemptReport } from "./attempt-report.ts";
+import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, AttemptSettlement } from "./attempt-bridge.ts";
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
@@ -45,7 +51,8 @@ import {
 	resetCloseoutChoices,
 } from "./closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
-import { replanConflict, RunLanes } from "./lanes.ts";
+import { laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { hasStaleInputs, inputSnapshot, requirementConflict, staleRequirementIds, currentInputVersion } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
@@ -55,20 +62,25 @@ import {
 	END_STATUS,
 	endLabel,
 	HOLD_MS,
+	lastWriterChangeAt,
 	maxRounds,
 	reviewGate,
+	reviewProof,
 	ROUND_DELAY_MS,
 	STATUS_LABEL,
 	treeFingerprint,
 	type CoverageCheck,
 	type CoverageInput,
 	type CoverageLane,
+	type CoverageResult,
 	type Gate,
 	type RoundDecision,
 } from "./rounds.ts";
+import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
+import { locateResult, projectAcceptedResult } from "./result-location.ts";
 import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, RUN_KEEP, writeRun } from "./run.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
-import { noteResumePointer, protectedResumeRunIds } from "./resume.ts";
+import { noteResumePointer, protectedResumeRunIds, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
@@ -95,6 +107,12 @@ const LIVE_FLUSH_MS = 2_000;
 const DRAIN_POLL_MS = 1_000;
 /** How long a stopping run keeps its scope, lease and accounting while owned work settles. */
 const DRAIN_MAX_MS = 30_000;
+/**
+ * How long a consumer's admission may wait for an already-started settlement of its prerequisite. A native delivery
+ * often lands just before the next tool call: without this barrier the consumer would read the previous pending row
+ * and be refused for a result that is being written in the same tick.
+ */
+const ADMISSION_SETTLE_WAIT_MS = 1_000;
 
 /** Asks the owning session to rewrite the run's record soon (spawns, spend) and to re-check its live phase at once. */
 export function touchRun(runId: string): void {
@@ -185,25 +203,127 @@ function artifactsOf(ctx: ExtensionContext): { artifactsDir?: string } {
 	return typeof dir === "string" && dir !== "" ? { artifactsDir: dir } : {};
 }
 
+/** One prepared dispatch: the lane contract snapshot and its pre-attempt baseline, keyed by the bridge handle. */
+interface PreparedAttempt {
+	lane: string;
+	spawnKey: string;
+	parentId: string;
+	dispatch: string;
+	startedAt: number;
+	/** Monotonic per-run attempt order; a newer attempt for the same lane supersedes an older settlement. */
+	epoch: number;
+	/** Fingerprint of the lane route this attempt ran under; a same-route respawn needs a new plan route. */
+	route: string;
+	artifactMode: AttemptArtifactMode;
+	results: readonly PlanLaneResult[];
+	laneFiles?: readonly string[];
+	/** Producer result versions this attempt started from; absent when the lane declared no prerequisites. */
+	consumed?: readonly ResultInputVersion[];
+	/** Captured immediately before the attempt; absent for a legacy lane with no declared results. */
+	baseline?: ResultBaseline;
+}
+
+/** The last settled attempt of a lane, kept bounded for a later re-evaluation whose check evidence was not ready yet. */
+interface SettledAttempt {
+	prepared: PreparedAttempt;
+	attemptId: string;
+	reportText?: string;
+	citations: readonly AnswerCitation[];
+	artifact?: ArtifactEvidenceSource;
+	/** The lane declared a check and no approved report existed at settlement; one re-evaluation is owed. */
+	checkDeferred?: boolean;
+}
+
+/** One result reason is one compact record and closeout line: no newlines, no unbounded model or host text. */
+function compactResultReason(text: string): string {
+	const line = text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, " ").replace(/\s+/gu, " ").trim();
+	return line.slice(0, 100);
+}
+
+/**
+ * Whether acting on this plan can change the target or run commands there. A safe reader stays a reader; every other
+ * lane kind, declared file or non-answer result must hold the worktree write claim before the plan is bound.
+ */
+function planNeedsWrite(plan: RunPlan): boolean {
+	return plan.lanes.some(
+		lane =>
+			(lane.kind !== "explore" && lane.kind !== "review") ||
+			(lane.files?.length ?? 0) > 0 ||
+			(lane.results ?? []).some(result => result.kind !== "answer"),
+	);
+}
+
+/** The bounded contract a run row keeps after its lane leaves: only fields that identify what must still be shown. */
+function persistedResultContract(result: PlanLaneResult): PlanLaneResult {
+	return {
+		id: result.id,
+		kind: result.kind,
+		criterion: result.criterion,
+		...(result.path === undefined ? {} : { path: result.path }),
+		...(result.contains === undefined ? {} : { contains: result.contains }),
+		...(result.check === undefined ? {} : { check: result.check }),
+	};
+}
+/** A requirement whose lane left the plan is still owed: only an explicit scope change or acceptance clears it. */
+const ORPHAN_RESULT_REASON = "계획에서 빠진 필수 결과입니다. 다시 배정하거나 사용자가 범위를 바꿔야 합니다.";
+const RESULT_FALLBACK_REASON: Record<"unmet" | "reviewable", string> = {
+	unmet: "요구 결과가 충족되지 않았습니다.",
+	reviewable: "제출물이 있어 자연어 판단이 필요합니다.",
+};
+/** A host attempt reference is a short token, never a path or model text; an unsafe one is omitted. */
+const ATTEMPT_REF = /^[A-Za-z0-9:._-]{1,64}$/u;
+/** Structured spawn refusals the user must resolve in team setup; capacity and plan errors are not included. */
+const CONFIG_REFUSAL_CODES: Readonly<Partial<Record<SpawnBlockCode, true>>> = {
+	"no-config": true,
+	unapproved: true,
+	shadow: true,
+};
+
+/** A config refusal reason is one bounded row line; a host path is not carried into the run record. */
+function configRefusalReason(text: string): string {
+	const redacted = text.replace(/(^|[\s("'=])(?:~\/[^\s)"']*|[A-Za-z]:[\\/][^\s)"']*|\/(?:[^\s/)"']+\/)[^\s)"']*)/gu, "$1<path>");
+	return compactResultReason(redacted);
+}
+
 /** The unverified gate a round message is built from, as `decideRound` hands it over. */
 type RoundGate = Extract<RoundDecision, { action: "continue" }>["gate"];
 
+/** One accepted row's usable location: a retained isolated artifact, the current parent, or an answer's own proof. */
+type AcceptedLocation =
+	| { ok: true; integrated: boolean; retained?: LaneResultReadiness["retained"] }
+	| { ok: false; reason: string };
+
 interface OwnRun {
 	record: RunRecord;
+	/** The actual target worktree: tree snapshots, checks, evidence and reviewer proofs read here. */
 	root: string;
 	repoId: string;
+	/** This native session's Storm store, captured at admission: every persistence write of this run goes here. */
+	sessionDir: string;
 	/** The session that directs the run: live record writes happen without a ctx of their own. */
 	ctx: ExtensionContext;
 	/** Snapshot at admission: the host may mutate the session manager when it switches conversations. */
-	readonly sessionId: string | undefined;
+	readonly sessionId: string;
 	/** The approved config the run started under. */
 	config: StormConfig;
-	/** Approval records of the repo: the run-end janitor keeps them within their limits. */
+	/** Approval records of this session's target: the run-end janitor keeps them within their limits. */
 	store: ApprovalStore;
 	/** The worktree execution slot, held through drain and released only at finalization. */
 	lease?: RunLease;
 	/** One lane matcher for this run; retained across replans so reservations do not collide. */
 	lanes: RunLanes;
+	/** Prepared dispatches by bridge handle; a settlement consumes exactly its own entry. */
+	attempts: Map<string, PreparedAttempt>;
+	/** Monotonic attempt order; a newer attempt of a lane fences every older settlement. */
+	attemptSerial: number;
+	/** Latest prepared attempt epoch per lane, so a late success/failure cannot overwrite newer evidence. */
+	laneAttempt: Map<string, number>;
+	/** The latest settled attempt per lane, for a bounded re-evaluation once approved check evidence exists. */
+	settled: Map<string, SettledAttempt>;
+	/** Accepted S1 evidence by result id, with its host-bound retained source; the location check needs these facts. */
+	evidence: Map<string, { item: ResultEvidenceItem; artifact?: ArtifactEvidenceSource }>;
+	/** Lanes whose settlement is being evaluated now; a consumer admission waits for these before reading rows. */
+	settling: Set<string>;
 	/** Aborts checks and other bounded work as soon as the run starts stopping. */
 	abort: AbortController;
 	/** Required-check reports by tree fingerprint; "skipped" means the tree was decided ineligible. */
@@ -248,7 +368,7 @@ interface OwnRun {
 	/** When Storm first sent a round for a tree-only stale review: a verdict after it is not stale because of the tree. */
 	rereviewedAt?: number;
 	/** The team's activity when Storm sent its last round message: what the next round is expected to move. */
-	progress?: { changes: number; reviews: number; requests: number };
+	progress?: { changes: number; reviews: number; requests: number; result?: string };
 	/** The pending look timer: the round delay, or the wait while the session is held. */
 	hold?: unknown;
 	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
@@ -287,20 +407,23 @@ export interface RunControllerDeps {
 	ui(ctx: ExtensionContext): UiPort;
 	loadState(ctx: ExtensionContext): Promise<ProjectState>;
 	now(): number;
-	/** Subagents whose latest turn was during the run, from the agent ledger. */
-	agents?(runId: string): AgentEntry[];
+	/** Subagents whose latest turn was during the run, from the agent ledger, scoped to this session's store. */
+	agents?(runId: string, sessionDir: string): AgentEntry[];
 	/** The work tree's state against `base` (HEAD when absent); absent in hosts and tests that have no git. */
 	tree?(root: string, base?: string): Promise<TreeReading | undefined>;
-	/** Every subagent this process has seen (any run): the janitor only cleans those omp has parked. */
-	ledger?(): AgentEntry[];
+	/** Every subagent this process has seen in this session (any run): the janitor only cleans those omp has parked. */
+	ledger?(sessionDir: string): AgentEntry[];
 	/** omp's agent dir: the janitor deletes omp records only below its `sessions/`. Absent → no omp record cleanup. */
 	agentDir?: string;
 	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
 	flushMs?: number;
 	/** The look timer's clock; real timers when absent. */
 	timers?: RunTimers;
-	/** Acquires the per-worktree execution lease; the real hard-link lease when absent. */
-	lease?(root: string, runId: string): Promise<AcquireRunLeaseResult>;
+	/** Acquires the session's execution lease; the real hard-link lease when absent. */
+	lease?(
+		input: Parameters<typeof acquireRunLease>[0],
+		deps?: Parameters<typeof acquireRunLease>[1],
+	): Promise<AcquireRunLeaseResult>;
 	/**
 	 * The live status record: the run after it was first written, on every live rewrite and when a round is sent;
 	 * `undefined` when the run ends. A failing hook never breaks the run.
@@ -322,6 +445,41 @@ export class RunController {
 	#finishing: Promise<RunRecord | undefined> | undefined;
 
 	constructor(private readonly deps: RunControllerDeps) {}
+
+	/** Wake one consumer admission when a prerequisite's settlement finishes or times out. */
+	readonly #settleWaiters = new Set<() => void>();
+
+	#wakeSettlementWaiters(): void {
+		const waiters = [...this.#settleWaiters];
+		this.#settleWaiters.clear();
+		for (const wake of waiters) wake();
+	}
+
+	/** Wait, bounded, while a prerequisite has an attempt in flight or its result row is being written. */
+	async #awaitSettlements(own: OwnRun, lanes: ReadonlySet<string>, ms: number): Promise<void> {
+		if (lanes.size === 0) return;
+		const deadline = Date.now() + ms;
+		while (this.#hasOpenSettlement(own, lanes)) {
+			const left = deadline - Date.now();
+			if (left <= 0) return;
+			const { promise, resolve } = Promise.withResolvers<void>();
+			let timer: ReturnType<typeof setTimeout>;
+			const wake = () => {
+				clearTimeout(timer);
+				this.#settleWaiters.delete(wake);
+				resolve();
+			};
+			timer = setTimeout(wake, left);
+			this.#settleWaiters.add(wake);
+			await promise;
+		}
+	}
+
+	#hasOpenSettlement(own: OwnRun, lanes: ReadonlySet<string>): boolean {
+		for (const prepared of own.attempts.values()) if (lanes.has(prepared.lane)) return true;
+		for (const lane of own.settling) if (lanes.has(lane)) return true;
+		return false;
+	}
 
 	/** Why no run can be queued or started now: one run per session, running, queued or starting. */
 	refusal(): string | undefined {
@@ -348,7 +506,7 @@ export class RunController {
 		const own = this.#own;
 		if (!own) return undefined;
 		const live = getLedgerRun(own.record.runId);
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const record: RunRecord = {
 			...own.record,
 			costUsd: live?.costUsd ?? own.record.costUsd,
@@ -442,39 +600,59 @@ export class RunController {
 		}
 		const shadow = shadowBlock(state);
 		if (shadow) return refuse(shadow.reason);
+		// The session's own store is the only persistence base; without a host-attested identity there is no safe one.
+		// Never substitute cwd, a run id or a literal "main" for a missing session id.
+		const sessionId = closeoutSessionId(ctx);
+		if (sessionId === undefined) return refuse("세션 ID를 확인하지 못해 Storm 실행을 시작하지 않았습니다.");
+		if (state.sessionDir === "") return refuse("세션 저장소를 확인하지 못해 Storm 실행을 시작하지 않았습니다.");
+		const sessionDir = state.sessionDir;
 		const root = state.repo.root;
-		const busy = refuse("이 작업 트리에서 다른 Storm 실행이 진행 중입니다.");
-		if (activeLedgerRun(root)) return busy;
+		const target: ResumeTarget = { repoId: state.repo.repoId, root };
+		const busy = refuse("이 세션에서 다른 Storm 실행이 진행 중입니다.");
+		if (activeLedgerRun(sessionDir)) return busy;
+		// The host may mutate its session manager in place instead of emitting a switch: every await below must also
+		// prove that the context still names this same native session.
+		const stale = (): boolean => this.#generation !== generation || closeoutSessionId(ctx) !== sessionId;
 		const ui = this.deps.ui(ctx);
 		const ready = await this.#ready(ctx, ui, !auto);
-		if (this.#generation !== generation) return gone();
+		if (stale()) return gone();
 		if (!ready.ok) return ready;
 		if (!auto) await this.#compactFirst(ctx, ui);
-		if (this.#generation !== generation) return gone();
-		// The dialog and the compaction awaited: another session's run may have started meanwhile.
-		if (activeLedgerRun(root)) return busy;
+		if (stale()) return gone();
+		// The dialog and the compaction awaited: a run of this session may have started meanwhile.
+		if (activeLedgerRun(sessionDir)) return busy;
 
-		// The last step before the baseline snapshot: hold the worktree execution slot for the whole run. A failed
-		// acquisition is a refusal, and everything below releases it unless the run takes ownership.
+		// The last step before the baseline snapshot: take this session's slot and a read claim on the target. A safe
+		// reader may run beside another session's reader; a writer of any session conflicts. A failed acquisition is a
+		// refusal, and everything below releases the lease unless the run takes ownership.
 		let acquired: AcquireRunLeaseResult;
 		try {
-			acquired = await (this.deps.lease ?? acquireRunLease)(root, runId);
+			acquired = await (this.deps.lease ?? acquireRunLease)({ sessionDir, sessionId, root, runId, mode: "read" });
 		} catch (error) {
 			return refuse(`실행 잠금을 확인하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 		}
-		if (this.#generation !== generation) {
+		if (stale()) {
 			if (acquired.ok) await this.#releaseLease(acquired.lease, ctx);
 			return gone();
 		}
 		if (!acquired.ok) return refuse(acquired.reason);
 		let lease: RunLease | undefined = acquired.lease;
 		try {
+			// A plan that may change the target must hold the write claim before any handoff or spawn can act on it.
+			if (plan !== undefined && planNeedsWrite(plan)) {
+				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
+				if (stale()) return gone();
+				if (!upgraded.ok) return refuse(upgraded.reason);
+			}
 			const startTree = await this.#treeAt(root);
-			if (this.#generation !== generation) return gone();
-			// A resumed run starts a new record; what it continues is the old record on disk, when that is still readable.
+			if (stale()) return gone();
+			// A resumed run starts a new record; what it continues is an old record of this same session and target.
 			// An automatic probe has no handoff to put it in, so it does not read the old record.
-			const continued = !auto && requested.resumeOf !== undefined ? await readRun(root, requested.resumeOf) : undefined;
-			if (this.#generation !== generation) return gone();
+			const continued = !auto && requested.resumeOf !== undefined ? await readRun(sessionDir, requested.resumeOf) : undefined;
+			if (stale()) return gone();
+			if (continued !== undefined && !(await trustedResume(sessionDir, target, continued))) {
+				return refuse("이 세션과 이 작업 트리에서 시작한 실행만 이어갈 수 있습니다.");
+			}
 			const resume =
 				continued === undefined
 					? undefined
@@ -496,19 +674,19 @@ export class RunController {
 				} catch (error) {
 					return refuse(`팀 설정을 다시 확인하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 				}
-				if (this.#generation !== generation) return gone();
+				if (stale()) return gone();
 				const currentGate = teamGate(current);
 				if (!currentGate.ok) return refuse(currentGate.block.reason);
 				const currentShadow = shadowBlock(current);
 				if (currentShadow) return refuse(currentShadow.reason);
-				if (current.repo.repoId !== state.repo.repoId || current.repo.root !== root) {
-					return refuse("다른 프로젝트의 팀 설정으로 바뀌어 실행을 시작하지 않았습니다.");
+				if (current.repo.repoId !== state.repo.repoId || current.repo.root !== root || current.sessionDir !== sessionDir) {
+					return refuse("다른 프로젝트나 세션의 팀 설정으로 바뀌어 실행을 시작하지 않았습니다.");
 				}
 				if (currentGate.hash !== gate.hash || (configHash !== undefined && currentGate.hash !== configHash)) {
 					return refuse("시작하는 동안 팀 설정이 바뀌어 실행 계획을 다시 확인해야 합니다. 다시 시도하세요.");
 				}
 			}
-			if (activeLedgerRun(root)) return busy;
+			if (activeLedgerRun(sessionDir)) return busy;
 
 			const { config, hash } = gate;
 			const { task } = requested;
@@ -544,11 +722,18 @@ export class RunController {
 				record,
 				root,
 				repoId: state.repo.repoId,
+				sessionDir,
 				ctx,
-				sessionId: closeoutSessionId(ctx),
+				sessionId,
 				config,
 				store: state.store,
 				lanes: new RunLanes(runId),
+				attempts: new Map(),
+				attemptSerial: 0,
+				laneAttempt: new Map(),
+				settled: new Map(),
+				evidence: new Map(),
+				settling: new Set(),
 				abort: new AbortController(),
 				checks: new Map(),
 				// An automatic probe starts inside a turn whose `agent_start` already happened: it is round one, not a run
@@ -575,12 +760,16 @@ export class RunController {
 			own.lease = lease;
 			lease = undefined;
 			this.#own = own;
+			// An automatic plan is bound before its first spawn: seed its requirements into the record now.
+			this.#syncResults(own);
 			// From here a child's start, settle or approval can refresh the phase immediately; finalization removes it.
 			userWaits.delete(runId);
 			phaseWatchers.set(runId, () => this.#emitPhase(own));
 			try {
 				startLedgerRun({
 					runId,
+					sessionId,
+					sessionDir,
 					repoId: own.repoId,
 					root: own.root,
 					...(own.base !== undefined ? { base: own.base } : {}),
@@ -591,17 +780,17 @@ export class RunController {
 				if (plan !== undefined) setLedgerPlan(runId, plan);
 				spawnsByRun.set(runId, []);
 				openRunReads(runId);
-				const startingWrite = writeRun(own.root, record);
+				const startingWrite = writeRun(own.sessionDir, record);
 				// The final record waits for the start write, so a shutdown that lands during admission cannot overwrite it.
 				this.#liveWrite = startingWrite.catch(() => undefined);
 				await startingWrite;
-				if (this.#generation !== generation || this.#own !== own) {
+				if (stale() || this.#own !== own) {
 					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 					return gone();
 				}
-				// Outside the repository, so a record committed or rewritten there is not a run this machine started.
-				await noteResumePointer(state.store.dir, own.root, record).catch(() => undefined);
-				if (this.#generation !== generation || this.#own !== own) {
+				// In this session's own profile store, keyed by its native id and bound to the exact target.
+				await noteResumePointer(own.sessionDir, target, record).catch(() => undefined);
+				if (stale() || this.#own !== own) {
 					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 					return gone();
 				}
@@ -701,6 +890,780 @@ export class RunController {
 	/** The lane matcher of this session's run: the extension assigns director task names and admits successful spawns. */
 	runLanes(): RunLanes | undefined {
 		return this.#own?.lanes;
+	}
+
+	/**
+	 * Current facts for the prerequisite edges of a task/follow-up admission. It reads the run's own result ledger and
+	 * re-locates every accepted result at its current source: an isolated artifact only from its verified retained
+	 * source, shared content only from the current parent. A director's "applied" claim is never proof, and only the
+	 * lanes a plan's edges name are inspected.
+	 */
+	async laneReadiness(plan: RunPlan, needed: ReadonlySet<string>): Promise<Map<string, LaneReadiness>> {
+		const view = new Map<string, LaneReadiness>();
+		const own = this.#own;
+		if (own === undefined) return view;
+		// A native delivery can land just before the consumer's call. Wait only for the prerequisites this admission
+		// actually reads, and never past a bounded window: a running producer still blocks.
+		await this.#awaitSettlements(own, needed, ADMISSION_SETTLE_WAIT_MS);
+		this.#syncResults(own);
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
+		const coverage = new Map((this.#planLanes(own, agents) ?? []).map(lane => [lane.name, lane.state === "done"]));
+		const sharedTeam = own.config.isolation !== "isolated";
+		for (const name of needed) {
+			const lane = plan.lanes.find(candidate => candidate.name === name);
+			if (lane === undefined) continue;
+			const isolated = lane.isolationReason !== undefined || own.config.isolation === "isolated";
+			const results: LaneResultReadiness[] = [];
+			for (const result of lane.results ?? []) {
+				const row = own.record.results?.find(candidate => candidate.id === result.id);
+				let state = row?.state ?? "pending";
+				let retained: LaneResultReadiness["retained"];
+				let retainedReason: string | undefined;
+				let integrated = false;
+				if (state === "accepted") {
+					// An accepted result is usable only from the location S1 can still prove now: a retained source for an
+					// isolated artifact, the current parent for shared content. A revert or a vanished patch blocks consumers.
+					const location = await this.#acceptedLocation(own, result, isolated, row);
+					if (!location.ok) {
+						state = "unmet";
+						retainedReason = location.reason;
+					} else {
+						integrated = location.integrated;
+						retained = location.retained;
+					}
+				} else if (isolated && result.kind === "artifact" && state === "reviewable") {
+					// A reviewable isolated artifact is not a usable source: its submission has no accepted digest to read.
+					const evidence = own.evidence.get(result.id);
+					state = "unmet";
+					retainedReason = evidence === undefined || row?.attemptId === undefined || row.identity === undefined
+						? "보존된 산출물의 시도 근거를 확인하지 못했습니다."
+						: "보존된 산출물의 근거가 현재 계약과 다릅니다.";
+				}
+				const citation = own.evidence.get(result.id)?.item.citation;
+				results.push({
+					id: result.id,
+					kind: result.kind,
+					state,
+					integrated,
+					...(row?.contentVersion === undefined ? {} : { version: row.contentVersion }),
+					...(result.path === undefined ? {} : { path: result.path }),
+					...(citation === undefined ? {} : { citation: { path: citation.path, ...(citation.line === undefined ? {} : { line: citation.line }) } }),
+					...(retained === undefined ? {} : { retained }),
+					...(retainedReason === undefined ? {} : { reason: retainedReason }),
+				});
+			}
+			const settled = coverage.get(name) === true;
+			const handle = own.lanes.agentForLane(name);
+			const running =
+				own.settling.has(name) ||
+				[...own.attempts.values()].some(prepared => prepared.lane === name) ||
+				(handle !== undefined && agents.some(agent => agent.id === handle && agent.state === "running"));
+			view.set(name, {
+				results,
+				settled,
+				running,
+				// A legacy lane with no declared results has only the shared tree itself as integration proof.
+				integrated: sharedTeam && lane.isolationReason === undefined && (results.length === 0 ? settled : results.every(result => result.integrated)),
+				...(handle === undefined ? {} : { handle }),
+			});
+		}
+		return view;
+	}
+
+	/**
+	 * One accepted result's current, usable location, re-read from S1 evidence rather than a status claim: an isolated
+	 * artifact only from its verified retained source, shared content from the current parent, and an answer from its
+	 * own recorded proof (which has no file location to lose). A review-accepted row has no attempt digest to
+	 * re-locate; its bound current-tree verdict is the authority and `#refreshResultReviews` reopens it when the tree
+	 * moves. `isolated` is the planned lane's mode; a row whose lane left the plan infers it from the artifact evidence
+	 * S1 bound to the accepted attempt, never from a path or a claim.
+	 */
+	async #acceptedLocation(
+		own: OwnRun,
+		result: PlanLaneResult,
+		isolated: boolean | undefined,
+		row: RunResult | undefined,
+	): Promise<AcceptedLocation> {
+		if (row === undefined || row.state !== "accepted" || row.attemptId === undefined) {
+			return { ok: false, reason: "수용된 결과가 없습니다." };
+		}
+		if (row.origin === "review") return { ok: true, integrated: false };
+		if (result.kind === "answer") return { ok: true, integrated: false };
+		// An accepted row whose recorded producer versions changed is no longer proof, even before a later pass writes
+		// the invalidation reason: a consumer must not start from it.
+		if (hasStaleInputs(row, own.record.results ?? [])) {
+			return { ok: false, reason: "선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다." };
+		}
+		const evidence = own.evidence.get(result.id);
+		if (evidence === undefined || evidence.item.identity !== row.identity || evidence.item.attemptId !== row.attemptId) {
+			return { ok: false, reason: "수용 당시의 시도 근거를 확인하지 못했습니다." };
+		}
+		const projection = projectAcceptedResult({
+			row: { id: row.id, state: row.state, attemptId: row.attemptId, identity: row.identity, contentVersion: row.contentVersion ?? "" },
+			result,
+			item: evidence.item,
+			...(evidence.artifact === undefined ? {} : { artifact: evidence.artifact }),
+		});
+		if (!projection.ok) return { ok: false, reason: "수용된 결과의 근거가 현재 계약과 다릅니다." };
+		if (result.kind === "artifact" && (isolated ?? evidence.artifact !== undefined)) {
+			const location = await locateResult({
+				mode: "retained",
+				parentRoot: own.root,
+				accepted: projection.accepted,
+				expectedAttemptId: row.attemptId,
+			});
+			if (!location.ok) return { ok: false, reason: `보존된 산출물을 확인하지 못했습니다(${location.code}).` };
+			return {
+				ok: true,
+				integrated: false,
+				retained: {
+					ref: location.location.ref,
+					path: location.location.path,
+					...(location.location.digest === undefined ? {} : { digest: location.location.digest }),
+					kind: location.location.kind,
+				},
+			};
+		}
+		const location = await locateResult({
+			mode: "integrated",
+			parentRoot: own.root,
+			accepted: projection.accepted,
+			expectedAttemptId: row.attemptId,
+		});
+		if (!location.ok) return { ok: false, reason: `현재 트리에서 수용된 결과를 확인하지 못했습니다(${location.code}).` };
+		return { ok: true, integrated: true };
+	}
+
+	/**
+	 * Prepares one accepted dispatch: binds the lane's declared results and captures the shared before state. The
+	 * extension calls this after every existing spawn/follow-up refusal and before the child runs, so a failed
+	 * capture can still stop the work. A legacy lane (no `results`) stores nothing and never gains a requirement.
+	 */
+	async prepareAttempt(input: AttemptPreparation): Promise<AttemptAdmission> {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== input.runId) {
+			return { ok: false, reason: "이 실행은 더 이상 진행 중이 아닙니다." };
+		}
+		if (own.ending !== undefined || own.abort.signal.aborted) {
+			return { ok: false, reason: "실행이 끝나는 중이라 새 작업의 기준선을 만들지 않았습니다." };
+		}
+		// No write-capable attempt starts under a read claim: a plan that can change the target is upgraded before its
+		// first spawn, and a failure here refuses the work rather than letting it write beside another owner.
+		if (own.record.plan !== undefined && planNeedsWrite(own.record.plan)) {
+			const upgraded = await this.#upgradeLease(own);
+			if (!upgraded.ok) return { ok: false, reason: upgraded.reason };
+			if (this.#own !== own) return { ok: false, reason: "실행이 바뀌어 작업을 시작하지 않았습니다." };
+		}
+		this.#syncResults(own);
+		const lane = own.record.plan?.lanes.find(candidate => candidate.name === input.lane);
+		if (lane?.results === undefined || lane.results.length === 0) return { ok: true };
+		// The same dispatch is prepared once; a repeated call keeps the first, honest before state.
+		if (own.attempts.has(input.dispatch)) return { ok: true };
+		const route = laneRouteFingerprint(lane);
+		// A native retry already exhausted this exact route. A renamed lane with the same role, goal, files and isolation
+		// is the same route, not a fresh allowance; the director must reassign the id to a genuinely different route.
+		const exhausted = lane.results.some(result => {
+			const row = own.record.results?.find(candidate => candidate.id === result.id);
+			return row !== undefined && row.state !== "accepted" && row.remedy === "retry" && row.retryRoute === route;
+		});
+		if (exhausted) {
+			return { ok: false, reason: "호스트 재시도·대체 경로가 소진된 같은 레인/경로입니다. 이 레인을 다시 스폰하지 말고, 필수 결과를 다른 승인된 역할·파일·목표의 레인으로 이관하거나 조건을 바꾼 뒤 계획을 다시 내세요." };
+		}
+		const capture = await captureSharedBaseline({
+			lane: lane.name,
+			results: lane.results,
+			root: own.root,
+			config: own.config,
+			...(lane.files === undefined ? {} : { laneFiles: lane.files }),
+			artifactMode: input.artifactMode,
+		});
+		if (!capture.ok) {
+			return { ok: false, reason: `필수 결과의 사전 기준선을 만들지 못해 작업을 시작하지 않았습니다: ${capture.reason}` };
+		}
+		// Snapshot the producer versions now, before the child runs: this attempt's evidence may only be used against
+		// these versions. A newer attempt of the same lane fences this one even if its settlement arrives later.
+		const epoch = ++own.attemptSerial;
+		own.laneAttempt.set(lane.name, epoch);
+		const consumed = inputSnapshot(own.record.plan, lane, own.record.results);
+		own.attempts.set(input.dispatch, {
+			lane: lane.name,
+			spawnKey: input.spawnKey,
+			parentId: input.parentId,
+			dispatch: input.dispatch,
+			startedAt: input.startedAt,
+			epoch,
+			route,
+			artifactMode: input.artifactMode,
+			results: lane.results,
+			...(consumed.length === 0 ? {} : { consumed }),
+			...(lane.files === undefined ? {} : { laneFiles: lane.files }),
+			baseline: capture.baseline,
+		});
+		return { ok: true };
+	}
+
+	/**
+	 * Settles exactly one prepared dispatch. Only an exact, usable host report may bind `attemptId`; a missing,
+	 * stale or mismatched report leaves the requirement unresolved with a compact reason, and a late settlement for
+	 * a run that is no longer this session's is ignored. Evaluation never trusts model text as a path or a verdict.
+	 */
+	async settleAttempt(input: AttemptSettlement): Promise<void> {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== input.runId) return;
+		const prepared = own.attempts.get(input.dispatch);
+		if (prepared === undefined) return;
+		own.attempts.delete(input.dispatch);
+		own.settling.add(prepared.lane);
+		try {
+			// A newer attempt of this lane already started: its settlement governs the requirement. The older attempt
+			// must not reinstate a success (or a failure) even when the host delivers it late.
+			if (prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+			const report = input.report;
+			const exact =
+				attemptUsable(report) &&
+				report.runId === input.runId &&
+				report.parentId === input.parentId &&
+				report.spawnKey === input.spawnKey;
+			if (!exact || report.attemptId === undefined) {
+				this.#applyUnusableAttempt(own, prepared, report);
+				return;
+			}
+			// The host's settlement authority is checked before any file or answer read: a failed, cancelled or
+			// schema-invalid attempt can witness its own failure, never make a physically present file or prior answer an
+			// accepted result. The exact attempt id stays bound so the record says which native job failed.
+			if (report.outcome !== "success" || report.schemaStatus === "invalid") {
+				this.#applyBlockedAttempt(own, prepared, report);
+				return;
+			}
+			// A success against a producer version that has since changed is not evidence for the requirement now: the
+			// attempt is recorded honestly as unmet rather than reviving the old input's proof.
+			if (this.#staleInputs(own, prepared)) {
+				this.#applyStaleInput(own, prepared, report.attemptId);
+				return;
+			}
+			const artifacts = report.artifacts.filter(artifact => artifact.kind === "patch" && artifact.path !== "");
+			const patch = artifacts.find(artifact => (artifact.bytes ?? 0) > 0);
+			const artifact: ArtifactEvidenceSource | undefined =
+				patch === undefined
+					? undefined
+					: {
+							attemptId: report.attemptId,
+							path: patch.path,
+							form: "patch",
+							...(patch.digest === undefined ? {} : { expectedDigest: patch.digest }),
+						};
+			const settled: SettledAttempt = {
+				prepared,
+				attemptId: report.attemptId,
+				...(input.reportText === undefined ? {} : { reportText: input.reportText }),
+				citations: [...input.citations],
+				...(artifact === undefined ? {} : { artifact }),
+			};
+			own.settled.set(prepared.lane, settled);
+			await this.#evaluateAttempt(own, settled);
+			this.#scheduleFlush(own);
+		} finally {
+			own.settling.delete(prepared.lane);
+			this.#wakeSettlementWaiters();
+		}
+	}
+
+	/**
+	 * Re-derives the ledger from the current plan without inventing requirements: a new id starts pending, an existing
+	 * id keeps its state across reassignment, and a removed lane keeps every non-accepted obligation (with no lane).
+	 * The bounded contract is persisted per id so an accepted row can still be re-located after its lane leaves; it is
+	 * never rewritten while the identity matches. A changed contract under the same id is a new requirement: its old
+	 * contract, attempt evidence and accepted proof are dropped, never inherited.
+	 */
+	#syncResults(own: OwnRun): boolean {
+		const rows = own.record.results ?? [];
+		const byId = new Map(rows.map(row => [row.id, row]));
+		const assigned = new Set<string>();
+		let changed = false;
+		for (const lane of own.record.plan?.lanes ?? []) {
+			for (const result of lane.results ?? []) {
+				const identity = resultContractIdentity(result);
+				assigned.add(result.id);
+				const row = byId.get(result.id);
+				if (row === undefined) {
+					rows.push({
+						id: result.id,
+						lane: lane.name,
+						state: "pending",
+						identity,
+						contract: persistedResultContract(result),
+						origin: "plan",
+					});
+					byId.set(result.id, rows[rows.length - 1]!);
+					changed = true;
+					continue;
+				}
+				if (row.lane !== lane.name) {
+					row.lane = lane.name;
+					// A reassigned requirement is no longer the orphan its old row said it was; keep the failure reason.
+					if (row.reason?.startsWith(ORPHAN_RESULT_REASON)) {
+						const prior = row.reason.slice(ORPHAN_RESULT_REASON.length).trim();
+						if (prior === "") delete row.reason;
+						else row.reason = prior;
+					}
+					// A genuinely different route may reassign the same requirement once; a rename with the same route
+					// keeps the retry remedy and the prepareAttempt guard blocks the identical respawn.
+					if (row.remedy === "retry" && row.retryRoute !== undefined && row.retryRoute !== laneRouteFingerprint(lane)) {
+						delete row.remedy;
+						delete row.retryRoute;
+						delete row.unblock;
+					}
+					changed = true;
+				}
+				if (row.identity === undefined) {
+					row.identity = identity;
+					if (row.contract === undefined) row.contract = persistedResultContract(result);
+					changed = true;
+				} else if (row.identity !== identity) {
+					row.state = "pending";
+					row.identity = identity;
+					row.contract = persistedResultContract(result);
+					row.origin = "plan";
+					delete row.reason;
+					delete row.attemptId;
+					delete row.remedy;
+			delete row.retryRoute;
+					delete row.unblock;
+					delete row.contentVersion;
+					delete row.consumed;
+					delete row.reviewTree;
+					own.evidence.delete(row.id);
+					changed = true;
+				}
+			}
+		}
+		for (const row of rows) {
+			if (assigned.has(row.id)) continue;
+			if (row.lane !== undefined) {
+				delete row.lane;
+				changed = true;
+			}
+			if (row.state !== "accepted" && !(row.reason ?? "").startsWith(ORPHAN_RESULT_REASON)) {
+				row.reason = row.reason === undefined || row.reason === ""
+					? ORPHAN_RESULT_REASON
+					: compactResultReason(`${ORPHAN_RESULT_REASON} ${row.reason}`);
+				changed = true;
+			}
+		}
+		if (changed) {
+			if (rows.length > 0) own.record.results = rows;
+			else delete own.record.results;
+			this.#scheduleFlush(own);
+		}
+		// A plan change can leave an already-invalid consumer in the ledger (a legacy row, a removed producer). The
+		// rows are re-read after the plan edit, never assumed fresh.
+		if (this.#invalidateConsumers(own)) changed = true;
+		return changed;
+	}
+
+	/** The current plan's declaration for one result id, wherever its lane now is. */
+	#plannedResult(own: OwnRun, id: string): PlanLaneResult | undefined {
+		for (const lane of own.record.plan?.lanes ?? []) {
+			const found = lane.results?.find(result => result.id === id);
+			if (found !== undefined) return found;
+		}
+		return undefined;
+	}
+
+	/** Whether a prepared attempt's declared producer versions changed after it started. */
+	#staleInputs(own: OwnRun, prepared: PreparedAttempt): boolean {
+		if ((prepared.consumed ?? []).length === 0) return false;
+		const byId = new Map((own.record.results ?? []).map(row => [row.id, row]));
+		return (prepared.consumed ?? []).some(input => currentInputVersion(byId.get(input.id)) !== input.version);
+	}
+
+	/** Bind a row to the producer versions this attempt started from; the attempt's outcome never rewrites that fact. */
+	#bindConsumed(row: RunResult, prepared: PreparedAttempt): void {
+		if ((prepared.consumed ?? []).length === 0) {
+			delete row.consumed;
+			return;
+		}
+		row.consumed = [...(prepared.consumed ?? [])];
+	}
+
+	/**
+	 * A success whose producer versions changed is no longer evidence. The attempt is still host-observed, so its id is
+	 * recorded, but the row is unmet and every consumer of it is reopened transitively.
+	 */
+	#applyStaleInput(own: OwnRun, prepared: PreparedAttempt, attemptId: string): void {
+		const rows = own.record.results ?? [];
+		let changed = false;
+		for (const result of prepared.results) {
+			const row = rows.find(candidate => candidate.id === result.id);
+			if (row === undefined) continue;
+			const identity = resultContractIdentity(result);
+			if (row.identity !== undefined && row.identity !== identity) continue;
+			row.state = "unmet";
+			row.reason = compactResultReason("선행 결과가 시도 시작 뒤에 바뀌어 이 시도의 결과를 수용하지 않았습니다.");
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			row.identity = identity;
+			row.origin = "attempt";
+			row.attemptId = attemptId;
+			this.#bindConsumed(row, prepared);
+			delete row.contentVersion;
+			delete row.reviewTree;
+			own.evidence.delete(row.id);
+			changed = true;
+		}
+		if (this.#invalidateConsumers(own)) changed = true;
+		if (changed) this.#scheduleFlush(own);
+	}
+
+	/**
+	 * Reopens rows whose recorded producer versions no longer describe the ledger. Only accepted/reviewable evidence is
+	 * touched: a pending row invents nothing and an already-unmet row stays as it is. The pass is transitive because a
+	 * reopened row is no longer a usable input.
+	 */
+	#invalidateConsumers(own: OwnRun): boolean {
+		const rows = own.record.results ?? [];
+		if (rows.length === 0) return false;
+		const stale = staleRequirementIds(rows);
+		if (stale.size === 0) return false;
+		let changed = false;
+		for (const row of rows) {
+			if (!stale.has(row.id)) continue;
+			if (row.state !== "accepted" && row.state !== "reviewable") continue;
+			row.state = "unmet";
+			row.origin = "plan";
+			row.reason = compactResultReason("입력으로 쓴 선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다.");
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			// The attempt is a real host fact and remains useful for the round/closeout; its evidence is what is invalid.
+			delete row.contentVersion;
+			delete row.reviewTree;
+			own.evidence.delete(row.id);
+			changed = true;
+		}
+		if (changed) this.#scheduleFlush(own);
+		return changed;
+	}
+
+	/** Approved check evidence for the exact tree Storm reads now; absent is missing proof, never a pass. */
+	async #approvedCheckEvidence(own: OwnRun): Promise<ApprovedCheckEvidence | undefined> {
+		const now = await this.#treeAt(own.root, own.base);
+		if (now === undefined) return undefined;
+		const fingerprint = treeFingerprint(now.state);
+		const report = own.checks.get(fingerprint);
+		if (report === undefined || report === "skipped") return undefined;
+		let approval;
+		try {
+			approval = (await this.deps.loadState(own.ctx)).approval;
+		} catch {
+			return undefined;
+		}
+		return {
+			config: { status: "ok", path: "", config: own.config, hash: own.record.configHash, warnings: [] },
+			approval,
+			report,
+			treeFingerprint: fingerprint,
+		};
+	}
+
+	/** Applies one evaluator report to the rows it was run for, preserving a prior accepted row for unchanged content. */
+	#applyEvaluated(
+		own: OwnRun,
+		prepared: PreparedAttempt,
+		attemptId: string,
+		items: readonly ResultEvidenceItem[],
+		deferred: ReadonlySet<string>,
+	): void {
+		const rows = own.record.results ?? [];
+		for (const item of items) {
+			const row = rows.find(candidate => candidate.id === item.id);
+			if (row === undefined) continue;
+			// A late settlement of the previous contract must not overwrite a requirement whose id now means something
+			// else; the replan reset it to pending and this attempt cannot resurrect the old obligation.
+			if (row.identity !== undefined && row.identity !== item.identity) continue;
+			// A follow-up that changed nothing is not a regression of evidence an earlier attempt already proved. A
+			// failing declared check is not a no-op even when the bytes are unchanged, so it always updates the row.
+			// A reviewable submission is evidence too: unrelated edits in the same lane must not turn it back into
+			// "nothing changed" and force the producer to submit again (T05 control).
+			const unchanged =
+				item.state === "unmet" &&
+				item.check === undefined &&
+				item.digest !== undefined &&
+				item.digest === item.previousDigest;
+			const preserved =
+				unchanged &&
+				(row.state === "accepted" || row.state === "reviewable") &&
+				row.identity === item.identity &&
+				row.contentVersion === item.contentVersion;
+			if (preserved) {
+				// The result is still the same content, but its dependency snapshot is the newer attempt's: keep the
+				// proof and bind it to the versions this attempt really started from.
+				this.#bindConsumed(row, prepared);
+				continue;
+			}
+			if (deferred.has(item.id) && item.state !== "accepted") {
+				// A required check with no approved evidence yet defers only that check. When the content itself is
+				// still the earlier reviewable submission, keep its attempt and version instead of asking for a new
+				// submission; when the content is no submission at all, keep it unmet: an unavailable check never
+				// turns absent or failing content into something a reviewer could judge.
+				if (item.checkDeferred === true) {
+					row.state = "reviewable";
+					row.reason = compactResultReason("승인된 필수 검사 근거를 기다립니다.");
+				} else {
+					row.state = item.state;
+					row.reason = compactResultReason(item.reason ?? RESULT_FALLBACK_REASON[item.state]);
+				}
+				row.attemptId = attemptId;
+				row.identity = item.identity;
+				row.origin = "attempt";
+				this.#bindConsumed(row, prepared);
+				delete row.remedy;
+				delete row.retryRoute;
+				delete row.unblock;
+				delete row.reviewTree;
+				if (item.contentVersion === undefined) delete row.contentVersion;
+				else row.contentVersion = item.contentVersion;
+				continue;
+			}
+			row.state = item.state;
+			row.attemptId = attemptId;
+			row.identity = item.identity;
+			row.origin = "attempt";
+			this.#bindConsumed(row, prepared);
+			delete row.reviewTree;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			if (item.contentVersion === undefined) delete row.contentVersion;
+			else row.contentVersion = item.contentVersion;
+			if (item.state === "accepted") delete row.reason;
+			else row.reason = compactResultReason(item.reason ?? RESULT_FALLBACK_REASON[item.state]);
+		}
+		// A producer row that changed content reopens only the evidence that consumed it, transitively.
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+	}
+
+	/**
+	 * A usable envelope whose host settlement is failure/cancel, or whose structured output is invalid, leaves every
+	 * requirement unmet without reading the tree or an answer. The attempt id is still the host's fact, so it stays.
+	 */
+	#applyBlockedAttempt(own: OwnRun, prepared: PreparedAttempt, report: AttemptReport): void {
+		// A native retry count is a host fact: the existing retry/fallback path is exhausted, so Storm must not start
+		// another retry outside its configured limits. A generic failure without that fact stays ordinary work.
+		const exhausted = report.outcome === "failure" && report.schemaStatus !== "invalid" && report.retry !== undefined;
+		const why =
+			report.schemaStatus === "invalid"
+				? "구조화 결과가 유효하지 않아"
+				: report.outcome === "cancel"
+					? "시도가 취소되어"
+					: exhausted
+						? `호스트 재시도·대체 경로가 소진되어(재시도 ${report.retry!.attempt})`
+						: "시도가 실패로 끝나";
+		const reason = compactResultReason(`${why} 필수 결과를 수용하지 않았습니다.`);
+		const rows = own.record.results ?? [];
+		for (const result of prepared.results) {
+			const row = rows.find(candidate => candidate.id === result.id);
+			if (row === undefined) continue;
+			const identity = resultContractIdentity(result);
+			if (row.identity !== undefined && row.identity !== identity) continue;
+			row.state = "unmet";
+			row.reason = reason;
+			row.identity = identity;
+			row.origin = "attempt";
+			if (exhausted) {
+				row.remedy = "retry";
+				row.retryRoute = prepared.route;
+				delete row.unblock;
+			} else {
+				delete row.remedy;
+				delete row.retryRoute;
+				delete row.unblock;
+			}
+			if (report.attemptId !== undefined) row.attemptId = report.attemptId;
+			else delete row.attemptId;
+			this.#bindConsumed(row, prepared);
+			delete row.contentVersion;
+			delete row.reviewTree;
+		}
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+	}
+
+	/** A report that cannot bind leaves every non-accepted requirement unresolved without an attempt id. */
+	#applyUnusableAttempt(own: OwnRun, prepared: PreparedAttempt, report: AttemptReport): void {
+		const code = report.captureError ?? (report.attemptId === undefined ? "native-result-missing" : "spawn-mismatch");
+		const reason = compactResultReason(`호스트 시도를 확인하지 못했습니다(${code}).`);
+		const rows = own.record.results ?? [];
+		for (const result of prepared.results) {
+			const row = rows.find(candidate => candidate.id === result.id);
+			if (row === undefined) continue;
+			const identity = resultContractIdentity(result);
+			if (row.identity !== undefined && row.identity !== identity) continue;
+			// An earlier accepted attempt still stands; only a new unresolved attempt replaces an unresolved row.
+			if (row.state === "accepted" && row.identity === identity) continue;
+			row.state = "unmet";
+			row.reason = reason;
+			row.identity = identity;
+			row.origin = "attempt";
+			delete row.attemptId;
+			this.#bindConsumed(row, prepared);
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			delete row.contentVersion;
+			delete row.reviewTree;
+		}
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+	}
+
+	/** Evaluates one settled attempt against its stored before state and writes the run-scoped rows. */
+	async #evaluateAttempt(own: OwnRun, settled: SettledAttempt): Promise<void> {
+		const prepared = settled.prepared;
+		const checkNames = prepared.results.filter(result => result.check !== undefined).map(result => result.id);
+		const checks = checkNames.length === 0 ? undefined : await this.#approvedCheckEvidence(own);
+		const deferred = new Set(checkNames.length > 0 && checks === undefined ? checkNames : []);
+		settled.checkDeferred = deferred.size > 0;
+		const wantsAnswer = prepared.results.some(result => result.kind === "answer");
+		const evaluation = await evaluateSettledResults({
+			lane: prepared.lane,
+			attemptId: settled.attemptId,
+			results: prepared.results,
+			shared: { root: own.root, ...(prepared.baseline === undefined ? {} : { baseline: prepared.baseline }) },
+			artifactMode: prepared.artifactMode,
+			config: own.config,
+			...(prepared.laneFiles === undefined ? {} : { laneFiles: prepared.laneFiles }),
+			...(checks === undefined ? {} : { checks }),
+			...(settled.artifact === undefined ? {} : { artifact: settled.artifact }),
+			...(wantsAnswer ? { answer: { text: settled.reportText ?? "", citations: [...settled.citations] } } : {}),
+		});
+		// The run was finalized while the evidence was being read: this settlement is detached and must not mutate the
+		// record already written (or the object a caller still holds).
+		if (this.#own !== own) return;
+		if (!evaluation.ok) {
+			const rows = own.record.results ?? [];
+			for (const result of prepared.results) {
+				const row = rows.find(candidate => candidate.id === result.id);
+				if (row === undefined) continue;
+				const identity = resultContractIdentity(result);
+				if (row.identity !== undefined && row.identity !== identity) continue;
+				if (row.state === "accepted" && row.identity === identity) continue;
+				row.state = "unmet";
+				row.reason = compactResultReason(`결과 근거를 평가하지 못했습니다: ${evaluation.reason}`);
+				row.attemptId = settled.attemptId;
+				row.identity = identity;
+				row.origin = "attempt";
+				this.#bindConsumed(row, prepared);
+				delete row.remedy;
+			delete row.retryRoute;
+				delete row.unblock;
+				delete row.contentVersion;
+				delete row.reviewTree;
+			}
+			this.#invalidateConsumers(own);
+			return;
+		}
+		this.#applyEvaluated(own, prepared, settled.attemptId, evaluation.report.results, deferred);
+		// The location check needs the accepted item's observed digest/paths and the host-bound retained source; a
+		// row alone cannot prove that the current parent carries the accepted content.
+		for (const item of evaluation.report.results) {
+			if (item.state !== "accepted") continue;
+			own.evidence.set(item.id, { item, ...(settled.artifact === undefined ? {} : { artifact: settled.artifact }) });
+		}
+	}
+
+	/** Whether a settled lane is still waiting for approved check evidence it declared. */
+	#hasDeferredCheck(own: OwnRun): boolean {
+		return [...own.settled.values()].some(
+			settled =>
+				settled.checkDeferred === true &&
+				settled.prepared.epoch >= (own.laneAttempt.get(settled.prepared.lane) ?? 0) &&
+				!this.#staleInputs(own, settled.prepared),
+		);
+	}
+
+	/** Re-runs a check-bearing lane once the approved check report for the current tree exists. */
+	async #refreshCheckedResults(own: OwnRun): Promise<void> {
+		for (const [lane, settled] of [...own.settled]) {
+			if (settled.checkDeferred !== true) continue;
+			// A newer attempt or a changed producer makes this settlement's evidence unusable; re-evaluating it would
+			// revive a result the run already reopened, and keeping it would ask for checks nobody can use.
+			if (settled.prepared.epoch < (own.laneAttempt.get(settled.prepared.lane) ?? 0) || this.#staleInputs(own, settled.prepared)) {
+				own.settled.delete(lane);
+				continue;
+			}
+			const rows = own.record.results ?? [];
+			const open = settled.prepared.results.some(result => {
+				const row = rows.find(candidate => candidate.id === result.id);
+				return row !== undefined && row.state !== "accepted";
+			});
+			if (!open) continue;
+			if ((await this.#approvedCheckEvidence(own)) === undefined) continue;
+			await this.#evaluateAttempt(own, settled);
+		}
+	}
+
+	/**
+	 * Binds submitted qualitative rows to the approved reviewer's current-tree verdict. An incorrect verdict on this
+	 * exact content leaves the row unmet; a stale/unbound verdict leaves it reviewable; a correct current-tree verdict
+	 * accepts it even when another run-level check keeps the whole run unverified. Machine-accepted rows are untouched.
+	 */
+	#refreshResultReviews(own: OwnRun, agents: readonly AgentEntry[], now: TreeState | undefined): boolean {
+		this.#syncResults(own);
+		const rows = own.record.results ?? [];
+		if (rows.length === 0) return false;
+		const treeNow = now === undefined || now.incomplete ? undefined : treeFingerprint(now);
+		const proof = reviewProof(agents, own.config, treeNow, lastWriterChangeAt(agents));
+		let changed = false;
+		for (const row of rows) {
+			if (row.state === "pending") continue;
+			if (row.state === "unmet" && row.origin !== "review") continue;
+			if (row.state === "accepted" && row.origin !== "review") continue;
+			// A reviewer on the current tree is not proof that a result built from replaced inputs is still correct.
+			if (hasStaleInputs(row, rows)) continue;
+			// A review state was bound to an older tree: the submission itself is still there, so reopen it for judgement.
+			if (row.origin === "review" && row.reviewTree !== treeNow) {
+				row.state = "reviewable";
+				row.origin = "attempt";
+				row.reason = compactResultReason("리뷰 이후 트리가 바뀌어 새 판단이 필요합니다.");
+				delete row.remedy;
+			delete row.retryRoute;
+				delete row.unblock;
+				delete row.reviewTree;
+				changed = true;
+			}
+			if (treeNow === undefined) continue;
+			// A tree verdict judges only what the reviewer can actually see in the integrated tree. An answer's wording
+			// and an isolated artifact's content are not in it, so those rows stay reviewable instead of borrowing proof.
+			const planned = this.#plannedResult(own, row.id);
+			if (planned?.kind !== "change") continue;
+			if (proof.state === "current") {
+				if (row.state !== "accepted" || row.origin !== "review" || row.reviewTree !== treeNow) {
+					row.state = "accepted";
+					row.origin = "review";
+					row.reviewTree = treeNow;
+					delete row.reason;
+					delete row.remedy;
+			delete row.retryRoute;
+					delete row.unblock;
+					changed = true;
+				}
+			} else if (proof.state === "incorrect" && proof.tree === treeNow && row.state === "reviewable") {
+				row.state = "unmet";
+				row.origin = "review";
+				row.reviewTree = treeNow;
+				row.reason = compactResultReason("독립 리뷰가 이 결과를 incorrect로 판정했습니다.");
+				delete row.remedy;
+			delete row.retryRoute;
+				delete row.unblock;
+				changed = true;
+			}
+		}
+		if (this.#invalidateConsumers(own)) changed = true;
+		if (changed) this.#scheduleFlush(own);
+		return changed;
 	}
 
 	/** Changes this session's run record and schedules its live rewrite; a no-op without a run. */
@@ -809,7 +1772,7 @@ export class RunController {
 		const attempt = { controller: new AbortController(), applied: false };
 		own.checkpoint = attempt;
 		// Capture the ledger now: it is what the handoff summary must keep, not the context it replaces.
-		const guidance = checkpointGuidance(own.record, this.deps.agents?.(own.record.runId) ?? []);
+		const guidance = checkpointGuidance(own.record, this.deps.agents?.(own.record.runId, own.sessionDir) ?? []);
 		const settle = (completed: boolean): void => {
 			// A stopped, switched or replaced run owns nothing: its late result must not mark the next run.
 			if (this.#own !== own || own.checkpoint !== attempt) return;
@@ -852,24 +1815,58 @@ export class RunController {
 	}
 
 	/** The approved config this session's run started under. */
-	runConfig(): StormConfig | undefined {
-		return this.#own?.config;
+	runConfig(ctx?: ExtensionContext): StormConfig | undefined {
+		const own = this.#own;
+		if (own === undefined) return undefined;
+		if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) return undefined;
+		return own.config;
 	}
 
-	/** From the storm tool's plan action: the plan this session's run spawns under, visible to every session. */
-	setPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string } {
+	/**
+	 * Proves this session's run may write the target before an effect the controller does not perform itself (a
+	 * follow-up that can write, a shell-capable spawn). The caller must not perform the effect when this refuses.
+	 */
+	async ensureWrite(ctx?: ExtensionContext): Promise<{ ok: true } | { ok: false; reason: string }> {
+		const own = this.#own;
+		if (own === undefined) return { ok: false, reason: "진행 중인 Storm 실행이 없어 쓰기 권한을 확인하지 못했습니다." };
+		if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) {
+			return { ok: false, reason: "다른 세션이 시작한 실행의 쓰기 권한은 빌려올 수 없습니다." };
+		}
+		return this.#upgradeLease(own);
+	}
+
+	/**
+	 * From the storm tool's plan action: the plan this session's run spawns under, visible to every session. The
+	 * caller's native session must be the one directing the run, and a write-capable plan upgrades the target claim
+	 * before it becomes authority for any spawn.
+	 */
+	async setPlan(ctx: ExtensionContext, plan: RunPlan): Promise<{ ok: true } | { ok: false; reason: string }> {
 		const own = this.#own;
 		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 계획을 저장하지 않았습니다." };
+		if (closeoutSessionId(ctx) !== own.sessionId) {
+			return { ok: false, reason: "다른 세션이 시작한 실행에는 계획을 적용할 수 없습니다." };
+		}
 		// A lane keeps the identity its evidence is bound to: goal, kind, role and files. A status update belongs in
 		// progress; renaming a changed lane is the only way to start its evidence over. Reject before touching the plan
-		// in force or the record, so a refused replan leaves both exactly as they were.
+		// in force or the record, so a refused replan leaves both exactly as they were. The run's own row identities are
+		// checked too: a requirement that has moved or lost its lane cannot be rewritten by a later plan reusing its id.
+		const weakened = requirementConflict(own.record.results, plan);
+		if (weakened !== undefined) return { ok: false, reason: weakened };
 		const conflict = replanConflict(own.record.plan, plan);
 		if (conflict !== undefined) return { ok: false, reason: conflict };
+		if (planNeedsWrite(plan)) {
+			const upgraded = await this.#upgradeLease(own);
+			if (!upgraded.ok) return upgraded;
+			if (this.#own !== own) return { ok: false, reason: "실행이 바뀌어 계획을 적용하지 않았습니다." };
+		}
 		// A stopping run blocks new spawns; its plan is no longer authority for them.
 		if (!setLedgerPlan(own.record.runId, plan)) {
 			return { ok: false, reason: "실행이 끝나는 중이라 계획을 적용하지 않았습니다." };
 		}
 		own.record.plan = plan;
+		// Required results are obligations, not plan text: adding a lane seeds pending rows, and a removed lane keeps
+		// every requirement it still owed.
+		this.#syncResults(own);
 		this.#scheduleFlush(own);
 		return { ok: true };
 	}
@@ -879,9 +1876,12 @@ export class RunController {
 	 * stop or start is touched and no transcript record is written here. A later valid submission replaces it; the
 	 * final record keeps exactly the last one.
 	 */
-	submitCloseout(draft: CloseoutDraft): { ok: true } | { ok: false; reason: string } {
+	submitCloseout(ctx: ExtensionContext, draft: CloseoutDraft): { ok: true } | { ok: false; reason: string } {
 		const own = this.#own;
 		if (!own) return { ok: false, reason: "진행 중인 Storm 실행이 없어 결과 브리프를 저장하지 않았습니다." };
+		if (closeoutSessionId(ctx) !== own.sessionId) {
+			return { ok: false, reason: "다른 세션이 시작한 실행에는 결과 브리프를 저장할 수 없습니다." };
+		}
 		const parsed = parseCloseout(draft);
 		if (parsed === undefined) {
 			return {
@@ -985,7 +1985,7 @@ export class RunController {
 		if (own.ending !== undefined || own.abort.signal.aborted) return false;
 		const now = await this.#treeAt(own.root, own.base);
 		if (now === undefined) return false;
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
 		if (planLanes?.some(lane => lane.state !== "done")) return false;
 		const fingerprint = treeFingerprint(now.state);
@@ -998,7 +1998,7 @@ export class RunController {
 				now: now.state,
 				...(own.rereviewedAt !== undefined ? { rereviewedAt: own.rereviewedAt } : {}),
 			},
-			{ checks: [], lanes: planLanes ?? [] },
+			this.#coverage(own, undefined, planLanes),
 		);
 		return gate.state === "unverified" && gate.cause === "coverage";
 	}
@@ -1011,7 +2011,7 @@ export class RunController {
 	/** The round's decision from the tree now and the gate as the ledger has it after that. */
 	async #roundDecision(own: OwnRun, aborted: boolean, allowChecks: boolean): Promise<RoundDecision> {
 		let now = await this.#treeAt(own.root, own.base);
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
 		const tree = {
 			...(own.tree !== undefined ? { start: own.tree } : {}),
@@ -1020,8 +2020,21 @@ export class RunController {
 		};
 		// The pure gate already knows empty coverage (no checks, no lanes) from the start. Checks run only from the
 		// look timer, never inside omp's agent_end handler: they may take far longer than its budget.
-		const initial: CoverageInput = { checks: [], lanes: planLanes ?? [] };
-		if (allowChecks && !aborted) now = await this.#maybeRunChecks(own, reviewGate(agents, own.config, tree, initial), now, planLanes);
+		const initial = this.#coverage(own, undefined, planLanes);
+		initial.checks = [];
+		const baseGate = reviewGate(agents, own.config, tree, initial);
+		// A required result that names an approved check may need that check to decide it. The check runner normally
+		// starts only when the gate is otherwise check-ready; a deferred row is exactly that case, and leaving it as
+		// `results` would stop the runner from ever supplying the evidence the row waits for.
+		const checkable =
+			this.#hasDeferredCheck(own) && baseGate.state === "unverified" && baseGate.cause !== "lanes"
+				? ({ ...baseGate, cause: "coverage" } as Gate)
+				: baseGate;
+		if (allowChecks && !aborted) now = await this.#maybeRunChecks(own, checkable, now, planLanes);
+		// Bind any check evidence that arrived after settlement, then the reviewer's current-tree proof, before the gate
+		// reads rows: a reviewable submission becomes accepted here, never by the round rules guessing.
+		await this.#refreshCheckedResults(own);
+		this.#refreshResultReviews(own, agents, now?.state);
 		const currentTree = {
 			...(tree.start !== undefined ? { start: tree.start } : {}),
 			...(now !== undefined ? { now: now.state } : {}),
@@ -1041,11 +2054,14 @@ export class RunController {
 		});
 	}
 
-	/** Plan lanes as coverage evidence: only a lane with an admitted, settled worker is done. */
+	/** Plan lanes as coverage evidence: a settled worker is not done while a declared row is pending or unmet. */
 	#planLanes(own: OwnRun, agents: readonly AgentEntry[]): CoverageLane[] | undefined {
 		const plan = own.record.plan;
 		if (plan === undefined) return undefined;
 		const remaining = new Set(own.lanes.remaining(plan, agents, this.#failedIds(own, agents)));
+		for (const row of own.record.results ?? []) {
+			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) remaining.add(row.lane);
+		}
 		return plan.lanes.map(lane => ({ name: lane.name, state: remaining.has(lane.name) ? "pending" : "done" }));
 	}
 
@@ -1076,9 +2092,160 @@ export class RunController {
 		}
 	}
 
+	/**
+	 * The latest spawn event for one lane: an exact lane/spawnKey match by the lane's configured agent, or that agent's
+	 * sole same-role lane when the host key names no lane. A spawn owned by another role leaves it undefined even when
+	 * its key equals the lane name, and a same-role sibling leaves it undefined rather than guessing which requirement
+	 * the refusal belongs to.
+	 */
+	#configRefusal(own: OwnRun, laneName: string): { reason?: string } | undefined {
+		const plan = own.record.plan;
+		const lane = plan?.lanes.find(candidate => candidate.name === laneName);
+		if (plan === undefined || lane === undefined || (lane.results?.length ?? 0) === 0) return undefined;
+		const agent = own.config.roles[lane.role]?.agent;
+		const siblings = plan.lanes.filter(candidate => candidate.role === lane.role);
+		const spawns = spawnsByRun.get(own.record.runId) ?? [];
+		let latest: SpawnRecord | undefined;
+		for (const spawn of spawns) {
+			// A host key can collide with a lane name while another role owns the spawn. Only the lane's configured
+			// agent attributes a role-specific refusal; without one, the spawn's own role must match.
+			const mine = agent === undefined ? spawn.role === lane.role : spawn.agent === agent;
+			if (!mine) continue;
+			const exact = spawn.lane === laneName || spawn.spawnKey === laneName;
+			const bySoleRole = !exact && spawn.lane === undefined && siblings.length === 1;
+			if (exact || bySoleRole) latest = spawn;
+		}
+		if (latest?.outcome !== "blocked" || latest.code === undefined || CONFIG_REFUSAL_CODES[latest.code] !== true) return undefined;
+		const reason = typeof latest.reason === "string" ? configRefusalReason(latest.reason) : "";
+		return reason === "" ? {} : { reason };
+	}
+
+	/**
+	 * A pending result whose lane could not start for team-config/auth reasons says so with the refusal's own unblock
+	 * text. The state is derived from the latest spawn event, so a later admitted spawn clears it; no path is guessed.
+	 */
+	#syncConfigRefusals(own: OwnRun): boolean {
+		this.#syncResults(own);
+		const rows = own.record.results ?? [];
+		let changed = false;
+		for (const row of rows) {
+			if (row.state !== "pending" || row.lane === undefined) continue;
+			const refusal = this.#configRefusal(own, row.lane);
+			if (refusal === undefined) {
+				if (row.remedy === "blocked") {
+					delete row.remedy;
+					delete row.unblock;
+					changed = true;
+				}
+				continue;
+			}
+			if (row.remedy !== undefined && row.remedy !== "blocked") continue;
+			if (row.remedy === "blocked" && row.unblock === refusal.reason) continue;
+			row.remedy = "blocked";
+			if (refusal.reason === undefined) delete row.unblock;
+			else row.unblock = refusal.reason;
+			changed = true;
+		}
+		if (changed) this.#scheduleFlush(own);
+		return changed;
+	}
+
+	/**
+	 * The official rows as coverage facts. Plan text is never proof: kind and the producer edge come from the plan,
+	 * while state, attempt, content version and the consumed producer versions come only from the run ledger. A
+	 * consumer whose producer is not current names that producer; once the new version is accepted, the direction is
+	 * the consumer's own re-check, so `blockedBy` is absent. The witness carries both the consumed and current producer
+	 * versions: replacing B while A still consumed v1 is real progress, not an identical failure to stop on.
+	 */
+	#coverageResults(own: OwnRun): CoverageResult[] {
+		this.#syncConfigRefusals(own);
+		const rows = own.record.results ?? [];
+		if (rows.length === 0) return [];
+		const byId = new Map(rows.map(row => [row.id, row]));
+		const lanes = own.record.plan?.lanes ?? [];
+		const laneByName = new Map(lanes.map(lane => [lane.name, lane]));
+		const planned = new Map<string, PlanLaneResult>();
+		const resultLane = new Map<string, string>();
+		const needsAccepted = new Map<string, boolean>();
+		for (const lane of lanes) {
+			for (const result of lane.results ?? []) {
+				planned.set(result.id, result);
+				resultLane.set(result.id, lane.name);
+			}
+		}
+		for (const lane of lanes) {
+			for (const dependency of lane.dependsOn ?? []) {
+				for (const result of laneByName.get(dependency.lane)?.results ?? []) {
+					needsAccepted.set(result.id, (needsAccepted.get(result.id) ?? false) || dependency.need !== "reviewable");
+				}
+			}
+		}
+		const out: CoverageResult[] = [];
+		for (const row of rows) {
+			const result = planned.get(row.id);
+			const candidates: { id: string; accepted: boolean }[] = [];
+			if ((row.consumed ?? []).length > 0) {
+				for (const input of row.consumed ?? []) candidates.push({ id: input.id, accepted: needsAccepted.get(input.id) ?? true });
+			} else if (row.lane !== undefined) {
+				for (const dependency of laneByName.get(row.lane)?.dependsOn ?? []) {
+					for (const required of laneByName.get(dependency.lane)?.results ?? []) {
+						candidates.push({ id: required.id, accepted: dependency.need !== "reviewable" });
+					}
+				}
+			}
+			let blockedBy: string | undefined;
+			if (row.state !== "accepted") {
+				for (const candidate of candidates) {
+					const producer = byId.get(candidate.id);
+					const current = producer !== undefined &&
+						(producer.state === "accepted" || (!candidate.accepted && producer.state === "reviewable"));
+					if (current) continue;
+					blockedBy = resultLane.get(candidate.id);
+					if (blockedBy !== undefined) break;
+				}
+			}
+			const consumedRefs = (row.consumed ?? []).map(input => `${input.id}@${input.version.slice(0, 8)}`);
+			const currentRefs = [...new Set(candidates.map(candidate => `${candidate.id}@${currentInputVersion(byId.get(candidate.id)).slice(0, 8)}`))];
+			const baseEvidence = consumedRefs.length > 0
+				? `${consumedRefs.join(",")}>${currentRefs.join(",")}`
+				: currentRefs.length > 0
+					? currentRefs.join(",")
+					: row.contentVersion?.slice(0, 12);
+			const route = row.remedy === "retry" && row.retryRoute !== undefined ? `retry:${row.retryRoute}` : undefined;
+			const evidence = route === undefined
+				? baseEvidence
+				: baseEvidence === undefined || baseEvidence === "" ? route : `${route}|${baseEvidence}`;
+			// A requirement whose lane left the plan is still owed, but nothing in the team can run or review it. Name
+			// the one action that can clear it instead of the old lane's work or a review the planned tree cannot bind.
+			const orphan = row.state !== "accepted" && row.lane === undefined && result === undefined;
+			out.push({
+				id: row.id,
+				state: row.state,
+				...(row.lane === undefined ? {} : { lane: row.lane }),
+				...(row.reason === undefined ? {} : { reason: row.reason }),
+				...(result === undefined ? {} : { kind: result.kind }),
+				...(row.attemptId === undefined || !ATTEMPT_REF.test(row.attemptId) ? {} : { attempt: row.attemptId }),
+				...(blockedBy === undefined ? {} : { blockedBy }),
+				...(orphan
+					? { remedy: "replan" as const }
+					: row.remedy === undefined
+						? blockedBy === undefined ? {} : { remedy: "producer" as const }
+						: { remedy: row.remedy }),
+				...(row.unblock === undefined ? {} : { unblock: row.unblock }),
+				...(row.state === "reviewable" && (orphan || (result !== undefined && result.kind !== "change")) ? { judgeable: false } : {}),
+				...(evidence === undefined || evidence === "" ? {} : { evidence }),
+			});
+		}
+		return out;
+	}
+
 	/** The evidence the gate may use for this exact tree; a missing or stale report stays missing, never a pass. */
 	#coverage(own: OwnRun, tree: TreeState | undefined, planLanes: CoverageLane[] | undefined): CoverageInput {
 		const coverage: CoverageInput = { checks: [], lanes: planLanes ?? [] };
+		const results = this.#coverageResults(own);
+		if (results.length > 0) coverage.results = results;
+		// A reviewable row without an approved reviewer is a blocker, not an endless round.
+		coverage.reviewer = usableRole(own.config, "reviewer") !== undefined;
 		const required = own.config.requiredChecks?.map(check => check.name) ?? [];
 		if (required.length) coverage.requiredChecks = required;
 		if (tree === undefined) return coverage;
@@ -1127,8 +2294,16 @@ export class RunController {
 		try {
 			const state = await this.deps.loadState(own.ctx).catch(() => undefined);
 			if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted) return now;
-			// A changed hash or a withdrawal of approval is not permission to run the run's old checks.
-			if (state === undefined || state.config.status !== "ok") {
+			// A changed hash or a withdrawal of approval is not permission to run the run's old checks. Neither is a
+			// session manager that now names another session or target: the captured owner alone authorizes commands.
+			if (
+				state === undefined ||
+				state.config.status !== "ok" ||
+				state.sessionDir !== own.sessionDir ||
+				state.repo.repoId !== own.repoId ||
+				state.repo.root !== own.root ||
+				closeoutSessionId(own.ctx) !== own.sessionId
+			) {
 				own.checks.set(fingerprint, "skipped");
 				return now;
 			}
@@ -1137,6 +2312,14 @@ export class RunController {
 				own.checks.set(fingerprint, "skipped");
 				return now;
 			}
+			// Checks run commands in the target: the write claim must already be held before the first one starts.
+			const upgraded = await this.#upgradeLease(own);
+			if (!upgraded.ok) {
+				own.checks.set(fingerprint, "skipped");
+				this.#stopSoon(own, "interrupted", own.ctx);
+				return now;
+			}
+			if (this.#own !== own) return now;
 			// Verification begins only with the actual runner: preparing or loading state is not "verifying".
 			own.checksRunning = true;
 			this.#emitPhase(own);
@@ -1251,7 +2434,15 @@ export class RunController {
 	#sendRound(own: OwnRun, ctx: ExtensionContext, gate: RoundGate, round: number): void {
 		if (own.ending !== undefined || this.#own !== own) return;
 		const ui = this.deps.ui(ctx);
-		own.progress = { changes: gate.changes, reviews: gate.reviews, requests: gate.requests };
+		// A plain/review round may intervene between two result gates. Keep the last witness so the next result gate does
+		// not look like a brand-new obligation forever; a genuinely changed witness still counts once.
+		const witness = gate.resultProgress ?? own.progress?.result;
+		own.progress = {
+			changes: gate.changes,
+			reviews: gate.reviews,
+			requests: gate.requests,
+			...(witness === undefined ? {} : { result: witness }),
+		};
 		// Only a review repair needs a reviewer name; a lane or check repair round has no review to request.
 		const reviewer = usableRole(own.config, "reviewer")?.agent;
 		// Tree-only staleness is asked about once: a verdict given from now on is honoured whatever the tree does.
@@ -1378,8 +2569,10 @@ export class RunController {
 	 */
 	async #recheckVerified(own: OwnRun): Promise<RunEndReason> {
 		const now = await this.#treeAt(own.root, own.base);
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
+		await this.#refreshCheckedResults(own);
+		this.#refreshResultReviews(own, agents, now?.state);
 		const coverage = this.#coverage(own, now?.state, planLanes);
 		const gate = reviewGate(
 			agents,
@@ -1409,7 +2602,7 @@ export class RunController {
 	#boundAsyncRunning(own: OwnRun): boolean {
 		const snapshot = this.#asyncSnapshot(own.ctx);
 		if (!snapshot) return false;
-		const bound = new Set((this.deps.agents?.(own.record.runId) ?? []).map(agent => agent.id));
+		const bound = new Set((this.deps.agents?.(own.record.runId, own.sessionDir) ?? []).map(agent => agent.id));
 		for (const spawn of spawnsByRun.get(own.record.runId) ?? []) if (spawn.spawnKey !== undefined) bound.add(spawn.spawnKey);
 		return [...snapshot.running].some(
 			job =>
@@ -1428,7 +2621,7 @@ export class RunController {
 		if (own.ending !== undefined || own.abort.signal.aborted) return "stopping";
 		if ((userWaits.get(own.record.runId)?.size ?? 0) > 0) return "waiting-user";
 		if (own.checksRunning === true) return "verifying";
-		const agents = this.deps.agents?.(own.record.runId) ?? [];
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const reviewer = usableRole(own.config, "reviewer")?.agent;
 		if (reviewer !== undefined && agents.some(agent => agent.state === "running" && agent.name === reviewer)) return "verifying";
 		if (agents.some(agent => agent.state === "running")) return "workers";
@@ -1447,16 +2640,120 @@ export class RunController {
 		this.#liveStatus(own.ctx, this.active());
 	}
 
-	/** Whether this run still owns live work: a running agent, a running check, or a job bound to its agents/spawns. */
+	/** Whether this run still owns live work: a running agent, a running check, a settlement being evaluated, or a bound job. */
 	#hasLiveWork(own: OwnRun): boolean {
 		if (own.checking !== undefined) return true;
-		if ((this.deps.agents?.(own.record.runId) ?? []).some(agent => agent.state === "running")) return true;
+		// A settlement already inside `settleAttempt` has left `attempts` for `settling`; the record it will write is
+		// current evidence, so finalization must wait for it instead of judging the previous accepted row.
+		if (own.settling.size > 0) return true;
+		if ((this.deps.agents?.(own.record.runId, own.sessionDir) ?? []).some(agent => agent.state === "running")) return true;
 		return this.#boundAsyncRunning(own);
+	}
+
+	/**
+	 * Re-reads every accepted row at its current source before the final record is written. A reverted shared change or
+	 * a vanished retained artifact reopens that row and, transitively, the rows that consumed its version; an
+	 * independent accepted row stays. The contract comes from the plan in force, else from the bounded copy the row
+	 * persisted, so a lane removed after acceptance cannot hide its proof. An answer has no patch to miss. A
+	 * review-accepted row's digest is its bound tree: a current tree that no longer matches reopens the submission for
+	 * judgement instead of carrying the old verdict into the record.
+	 */
+	async #revokeUnlocatedAccepted(own: OwnRun): Promise<void> {
+		let changed = false;
+		let treeNow: string | undefined;
+		let readTree = false;
+		const currentTree = async (): Promise<string | undefined> => {
+			if (readTree) return treeNow;
+			readTree = true;
+			const now = await this.#treeAt(own.root, own.base);
+			treeNow = now === undefined || now.state.incomplete ? undefined : treeFingerprint(now.state);
+			return treeNow;
+		};
+		for (const row of own.record.results ?? []) {
+			if (row.state !== "accepted") continue;
+			const planned = this.#plannedResult(own, row.id) ?? row.contract;
+			// A legacy row that never recorded its contract is not reconstructed from plan text; there is no safe
+			// historical source to re-locate it against and no new evidence is invented here.
+			if (planned === undefined) continue;
+			if (row.origin === "review") {
+				const tree = await currentTree();
+				// Without a current reading the gate cannot have an honest verified label; leave the row to it rather
+				// than guessing that an unread tree matches.
+				if (tree === undefined || row.reviewTree === tree) continue;
+				row.state = "reviewable";
+				row.origin = "attempt";
+				row.reason = compactResultReason("리뷰 이후 트리가 바뀌어 새 판단이 필요합니다.");
+				delete row.reviewTree;
+				delete row.remedy;
+				delete row.retryRoute;
+				delete row.unblock;
+				changed = true;
+				continue;
+			}
+			if (planned.kind === "answer") continue;
+			const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(result => result.id === row.id));
+			const isolated = lane === undefined ? undefined : lane.isolationReason !== undefined || own.config.isolation === "isolated";
+			const location = await this.#acceptedLocation(own, planned, isolated, row);
+			if (location.ok) continue;
+			row.state = "unmet";
+			row.origin = "attempt";
+			row.reason = compactResultReason(`수용된 결과가 현재 위치에서 확인되지 않았습니다: ${location.reason}`);
+			delete row.contentVersion;
+			delete row.reviewTree;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			own.evidence.delete(row.id);
+			changed = true;
+		}
+		if (!changed) return;
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+	}
+
+	/**
+	 * A run may close between a dispatch's admission and its terminal settlement. That attempt's requirement is not
+	 * accepted: the row becomes unmet with a compact reason, so a late async delivery cannot resurrect it after the
+	 * final record was written. No file or answer is read here.
+	 */
+	#closePendingAttempts(own: OwnRun): boolean {
+		if (own.attempts.size === 0) return false;
+		const rows = own.record.results ?? [];
+		let changed = false;
+		for (const prepared of own.attempts.values()) {
+			for (const result of prepared.results) {
+				const row = rows.find(candidate => candidate.id === result.id);
+				if (row === undefined) continue;
+				const identity = resultContractIdentity(result);
+				if (row.identity !== undefined && row.identity !== identity) continue;
+				row.state = "unmet";
+				row.reason = compactResultReason("결과가 확정되기 전에 실행이 종료되었습니다.");
+				row.identity = identity;
+				row.origin = "attempt";
+				delete row.attemptId;
+				this.#bindConsumed(row, prepared);
+				delete row.remedy;
+			delete row.retryRoute;
+				delete row.unblock;
+				delete row.contentVersion;
+				delete row.reviewTree;
+				changed = true;
+			}
+		}
+		own.attempts.clear();
+		if (this.#invalidateConsumers(own)) changed = true;
+		return changed;
 	}
 
 	/** Writes the final record and releases the lease; only runs after owned work has settled. */
 	async #finalize(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext | undefined): Promise<RunRecord | undefined> {
 		if (this.#own !== own) return undefined;
+		// A settlement that entered `settleAttempt` after the caller's live-work check is still current evidence. Keep the
+		// run stopping and let the drain timer retry; the final record never lands on top of a record still being written.
+		if (own.settling.size > 0) {
+			this.#deferFinalize(own);
+			return undefined;
+		}
 		this.#own = undefined;
 		// A late child event or dialog answer now finds no watcher for this run, so it cannot mark the next one.
 		phaseWatchers.delete(own.record.runId);
@@ -1473,20 +2770,39 @@ export class RunController {
 		this.#flushTimer = undefined;
 		liveWriters.delete(own.record.runId);
 		const ledger = endLedgerRun(own.record.runId);
+		// No verified close can race an attempt whose terminal metadata never arrived: the row is unmet, and the run
+		// records the honest no-progress end instead of a stale verification label.
+		this.#closePendingAttempts(own);
+		this.#syncConfigRefusals(own);
+		this.#syncResults(own);
+		// Every final record carries current evidence, not the row's last accepted state: a later write may have
+		// reverted a shared change or removed the retained patch, even when the producing lane is no longer planned.
+		// Vanished evidence reopens the row and what consumed its version; a verified label additionally requires every
+		// row to still be accepted after that re-read.
+		await this.#revokeUnlocatedAccepted(own);
+		let finalReason: RunEndReason =
+			reason === "verified" && (own.record.results ?? []).some(row => row.state !== "accepted") ? "no-progress" : reason;
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
-		const seen = this.deps.agents?.(own.record.runId) ?? [];
+		const seen = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		// A team with doc consistency off asked for no doc findings, so none are counted.
 		const agents = docsEnabled(own.config) ? seen : seen.map(withoutDocFindings);
 		// Read while the run's spawn map still binds its failed ids: a lane is pending only from authoritative state.
-		const pendingLanes =
-			own.record.plan === undefined ? [] : own.lanes.remaining(own.record.plan, agents, this.#failedIds(own, agents));
+		// A settled worker is not a finished requirement: an open result row keeps its lane, including a consumer whose
+		// producer changed after the last attempt (T05).
+		const pendingNames = new Set(
+			own.record.plan === undefined ? [] : own.lanes.remaining(own.record.plan, agents, this.#failedIds(own, agents)),
+		);
+		for (const row of own.record.results ?? []) {
+			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) pendingNames.add(row.lane);
+		}
+		const pendingLanes = (own.record.plan?.lanes ?? []).filter(lane => pendingNames.has(lane.name)).map(lane => lane.name);
 		spawnsByRun.delete(own.record.runId);
 		clearRunReads(own.record.runId);
 		const record: RunRecord = {
 			...own.record,
 			endedAt: iso(this.deps.now()),
-			status: ledger?.exceeded ? "budget-exceeded" : END_STATUS[reason],
-			endReason: reason,
+			status: ledger?.exceeded ? "budget-exceeded" : END_STATUS[finalReason],
+			endReason: finalReason,
 			costUsd: ledger?.costUsd ?? own.record.costUsd,
 			costByModel: { ...(ledger?.costByModel ?? own.record.costByModel) },
 			spawns,
@@ -1500,9 +2816,9 @@ export class RunController {
 		const card = isSubstantiveRun(record) ? closeoutCard(record, pendingLanes, requiredChecks) : undefined;
 		try {
 			await this.#liveWrite;
-			// Only runs this machine recorded are ever cleaned later: run records in the repo are not trusted for paths.
+			// Only runs this session recorded are ever cleaned later: its own store is not another session's.
 			if (record.artifactsDir && record.process) {
-				await recordTrustedRun(own.store.dir, {
+				await recordTrustedRun(own.sessionDir, {
 					runId: record.runId,
 					artifactsDir: record.artifactsDir,
 					process: record.process,
@@ -1512,13 +2828,13 @@ export class RunController {
 			}
 			// A shutdown (no ctx) must not wait on file cleanup; the next run's end catches up.
 			const cleaned = ctx ? await this.#cleanUp(own, record, agents, ctx) : [];
-			await writeRun(own.root, record);
-			await appendRunIndex(own.root, summarizeForIndex(record)).catch(() => undefined);
+			await writeRun(own.sessionDir, record);
+			await appendRunIndex(own.sessionDir, summarizeForIndex(record)).catch(() => undefined);
 			// The idle status line reads the last run from disk: report only once the final record is there.
 			if (ctx) this.#liveStatus(ctx, undefined);
-			const protect = await protectedResumeRunIds(own.store.dir, own.root).catch(() => []);
-			await pruneRuns(own.root, RUN_KEEP, protect);
-			if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now());
+			const protect = await protectedResumeRunIds(own.sessionDir).catch(() => []);
+			await pruneRuns(own.sessionDir, RUN_KEEP, protect);
+			if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now(), own.sessionDir);
 			// An automatic probe stays out of the main transcript while it is routine; a blocked spawn is not routine, and
 			// the live status line already carried the rest. The substantive card waits for the lease release below.
 			const quietAuto =
@@ -1535,7 +2851,7 @@ export class RunController {
 		// identity that differs from the one that directed the run is the same case even when the reason was not shutdown.
 		const showingSession = ctx === undefined ? undefined : closeoutSessionId(ctx);
 		const sameSession = own.sessionId === showingSession;
-		if (ctx !== undefined && reason !== "shutdown" && sameSession && card !== undefined) {
+		if (ctx !== undefined && finalReason !== "shutdown" && sameSession && card !== undefined) {
 			const registered = rememberCloseoutReport(ctx, record.runId, card.options);
 			const hint = ctx.mode === "tui" && registered ? `\n\n${CLOSEOUT_CHOICE_HINT}` : "";
 			try {
@@ -1557,27 +2873,56 @@ export class RunController {
 		}
 	}
 
+	/**
+	 * Upgrades this run's target claim from a safe reader to an unbounded writer. The caller must stop the run on
+	 * failure, because a read lease that cannot write must not let a write-capable effect proceed.
+	 */
+	async #upgradeLease(own: OwnRun): Promise<{ ok: true } | { ok: false; reason: string }> {
+		const lease = own.lease;
+		if (lease === undefined) return { ok: false, reason: "실행 잠금이 없어 쓰기 권한을 확인하지 못했습니다." };
+		if (lease.mode === "write") return { ok: true };
+		try {
+			return await lease.upgrade({ scope: { kind: "unbounded" } });
+		} catch (error) {
+			return { ok: false, reason: `쓰기 권한을 확인하지 못했습니다: ${errorText(error)}` };
+		}
+	}
+
 	/** Storm's limits and, when the team allows it, omp records of older runs' parked agents; best-effort. */
 	async #cleanUp(own: OwnRun, record: RunRecord, agents: AgentEntry[], ctx: ExtensionContext): Promise<string[]> {
 		try {
-			// Consent and trials come from the approval in force now too: a consent withdrawn mid-run stops deletion.
-			const state = await this.deps.loadState(ctx);
-			const gate = teamGate(state);
+			// A switched context no longer speaks for this run's owner. Only the same native session, the same captured
+			// store and the same target may supply the current cleanup consent; otherwise the start slate is used with
+			// cleanup disabled. Never reload another session's approval to authorize destructive work on this one.
+			const liveCtx = closeoutSessionId(ctx) === own.sessionId ? ctx : undefined;
+			const state = liveCtx === undefined ? undefined : await this.deps.loadState(liveCtx).catch(() => undefined);
+			const sameOwner =
+				state !== undefined &&
+				state.sessionDir === own.sessionDir &&
+				state.repo.repoId === own.repoId &&
+				state.repo.root === own.root;
+			const gate = sameOwner ? teamGate(state) : undefined;
 			const agentDir = this.deps.agentDir;
+			const consent = gate?.ok === true && agentDir !== undefined;
+			// The captured store must still resolve to this profile/session before a cleanup walks or writes it. A
+			// redirected or legacy path skips destructive cleanup entirely.
+			try {
+				await assertSessionStoreSafe(own.sessionDir);
+			} catch {
+				return [];
+			}
 			const { result, cleaned } = await runJanitor({
-				root: own.root,
-				storeDir: state.store.dir,
+				sessionDir: own.sessionDir,
 				// Without a known agent dir nothing of omp's is deleted: the config below then carries no consent.
 				sessionsRoot: agentDir ? path.join(agentDir, "sessions") : "",
-				config: gate.ok && agentDir ? gate.config : withoutCleanup(gate.ok ? gate.config : own.config),
+				config: consent && gate.ok ? gate.config : withoutCleanup(own.config),
 				startConfig: own.config,
-				configHash: gate.ok ? gate.hash : own.record.configHash,
+				configHash: gate?.ok ? gate.hash : own.record.configHash,
 				runId: own.record.runId,
 				process: own.record.process ?? processKey(),
 				now: this.deps.now(),
-				ledger: this.deps.ledger?.() ?? agents,
-				approvals: state.store,
-				...(agentDir ? { agentDir } : {}),
+				ledger: this.deps.ledger?.(own.sessionDir) ?? agents,
+				...(consent ? { approvals: own.store } : {}),
 			});
 			if (result.agents || result.stormFiles) record.cleanup = result;
 			return cleaned;
@@ -1597,6 +2942,9 @@ export class RunController {
 	}
 
 	#scheduleFlush(own: OwnRun): void {
+		// A finalized run owns no live record: the final write already happened (or is happening) and no late mutation
+		// may schedule a rewrite on top of it.
+		if (this.#own !== own) return;
 		if (this.#flushTimer) return;
 		this.#flushTimer = setTimeout(() => {
 			this.#flushTimer = undefined;
@@ -1604,7 +2952,7 @@ export class RunController {
 			// A run that finished meanwhile has already written its final record.
 			if (!live || this.#own !== own) return;
 			this.#liveStatus(own.ctx, live);
-			this.#liveWrite = writeRun(own.root, { ...live, updatedAt: iso(this.deps.now()) }).catch(() => undefined);
+			this.#liveWrite = writeRun(own.sessionDir, { ...live, updatedAt: iso(this.deps.now()) }).catch(() => undefined);
 		}, this.deps.flushMs ?? LIVE_FLUSH_MS);
 		this.#flushTimer.unref?.();
 	}
@@ -1653,6 +3001,8 @@ const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
 	"disabled-role": "쓰지 않는 역할",
 	"no-plan": "계획 없음",
 	"role-not-in-plan": "계획에 없는 역할",
+	"unmapped-agent": "계획에 매핑되지 않은 에이전트",
+	"unassigned-lane": "계획 레인 미배정",
 	"role-cap": "역할 워커 상한",
 	parallelism: "동시 상한",
 	budget: "예산 초과",

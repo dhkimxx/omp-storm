@@ -44,23 +44,29 @@ export function activeTrialFor(
 }
 
 /**
- * Spawn key (omp names the subagent after it, so it is the agent id) → the trial its spawn was routed to.
- * Module-level on purpose: the subagent's own session reports its spend through this same module.
+ * Spawn key (omp names the subagent after it, so it is the agent id) → the trial its spawn was routed to, per owner
+ * session store. Module-level on purpose: the subagent's own session reports its spend through this same module. The
+ * scope keeps two profiles or native sessions from charging one session's trial for another's same-named agent.
  */
 const routedAgents = new Map<string, string>();
 
-/** Remembers that the spawn with this key was routed to a trial candidate. */
-export function noteTrialSpawn(spawnKey: string, trialId: string): void {
-	routedAgents.set(spawnKey, trialId);
+function routedKey(scope: string, spawnKey: string): string {
+	return `${scope}\u0000${spawnKey}`;
+}
+
+/** Remembers that the spawn with this key was routed to a trial candidate under `scope`. */
+export function noteTrialSpawn(spawnKey: string, trialId: string, scope: string): void {
+	routedAgents.set(routedKey(scope, spawnKey), trialId);
 }
 
 /**
  * The trial whose budget a message of `agentId` on model `selector` counts against: only subagents whose spawn was
- * routed to the trial, and only while they run the candidate (a routed agent may fall back to the role's own models).
- * The main session, other roles on the same model and work outside the trial are never charged.
+ * routed to the trial under the same session store, and only while they run the candidate (a routed agent may fall
+ * back to the role's own models). The main session, other roles on the same model and work outside the trial are
+ * never charged. Without a scope entry, nothing is charged.
  */
-export function trialCharge(agentId: string, selector: string, config: Pick<StormConfig, "trials">): string | undefined {
-	const trialId = routedAgents.get(agentId);
+export function trialCharge(agentId: string, selector: string, config: Pick<StormConfig, "trials">, scope: string): string | undefined {
+	const trialId = routedAgents.get(routedKey(scope, agentId));
 	if (trialId === undefined) return undefined;
 	const trial = config.trials?.find(t => t.id === trialId);
 	return trial && parseModelEntry(trial.model).selector === selector ? trialId : undefined;

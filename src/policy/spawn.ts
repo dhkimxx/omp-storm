@@ -198,6 +198,30 @@ function roleCapBlock(config: StormConfig, runtime: SpawnRuntime, roleId: string
 	};
 }
 
+/**
+ * A role spawn needs a concrete plan lane and a host spawn key so its lane capability and result owner can be bound.
+ * The exact lane name may be rewritten by automatic placement before the host allocates the key; the extension's lane
+ * admission resolves that assignment, so this guard only refuses a plan with no lane for the role or a keyless spawn.
+ */
+function laneBindingBlock(runtime: SpawnRuntime, roleId: string, agent: string, spawnKey: string | undefined): SpawnBlock | undefined {
+	const plan = runtime.run?.plan;
+	if (!plan) return undefined;
+	const eligible = plan.lanes.filter(lane => lane.role === roleId);
+	if (eligible.length === 0) {
+		return {
+			code: "unassigned-lane",
+			reason: `실행 계획에 ${roleTitle(roleId)} 역할 레인이 없어 ${agent} 스폰을 배정할 수 없습니다. plan으로 그 역할의 레인을 만들거나 맞는 역할의 에이전트를 쓰세요.`,
+		};
+	}
+	if (spawnKey === undefined) {
+		return {
+			code: "unassigned-lane",
+			reason: `호스트가 스폰 키를 주지 않아 ${agent} 을(를) 계획 레인에 배정할 수 없습니다. task 항목마다 계획 레인 이름을 붙여 다시 스폰하세요.`,
+		};
+	}
+	return undefined;
+}
+
 /** The record of a refused spawn: what was asked for, the block's code and what the model was told. */
 export function blockedSpawn(event: SpawnEvent, refusal: SpawnBlock, now: number): SpawnRecord {
 	return {
@@ -238,14 +262,28 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		if (!checked.ok) return block(checked.block);
 		const overBudget = budgetBlock(runtime);
 		if (overBudget) return block(overBudget);
-		// omp's bundled agents do a role's work, so they take that role's slots like its storm-* agent does.
+		// omp's bundled agents do a role's work, so they take that role's slots like its storm-* agent does. The role id
+		// counts even when the team has no usable definition for it: without a lane for that role, nothing may spawn.
 		const builtinKey = BUILTIN_AGENT_ROLES[event.agent];
 		const builtin = builtinKey === undefined ? undefined : usableRole(checked.config, builtinKey);
-		const counted: Partial<SpawnRecord> = builtinKey !== undefined && builtin ? { role: builtinKey } : {};
+		const counted: Partial<SpawnRecord> = builtinKey === undefined ? {} : { role: builtinKey };
+		// A native agent outside omp's known role substitutes has no lane, role cap or capability decision. During a
+		// run that is an unattributed writer, not an ordinary spawn: refuse it rather than guess from its model or name.
+		const unmapped: SpawnBlock | undefined =
+			builtinKey === undefined
+				? {
+						code: "unmapped-agent",
+						reason: `실행 중에는 계획 레인에 매핑된 에이전트만 스폰할 수 있습니다. ${event.agent} 은(는) 팀 역할에 매핑되지 않아 쓰기 권한과 결과 소유자를 정할 수 없습니다. 팀의 storm-* 에이전트를 쓰거나 plan으로 역할이 있는 레인을 지정하세요.`,
+					}
+				: undefined;
 		const runBlock =
 			planBlock(runtime) ??
-			(counted.role === undefined ? undefined : roleCapBlock(checked.config, runtime, counted.role, event.agent)) ??
-			totalBlock(checked.config, runtime);
+			unmapped ??
+			(counted.role === undefined
+				? undefined
+				: (roleCapBlock(checked.config, runtime, counted.role, event.agent) ??
+					totalBlock(checked.config, runtime) ??
+					laneBindingBlock(runtime, counted.role, event.agent, event.spawnKey)));
 		if (runBlock) return block(runBlock, counted);
 		const requested = stripEffort(event.patterns[0] ?? "");
 		if (approvedSelectors(checked.config).has(requested)) {
@@ -314,7 +352,11 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	}
 	const overBudget = budgetBlock(runtime);
 	if (overBudget) return block(overBudget, { role: roleKey });
-	const runBlock = planBlock(runtime) ?? roleCapBlock(config, runtime, requestedRole, event.agent) ?? totalBlock(config, runtime);
+	const runBlock =
+		planBlock(runtime) ??
+		roleCapBlock(config, runtime, requestedRole, event.agent) ??
+		totalBlock(config, runtime) ??
+		laneBindingBlock(runtime, requestedRole, event.agent, event.spawnKey);
 	if (runBlock) return block(runBlock, { role: roleKey });
 
 	const ordered = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));

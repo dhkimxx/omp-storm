@@ -10,12 +10,12 @@ import type { AgentEntry, AnalysisContext, RunPlan, RunSpec } from "../types.ts"
 export type RunRequestResult = { ok: true; runId: string } | { ok: false; reason: string };
 
 /**
- * The personal automatic-delegation policy of the main session owning a tool call. Consent is read from the
- * approval store, never derived from team approval: a blocked state keeps the main session's direct tools blocked
- * instead of silently falling back to them.
+ * The personal automatic-delegation policy of the native main session that owns a tool call. Consent is read from
+ * that session's own store, never derived from team approval: a blocked state keeps the main session's direct tools
+ * blocked instead of silently falling back to them.
  */
 export interface AutoDelegationState {
-	/** The user's explicit opt-in for this profile and repository. */
+	/** The user's explicit opt-in for this native session. */
 	enabled: boolean;
 	/** Why an automatic run cannot start now (team config/approval or an omp mode); absent when it can. */
 	blocked?: string;
@@ -41,8 +41,11 @@ export interface StormToolHost extends DecideHost {
 		 * commit, so a refused replan neither opens nor saves a team change.
 		 */
 		replanConflict?(plan: RunPlan): string | undefined;
-		/** Puts a validated plan in force for the active run (replacing any earlier one); fails when no run is active. */
-		setRunPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string };
+		/**
+		 * Puts a validated plan in force for the active run (replacing any earlier one); fails when no run is active.
+		 * A write-capable plan upgrades the target lease, so the runtime may answer asynchronously.
+		 */
+		setRunPlan(plan: RunPlan): { ok: true } | { ok: false; reason: string } | Promise<{ ok: true } | { ok: false; reason: string }>;
 		/**
 		 * Holds the director's closeout for this session's current run until it settles; a later brief replaces it.
 		 * Optional for hosts without the closeout runtime, which the tool then refuses.

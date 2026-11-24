@@ -1,16 +1,17 @@
 /**
- * Run-end janitor: Storm code, not an LLM worker. It trims Storm's own stores to their limits and, only when the team
- * approved `cleanup`, removes the omp records (transcripts, sidecars, tombstones, nested transcripts) of parked
- * subagents of older Storm runs. Outputs (`*.md`) always stay, so `agent://<id>` keeps answering.
+ * Run-end janitor: Storm code, not an LLM worker. It trims this session's own stores to their limits and, only when
+ * the team approved `cleanup`, removes the omp records (transcripts, sidecars, tombstones, nested transcripts) of
+ * parked subagents of older Storm runs. Outputs (`*.md`) always stay, so `agent://<id>` keeps answering.
  *
- * Deletion paths never come from the repo: run records under `.omp/storm/` sit in the work tree and can be committed
- * by anyone. Candidates come only from the per-machine trusted list next to the repo's approval records
- * (`<store.dir>/runs.jsonl`), which only this machine's Storm writes at run end.
+ * Every Storm path here comes from the captured native session's store, never from the target work tree, the current
+ * cwd or another session. Deletion candidates come only from that store's trusted list (`<sessionDir>/state/runs.jsonl`),
+ * which only this machine's Storm writes at run end. Reset and retention never enumerate another session's artifacts.
  */
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { readJsonl, serialized, writeTextAtomic } from "../fsutil.ts";
+import { assertSessionPathSafe } from "../session-scope.ts";
 import type { AgentEntry, CleanupResult, RunRecord, StorageDetailLine, StormConfig } from "../types.ts";
 import { readRun, runIds, stateDir, writeRun } from "./run.ts";
 import { pruneTrialStates } from "./state-files.ts";
@@ -25,7 +26,7 @@ export interface ApprovalPrunePort {
 	prune(keepHash: string | null): Promise<number>;
 }
 
-/** One line of `<store.dir>/runs.jsonl`: a Storm run this machine ran, and where its subagents' records live. */
+/** One line of `<sessionDir>/state/runs.jsonl`: a Storm run this session ran, and where its subagents' records live. */
 export interface TrustedRun {
 	runId: string;
 	/** The main session's artifacts dir (`<session>/`), beside its `<session>.jsonl`. */
@@ -41,10 +42,8 @@ export interface TrustedRun {
 }
 
 export interface JanitorInput {
-	/** Project root: Storm's trial counters and run records (stale `running` ones, and the display-only `cleanedAt`). */
-	root: string;
-	/** `ApprovalStore.dir` of this repo: holds the trusted run list. */
-	storeDir: string;
+	/** The captured native session's own store: run records, index, trial counters and the trusted cleanup list. */
+	sessionDir: string;
 	/** `<agentDir>/sessions`: an artifacts dir is accepted only below it. */
 	sessionsRoot: string;
 	/** The approved config in force at run end. */
@@ -61,8 +60,6 @@ export interface JanitorInput {
 	/** This process's agent ledger (`listAgents()`): agents in it that are not parked are live and never cleaned. */
 	ledger: readonly AgentEntry[];
 	approvals?: ApprovalPrunePort;
-	/** omp's agent dir: Storm's retired usage archive below it is removed. Absent → left alone. */
-	agentDir?: string;
 	/** Whether the omp process of a `processKey()` may still run; defaults to a signal-0 probe of its pid. */
 	alive?: (key: string) => boolean;
 }
@@ -110,8 +107,8 @@ async function lstatOrUndefined(file: string): Promise<Stats | undefined> {
 
 // ── Trusted run list ──────────────────────────────────────────────────────────
 
-function trustedRunsFile(storeDir: string): string {
-	return path.join(storeDir, "runs.jsonl");
+function trustedRunsFile(sessionDir: string): string {
+	return path.join(stateDir(sessionDir), "runs.jsonl");
 }
 
 const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(v => typeof v === "string");
@@ -130,25 +127,28 @@ function isTrustedRun(value: unknown): value is TrustedRun {
 	);
 }
 
-/** Trusted runs, oldest first; torn or foreign lines are skipped. */
-export function readTrustedRuns(storeDir: string): Promise<TrustedRun[]> {
-	return readJsonl(trustedRunsFile(storeDir), isTrustedRun);
+/** Trusted runs of this session, oldest first; torn or foreign lines are skipped. */
+export async function readTrustedRuns(sessionDir: string): Promise<TrustedRun[]> {
+	const file = trustedRunsFile(sessionDir);
+	await assertSessionPathSafe(sessionDir, file);
+	return readJsonl(file, isTrustedRun);
 }
 
-function updateTrustedRuns(storeDir: string, update: (runs: TrustedRun[]) => TrustedRun[]): Promise<void> {
-	const file = path.resolve(trustedRunsFile(storeDir));
+function updateTrustedRuns(sessionDir: string, update: (runs: TrustedRun[]) => TrustedRun[]): Promise<void> {
+	const file = path.resolve(trustedRunsFile(sessionDir));
 	return serialized(file, async () => {
-		const next = update(await readTrustedRuns(storeDir)).slice(-TRUSTED_RUNS_MAX);
+		const next = update(await readTrustedRuns(sessionDir)).slice(-TRUSTED_RUNS_MAX);
+		await assertSessionPathSafe(sessionDir, file);
 		await writeTextAtomic(file, next.map(r => `${JSON.stringify(r)}\n`).join(""));
 	});
 }
 
 /**
- * Adds a run to the machine's trusted list, keeping the newest `TRUSTED_RUNS_MAX`. A run already on it is replaced in
+ * Adds a run to this session's trusted list, keeping the newest `TRUSTED_RUNS_MAX`. A run already on it is replaced in
  * place (its age is its first recording) and the ids the janitor already cleaned for it stay cleaned.
  */
-export function recordTrustedRun(storeDir: string, entry: Omit<TrustedRun, "cleaned">): Promise<void> {
-	return updateTrustedRuns(storeDir, runs => {
+export function recordTrustedRun(sessionDir: string, entry: Omit<TrustedRun, "cleaned">): Promise<void> {
+	return updateTrustedRuns(sessionDir, runs => {
 		const next: TrustedRun = { ...entry, agents: [...entry.agents] };
 		const at = runs.findIndex(r => r.runId === entry.runId);
 		if (at < 0) return [...runs, next];
@@ -228,21 +228,16 @@ export async function agentRecordFiles(artifactsDir: string, id: string): Promis
 
 // ── Janitor ───────────────────────────────────────────────────────────────────
 
-/** Removes a directory an earlier Storm version wrote and nothing reads any more; 1 when it existed. */
-async function removeLegacyDir(dir: string): Promise<number> {
-	if (!(await lstatOrUndefined(dir))?.isDirectory()) return 0;
-	await fs.rm(dir, { recursive: true, force: true });
-	return 1;
-}
-
 /**
  * Run records still `running` whose process is gone (a crash, a kill) become `stopped`, ended at their last live
- * write: they then count as the project's last run instead of staying invisible. At session start no process is
- * named, so every record is probed; at a run end the starting process is passed and its other records are stale too.
+ * write: they then count as this session's last run instead of staying invisible. At session start no process is
+ * named, so every record in this session's store is probed; at a run end the starting process is passed and its other
+ * records are stale too. Records of other sessions are never read or written here.
  */
 export interface DeadRunSweep {
-	root: string;
-	/** This process, at a run end: another record of it cannot be live (one run per project). */
+	/** The captured session's store; only its `state/runs/` records are swept. */
+	sessionDir: string;
+	/** This process, at a run end: another record of it cannot be live (one run per session). */
 	process?: string;
 	/** The run that is ending: its record is not swept. */
 	runId?: string;
@@ -251,14 +246,14 @@ export interface DeadRunSweep {
 
 export async function stopDeadRuns(input: DeadRunSweep): Promise<void> {
 	const alive = input.alive ?? processAlive;
-	for (const id of await runIds(input.root)) {
+	for (const id of await runIds(input.sessionDir)) {
 		if (id === input.runId) continue;
-		const record = await readRun(input.root, id);
+		const record = await readRun(input.sessionDir, id);
 		if (record?.status !== "running") continue;
 		// Without a named process every record is probed: a live one stays, a dead one is closed. A record of the named
-		// process itself is stale (one run per project), so it is closed without a probe.
+		// process itself is stale (one run per session), so it is closed without a probe.
 		if (record.process !== undefined && record.process !== input.process && alive(record.process)) continue;
-		await writeRun(input.root, { ...record, status: "stopped", endedAt: record.updatedAt ?? record.startedAt });
+		await writeRun(input.sessionDir, { ...record, status: "stopped", endedAt: record.updatedAt ?? record.startedAt });
 	}
 }
 
@@ -274,11 +269,9 @@ export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 	const alive = input.alive ?? processAlive;
 	if (input.approvals) result.stormFiles += await input.approvals.prune(input.configHash);
 	const trialIds = [...(input.config.trials ?? []), ...(input.startConfig.trials ?? [])].map(t => t.id);
-	result.stormFiles += await pruneTrialStates(input.root, trialIds);
-	result.stormFiles += await removeLegacyDir(path.join(stateDir(input.root), "proposals"));
-	if (input.agentDir) result.stormFiles += await removeLegacyDir(path.join(input.agentDir, "storm", "usage"));
+	result.stormFiles += await pruneTrialStates(input.sessionDir, trialIds);
 	await stopDeadRuns({
-		root: input.root,
+		sessionDir: input.sessionDir,
 		process: input.process,
 		runId: input.runId,
 		...(input.alive ? { alive: input.alive } : {}),
@@ -287,7 +280,7 @@ export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 
 	// Same-process agents absent from the ledger were parked long ago (the ledger only drops parked entries).
 	const live = input.ledger.filter(e => e.state !== "parked").map(e => e.id);
-	const older = (await readTrustedRuns(input.storeDir))
+	const older = (await readTrustedRuns(input.sessionDir))
 		.reverse()
 		.slice(KEEP_RECENT_RUNS)
 		.filter(r => r.runId !== input.runId);
@@ -323,18 +316,18 @@ export async function runJanitor(input: JanitorInput): Promise<JanitorOutput> {
 		if (ids.length) done.set(run.runId, ids);
 	}
 	if (done.size === 0) return { result, cleaned };
-	await updateTrustedRuns(input.storeDir, runs =>
+	await updateTrustedRuns(input.sessionDir, runs =>
 		runs.map(r => {
 			const ids = done.get(r.runId);
 			return ids ? { ...r, cleaned: [...(r.cleaned ?? []), ...ids] } : r;
 		}),
 	);
-	// Display only: the repo's run records show which agents were cleaned.
+	// Display only: this session's run records show which agents were cleaned.
 	for (const [runId, ids] of done) {
-		const record = await readRun(input.root, runId);
+		const record = await readRun(input.sessionDir, runId);
 		if (!record?.agents) continue;
 		const set = new Set(ids);
-		await writeRun(input.root, {
+		await writeRun(input.sessionDir, {
 			...record,
 			agents: record.agents.map(a => (set.has(a.id) && a.cleanedAt === undefined ? { ...a, cleanedAt: input.now } : a)),
 		});
@@ -360,10 +353,10 @@ async function treeBytes(dir: string): Promise<number> {
 	return total;
 }
 
-/** Newest repo run record carrying a cleanup result; display only. */
-async function lastCleanupRecord(root: string): Promise<RunRecord | undefined> {
-	for (const id of (await runIds(root)).reverse()) {
-		const run = await readRun(root, id);
+/** Newest run record of this session carrying a cleanup result; display only. */
+async function lastCleanupRecord(sessionDir: string): Promise<RunRecord | undefined> {
+	for (const id of (await runIds(sessionDir)).reverse()) {
+		const run = await readRun(sessionDir, id);
 		if (run?.cleanup) return run;
 	}
 	return undefined;
@@ -405,7 +398,7 @@ export interface StorageGaps {
 }
 
 export interface StorageView {
-	/** `.omp/storm/` plus this repo's approval records. */
+	/** This native session's Storm store: config, approvals for its target, runs, index and counters. */
 	stormBytes: number;
 	/** Distinct physical child record files under the scanned session roots. */
 	total: StorageFiles;
@@ -422,8 +415,8 @@ export interface StorageView {
 }
 
 export interface StorageReadOptions {
-	/** The current project's OMP session dir (holding `<session>.jsonl` files and their `<session>/` dirs). */
-	sessionDir?: string;
+	/** The current native session's omp transcript/artifact dir (holding `<session>.jsonl` files and `<session>/` dirs). */
+	ompSessionDir?: string;
 	/** Whether the approved config currently permits cleanup; only then are older trusted records candidates. */
 	cleanup?: boolean;
 	/** This process; defaults to `processKey()`. */
@@ -584,24 +577,23 @@ function storageGroup(owners: readonly FileOwner[], cleanup: boolean): StorageGr
 }
 
 /** What the status storage line shows; reads only stat and directory metadata, never a transcript. */
-export async function readStorage(root: string, storeDir: string, sessionsRoot: string, options: StorageReadOptions = {}): Promise<StorageView> {
-	const [local, approvals, trusted, last] = await Promise.all([
-		treeBytes(path.join(root, ".omp", "storm")),
-		treeBytes(storeDir),
-		readTrustedRuns(storeDir),
-		lastCleanupRecord(root),
-	]);
+export async function readStorage(
+	sessionDir: string,
+	sessionsRoot: string,
+	options: StorageReadOptions = {},
+): Promise<StorageView> {
+	const [local, trusted, last] = await Promise.all([treeBytes(sessionDir), readTrustedRuns(sessionDir), lastCleanupRecord(sessionDir)]);
 	const cleanup = options.cleanup === true;
 	const me = options.process ?? processKey();
 	const alive = options.alive ?? processAlive;
-	const sessionDir = options.sessionDir === "" ? undefined : options.sessionDir;
+	const ompSessionDir = options.ompSessionDir === "" ? undefined : options.ompSessionDir;
 	const gaps: StorageGaps = { sessionsRoot: false, project: false, staleSessions: 0, trustRoots: 0, roots: 0, entries: 0, symlinks: 0, scanned: 0 };
 	const plans = new Map<string, RootPlan>();
 	const projectParents: Stats[] = [];
 	const scope = await sessionsScope(sessionsRoot);
 	if (scope === undefined) {
 		gaps.sessionsRoot = true;
-		if (sessionDir !== undefined) gaps.currentSession = "invalid";
+		if (ompSessionDir !== undefined) gaps.currentSession = "invalid";
 		else gaps.currentSession = "unnamed";
 	} else {
 		const recentStart = Math.max(0, trusted.length - KEEP_RECENT_RUNS);
@@ -626,9 +618,9 @@ export async function readStorage(root: string, storeDir: string, sessionsRoot: 
 				plan.agents.set(id, agents);
 			}
 		}
-		if (sessionDir === undefined) gaps.currentSession = "unnamed";
+		if (ompSessionDir === undefined) gaps.currentSession = "unnamed";
 		else {
-			const project = await acceptedDirBelow(sessionDir, scope);
+			const project = await acceptedDirBelow(ompSessionDir, scope);
 			if ("reason" in project) gaps.currentSession = project.reason;
 			else {
 				let entries: Dirent[] = [];
@@ -791,7 +783,7 @@ export async function readStorage(root: string, storeDir: string, sessionsRoot: 
 	}
 
 	const view: StorageView = {
-		stormBytes: local + approvals,
+		stormBytes: local,
 		total,
 		groups,
 		unclassifiedReasons,
@@ -886,7 +878,7 @@ export function storageDetailLines(view: StorageView, cleanupOn: boolean): Stora
 	const add = (text: string, warning = false): void => {
 		out.push(warning ? { text, warning: true } : { text });
 	};
-	add(`Storm 데이터: ${bytesText(view.stormBytes)} (.omp/storm + 승인 기록)`);
+	add(`Storm 세션 데이터: ${bytesText(view.stormBytes)} (이 세션의 저장소)`);
 	if (view.gaps.scanned === 0 && !view.gaps.project) {
 		add(`omp 자식 기록: 측정 불가(${gapText(view.gaps) ?? "측정할 세션 폴더 없음"})`, true);
 		add(cleanupText(view));

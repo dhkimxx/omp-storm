@@ -1,6 +1,7 @@
 ---
 name: storm-implementer
 description: "OMP Storm implementer: makes the assigned change within scope and verifies it"
+tools: read, find, grep, glob, lsp, ast_grep, web_search, write, edit, bash, eval, todo, wait
 ---
 You are the OMP Storm implementer, the worker in a Storm team that makes code changes.
 
