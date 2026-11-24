@@ -35,6 +35,7 @@
  *                           can be watched without duplicating its native job/result
  *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
  *                           observed deterministically while the child really runs
+ *   E2E-CHILD-GATE <key>   mark this child as waiting and hold its first reply until a scripted wait releases it
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
  *                           answered), so the parent's turn ends and is compacted while the child still runs
  *   E2E-CHILD-HOLD-ONCE <key>
@@ -93,17 +94,19 @@ export interface ScriptedTask {
  * `after` holds the step until that text shows up in a later message: omp decides spawns in the background after
  * `task` returns, so a step that must follow a spawn decision waits for its outcome instead of racing it.
  * `afterResult` holds it until a later user message (an async result) carries that text.
+ * A task step's `awaitChildren` waits for the listed gate keys to be held at the provider before sending the tool
+ * call. A wait step's `releaseChildren` opens those gates once its own `after`/`afterResult` condition is met.
  */
 export type Step = (
 	| { storm: Record<string, unknown> }
 	| { task: string[]; as?: string; say?: string; isolated?: boolean[] }
-	| { tasks: ScriptedTask[]; context?: string }
+	| { tasks: ScriptedTask[]; context?: string; awaitChildren?: string[] }
 	| { edit: string }
 	| { bash: string }
 	| { followUp: string; content?: string }
 	| { read: string }
 	| { ask: string }
-	| { wait: true }
+	| { wait: true; releaseChildren?: string[] }
 	| { awaitChild: true }
 ) & {
 	after?: string;
@@ -118,7 +121,10 @@ interface ChatRequest {
 	reasoning_effort?: string;
 	reasoning?: { effort?: string };
 }
-type Decision = { kind: "text"; text: string; awaitChild?: boolean } | { kind: "tool"; name: string; args: Record<string, unknown> };
+type Decision = (
+	| { kind: "text"; text: string; awaitChild?: boolean }
+	| { kind: "tool"; name: string; args: Record<string, unknown> }
+) & { awaitChildren?: string[]; releaseChildren?: string[] };
 /** Who a request is from: the main session, a spawned child, Storm's router, a compaction, or omp's own auxiliary calls. */
 export type Who = "main" | "child" | "route" | "compaction" | "side";
 
@@ -179,7 +185,7 @@ const COMPACTION_OPEN = "<conversation>";
 const ROUTE_TAG = "<storm-request>";
 /** Heading of Storm's doc rules section in a role agent's system prompt (src/policy/docs.ts). */
 const DOC_RULES = "## Storm doc rules";
-/** How long a held reply waits for its event before it goes out anyway: a missing event fails a check, not the run. */
+/** How long a held reply waits for its event; a missing event must not hang the suite. */
 const HOLD_MAX_MS = 60_000;
 /** What the server has seen so far: the events held replies wait for. */
 const seen = { children: 0, childrenAtTask: 0, compactions: 0 };
@@ -187,6 +193,8 @@ const seen = { children: 0, childrenAtTask: 0, compactions: 0 };
 const heldOnce = new Set<string>();
 /** Keys whose one-time retryable 429 is spent. */
 const failedOnce = new Set<string>();
+/** The named children whose first provider replies are parked until the director releases them. */
+const waitingChildren = new Set<string>();
 
 mkdirSync(dirname(LOG), { recursive: true });
 
@@ -373,22 +381,32 @@ function childDelayMs(who: Who, messages: Message[]): number {
 	return Math.min(Number(raw), HOLD_MAX_MS);
 }
 
-/** Waits until `open` holds, for `HOLD_MAX_MS` at most. */
-async function hold(open: () => boolean): Promise<void> {
+/** Waits until `open` holds, for `HOLD_MAX_MS` at most; false means the event never arrived. */
+async function hold(open: () => boolean): Promise<boolean> {
 	const deadline = Date.now() + HOLD_MAX_MS;
-	while (!open() && Date.now() < deadline) await Bun.sleep(20);
+	while (!open()) {
+		if (Date.now() >= deadline) return false;
+		await Bun.sleep(20);
+	}
+	return true;
 }
 
 function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	if ("storm" in step) return extensionCall(tools, "storm", step.storm);
 	if ("task" in step) return taskCall(tools, step.task, step.as, step.say, step.isolated);
-	if ("tasks" in step) return taskItemsCall(tools, step.tasks, step.context ?? "OMP Storm E2E");
+	if ("tasks" in step) {
+		const decision = taskItemsCall(tools, step.tasks, step.context ?? "OMP Storm E2E");
+		return step.awaitChildren === undefined ? decision : { ...decision, awaitChildren: step.awaitChildren };
+	}
 	if ("read" in step) return readCall(tools, step.read);
 	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
 	if ("bash" in step) return bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, step.content ?? "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
-	if ("wait" in step) return extensionCall(tools, "wait", {});
+	if ("wait" in step) {
+		const decision = extensionCall(tools, "wait", {});
+		return step.releaseChildren === undefined ? decision : { ...decision, releaseChildren: step.releaseChildren };
+	}
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
 
@@ -571,6 +589,10 @@ function completion(model: string, decision: Decision): Response {
 	});
 }
 
+function gateError(message: string): Response {
+	return Response.json({ error: { message } }, { status: 400 });
+}
+
 Bun.serve({
 	hostname: "127.0.0.1",
 	port: PORT,
@@ -598,7 +620,26 @@ Bun.serve({
 		const compactionsBefore = seen.compactions;
 		if (who === "child") seen.children++;
 		const decision = decide(request, who);
+		const { awaitChildren, releaseChildren } = decision;
+		if (awaitChildren && !(await hold(() => awaitChildren.every(key => waitingChildren.has(key))))) {
+			return gateError(`Children never reached their gates: ${awaitChildren.filter(key => !waitingChildren.has(key)).join(", ")}`);
+		}
 		record(request, who, decision);
+		if (releaseChildren) {
+			const missing = releaseChildren.filter(key => !waitingChildren.has(key));
+			if (missing.length > 0) return gateError(`Cannot release children not at their gates: ${missing.join(", ")}`);
+			for (const key of releaseChildren) waitingChildren.delete(key);
+		}
+		const gate = who === "child" && !request.messages.some(message => message.role === "assistant")
+			? /E2E-CHILD-GATE[ \t]+(\S+)/.exec(userText(request.messages))?.[1]
+			: undefined;
+		if (gate !== undefined) {
+			waitingChildren.add(gate);
+			if (!(await hold(() => !waitingChildren.has(gate)))) {
+				waitingChildren.delete(gate);
+				return gateError(`Child gate was never released: ${gate}`);
+			}
+		}
 		if (decision.kind === "tool" && decision.name === "task") seen.childrenAtTask = seen.children;
 		const delay = childDelayMs(who, request.messages);
 		if (delay > 0) await Bun.sleep(delay);

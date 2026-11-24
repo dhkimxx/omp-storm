@@ -59,11 +59,36 @@ interface Tool {
 	): Promise<{ details: { outcome: string }; content?: Array<{ type: string; text?: string }> }>;
 }
 
+const fakeSessionShutdowns: Array<(kind: Agent["kind"]) => Promise<void>> = [];
+
+async function shutdownFakeSessions(): Promise<void> {
+	const shutdowns = fakeSessionShutdowns.splice(0);
+	// A main session keeps its worktree lease while its workers are running, so close children first.
+	for (const kind of ["sub", "main"] as const) {
+		for (const shutdown of shutdowns) await shutdown(kind);
+	}
+}
+
 /** One session's omp as the extension sees it. Only `git` really runs; the `omp` CLI fails, as in `makeProject`. */
 function fakeOmp(project: TestProject) {
 	const handlers = new Map<string, Handler[]>();
 	const sent: string[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
+	const sessions = new Map<string, ExtensionContext>();
+	const rememberSession = (ctx: ExtensionContext): void => {
+		sessions.set(`${ctx.agent.kind}:${ctx.agent.id}`, ctx);
+	};
+	const emit = async (event: string, payload: unknown, on: ExtensionContext): Promise<unknown> => {
+		rememberSession(on);
+		let answer: unknown;
+		for (const handler of handlers.get(event) ?? []) answer ??= await handler(payload, on);
+		return answer;
+	};
+	fakeSessionShutdowns.push(async kind => {
+		for (const session of sessions.values()) {
+			if (session.agent.kind === kind) await emit("session_shutdown", {}, session);
+		}
+	});
 	const statuses: Array<string | undefined> = [];
 	/** Answers to the next dialogs, by position; empty means the user dismissed them. */
 	const answers: Array<string | undefined | ((options: string[]) => string | undefined | Promise<string | undefined>)> = [];
@@ -196,22 +221,20 @@ function fakeOmp(project: TestProject) {
 		},
 		sessionId: () => mainSessionId,
 		activeTools: () => active,
-		/** Fires an omp event; the first handler result that is not undefined is omp's answer. */
-		emit: async (event: string, payload: unknown, on: ExtensionContext): Promise<unknown> => {
-			let answer: unknown;
-			for (const handler of handlers.get(event) ?? []) answer ??= await handler(payload, on);
-			return answer;
-		},
+		emit,
 		command: (args: string, on: ExtensionContext) => {
 			if (!command) throw new Error("the /storm command is not registered");
+			rememberSession(on);
 			return command(args, on);
 		},
 		tool: async (params: unknown, on: ExtensionContext): Promise<string> => {
 			if (!tool) throw new Error("the storm tool is not registered");
+			rememberSession(on);
 			return (await tool.execute("call-1", params, undefined, undefined, on)).details.outcome;
 		},
 		toolReply: async (params: unknown, on: ExtensionContext): Promise<{ outcome: string; text: string }> => {
 			if (!tool) throw new Error("the storm tool is not registered");
+			rememberSession(on);
 			const reply = await tool.execute("call-1", params, undefined, undefined, on);
 			return { outcome: reply.details.outcome, text: reply.content?.find(part => part.type === "text")?.text ?? "" };
 		},
@@ -242,11 +265,16 @@ beforeEach(async () => {
 afterEach(async () => {
 	vi.useRealTimers();
 	setSystemTime();
-	resetLedger();
-	resetAgents();
-	resetTrialSpawns();
-	resetCloseoutChoices();
-	await project.remove();
+	try {
+		// Release real leases while the project still exists. Linux can reuse its directory inode in the next test.
+		await shutdownFakeSessions();
+	} finally {
+		resetLedger();
+		resetAgents();
+		resetTrialSpawns();
+		resetCloseoutChoices();
+		await project.remove();
+	}
 });
 
 const approve = async (config: StormConfig) => approveAndSave(await loadProjectState(project.env), config, { shadowedAgents: [] });
@@ -431,12 +459,33 @@ describe("a run through the hooks", () => {
 		expect(settings.calls()).toBe(1);
 	});
 
+	test("closing the fake host releases its real lease even with an unfinished child session", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("fix it", main);
+		const plan = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
+		expect(plan.text).toContain("실행 계획을 적용했습니다");
+		const runId = activeLedgerRun(project.sessionDir)?.runId;
+		admitChild(runId, "Impl");
+		await child.emit("before_agent_start", { systemPrompt: [] }, child.ctx(sub("Impl")));
+		expect(listAgents({ scope: project.sessionDir })).toMatchObject([{ id: "Impl", state: "running" }]);
+
+		await shutdownFakeSessions();
+		expect(await readRun(project.sessionDir, runId as string)).toMatchObject({ status: "stopped", endReason: "shutdown" });
+		const reopened = fakeOmp(project);
+		await reopened.command("fix it again", reopened.ctx(MAIN));
+		expect(reopened.sent, JSON.stringify(reopened.transcript)).toHaveLength(1);
+	});
+
 	test("worker capability is enforced from the effective tools, and nested fencing is run-scoped", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.command("review task", main);
+		expect(omp.sent, JSON.stringify(omp.transcript)).toHaveLength(1);
 		expect(
 			await omp.tool(
 				{

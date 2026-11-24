@@ -354,6 +354,9 @@ npm run e2e      # 가짜 LLM 서버로 실제 omp에서 확인(유료 호출 �
 npm run e2e:tui  # 같은 확인을 터미널 UI에서
 ```
 
+- 훅 테스트는 임시 작업 트리를 지우기 전에 OMP 세션 종료 이벤트를 보내 실행 잠금을 해제합니다. Linux는 삭제된 디렉터리의 inode를 다음 테스트에 재사용할 수 있습니다.
+- RPC 병렬 상한 테스트는 워커가 실제로 동시에 실행 중일 때 초과 요청을 보내고, 거절을 확인한 뒤 워커를 종료시킵니다.
+
 - 설계와 결정: [docs/design.md](docs/design.md)
 - 열린 결정, 확인하지 못한 것, 이후 할 일: [docs/next.md](docs/next.md)
 - 변경 기록: [CHANGELOG.md](CHANGELOG.md), 버전별 배경과 근거: [docs/history.md](docs/history.md)

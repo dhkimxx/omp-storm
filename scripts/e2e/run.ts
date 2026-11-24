@@ -1031,6 +1031,10 @@ async function main(): Promise<void> {
 				{ name: "review-a", kind: "review", role: "reviewer" },
 				{ name: "review-b", kind: "review", role: "reviewer" },
 			];
+			const gateKey = (lane: string): string => `spawn-cap-${lane}`;
+			const holdLane = (lane: string): string => `E2E-CHILD-GATE ${gateKey(lane)} ${READ_AND_CLAIM}`;
+			const roleBoundary = ["read-a", "read-b"].map(gateKey);
+			const teamBoundary = ["read-d", "write"].map(gateKey);
 			const run = await runOf(
 				rpc,
 				files,
@@ -1048,25 +1052,26 @@ async function main(): Promise<void> {
 					// Boundary request: both explorer lanes fit the plan's two workers.
 					{
 						tasks: [
-							{ name: "read-a", agent: "storm-explorer", say: READ_AND_CLAIM },
-							{ name: "read-b", agent: "storm-explorer", say: READ_AND_CLAIM },
+							{ name: "read-a", agent: "storm-explorer", say: holdLane("read-a") },
+							{ name: "read-b", agent: "storm-explorer", say: holdLane("read-b") },
 						],
 					},
-					// While both are live, the third concrete lane exceeds the role's planned workers.
-					{ tasks: [{ name: "read-c", agent: "storm-explorer", say: READ_AND_CLAIM }] },
-					{ wait: true },
+					// Reach the provider with both first replies held before making the overflow request.
+					{ tasks: [{ name: "read-c", agent: "storm-explorer", say: READ_AND_CLAIM }], awaitChildren: roleBoundary },
+					// Keep both alive through the asynchronous spawn decision, then let native wait drain them.
+					{ wait: true, afterResult: "Background job read-c has completed.", releaseChildren: roleBoundary },
 					// Boundary request for the team: one fresh explorer + one implementer fill parallelism 2.
 					{
 						tasks: [
-							{ name: "read-d", agent: "storm-explorer", say: READ_AND_CLAIM },
-							{ name: "write", agent: "storm-implementer", say: READ_AND_CLAIM },
+							{ name: "read-d", agent: "storm-explorer", say: holdLane("read-d") },
+							{ name: "write", agent: "storm-implementer", say: holdLane("write") },
 						],
 					},
-					// While those two are live, one more concrete lane exceeds the team's parallelism.
-					{ tasks: [{ name: "review-a", agent: "storm-reviewer" }] },
-					{ wait: true },
-					// The refusal did not poison the run: a fresh valid request after it still starts.
-					{ tasks: [{ name: "review-b", agent: "storm-reviewer" }] },
+					// The fresh reviewer role has capacity, but the two held children fill the team.
+					{ tasks: [{ name: "review-a", agent: "storm-reviewer", say: "E2E-CAP-REVIEW-A" }], awaitChildren: teamBoundary },
+					{ wait: true, afterResult: "Background job review-a has completed.", releaseChildren: teamBoundary },
+					// Native wait has returned both settlements, so a distinct reviewer lane can now start.
+					{ tasks: [{ name: "review-b", agent: "storm-reviewer", say: "E2E-CAP-REVIEW-B" }] },
 					{ task: ["storm-architect"], as: "Arch" },
 					{ task: ["storm-quick"], as: "Quick" },
 					{ wait: true },
@@ -1077,6 +1082,22 @@ async function main(): Promise<void> {
 			const routed = run.spawns.filter(spawn => spawn.outcome !== "blocked");
 			const routedLanes = routed.map(spawn => spawn.lane);
 			const detail = JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.lane, spawn.outcome, spawn.code]));
+			const modelRequests = llm.all();
+			const taskRequestIndex = (lane: string): number => modelRequests.findIndex(entry => {
+				const tasks = entry.decision.args?.tasks;
+				return entry.who === "main" && entry.decision.tool === "task" && Array.isArray(tasks) && tasks.some(task => task.name === lane);
+			});
+			const probeSawLivePair = (lane: string, keys: string[]): boolean => {
+				const probe = taskRequestIndex(lane);
+				return probe >= 0 && keys.every(key => {
+					const isChild = (entry: LlmEntry): boolean => entry.who === "child" && entry.lastUser.includes(`E2E-CHILD-GATE ${key} `);
+					const first = modelRequests.findIndex(isChild);
+					const next = modelRequests.findIndex((entry, index) => index > first && isChild(entry));
+					return first >= 0 && first < probe && next > probe;
+				});
+			};
+			const postWait = modelRequests[taskRequestIndex("review-b")]?.lastTool ?? "";
+			const childRequests = children(modelRequests);
 			check("no plan yet: the spawn starts no child and says no-plan", blockCodes(run).includes("no-plan") && results.includes("[storm:no-plan]") && !routed.some(spawn => spawn.spawnKey === "Early0"), detail);
 			check(
 				"a batch naming an unknown lane starts nothing, not even its valid first item",
@@ -1085,7 +1106,7 @@ async function main(): Promise<void> {
 			);
 			check(
 				"the boundary request at the role's planned workers starts both concrete explorer lanes",
-				routedLanes.includes("read-a") && routedLanes.includes("read-b") && children(llm.all()).length >= 2,
+				routedLanes.includes("read-a") && routedLanes.includes("read-b") && probeSawLivePair("read-c", roleBoundary),
 				detail,
 			);
 			check(
@@ -1095,13 +1116,17 @@ async function main(): Promise<void> {
 			);
 			check(
 				"the boundary request at the team's parallelism starts both concrete lanes",
-				routedLanes.includes("read-d") && routedLanes.includes("write"),
+				routedLanes.includes("read-d") && routedLanes.includes("write") && probeSawLivePair("review-a", teamBoundary),
 				detail,
 			);
 			check(
 				"one more live lane than the team's parallelism is refused with parallelism, and a later valid request starts",
-				reasons.includes("[storm:parallelism]") && run.spawns.find(spawn => spawn.spawnKey === "review-a")?.code === "parallelism" && run.spawns.filter(spawn => spawn.lane === "review-b" && spawn.outcome !== "blocked").length === 1,
-				`${detail} reasons=${reasons.slice(0, 300)}`,
+				reasons.includes("[storm:parallelism]") && run.spawns.find(spawn => spawn.spawnKey === "review-a")?.code === "parallelism" &&
+					!childRequests.some(kid => kid.lastUser.includes("E2E-CAP-REVIEW-A")) &&
+					postWait.includes("### read-d [task] — completed") && postWait.includes("### write [task] — completed") &&
+					run.spawns.filter(spawn => spawn.lane === "review-b" && spawn.outcome !== "blocked").length === 1 &&
+					childRequests.some(kid => kid.lastUser.includes("E2E-CAP-REVIEW-B")),
+				`${detail} wait=${postWait.slice(0, 700)} reasons=${reasons.slice(0, 300)}`,
 			);
 			check(
 				"a disabled role and a role without a lane are denied without starting a child",

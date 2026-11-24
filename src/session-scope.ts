@@ -56,21 +56,25 @@ function isWithin(child: string, parent: string): boolean {
 	return child === parent || child.startsWith(parent + path.sep);
 }
 
-/** The physical location of an existing managed path; undefined when no ordinary component exists. */
+/** Resolve an existing path, distinguishing a missing entry from an unresolved link. */
 async function resolvedIfExists(target: string): Promise<string | undefined> {
 	try {
 		return await realpath(target);
 	} catch (error) {
-		if (errorCode(error) !== "ENOENT") throw new Error("세션 저장소의 관리 경로를 안전하게 확인할 수 없습니다");
-		const exists = await lstat(target).then(
-			() => true,
-			(e: unknown) => {
-				if (errorCode(e) === "ENOENT") return false;
-				throw new Error("세션 저장소의 관리 경로를 안전하게 확인할 수 없습니다");
-			},
-		);
-		if (exists) throw new Error("세션 저장소의 관리 경로에 확인할 수 없는 연결이 있습니다");
-		return undefined;
+		if (errorCode(error) !== "ENOENT") throw new Error("세션 저장소 경로의 연결을 안전하게 확인할 수 없습니다");
+	}
+	try {
+		await lstat(target);
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") return undefined;
+		throw new Error("세션 저장소 경로의 연결을 안전하게 확인할 수 없습니다");
+	}
+	// A first write may have published this entry between realpath and lstat. Resolve it before treating it as a broken link.
+	try {
+		return await realpath(target);
+	} catch (error) {
+		if (errorCode(error) === "ENOENT") throw new Error("세션 저장소 경로에 확인할 수 없는 연결이 있습니다");
+		throw new Error("세션 저장소 경로의 연결을 안전하게 확인할 수 없습니다");
 	}
 }
 
@@ -83,24 +87,12 @@ async function physicalPath(target: string): Promise<string> {
 	let current = path.resolve(target);
 	const tail: string[] = [];
 	for (;;) {
-		try {
-			const resolved = await realpath(current);
-			return tail.length === 0 ? resolved : path.join(resolved, ...tail);
-		} catch (error) {
-			if (errorCode(error) !== "ENOENT") throw new Error("세션 저장소 경로의 연결을 안전하게 확인할 수 없습니다");
-			const exists = await lstat(current).then(
-				() => true,
-				(e: unknown) => {
-					if (errorCode(e) === "ENOENT") return false;
-					throw new Error("세션 저장소 경로의 연결을 안전하게 확인할 수 없습니다");
-				},
-			);
-			if (exists) throw new Error("세션 저장소 경로에 확인할 수 없는 연결이 있습니다");
-			const parent = path.dirname(current);
-			if (parent === current) return path.resolve(target);
-			tail.unshift(path.basename(current));
-			current = parent;
-		}
+		const resolved = await resolvedIfExists(current);
+		if (resolved !== undefined) return tail.length === 0 ? resolved : path.join(resolved, ...tail);
+		const parent = path.dirname(current);
+		if (parent === current) return path.resolve(target);
+		tail.unshift(path.basename(current));
+		current = parent;
 	}
 }
 
