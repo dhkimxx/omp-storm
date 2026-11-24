@@ -17,12 +17,16 @@
  * A recorded owner's death is never proof its detached child process group ended. This module therefore never deletes
  * a fence merely because the recorded parent PID is gone; it refuses to start, names the fence path and asks a human
  * to verify that no child remains before removing it. Queue waiting is finite and uses the job's own timeout.
+ *
+ * A caller that holds the target's write lease can also set `targetFence`. For each attempt that reaches the spawn
+ * point, a durable marker is written in the same host-global namespace, keyed by the target's `stat` dev+ino rather
+ * than by a declared resource key. It survives an OMP crash or an unproven child and is removed only after OS proof or
+ * before a child exists. `targetJobBlock` is the read-only guard a new run uses before touching that target.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	canonicalResourceKey,
@@ -37,6 +41,18 @@ import {
 } from "../config/schema.ts";
 import type { ConfiguredJob } from "../types.ts";
 import { MAX_CHECK_OUTPUT_BYTES, runBoundedProcess, type BoundedProcessResult, type CheckOutput } from "./checks.ts";
+import {
+	acquireTargetMarker,
+	ensureLockDir,
+	errorCode,
+	HOST,
+	isFenceOwner,
+	ownerState,
+	PROCESS_START,
+	releaseTargetMarker,
+	type FenceOwner,
+	type TargetMarker,
+} from "./job-fence.ts";
 
 /** Per-job wall clock when the approved config sets none. */
 export const DEFAULT_JOB_TIMEOUT_MS = 10 * 60_000;
@@ -46,20 +62,27 @@ const LOCK_SCHEMA = "storm.job-resource/v1";
 /** Lock records are small; anything larger is not one of ours and must not be parsed. */
 const MAX_LOCK_RECORD_BYTES = 16_384;
 const LOCK_POLL_MS = 25;
-const MAX_HOST_LENGTH = 255;
-const TOKEN_RE = /^[A-Za-z0-9-]{8,128}$/;
-
-const HOST = (() => {
-	const hostname = os.hostname();
-	if (hostname.length > 0 && hostname.length <= MAX_HOST_LENGTH && !/[\u0000-\u001f\u007f]/.test(hostname)) {
-		return hostname;
-	}
-	return "unknown-host";
-})();
-const PROCESS_START = Math.round(performance.timeOrigin);
 const EMPTY_OUTPUT: Readonly<CheckOutput> = Object.freeze({ tail: "", totalBytes: 0, truncated: false });
 
 export type JobStatus = "passed" | "failed" | "timed-out" | "cancelled" | "spawn-error" | "unrun";
+
+/** Why a job never produced a child. The caller decides which of these are retryable waits and which are blockers. */
+export type JobUnrunCause =
+	| "queue-timeout"
+	| "owner-dead"
+	| "owner-unknown"
+	| "record-invalid"
+	| "revoked"
+	| "cancelled"
+	| "invalid";
+
+export type JobFenceCause = "process-unproven" | "lock-unreleased";
+
+/** A fence retained by this attempt, with every file a human or a later proof must release. */
+export interface JobFence {
+	cause: JobFenceCause;
+	paths: readonly string[];
+}
 
 /**
  * What one configured job did. `argv` is deliberately absent: the caller already bound the approved name to an
@@ -83,10 +106,13 @@ export interface JobExecutionReceipt {
 	/** A short fixed explanation (timeout, cancellation, lock uncertainty); never raw command output. */
 	detail?: string;
 	/**
-	 * True only when the child's end could not be confirmed, so resource fences were intentionally left in place.
-	 * Absent means every acquired fence was released or no fence was needed.
+	 * Present only when this attempt kept a fence: `process-unproven` when the child's end could not be confirmed,
+	 * `lock-unreleased` when the child ended or never started but a lock file stayed. Absent means everything was
+	 * released or no fence was needed.
 	 */
-	fenceRetained?: true;
+	fence?: JobFence;
+	/** Present only with `status: "unrun"`; typed at the source, never parsed back from `detail`. */
+	unrunCause?: JobUnrunCause;
 }
 
 export interface RunConfiguredJobInput {
@@ -103,23 +129,23 @@ export interface RunConfiguredJobInput {
 	/** Cancels both queue waiting and the running process group. */
 	signal?: AbortSignal;
 	/**
+	 * Set only when the caller holds the target's write lease and wants a durable per-spawn marker in the host-global
+	 * fence namespace. The marker is keyed by the canonical target identity (stat dev+ino) and is written after the
+	 * resource locks and before `canStart`. It survives an OMP crash or an unproven child and is removed only after the
+	 * OS proves the child ended or before any child exists.
+	 */
+	targetFence?: true;
+	/**
 	 * Revalidated after every lock is held and immediately before spawning. Return false when the selection, approval,
 	 * plan or tree changed while this attempt waited; the job is then `unrun` and every lock is released.
 	 */
 	canStart?: () => boolean | Promise<boolean>;
 }
 
-interface JobLockOwner {
-	token: string;
-	pid: number;
-	host: string;
-	processStart: number;
-}
-
 interface ResourceLockRecord {
 	schema: typeof LOCK_SCHEMA;
 	key: string;
-	owner: JobLockOwner;
+	owner: FenceOwner;
 	acquiredAt: string;
 }
 
@@ -134,15 +160,6 @@ type LockRead =
 	| { kind: "invalid"; detail: string }
 	| { kind: "valid"; record: ResourceLockRecord };
 
-type OwnerState = "alive" | "dead" | "unknown";
-
-function errorCode(error: unknown): string {
-	if (typeof error === "object" && error !== null && "code" in error && typeof error.code === "string") {
-		return error.code.slice(0, 40);
-	}
-	return "알 수 없는 오류";
-}
-
 function joinDetails(...details: Array<string | undefined>): string | undefined {
 	const parts = details.filter((detail): detail is string => detail !== undefined && detail !== "");
 	return parts.length === 0 ? undefined : parts.join(" · ");
@@ -153,7 +170,15 @@ function isAborted(signal: AbortSignal | undefined): boolean {
 	return signal?.aborted === true;
 }
 
-function emptyReceipt(name: string, detail: string, fenceRetained = false): JobExecutionReceipt {
+function fenceOf(cause: JobFenceCause, paths: readonly string[]): JobFence {
+	return { cause, paths: Object.freeze([...new Set(paths)]) };
+}
+
+function emptyReceipt(
+	name: string,
+	detail: string,
+	extra: { unrunCause: JobUnrunCause; fence?: JobFence },
+): JobExecutionReceipt {
 	return {
 		name,
 		status: "unrun",
@@ -165,14 +190,15 @@ function emptyReceipt(name: string, detail: string, fenceRetained = false): JobE
 		stdout: EMPTY_OUTPUT,
 		stderr: EMPTY_OUTPUT,
 		detail,
-		...(fenceRetained ? { fenceRetained: true as const } : {}),
+		unrunCause: extra.unrunCause,
+		...(extra.fence === undefined ? {} : { fence: extra.fence }),
 	};
 }
 
 function executedReceipt(
 	name: string,
 	result: BoundedProcessResult,
-	extra: { detail?: string | undefined; fenceRetained?: boolean },
+	extra: { detail?: string | undefined; fence?: JobFence },
 ): JobExecutionReceipt {
 	const detail = joinDetails(result.note, extra.detail);
 	return {
@@ -186,7 +212,7 @@ function executedReceipt(
 		stdout: result.stdout,
 		stderr: result.stderr,
 		...(detail === undefined ? {} : { detail }),
-		...(extra.fenceRetained === true ? { fenceRetained: true as const } : {}),
+		...(extra.fence === undefined ? {} : { fence: extra.fence }),
 	};
 }
 
@@ -256,67 +282,13 @@ function canonicalResourceKeys(
 	return { ok: true, keys: Object.freeze([...unique].sort()) };
 }
 
-function lockBaseDir(): string {
-	const uid = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-	// A fixed base, not `os.tmpdir()`: TMPDIR can differ between sessions and would split one user's fences into
-	// overlapping namespaces. macOS and Linux have a host-global /tmp; other supported hosts use the OS temp dir.
-	const base = process.platform === "darwin" || process.platform === "linux" ? "/tmp" : os.tmpdir();
-	return path.join(base, `omp-storm-jobs-${uid}`, "v1");
-}
-
-/**
- * Creates the host-global per-user lock directory 0700 and accepts an existing one only when it is a real directory
- * private to this user. A looser directory is refused rather than tightening a path someone else may control.
- */
-async function ensureLockDir(): Promise<{ ok: true; dir: string } | { ok: false; detail: string }> {
-	const dir = lockBaseDir();
-	try {
-		await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-	} catch (error) {
-		return { ok: false, detail: `자원 잠금 디렉터리를 만들 수 없습니다 (${errorCode(error)})` };
-	}
-	let real: string;
-	try {
-		real = await fs.realpath(dir);
-	} catch (error) {
-		return { ok: false, detail: `자원 잠금 디렉터리를 확인할 수 없습니다 (${errorCode(error)})` };
-	}
-	try {
-		const st = await fs.stat(real, { bigint: true });
-		if (!st.isDirectory()) return { ok: false, detail: "자원 잠금 경로가 디렉터리가 아닙니다" };
-		if (typeof process.getuid === "function" && Number(st.uid) !== process.getuid()) {
-			return { ok: false, detail: "자원 잠금 디렉터리의 소유자가 이 사용자가 아닙니다" };
-		}
-		if ((Number(st.mode) & 0o077) !== 0) {
-			return { ok: false, detail: "자원 잠금 디렉터리가 이 사용자 전용이 아닙니다 (0700 필요)" };
-		}
-	} catch (error) {
-		return { ok: false, detail: `자원 잠금 디렉터리를 확인할 수 없습니다 (${errorCode(error)})` };
-	}
-	return { ok: true, dir: real };
-}
-
 function lockPathFor(dir: string, key: string): string {
 	return path.join(dir, `${createHash("sha256").update(key).digest("hex")}.lock`);
 }
 
 function isLockRecord(value: unknown, key: string): value is ResourceLockRecord {
 	if (!isRecord(value) || value.schema !== LOCK_SCHEMA || value.key !== key) return false;
-	const owner = value.owner;
-	if (!isRecord(owner)) return false;
-	if (typeof owner.token !== "string" || !TOKEN_RE.test(owner.token)) return false;
-	if (typeof owner.pid !== "number" || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
-	if (
-		typeof owner.host !== "string" ||
-		owner.host.length === 0 ||
-		owner.host.length > MAX_HOST_LENGTH ||
-		/[\u0000-\u001f\u007f]/.test(owner.host)
-	) {
-		return false;
-	}
-	if (typeof owner.processStart !== "number" || !Number.isFinite(owner.processStart) || owner.processStart <= 0) {
-		return false;
-	}
+	if (!isFenceOwner(value.owner)) return false;
 	return typeof value.acquiredAt === "string" && Number.isFinite(Date.parse(value.acquiredAt));
 }
 
@@ -354,25 +326,6 @@ async function readLockRecord(lockPath: string, key: string): Promise<LockRead> 
 		return { kind: "invalid", detail: `잠금 파일을 확인할 수 없습니다 (${errorCode(error)})` };
 	} finally {
 		await handle.close().catch(() => undefined);
-	}
-}
-
-/**
- * Conservative liveness. Another host is `unknown` (this namespace is local only) and an unreadable probe is
- * `unknown`. `dead` is not permission to reclaim: a detached child process group can outlive the recorded parent, so
- * only `alive` keeps waiting; both `dead` and `unknown` return a manual verification path.
- */
-function ownerState(owner: JobLockOwner): OwnerState {
-	if (owner.host !== HOST) return "unknown";
-	if (owner.pid === process.pid) return owner.processStart === PROCESS_START ? "alive" : "dead";
-	try {
-		process.kill(owner.pid, 0);
-		return "alive";
-	} catch (error) {
-		const code = errorCode(error);
-		if (code === "ESRCH") return "dead";
-		if (code === "EPERM") return "alive";
-		return "unknown";
 	}
 }
 
@@ -438,7 +391,7 @@ async function acquireResourceLock(
 	signal: AbortSignal | undefined,
 	deadline: number,
 	queueTimeoutMs: number,
-): Promise<{ ok: true; held: HeldLock } | { ok: false; detail: string }> {
+): Promise<{ ok: true; held: HeldLock } | { ok: false; cause: JobUnrunCause; detail: string }> {
 	const lockPath = lockPathFor(dir, key);
 	const record: ResourceLockRecord = {
 		schema: LOCK_SCHEMA,
@@ -447,13 +400,16 @@ async function acquireResourceLock(
 		acquiredAt: new Date().toISOString(),
 	};
 	const written = await writeLockRecord(dir, key, record);
-	if (!written.ok) return written;
+	if (!written.ok) return { ok: false, cause: "invalid", detail: written.detail };
 	try {
 		for (;;) {
-			if (isAborted(signal)) return { ok: false, detail: "자원을 기다리는 중에 취소되었습니다" };
+			if (isAborted(signal)) {
+				return { ok: false, cause: "cancelled", detail: "자원을 기다리는 중에 취소되었습니다" };
+			}
 			if (performance.now() >= deadline) {
 				return {
 					ok: false,
+					cause: "queue-timeout",
 					detail: `자원 ${key} 대기 시간 한도 ${queueTimeoutMs}ms를 넘었습니다. 다른 실행이 그 자원을 쓰고 있는지 확인하세요: ${lockPath}`,
 				};
 			}
@@ -461,7 +417,7 @@ async function acquireResourceLock(
 			try {
 				linked = await publishLock(written.tmp, lockPath);
 			} catch (error) {
-				return { ok: false, detail: `자원 잠금을 만들 수 없습니다 (${errorCode(error)})` };
+				return { ok: false, cause: "invalid", detail: `자원 잠금을 만들 수 없습니다 (${errorCode(error)})` };
 			}
 			if (linked) {
 				return { ok: true, held: { path: lockPath, key, token: record.owner.token } };
@@ -471,6 +427,7 @@ async function acquireResourceLock(
 			if (current.kind === "invalid") {
 				return {
 					ok: false,
+					cause: "record-invalid",
 					detail: `자원 ${key}의 잠금 기록을 확인할 수 없습니다: ${lockPath} (${current.detail}). 실행 중인 자식 프로세스가 없는지 확인한 뒤 이 잠금 파일을 직접 지우세요.`,
 				};
 			}
@@ -481,22 +438,25 @@ async function acquireResourceLock(
 				if (waitMs <= 0) {
 					return {
 						ok: false,
+						cause: "queue-timeout",
 						detail: `자원 ${key} 대기 시간 한도 ${queueTimeoutMs}ms를 넘었습니다. 다른 실행이 그 자원을 쓰고 있는지 확인하세요: ${lockPath}`,
 					};
 				}
 				if (!(await waitForResource(waitMs, signal))) {
-					return { ok: false, detail: "자원을 기다리는 중에 취소되었습니다" };
+					return { ok: false, cause: "cancelled", detail: "자원을 기다리는 중에 취소되었습니다" };
 				}
 				continue;
 			}
 			if (state === "dead") {
 				return {
 					ok: false,
+					cause: "owner-dead",
 					detail: `자원 ${key}의 잠금 소유자(pid ${owner.pid}, 호스트 ${owner.host})가 종료된 것으로 보이지만, 그 프로세스가 띄운 자식 프로세스 그룹이 아직 실행 중일 수 있어 자동으로 지우지 않았습니다. 실행 중인 자식이 없는지 확인한 뒤 이 잠금 파일을 직접 지우세요: ${lockPath}`,
 				};
 			}
 			return {
 				ok: false,
+				cause: "owner-unknown",
 				detail: `자원 ${key}의 잠금 소유자(pid ${owner.pid}, 호스트 ${owner.host})가 종료됐는지 확인할 수 없습니다. 실행 중인 자식이 없는지 확인한 뒤 이 잠금 파일을 직접 지우세요: ${lockPath}`,
 			};
 		}
@@ -525,21 +485,26 @@ async function releaseResourceLock(held: HeldLock): Promise<{ ok: true } | { ok:
 
 async function releaseLocks(
 	held: readonly HeldLock[],
-): Promise<{ fenceRetained: boolean; detail?: string }> {
+): Promise<{ paths: readonly string[]; detail?: string }> {
+	const paths: string[] = [];
 	const failures: string[] = [];
 	for (const lock of held) {
 		const released = await releaseResourceLock(lock);
-		if (!released.ok) failures.push(released.detail);
+		if (released.ok) continue;
+		paths.push(lock.path);
+		failures.push(released.detail);
 	}
-	if (failures.length === 0) return { fenceRetained: false };
-	return { fenceRetained: true, detail: failures.join(" · ") };
+	return { paths, ...(failures.length === 0 ? {} : { detail: failures.join(" · ") }) };
 }
 
 /**
- * Runs one approved job under its caller-supplied resource keys. The job is `unrun` when validation, lock
- * acquisition, a dead/unreadable fence, bounded queue waiting, cancellation or `canStart` stops it before a child
- * exists. A running child, including one ended by timeout or abort, reports the OS outcome; its resource fences are
- * released only after `close`, and kept with `fenceRetained: true` when teardown cannot prove the end.
+ * Runs one approved job under its caller-supplied resource keys and, when the caller holds the target's write lease,
+ * one durable target marker. The job is `unrun` when validation, lock acquisition, a dead/unreadable fence, bounded
+ * queue waiting, cancellation or `canStart` stops it before a child exists; `unrunCause` says which. A running child,
+ * including one ended by timeout or abort, reports the OS outcome. Fences are released only after the OS proves the
+ * end (or before any child exists), and a failed release is reported as `lock-unreleased` with every exact path. When
+ * teardown cannot prove the end, the receipt says `process-unproven`; a later `close` releases only this attempt's
+ * exact tokens, and never on a timeout or a dead PID alone.
  */
 export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<JobExecutionReceipt> {
 	const job = input.job;
@@ -548,35 +513,51 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 		const name = typeof job === "object" && job !== null && typeof job.name === "string"
 			? job.name.slice(0, MAX_CHECK_NAME_LENGTH)
 			: "";
-		return emptyReceipt(name, issue);
+		return emptyReceipt(name, issue, { unrunCause: "invalid" });
 	}
 	const name = job.name;
 	const keys = canonicalResourceKeys(input.resourceKeys);
-	if (!keys.ok) return emptyReceipt(name, keys.detail);
+	if (!keys.ok) return emptyReceipt(name, keys.detail, { unrunCause: "invalid" });
 	if (typeof input.cwd !== "string" || input.cwd.trim() === "") {
-		return emptyReceipt(name, "작업 디렉터리가 비어 있습니다");
+		return emptyReceipt(name, "작업 디렉터리가 비어 있습니다", { unrunCause: "invalid" });
 	}
-	if (isAborted(input.signal)) return emptyReceipt(name, "취소되었습니다");
+	if (isAborted(input.signal)) return emptyReceipt(name, "취소되었습니다", { unrunCause: "cancelled" });
 
 	const timeoutMs = job.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
 	const held: HeldLock[] = [];
-	const stopBeforeSpawn = async (detail: string): Promise<JobExecutionReceipt> => {
+	let marker: TargetMarker | undefined;
+	const stopBeforeSpawn = async (cause: JobUnrunCause, detail: string): Promise<JobExecutionReceipt> => {
+		const markerRelease = marker === undefined ? { ok: true as const } : await releaseTargetMarker(marker);
 		const released = await releaseLocks(held);
-		return emptyReceipt(name, joinDetails(detail, released.detail) ?? detail, released.fenceRetained);
+		const paths = [...(markerRelease.ok || marker === undefined ? [] : [marker.path]), ...released.paths];
+		const fullDetail = joinDetails(detail, markerRelease.ok ? undefined : markerRelease.detail, released.detail) ?? detail;
+		return emptyReceipt(name, fullDetail, {
+			unrunCause: cause,
+			...(paths.length === 0 ? {} : { fence: fenceOf("lock-unreleased", paths) }),
+		});
 	};
 
 	if (keys.keys.length > 0) {
 		const prepared = await ensureLockDir();
-		if (!prepared.ok) return emptyReceipt(name, prepared.detail);
+		if (!prepared.ok) return emptyReceipt(name, prepared.detail, { unrunCause: "invalid" });
 		// The job's own timeout also bounds queue waiting; the process gets a fresh full timeout after spawning.
 		const queueDeadline = performance.now() + timeoutMs;
 		for (const key of keys.keys) {
 			const acquired = await acquireResourceLock(prepared.dir, key, input.signal, queueDeadline, timeoutMs);
-			if (!acquired.ok) return stopBeforeSpawn(acquired.detail);
+			if (!acquired.ok) return stopBeforeSpawn(acquired.cause, acquired.detail);
 			held.push(acquired.held);
 		}
 	}
-	if (isAborted(input.signal)) return stopBeforeSpawn("취소되었습니다");
+	if (isAborted(input.signal)) return stopBeforeSpawn("cancelled", "취소되었습니다");
+
+	// After the resource locks and before `canStart`: the controller journals a write-ahead receipt in `canStart`, so a
+	// crash between the two still leaves a target marker for the next run to find.
+	if (input.targetFence === true) {
+		const acquired = await acquireTargetMarker(input.cwd, name);
+		if (!acquired.ok) return stopBeforeSpawn(acquired.cause, acquired.detail);
+		marker = acquired.marker;
+	}
+	if (isAborted(input.signal)) return stopBeforeSpawn("cancelled", "취소되었습니다");
 
 	if (input.canStart !== undefined) {
 		let canStart = false;
@@ -585,9 +566,9 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 		} catch {
 			canStart = false;
 		}
-		if (!canStart) return stopBeforeSpawn("시작 조건이 더 이상 충족되지 않아 실행하지 않았습니다");
+		if (!canStart) return stopBeforeSpawn("revoked", "시작 조건이 더 이상 충족되지 않아 실행하지 않았습니다");
 	}
-	if (isAborted(input.signal)) return stopBeforeSpawn("취소되었습니다");
+	if (isAborted(input.signal)) return stopBeforeSpawn("cancelled", "취소되었습니다");
 
 	let result: BoundedProcessResult;
 	try {
@@ -600,6 +581,7 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 		});
 	} catch (error) {
 		// The shared runner settles instead of throwing; if that ever changes, the child's end is unproven.
+		const paths = [...(marker === undefined ? [] : [marker.path]), ...held.map((lock) => lock.path)];
 		return {
 			name,
 			status: "failed",
@@ -611,15 +593,32 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 			stdout: EMPTY_OUTPUT,
 			stderr: EMPTY_OUTPUT,
 			detail: `프로세스 실행 결과를 받지 못해 자원 잠금을 유지했습니다 (${errorCode(error)})`,
-			fenceRetained: true,
+			fence: fenceOf("process-unproven", paths),
 		};
 	}
 	if (!result.processEnded) {
+		const retained = marker;
+		// `close` is the same OS proof the normal path uses. It can arrive after hard teardown; only this attempt's
+		// exact tokens are released, and only when that proof arrives.
+		void result.ended
+			.then(async () => {
+				if (retained !== undefined) await releaseTargetMarker(retained);
+				await releaseLocks(held);
+			})
+			.catch(() => undefined);
+		const paths = [...(retained === undefined ? [] : [retained.path]), ...held.map((lock) => lock.path)];
 		return executedReceipt(name, result, {
-			detail: "프로세스 종료를 확인하지 못해 자원 잠금을 유지했습니다. 상태를 확인하기 전에는 같은 자원으로 시작하지 마세요",
-			fenceRetained: true,
+			detail: "프로세스 종료를 확인하지 못해 자원 잠금과 대상 표시를 유지했습니다. 상태를 확인하기 전에는 같은 자원으로 시작하지 마세요",
+			fence: fenceOf("process-unproven", paths),
 		});
 	}
+	const markerRelease = marker === undefined ? { ok: true as const } : await releaseTargetMarker(marker);
 	const released = await releaseLocks(held);
-	return executedReceipt(name, result, { detail: released.detail, fenceRetained: released.fenceRetained });
+	const paths = [...(markerRelease.ok || marker === undefined ? [] : [marker.path]), ...released.paths];
+	return executedReceipt(name, result, {
+		detail: joinDetails(markerRelease.ok ? undefined : markerRelease.detail, released.detail),
+		...(paths.length === 0 ? {} : { fence: fenceOf("lock-unreleased", paths) }),
+	});
 }
+
+export { targetJobBlock } from "./job-fence.ts";

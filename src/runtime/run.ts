@@ -1,13 +1,14 @@
+import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
-import { isRecord } from "../config/schema.ts";
 import { shortHash } from "../config/canonical.ts";
-import { readJson, writeJsonAtomic } from "../fsutil.ts";
+import { writeJsonAtomic } from "../fsutil.ts";
 import { assertSessionPathSafe, sessionStateDir } from "../session-scope.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd, usableRole } from "../policy/spawn.ts";
 import { LANE_ROLES, ROLE_STAND_INS, roleTitle, workerRange } from "../roles.ts";
-import type { LaneKind, RoleId, RunPlan, RunRecord, StormConfig } from "../types.ts";
+import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
 import { END_STATUS } from "./rounds.ts";
 
 /** What a lane kind covers beyond its name, where the role alone does not say it. */
@@ -91,11 +92,53 @@ export async function writeRun(sessionDir: string, run: RunRecord): Promise<void
 	await writeJsonAtomic(file, run);
 }
 
+/** One run record is bounded before parsing: a large, replaced or non-regular file is not a record. */
+export const RUN_RECORD_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Reads one run record within a byte bound. The file must be a regular file, is opened without following a symlink,
+ * and the inode must not change between `lstat` and `open`; a record whose size changes while it is read is rejected
+ * rather than parsed as a torn prefix. Unreadable input is "no record", as `readJson` treated it.
+ */
+async function readRunJson(file: string): Promise<unknown> {
+	let before;
+	try {
+		before = await fs.lstat(file);
+	} catch {
+		return undefined;
+	}
+	if (!before.isFile() || before.size > RUN_RECORD_MAX_BYTES) return undefined;
+	let handle: FileHandle;
+	try {
+		handle = await fs.open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+	} catch {
+		return undefined;
+	}
+	try {
+		const after = await handle.stat();
+		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size) return undefined;
+		const buffer = Buffer.alloc(after.size + 1);
+		let read = 0;
+		for (;;) {
+			const next = await handle.read(buffer, read, buffer.length - read, read);
+			if (next.bytesRead === 0) break;
+			read += next.bytesRead;
+			if (read === buffer.length) break;
+		}
+		if (read !== after.size) return undefined;
+		return JSON.parse(buffer.subarray(0, read).toString("utf8"));
+	} catch {
+		return undefined;
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
+
 export async function readRun(sessionDir: string, runId: string): Promise<RunRecord | undefined> {
 	const file = runFile(sessionDir, runId);
 	if (!file) return undefined;
 	await assertSessionPathSafe(sessionDir, file);
-	const value = await readJson(file);
+	const value = await readRunJson(file);
 	return isRunRecord(value) && value.runId === runId ? value : undefined;
 }
 
@@ -171,53 +214,22 @@ export interface ResumeInfo {
 	runId: string;
 	endReason?: string;
 	turns?: number;
-	plan?: RunPlan;
 	/** Length of the stored request: the limit is named when the record itself holds no more. */
 	requestLength?: number;
 	/** The user's words when they asked to resume, not part of the task. */
 	said?: string;
+	/**
+	 * Present when the old record's accepted proof was revalidated into this run: counts of what survives, plus a
+	 * short list of lanes still open. Counts only — the old record is never replayed into the handoff.
+	 */
+	checkpoint?: { kept: number; reopened: number; blocked: number; laneNames?: readonly string[]; planUnavailable?: true };
 }
 
-/** Lanes a resume handoff names: the whole plan would bury the rules. */
-const RESUME_LANES = 12;
-/** One line is all a lane may take in the handoff. */
-const RESUME_LANE_CHARS = 160;
+/** Still-open lanes a restored handoff names, and one name's bound. */
+const RESUME_OPEN_LANES = 8;
+const RESUME_OPEN_LANE_CHARS = 60;
 /** The user's sentence is a note, not a second task. */
 const RESUME_SAID_CHARS = 1_000;
-
-interface ResumeLane {
-	name: string;
-	role: string;
-	goal?: string;
-	/** Why the lane's work is outside the parent tree; a resumed run must not put it back in the shared checkout. */
-	isolationReason?: string;
-}
-
-/** A stored plan is session-store data: only an array of objects with a string name is a plan. */
-function resumeLanes(plan: unknown): ResumeLane[] | undefined {
-	if (!isRecord(plan) || !Array.isArray(plan.lanes)) return undefined;
-	const out: ResumeLane[] = [];
-	for (const lane of plan.lanes) {
-		if (!isRecord(lane) || typeof lane.name !== "string") return undefined;
-		out.push({
-			name: lane.name,
-			role: typeof lane.role === "string" ? lane.role : "",
-			...(typeof lane.goal === "string" && lane.goal.trim() ? { goal: lane.goal } : {}),
-			...(typeof lane.isolationReason === "string" && lane.isolationReason.trim() ? { isolationReason: lane.isolationReason } : {}),
-		});
-	}
-	return out;
-}
-
-/** One plan line: its name and the agent doing it, its goal when it had one, and a separate checkout when it had a reason. */
-function resumeLane(config: StormConfig, lane: ResumeLane): string {
-	const agent = lane.role === "" ? undefined : (usableRole(config, lane.role)?.agent ?? lane.role);
-	const head = agent === undefined ? `- ${lane.name}` : `- ${lane.name} (${agent})`;
-	const isolated = lane.isolationReason === undefined ? "" : ` [separate checkout: ${lane.isolationReason}]`;
-	const line = lane.goal ? `${head}${isolated}: ${lane.goal}` : `${head}${isolated}`;
-	// A stored plan is session-store data: keep control characters and line breaks from adding lines the bounds above do not cover.
-	return line.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").replace(/\s+/g, " ").slice(0, RESUME_LANE_CHARS);
-}
 
 /** The user's sentence in one line, short enough to stay a note. */
 function resumeSaid(said: string | undefined): string | undefined {
@@ -227,28 +239,62 @@ function resumeSaid(said: string | undefined): string | undefined {
 	return `On resuming the user said: ${text}`.slice(0, RESUME_SAID_CHARS);
 }
 
-/** What the director of a resumed run reads before the team: the old run, where it stopped, and the plan it was following. */
-function resumeBlock(config: StormConfig, resume: ResumeInfo): string[] {
-	const allLanes = resumeLanes(resume.plan) ?? [];
-	const lanes = allLanes.slice(0, RESUME_LANES);
-	const turns = resume.turns ?? 0;
-	const rounds = Number.isFinite(turns) ? Math.max(0, Math.trunc(turns)) : 0;
+/** Counts from a stored record are labels: never negative, never fractional, never NaN. */
+function resumeCount(value: number): number {
+	return Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+/** One short still-open lane list; a stored name is a label, so controls and extra lines are removed. */
+function checkpointLanes(names: readonly string[] | undefined): string[] {
+	if (!Array.isArray(names)) return [];
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const name of names) {
+		if (typeof name !== "string") continue;
+		const clean = name
+			.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029<>]/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, RESUME_OPEN_LANE_CHARS);
+		if (clean === "" || seen.has(clean)) continue;
+		seen.add(clean);
+		out.push(clean);
+		if (out.length === RESUME_OPEN_LANES) break;
+	}
+	return out;
+}
+
+/**
+ * What a restored checkpoint contributes: how much proof survived and which lanes are still open. The detailed old
+ * plan is deliberately not replayed — the plan was re-validated and seeded, and imported rows already carry their
+ * evidence; only counts and a short open list help the director choose the next round.
+ */
+function checkpointBlock(checkpoint: NonNullable<ResumeInfo["checkpoint"]>): string[] {
+	const lanes = checkpointLanes(checkpoint.laneNames);
+	return [
+		`Checkpoint restored: kept ${resumeCount(checkpoint.kept)} accepted, reopened ${resumeCount(checkpoint.reopened)}, blocked ${resumeCount(checkpoint.blocked)}.`,
+		...(lanes.length === 0 ? [] : [`Still open: ${lanes.join(", ")}`]),
+	];
+}
+
+/** What the director of a resumed run reads before the team: the old run, where it stopped, and what still holds. */
+function resumeBlock(resume: ResumeInfo): string[] {
+	const rounds = resumeCount(resume.turns ?? 0);
 	// Both came from the session store: an id that is not a run id or a reason this version does not know is not shown.
 	const subject = RUN_ID.test(resume.runId) ? `run ${resume.runId}` : "the earlier run";
 	const reason =
 		resume.endReason !== undefined && Object.hasOwn(END_STATUS, resume.endReason) ? ` (${resume.endReason})` : "";
+	const header = `Continues ${subject}, which stopped${reason} after ${rounds} rounds.`;
 	const said = resumeSaid(resume.said);
-	const isolated = allLanes.some(lane => lane.isolationReason !== undefined);
+	const limit = resume.requestLength === REQUEST_LIMIT ? ["The stored request was cut at 20,000 characters."] : [];
 	return [
-		`Continues ${subject}, which stopped${reason} after ${rounds} rounds. ${
-			isolated
-				? "Its shared-checkout changes are in the working tree or committed. Lanes with a reason used separate checkouts apart from branches; check whether their changes landed here before redoing them."
-				: "Its changes are in the working tree or committed."
-		}`,
-		"First check the current state (git status and diff, the tests), then finish what is left. Do not redo finished work.",
-		...(resume.requestLength === REQUEST_LIMIT ? ["The stored request was cut at 20,000 characters."] : []),
+		header,
+		...(resume.checkpoint === undefined ? [] : checkpointBlock(resume.checkpoint)),
+		resume.checkpoint === undefined || resume.checkpoint.planUnavailable === true
+			? "The old plan could not be restored. Check `storm status` for remaining requirements and submit a plan."
+			: "Finish every open lane; accepted results restored from the checkpoint need no new work. See `storm status` for the current plan and results.",
+		...limit,
 		...(said ? [said] : []),
-		...(lanes.length ? ["Earlier plan:", ...lanes.map(lane => resumeLane(config, lane))] : []),
 	];
 }
 
@@ -302,7 +348,7 @@ export function buildHandoff(input: {
 		const past = config.budget.onExceed === "stop" ? "the run stops" : "new spawns are blocked";
 		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; past it ${past}.`);
 	}
-	const resume = input.resume ? resumeBlock(config, input.resume) : [];
+	const resume = input.resume ? resumeBlock(input.resume) : [];
 	return [
 		`<storm-run id="${input.runId}" config="${shortHash(input.hash)}">`,
 		"Task:",

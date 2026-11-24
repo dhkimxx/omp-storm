@@ -473,7 +473,8 @@ describe("run start", () => {
 			turns: 2,
 			request: "the earlier request",
 			plan: {
-				lanes: [{ name: "login", kind: "code", role: "implementer", goal: "fix the login" }],
+				lanes: [{ name: "login", kind: "code", role: "implementer", goal: "fix the login", files: ["login.ts"],
+					results: [{ id: "login-fix", kind: "change", criterion: "fix the login", path: "login.ts" }] }],
 				workers: { implementer: 1 },
 				submittedAt: "2026-11-19T09:00:00.000Z",
 			},
@@ -482,19 +483,54 @@ describe("run start", () => {
 		await writeRun(h.sessionDir, old);
 		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
 		const runId = await h.start({ task: "carry on", resumeOf: old.runId });
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ request: "carry on", resumeOf: old.runId });
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({
+			request: "carry on", resumeOf: old.runId, plan: { lanes: old.plan!.lanes },
+		});
 		expect(h.sent[0]).toContain(old.runId);
 		expect(h.sent[0]).toContain("(interrupted)");
-		expect(h.sent[0]).toContain("- login (storm-implementer): fix the login");
+		expect(h.sent[0]).toContain("Still open: login");
 		await h.controller.finish("no-changes");
 	});
 
-	test("a resumeOf with no readable record still starts, without a resume block", async () => {
+	test("a continuation with no readable record cannot start work from scratch", async () => {
 		const h = session();
-		const runId = await h.start({ task: "t", resumeOf: "run-20261119-000000-none" });
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ resumeOf: "run-20261119-000000-none" });
-		expect(h.sent[0]).not.toContain("Continues run");
-		await h.controller.finish("no-changes");
+		const result = await h.controller.start(h.ctx, { task: "t", resumeOf: "run-20261119-000000-none" });
+		expect(result).toMatchObject({ ok: false, reason: expect.stringContaining("이전 실행을 읽을 수 없어") });
+		expect(await runIds(h.sessionDir)).toEqual([]);
+	});
+
+	test("a started call with no receipt remains non-replayable across a continuation that omitted its lane", async () => {
+		const marker = path.join(root, "reran");
+		const h = session({
+			config: { ...SESSION_TEAM, jobs: [{ name: "experiment", argv: [process.execPath, "-e",
+				`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "unexpected"); console.log("OK");`] }] },
+		});
+		const old = runRecord({
+			runId: "run-20261119-090000-ab12", status: "stopped", request: "run the experiment", endReason: "interrupted",
+			jobs: [{ lane: "experiment", name: "experiment", status: "started", exitCode: null,
+				startedAt: "2026-11-19T09:00:00.000Z", finishedAt: null, attemptId: "job:run-20261119-090000-ab12:1" }],
+		});
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const middle = await h.start({ task: "continue", resumeOf: old.runId });
+		await h.controller.finish("interrupted");
+
+		const next = await h.start({ task: "continue again", resumeOf: middle });
+		const plan: RunPlan = {
+			submittedAt: "2026-11-20T09:00:00.000Z", workers: {},
+			lanes: [{ name: "experiment", kind: "run", role: "quick", job: "experiment",
+				results: [{ id: "experiment-outcome", kind: "answer", criterion: "record observed outcome", contains: "OK" }] }],
+		};
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		expect(await h.controller.executeJobs(h.ctx, ["experiment"], () => true)).toMatchObject({
+			ok: true, text: expect.stringContaining("재실행하지 않습니다"),
+		});
+		await h.controller.finish("no-progress");
+		expect(existsSync(marker)).toBe(false);
+		expect(await readRun(h.sessionDir, next)).toMatchObject({
+			results: [{ id: "experiment-outcome", state: "unmet", remedy: "blocked" }],
+			jobs: [{ name: "experiment", status: "unknown" }],
+		});
 	});
 
 	test("a start points this machine at its run; the pointer covers the request", async () => {

@@ -11,8 +11,10 @@ import {
 	DEFAULT_JOB_TIMEOUT_MS,
 	type JobExecutionReceipt,
 	runConfiguredJob,
+	targetJobBlock,
 } from "../src/runtime/job-executor.ts";
 import type { ConfiguredJob } from "../src/types.ts";
+import { acquireTargetMarker, releaseTargetMarker } from "../src/runtime/job-fence.ts";
 import { TEAM } from "./support.ts";
 
 const dirs: string[] = [];
@@ -48,7 +50,11 @@ function runJob(
 	job: ConfiguredJob,
 	cwd: string,
 	resourceKeys: readonly string[],
-	options: { signal?: AbortSignal; canStart?: () => boolean | Promise<boolean> } = {},
+	options: {
+		signal?: AbortSignal;
+		canStart?: () => boolean | Promise<boolean>;
+		targetFence?: true;
+	} = {},
 ): Promise<JobExecutionReceipt> {
 	return runConfiguredJob({
 		job,
@@ -56,7 +62,33 @@ function runJob(
 		resourceKeys,
 		...(options.signal === undefined ? {} : { signal: options.signal }),
 		...(options.canStart === undefined ? {} : { canStart: options.canStart }),
+		...(options.targetFence === undefined ? {} : { targetFence: options.targetFence }),
 	});
+}
+
+/** Mirrors the executor's marker key so a test can inspect and remove only its own marker. */
+async function targetInfoFor(root: string): Promise<{ dir: string; identity: string; real: string }> {
+	const basePath = lockRoot();
+	await fs.mkdir(basePath, { recursive: true, mode: 0o700 });
+	const base = await fs.realpath(basePath);
+	const real = await fs.realpath(root);
+	const st = await fs.stat(real, { bigint: true });
+	const identity = st.ino !== 0n ? `dev:${st.dev.toString()}:ino:${st.ino.toString()}` : `path:${real}`;
+	return {
+		dir: path.join(base, "targets", createHash("sha256").update(identity).digest("hex")),
+		identity,
+		real,
+	};
+}
+
+async function targetDirFor(root: string): Promise<string> {
+	return (await targetInfoFor(root)).dir;
+}
+
+async function markerFilesFor(root: string): Promise<string[]> {
+	const dir = await targetDirFor(root);
+	const names = await fs.readdir(dir).catch(() => [] as string[]);
+	return names.filter((name) => name.endsWith(".marker")).map((name) => path.join(dir, name));
 }
 
 async function waitForFile(file: string, timeoutMs = 3_000): Promise<void> {
@@ -207,7 +239,7 @@ describe("runConfiguredJob", () => {
 		expect(receipt.signal).toBeNull();
 		expect(receipt.stdout.tail).toBe("out");
 		expect(receipt.stderr.tail).toBe("boom");
-		expect(receipt.fenceRetained).toBeUndefined();
+		expect(receipt.fence).toBeUndefined();
 	});
 
 	test("output beyond the receipt bound is truncated but its real size is kept", async () => {
@@ -341,8 +373,7 @@ setTimeout(() => { writeFileSync("holder.done", "yes"); process.exit(0); }, 500)
 		controller.abort();
 		const waiting = await waiter;
 		expect(waiting.status).toBe("unrun");
-		expect(waiting.startedAt).toBeNull();
-		expect(waiting.detail).toContain("취소");
+		expect(waiting.unrunCause).toBe("cancelled");
 		expect(await Bun.file(path.join(root, "waiter.ran")).exists()).toBe(false);
 		const held = await holder;
 		expect(held.status).toBe("passed");
@@ -370,6 +401,8 @@ setTimeout(() => { writeFileSync("holder.done", "yes"); process.exit(0); }, 500)
 			[key],
 		);
 		expect(waiter.status).toBe("unrun");
+		expect(waiter.unrunCause).toBe("queue-timeout");
+		expect(waiter.fence).toBeUndefined();
 		expect(waiter.startedAt).toBeNull();
 		expect(waiter.detail).toContain("대기 시간 한도");
 		expect(await Bun.file(path.join(root, "waiter.ran")).exists()).toBe(false);
@@ -401,6 +434,8 @@ setTimeout(() => { writeFileSync("holder.done", "yes"); process.exit(0); }, 200)
 		expect(held.status).toBe("passed");
 		expect(sawHolderDone).toBe(true);
 		expect(waiting.status).toBe("unrun");
+		expect(waiting.unrunCause).toBe("revoked");
+		expect(waiting.fence).toBeUndefined();
 		expect(waiting.detail).toContain("시작 조건");
 		expect(await Bun.file(path.join(root, "waiter.ran")).exists()).toBe(false);
 
@@ -428,7 +463,7 @@ setTimeout(() => {}, 10000);
 			[key],
 		);
 		expect(receipt.status).toBe("timed-out");
-		expect(receipt.fenceRetained).toBeUndefined();
+		expect(receipt.fence).toBeUndefined();
 		expect(receipt.detail).toContain("시간 한도");
 		await Bun.sleep(700);
 		expect(await Bun.file(path.join(root, "grandchild.ran")).exists()).toBe(false);
@@ -451,7 +486,7 @@ setTimeout(() => {}, 10000);
 		expect(failed.status).toBe("spawn-error");
 		expect(failed.exitCode).toBeNull();
 		expect(failed.detail).toContain("실행하지 못했습니다");
-		expect(failed.fenceRetained).toBeUndefined();
+		expect(failed.fence).toBeUndefined();
 
 		await writeScript(root, "ok.mjs", "process.exit(0);\n");
 		const after = await runJob(writerJob("after-spawn-error", "ok.mjs"), root, [key]);
@@ -481,8 +516,9 @@ setTimeout(() => {}, 10000);
 				[key],
 			);
 			expect(receipt.status).toBe("unrun");
+			expect(receipt.unrunCause).toBe("owner-dead");
 			expect(receipt.startedAt).toBeNull();
-			expect(receipt.fenceRetained).toBeUndefined();
+			expect(receipt.fence).toBeUndefined();
 			expect(receipt.detail).toContain("자동으로 지우지 않았습니다");
 			expect(receipt.detail).toContain("자식 프로세스");
 			expect(receipt.detail).toContain(fence);
@@ -550,6 +586,265 @@ process.stdout.write(JSON.stringify(receipt));
 		const [a, b] = await Promise.all([runHelper("a", tmpA), runHelper("b", tmpB)]);
 		expect([a.status, b.status]).toEqual(["passed", "passed"]);
 		expect(await Bun.file(path.join(root, "busy.flag")).exists()).toBe(false);
+	});
+
+	test("targetFence marks the canonical target and cleans the marker after a proven end", async () => {
+		const root = await tempRoot();
+		await writeScript(root, "ok.mjs", "process.exit(0);\n");
+		const key = resourceKey("target-normal");
+		const receipt = await runJob(writerJob("target-normal", "ok.mjs"), root, [key], { targetFence: true });
+		expect(receipt.status).toBe("passed");
+		expect(receipt.fence).toBeUndefined();
+		expect(await markerFilesFor(root)).toEqual([]);
+		expect(await targetJobBlock(root)).toBeUndefined();
+	});
+
+	test("distinct jobs of one approved batch overlap in the same marked target", async () => {
+		const root = await tempRoot();
+		await writeScript(
+			root,
+			"target-a.mjs",
+			`import { existsSync, writeFileSync } from "node:fs";
+writeFileSync("target-a.flag", "");
+const started = Date.now();
+const wait = () => {
+	if (existsSync("target-b.flag")) { writeFileSync("target-overlap.done", "a"); process.exit(0); }
+	if (Date.now() - started > 3000) process.exit(9);
+	setTimeout(wait, 10);
+};
+wait();
+`,
+		);
+		await writeScript(
+			root,
+			"target-b.mjs",
+			`import { existsSync, writeFileSync } from "node:fs";
+writeFileSync("target-b.flag", "");
+const started = Date.now();
+const wait = () => {
+	if (existsSync("target-a.flag")) { writeFileSync("target-overlap.done", "b"); process.exit(0); }
+	if (Date.now() - started > 3000) process.exit(9);
+	setTimeout(wait, 10);
+};
+wait();
+`,
+		);
+		const [a, b] = await Promise.all([
+			runJob(writerJob("target-a", "target-a.mjs"), root, [resourceKey("target-a")], { targetFence: true }),
+			runJob(writerJob("target-b", "target-b.mjs"), root, [resourceKey("target-b")], { targetFence: true }),
+		]);
+		expect([a.status, b.status]).toEqual(["passed", "passed"]);
+		expect([a.fence, b.fence]).toEqual([undefined, undefined]);
+		expect(await markerFilesFor(root)).toEqual([]);
+		expect(await targetJobBlock(root)).toBeUndefined();
+	});
+
+	test("a malformed target marker fails closed and is removed only by hand", async () => {
+		const root = await tempRoot();
+		await writeScript(root, "ok.mjs", "process.exit(0);\n");
+		const { dir } = await targetInfoFor(root);
+		await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+		const marker = path.join(dir, `${randomUUID()}.marker`);
+		await fs.writeFile(marker, "{not-json", { mode: 0o600 });
+		const block = await targetJobBlock(root);
+		expect(block).toContain(marker);
+		expect(block).toContain("직접 지워야");
+
+		const refused = await runJob(writerJob("blocked", "ok.mjs"), root, [], { targetFence: true });
+		expect(refused.status).toBe("unrun");
+		expect(refused.unrunCause).toBe("record-invalid");
+		expect(refused.detail).toContain(marker);
+		expect(await Bun.file(marker).exists()).toBe(true);
+
+		await fs.unlink(marker);
+		expect(await targetJobBlock(root)).toBeUndefined();
+		const after = await runJob(writerJob("after-malformed", "ok.mjs"), root, [], { targetFence: true });
+		expect(after.status).toBe("passed");
+	});
+
+	test("a dead target marker blocks a job until a human proves it gone", async () => {
+		const root = await tempRoot();
+		await writeScript(root, "ok.mjs", "process.exit(0);\n");
+		const { dir, identity, real } = await targetInfoFor(root);
+		await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+		const marker = path.join(dir, `${randomUUID()}.marker`);
+		const record = {
+			schema: "storm.job-target/v1",
+			identity,
+			root: real,
+			job: "crash",
+			owner: { token: randomUUID(), pid: process.pid, host: os.hostname(), processStart: 1 },
+			startedAt: new Date().toISOString(),
+		};
+		await fs.writeFile(marker, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+		const block = await targetJobBlock(root);
+		expect(block).toContain(marker);
+		expect(block).toContain("종료된 것으로 보이지만");
+
+		const refused = await runJob(writerJob("blocked-dead", "ok.mjs"), root, [], { targetFence: true });
+		expect(refused.status).toBe("unrun");
+		expect(refused.unrunCause).toBe("owner-dead");
+		expect(refused.fence).toBeUndefined();
+		expect(await Bun.file(marker).exists()).toBe(true);
+
+		await fs.unlink(marker);
+		expect(await targetJobBlock(root)).toBeUndefined();
+		const after = await runJob(writerJob("after-dead", "ok.mjs"), root, [], { targetFence: true });
+		expect(after.status).toBe("passed");
+	});
+
+	test("an unproven child leaves the target marker for manual proof", async () => {
+		const root = await tempRoot();
+		await writeScript(
+			root,
+			"late.mjs",
+			`import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5200)"], {
+	detached: true,
+	stdio: ["ignore", "inherit", "inherit"],
+});
+writeFileSync("grandchild.started", String(grandchild.pid));
+grandchild.unref();
+process.exit(0);
+`,
+		);
+		await writeScript(root, "ok.mjs", "process.exit(0);\n");
+		let grandchild = 0;
+		try {
+			const running = runJob(
+				{ name: "late", argv: [process.execPath, "late.mjs"], timeoutMs: 100 },
+				root,
+				[],
+				{ targetFence: true },
+			);
+			await waitForFile(path.join(root, "grandchild.started"), 5_000);
+			grandchild = Number(await fs.readFile(path.join(root, "grandchild.started"), "utf8"));
+			const receipt = await running;
+			expect(receipt.status).toBe("timed-out");
+			expect(receipt.fence?.cause).toBe("process-unproven");
+			const markers = await markerFilesFor(root);
+			expect(markers).toHaveLength(1);
+			expect(receipt.fence?.paths).toEqual(markers);
+			expect(await targetJobBlock(root)).toContain(markers[0]);
+
+			// Bun's node:child_process never emits `close` while a surviving descendant holds the pipe, so the late
+			// release is not observable here. The exact-token test below binds the release rule; production Node's
+			// `close` is the event that drives it. Manual proof must still be able to clear the marker.
+			await fs.unlink(markers[0]);
+			expect(await targetJobBlock(root)).toBeUndefined();
+			const after = await runJob(writerJob("after-unproven", "ok.mjs"), root, [], { targetFence: true });
+			expect(after.status).toBe("passed");
+		} finally {
+			if (grandchild > 0) {
+				try {
+					process.kill(-grandchild, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
+	}, 20_000);
+
+	test("a target marker is released only by its exact token", async () => {
+		const root = await tempRoot();
+		const acquired = await acquireTargetMarker(root, "token-test");
+		if (!acquired.ok) throw new Error(acquired.detail);
+		const marker = acquired.marker;
+		const raw = JSON.parse(await fs.readFile(marker.path, "utf8")) as { owner: { token: string } };
+		expect(raw.owner.token).toBe(marker.token);
+
+		const stale = await releaseTargetMarker({ ...marker, token: randomUUID() });
+		expect(stale.ok).toBe(false);
+		expect(await Bun.file(marker.path).exists()).toBe(true);
+		expect(await targetJobBlock(root)).toContain(marker.path);
+
+		const released = await releaseTargetMarker({ ...marker, token: raw.owner.token });
+		expect(released.ok).toBe(true);
+		expect(await Bun.file(marker.path).exists()).toBe(false);
+		expect(await targetJobBlock(root)).toBeUndefined();
+	});
+
+	test("distinct target identities do not share a marker", async () => {
+		const rootA = await tempRoot();
+		const rootB = await tempRoot();
+		const a = await acquireTargetMarker(rootA, "target-a");
+		if (!a.ok) throw new Error(a.detail);
+		const b = await acquireTargetMarker(rootB, "target-b");
+		if (!b.ok) throw new Error(b.detail);
+		try {
+			const blockA = await targetJobBlock(rootA);
+			const blockB = await targetJobBlock(rootB);
+			expect(blockA).toContain(a.marker.path);
+			expect(blockA).not.toContain(b.marker.path);
+			expect(blockB).toContain(b.marker.path);
+			expect(blockB).not.toContain(a.marker.path);
+		} finally {
+			await releaseTargetMarker(a.marker);
+			await releaseTargetMarker(b.marker);
+		}
+		expect(await targetJobBlock(rootA)).toBeUndefined();
+		expect(await targetJobBlock(rootB)).toBeUndefined();
+	});
+
+	test("a killed owner leaves a marker that blocks another process until manual removal", async () => {
+		const root = await tempRoot();
+		await writeScript(
+			root,
+			"hold.mjs",
+			`import { writeFileSync } from "node:fs";
+writeFileSync("hold.started", String(process.pid));
+setInterval(() => {}, 1000);
+`,
+		);
+		await writeScript(root, "ok.mjs", "process.exit(0);\n");
+		const executor = pathToFileURL(path.join(import.meta.dir, "..", "src", "runtime", "job-executor.ts")).href;
+		await writeScript(
+			root,
+			"crash-helper.mjs",
+			`import { runConfiguredJob } from ${JSON.stringify(executor)};
+await runConfiguredJob({
+	job: { name: "hold", argv: [process.execPath, "hold.mjs"], timeoutMs: 60000 },
+	cwd: ${JSON.stringify(root)},
+	resourceKeys: [],
+	targetFence: true,
+});
+`,
+		);
+		const helper = Bun.spawn([process.execPath, "crash-helper.mjs"], {
+			cwd: root,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		let childPid = 0;
+		try {
+			await waitForFile(path.join(root, "hold.started"), 5_000);
+			childPid = Number(await fs.readFile(path.join(root, "hold.started"), "utf8"));
+			helper.kill("SIGKILL");
+			await helper.exited;
+
+			const markers = await markerFilesFor(root);
+			expect(markers).toHaveLength(1);
+			const block = await targetJobBlock(root);
+			expect(block).toContain(markers[0]);
+
+			const refused = await runJob(writerJob("blocked-crash", "ok.mjs"), root, [], { targetFence: true });
+			expect(refused.status).toBe("unrun");
+			expect(refused.unrunCause).toBe("owner-dead");
+
+			await fs.unlink(markers[0]);
+			expect(await targetJobBlock(root)).toBeUndefined();
+			const after = await runJob(writerJob("after-crash", "ok.mjs"), root, [], { targetFence: true });
+			expect(after.status).toBe("passed");
+		} finally {
+			if (childPid > 0) {
+				try {
+					process.kill(-childPid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
 	});
 });
 

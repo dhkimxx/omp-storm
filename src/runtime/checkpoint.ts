@@ -134,18 +134,14 @@ function boundedState(lines: string[]): string[] {
 	return out;
 }
 
-/**
- * Storm's ledger of a run for a compaction of its directing session: the request's constraints, plan lanes and their
- * goals, the required-result ledger and dependency edges, the run's agents with their `agent://` handles, the review
- * tally and what Storm blocked. Compact Korean lines from record metadata only; no file contents, command output or
- * logs. Long lists and text are cut, counted or pointed to by `runRecordRef`. `agents` may hold other runs' agents;
- * only those of `run` are listed.
- */
-export function workingState(run: RunRecord, agents: readonly AgentEntry[]): string[] {
-	const out = [`Storm 실행 ${run.runId} 장부 (압축 뒤에도 유지할 상태). 요청: ${oneLine(run.task, MAX_TASK)}`];
-	const request = requestText(run);
-	if (request) out.push(`요청 발췌(앞 200자 밖 제약 포함): ${request}`);
+/** Shared bounded view of plans and requirements; never copies the task or saved evidence. */
+export function checkpointWorkState(run: RunRecord): string[] {
+	const out = ["Storm 실행 계획·필수 결과:"];
+	appendPlanState(out, run, true);
+	return boundedState(out);
+}
 
+function appendPlanState(out: string[], run: RunRecord, details = false): void {
 	const plan = run.plan;
 	const note = plan?.note;
 	if (typeof note === "string" && note.trim()) out.push(`계획 메모(남은 결정 포함): ${oneLine(note, MAX_PLAN_NOTE)}`);
@@ -156,7 +152,9 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 		out.push(`계획 레인 ${lanes.length}개:`);
 		for (const l of lanes.slice(0, MAX_LANES)) {
 			const goal = l.goal?.trim() ? `: ${oneLine(l.goal, MAX_LANE_GOAL)}` : "";
-			out.push(`- ${oneLine(l.name, MAX_NAME)} (${l.kind}, ${roleTitle(l.role)})${goal}`);
+			const job = !details || l.job === undefined ? "" : ` · 정형 작업 ${oneLine(l.job, MAX_NAME)}`;
+			const isolated = !details || l.isolationReason === undefined ? "" : ` · 격리: ${oneLine(l.isolationReason, MAX_LANE_GOAL)}`;
+			out.push(`- ${oneLine(l.name, MAX_NAME)} (${l.kind}, ${roleTitle(l.role)})${goal}${job}${isolated}`);
 		}
 		if (lanes.length > MAX_LANES) out.push(`- 외 ${lanes.length - MAX_LANES}개`);
 	}
@@ -169,6 +167,7 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 			const attempt = row.attemptId === undefined ? "" : ` · 시도 ${oneLine(row.attemptId, MAX_ATTEMPT)}`;
 			const reason = row.reason === undefined ? "" : ` · ${oneLine(row.reason, MAX_RESULT_REASON)}`;
 			out.push(`- ${oneLine(row.id, MAX_NAME)} = ${RESULT_STATE_LABEL[row.state]} · ${lane}${attempt}${reason}`);
+			if (details && row.lane === undefined && row.contract !== undefined) out.push(`  계약: ${JSON.stringify(row.contract)}`);
 		}
 		if (results.length > MAX_RESULTS) {
 			const ref = runRecordRef(run.runId);
@@ -183,6 +182,21 @@ export function workingState(run: RunRecord, agents: readonly AgentEntry[]): str
 			.map(edge => `${oneLine(edge.from, MAX_EDGE_NAME)}→${oneLine(edge.to, MAX_EDGE_NAME)}(${DEPENDENCY_NEED_LABEL[edge.need]})`);
 		out.push(`계획 선행 의존 ${edges.length}개: ${shown.join(", ")}${edges.length > MAX_DEPENDENCIES ? ` 외 ${edges.length - MAX_DEPENDENCIES}개` : ""}`);
 	}
+}
+
+/**
+ * Storm's ledger of a run for a compaction of its directing session: the request's constraints, plan lanes and their
+ * goals, the required-result ledger and dependency edges, the run's agents with their `agent://` handles, the review
+ * tally and what Storm blocked. Compact Korean lines from record metadata only; no file contents, command output or
+ * logs. Long lists and text are cut, counted or pointed to by `runRecordRef`. `agents` may hold other runs' agents;
+ * only those of `run` are listed.
+ */
+export function workingState(run: RunRecord, agents: readonly AgentEntry[]): string[] {
+	const out = [`Storm 실행 ${run.runId} 장부 (압축 뒤에도 유지할 상태). 요청: ${oneLine(run.task, MAX_TASK)}`];
+	const request = requestText(run);
+	if (request) out.push(`요청 발췌(앞 200자 밖 제약 포함): ${request}`);
+
+	appendPlanState(out, run);
 
 	const mine = agents.filter(a => a.runId === run.runId);
 	if (mine.length === 0) out.push("서브에이전트: 없음");

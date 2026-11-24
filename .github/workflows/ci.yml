@@ -38,6 +38,8 @@ jobs:
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e" npm run e2e
       - name: E2E (automatic delegation and worktree ownership)
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-auto" npm run e2e:auto
+      - name: E2E (checkpoint across a native OMP restart)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-checkpoint" node_modules/.bin/bun scripts/e2e/checkpoint-resume.ts
       # omp's goal and loop modes exist only in its TUI, which the harness drives on a pty.
       - name: Can this runner open a pty?
         id: pty

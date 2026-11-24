@@ -50,20 +50,20 @@ const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
 const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
 
-const DESCRIPTION = `OMP Storm: plan, delegate, and close approved work.
-- run {task}: queue verbatim request; end turn.
-- plan {plan}: before work. Each non-review lane needs results; dependsOn waits for proof. Keep name, kind, role, job, files and goal on replan; progress is status, new scope needs a new name. Review the dirty tree. Sequence overlaps.
-- execute {lanes}: ready run lanes with an approved job, not AI workers. Use a pathless answer with an exact stdout contains marker. Exit and marker prove execution only. Batch independent jobs; do not repeat accepted jobs.
-- brief {brief}: result, verification, remaining?, three concrete next directions (first recommended). Stages only; skip trivial.
-- status: team, approval, runs, approved job names.
+const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
+- run {task}: queue the request verbatim, then end the turn.
+- plan {plan}: before work; it opens this request's run. Non-review lanes need results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
+- execute {lanes}: planned job lanes, not AI workers; exit and an exact stdout marker prove execution only.
+- brief {brief}: stages result, verification, remaining? and three next directions (first recommended); never verifies or ends the run. Skip trivial.
+- status: team, approval, runs and approved job names.
 - agents: existing workers and follow-up allowance.
-Team: /storm.`;
+Team changes: /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
-		action: z.enum(ACTIONS).describe("Operation to perform"),
-		task: z.string().optional().describe("run: the user's task request, verbatim"),
-		lanes: z.array(z.string().min(1).max(MAX_LANE_TEXT)).min(1).max(50).optional().describe("execute: exact planned job lane names"),
+		action: z.enum(ACTIONS).describe("Operation"),
+		task: z.string().optional().describe("run: the request verbatim"),
+		lanes: z.array(z.string().min(1).max(MAX_LANE_TEXT)).min(1).max(50).optional().describe("execute: planned job lane names"),
 		plan: z
 			.object({
 				lanes: z
@@ -71,16 +71,16 @@ function stormParams(z: Zod): StormToolSchema {
 						z.object({
 							name: z.string().describe("Unique lane name"),
 							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
-							role: z.enum(ROLE_IDS).optional().describe("Role doing the lane; default from kind"),
-							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("Approved project job name; use with kind run instead of an AI worker"),
+							role: z.enum(ROLE_IDS).optional().describe("Role for the lane; default from kind"),
+							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("Approved job name; kind run, no AI worker"),
 							files: z.array(z.string()).optional().describe("Files the lane may change"),
-							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep it on replan"),
+							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep on replan"),
 							isolationReason: z
 								.string()
 								.max(MAX_LANE_TEXT)
 								.optional()
-								.describe("Only for an independent experiment preserved outside the parent tree; one safe line. Omit to share the tree"),
-							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Lane status only; a real scope change needs a new name"),
+								.describe("Independent experiment outside the tree; omit to share it"),
+							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Status only; a scope change needs a new name"),
 							results: z
 								.array(
 									z
@@ -89,73 +89,73 @@ function stormParams(z: Zod): StormToolSchema {
 												.string()
 												.max(MAX_RESULT_ID)
 												.regex(RESULT_ID_RE, "id: 영문·숫자로 시작하고 영문·숫자·. _ -만 쓰는 64자 이하 id")
-												.describe("Stable plan-wide result id; same id on replan keeps the requirement"),
-											kind: z.enum(RESULT_KIND_IDS).describe("change|artifact|answer: where the result is observed"),
+												.describe("Stable id; same id on replan"),
+											kind: z.enum(RESULT_KIND_IDS).describe("change|artifact|answer"),
 											criterion: z
 												.string()
 												.max(MAX_RESULT_CRITERION)
-												.describe("What the attempt must show, as one visible line; never proof by itself"),
+												.describe("Visible line the attempt must show; not proof"),
 											path: z
 												.string()
 												.max(MAX_RESULT_PATH)
 												.optional()
-												.describe("Safe workspace-relative path; pathless change uses lane.files; answer may cite a source"),
+												.describe("Workspace-relative; pathless change uses files; answer cites a source"),
 											contains: z
 												.string()
 												.max(MAX_RESULT_CONTAINS)
 												.optional()
-												.describe("Exact literal, whitespace kept; on answer it is matched in the cited source; optional"),
+												.describe("Exact literal, whitespace kept; on answer read from the cited source"),
 											check: z
 												.string()
 												.optional()
-												.describe("Name of a check in the approved requiredChecks; never a command line"),
+												.describe("Approved requiredChecks name, never a command"),
 										})
 										.strict(),
 								)
 								.min(1)
 								.max(MAX_LANE_RESULTS)
 								.optional()
-								.describe("Required on every non-review lane: observable outcomes; plan input, not evidence"),
+								.describe("Required on non-review lanes; plan input, not evidence"),
 							dependsOn: z
 								.array(
 									z
 										.object({
-											lane: z.string().min(1).max(MAX_LANE_TEXT).describe("Prerequisite lane name in this plan"),
+											lane: z.string().min(1).max(MAX_LANE_TEXT).describe("Prerequisite lane in this plan"),
 											need: z
 												.enum(LANE_NEED_IDS)
-												.describe("result|integrated|reviewable: the state that must hold before this lane starts"),
+												.describe("result|integrated|reviewable before this lane starts"),
 										})
 										.strict(),
 								)
 								.min(1)
 								.max(MAX_LANE_DEPENDENCIES)
 								.optional()
-								.describe("Prerequisite lanes; plan input, not proof that the need holds"),
+								.describe("Prerequisite lanes; not proof the need holds"),
 						}),
 					)
 					.describe("1-50 lanes"),
-				workers: z.record(z.string(), z.number()).optional().describe("Live agents per role id used by the lanes"),
+				workers: z.record(z.string(), z.number()).optional().describe("Live agents per lane role"),
 				note: z.string().optional(),
 			})
 			.optional()
-			.describe("plan: the run plan"),
+			.describe("plan: lanes and workers"),
 		brief: z
 			.object({
-				result: z.string().max(CLOSEOUT_TEXT_MAX).describe("What the run delivered, with evidence locations"),
-				verification: z.string().max(CLOSEOUT_TEXT_MAX).describe("What proves it, with evidence locations"),
-				remaining: z.string().max(CLOSEOUT_TEXT_MAX).optional().describe("What is still open; omit when nothing is"),
+				result: z.string().max(CLOSEOUT_TEXT_MAX).describe("What the run delivered, with locations"),
+				verification: z.string().max(CLOSEOUT_TEXT_MAX).describe("What proves it, with locations"),
+				remaining: z.string().max(CLOSEOUT_TEXT_MAX).optional().describe("Still open; omit if none"),
 				next: z
 					.array(z.string().max(CLOSEOUT_NEXT_MAX))
 					.refine(directions => directions.length === 3, "next: 정확히 세 방향이어야 합니다")
 					.transform(directions => directions as [string, string, string])
-					.describe("Three concrete next directions; the first is recommended"),
+					.describe("Three concrete directions; first recommended"),
 			})
 			.transform(value => {
 				const { remaining, ...rest } = value;
 				return remaining === undefined ? rest : { ...rest, remaining };
 			})
 			.optional()
-			.describe("brief: results and the next directions for the current run"),
+			.describe("brief: result, verification and next directions"),
 	});
 }
 

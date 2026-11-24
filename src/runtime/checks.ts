@@ -197,6 +197,24 @@ function spawnErrorNote(error: unknown): string {
 	return typeof code === "string" && code.length <= 40 ? `실행하지 못했습니다 (${code})` : "실행하지 못했습니다";
 }
 
+/**
+ * Stops reading without destroying the pipe: `destroy()` makes Node emit `close` immediately, which would turn our own
+ * teardown into false proof that the child ended. `pause()` + `unref()` let this process exit while a later, genuine
+ * `close` still reports the end when the last process holding the pipe goes away.
+ */
+function releasePipes(child: ChildProcess): void {
+	for (const stream of [child.stdout, child.stderr]) {
+		if (stream === null) continue;
+		const pipe = stream as typeof stream & { pause?: () => void; unref?: () => void };
+		try {
+			pipe.pause?.();
+			pipe.unref?.();
+		} catch {
+			// Leaving the pipe paused but referenced is safer than destroying it and faking a close.
+		}
+	}
+}
+
 export interface BoundedProcessInput {
 	/** Executable first, then its arguments; never a shell command line. */
 	argv: readonly string[];
@@ -217,13 +235,19 @@ export interface BoundedProcessResult {
 	stderr: CheckOutput;
 	/** True only when the OS reported the child closed (or it never started); false means teardown gave up. */
 	processEnded: boolean;
+	/**
+	 * Resolves when the OS reports the child's stdio closed, even after `processEnded: false` settled the result.
+	 * A caller holding a fence waits for this before releasing; it never resolves if the OS never reports the end.
+	 */
+	ended: Promise<void>;
 	note?: string;
 }
 
 /**
  * Spawns one command and waits for it. A timeout or abort sends SIGTERM to its process group, then SIGKILL, and settles
  * the result even if teardown does not finish, so a caller can never hang forever. Stdout/stderr are retained only as
- * bounded tails. `processEnded` tells a caller whether releasing a resource fence is provable.
+ * bounded tails. `processEnded` tells a caller whether releasing a resource fence is provable; when teardown gave up,
+ * `ended` resolves only if the OS later reports the child's actual close, so a caller can release exact tokens then.
  */
 export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedProcessResult> {
 	const { argv, cwd, timeoutMs, outputLimitBytes, signal } = input;
@@ -232,8 +256,10 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 	const startedAt = new Date().toISOString();
 	const began = performance.now();
 	const { promise, resolve } = Promise.withResolvers<BoundedProcessResult>();
+	const ended = Promise.withResolvers<void>();
 	const executable = argv[0];
 	if (executable === undefined) {
+		ended.resolve();
 		resolve({
 			status: "spawn-error",
 			exitCode: null,
@@ -244,6 +270,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			stdout: stdout.result(),
 			stderr: stderr.result(),
 			processEnded: true,
+			ended: ended.promise,
 			note: "실행 파일이 없습니다",
 		});
 		return promise;
@@ -258,6 +285,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			windowsHide: true,
 		});
 	} catch (error) {
+		ended.resolve();
 		resolve({
 			status: "spawn-error",
 			exitCode: null,
@@ -268,6 +296,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			stdout: stdout.result(),
 			stderr: stderr.result(),
 			processEnded: true,
+			ended: ended.promise,
 			note: spawnErrorNote(error),
 		});
 		return promise;
@@ -308,6 +337,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			stdout: stdout.result(),
 			stderr: stderr.result(),
 			processEnded,
+			ended: ended.promise,
 			...(note === undefined ? {} : { note }),
 		});
 	};
@@ -323,9 +353,9 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 		}, KILL_GRACE_MS);
 		hardTeardown = setTimeout(() => {
 			if (settled) return;
-			// A process that cannot be reaped must not keep this promise or its pipes alive. Its end is unproven.
-			child.stdout?.destroy();
-			child.stderr?.destroy();
+			// A process that cannot be reaped must not keep this promise or this process alive. Its end is unproven, but
+			// the `close` listener stays: `ended` resolves only when the OS later reports the actual end.
+			releasePipes(child);
 			child.unref();
 			finish(null, null, false);
 		}, KILL_GRACE_MS + HARD_TEARDOWN_MS);
@@ -334,11 +364,14 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 	child.on("error", (error) => {
 		spawnError = spawnErrorNote(error);
 		// A spawn that never got a pid never created a process; an error after a pid exists does not prove it ended.
+		if (child.pid === undefined) ended.resolve();
 		finish(null, null, child.pid === undefined);
 	});
 	child.on("close", (code, endedBy) => {
 		// A spawn that never got a pid is a spawn failure even if only `close` reports it.
 		if (spawnError === undefined && child.pid === undefined) spawnError = "실행하지 못했습니다";
+		// This is the OS proof a retained fence waits for, including when it arrives after hard teardown.
+		ended.resolve();
 		finish(code, endedBy, true);
 	});
 	child.stdout?.on("data", (chunk: Buffer) => stdout.add(chunk));

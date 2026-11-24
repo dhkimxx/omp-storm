@@ -1793,6 +1793,43 @@ describe("automatic delegation", () => {
 		await omp.emit("session_shutdown", {}, main);
 	});
 
+	test("the fixed bootstrap is small and catalog-free, adds no message, and auto off leaves no Storm text", async () => {
+		await approve({ ...TEAM, jobs: [{ name: "unit-job", argv: ["bun", "test"] }] });
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const started = (await omp.emit(
+			"before_agent_start",
+			{ reason: "prompt", prompt: "fix the login bug", systemPrompt: ["base"] },
+			main,
+		)) as { systemPrompt: string[]; message?: unknown };
+		// One system block only: believing otherwise would be a paid extra request or a synthetic user turn.
+		expect(Object.keys(started)).toEqual(["systemPrompt"]);
+		expect(omp.sent).toEqual([]);
+		expect(activeLedgerRun(project.sessionDir)).toBeUndefined();
+		const stormText = started.systemPrompt.slice(1).join("\n");
+		// The review baseline was 4,209 B for the two fixed blocks; the budget is 1,300 B.
+		expect(Buffer.byteLength(stormText, "utf8")).toBeLessThanOrEqual(1_300);
+		expect(stormText).toContain("<storm-auto>");
+		expect(stormText).toContain("<storm-decision>");
+		// The approved job catalog is live state: it belongs to `storm status`, never to the cached system prompt.
+		expect(stormText).not.toContain("unit-job");
+		expect(stormText).not.toContain("approved project job names");
+		// The same bytes on the next plain turn and on a revived main session.
+		expect(await omp.emit("before_agent_start", { reason: "prompt", prompt: "more", systemPrompt: started.systemPrompt }, main)).toBeUndefined();
+		const revived = (await omp.emit("before_agent_start", { reason: "revive", prompt: "revived context", systemPrompt: ["base"] }, main)) as {
+			systemPrompt: string[];
+		};
+		expect(revived.systemPrompt.join("\n")).toBe(started.systemPrompt.join("\n"));
+		// Auto off and no run: remove the blocks a previous turn added, so the prompt carries no Storm text.
+		await writeAutoDelegation((await loadProjectState(project.env)).sessionDir, false);
+		expect(await omp.emit("before_agent_start", { reason: "prompt", prompt: "plain chat", systemPrompt: started.systemPrompt }, main)).toEqual({
+			systemPrompt: ["base"],
+		});
+		await omp.emit("session_shutdown", {}, main);
+	});
+
 	test("before a run it blocks direct project tools, reads and spawns, while plan and worker results stay open", async () => {
 		await approve(TEAM);
 		await enableAuto();

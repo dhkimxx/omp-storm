@@ -11,6 +11,7 @@
 
 import type { SymbolKey } from "@oh-my-pi/pi-tui";
 import type { CloseoutDraft } from "./runtime/closeout.ts";
+import type { ResultProof } from "./runtime/checkpoint-import.ts";
 import type { ReviewEvidence } from "./runtime/review.ts";
 import type { RunPhase } from "./view/appearance.ts";
 
@@ -817,6 +818,10 @@ export interface RunResult {
 	origin?: "plan" | "attempt" | "review";
 	/** Tree fingerprint an `origin: "review"` state was bound to; another tree makes that review state stale. */
 	reviewTree?: string;
+	/** Bounded, host-observed proof; on resume the current source must confirm it. */
+	proof?: ResultProof;
+	/** The earlier run whose accepted proof was revalidated, never a new attempt. */
+	restoredFrom?: string;
 }
 
 /** `<sessionDir>/state/runs/<runId>.json`: what one Storm run did and under which approval. */
@@ -887,12 +892,18 @@ export interface RunRecord {
 export interface RunJob {
 	lane: string;
 	name: string;
-	status: "passed" | "failed" | "timed-out" | "cancelled" | "spawn-error" | "unrun";
+	status: "started" | "unknown" | "passed" | "failed" | "timed-out" | "cancelled" | "spawn-error" | "unrun";
 	exitCode: number | null;
 	startedAt: string | null;
 	finishedAt: string | null;
 	/** Fixed runtime explanation, never process output. */
 	detail?: string;
+	attemptId?: string;
+	/** Digest of the approved definition, not model-supplied text. */
+	jobSha256?: string;
+	/** Digest of observed, bounded stdout, not stdout itself. */
+	stdoutSha256?: string;
+	fence?: { cause: "process-unproven" | "lock-unreleased"; paths: readonly string[] };
 }
 
 export interface RunReads {

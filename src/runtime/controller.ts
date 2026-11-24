@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { ApprovalStore } from "../approval/store.ts";
+import { MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
 import { clearWorkerSlots, formatUsd, reservedWorkers, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
@@ -41,7 +42,7 @@ import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, Attempt
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
-import { runConfiguredJob } from "./job-executor.ts";
+import { runConfiguredJob, targetJobBlock } from "./job-executor.ts";
 import {
 	CLOSEOUT_CHOICE_HINT,
 	CLOSEOUT_TITLE,
@@ -54,6 +55,12 @@ import {
 	resetCloseoutChoices,
 } from "./closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
+import {
+	captureCheckpointProof,
+	normalizeCheckpointContract,
+	normalizeCheckpointPlan,
+	revalidateCheckpointProof,
+} from "./checkpoint-import.ts";
 import { dependencyBlock, laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
 import { hasStaleInputs, inputSnapshot, requirementConflict, staleRequirementIds, currentInputVersion } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
@@ -275,6 +282,66 @@ const RESULT_FALLBACK_REASON: Record<"unmet" | "reviewable", string> = {
 };
 /** A host attempt reference is a short token, never a path or model text; an unsafe one is omitted. */
 const ATTEMPT_REF = /^[A-Za-z0-9:._-]{1,64}$/u;
+const PROOF_DIGEST = /^[a-f0-9]{64}$/u;
+
+function jobDigest(job: NonNullable<StormConfig["jobs"]>[number]): string {
+	return createHash("sha256").update(JSON.stringify([job.argv, [...(job.resources ?? [])].sort(), job.timeoutMs ?? null])).digest("hex");
+}
+
+function setJobReceipt(run: RunRecord, receipt: RunJob): void {
+	const jobs = (run.jobs ??= []);
+	const index = jobs.findIndex(job => job.name === receipt.name);
+	if (index === -1) jobs.push(receipt);
+	else jobs[index] = receipt;
+}
+
+const UNCERTAIN_JOB = "이전 호출의 효과를 확인할 수 없습니다. 외부 상태와 산출물을 먼저 확인하세요. 이 이어가기에서는 재실행하지 않습니다.";
+
+function blockedJobRow(row: RunResult, reason: string): void {
+	row.state = "unmet";
+	row.reason = compactResultReason(reason);
+	row.remedy = "blocked";
+	row.unblock = "실행 기록과 작업 대상의 상태를 확인한 뒤, 필요하면 새 실행을 명시적으로 시작하세요.";
+	delete row.contentVersion;
+	delete row.proof;
+	delete row.restoredFrom;
+}
+
+function historicalJob(run: RunRecord | undefined, name: string): RunJob | undefined {
+	return Array.isArray(run?.jobs) ? run.jobs.find(job => job !== null && typeof job === "object" && job.name === name) : undefined;
+}
+
+function unsafeToReplay(job: RunJob | undefined, currentHash: string): boolean {
+	if (job === undefined) return false;
+	if (job.fence?.cause === "process-unproven" || job.status === "started" || job.status === "unknown") return true;
+	if (job.status === "passed") return job.jobSha256 === undefined || job.jobSha256 === currentHash;
+	return !["failed", "timed-out", "cancelled", "spawn-error", "unrun"].includes(job.status);
+}
+
+/** Carry the no-replay decision even if the lane disappears from this continuation's plan. */
+function checkpointReceipts(run: RunRecord): RunJob[] {
+	const receipts = new Map<string, RunJob>();
+	for (const old of Array.isArray(run.jobs) ? run.jobs : []) {
+		if (old === null || typeof old !== "object" || typeof old.name !== "string" || old.name.trim() !== old.name ||
+			old.name.length === 0 || old.name.length > MAX_CHECK_NAME_LENGTH || !unsafeToReplay(old, old.jobSha256 ?? "")) continue;
+		const unique = !receipts.has(old.name);
+		const digest = old.jobSha256;
+		const passed = unique && old.status === "passed" && old.exitCode === 0 && old.fence === undefined &&
+			typeof digest === "string" && PROOF_DIGEST.test(digest);
+		receipts.set(old.name, {
+			name: old.name,
+			lane: typeof old.lane === "string" && old.lane.length <= 200 ? old.lane : old.name,
+			status: passed ? "passed" : "unknown",
+			exitCode: passed ? 0 : null,
+			startedAt: typeof old.startedAt === "string" && Number.isFinite(Date.parse(old.startedAt)) ? old.startedAt : null,
+			finishedAt: typeof old.finishedAt === "string" && Number.isFinite(Date.parse(old.finishedAt)) ? old.finishedAt : null,
+			...(passed ? { jobSha256: digest } : { detail: UNCERTAIN_JOB }),
+			...(unique && typeof old.attemptId === "string" && ATTEMPT_REF.test(old.attemptId) ? { attemptId: old.attemptId } : {}),
+			...(passed && typeof old.stdoutSha256 === "string" && PROOF_DIGEST.test(old.stdoutSha256) ? { stdoutSha256: old.stdoutSha256 } : {}),
+		});
+	}
+	return [...receipts.values()];
+}
 /** Structured spawn refusals the user must resolve in team setup; capacity and plan errors are not included. */
 const CONFIG_REFUSAL_CODES: Readonly<Partial<Record<SpawnBlockCode, true>>> = {
 	"no-config": true,
@@ -323,8 +390,8 @@ interface OwnRun {
 	laneAttempt: Map<string, number>;
 	/** The latest settled attempt per lane, for a bounded re-evaluation once approved check evidence exists. */
 	settled: Map<string, SettledAttempt>;
-	/** Accepted S1 evidence by result id, with its host-bound retained source; the location check needs these facts. */
-	evidence: Map<string, { item: ResultEvidenceItem; artifact?: ArtifactEvidenceSource }>;
+	/** Revalidated lanes owe no new worker attempt unless their results are reopened. */
+	restoredLanes: Set<string>;
 	/** Lanes whose settlement is being evaluated now; a consumer admission waits for these before reading rows. */
 	settling: Set<string>;
 	/** Aborts checks and other bounded work as soon as the run starts stopping. */
@@ -335,7 +402,7 @@ interface OwnRun {
 	checking?: string;
 	/** Jobs may overlap inside a batch by declared resource, never with unchecked worktree writers. */
 	jobBatch?: true;
-	jobFence?: true;
+	jobFence?: string;
 	/** The compact evidence of the latest check report, written with every live and final record. */
 	checkEvidence?: RunCheckEvidence[];
 	/** The last valid closeout brief submitted for this run; the final record only, never a status change. */
@@ -644,6 +711,9 @@ export class RunController {
 		if (!acquired.ok) return refuse(acquired.reason);
 		let lease: RunLease | undefined = acquired.lease;
 		try {
+			const targetBlock = await targetJobBlock(root);
+			if (stale()) return gone();
+			if (targetBlock !== undefined) return refuse(targetBlock);
 			// A plan that may change the target must hold the write claim before any handoff or spawn can act on it.
 			if (plan !== undefined && planNeedsWrite(plan)) {
 				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
@@ -656,9 +726,17 @@ export class RunController {
 			// An automatic probe has no handoff to put it in, so it does not read the old record.
 			const continued = !auto && requested.resumeOf !== undefined ? await readRun(sessionDir, requested.resumeOf) : undefined;
 			if (stale()) return gone();
+			if (requested.resumeOf !== undefined && continued === undefined) return refuse("이전 실행을 읽을 수 없어 안전하게 이어갈 수 없습니다.");
 			if (continued !== undefined && !(await trustedResume(sessionDir, target, continued))) {
 				return refuse("이 세션과 이 작업 트리에서 시작한 실행만 이어갈 수 있습니다.");
 			}
+			const restoredPlan = continued?.plan === undefined ? undefined : normalizeCheckpointPlan(gate.config, continued.plan);
+			if (restoredPlan !== undefined && planNeedsWrite(restoredPlan)) {
+				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
+				if (!upgraded.ok) return refuse(upgraded.reason);
+				if (stale()) return gone();
+			}
+			plan ??= restoredPlan;
 			const resume =
 				continued === undefined
 					? undefined
@@ -666,7 +744,6 @@ export class RunController {
 							runId: continued.runId,
 							...(continued.endReason !== undefined ? { endReason: continued.endReason } : {}),
 							...(continued.turns !== undefined ? { turns: continued.turns } : {}),
-							...(continued.plan !== undefined ? { plan: continued.plan } : {}),
 							...(continued.request !== undefined ? { requestLength: continued.request.length } : {}),
 							...(requested.resumeNote !== undefined ? { said: requested.resumeNote } : {}),
 						};
@@ -738,7 +815,7 @@ export class RunController {
 				attemptSerial: 0,
 				laneAttempt: new Map(),
 				settled: new Map(),
-				evidence: new Map(),
+				restoredLanes: new Set(),
 				settling: new Set(),
 				abort: new AbortController(),
 				checks: new Map(),
@@ -752,12 +829,37 @@ export class RunController {
 				...(startTree !== undefined ? { tree: startTree.state, base: startTree.base } : {}),
 				...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
 			};
+			if (continued !== undefined) {
+				const receipts = checkpointReceipts(continued);
+				if (receipts.length > 400) return refuse("이전 정형 작업 기록이 너무 많아 중복 실행 없이 이어갈 수 없습니다.");
+				if (receipts.length > 0) record.jobs = receipts;
+			}
+			if (continued !== undefined) {
+				await this.#restoreCheckpoint(own, continued, plan);
+				const current = await this.deps.loadState(ctx).catch(() => undefined);
+				if (stale()) return gone();
+				if (current === undefined || current.sessionDir !== sessionDir || current.repo.root !== root ||
+					current.repo.repoId !== target.repoId || current.config.status !== "ok" ||
+					current.config.hash !== hash || !isApproved(current)) return refuse("승인 또는 작업 대상이 바뀌어 체크포인트를 적용하지 않았습니다.");
+			}
+			if (stale()) return gone();
 			// A stored record is untrusted input: build the message before anything of this run exists, so a bad plan or
 			// reason refuses the start instead of leaving a current run without a handoff.
 			let handoff: string | undefined;
 			if (!auto) {
 				try {
-					handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit, ...(resume ? { resume } : {}) });
+					const rows = own.record.results ?? [];
+					const kept = rows.filter(row => row.restoredFrom !== undefined && row.state === "accepted").length;
+					const blocked = rows.filter(row => row.remedy === "blocked").length;
+					const checkpoint = continued === undefined || (restoredPlan === undefined && rows.length === 0 && !record.jobs?.length)
+						? undefined
+						: {
+								kept, reopened: rows.length - kept - blocked, blocked,
+								laneNames: restoredPlan?.lanes.filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name) ?? [],
+								...(restoredPlan === undefined ? { planUnavailable: true as const } : {}),
+							};
+					handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit,
+						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }) });
 				} catch (error) {
 					return refuse(`실행 계약을 만들지 못해 시작하지 않았습니다: ${errorText(error)}`);
 				}
@@ -926,7 +1028,7 @@ export class RunController {
 				let retained: LaneResultReadiness["retained"];
 				let retainedReason: string | undefined;
 				let integrated = false;
-				if (state === "accepted") {
+				if (state === "accepted" || (state === "reviewable" && row?.restoredFrom !== undefined && result.kind === "change")) {
 					// An accepted result is usable only from the location S1 can still prove now: a retained source for an
 					// isolated artifact, the current parent for shared content. A revert or a vanished patch blocks consumers.
 					const location = await this.#acceptedLocation(own, result, isolated, row);
@@ -939,13 +1041,13 @@ export class RunController {
 					}
 				} else if (isolated && result.kind === "artifact" && state === "reviewable") {
 					// A reviewable isolated artifact is not a usable source: its submission has no accepted digest to read.
-					const evidence = own.evidence.get(result.id);
+					const evidence = row?.proof;
 					state = "unmet";
 					retainedReason = evidence === undefined || row?.attemptId === undefined || row.identity === undefined
 						? "보존된 산출물의 시도 근거를 확인하지 못했습니다."
 						: "보존된 산출물의 근거가 현재 계약과 다릅니다.";
 				}
-				const citation = own.evidence.get(result.id)?.item.citation;
+				const citation = row?.proof?.item.citation;
 				results.push({
 					id: result.id,
 					kind: result.kind,
@@ -990,17 +1092,30 @@ export class RunController {
 		isolated: boolean | undefined,
 		row: RunResult | undefined,
 	): Promise<AcceptedLocation> {
-		if (row === undefined || row.state !== "accepted" || row.attemptId === undefined) {
+		const restoredSubmission = row?.restoredFrom !== undefined && row.proof !== undefined &&
+			result.kind === "change" && (row.state === "reviewable" || row.origin === "review");
+		if (row === undefined || (row.state !== "accepted" && !restoredSubmission) || row.attemptId === undefined) {
 			return { ok: false, reason: "수용된 결과가 없습니다." };
 		}
-		if (row.origin === "review") return { ok: true, integrated: false };
-		if (result.kind === "answer") return { ok: true, integrated: false };
 		// An accepted row whose recorded producer versions changed is no longer proof, even before a later pass writes
 		// the invalidation reason: a consumer must not start from it.
 		if (hasStaleInputs(row, own.record.results ?? [])) {
 			return { ok: false, reason: "선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다." };
 		}
-		const evidence = own.evidence.get(result.id);
+		if (restoredSubmission) {
+			const source = await revalidateCheckpointProof({ row, result, root: own.root, forReview: true });
+			if (!source.ok) return source;
+			if (row.state === "reviewable") return { ok: true, integrated: true };
+		}
+		if (row.origin === "review") return { ok: true, integrated: false };
+		if (result.kind === "answer") {
+			if (row.restoredFrom !== undefined && row.proof !== undefined) {
+				const source = await revalidateCheckpointProof({ row, result, root: own.root, isolated: false });
+				if (!source.ok) return source;
+			}
+			return { ok: true, integrated: false };
+		}
+		const evidence = row.proof;
 		if (evidence === undefined || evidence.item.identity !== row.identity || evidence.item.attemptId !== row.attemptId) {
 			return { ok: false, reason: "수용 당시의 시도 근거를 확인하지 못했습니다." };
 		}
@@ -1063,6 +1178,16 @@ export class RunController {
 		this.#syncResults(own);
 		const lane = own.record.plan?.lanes.find(candidate => candidate.name === input.lane);
 		if (lane?.results === undefined || lane.results.length === 0) return { ok: true };
+		if (own.restoredLanes.has(lane.name)) {
+			await this.#revokeUnlocatedAccepted(own, true);
+			if (this.#own !== own || own.record.plan?.lanes.find(candidate => candidate.name === input.lane) !== lane) {
+				return { ok: false, reason: "체크포인트 확인 중 실행 또는 계획이 바뀌었습니다." };
+			}
+			if (lane.results.every(result => own.record.results?.some(row => row.id === result.id &&
+				(row.state === "accepted" || (row.state === "reviewable" && row.restoredFrom !== undefined))))) {
+				return { ok: false, reason: "[storm:checkpoint-kept] 결과를 현재 근거로 복원했습니다. 남은 레인 또는 새 리뷰를 진행하세요." };
+			}
+		}
 		// The same dispatch is prepared once; a repeated call keeps the first, honest before state.
 		if (own.attempts.has(input.dispatch)) return { ok: true };
 		const route = laneRouteFingerprint(lane);
@@ -1174,6 +1299,111 @@ export class RunController {
 		}
 	}
 
+	/** Rehydrate one validated plan; a prior record locates claims, only current evidence accepts them. */
+	async #restoreCheckpoint(own: OwnRun, previous: RunRecord, plan: RunPlan | undefined): Promise<void> {
+		this.#syncResults(own);
+		const oldRows = new Map<string, RunResult | null>();
+		if (Array.isArray(previous.results) && previous.results.length <= 400) {
+			for (const old of previous.results) {
+				if (old !== null && typeof old === "object" && typeof old.id === "string") {
+					oldRows.set(old.id, oldRows.has(old.id) ? null : old);
+				}
+			}
+		}
+		const rows = new Map(own.record.results?.map(row => [row.id, row]));
+		for (const old of oldRows.values()) {
+			if (old === null || rows.has(old.id)) continue;
+			const contract = normalizeCheckpointContract(old.contract);
+			if (contract === undefined || old.id !== contract.id || old.identity !== resultContractIdentity(contract)) continue;
+			const row: RunResult = {
+				id: contract.id, identity: old.identity, contract, state: "pending", origin: "plan", reason: ORPHAN_RESULT_REASON,
+			};
+			(own.record.results ??= []).push(row);
+			rows.set(row.id, row);
+		}
+		if (plan === undefined) return;
+		const artifactsDir = own.record.artifactsDir === previous.artifactsDir ? own.record.artifactsDir : undefined;
+		const keptJobs = new Set<string>();
+		for (const lane of plan.lanes) {
+			const job = lane.job === undefined ? undefined : own.config.jobs?.find(item => item.name === lane.job);
+			const pastJob = job === undefined ? undefined : historicalJob(own.record, job.name);
+			const jobHash = job === undefined ? undefined : jobDigest(job);
+			const expected = new Set(inputSnapshot(plan, lane, []).map(input => input.id));
+			const previousInputs = (old: RunResult): RunResult["consumed"] | false => {
+				if (old.consumed === undefined) return expected.size === 0 ? undefined : false;
+				if (!Array.isArray(old.consumed) || old.consumed.length !== expected.size) return false;
+				const seen = new Set<string>();
+				for (const input of old.consumed) {
+					if (!input || !expected.has(input.id) || seen.has(input.id) ||
+						typeof input.version !== "string" || !PROOF_DIGEST.test(input.version)) return false;
+					seen.add(input.id);
+				}
+				return old.consumed.map(({ id, version }) => ({ id, version }));
+			};
+			for (const result of lane.results ?? []) {
+				const row = rows.get(result.id)!;
+				const old = oldRows.get(result.id);
+				const identical = old != null && old.lane === lane.name && old.identity === row.identity;
+				const consumed = identical ? previousInputs(old) : false;
+				const forReview = result.kind === "change" && (old?.state === "reviewable" || old?.origin === "review");
+				if (identical && (old.state === "accepted" || (forReview && old.state === "reviewable")) && consumed !== false &&
+					typeof old.attemptId === "string" && ATTEMPT_REF.test(old.attemptId) &&
+					typeof old.contentVersion === "string" && PROOF_DIGEST.test(old.contentVersion)) {
+					const valid = job === undefined
+						? await revalidateCheckpointProof({ row: old, result, root: own.root,
+							...(artifactsDir === undefined ? {} : { artifactsDir }),
+							...(forReview ? { forReview: true as const } : {}),
+							isolated: lane.isolationReason !== undefined || own.config.isolation === "isolated" })
+						: { ok: pastJob?.status === "passed" && pastJob.exitCode === 0 && pastJob.fence === undefined &&
+							pastJob.jobSha256 === jobHash && pastJob.lane === lane.name &&
+							pastJob.attemptId === old.attemptId && pastJob.stdoutSha256 === old.contentVersion,
+							reason: "이전 실행을 승인된 명령 및 관측 결과와 대조할 수 없습니다." };
+					if (valid.ok) {
+						row.state = forReview ? "reviewable" : "accepted";
+						if (forReview) row.reason = "현재 내용은 확인했습니다. 새 리뷰가 필요합니다.";
+						row.origin = "attempt";
+						row.attemptId = old.attemptId;
+						row.contentVersion = old.contentVersion;
+						row.restoredFrom = previous.runId;
+						if (consumed?.length) row.consumed = consumed;
+						if (job === undefined && old.proof !== undefined) {
+							const proof = captureCheckpointProof(old.proof.item, old.proof.artifact);
+							if (proof !== undefined) row.proof = proof;
+						}
+						continue;
+					}
+					if ("reason" in valid && typeof valid.reason === "string") row.reason = compactResultReason(valid.reason);
+				}
+				if (jobHash !== undefined && unsafeToReplay(pastJob, jobHash)) blockedJobRow(row, UNCERTAIN_JOB);
+			}
+			if (pastJob !== undefined && job !== undefined && jobHash !== undefined && unsafeToReplay(pastJob, jobHash)) {
+				const all = lane.results?.every(result => rows.get(result.id)?.state === "accepted") === true;
+				if (all) keptJobs.add(job.name);
+				setJobReceipt(own.record, {
+					lane: lane.name, name: job.name, status: all ? "passed" : "unknown", exitCode: all ? 0 : null,
+					startedAt: typeof pastJob.startedAt === "string" && Number.isFinite(Date.parse(pastJob.startedAt)) ? pastJob.startedAt : null,
+					finishedAt: typeof pastJob.finishedAt === "string" && Number.isFinite(Date.parse(pastJob.finishedAt)) ? pastJob.finishedAt : null,
+					...(all && pastJob.stdoutSha256 !== undefined ? { jobSha256: jobHash, stdoutSha256: pastJob.stdoutSha256 } : {}),
+					...(typeof pastJob.attemptId === "string" && ATTEMPT_REF.test(pastJob.attemptId) ? { attemptId: pastJob.attemptId } : {}),
+					...(!all ? { detail: UNCERTAIN_JOB } : {}),
+				});
+			}
+		}
+		this.#invalidateConsumers(own);
+		for (const lane of plan.lanes) {
+			const results = lane.results ?? [];
+			if (results.length > 0 && results.every(result => {
+				const current = rows.get(result.id);
+				return current?.state === "accepted" || (current?.state === "reviewable" && current.restoredFrom !== undefined);
+			})) own.restoredLanes.add(lane.name);
+			else if (lane.job !== undefined && keptJobs.has(lane.job)) {
+				const receipt = historicalJob(own.record, lane.job)!;
+				setJobReceipt(own.record, { ...receipt, status: "unknown", detail: UNCERTAIN_JOB });
+				for (const result of results) blockedJobRow(rows.get(result.id)!, UNCERTAIN_JOB);
+			}
+		}
+	}
+
 	/**
 	 * Re-derives the ledger from the current plan without inventing requirements: a new id starts pending, an existing
 	 * id keeps its state across reassignment, and a removed lane keeps every non-accepted obligation (with no lane).
@@ -1238,7 +1468,8 @@ export class RunController {
 					delete row.contentVersion;
 					delete row.consumed;
 					delete row.reviewTree;
-					own.evidence.delete(row.id);
+					delete row.proof;
+					delete row.restoredFrom;
 					changed = true;
 				}
 			}
@@ -1315,7 +1546,8 @@ export class RunController {
 			this.#bindConsumed(row, prepared);
 			delete row.contentVersion;
 			delete row.reviewTree;
-			own.evidence.delete(row.id);
+			delete row.proof;
+			delete row.restoredFrom;
 			changed = true;
 		}
 		if (this.#invalidateConsumers(own)) changed = true;
@@ -1345,7 +1577,8 @@ export class RunController {
 			// The attempt is a real host fact and remains useful for the round/closeout; its evidence is what is invalid.
 			delete row.contentVersion;
 			delete row.reviewTree;
-			own.evidence.delete(row.id);
+			delete row.proof;
+			delete row.restoredFrom;
 			changed = true;
 		}
 		if (changed) this.#scheduleFlush(own);
@@ -1492,6 +1725,8 @@ export class RunController {
 			this.#bindConsumed(row, prepared);
 			delete row.contentVersion;
 			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
 		}
 		this.#invalidateConsumers(own);
 		this.#scheduleFlush(own);
@@ -1520,6 +1755,8 @@ export class RunController {
 			delete row.unblock;
 			delete row.contentVersion;
 			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
 		}
 		this.#invalidateConsumers(own);
 		this.#scheduleFlush(own);
@@ -1563,20 +1800,26 @@ export class RunController {
 				row.origin = "attempt";
 				this.#bindConsumed(row, prepared);
 				delete row.remedy;
-			delete row.retryRoute;
+				delete row.retryRoute;
 				delete row.unblock;
 				delete row.contentVersion;
 				delete row.reviewTree;
+				delete row.proof;
+				delete row.restoredFrom;
 			}
 			this.#invalidateConsumers(own);
 			return;
 		}
 		this.#applyEvaluated(own, prepared, settled.attemptId, evaluation.report.results, deferred);
-		// The location check needs the accepted item's observed digest/paths and the host-bound retained source; a
-		// row alone cannot prove that the current parent carries the accepted content.
 		for (const item of evaluation.report.results) {
-			if (item.state !== "accepted") continue;
-			own.evidence.set(item.id, { item, ...(settled.artifact === undefined ? {} : { artifact: settled.artifact }) });
+			const row = own.record.results?.find(candidate => candidate.id === item.id);
+			if (row?.attemptId !== settled.attemptId) continue;
+			const proof = (item.state === "accepted" || (item.kind === "change" && item.state === "reviewable")) && row.state === item.state
+				? captureCheckpointProof(item, item.kind === "artifact" ? settled.artifact : undefined)
+				: undefined;
+			if (proof !== undefined) row.proof = proof;
+			else delete row.proof;
+			delete row.restoredFrom;
 		}
 	}
 
@@ -1838,12 +2081,14 @@ export class RunController {
 		if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) {
 			return { ok: false, reason: "다른 세션이 시작한 실행의 쓰기 권한은 빌려올 수 없습니다." };
 		}
-		if (this.jobsRunning()) return { ok: false, reason: "[storm:job-wait] 정형 작업이 정리된 뒤 작업 트리를 쓸 수 있습니다." };
+		const blocker = this.jobGate();
+		if (blocker !== undefined) return { ok: false, reason: blocker };
 		return this.#upgradeLease(own);
 	}
 
-	jobsRunning(): boolean {
-		return this.#own?.jobBatch === true || this.#own?.jobFence === true;
+	jobGate(): string | undefined {
+		return this.#own?.jobFence ?? (this.#own?.jobBatch === true
+			? "[storm:job-wait] 정형 작업이 끝난 다음 실행하세요." : undefined);
 	}
 
 	/** Executes only jobs in this run's plan and current approval. Tool input never supplies argv or lock keys. */
@@ -1858,6 +2103,7 @@ export class RunController {
 		if (own === undefined || plan === undefined || !stillOwner() || closeoutSessionId(ctx) !== own.sessionId || own.ending !== undefined) {
 			return { ok: false, reason: "현재 대화의 실행 계획에서만 정형 작업을 시작할 수 있습니다." };
 		}
+		if (own.jobFence !== undefined) return { ok: false, reason: own.jobFence };
 		if (reservedWorkers(own.record.runId).length > 0 || this.#hasLiveWork(own)) {
 			return { ok: false, reason: "[storm:job-wait] 실행 중인 워커·검사·정형 작업이 끝난 뒤 호출하세요. 팀 변경은 필요하지 않습니다." };
 		}
@@ -1870,7 +2116,7 @@ export class RunController {
 		}
 		const jobSignal = signal === undefined ? own.abort.signal : AbortSignal.any([own.abort.signal, signal]);
 		const owner = (): boolean =>
-			this.#own === own && own.record.plan === plan && own.ending === undefined && own.jobFence !== true &&
+			this.#own === own && own.record.plan === plan && own.ending === undefined && own.jobFence === undefined &&
 			!jobSignal.aborted && stillOwner() && closeoutSessionId(ctx) === own.sessionId;
 		const approved = async (): Promise<boolean> => {
 			if (!owner()) return false;
@@ -1896,9 +2142,21 @@ export class RunController {
 				if (!owner()) break;
 				for (const entry of pending) {
 					const { lane, job } = entry;
-					if (own.record.jobs?.some(receipt => receipt.lane === lane.name && receipt.status === "passed") &&
+					const digest = jobDigest(job);
+					const previous = historicalJob(own.record, job.name);
+					if (previous?.lane === lane.name && previous.status === "passed" && previous.jobSha256 === digest &&
+						(own.restoredLanes.has(lane.name) || previous.attemptId?.startsWith(`job:${own.record.runId}:`)) &&
 						(lane.results ?? []).every(result => own.record.results?.some(row => row.id === result.id && row.state === "accepted"))) {
 						lines.push(`${lane.name}: 완료된 결과를 유지했습니다.`);
+						continue;
+					}
+					if (unsafeToReplay(previous, digest)) {
+						const previousAttempt = previous?.attemptId;
+						setJobReceipt(own.record, { lane: lane.name, name: job.name, status: "unknown", exitCode: null,
+							startedAt: null, finishedAt: null, jobSha256: digest, detail: UNCERTAIN_JOB,
+							...(typeof previousAttempt === "string" && ATTEMPT_REF.test(previousAttempt) ? { attemptId: previousAttempt } : {}) });
+						for (const row of own.record.results ?? []) if (row.lane === lane.name) blockedJobRow(row, UNCERTAIN_JOB);
+						lines.push(`${lane.name}: 차단 · ${UNCERTAIN_JOB}`);
 						continue;
 					}
 					const reason = dependencyBlock(lane, view);
@@ -1913,11 +2171,15 @@ export class RunController {
 					for (const key of keys) resources.add(key);
 				}
 				if (ready.length === 0) {
+					this.#invalidateConsumers(own);
+					this.#scheduleFlush(own);
 					for (const [name, reason] of waiting) lines.push(`${name}: 대기 · ${reason}`);
 					break;
 				}
 				lines.push(...await Promise.all(ready.map(async ({ lane, job }) => {
 					const inputs = inputSnapshot(plan, lane, own.record.results);
+					const attempt = `job:${own.record.runId}:${++own.attemptSerial}`;
+					const jobSha256 = jobDigest(job);
 					const receipt = await runConfiguredJob({
 						job,
 						cwd: own.root,
@@ -1925,24 +2187,31 @@ export class RunController {
 							? job.resources.map(key => `resource:${createHash("sha256").update(key).digest("hex")}`)
 							: [`target:${createHash("sha256").update(own.root).digest("hex")}`],
 						signal: jobSignal,
-						canStart: approved,
+						targetFence: true,
+						canStart: async () => {
+							if (!(await approved())) return false;
+							setJobReceipt(own.record, { lane: lane.name, name: job.name, status: "started", exitCode: null,
+								startedAt: iso(this.deps.now()), finishedAt: null, attemptId: attempt, jobSha256 });
+							await this.#writeLiveSnapshot(own);
+							return approved();
+						},
 					});
-					if (receipt.fenceRetained === true) own.jobFence = true;
-					const { name, status, exitCode, startedAt, finishedAt, detail } = receipt;
-					const saved: RunJob = { lane: lane.name, name, status, exitCode, startedAt, finishedAt, ...(detail === undefined ? {} : { detail }) };
-					if (receipt.fenceRetained === true && stillOwner()) {
-						this.deps.ui(ctx).notify(detail ?? "프로세스 종료를 확인하지 못해 정형 작업 자원 예약을 유지했습니다.", "warning");
-					}
-					const receipts = (own.record.jobs ??= []);
-					const index = receipts.findIndex(item => item.lane === lane.name);
-					if (index < 0) receipts.push(saved);
-					else receipts[index] = saved;
-					const attempt = `job:${++own.attemptSerial}`;
+					const { name, status, exitCode, startedAt, finishedAt, detail, fence, unrunCause } = receipt;
+					const inconclusive = fence?.cause === "process-unproven";
+					const ambiguous = fence !== undefined || unrunCause === "owner-dead" || unrunCause === "owner-unknown" || unrunCause === "record-invalid";
+					if (inconclusive) own.jobFence = "[storm:job-fence] 정형 작업의 프로세스 종료를 확인할 수 없어 이 작업 대상을 계속 보호합니다. 실행 기록의 잠금 위치를 확인하세요.";
 					const version = createHash("sha256").update(receipt.stdout.tail).digest("hex");
+					setJobReceipt(own.record, { lane: lane.name, name, status: inconclusive ? "unknown" : status,
+						exitCode, startedAt, finishedAt, attemptId: attempt, jobSha256,
+						...(status === "passed" ? { stdoutSha256: version } : {}),
+						...(detail === undefined ? {} : { detail }),
+						...(fence === undefined ? {} : { fence }),
+					});
+					if (ambiguous && stillOwner() && detail !== undefined) this.deps.ui(ctx).notify(detail, "warning");
 					for (const result of lane.results ?? []) {
 						const row = own.record.results?.find(candidate => candidate.id === result.id && candidate.lane === lane.name);
 						if (!row || row.identity !== resultContractIdentity(result)) continue;
-						const matches = status === "passed" && exitCode === 0 && result.contains !== undefined && receipt.stdout.tail.includes(result.contains);
+						const matches = !ambiguous && status === "passed" && exitCode === 0 && result.contains !== undefined && receipt.stdout.tail.includes(result.contains);
 						row.state = matches ? "accepted" : "unmet";
 						row.origin = "attempt";
 						row.attemptId = attempt;
@@ -1950,17 +2219,22 @@ export class RunController {
 						delete row.unblock;
 						delete row.retryRoute;
 						delete row.reviewTree;
+						delete row.proof;
+						delete row.restoredFrom;
 						if (inputs.length > 0) row.consumed = inputs;
 						else delete row.consumed;
 						if (matches) {
 							row.contentVersion = version;
 							delete row.reason;
+						} else if (ambiguous) {
+							blockedJobRow(row, "정형 작업의 종료 또는 자원 소유권을 확인하지 못했습니다.");
 						} else {
 							delete row.contentVersion;
 							row.reason = status === "passed" ? "기대한 stdout 근거를 확인하지 못했습니다." :
 								compactResultReason(detail ?? `실행 ${status}${exitCode === null ? "" : ` (exit ${exitCode})`}`);
 						}
 					}
+					await this.#writeLiveSnapshot(own).catch(() => undefined);
 					return `${lane.name} (${name}): ${status}${exitCode === null ? "" : ` · exit ${exitCode}`}${detail === undefined ? "" : ` · ${detail}`}`;
 				})));
 				this.#invalidateConsumers(own);
@@ -1985,7 +2259,8 @@ export class RunController {
 		if (closeoutSessionId(ctx) !== own.sessionId) {
 			return { ok: false, reason: "다른 세션이 시작한 실행에는 계획을 적용할 수 없습니다." };
 		}
-		if (this.jobsRunning()) return { ok: false, reason: "정형 실행이 끝난 다음 계획을 바꿀 수 있습니다." };
+		const blocker = this.jobGate();
+		if (blocker !== undefined) return { ok: false, reason: blocker };
 		for (const receipt of own.record.jobs ?? []) {
 			const lane = plan.lanes.find(candidate => candidate.job === receipt.name);
 			if (lane !== undefined && lane.name !== receipt.lane) {
@@ -2013,6 +2288,10 @@ export class RunController {
 		// Required results are obligations, not plan text: adding a lane seeds pending rows, and a removed lane keeps
 		// every requirement it still owed.
 		this.#syncResults(own);
+		for (const lane of plan.lanes) {
+			if (lane.job === undefined || historicalJob(own.record, lane.job)?.status !== "unknown") continue;
+			for (const row of own.record.results ?? []) if (row.lane === lane.name) blockedJobRow(row, UNCERTAIN_JOB);
+		}
 		this.#scheduleFlush(own);
 		return { ok: true };
 	}
@@ -2102,6 +2381,7 @@ export class RunController {
 	 * handler omp is still closing the turn, so nothing is sent from it.
 	 */
 	async #decide(own: OwnRun, ctx: ExtensionContext, aborted: boolean): Promise<void> {
+		if (own.jobFence !== undefined) return this.#stop(own, aborted ? "interrupted" : "no-progress", ctx);
 		const turns = own.record.turns ?? 0;
 		// The turn settled: the live line moves to the round decision before any tree read or check starts.
 		this.#emitPhase(own);
@@ -2156,6 +2436,7 @@ export class RunController {
 
 	/** The round's decision from the tree now and the gate as the ledger has it after that. */
 	async #roundDecision(own: OwnRun, aborted: boolean, allowChecks: boolean): Promise<RoundDecision> {
+		await this.#revokeUnlocatedAccepted(own, true);
 		let now = await this.#treeAt(own.root, own.base);
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
@@ -2206,7 +2487,11 @@ export class RunController {
 		if (plan === undefined) return undefined;
 		const remaining = new Set(own.lanes.remaining(plan, agents, this.#failedIds(own, agents)));
 		for (const lane of plan.lanes) {
-			if (lane.job !== undefined && own.record.jobs?.some(job => job.lane === lane.name && job.status === "passed")) remaining.delete(lane.name);
+			if (lane.job !== undefined && own.record.jobs?.some(job => job.name === lane.job && job.lane === lane.name && job.status === "passed" &&
+				(own.restoredLanes.has(lane.name) || job.attemptId?.startsWith(`job:${own.record.runId}:`)))) remaining.delete(lane.name);
+			if (own.restoredLanes.has(lane.name) && lane.results?.length &&
+				lane.results.every(result => own.record.results?.some(row => row.id === result.id &&
+					(row.state === "accepted" || (row.state === "reviewable" && row.restoredFrom !== undefined))))) remaining.delete(lane.name);
 		}
 		for (const row of own.record.results ?? []) {
 			if (row.lane !== undefined && (row.state === "pending" || row.state === "unmet")) remaining.add(row.lane);
@@ -2393,6 +2678,8 @@ export class RunController {
 		const coverage: CoverageInput = { checks: [], lanes: planLanes ?? [] };
 		const results = this.#coverageResults(own);
 		if (results.length > 0) coverage.results = results;
+		if (own.record.results?.some(row => row.restoredFrom !== undefined && row.contract?.kind === "change" &&
+			(row.state === "accepted" || row.state === "reviewable"))) coverage.restoredChange = true;
 		// A reviewable row without an approved reviewer is a blocker, not an endless round.
 		coverage.reviewer = usableRole(own.config, "reviewer") !== undefined;
 		const required = own.config.requiredChecks?.map(check => check.name) ?? [];
@@ -2717,6 +3004,7 @@ export class RunController {
 	 * check bound to the pre-drain tree is not replayed as authority for the tree that remains.
 	 */
 	async #recheckVerified(own: OwnRun): Promise<RunEndReason> {
+		await this.#revokeUnlocatedAccepted(own, true);
 		const now = await this.#treeAt(own.root, own.base);
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
@@ -2791,7 +3079,7 @@ export class RunController {
 
 	/** Whether this run still owns live work: a running agent, a running check, a settlement being evaluated, or a bound job. */
 	#hasLiveWork(own: OwnRun): boolean {
-		if (own.jobBatch === true || own.jobFence === true) return true;
+		if (own.jobBatch === true) return true;
 		if (own.checking !== undefined) return true;
 		// A settlement already inside `settleAttempt` has left `attempts` for `settling`; the record it will write is
 		// current evidence, so finalization must wait for it instead of judging the previous accepted row.
@@ -2808,7 +3096,7 @@ export class RunController {
 	 * review-accepted row's digest is its bound tree: a current tree that no longer matches reopens the submission for
 	 * judgement instead of carrying the old verdict into the record.
 	 */
-	async #revokeUnlocatedAccepted(own: OwnRun): Promise<void> {
+	async #revokeUnlocatedAccepted(own: OwnRun, restoredOnly = false): Promise<void> {
 		let changed = false;
 		let treeNow: string | undefined;
 		let readTree = false;
@@ -2820,7 +3108,8 @@ export class RunController {
 			return treeNow;
 		};
 		for (const row of own.record.results ?? []) {
-			if (row.state !== "accepted") continue;
+			if (restoredOnly && row.restoredFrom === undefined) continue;
+			if (row.state !== "accepted" && !(row.state === "reviewable" && row.restoredFrom !== undefined)) continue;
 			const planned = this.#plannedResult(own, row.id) ?? row.contract;
 			// A legacy row that never recorded its contract is not reconstructed from plan text; there is no safe
 			// historical source to re-locate it against and no new evidence is invented here.
@@ -2838,9 +3127,9 @@ export class RunController {
 				delete row.retryRoute;
 				delete row.unblock;
 				changed = true;
-				continue;
+				if (row.restoredFrom === undefined) continue;
 			}
-			if (planned.kind === "answer") continue;
+			if (planned.kind === "answer" && (row.restoredFrom === undefined || row.proof === undefined)) continue;
 			const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(result => result.id === row.id));
 			const isolated = lane === undefined ? undefined : lane.isolationReason !== undefined || own.config.isolation === "isolated";
 			const location = await this.#acceptedLocation(own, planned, isolated, row);
@@ -2853,7 +3142,8 @@ export class RunController {
 			delete row.remedy;
 			delete row.retryRoute;
 			delete row.unblock;
-			own.evidence.delete(row.id);
+			delete row.proof;
+			delete row.restoredFrom;
 			changed = true;
 		}
 		if (!changed) return;
@@ -3027,6 +3317,7 @@ export class RunController {
 	 * failure, because a read lease that cannot write must not let a write-capable effect proceed.
 	 */
 	async #upgradeLease(own: OwnRun): Promise<{ ok: true } | { ok: false; reason: string }> {
+		if (own.jobFence !== undefined) return { ok: false, reason: own.jobFence };
 		const lease = own.lease;
 		if (lease === undefined) return { ok: false, reason: "실행 잠금이 없어 쓰기 권한을 확인하지 못했습니다." };
 		if (lease.mode === "write") return { ok: true };
@@ -3101,9 +3392,19 @@ export class RunController {
 			// A run that finished meanwhile has already written its final record.
 			if (!live || this.#own !== own) return;
 			this.#liveStatus(own.ctx, live);
-			this.#liveWrite = writeRun(own.sessionDir, { ...live, updatedAt: iso(this.deps.now()) }).catch(() => undefined);
+			void this.#writeLiveSnapshot(own).catch(() => undefined);
 		}, this.deps.flushMs ?? LIVE_FLUSH_MS);
 		this.#flushTimer.unref?.();
+	}
+
+	/** The before-spawn receipt must land before any command can run, and writes never overtake it. */
+	#writeLiveSnapshot(own: OwnRun): Promise<void> {
+		const write = this.#liveWrite.catch(() => undefined).then(async () => {
+			const live = this.active();
+			if (live !== undefined && this.#own === own) await writeRun(own.sessionDir, { ...live, updatedAt: iso(this.deps.now()) });
+		});
+		this.#liveWrite = write.catch(() => undefined);
+		return write;
 	}
 
 	#threshold(ctx: ExtensionContext, kind: "warn" | "limit", run: LedgerRun): void {

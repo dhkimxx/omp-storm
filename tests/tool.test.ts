@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import * as zod from "@oh-my-pi/omptype/zod";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import { MAX_LANE_DEPENDENCIES, MAX_LANE_RESULTS, MAX_LANE_TEXT, MAX_RESULT_CRITERION, MAX_RESULT_ID } from "../src/plan/validate.ts";
 import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE } from "../src/proposals/present.ts";
@@ -84,6 +85,16 @@ describe("tool definition", () => {
 		expect(tool.description).toContain("brief");
 		expect(tool.description).toContain("progress");
 		expect(tool.description).toContain("dependsOn");
+	});
+
+	test("the provider-serialized tool stays under the 4,904-byte review baseline", () => {
+		// 4,904 B was the v0.24.0 storm tool as `toolWireSchema` serializes it; only description text was condensed,
+		// so the schema and the call-site affordances are unchanged.
+		const serialized = JSON.stringify({
+			type: "function",
+			function: { name: tool.name, description: tool.description, parameters: toolWireSchema(tool as never) },
+		});
+		expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(4_904);
 	});
 
 	test("the schema accepts run fields but strips modes and unknown top-level fields", () => {

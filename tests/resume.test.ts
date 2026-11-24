@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { sha256Hex } from "../src/config/canonical.ts";
-import { lastRun, pruneRuns, readRun, runsDir, writeRun } from "../src/runtime/run.ts";
+import { lastRun, pruneRuns, readRun, RUN_RECORD_MAX_BYTES, runsDir, writeRun } from "../src/runtime/run.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import {
 	findResumeCandidate,
@@ -317,5 +317,29 @@ describe("resume retention protection", () => {
 		await pruneRuns(sessionDir, 1);
 		expect(await readRun(sessionDir, live.runId)).toBeDefined();
 		expect(await readRun(sessionDir, newest.runId)).toBeDefined();
+	});
+});
+
+describe("run record reads", () => {
+	test("a read is bounded to a regular file and refuses a symlink, a directory or an oversized record", async () => {
+		const record = run();
+		await writeRun(sessionDir, record);
+		expect((await readRun(sessionDir, record.runId))?.task).toBe(record.task);
+
+		const dir = runsDir(sessionDir);
+		const hugeId = "run-20261120-100001-huge";
+		await writeFile(path.join(dir, `${hugeId}.json`), JSON.stringify({ ...record, runId: hugeId, task: "x".repeat(RUN_RECORD_MAX_BYTES) }));
+		expect(await readRun(sessionDir, hugeId)).toBeUndefined();
+
+		const realId = "run-20261120-100002-real";
+		await writeRun(sessionDir, { ...record, runId: realId });
+		const linkId = "run-20261120-100003-link";
+		await symlink(path.join(dir, `${realId}.json`), path.join(dir, `${linkId}.json`));
+		expect(await readRun(sessionDir, realId)).toBeDefined();
+		expect(await readRun(sessionDir, linkId)).toBeUndefined();
+
+		const dirId = "run-20261120-100004-dir";
+		await mkdir(path.join(dir, `${dirId}.json`), { recursive: true });
+		expect(await readRun(sessionDir, dirId)).toBeUndefined();
 	});
 });

@@ -130,7 +130,10 @@ type Decision = (
 /** Who a request is from: the main session, a spawned child, Storm's router, a compaction, or omp's own auxiliary calls. */
 export type Who = "main" | "child" | "route" | "compaction" | "side";
 
-/** One line of the request log. */
+/**
+ * One line of the request log. Every `*Bytes` field is UTF-8 at the provider endpoint, measured before parsing for
+ * `bodyBytes`; these are bytes, never tokens and never an estimate of them.
+ */
 export interface LlmEntry {
 	ts: number;
 	who: Who;
@@ -151,6 +154,17 @@ export interface LlmEntry {
 	keywordNotice: boolean;
 	/** Storm's doc rules section of the system prompt: its size and a hash, to tell the role variants apart. */
 	docRules: { chars: number; hash: string } | null;
+	/** The system/developer text at the provider endpoint: UTF-8 bytes and a stable hash of the same bytes. */
+	systemBytes: number;
+	systemSha256: string;
+	/** Storm's fixed bootstrap in the system prompt (`<storm-auto>`, `<storm-decision>`): UTF-8 bytes, 0 when absent. */
+	stormBlockBytes: number;
+	/** The offered tool catalog: UTF-8 bytes of the whole array, of the `storm` entry and of its parameters schema. */
+	toolsBytes: number;
+	stormToolBytes: number;
+	stormSchemaBytes: number;
+	/** UTF-8 bytes of the provider request body as received, before parsing. */
+	bodyBytes: number;
 	/** `STORM-ROLE <name>` markers in any message (a shadowing role definition carries one). */
 	roles: string[];
 	/** The tool result this request answers, cut. */
@@ -538,11 +552,14 @@ function docRulesOf(system: string): LlmEntry["docRules"] {
 	return { chars: section.length, hash: new Bun.CryptoHasher("sha256").update(section).digest("hex").slice(0, 12) };
 }
 
-function record(request: ChatRequest, who: Who, decision: Decision): void {
+function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: number): void {
 	const messages = request.messages.map(message => ({ role: message.role, text: textOf(message.content) }));
 	const users = messages.filter(entry => entry.role === "user");
 	const last = messages.at(-1);
-	const storm = request.tools?.find(tool => tool.function.name === "storm")?.function;
+	// The system/developer text as the provider sees it; omp sends one system message, joined here when it sends more.
+	const system = request.messages.filter(message => message.role === "system" || message.role === "developer").map(message => textOf(message.content)).join("\n");
+	const stormTool = request.tools?.find(tool => tool.function.name === "storm");
+	const storm = stormTool?.function;
 	const entry: LlmEntry = {
 		ts: Date.now(),
 		who,
@@ -555,7 +572,17 @@ function record(request: ChatRequest, who: Who, decision: Decision): void {
 		users: users.map(entry => entry.text.slice(0, 300)),
 		lastUser: (users.at(-1)?.text ?? "").slice(0, 8_000),
 		keywordNotice: users.some(entry => NOTICES.some(notice => entry.text.includes(notice))),
-		docRules: docRulesOf(messages.filter(entry => entry.role === "system" || entry.role === "developer").map(entry => entry.text).join("\n")),
+		docRules: docRulesOf(system),
+		systemBytes: Buffer.byteLength(system, "utf8"),
+		systemSha256: new Bun.CryptoHasher("sha256").update(system).digest("hex").slice(0, 12),
+		stormBlockBytes: Buffer.byteLength(
+			[...system.matchAll(/<(storm-(?:auto|decision))>[\s\S]*?<\/\1>/g)].map(match => match[0]).join("\n"),
+			"utf8",
+		),
+		toolsBytes: Buffer.byteLength(JSON.stringify(request.tools ?? []), "utf8"),
+		stormToolBytes: stormTool === undefined ? 0 : Buffer.byteLength(JSON.stringify(stormTool), "utf8"),
+		stormSchemaBytes: storm === undefined ? 0 : Buffer.byteLength(JSON.stringify(storm.parameters ?? {}), "utf8"),
+		bodyBytes,
 		roles: [...new Set(messages.flatMap(entry => [...entry.text.matchAll(/STORM-ROLE ([\w-]+)/g)].map(match => match[1] ?? "")))],
 		lastTool: last?.role === "tool" ? last.text.slice(0, 1_000) : "",
 		compactionContext: who === "compaction"
@@ -628,12 +655,15 @@ Bun.serve({
 		const url = new URL(req.url);
 		if (req.method === "GET" && url.pathname.endsWith("/models")) return Response.json({ object: "list", data: [] });
 		if (req.method !== "POST" || !url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
-		const request = (await req.json()) as ChatRequest;
+		// The bytes as they arrived at the endpoint, before any parse or re-serialization: the honest size baseline.
+		const raw = await req.text();
+		const bodyBytes = Buffer.byteLength(raw, "utf8");
+		const request = JSON.parse(raw) as ChatRequest;
 		const who = classify(request);
 		// A provider out of quota: omp falls back along retry.fallbackChains and emits retry_fallback_applied.
 		// `x-should-retry` keeps the provider client from backing off for 15 s before omp sees the error.
 		if (request.model === QUOTA_OUT) {
-			record(request, who, { kind: "text", text: "429 insufficient_quota" });
+			record(request, who, { kind: "text", text: "429 insufficient_quota" }, bodyBytes);
 			const error = { message: "You exceeded your current quota, please check your plan and billing details.", type: "insufficient_quota", code: "insufficient_quota" };
 			return Response.json({ error }, { status: 429, headers: { "x-should-retry": "false" } });
 		}
@@ -641,7 +671,7 @@ Bun.serve({
 		const retryKey = who === "child" ? /E2E-CHILD-429-ONCE[ \t]+(\S+)/.exec(userText(request.messages))?.[1] : undefined;
 		if (retryKey !== undefined && !failedOnce.has(retryKey) && !request.messages.some(message => message.role === "assistant")) {
 			failedOnce.add(retryKey);
-			record(request, who, { kind: "text", text: "429 retry once" });
+			record(request, who, { kind: "text", text: "429 retry once" }, bodyBytes);
 			const error = { message: "Temporary rate limit.", type: "rate_limit_error", code: "rate_limit" };
 			return Response.json({ error }, { status: 429, headers: { "x-should-retry": "true", "retry-after-ms": "1" } });
 		}
@@ -652,7 +682,7 @@ Bun.serve({
 		if (awaitChildren && !(await hold(() => awaitChildren.every(key => waitingChildren.has(key))))) {
 			return gateError(`Children never reached their gates: ${awaitChildren.filter(key => !waitingChildren.has(key)).join(", ")}`);
 		}
-		record(request, who, decision);
+		record(request, who, decision, bodyBytes);
 		if (releaseChildren) {
 			const missing = releaseChildren.filter(key => !waitingChildren.has(key));
 			if (missing.length > 0) return gateError(`Cannot release children not at their gates: ${missing.join(", ")}`);

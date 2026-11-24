@@ -179,7 +179,13 @@ try {
 			await rpc.prompt("/storm auto");
 			suite.check("the explicit switch offers turning it off", same(rpc.dialogs.at(-1)?.options, [AUTO.off, CANCEL]), JSON.stringify(rpc.dialogs.at(-1)));
 			await waitChoice(files, "off");
+			const off = new LlmCursor(env);
 			await rpc.turn(scripted({ edit: "direct-after-off.txt" }));
+			suite.check(
+				"auto off leaves zero Storm bytes in the system prompt",
+				off.of("main").length > 0 && off.of("main").every(entry => entry.stormBlockBytes === 0),
+				JSON.stringify(off.of("main").map(entry => ({ stormBlockBytes: entry.stormBlockBytes, systemBytes: entry.systemBytes }))),
+			);
 			suite.check("turning it off restores stock edits in the same session", existsSync(join(env.project, "direct-after-off.txt")));
 			suite.check("no run was opened", files.runIds().size === 0);
 			resetFile("direct-after-off.txt");
@@ -229,6 +235,27 @@ try {
 			const chat = new LlmCursor(env);
 			await rpc.turn("Hello. No repository task.");
 			suite.check("conversation has one main request and no run, classifier or worker", chat.of("main").length === 1 && chat.of("route").length === 0 && chat.of("child").length === 0 && files.runIds().size === before.size);
+			const greeting = chat.of("main")[0];
+			suite.check(
+				"plain chat carries the fixed Storm bootstrap under 1,300 B, not a classifier",
+				greeting !== undefined && greeting.stormBlockBytes > 0 && greeting.stormBlockBytes <= 1_300,
+				`block=${greeting?.stormBlockBytes} B (review baseline 4,209, budget 1,300)`,
+			);
+			suite.check(
+				"the offered storm tool serializes under the 4,904 B review baseline",
+				greeting !== undefined && greeting.stormToolBytes > 0 && greeting.stormToolBytes <= 4_904,
+				`tool=${greeting?.stormToolBytes} B (review baseline 4,904)`,
+			);
+			const repeat = new LlmCursor(env);
+			await rpc.turn("Thanks. Still just conversation.");
+			const again = repeat.of("main")[0];
+			suite.check(
+				"the bootstrap and the whole system prompt stay byte-identical across plain chat turns",
+				repeat.of("main").length === 1 && greeting !== undefined && again !== undefined &&
+					greeting.stormBlockBytes === again.stormBlockBytes && greeting.systemSha256 === again.systemSha256,
+				`block=${greeting?.stormBlockBytes}→${again?.stormBlockBytes} system=${greeting?.systemSha256}→${again?.systemSha256}`,
+			);
+			suite.check("plain chat still opens no run", files.runIds().size === before.size);
 
 			await rpc.turn(scripted({ edit: "direct-before.txt" }, { bash: "printf nope > direct-shell.txt" }));
 			suite.check("the director cannot write through either the file tool or shell", !existsSync(join(env.project, "direct-before.txt")) && !existsSync(join(env.project, "direct-shell.txt")));

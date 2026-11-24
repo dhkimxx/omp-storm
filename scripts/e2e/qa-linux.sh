@@ -21,6 +21,7 @@ run bun scripts/e2e/session-scope.ts
 
 # RPC consumer paths and the native run lifecycle in per-session stores.
 run bun scripts/e2e/run.ts
+run bun scripts/e2e/checkpoint-resume.ts
 
 # Interactive host: setup, approvals, runs, ask/resume and shutdown/resume.
 run bun scripts/e2e/tui.ts

@@ -76,7 +76,7 @@ import {
 	noteAgentUsage,
 	noteVerdictTree,
 } from "./runtime/agents.ts";
-import { workingState } from "./runtime/checkpoint.ts";
+import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { AttemptCollector } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
@@ -239,27 +239,19 @@ interface AutoStatus {
 }
 
 /**
- * The stable automatic-delegation instruction appended to the director's system prompt. It carries no live state,
- * so it does not invalidate the prompt cache between turns; refusals carry the exact fix when a call is blocked.
+ * The stable automatic-delegation bootstrap appended to the director's system prompt while auto is on. It keeps only
+ * rules no refusal or schema can teach at the point of use: the ordinary-chat contract, plan-first when unsure, the
+ * direct-tool allowlist, capacity wait and the paid-miss finish/review rule. Live state (run ids, counts, job names,
+ * modes) never enters it, so the prompt cache survives mode toggles and replans; refusals carry exact fixes.
+ * Budget: AUTO_INSTRUCTION + DECISION_INSTRUCTION ≤ 1,300 UTF-8 bytes (the 0.24.0 pair was 4,209 B); tests enforce it.
  */
 const AUTO_INSTRUCTION = `<storm-auto>
 This session delegates project work automatically.
 - General conversation needs no tools: answer directly.
-- Keep the scope tiny: one lane and one worker for a quick mechanical edit or a read-only lookup. When the request is uncertain, submit an explore-only plan first instead of guessing implementation lanes.
-- Inspection, verification, or file changes belong to the approved team. Submit a storm plan; it opens the run for this request. Use task for independent judgment/work lanes, or storm execute for announced project jobs with fixed commands. Do not open a domain mode or ask users to pick workers.
-- Replan only when evidence changes an assumption. Keep existing lane name, kind, role, job, files, and goal; progress is status only. Match each task item to its planned lane. At capacity, wait for admitted work; do not change the team.
-- Lanes share this work tree by default. Add \`isolationReason\` to a lane only when its result must stay outside the parent tree as an independent experiment; Storm requires omp isolation to be on and \`task.isolation.apply\` off for that lane. Never add \`isolationReason\` to the final review: its verdict must prove the integrated work, and Storm withholds a review it cannot bind to the tree that reviewer actually saw.
-- Do not call read, grep, glob, bash, edit, ast_edit, eval, or any other file, shell, or unknown tool yourself; for \`write\`, only the two forms below are allowed. Do not spawn an agent before the plan opens the run. Storm blocks those calls.
-- Direct writes are limited to \`write local://<name>.md\` notes and \`write agent://<id>\` messages; read worker results with \`read agent://<id>\` and bounded line ranges.
-- Follow up on the same worker with \`write agent://<id>\`. At capacity, wait; only a closed or context-limited worker needs a replacement that reads \`agent://<id>\`.
-- Keep each worker result to about 1500 characters with evidence locations and links; do not paste raw logs. Send those ranges to workers or the reviewer; do not read repository files yourself.
-- When you need the user, use the native \`ask\` tool within this turn; never end by pretending no lane was work.
-- Spawn only the plan's approved roles and worker counts; Storm refuses anything outside the plan.
-- Finish against the requested results, even without edits. When code changes and the team has a reviewer, verification still needs the reviewer to accept the current tree.
-- Near the end of a substantial run, after its results and before you end the turn, submit one \`brief\` action with the \`storm\` tool: \`result\`, \`verification\` with evidence locations, optional \`remaining\`, and exactly three concrete \`next\` directions (the first is your recommendation). Restage it if later rounds change the result. A brief only stages the closeout; it neither verifies nor ends the run, and submitting it is no proof. Skip the brief and next directions for a trivial lookup or a quick one-step request.
-- Do not repeat the brief's directions as a numbered menu in your prose: Storm shows the menu when the run settles. Never claim work is verified before Storm's final gate says so. Do not make another model call just to write the brief.
-- Continue permitted work while capacity or resources are busy. Report a blocker the user can resolve; never work around it with direct tools.
-- Keep going until the plan's lanes are done or blocked.
+- Keep the scope tiny: one lane, one worker for a quick edit or a read-only lookup. When unsure, plan an explore lane first.
+- Inspection, verification or file changes belong to the approved team: a storm plan opens this request's run. Use task for work lanes, storm execute for approved jobs. At capacity wait; do not ask the user whom to spawn.
+- Direct writes are only write local://<name>.md and write agent://<id>; read results with read agent://<id> and bounded ranges. Other project, shell or unknown tools are blocked.
+- Finish every declared result, even without edits. With a reviewer, verification needs the reviewer to accept the current tree.
 </storm-auto>`;
 
 /**
@@ -268,11 +260,8 @@ This session delegates project work automatically.
  * keeps the prompt cache stable. The per-request decision history lives in the runtime, never in this text.
  */
 const DECISION_INSTRUCTION = `<storm-decision>
-Routine in-scope setup, checks, retries and fixes the user already requested need no confirmation: do the work that is ready first.
-Only a genuine user decision may use the native \`ask\` tool: a scope change, an irreversible action, or a choice that belongs to the user. Replan within the approved bounds instead of asking to widen them.
-Put \`data-storm-decision="<stable-key>"\` and exactly one \`data-storm-reason\` (\`scope-change\`, \`irreversible-action\`, \`user-choice\`) on the main \`<form>\` tag; keep the same key across replans and rounds of this request.
-For a scope change or irreversible action, preselect nothing: a timeout or cancel is not consent and must never submit an approval.
-Ask once per request, consolidate related questions, and never repeat an authorization.
+Routine in-scope setup, checks and fixes need no confirmation: do the work that is ready first.
+Only a genuine user decision may use native ask: scope change, irreversible action or user choice. Put data-storm-decision="<stable-key>" and exactly one data-storm-reason (scope-change, irreversible-action, user-choice) on the main <form>; reuse the key across replans. Preselect nothing; a timeout or cancel is not consent. Ask once per request.
 </storm-decision>`;
 
 /** Said when an automatic session tries to spawn outside the run its plan opens. */
@@ -643,7 +632,6 @@ export default function storm(pi: ExtensionAPI): void {
 	interface AutoEntry extends AutoStatus {
 		task: string | undefined;
 		settling?: Promise<void>;
-		jobNames?: readonly string[];
 		epoch: number;
 	}
 	const autos = new Map<string, AutoEntry>();
@@ -682,16 +670,12 @@ export default function storm(pi: ExtensionAPI): void {
 			// A failed load cannot prove consent was withdrawn for the same conversation; on a changed one the entry is
 			// already gone and this writes nothing.
 			if (current()) {
-				delete entry.jobNames;
 				if (entry.enabled) entry.problem = "팀 설정을 확인하지 못했습니다. /storm 으로 확인하세요.";
 			}
 			return;
 		}
 		if (!current()) return;
 		entry.problem = teamProblem(state) ?? modeProblem(ctx);
-		const jobNames = state.config.status === "ok" && entry.problem === undefined ? state.config.config.jobs?.map(job => job.name) : undefined;
-		if (jobNames?.length) entry.jobNames = jobNames;
-		else delete entry.jobNames;
 		try {
 			const enabled = await readAutoDelegation(state.sessionDir);
 			if (current()) entry.enabled = enabled;
@@ -1109,9 +1093,12 @@ export default function storm(pi: ExtensionAPI): void {
 		return {
 			now: Date.now,
 			loadState,
-			statusText: opts => {
+			statusText: async opts => {
 				if (!stillOwner()) throw new Error(stale);
-				return statusText(flow, opts);
+				const text = await statusText(flow, opts);
+				if (!stillOwner()) throw new Error(stale);
+				const run = runs.active();
+				return run?.resumeOf === undefined ? text : `${text}\n\n${checkpointWorkState(run).join("\n")}`;
 			},
 			auto: () => autoSnapshot(sessionId),
 			runtime: {
@@ -1248,8 +1235,9 @@ export default function storm(pi: ExtensionAPI): void {
 			// Recheck the captured run rather than a repo or cwd match; a close or a new run is not this spawn's owner.
 			const run = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
 			if (capturedRunId !== undefined && (run === undefined || run.closing)) return closed();
-			if (capturedRunId === runs.runId() && runs.jobsRunning()) {
-				return { block: true, reason: "[storm:job-wait] 정형 작업이 끝날 때까지 워커 시작을 기다리세요." };
+			if (capturedRunId === runs.runId()) {
+				const gate = runs.jobGate();
+				if (gate !== undefined) return { block: true, reason: gate };
 			}
 			if (ctx.agent.kind === "main" && auto?.enabled === true && runs.runId() === undefined) {
 				return { block: true, reason: autoRefusal(auto?.problem, AUTO_SPAWN_REASON) };
@@ -1406,8 +1394,9 @@ export default function storm(pi: ExtensionAPI): void {
 				}
 				if (timedOut) return closed();
 				if (!stillOwn()) return moved();
-				if (current !== undefined && current.runId === runs.runId() && runs.jobsRunning()) {
-					return ledgerBlock("정형 작업이 끝날 때까지 워커 시작을 기다리세요.", current, Date.now());
+				if (current !== undefined && current.runId === runs.runId()) {
+					const gate = runs.jobGate();
+					if (gate !== undefined) return ledgerBlock(gate, current, Date.now());
 				}
 				if (record?.trialId) {
 					const trialId = record.trialId;
@@ -1508,46 +1497,49 @@ export default function storm(pi: ExtensionAPI): void {
 			const generation = sessionGeneration;
 			const auto = autoFor(sessionId);
 			// Only an ordinary prompt carries a user request. A revive has no prompt, and Storm's own run messages
-			// are generated continuations: neither may capture or replace the task a plan opens.
-			if (event.reason !== "prompt") return undefined;
-			const prompt = typeof event.prompt === "string" ? event.prompt : "";
-			const text = prompt.trimStart();
-			const runMessage = text.startsWith("<storm-run ");
-			if (!runMessage) {
-				// The host can start a new prompt while its detached terminal agent_end is still closing Storm's run.
-				// Wait for that decision and lease release before deciding if this is a new task or run context.
-				if (auto.settling !== undefined) {
-					await auto.settling.catch(() => undefined);
-					if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId || autos.get(sessionId) !== auto) return undefined;
+			// are generated continuations: neither may capture or replace the task a plan opens. Both still get the
+			// stable bootstrap below, so the system prompt does not change between an ordinary and a revived turn.
+			if (event.reason === "prompt") {
+				const prompt = typeof event.prompt === "string" ? event.prompt : "";
+				const text = prompt.trimStart();
+				const runMessage = text.startsWith("<storm-run ");
+				if (!runMessage) {
+					// The host can start a new prompt while its detached terminal agent_end is still closing Storm's run.
+					// Wait for that decision and lease release before deciding if this is a new task or run context.
+					if (auto.settling !== undefined) {
+						await auto.settling.catch(() => undefined);
+						if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId || autos.get(sessionId) !== auto) return undefined;
+					}
+					if (text === "") {
+						// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
+						if (runs.runId() === undefined) auto.task = undefined;
+						return undefined;
+					}
+					// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
+					// reminders and steers must not replace it; a prompt while this session directs is run context.
+					if (runs.runId() === undefined && auto.task === undefined) {
+						auto.task = prompt;
+						// The first prompt of a user turn starts its request; decisions never inherit from the last one.
+						decisions.nextRequest(sessionId, sessionGeneration);
+					}
+					const env = envForSession(sessionId, ctx.cwd);
+					await refreshAuto(ctx, () => stateCache.get(env));
 				}
-				if (text === "") {
-					// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
-					if (runs.runId() === undefined) auto.task = undefined;
-					return undefined;
-				}
-				// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
-				// reminders and steers must not replace it; a prompt while this session directs is run context.
-				if (runs.runId() === undefined && auto.task === undefined) {
-					auto.task = prompt;
-					// The first prompt of a user turn starts its request; decisions never inherit from the last one.
-					decisions.nextRequest(sessionId, sessionGeneration);
-				}
-				const env = envForSession(sessionId, ctx.cwd);
-				await refreshAuto(ctx, () => stateCache.get(env));
+				// A switch during the read must not attach Storm guidance to another conversation's prompt.
+				if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId) return undefined;
 			}
-			// A switch during the read must not attach Storm guidance to another conversation's prompt.
-			if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId) return undefined;
 			const autoOn = autos.get(sessionId) === auto && auto.enabled;
 			const activeRun = getLedgerRun(runs.runId());
 			const manualOn = activeRun !== undefined && activeRun.sessionId === sessionId;
-			if (!autoOn && !manualOn) return undefined;
-			const additions: string[] = [];
-			if (!event.systemPrompt.includes(DECISION_INSTRUCTION)) additions.push(DECISION_INSTRUCTION);
-			if (autoOn && !event.systemPrompt.includes(AUTO_INSTRUCTION)) additions.push(AUTO_INSTRUCTION);
-			if (autoOn && auto.jobNames?.length) additions.push(`Storm approved project job names: ${JSON.stringify(auto.jobNames)}.`);
-			if (additions.length === 0) return undefined;
-			// Append only: the prompt itself is the host's, and these blocks are stable between turns.
-			return { systemPrompt: [...event.systemPrompt, ...additions] };
+			// A block applies only while its mode does. Dropping a block this handler added earlier keeps auto-off and
+			// post-run prompts free of Storm text instead of leaving the host's promoted base prompt stale.
+			const wanted = new Set<string>();
+			if (autoOn || manualOn) wanted.add(DECISION_INSTRUCTION);
+			if (autoOn) wanted.add(AUTO_INSTRUCTION);
+			const kept = event.systemPrompt.filter(entry => (entry !== AUTO_INSTRUCTION && entry !== DECISION_INSTRUCTION) || wanted.has(entry));
+			const additions = [...wanted].filter(block => !kept.includes(block));
+			if (additions.length === 0 && kept.length === event.systemPrompt.length) return undefined;
+			return { systemPrompt: [...kept, ...additions] };
 		}
 		const ledger = childLedger(ctx);
 		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
@@ -1835,9 +1827,8 @@ export default function storm(pi: ExtensionAPI): void {
 		if (followAgent !== undefined && followLanes !== undefined) {
 			// A job batch owns the run while it executes and starts only with no live workers. A genuine work-bearing
 			// note would make a worker live, so it waits for the batch; a `?progress` note never reaches this block.
-			if (runs.jobsRunning()) {
-				return { block: true, reason: "[storm:job-wait] 정형 작업이 끝날 때까지 워커 후속 작업을 보내지 마세요. wait 도구나 완료 알림 뒤 다시 보내세요." };
-			}
+			const blockedByJob = runs.jobGate();
+			if (blockedByJob !== undefined) return { block: true, reason: blockedByJob };
 			// A work-bearing follow-up starts a new turn that may write: prove the target's write lease first.
 			const writable = await runs.ensureWrite(ctx);
 			if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
@@ -1940,9 +1931,12 @@ export default function storm(pi: ExtensionAPI): void {
 			return { block: true, reason: "[storm:session] 대화가 바뀌어 이 후속 지시를 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 		}
 		// The job batch may have started during the authority/readiness awaits. Do not deliver a worker turn into it.
-		if (followAgent !== undefined && runs.jobsRunning()) {
-			if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
-			return { block: true, reason: "[storm:job-wait] 정형 작업이 시작되어 이 후속 작업을 전달하지 않았습니다. 작업이 끝난 뒤 다시 보내세요." };
+		if (followAgent !== undefined) {
+			const blockedByJob = runs.jobGate();
+			if (blockedByJob !== undefined) {
+				if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
+				return { block: true, reason: blockedByJob };
+			}
 		}
 		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
 		return undefined;

@@ -224,6 +224,8 @@ export interface CoverageInput {
 	 * rounds that no verdict can end. Absent keeps the caller's old behavior.
 	 */
 	reviewer?: boolean;
+	/** Revalidated work from a prior run still needs its own current-tree review and checks. */
+	restoredChange?: true;
 }
 
 export type Gate =
@@ -485,7 +487,8 @@ function gateCore(
 	const changes = agents.reduce((sum, agent) => sum + (agent.changes ?? 0), 0);
 	const requests = agents.reduce((sum, agent) => sum + agent.requests, 0);
 	// A read that fails after a known start is a change Storm cannot rule out; a run without a start tree has no tree evidence.
-	const treeChanged = tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files);
+	const treeChanged = coverage?.restoredChange === true ||
+		(tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files));
 	// A change the team can put down to the quick role alone needs no reviewer: quick agents do small, self-contained work.
 	const quickOnly = agents.some(agent => agent.role === "quick") && !agents.some(agent => agent.role === "implementer" || agent.role === undefined);
 	const treeNow = tree?.now === undefined || tree.now.incomplete ? undefined : treeFingerprint(tree.now);
