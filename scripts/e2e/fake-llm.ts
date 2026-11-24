@@ -114,8 +114,8 @@ export type Step = (
 ) & {
 	after?: string;
 	afterResult?: string;
-	/** Park an unmet `after` reply until the PTY driver observes the intermediate state and signals release. */
-	releaseFile?: string;
+	/** After a host receipt, park an unmet `after` reply until the PTY driver signals release. */
+	releaseFile?: { name: string; receipt: string };
 };
 interface ChatRequest {
 	model: string;
@@ -458,9 +458,10 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 	const seen = (text: string, from: (role: string) => boolean) => later.some(m => from(m.role) && textOf(m.content).includes(text));
 	if (step.afterResult !== undefined && !seen(step.afterResult, role => role === "user")) return { kind: "text", text: "waiting" };
 	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) {
-		return step.releaseFile === undefined
-			? { kind: "text", text: "waiting" }
-			: { kind: "text", text: "waiting", releaseFile: step.releaseFile };
+		const gate = step.releaseFile;
+		return gate !== undefined && seen(gate.receipt, role => role === "user" || role === "tool")
+			? { kind: "text", text: "waiting", releaseFile: gate.name }
+			: { kind: "text", text: "waiting" };
 	}
 	// A follow-up waits for its target's async result (a user message), so the target's usage is on the ledger by then.
 	if ("followUp" in step && !seen(step.followUp.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };

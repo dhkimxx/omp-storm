@@ -116,17 +116,15 @@ const steps: Step[] = [
 	{ tasks: [{ name: "origin", agent: "storm-explorer", task: "Report the original line from source", say: READ_AND_CLAIM }] },
 	{ wait: true },
 	{ tasks: [{ name: "api-verify", agent: "storm-explorer", task: "Verify the API criterion from source", say: API_UNMET }] },
-	// The director is inside this native wait while both composer messages arrive: the first excludes the untried UI
-	// leaf, the second asks for the failed API result alone. The fake child holds its reply long enough that neither
-	// message races the first attempt's settlement.
+	// Hold this child long enough to exclude the untouched UI leaf while the director is waiting.
 	{ wait: true },
 	// The host's retry nudge — not the raw input — admits this one normal retry on the existing lane and contract.
 	{
 		followUp: "agent://api-verify",
 		content: API_RETRY,
-		afterResult: "API 검증 결과는 아직 확인하지 못했습니다",
+		// OMP can deliver the child output in the wait tool receipt or in a later asynchronous user message.
 		after: 'action="retry"',
-		releaseFile: RELEASE_RETRY_ROUND,
+		releaseFile: { name: RELEASE_RETRY_ROUND, receipt: "API 검증 결과는 아직 확인하지 못했습니다" },
 	},
 	{ wait: true },
 ];
