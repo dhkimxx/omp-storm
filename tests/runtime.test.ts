@@ -322,9 +322,9 @@ describe("handoff", () => {
 		}
 	});
 
-	test("no cap numbers, no model or effort mechanics, no pointer to the agents action", () => {
-		const text = buildHandoff({ ...base, config: { ...five, contextCap: 123_000, fallbackRole: "implementer" } });
-		for (const absent of ["123", "200k", "p/implementer", "effort", "fallback", "agents`"]) expect(text).not.toContain(absent);
+	test("no model or effort mechanics, no pointer to the agents action", () => {
+		const text = buildHandoff({ ...base, config: { ...five, fallbackRole: "implementer" } });
+		for (const absent of ["p/implementer", "effort", "fallback", "agents`"]) expect(text).not.toContain(absent);
 	});
 
 	test("the plan rule maps each lane kind to a usable role's agent, along the stand-ins", () => {

@@ -58,8 +58,6 @@ export interface ReviewedResult {
 	correct: boolean;
 }
 
-/** At most this many scoped result verdicts are read from one payload; a longer list is not a scoped review. */
-export const REVIEWED_RESULTS_MAX = 16;
 const RECEIPT_RE = /^[0-9a-f]{32}$/u;
 const CITATION_MAX = 300;
 const CITATION_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
@@ -79,11 +77,13 @@ function reviewedResultOf(value: unknown): ReviewedResult | undefined {
 }
 
 /**
- * The scoped result verdicts of one payload. A malformed entry scopes nothing, and an id named twice is ambiguous: every
- * entry for it is dropped, so one review never settles a result it did not judge exactly once.
+ * The scoped result verdicts of one payload, however many a reviewer judged in one turn: each entry is small and is
+ * bound to its own receipt later, so the list length decides nothing. A malformed entry scopes nothing, and an id
+ * named twice is ambiguous: every entry for it is dropped, so one review never settles a result it did not judge
+ * exactly once.
  */
 export function reviewedResultsIn(list: unknown): ReviewedResult[] {
-	if (!Array.isArray(list) || list.length > REVIEWED_RESULTS_MAX) return [];
+	if (!Array.isArray(list)) return [];
 	const parsed = list.map(reviewedResultOf).filter((entry): entry is ReviewedResult => entry !== undefined);
 	const counts = new Map<string, number>();
 	for (const entry of parsed) counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);

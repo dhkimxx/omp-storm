@@ -1,12 +1,12 @@
 /**
- * Director context checkpoints. Past its context cap the director is compacted — in the background for automatic runs
+ * Director context checkpoints. Past 70% of its model window the director is compacted — in the background for automatic runs
  * at their first plan and sync-wait boundaries, and at an async wait for manual runs — keeping decisions and evidence
  * locations rather than raw contents; every compaction (omp's own included) also gets Storm's ledger of the run, so
  * lanes and each agent's `agent://` handle survive it.
  */
 import { tokens } from "../report/agents.ts";
 import { roleTitle } from "../roles.ts";
-import type { AgentEntry, AgentLiveState, LaneNeed, RunRecord, RunResultState } from "../types.ts";
+import type { AgentEntry, AgentLiveState, LaneNeed, PlanLaneResult, RunRecord, RunResultState } from "../types.ts";
 import { reviewTotals } from "./review.ts";
 import { runRecordRef } from "./run.ts";
 
@@ -28,6 +28,8 @@ const MAX_PLAN_NOTE = 300;
 const MAX_RESULTS = 12;
 const MAX_DEPENDENCIES = 8;
 const MAX_RESULT_REASON = 100;
+/** One field of a result contract (criterion, path, contains, check); the stored contract keeps the whole text. */
+const MAX_CONTRACT_FIELD = 120;
 const MAX_ATTEMPT = 64;
 const MAX_EDGE_NAME = 60;
 /** Hard cap on the whole ledger; longer text points at the run record instead of replaying it. */
@@ -45,8 +47,8 @@ export const CHECKPOINT_INSTRUCTIONS = [
 ].join("\n");
 
 /**
- * Whether the director's context (`tokens`) is at or past `cap` and no checkpoint ran within `minGapMs`. A checkpoint
- * in flight excludes another, and a host rejection holds the next try off for the same gap: a host that refuses
+ * Whether the director's context (`tokens`) is at or past `cap` (a share of its window, `windowThreshold`) and no
+ * checkpoint ran within `minGapMs`. A checkpoint in flight excludes another, and a host rejection holds the next try off for the same gap: a host that refuses
  * (already compacting, nothing to compact, a session change) is never asked at every boundary.
  */
 export function shouldCheckpoint(input: {
@@ -83,6 +85,19 @@ const DEPENDENCY_NEED_LABEL: Readonly<Record<LaneNeed, string>> = {
 function oneLine(text: string, max: number): string {
 	const clean = text.replace(/\s+/g, " ").trim();
 	return clean.length > max ? `${clean.slice(0, max - 1).trimEnd()}…` : clean;
+}
+
+/** A result contract as one JSON line with every text field bounded: plans may now carry long criteria and `contains`. */
+function contractText(contract: PlanLaneResult): string {
+	const field = (value: string | undefined): string | undefined => (value === undefined ? undefined : oneLine(value, MAX_CONTRACT_FIELD));
+	return JSON.stringify({
+		id: oneLine(contract.id, MAX_NAME),
+		kind: contract.kind,
+		criterion: field(contract.criterion),
+		path: field(contract.path),
+		contains: field(contract.contains),
+		check: field(contract.check),
+	});
 }
 
 /**
@@ -167,7 +182,7 @@ function appendPlanState(out: string[], run: RunRecord, details = false): void {
 			const attempt = row.attemptId === undefined ? "" : ` · 시도 ${oneLine(row.attemptId, MAX_ATTEMPT)}`;
 			const reason = row.reason === undefined ? "" : ` · ${oneLine(row.reason, MAX_RESULT_REASON)}`;
 			out.push(`- ${oneLine(row.id, MAX_NAME)} = ${RESULT_STATE_LABEL[row.state]} · ${lane}${attempt}${reason}`);
-			if (details && row.lane === undefined && row.contract !== undefined) out.push(`  계약: ${JSON.stringify(row.contract)}`);
+			if (details && row.lane === undefined && row.contract !== undefined) out.push(`  계약: ${contractText(row.contract)}`);
 		}
 		if (results.length > MAX_RESULTS) {
 			const ref = runRecordRef(run.runId);

@@ -841,6 +841,36 @@ function roundInstruction(gate: Unverified, reviewer?: string): string {
 	}
 }
 
+/** Reviewable answers waiting for a reviewer, the reviewer turns they take and how many reviewers may run at once. */
+export interface AnswerReviewLoad {
+	answers: number;
+	batches: number;
+	slots: number;
+}
+
+/**
+ * How the director gets every waiting answer reviewed this round. Storm appends the next unsent batch to each approved
+ * reviewer task or follow-up itself, so the director only sends the turns: as many as there are batches, never more
+ * reviewers at once than the role allows, the rest as new tasks or follow-ups once a reviewer finishes.
+ */
+function answerBatchInstruction(load: AnswerReviewLoad, reviewer: string | undefined): string {
+	const who = reviewer === undefined ? "the approved reviewer" : `\`${detail(reviewer, 40) ?? reviewer}\``;
+	const answers = `${load.answers} reviewable answer${load.answers === 1 ? "" : "s"}`;
+	const tasks = `${load.batches} review task${load.batches === 1 ? "" : "s"}`;
+	const queue =
+		load.batches > load.slots
+			? ` Run at most ${load.slots} at once; send each remaining one as a new task or a follow-up once a reviewer finishes.`
+			: "";
+	return `Next: Storm holds ${answers} waiting for review in ${load.batches} batch${load.batches === 1 ? "" : "es"}. Send ${who} ${tasks} this round, one per batch.${queue} Storm appends the next unsent batch (answers, receipts and anchors) to each ${who} task or follow-up; write a plain review task and do not paste answers or receipts yourself. A tree or change verdict does not settle an answer; do not rerun the producing lanes.`;
+}
+
+/** Whether the gate's own next action is the scoped review of an answer, which the batch instruction replaces. */
+function answerReviewGate(gate: Unverified): boolean {
+	if (gate.cause !== "results" || gate.resultKind !== "answer") return false;
+	const remedy = gate.resultRemedy ?? (gate.resultState === "reviewable" ? "review" : undefined);
+	return remedy === "review" && answerReview(gate) !== undefined;
+}
+
 /** The model-facing section that starts a round: why Storm sent it, what to do, and whether another round follows. */
 export function buildRoundMessage(input: {
 	runId: string;
@@ -853,19 +883,26 @@ export function buildRoundMessage(input: {
 	reviewer?: string | undefined;
 	/** Rounds in a row that moved nothing (`RoundDecision.stalled`); any above 0 asks for a different approach. */
 	stalled?: number;
+	/** Reviewable answers whose packets Storm hands to reviewer turns this round; absent or none adds nothing. */
+	answerReviews?: AnswerReviewLoad | undefined;
 }): string {
 	const why = input.gate.unread ? "The work tree could not be read, so Storm cannot bind a verdict to it." : CAUSE[input.gate.cause];
 	const details: string[] = [];
 	if (input.gate.cause === "coverage" && input.gate.evidence !== undefined) details.push(CHECK_PROBLEM[input.gate.evidence]);
-	if (input.gate.cause === "lanes" && input.gate.lane !== undefined) details.push(`Unfinished lane: \`${input.gate.lane}\`.`);
+	// The detail bound is above the plan's lane-name bound: a valid name is named whole, a stored oversized one is cut.
+	const unfinished = input.gate.cause === "lanes" ? detail(input.gate.lane) : undefined;
+	if (unfinished !== undefined) details.push(`Unfinished lane: \`${unfinished}\`.`);
 	if (input.gate.cause === "results" && (input.gate.result !== undefined || input.gate.resultState !== undefined)) details.push(resultDetail(input.gate));
 	const capped = input.maxRounds !== undefined;
 	const lines = [
 		`<storm-run id="${input.runId}" round="${input.round}${capped ? `/${input.maxRounds}` : ""}">`,
 		`Storm checked the run when you stopped: it is not done. ${why}`,
 		...details,
-		roundInstruction(input.gate, input.reviewer),
 	];
+	const load = input.answerReviews;
+	const batched = load !== undefined && load.answers > 0 && load.batches > 0 ? answerBatchInstruction(load, input.reviewer) : undefined;
+	if (batched !== undefined && answerReviewGate(input.gate)) lines.push(batched);
+	else lines.push(roundInstruction(input.gate, input.reviewer), ...(batched === undefined ? [] : [batched]));
 	if ((input.stalled ?? 0) > 0) {
 		lines.push(
 			"Nothing changed since the last round: no new change, review or result evidence. Take a different approach or state the blocker; do not repeat the same work. Another round without progress ends the run.",

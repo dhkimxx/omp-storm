@@ -1139,6 +1139,22 @@ describe("S3 directed result feedback", () => {
 		expect(message).not.toContain("on the current tree");
 	});
 
+	test("waiting answers are sent as one reviewer turn per batch, never more at once than the reviewer slots", () => {
+		const receipt = "0123456789abcdef0123456789abcdef";
+		const gate = gateOf([openRow({ state: "reviewable", kind: "answer", attempt: "job:Submit0:Submit0", review: { receipt, citation: "report.json:2" } })], { reviewer: true });
+		const batched = (answers: number, batches: number, slots: number): string =>
+			buildRoundMessage({ runId: "run-3", round: 2, gate, reviewer: "storm-reviewer", answerReviews: { answers, batches, slots } });
+		const queued = batched(9, 3, 2);
+		expect(queued).toContain("9 reviewable answers");
+		expect(queued).toContain("3 review tasks");
+		expect(queued).toContain("at most 2 at once");
+		// Storm appends the packets itself: the director is not asked to paste one answer's receipt.
+		expect(queued).not.toContain(receipt);
+		expect(batched(4, 2, 2)).not.toContain("at most");
+		// Without waiting answers the scoped single-answer instruction stands.
+		expect(buildRoundMessage({ runId: "run-3", round: 2, gate, reviewer: "storm-reviewer", answerReviews: { answers: 0, batches: 0, slots: 2 } })).toContain(receipt);
+	});
+
 	test("a reviewable answer without a scoped review receipt goes back to its producer, not to a reviewer", () => {
 		const row = openRow({ state: "reviewable", kind: "answer" });
 		expect(nextRemedy(row, true)).toBe("work");

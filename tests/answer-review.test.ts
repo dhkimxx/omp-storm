@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "../src/runtime/answer-review.ts";
 import { listAgents, noteAgentReview, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
-import { reviewEvidenceOf, reviewPart, reviewedResultsIn, REVIEWED_RESULTS_MAX } from "../src/runtime/review.ts";
+import { reviewEvidenceOf, reviewPart, reviewedResultsIn } from "../src/runtime/review.ts";
 import type { AgentEntry } from "../src/types.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
@@ -68,6 +68,26 @@ describe("receipts", () => {
 		expect(packet).toContain(receiptOf());
 		expect(packet).toContain('"citation": "auth.md:1"');
 	});
+
+	test("a long answer is quoted whole without a handle, and as its head with the producer's handle otherwise", () => {
+		const answer = `${"a".repeat(5_000)}TAIL`;
+		const base = { resultId: "auth", criterion: "explains the authentication setup", answer, receipt: receiptOf(), citation: { path: "auth.md", line: 1 } };
+		// No way to read the rest: nothing is cut.
+		expect(answerReviewPacket({ ...base, quoteChars: 1_000 })).toContain("TAIL");
+		const cut = answerReviewPacket({ ...base, output: "agent://read-1", quoteChars: 1_000 });
+		expect(cut).not.toContain("TAIL");
+		expect(cut).toContain("agent://read-1");
+		expect(cut).toContain(receiptOf());
+		expect(cut.length).toBeLessThan(2_000);
+	});
+
+	test("a host part always points the reviewer at the producer's whole output", () => {
+		const base = { resultId: "auth", criterion: "explains the authentication setup", answer: "Authentication is off because", receipt: receiptOf(), citation: { path: "auth.md", line: 1 } };
+		const part = answerReviewPacket({ ...base, output: "agent://read-1", partial: true });
+		expect(part).toContain("Authentication is off because");
+		expect(part).toContain("read agent://read-1");
+		expect(answerReviewPacket(base)).not.toContain("agent://");
+	});
 });
 
 describe("reviewer yield parsing", () => {
@@ -86,7 +106,7 @@ describe("reviewer yield parsing", () => {
 		});
 	});
 
-	test("malformed, ambiguous or oversized result lists scope nothing", () => {
+	test("malformed or ambiguous result entries scope nothing", () => {
 		const receipt = receiptOf();
 		const good = { id: "auth", receipt, citation: "auth.md:1", verdict: "correct" };
 		expect(reviewedResultsIn([{ ...good, receipt: receipt.toUpperCase() }])).toEqual([]);
@@ -94,8 +114,15 @@ describe("reviewer yield parsing", () => {
 		expect(reviewedResultsIn([{ ...good, id: "../auth" }])).toEqual([]);
 		expect(reviewedResultsIn([{ ...good, citation: " auth.md:1" }])).toEqual([]);
 		expect(reviewedResultsIn([good, { ...good, verdict: "incorrect" }])).toEqual([]);
-		expect(reviewedResultsIn(Array.from({ length: REVIEWED_RESULTS_MAX + 1 }, (_, index) => ({ ...good, id: `r${index}` })))).toEqual([]);
 		expect(reviewedResultsIn([good, { ...good, id: "other" }]).map(entry => entry.id)).toEqual(["auth", "other"]);
+	});
+
+	test("a long verdict list is read whole, not dropped for its length", () => {
+		const receipt = receiptOf();
+		const list = Array.from({ length: 20 }, (_, index) => ({ id: `r${index}`, receipt, citation: "auth.md:1", verdict: "correct" }));
+		expect(reviewedResultsIn(list)).toHaveLength(20);
+		const part = reviewPart(final(list));
+		expect(part?.kind === "verdict" ? part.results?.length : undefined).toBe(20);
 	});
 
 	test("the ledger keeps scoped results on their own verdict record and rejects a tampered one", () => {

@@ -6,7 +6,10 @@
  * below are copied from pinned-OMP E2E captures (session JSONL / wait details), not invented shapes. Each delivery must
  * yield exactly the correlated job's own output; a shape that cannot be attributed yields no text (never accepted).
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { PlanLane } from "../src/types.ts";
 import type { AttemptSettlement } from "../src/runtime/attempt-bridge.ts";
 import {
@@ -18,7 +21,13 @@ import {
 
 const registry: AttemptRegistry = { get: () => undefined, onChange: () => () => undefined };
 
-function setup(): { collector: AttemptCollector; settlements: AttemptSettlement[] } {
+/** A registry whose children name their host output file, as `AgentRegistry.setHistory(id, { outputPath })` does. */
+const outputRegistry = (outputs: Record<string, string>): AttemptRegistry => ({
+	get: id => (outputs[id] === undefined ? undefined : { id, parentId: "Main", session: { instanceKey: `main:${id}` }, history: { outputPath: outputs[id] } }),
+	onChange: () => () => undefined,
+});
+
+function setup(host: AttemptRegistry = registry): { collector: AttemptCollector; settlements: AttemptSettlement[] } {
 	const settlements: AttemptSettlement[] = [];
 	const port: AttemptSettlementPort = {
 		prepare: async () => ({ ok: true }),
@@ -26,7 +35,7 @@ function setup(): { collector: AttemptCollector; settlements: AttemptSettlement[
 			settlements.push(input);
 		},
 	};
-	const collector = new AttemptCollector({ port, registry: () => registry, now: () => 1_000, registryWaitMs: 30 });
+	const collector = new AttemptCollector({ port, registry: () => host, now: () => 1_000, registryWaitMs: 30 });
 	return { collector, settlements };
 }
 
@@ -107,42 +116,46 @@ const waitRow = (id: string, over: Record<string, unknown>): Record<string, unkn
 	...over,
 });
 
+/** The child's text alone, for the cases where whether it is a preview does not matter. */
+const textOf = (result: string, agentId: string): string | undefined => nativeJobOutput(result, agentId)?.text;
+
 describe("nativeJobOutput on captured OMP 19 result strings", () => {
 	test("a completed wait row yields only the child's output", () => {
-		expect(nativeJobOutput(W0_RESULT, "W0")).toBe("The tracked_delta is -7 (e2e-answers.txt:1)");
+		expect(textOf(W0_RESULT, "W0")).toBe("The tracked_delta is -7 (e2e-answers.txt:1)");
 	});
 
 	test("a cancelled row skips the host abort reason and keeps the child's own output", () => {
-		expect(nativeJobOutput(F1_ERROR, "F1")).toBe('{\n  "aborted": true,\n  "error": "E2E wait failure control"\n}');
+		expect(textOf(F1_ERROR, "F1")).toBe('{\n  "aborted": true,\n  "error": "E2E wait failure control"\n}');
 	});
 
 	test("a genuinely bare result is preserved; only this agent's trailing hint is removed", () => {
 		const bare = "Task execution failed: boom\n\nImpl0-2 stopped and cannot be messaged — transcript unavailable";
-		expect(nativeJobOutput(bare, "Impl0-2")).toBe("Task execution failed: boom");
+		expect(textOf(bare, "Impl0-2")).toBe("Task execution failed: boom");
 		// A hint naming another agent is the child's text, not host framing.
-		expect(nativeJobOutput("answer 42\n\nOther is now idle — x", "Impl0-2")).toBe("answer 42\n\nOther is now idle — x");
+		expect(textOf("answer 42\n\nOther is now idle — x", "Impl0-2")).toBe("answer 42\n\nOther is now idle — x");
 	});
 
 	test("model text quoting another job's envelope or closing tags stays part of this child's output", () => {
 		const quoted = 'A says:\n<task-result id="B" agent="storm-explorer" status="completed" duration="1ms">\n\n<output>\nB answer 7\n</output>\n</task-result>\nso the total is 42 (report.json:2)';
-		expect(nativeJobOutput(wrapped("A", "storm-explorer", quoted), "A")).toBe(quoted);
-		expect(nativeJobOutput(wrapped("A", "storm-explorer", quoted), "B")).toBeUndefined();
+		expect(textOf(wrapped("A", "storm-explorer", quoted), "A")).toBe(quoted);
+		expect(textOf(wrapped("A", "storm-explorer", quoted), "B")).toBeUndefined();
 	});
 
-	test("a host-truncated preview envelope yields its preview body", () => {
+	test("a host-truncated preview envelope yields its preview body, marked as a preview", () => {
 		const preview = '<task-result id="P0" agent="storm-explorer" status="completed" duration="2s">\n<meta lines="900" size="20 KB" />\n<preview full-output="agent://P0">\nhead of the answer (report.json:2)\n</preview>\n</task-result>\n\nP0 is now idle — transcript at history://P0';
-		expect(nativeJobOutput(preview, "P0")).toBe("head of the answer (report.json:2)");
+		expect(nativeJobOutput(preview, "P0")).toEqual({ text: "head of the answer (report.json:2)", preview: true });
+		expect(nativeJobOutput(W0_RESULT, "W0")?.preview).toBe(false);
 	});
 
 	test("malformed, truncated, foreign or empty envelopes fail closed", () => {
 		// The async follow-up formatter cuts results over 12k chars mid-envelope.
-		expect(nativeJobOutput(`${W0_RESULT.slice(0, 120)}\n\n[Output truncated. Showing first 5,000 characters.]`, "W0")).toBeUndefined();
-		expect(nativeJobOutput(W0_RESULT, "W1")).toBeUndefined();
-		expect(nativeJobOutput('<task-result id="W0">\nThe total is 42\n</task-result>', "W0")).toBeUndefined();
-		expect(nativeJobOutput(wrapped("W0", "storm-explorer", "(no output)"), "W0")).toBeUndefined();
-		expect(nativeJobOutput(wrapped("W0", "storm-explorer", "(no output) after 3 req"), "W0")).toBeUndefined();
-		expect(nativeJobOutput(wrapped("W0", "storm-explorer", "   "), "W0")).toBeUndefined();
-		expect(nativeJobOutput("\n\nW0 is now idle — transcript at history://W0", "W0")).toBeUndefined();
+		expect(textOf(`${W0_RESULT.slice(0, 120)}\n\n[Output truncated. Showing first 5,000 characters.]`, "W0")).toBeUndefined();
+		expect(textOf(W0_RESULT, "W1")).toBeUndefined();
+		expect(textOf('<task-result id="W0">\nThe total is 42\n</task-result>', "W0")).toBeUndefined();
+		expect(textOf(wrapped("W0", "storm-explorer", "(no output)"), "W0")).toBeUndefined();
+		expect(textOf(wrapped("W0", "storm-explorer", "(no output) after 3 req"), "W0")).toBeUndefined();
+		expect(textOf(wrapped("W0", "storm-explorer", "   "), "W0")).toBeUndefined();
+		expect(textOf("\n\nW0 is now idle — transcript at history://W0", "W0")).toBeUndefined();
 	});
 });
 
@@ -357,6 +370,129 @@ describe("native wait rows settle each correlated job with its own output", () =
 		expect(bySpawn(settlements, "W0").reportText).toBeUndefined();
 		expect(bySpawn(settlements, "W0").citations).toEqual([]);
 		expect(bySpawn(settlements, "W2").reportText).toBeUndefined();
+		collector.stop();
+	});
+});
+
+/**
+ * OMP's `task-summary.md` for an output over its inline budget: the `<meta>` line, then a `<preview full-output>` head
+ * of the output (`previewHead`, about 5,000 chars at a line boundary), then the follow-up hint. The whole output is in
+ * `<artifactsDir>/<id>.md`, named by `SingleResult.outputPath` and the registry's `history.outputPath`.
+ */
+const previewed = (id: string, head: string): string =>
+	`<task-result id="${id}" agent="storm-explorer" status="completed" duration="4s">\n<meta lines="1200" size="64.0 KB" />\n` +
+	`<preview full-output="agent://${id}">\n${head}\n</preview>\n</task-result>\n\n` +
+	`${id} is now idle — message it via \`write agent://${id}\` to follow up; transcript at history://${id}`;
+
+describe("a host preview is replaced by the whole output the host wrote", () => {
+	let dir: string;
+	afterEach(async () => {
+		if (dir !== undefined) await rm(dir, { recursive: true, force: true });
+	});
+	const artifacts = async (): Promise<string> => {
+		dir = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-native-output-")));
+		return dir;
+	};
+	const HEAD = "The report total is 42 (report.json:2).\nSection one explains the count.";
+	const WHOLE = `${HEAD}\n${"Further measured detail over 120 lines in 3 runs.\n".repeat(400)}The source of the offset is notes.md:7.`;
+
+	const asyncPreview = async (collector: AttemptCollector, id: string): Promise<void> => {
+		await collector.observeMessage({
+			runId: "run-1",
+			parentId: "Main",
+			observedAt: 1_100,
+			message: {
+				customType: "async-result",
+				content: `<system-notice>\nBackground job ${id} has completed.\nResume your work using the result below.\n${previewed(id, HEAD)}\n</system-notice>`,
+				details: { jobs: [asyncJob(id)] },
+			},
+		});
+	};
+
+	test("an async preview settles with the whole output, its digest and citations taken from the whole text", async () => {
+		const root = await artifacts();
+		await writeFile(path.join(root, "P0.md"), WHOLE);
+		const { collector, settlements } = setup(outputRegistry({ P0: path.join(root, "P0.md") }));
+		await admit(collector, "P0");
+		await asyncPreview(collector, "P0");
+		const settled = bySpawn(settlements, "P0");
+		expect(settled.reportText).toBe(flat(WHOLE));
+		expect(settled.reportPartial).toBeUndefined();
+		// A citation only the whole output names is a candidate too.
+		expect(settled.citations).toEqual([{ path: "report.json", line: 2 }, { path: "notes.md", line: 7 }]);
+		collector.stop();
+	});
+
+	test("a wait row preview reads the whole output the same way", async () => {
+		const root = await artifacts();
+		await writeFile(path.join(root, "W5.md"), WHOLE);
+		const { collector, settlements } = setup(outputRegistry({ W5: path.join(root, "W5.md") }));
+		await admit(collector, "W5");
+		await collector.observeWaitResult({
+			runId: "run-1",
+			parentId: "Main",
+			observedAt: 1_200,
+			details: { op: "wait", jobs: [waitRow("W5", { resultText: previewed("W5", HEAD) })] },
+		});
+		expect(bySpawn(settlements, "W5").reportText).toBe(flat(WHOLE));
+		expect(bySpawn(settlements, "W5").reportPartial).toBeUndefined();
+		collector.stop();
+	});
+
+	test("a preview whose whole output cannot be read safely stays partial, never passed off as the answer", async () => {
+		const root = await artifacts();
+		await writeFile(path.join(root, "real.md"), WHOLE);
+		await writeFile(path.join(root, "N2.md"), "A later turn wrote something else entirely.");
+		await symlink(path.join(root, "real.md"), path.join(root, "N3.md"));
+		await writeFile(path.join(root, "N4-other.md"), WHOLE);
+		const { collector, settlements } = setup(outputRegistry({
+			N2: path.join(root, "N2.md"),
+			N3: path.join(root, "N3.md"),
+			N4: path.join(root, "N4-other.md"),
+			N5: "relative/N5.md",
+		}));
+		// N1: no output path at all; N2: another turn's text; N3: a symlink; N4: not this agent's file; N5: not absolute.
+		for (const id of ["N1", "N2", "N3", "N4", "N5"]) {
+			await admit(collector, id);
+			await asyncPreview(collector, id);
+			const settled = bySpawn(settlements, id);
+			expect(settled.reportPartial).toBe(true);
+			expect(settled.reportText).toBe(flat(HEAD));
+		}
+		collector.stop();
+	});
+
+	test("a sync result whose output the host cut to its tail is read whole when the host's own count matches", async () => {
+		const root = await artifacts();
+		await writeFile(path.join(root, "S0.md"), WHOLE);
+		await writeFile(path.join(root, "S1.md"), WHOLE);
+		const { collector, settlements } = setup();
+		const tail = WHOLE.slice(WHOLE.length - 2_000);
+		for (const [id, chars] of [["S0", WHOLE.length], ["S1", WHOLE.length + 1]] as const) {
+			collector.observeTaskCall({ runId: "run-1", parentId: "Main", toolCallId: `call_${id}`, startedAt: 990 });
+			await admit(collector, id);
+			await collector.observeTaskResult({
+				runId: "run-1",
+				parentId: "Main",
+				toolCallId: `call_${id}`,
+				observedAt: 1_100,
+				details: { results: [{ id, exitCode: 0, output: tail, truncated: true, outputPath: path.join(root, `${id}.md`), outputMeta: { lineCount: 403, charCount: chars } }] },
+			});
+		}
+		expect(bySpawn(settlements, "S0").reportText).toBe(flat(WHOLE));
+		expect(bySpawn(settlements, "S0").reportPartial).toBeUndefined();
+		// A count that does not match is not this result's output: the tail stays, marked partial.
+		expect(bySpawn(settlements, "S1").reportText).toBe(flat(tail));
+		expect(bySpawn(settlements, "S1").reportPartial).toBe(true);
+		collector.stop();
+	});
+
+	test("an output inlined whole is never re-read and never partial", async () => {
+		const { collector, settlements } = setup(outputRegistry({ W0: "/nonexistent/W0.md" }));
+		await admit(collector, "W0");
+		await collector.observeWaitResult({ runId: "run-1", parentId: "Main", observedAt: 1_200, details: { op: "wait", jobs: [waitRow("W0", { resultText: W0_RESULT })] } });
+		expect(bySpawn(settlements, "W0").reportText).toBe("The tracked_delta is -7 (e2e-answers.txt:1)");
+		expect(bySpawn(settlements, "W0").reportPartial).toBeUndefined();
 		collector.stop();
 	});
 });

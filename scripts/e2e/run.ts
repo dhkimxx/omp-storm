@@ -83,6 +83,8 @@ const PROVIDERS = {
 		{ id: "outsider-z", cost: price(5, 25), context: 60_000 },
 		// Reports a 35k prompt on a 60k window (fake-llm.ts): a heavy main session for the run-start check. Never in a team.
 		{ id: "heavy-main", cost: price(1, 4), context: 60_000 },
+		// Reports a 75k prompt on a 100k window: a director past 70% of its window mid-run. Below every role minimum.
+		{ id: "tight-main", cost: price(1, 4), context: 100_000 },
 	],
 	fake2: TEAM_PROVIDERS.fake2,
 };
@@ -95,6 +97,15 @@ const MAIN = "fake/general-b";
 const OUTSIDER = "fake/outsider-z";
 const MODELS_FILE = join(env.agentDir, "models.yml");
 const PROFILE_FILE = join(env.agentDir, "config.yml");
+/**
+ * 1M-window models that report a large prompt (fake-llm.ts): `wide-main` 150k, the old fixed run-start number;
+ * `wide-worker` 250k, past the retired 200k follow-up cap. Listed only for the steps that use them: with a 1M window
+ * they would otherwise enter every recommended team.
+ */
+const WIDE_PROVIDERS = {
+	...PROVIDERS,
+	fake: [...PROVIDERS.fake, { id: "wide-main", cost: price(1, 4), context: 1_000_000 }, { id: "wide-worker", cost: price(1, 4), context: 1_000_000 }],
+};
 
 const exitCodes: number[] = [];
 
@@ -1612,43 +1623,44 @@ async function main(): Promise<void> {
 		});
 	});
 
-	await suite.step("follow-up cap and the fresh-agent handoff", async () => {
-		// A subagent at or past its context cap takes no follow-ups during a run: the director starts a fresh one.
+	await suite.step("a follow-up to a worker far past the retired 200k cap is delivered", async () => {
+		// omp compacts a subagent itself, follow-up turns included, so Storm refuses no follow-up for its size.
 		const llm = new LlmCursor(env);
-		await session(cancelAll, async (rpc, files) => {
-			const dialogs = await editAndApprove(rpc, files, config => {
-				config.contextCap = 50;
+		writeFileSync(MODELS_FILE, modelsYml(env.port, WIDE_PROVIDERS));
+		try {
+			await session(cancelAll, async (rpc, files) => {
+				const dialogs = await editAndApprove(rpc, files, config => {
+					config.roles.explorer!.models = ["fake/wide-worker"];
+				});
+				check("the 1M-window explorer is approved through /storm", dialogs.at(-1)?.answer === APPROVE && files.config().roles.explorer?.models[0] === "fake/wide-worker", JSON.stringify(dialogs.at(-1)));
+				const marker = "E2E-FOLLOW-WIDE";
+				const run = await runOf(
+					rpc,
+					files,
+					startRun([
+						plan([{ name: "read", kind: "explore", results: [trackedAnswer("wide-report", "the wide explorer reports the tracked fixture from source")] }]),
+						{ task: ["storm-explorer"], as: "Wide", say: READ_AND_CLAIM },
+						{ followUp: "agent://Wide0", content: `${marker} ${READ_AND_CLAIM}` },
+					]),
+				);
+				const wide = run.agents?.find(agent => agent.id === "Wide0");
+				const refused = mains(llm.all()).filter(entry => entry.lastTool.includes("[storm:followup"));
+				const delivered = children(llm.all()).filter(kid => kid.model === "wide-worker" && kid.lastUser.includes(marker));
+				check("the worker's recorded context is past the retired 200k cap", (wide?.contextTokens ?? 0) > 200_000, `contextTokens=${wide?.contextTokens}`);
+				check("the follow-up is not refused and nothing is counted as blocked", refused.length === 0 && (run.blockedFollowUps ?? 0) === 0, `refused=${refused.length} blockedFollowUps=${run.blockedFollowUps}`);
+				check("the worker received the follow-up and took another turn", delivered.length > 0 && (wide?.followUps ?? 0) >= 1, `delivered=${delivered.length} followUps=${wide?.followUps}`);
+				check("the run still settles verified", run.status === "done" && run.endReason === "verified", `${run.status}/${run.endReason}`);
 			});
-			check("the tiny cap is approved through /storm", dialogs.at(-1)?.answer === APPROVE && files.config().contextCap === 50, JSON.stringify(dialogs.at(-1)));
-			const run = await runOf(
-				rpc,
-				files,
-				startRun([
-					plan([{ name: "impl", kind: "code", results: [trackedAnswer("fresh-report", "the fresh implementer reports the tracked fixture from source")] }]),
-					{ task: ["storm-implementer"], as: "Cap" },
-					{ followUp: "agent://Cap0" },
-					{ task: ["storm-implementer"], as: "Fresh", say: `E2E-CHILD-READ agent://Cap0,${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
-				]),
-			);
-			const reason = mains(llm.all()).find(entry => entry.lastTool.includes("[storm:followup-cap]"))?.lastTool ?? "";
-			const capped = run.agents?.find(agent => agent.id === "Cap0");
-			check("the follow-up is refused with followup-cap", reason !== "" && run.blockedFollowUps === 1 && capped?.followUps === 0, `blockedFollowUps=${run.blockedFollowUps} followUps=${capped?.followUps}`);
-			check("the reason names the agent's result and the agent to start", reason.includes("agent://Cap0") && reason.includes("storm-implementer"), reason.slice(0, 200));
-			const fresh = children(llm.all()).filter(kid => kid.lastUser.includes("E2E-CHILD-READ"));
-			const readBack = fresh.find(kid => kid.lastTool !== "");
-			check(
-				"a fresh agent reads the capped agent's result and finishes",
-				fresh.some(kid => kid.decision.tool === "read" && kid.decision.args?.path === "agent://Cap0") && readBack !== undefined && !readBack.lastTool.includes("[storm:") && run.agents?.some(agent => agent.id === "Fresh0") === true,
-				`${readBack?.lastTool.slice(0, 120)} agents=${run.agents?.map(agent => agent.id).join(",")}`,
-			);
-		});
+		} finally {
+			writeFileSync(MODELS_FILE, modelsYml(env.port, PROVIDERS));
+		}
 	});
 
 	await suite.step("mid-run compaction keeps Storm's ledger", async () => {
-		// Past its cap, the director is compacted while it waits on an async child. omp keeps the last 20k tokens
-		// verbatim by default, so this tiny session would have nothing to summarize: the profile keeps almost nothing
-		// for this one run.
-		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}compaction:\n  keepRecentTokens: 100\n`);
+		// Past 70% of its window, the director is compacted while it waits on an async child. omp keeps the last 20k
+		// tokens verbatim by default, so this tiny session would have nothing to summarize: the profile keeps almost
+		// nothing for this one run, and omp's own threshold compaction is off so the only compaction is Storm's.
+		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}compaction:\n  enabled: false\n  keepRecentTokens: 100\n`);
 		const llm = new LlmCursor(env);
 		try {
 			// The fake LLM orders the two sessions: the director's last reply goes out once the child has made its first
@@ -1658,15 +1670,8 @@ async function main(): Promise<void> {
 				{ task: ["storm-implementer"], as: "Ck", say: `E2E-CHILD-HOLD ${READ_AND_CLAIM}` },
 				{ awaitChild: true },
 			];
-			const { run, files } = await session(cancelAll, async (rpc, files) => {
-				files.editConfig(config => {
-					config.contextCap = 50;
-				});
-				rpc.answer = choose(APPROVE);
-				await rpc.prompt("/storm");
-				rpc.answer = cancelAll;
-				return { run: await runOf(rpc, files, startRun(steps)), files };
-			});
+			// `tight-main` reports 75k of a 100k window: past the 70% mid-run share, with no team or cap change.
+			const { run, files } = await session(cancelAll, async (rpc, files) => ({ run: await runOf(rpc, files, startRun(steps)), files }), { model: "fake/tight-main" });
 			const compactions = llm.of("compaction");
 			const ledger = compactions.find(entry => entry.compactionContext.includes(run.runId) && entry.compactionContext.includes("ckpt") && entry.compactionContext.includes("agent://Ck0"));
 			check("the compaction request carries the run, its lanes and agent:// handles", ledger !== undefined, `compactions=${compactions.length} context=${(compactions[0]?.compactionContext ?? "").slice(0, 300).replace(/\s+/g, " ")}`);
@@ -1779,12 +1784,34 @@ async function main(): Promise<void> {
 		);
 	});
 
+	await suite.step("a 150k context on a 1M-window model is not compacted at run start", async () => {
+		// The run-start compaction is a share of the model's window, not a fixed token number.
+		const llm = new LlmCursor(env);
+		writeFileSync(MODELS_FILE, modelsYml(env.port, WIDE_PROVIDERS));
+		try {
+			await session(
+				cancelAll,
+				async (rpc, files) => {
+					await rpc.turn("hello");
+					const run = await runOf(rpc, files, startRun([plan([{ name: "impl", kind: "code", results: [trackedAnswer("wide-main-report")] }]), { task: ["storm-implementer"], as: "Impl", say: READ_AND_CLAIM }]));
+					const compactions = llm.of("compaction").length;
+					const director = mains(llm.all()).filter(entry => entry.model === "wide-main");
+					check("the director really ran on the 1M-window model", director.length > 0, `mainRequests=${director.length}`);
+					check("the run starts and settles without any compaction", run.status === "done" && run.endReason === "verified" && compactions === 0 && !run.checkpoints?.length, `status=${run.status}/${run.endReason} compactions=${compactions}`);
+				},
+				{ model: "fake/wide-main" },
+			);
+		} finally {
+			writeFileSync(MODELS_FILE, modelsYml(env.port, PROVIDERS));
+		}
+	});
+
 	await suite.step("hub, status, rollback", async () => {
 		const llm = new LlmCursor(env);
 		await session(cancelAll, async (rpc, files) => {
 			// A second approval in this session, so rollback has an earlier config to restore.
 			await editAndApprove(rpc, files, config => {
-				config.contextCap = 77;
+				config.rounds = 7;
 			});
 			rpc.dialogs.length = 0;
 			rpc.answer = cancelAll;

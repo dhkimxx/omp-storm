@@ -55,17 +55,16 @@ describe("recommendedConfig", () => {
 		expect(recommendedConfig([rec("implementer", [cand("a/i")])], "quality").roles.implementer!.models).toEqual(["a/i:medium"]);
 	});
 
-	test("re-setup keeps what the user chose: switches, budget, caps, worker ranges, disabled roles, run settings, trials", () => {
+	test("re-setup keeps what the user chose: switches, budget, worker ranges, disabled roles, run settings, trials", () => {
 		const current: StormConfig = {
 			version: 1,
 			priority: "balanced",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["old/x"], workers: { min: 1, max: 7 }, contextCap: 90_000 },
+				explorer: { agent: "storm-explorer", models: ["old/x"], workers: { min: 1, max: 7 } },
 				implementer: { agent: "storm-implementer", models: ["old/i"], workers: 3 },
 			},
 			isolation: "isolated",
 			budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "stop" },
-			contextCap: 150_000,
 			docs: false,
 			disabledRoles: ["reviewer"],
 			trials: [{ ...trial, role: "explorer" }, trial],
@@ -75,12 +74,11 @@ describe("recommendedConfig", () => {
 			version: 1,
 			priority: "cost",
 			roles: {
-				explorer: { agent: "storm-explorer", models: ["a/x2:low", "b/z2:medium"], workers: { min: 1, max: 7 }, contextCap: 90_000 },
+				explorer: { agent: "storm-explorer", models: ["a/x2:low", "b/z2:medium"], workers: { min: 1, max: 7 } },
 				implementer: { agent: "storm-implementer", models: ["a/i2", "c/j2:medium"], workers: { min: 3, max: 3 } },
 			},
 			isolation: "isolated",
 			budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "stop" },
-			contextCap: 150_000,
 			docs: false,
 			disabledRoles: ["reviewer"],
 			// The reviewer's trial went with the role; other agents stay blocked because the current team blocked them.
@@ -100,7 +98,7 @@ describe("recommendedConfig", () => {
 		expect(next).not.toHaveProperty("contract");
 		expect(next).not.toHaveProperty("runtime");
 		expect(next).not.toHaveProperty("parallelism");
-		expect(next.contextCap).toBe(200_000);
+		expect(next).not.toHaveProperty("contextCap");
 		expect(next.roles.explorer!.workers).toEqual({ min: 1, max: 2 });
 		expect(next.fallbackRole).toBe("implementer");
 	});
@@ -173,6 +171,31 @@ describe("config diff", () => {
 		expect(new Set(fields).size).toBe(4);
 		for (const [i, id] of ["explorer", "implementer", "reviewer"].entries()) expect(fields[i]).toStartWith(roleTitle(id));
 		for (const id of ["reviewer", "implementer"]) expect(md).not.toContain(id);
+	});
+
+	test("a check's own time limit shows in the diff, alone or with the rest of the check", () => {
+		const check = { name: "unit", argv: ["bun", "test"] };
+		const withTimeout = (timeoutMs?: number): StormConfig => ({ ...TEAM, requiredChecks: [timeoutMs === undefined ? check : { ...check, timeoutMs }] });
+		expect(configHash(withTimeout(600_000))).not.toBe(configHash(withTimeout()));
+		expect(renderConfigDiff(undefined, withTimeout(600_000))).toContain("600");
+		expect(renderConfigDiff(undefined, withTimeout())).not.toContain("600");
+		// Only the time limit differs: the approval must still show a changed row.
+		expect(changedFields(withTimeout(), withTimeout(600_000))).toEqual(["필수 검사 unit"]);
+		expect(changedFields(withTimeout(600_000), withTimeout(900_000))).toEqual(["필수 검사 unit"]);
+		expect(renderConfigDiff(withTimeout(600_000), withTimeout(900_000))).toMatch(/600.*→.*900/);
+	});
+
+	test("an edit that only changes a stored contextCap still shows in the approval diff, team level and per role", () => {
+		const team = changed(c => (c.contextCap = 100_000));
+		const role = changed(c => (c.roles.reviewer.contextCap = 50_000));
+		expect(configHash(team)).not.toBe(configHash(TEAM));
+		expect(changedFields(TEAM, team)).toEqual(["contextCap(더는 쓰지 않는 필드)"]);
+		expect(renderConfigDiff(TEAM, team)).toMatch(/없음.*→.*100000/);
+		expect(changedFields(TEAM, role)).toEqual([`${roleTitle("reviewer")} contextCap(더는 쓰지 않는 필드)`]);
+		expect(renderConfigDiff(TEAM, role)).toMatch(/없음.*→.*50000/);
+		// The same stored value on both sides shows nothing.
+		expect(changedFields(team, structuredClone(team))).toEqual([]);
+		expect(renderConfigDiff(team, changed(c => (c.contextCap = 250_000)))).toMatch(/100000.*→.*250000/);
 	});
 
 	test("rich model rows mark old values, the new primary and fallbacks without changing the diff", () => {
@@ -369,13 +392,24 @@ describe("status", () => {
 		expect(bare).not.toContain("—");
 	});
 
+	test("a stored contextCap adds no setting row to a new config or the team panel", () => {
+		const old = { ...structuredClone(TEAM), contextCap: 123_456, roles: { ...TEAM.roles, reviewer: { ...TEAM.roles.reviewer!, contextCap: 50_000 } } } as StormConfig;
+		const diff = renderConfigDiff(undefined, old);
+		expect(diff).not.toContain("123,456");
+		expect(diff).not.toContain("50,000");
+		expect(diff).not.toContain("컨텍스트");
+		expect(renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: old, hash, warnings: [] } }), NOW)).not.toContain("컨텍스트");
+	});
+
 	test("user status stacks worker details while the model retains the compact table", () => {
 		const withAgent = view({ agents: [agent] });
 		const user = renderStatus(withAgent, NOW);
 		expect(user).toContain("- a1 · 구현 · 유휴 1분");
-		expect(user).toContain("a/i · 컨텍스트 250.0k/200.0k");
-		expect(user).toContain("후속 지시 1회 · 상한 도달");
-		expect(renderStatus(withAgent, NOW, "model")).toContain(renderAgentRows(agentRows([agent], TEAM), NOW));
+		// A 250k-token worker past the retired 200k cap still takes follow-ups; no cap is shown beside its context.
+		expect(user).toContain("250.0k");
+		expect(user).not.toContain("200.0k");
+		expect(agentRows([agent]).map(row => row.followUp)).toEqual(["ok"]);
+		expect(renderStatus(withAgent, NOW, "model")).toContain(renderAgentRows(agentRows([agent]), NOW));
 		expect(renderStatus(view(), NOW)).not.toContain("### 서브에이전트");
 	});
 
@@ -438,14 +472,20 @@ describe("status", () => {
 		expect(absent.spans.find(span => span.text === "없음")?.tone).toBe("muted");
 	});
 
+	test("a required check's own time limit shows in the team panel only when set", () => {
+		const panel = (check: { name: string; argv: string[]; timeoutMs?: number }) =>
+			renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: { ...TEAM, requiredChecks: [check] }, hash, warnings: [] } }), NOW);
+		expect(panel({ name: "test", argv: ["bun", "test"], timeoutMs: 600_000 })).toContain("600");
+		expect(panel({ name: "test", argv: ["bun", "test"] })).not.toContain("600");
+	});
+
 	test("the whole team setting is in the full status: every switch and run setting changes it", () => {
 		const of = (over: Partial<StormConfig>) => renderStatus(view({ config: { status: "ok", path: "/repo/c.json", config: { ...TEAM, ...over }, hash, warnings: [] } }), NOW);
 		const base = of({});
-		for (const over of [{ priority: "quality" }, { isolation: "isolated" }, { cleanup: true }, { docs: false }, { contextCap: 123_456 }, { fallbackRole: "implementer" }, { budget: { perRunUsd: 7.5, onExceed: "stop" } }] as Array<Partial<StormConfig>>) {
+		for (const over of [{ priority: "quality" }, { isolation: "isolated" }, { cleanup: true }, { docs: false }, { fallbackRole: "implementer" }, { budget: { perRunUsd: 7.5, onExceed: "stop" } }] as Array<Partial<StormConfig>>) {
 			expect(of(over)).not.toBe(base);
 		}
 		expect(base).not.toContain("병렬도");
-		expect(of({ contextCap: 123_456 })).toContain("123,456");
 		expect(of({})).toContain("공유 작업 트리");
 		expect(of({ isolation: "isolated" })).toContain("팀 격리(리뷰 포함)");
 		expect(renderStatus(view({ storage: "storage-line" }), NOW)).toContain("storage-line");
@@ -528,7 +568,7 @@ describe("status", () => {
 		const brief = renderStatusBrief(full, NOW, info);
 		expect(brief).toContain(shortHash(hash));
 		for (const part of ["실행 중: run-1", "마지막 실행: run-0", "승인됨", "시험 사용 1건"]) expect(brief).toContain(part);
-		for (const part of ["a/x → b/z", "컨텍스트 상한", "prov-q"]) expect(brief).not.toContain(part);
+		for (const part of ["a/x → b/z", "prov-q"]) expect(brief).not.toContain(part);
 		// The menu's auto row and its "전체 현황" action carry these; the panel keeps only the independent hash/approval.
 		expect(brief).not.toContain("자동 위임");
 		expect(brief).not.toContain("/storm status");
@@ -759,6 +799,25 @@ describe("status", () => {
 			expect(md).not.toContain("격리 레인");
 			expect(md).not.toContain("분리 체크아웃");
 		}
+	});
+
+	test("a very long isolation reason is cut on screen in every view that prints the lane", () => {
+		const reason = `${"긴".repeat(2_000)}끝`;
+		const lane = { name: "러너 비교", kind: "run" as const, role: "implementer", goal: "compare runners", isolationReason: reason };
+		const plan: RunPlan = { lanes: [lane], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
+		for (const md of [
+			renderStatus(view({ run: runRecord({ status: "running", plan }) }), NOW),
+			renderStatus(view({ lastRun: runRecord({ status: "done", plan }) }), NOW),
+		]) {
+			const row = md.split("\n").find(line => line.startsWith("- 격리 레인:"))!;
+			expect(row).toBeDefined();
+			expect(row).toContain("러너 비교");
+			expect(row).toContain("…");
+			expect(row).not.toContain("끝");
+			expect(row.length).toBeLessThan(300);
+		}
+		// The stored plan keeps the whole text.
+		expect(plan.lanes[0]!.isolationReason).toBe(reason);
 	});
 
 	test("an exceptional lane is named with its Korean reason and is never shown as started by the plan alone", () => {

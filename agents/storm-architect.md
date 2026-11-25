@@ -11,4 +11,4 @@ Return exactly one of two deliverables:
 - **(b) A diagnosis or design decision:** the evidence and the smallest fix.
 
 Back every claim with evidence locations: `path:start-end` line ranges, commands with their exit codes, log paths. Summarize what they show instead of pasting raw output or whole files. Say what you could not verify. Mark inferences as inferences.
-Keep the parent-facing decision and next steps within 1,500 characters; put a longer proposal in a worker-local artifact and give its handle.
+Lead the parent-facing report with the decision and next steps; put a longer proposal in a worker-local artifact and give its handle.

@@ -91,7 +91,7 @@ import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from 
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
 import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
 import { isRunId, readRun } from "./runtime/run.ts";
-import { treeAgainst, type TreeReading } from "./runtime/tree.ts";
+import { TREE_READ_TIMEOUT_MS, treeAgainst, type TreeReading } from "./runtime/tree.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
@@ -393,17 +393,19 @@ function approvedReviewer(config: StormConfig | undefined): string | undefined {
 }
 
 /**
- * The approved reviewer's own task items with Storm's scoped answer review packets appended (see
- * `RunController.answerReviewPackets`): the exact answer text, its receipt and anchor reach the reviewer in its
- * per-task context, never a system prompt or another worker. Other items, and a call with no packet, are unchanged.
+ * The approved reviewer's own task items, each with the next batch of Storm's scoped answer review packets not yet
+ * handed out (see `RunController.takeAnswerReviewBatch`): the exact answer text, its receipt and anchor reach one
+ * reviewer in its per-task context, never a system prompt or another worker, and no answer rides on two items. Other
+ * items, and reviewer items once every waiting answer is handed out, are unchanged.
  */
-function withAnswerReviewTask(input: Record<string, unknown>, reviewer: string | undefined, packets: string | undefined): Record<string, unknown> {
-	if (reviewer === undefined || packets === undefined) return input;
+function withAnswerReviewTask(input: Record<string, unknown>, reviewer: string | undefined, nextBatch: () => string | undefined): Record<string, unknown> {
+	if (reviewer === undefined) return input;
 	const add = (item: unknown): unknown => {
 		if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
 		const entry = item as Record<string, unknown>;
 		if (entry.agent !== reviewer || typeof entry.task !== "string" || entry.task.trim() === "") return item;
-		return { ...entry, task: `${entry.task.trimEnd()}\n\n${packets}` };
+		const packets = nextBatch();
+		return packets === undefined ? item : { ...entry, task: `${entry.task.trimEnd()}\n\n${packets}` };
 	};
 	if (Array.isArray(input.tasks)) {
 		const tasks = input.tasks.map(add);
@@ -426,8 +428,11 @@ interface ReviewerBaseline {
 const reviewerBaselines = new Map<string, ReviewerBaseline>();
 /** The work tree each subagent session actually runs in, so a reused reviewer's copy cannot pass for the parent. */
 const childWorkTrees = new Map<string, string>();
-/** A snapshot that outlasts this is no snapshot: the proof must not wait on a hung git read. */
-const REVIEW_SNAPSHOT_MS = 12_000;
+/**
+ * A snapshot that outlasts this is no snapshot: the proof must not wait on a hung git read. It leaves the tree reader
+ * its own full deadline, so a slow but working read of a large repository is still a tree, never a missing one.
+ */
+const REVIEW_SNAPSHOT_MS = TREE_READ_TIMEOUT_MS + 2_000;
 
 function reviewerBaselineKey(artifacts: string | undefined, id: string): string {
 	return `${artifacts ?? ""}\0${id}`;
@@ -483,14 +488,20 @@ async function recordReviewerBaseline(
 		reviewerBaselines.delete(key);
 		return;
 	}
-	const reading = await boundedTree(exec, run.root, run.base);
+	const separate = !sameWorkTree(run.root, reviewerRoot);
+	// With a known base both checkouts are read at once, so the two reads share one snapshot deadline inside the
+	// host's handler budget instead of adding up; only an unknown base waits for the parent's to read the other.
+	const [reading, early] = await Promise.all([
+		boundedTree(exec, run.root, run.base),
+		separate && run.base !== undefined ? boundedTree(exec, reviewerRoot, run.base) : Promise.resolve(undefined),
+	]);
 	if (!reading || reading.state.incomplete) {
 		reviewerBaselines.delete(key);
 		return;
 	}
 	const tree = fingerprintOf(reading);
-	if (!sameWorkTree(run.root, reviewerRoot)) {
-		const reviewed = await boundedTree(exec, reviewerRoot, reading.base);
+	if (separate) {
+		const reviewed = early ?? (await boundedTree(exec, reviewerRoot, reading.base));
 		if (!reviewed || reviewed.state.incomplete || fingerprintOf(reviewed) !== tree) {
 			reviewerBaselines.delete(key);
 			return;
@@ -1036,7 +1047,7 @@ export default function storm(pi: ExtensionAPI): void {
 	// The host's ask tool is the one real form-open signal a host emits: execution starts before the form waits and
 	// ends when it is answered, cancelled or fails. A host with no UI cannot show the form, so it claims no wait.
 	pi.on("tool_execution_start", (event, ctx) => {
-		// A synchronous wait is the one mid-run tool call that can outlast the plan: if the context crossed the cap
+		// A synchronous wait is the one mid-run tool call that can outlast the plan: if the context crossed 70% of its window
 		// since then, this boundary starts the automatic run's next background checkpoint. A manual run's wait tool
 		// adds nothing; its async wait uses the same handoff directly.
 		if (event.toolName === "wait") {
@@ -1813,7 +1824,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		// Automatic delegation keeps the strict supervisor gate during the run too: bash, eval, unknown tools and
 		// every repository file read stay refused, while task and published worker results remain reachable. The
-		// legacy director checks (follow-up caps, wide re-reads, edits) still run after this narrower gate.
+		// legacy director checks (cleaned follow-up targets, wide re-reads, edits) still run after this narrower gate.
 		if (autoOn) {
 			const strict = supervisorToolBlock(event.toolName, event.input);
 			if (strict !== undefined) return { block: true, reason: autoRunRefusal(strict) };
@@ -1925,7 +1936,7 @@ export default function storm(pi: ExtensionAPI): void {
 				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 			}
 			// The approved reviewer gets the exact submissions it must judge with its own task, not only an id or hash.
-			const finalInput = withAnswerReviewTask(placed.input, approvedReviewer(config), runs.answerReviewPackets());
+			const finalInput = withAnswerReviewTask(placed.input, approvedReviewer(config), () => runs.takeAnswerReviewBatch());
 			// The exact toolCallId is host-issued; admitted sync children later carry it into their attempt id.
 			attempts.observeTaskCall({ runId, parentId: ctx.agent.id, toolCallId: event.toolCallId, input: finalInput, startedAt: Date.now() });
 			return finalInput === event.input ? undefined : { input: finalInput };
@@ -2073,13 +2084,13 @@ export default function storm(pi: ExtensionAPI): void {
 			}
 		}
 		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
-		// A work-bearing follow-up that wakes the approved reviewer carries the scoped answer packets in that one message,
-		// so a resumed reviewer session judges the exact submissions too. A progress note stays a quiet note.
+		// A work-bearing follow-up that wakes the approved reviewer carries the next unsent batch of answer packets in that
+		// one message, so a resumed reviewer session judges exact submissions too. A progress note stays a quiet note.
 		if (!progress && followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
 			const content = (event.input as { content?: unknown }).content;
-			const packets = runs.answerReviewPackets();
-			if (packets !== undefined && typeof content === "string" && content.trim() !== "") {
-				return { input: { ...event.input, content: `${content.trimEnd()}\n\n${packets}` } };
+			if (typeof content === "string" && content.trim() !== "") {
+				const packets = runs.takeAnswerReviewBatch();
+				if (packets !== undefined) return { input: { ...event.input, content: `${content.trimEnd()}\n\n${packets}` } };
 			}
 		}
 		return undefined;

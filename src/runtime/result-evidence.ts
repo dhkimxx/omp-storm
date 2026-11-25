@@ -46,6 +46,10 @@ export interface ResultEvidenceLimits {
 	paths: number;
 	pathChars: number;
 	idChars: number;
+	/**
+	 * Longest answer text the deterministic checks scan. It is a scan bound, never a size rule: a longer answer is not
+	 * unmet for its length, it goes to review bound to the digest of its full text.
+	 */
 	answerChars: number;
 	citations: number;
 	quoteChars: number;
@@ -60,7 +64,9 @@ export const RESULT_EVIDENCE_LIMITS: Readonly<ResultEvidenceLimits> = Object.fre
 	// The wire parser and these two evidence bounds use the plan's own exported limits, not a second table.
 	pathChars: MAX_RESULT_PATH,
 	idChars: MAX_RESULT_ID,
-	answerChars: 8_192,
+	// The checks normalize and regex-scan the whole answer synchronously on the parent's event loop; a MiB of text is
+	// still a scan of milliseconds, a runaway output many times that is a stall. Every genuine answer is far below it.
+	answerChars: 1024 * 1024,
 	citations: 8,
 	quoteChars: 512,
 	fileBytes: 256 * 1024,
@@ -125,6 +131,11 @@ export interface AnswerCitation {
 export interface AnswerSubmission {
 	text: string;
 	citations: AnswerCitation[];
+	/**
+	 * `text` is only the part of the answer the host delivered (its preview or tail); the whole could not be read. No
+	 * check decides a part: the answer is reviewable, never accepted or unmet on it.
+	 */
+	partial?: boolean;
 }
 
 /**
@@ -1161,32 +1172,10 @@ interface VerifiedCitation {
 	excerpt?: string;
 }
 
-/**
- * Numeric facts only: file names and citation line references are stripped first so `report.json:2` cannot make the
- * answer look like it states `2`. A decimal is one fact; a number inside a longer token (`142`, `v2`) is not split. A
- * leading sign that is not part of a range or identifier is part of the fact, so `-42` and `42` are different facts
- * (U+2212 is a minus; `+42` and `-0` are the unsigned value).
- */
-function numericFacts(text: string): string[] {
-	const cleaned = text
-		.replace(/\b[A-Za-z][A-Za-z0-9._/-]*\.(?:json|md|txt|ts|tsx|js|jsx|mjs|cjs|yaml|yml|toml|log|patch|diff)(?::\d+)?/giu, " ")
-		.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+/gu, " ");
-	const values: string[] = [];
-	for (const match of cleaned.matchAll(/(?<![\p{L}\p{N}_.])([-+\u2212](?=\d))?(\d+(?:\.\d+)?)(?![\p{L}\p{N}_.])/gu)) {
-		const digits = match[2];
-		if (digits === undefined) continue;
-		values.push(signedNumber(match[1], digits));
-	}
-	return values;
-}
-
 function signedNumber(sign: string | undefined, digits: string): string {
 	const negative = sign === "-" || sign === "\u2212";
 	return negative && /[1-9]/u.test(digits) ? `-${digits}` : digits;
 }
-
-/** A spelled-out sign makes a bare digit unreliable as a numeric fact; such an answer is never judged by its digits. */
-const SIGN_WORD = /(?:^|[^\p{L}])(?:minus|negative|positive|음수|양수|마이너스|플러스)(?:[^\p{L}]|$)/iu;
 
 /** Comparison form: whitespace, wrapping quotes/backticks and one trailing sentence stop are not content; case is. */
 function canonicalText(value: string): string {
@@ -1286,18 +1275,15 @@ function answerAligns(answer: string, excerpt: string): boolean {
 /**
  * A declared `contains` must support the reported answer, not only exist somewhere in the file. Support is the
  * literal itself (case included), the cited line verbatim, or the same typed value (so `7`, `142` and `-42` never
- * pass for `42`). An answer whose signed numbers include one the literal does not state contradicts it; prose that
- * merely repeats the literal's number or words is unverifiable and goes to review instead of being accepted.
+ * pass for `42`). Only a typed answer (a bare scalar, `key: value` or `the key is value`) whose value differs from the
+ * literal's typed value contradicts it. Prose is never decided by the numbers in it: a research or measurement answer
+ * states counts, lines and timings beside the fact, and repeating the fact's number is no support either, so prose
+ * is unverifiable and goes to review.
  */
 function containsAgreement(answer: string, contains: string, excerpt: string | undefined): AnswerAgreement {
 	const literal = typedAgreement(answer, contains);
 	if (literal !== "unverifiable") return literal;
 	if (excerpt !== undefined && typedAgreement(answer, excerpt) === "supported") return "supported";
-	const requiredFacts = numericFacts(contains);
-	if (requiredFacts.length === 0 || SIGN_WORD.test(answer)) return "unverifiable";
-	const answerFacts = numericFacts(answer);
-	// A new (or sign-flipped) number in the answer contradicts the declared fact; merely repeating one is not support.
-	if (answerFacts.some(fact => !requiredFacts.includes(fact))) return "contradicted";
 	return "unverifiable";
 }
 
@@ -1311,7 +1297,6 @@ async function evaluateAnswer(
 	if (answer === undefined) return { state: "unmet", reason: "답변 제출이 없습니다." };
 	if (typeof answer !== "object" || answer === null) return { state: "unmet", reason: "답변 형식이 올바르지 않습니다." };
 	if (typeof answer.text !== "string" || answer.text.trim() === "") return { state: "unmet", reason: "답변 내용이 비어 있습니다." };
-	if (answer.text.length > limits.answerChars) return { state: "unmet", reason: `답변이 ${limits.answerChars}자를 넘습니다.` };
 	if (!Array.isArray(answer.citations)) return { state: "unmet", reason: "답변에 출처 목록이 없습니다." };
 	if (answer.citations.length > limits.citations) return { state: "unmet", reason: `출처가 ${limits.citations}개를 넘습니다.` };
 
@@ -1357,7 +1342,26 @@ async function evaluateAnswer(
 		digest: citation.digest,
 	});
 	const contains = result.contains;
+	if (answer.partial === true) {
+		// The citations found in a part are still re-read; the one that matches the declared path anchors the review.
+		const anchor = verified.find(pathMatched) ?? verified[0];
+		return {
+			state: "reviewable",
+			reason: "호스트가 답변 일부만 전달했고 전체 출력을 안전하게 읽지 못했습니다. 리뷰어가 워커 출력 전체로 판정합니다.",
+			digest,
+			...(anchor === undefined ? {} : { citation: viewOf(anchor) }),
+		};
+	}
 	if (verified.length === 0) return { state: "unmet", reason: "검증 가능한 출처를 인용하지 않았습니다.", digest };
+	// Past the scan bound no check runs, so none can decide the answer either way: its cited source is still verified
+	// below, and the reviewer judges the whole text against the same digest.
+	const scanned = answer.text.length <= limits.answerChars;
+	const unscanned = (citation: ResultCitationView): ItemOutcome => ({
+		state: "reviewable",
+		reason: "답변이 길어 기계 비교를 건너뛰었습니다. 리뷰어가 답변 전체를 출처와 대조해 판정합니다.",
+		digest,
+		citation,
+	});
 
 	const first = verified.find(pathMatched) ?? verified[0] as VerifiedCitation;
 	const citationView = viewOf(first);
@@ -1372,6 +1376,7 @@ async function evaluateAnswer(
 				? { state: "reviewable", reason: "출처가 읽기 한도를 넘어 요구 내용을 확인하지 못했습니다.", digest, citation: citationView }
 				: { state: "unmet", reason: "인용한 위치에서 요구 내용을 확인하지 못했습니다.", digest, citation: citationView };
 		}
+		if (!scanned) return unscanned(viewOf(anchor));
 		const agreement = containsAgreement(answer.text, contains, anchor.excerpt);
 		if (agreement === "supported") return { state: "accepted", digest, citation: viewOf(anchor) };
 		if (agreement === "contradicted") {
@@ -1379,6 +1384,7 @@ async function evaluateAnswer(
 		}
 		return { state: "reviewable", reason: "출처는 요구 내용을 포함하지만 답변과의 일치를 기계적으로 확인하지 못했습니다. 자연어 판단이 필요합니다.", digest, citation: viewOf(anchor) };
 	}
+	if (!scanned) return unscanned(citationView);
 	const aligned = verified.find(citation => pathMatched(citation) && citation.excerpt !== undefined && answerAligns(answer.text, citation.excerpt));
 	if (aligned !== undefined) return { state: "accepted", digest, citation: viewOf(aligned) };
 	return {

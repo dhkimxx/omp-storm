@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { CHECKPOINT_INSTRUCTIONS, checkpointGuidance, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
+import { MID_RUN_WINDOW_SHARE, RUN_START_WINDOW_SHARE, windowThreshold } from "../src/roles.ts";
+import { CHECKPOINT_INSTRUCTIONS, checkpointGuidance, checkpointWorkState, shouldCheckpoint, workingState } from "../src/runtime/checkpoint.ts";
 import type { AgentEntry, RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord } from "./fixtures.ts";
 
@@ -8,6 +9,21 @@ const TASK = "refactor the payment module";
 
 const run = (over: Partial<RunRecord> = {}): RunRecord => runRecord({ runId: "r1", status: "running", task: TASK, ...over });
 const agent = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ runId: "r1", lastActivityAt: 10, contextTokens: 45_000, ...over });
+
+describe("windowThreshold", () => {
+	test("run start compacts at half the window, mid-run at 70%, whatever the window size", () => {
+		const at = (window: number) => [windowThreshold(RUN_START_WINDOW_SHARE, window), windowThreshold(MID_RUN_WINDOW_SHARE, window)];
+		expect(at(200_000)).toEqual([100_000, 140_000]);
+		expect(at(1_000_000)).toEqual([500_000, 700_000]);
+	});
+
+	test("an unknown window gives no threshold, so Storm starts no compaction", () => {
+		for (const window of [undefined, 0]) {
+			expect(windowThreshold(RUN_START_WINDOW_SHARE, window)).toBeUndefined();
+			expect(windowThreshold(MID_RUN_WINDOW_SHARE, window)).toBeUndefined();
+		}
+	});
+});
 
 describe("shouldCheckpoint", () => {
 	test("fires at or past the cap, never below it", () => {
@@ -152,6 +168,20 @@ describe("workingState", () => {
 		expect(text).toContain("계획 선행 의존 2개");
 		expect(text).toContain("compare→write(결과)");
 		expect(text).toContain("build→compare(통합)");
+	});
+
+	test("a long contract field is cut in the ledger; short ones and the other fields stay whole", () => {
+		const long = "y".repeat(2_000);
+		const results: RunResult[] = [
+			{ id: "r-change", state: "pending", contract: { id: "r-change", kind: "change", criterion: long, path: "src/a.ts", contains: `${long}\nTAIL`, check: "unit" } },
+		];
+		const text = checkpointWorkState(run({ results })).join("\n");
+		expect(text).toContain("계약: ");
+		expect(text).toContain('"path":"src/a.ts"');
+		expect(text).toContain('"check":"unit"');
+		expect(text).not.toContain("y".repeat(200));
+		expect(text).not.toContain("TAIL");
+		expect(text.length).toBeLessThanOrEqual(6_000);
 	});
 
 	test("counts requirement rows and dependency edges past their ledger caps", () => {

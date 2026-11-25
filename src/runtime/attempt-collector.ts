@@ -20,9 +20,10 @@
  * No I/O beyond parent-side stat/read of host-named paths, no shell, no model call, no second record store.
  */
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
-import { isAbsolute } from "node:path";
+import type { FileHandle } from "node:fs/promises";
+import { basename, isAbsolute } from "node:path";
 import { RESULT_EVIDENCE_LIMITS, type AnswerCitation } from "./result-evidence.ts";
 import {
 	UNKNOWN_HOST_VERSION,
@@ -43,8 +44,11 @@ import {
 import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, AttemptSettlement } from "./attempt-bridge.ts";
 import type { PlanLane } from "../types.ts";
 
-/** Bounded host-authored text kept for an answer result; matches the evidence evaluator's answer ceiling. */
-export const ATTEMPT_REPORT_TEXT_MAX = RESULT_EVIDENCE_LIMITS.answerChars;
+/**
+ * Largest host output file read as a whole answer: the evaluator's scan bound in characters, at four UTF-8 bytes at
+ * most each. A longer output stays the host's partial text and goes to review with its handle.
+ */
+export const WHOLE_OUTPUT_MAX_BYTES = RESULT_EVIDENCE_LIMITS.answerChars * 4;
 /** A patch larger than this is not hashed or accepted as a retained result. */
 export const ATTEMPT_PATCH_MAX_BYTES = 64 * 1024 * 1024;
 /** How long an isolated async delivery waits for its registry patch before it fails closed. */
@@ -122,13 +126,27 @@ interface RegistryObservation {
 	artifacts: HostArtifactCapture[];
 }
 
+/** What one delivery carried as answer text. When the host cut it, the whole output is read at settlement. */
+interface DeliveredAnswer {
+	text?: string;
+	/** The end of the whole output the host kept when it cut it: a preview keeps the head, a sync result the tail. */
+	cut?: "head" | "tail";
+	/** The host's structured data payload; citation candidates come from it and from the final answer text. */
+	data?: unknown;
+	/** The output path the delivery itself named (a sync result); otherwise the registry's is used. */
+	outputPath?: string;
+	/** The host's exact character count of the whole output, when the delivery states one (sync `outputMeta`). */
+	chars?: number;
+}
+
+const NO_ANSWER: DeliveredAnswer = {};
+
 interface PendingAsync {
 	job: AsyncJobFact;
 	observedAt: number;
 	/** Native surface that delivered the terminal row; kept so the registry settlement cites the same channel. */
 	channel: "async-result" | "wait-result";
-	reportText?: string;
-	citations: AnswerCitation[];
+	answer: DeliveredAnswer;
 	timer?: NodeJS.Timeout;
 }
 
@@ -188,8 +206,12 @@ export interface AttemptTaskCallInput {
 
 /** The fields of one synchronous result the collector reads beyond the adapter's identity/outcome facts. */
 export interface AttemptSyncResult extends SyncResultFact {
-	/** The child's final text; host-authored, used only as bounded answer text. */
+	/** The child's final text; host-authored, used only as answer text. */
 	output?: unknown;
+	/** True when the host kept only the tail of the child's output in `output`; the whole is at `outputPath`. */
+	truncated?: unknown;
+	/** The host's own size of the whole output; `charCount` binds a read of `outputPath` to this result. */
+	outputMeta?: { charCount?: unknown } | undefined;
 	/** The host schema envelope including its data payload; citations are candidates only. */
 	structuredOutput?: { status?: unknown; error?: unknown; data?: unknown };
 }
@@ -216,7 +238,7 @@ function waitJobs(details: unknown): readonly Record<string, unknown>[] | undefi
 
 /** A wait row is a delivery only when the host still had a result or structured payload to hand over. */
 function waitDeliverable(job: Record<string, unknown>): boolean {
-	if (bounded(job.resultText) !== undefined || bounded(job.errorText) !== undefined) return true;
+	if (hostText(job.resultText) !== undefined || hostText(job.errorText) !== undefined) return true;
 	return record(job.structured) && (job.structured.status !== undefined || job.structured.data !== undefined || job.structured.error !== undefined);
 }
 
@@ -325,11 +347,14 @@ function asyncJobFor(details: unknown, spawnKey: string): string | undefined {
 	return spawn.jobId;
 }
 
-/** Bounded text with control characters removed, never an identity or a path. */
-function bounded(value: unknown, max = ATTEMPT_REPORT_TEXT_MAX): string | undefined {
+/**
+ * Host text with control characters removed, never an identity or a path. It is never cut: an answer is judged and
+ * digested whole, and only what Storm puts in a record or a model-facing packet is bounded.
+ */
+function hostText(value: unknown): string | undefined {
 	if (typeof value !== "string" || value === "") return undefined;
 	const clean = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
-	return clean === "" ? undefined : clean.slice(0, max);
+	return clean === "" ? undefined : clean;
 }
 
 /** The raw text of an extension content field (string or text parts), before any cleaning. */
@@ -401,9 +426,9 @@ function skipBlankLines(inner: string, at: number): number {
  * isolated from an `async-result` notice). A bare result (no envelope) is the host's genuine shape for follow-up turns
  * and failures and is returned as-is; a wrapped result must be this exact agent's well-formed envelope.
  */
-export function nativeJobOutput(result: string, agentId: string): string | undefined {
+export function nativeJobOutput(result: string, agentId: string): NativeJobOutput | undefined {
 	const value = withoutFollowUpHint(result.trimEnd(), agentId).trim();
-	if (!value.startsWith("<task-result")) return value === "" ? undefined : value;
+	if (!value.startsWith("<task-result")) return value === "" ? undefined : { text: value, preview: false };
 	const open = TASK_RESULT_OPEN.exec(value);
 	// Another job's (or a malformed/truncated) envelope is never this agent's answer.
 	if (open === null || open[1] !== agentId || !value.endsWith(TASK_RESULT_CLOSE)) return undefined;
@@ -429,7 +454,24 @@ export function nativeJobOutput(result: string, agentId: string): string | undef
 	else return undefined;
 	if (end < start) return undefined;
 	const body = inner.slice(start, end).trim();
-	return body === "" || NO_OUTPUT.test(body) ? undefined : body;
+	return body === "" || NO_OUTPUT.test(body) ? undefined : { text: body, preview: kind === "preview" };
+}
+
+/** One job's output as the host delivered it, and whether that is only the host's preview of a longer output. */
+export interface NativeJobOutput {
+	text: string;
+	/** The host cut the output to a `<preview full-output="agent://<id>">` head; the whole is in its output file. */
+	preview: boolean;
+}
+
+/** A delivered job output as answer text: a preview keeps the head of the whole output. */
+function deliveredOf(output: NativeJobOutput | undefined, data: unknown): DeliveredAnswer {
+	const text = hostText(output?.text);
+	return {
+		...(text === undefined ? {} : { text }),
+		...(output?.preview === true ? { cut: "head" as const } : {}),
+		...(data === undefined ? {} : { data }),
+	};
 }
 
 /**
@@ -489,12 +531,12 @@ function asyncJobResult(content: string, jobs: readonly unknown[], index: number
 	return segment;
 }
 
-/** Bounded worker output for one correlated async job, or undefined when the host shape cannot be attributed. */
-function asyncJobText(content: unknown, jobs: readonly unknown[], index: number, agentId: string): string | undefined {
+/** Worker output for one correlated async job, or undefined when the host shape cannot be attributed. */
+function asyncJobOutput(content: unknown, jobs: readonly unknown[], index: number, agentId: string): NativeJobOutput | undefined {
 	const raw = rawContentText(content);
 	if (raw === undefined) return undefined;
 	const result = asyncJobResult(raw, jobs, index);
-	return result === undefined ? undefined : bounded(nativeJobOutput(result, agentId));
+	return result === undefined ? undefined : nativeJobOutput(result, agentId);
 }
 
 /** An absolute host path within the adapter's own declared-path bound. */
@@ -508,6 +550,37 @@ function safeRelativePath(value: unknown): string | undefined {
 	if (value.startsWith("/") || value.includes("\0") || /[<>:"|?*\u0000-\u001f]/u.test(value)) return undefined;
 	if (value.split(/[\\/]+/).includes("..")) return undefined;
 	return value;
+}
+
+/**
+ * The whole output the host cut, read from its own output file. The path must be host-declared and absolute, name
+ * exactly this agent's `<id>.md`, and be a regular file (no symlink) within the scan bound. The text must contain the
+ * delivered part at the end the host kept, and match the host's own character count when it stated one; otherwise
+ * the file is another turn's or not this output, and nothing is read.
+ */
+async function readWholeOutput(path: string, agentId: string, answer: DeliveredAnswer): Promise<string | undefined> {
+	const declared = declaredPath(path);
+	if (declared === undefined || basename(declared) !== `${agentId}.md`) return undefined;
+	let handle: FileHandle | undefined;
+	try {
+		const link = await fs.lstat(declared);
+		if (link.isSymbolicLink() || !link.isFile()) return undefined;
+		handle = await fs.open(declared, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size <= 0 || stat.size > WHOLE_OUTPUT_MAX_BYTES) return undefined;
+		const raw = (await handle.readFile()).toString("utf8");
+		if (raw.length > RESULT_EVIDENCE_LIMITS.answerChars) return undefined;
+		if (answer.chars !== undefined && raw.length !== answer.chars) return undefined;
+		const whole = hostText(raw);
+		if (whole === undefined) return undefined;
+		const part = answer.text;
+		if (part !== undefined && !(answer.cut === "tail" ? whole.endsWith(part) : whole.startsWith(part))) return undefined;
+		return whole;
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
 }
 
 /**
@@ -567,7 +640,7 @@ function waitablePatch(error: string | undefined): boolean {
 	return error === "patch-artifact-missing" || error === "patch-artifact-unchanged" || error === "artifact-capture-stale";
 }
 
-/** Citation candidates from one attempt's structured data and its own bounded text. */
+/** Citation candidates from one attempt's structured data and its own text; at most the evaluator's citation count. */
 export function answerCitations(structured: unknown, text: string | undefined): AnswerCitation[] {
 	const out: AnswerCitation[] = [];
 	const seen = new Set<string>();
@@ -576,7 +649,7 @@ export function answerCitations(structured: unknown, text: string | undefined): 
 		const path = safeRelativePath(pathValue);
 		if (path === undefined) return;
 		const line = typeof lineValue === "number" && Number.isSafeInteger(lineValue) && lineValue > 0 && lineValue <= 10_000_000 ? lineValue : undefined;
-		const quote = bounded(quoteValue, RESULT_EVIDENCE_LIMITS.quoteChars);
+		const quote = hostText(quoteValue)?.slice(0, RESULT_EVIDENCE_LIMITS.quoteChars);
 		const key = `${path}\0${line ?? ""}\0${quote ?? ""}`;
 		if (seen.has(key)) return;
 		seen.add(key);
@@ -807,14 +880,14 @@ export class AttemptCollector {
 		}
 		// The sync tool content is the host's `<task-result>` summary; only a single-result call can be attributed.
 		const rawContent = rawContentText(input.content);
-		const fallbackText =
+		const fallbackOutput: NativeJobOutput | undefined =
 			rawContent === undefined
 				? undefined
 				: results?.length === 1 && typeof results[0]?.id === "string"
-					? bounded(nativeJobOutput(rawContent, results[0].id))
+					? nativeJobOutput(rawContent, results[0].id)
 					: rawContent.includes("<task-result")
 						? undefined
-						: bounded(rawContent);
+						: { text: rawContent, preview: false };
 		for (const tracked of [...this.#tracked.values()]) {
 			if (tracked.settled || tracked.followUp || tracked.runId !== input.runId) continue;
 			if (tracked.parentId !== input.parentId) continue;
@@ -853,10 +926,20 @@ export class AttemptCollector {
 				hostVersion: HOST_VERSION,
 			}, { requirePatch: tracked.requiresPatch });
 			if (!this.#deliveryBelongs(tracked, report)) continue;
-			const text = bounded(result.output) ?? fallbackText;
 			const structured = result.structuredOutput;
 			const data = structured !== null && typeof structured === "object" && "data" in structured ? structured.data : undefined;
-			await this.#settleReport(tracked, report, text, answerCitations(data, text));
+			const own = hostText(result.output);
+			const outputPath = declaredPath(result.outputPath);
+			const chars = record(result.outputMeta) && Number.isSafeInteger(result.outputMeta.charCount) ? result.outputMeta.charCount as number : undefined;
+			const delivered: DeliveredAnswer =
+				own === undefined
+					? deliveredOf(fallbackOutput, data)
+					: { text: own, ...(result.truncated === true ? { cut: "tail" as const } : {}), ...(data === undefined ? {} : { data }) };
+			await this.#settleReport(tracked, report, {
+				...delivered,
+				...(outputPath === undefined ? {} : { outputPath }),
+				...(chars === undefined ? {} : { chars }),
+			});
 		}
 	}
 
@@ -874,7 +957,7 @@ export class AttemptCollector {
 			const tracked = this.#tracked.get(agentId);
 			if (tracked === undefined || tracked.runId !== input.runId || tracked.settled) continue;
 			// Only this job's own output, never the notice frame or a sibling job's answer.
-			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobText(envelope.content, jobs, index, agentId));
+			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobOutput(envelope.content, jobs, index, agentId));
 		}
 	}
 
@@ -900,7 +983,7 @@ export class AttemptCollector {
 			// row of an independently delivered job carries no text and must not replace that completion.
 			const status = typeof job.status === "string" ? job.status : undefined;
 			const raw = typeof job.resultText === "string" && job.resultText !== "" ? job.resultText : job.errorText;
-			const text = typeof raw === "string" ? bounded(nativeJobOutput(raw, agentId)) : undefined;
+			const output = typeof raw === "string" ? nativeJobOutput(raw, agentId) : undefined;
 			if (status === "completed" && !waitDeliverable(job)) continue;
 			// The job can be enqueued just before `before_subagent_spawn`; admission is the child-start epoch, so the
 			// terminal settlement must not precede it. A pre-admission job (another turn or a reused child) is ignored.
@@ -926,9 +1009,8 @@ export class AttemptCollector {
 				tracked,
 				fact,
 				input.observedAt,
-				text,
+				deliveredOf(output, structured !== undefined && "data" in structured ? structured.data : undefined),
 				"wait-result",
-				structured !== undefined && "data" in structured ? structured.data : undefined,
 			);
 		}
 	}
@@ -1028,7 +1110,7 @@ export class AttemptCollector {
 		return true;
 	}
 
-	async #observeAsyncJob(tracked: TrackedAttempt, job: Record<string, unknown>, observedAt: number, text: string | undefined): Promise<void> {
+	async #observeAsyncJob(tracked: TrackedAttempt, job: Record<string, unknown>, observedAt: number, output: NativeJobOutput | undefined): Promise<void> {
 		const fact: AsyncJobFact = {
 			jobId: job.jobId,
 			agentId: job.agentId,
@@ -1041,9 +1123,8 @@ export class AttemptCollector {
 			tracked,
 			fact,
 			observedAt,
-			text,
+			deliveredOf(output, record(job.schema) && "data" in job.schema ? job.schema.data : undefined),
 			"async-result",
-			record(job.schema) && "data" in job.schema ? job.schema.data : undefined,
 		);
 	}
 
@@ -1052,9 +1133,8 @@ export class AttemptCollector {
 		tracked: TrackedAttempt,
 		fact: AsyncJobFact,
 		observedAt: number,
-		text: string | undefined,
+		answer: DeliveredAnswer,
 		channel: "async-result" | "wait-result",
-		citationData: unknown,
 	): Promise<void> {
 		const registry = tracked.registry === undefined ? undefined : this.#registryCapture(tracked.registry);
 		const retry = this.#retryOf(tracked);
@@ -1070,12 +1150,11 @@ export class AttemptCollector {
 			...(retry === undefined ? {} : { retryAttempt: retry }),
 		});
 		if (!this.#deliveryBelongs(tracked, report)) return;
-		const citations = answerCitations(citationData, text);
 		if (tracked.requiresPatch && report.capture !== "observed" && waitablePatch(report.captureError)) {
-			this.#holdAsync(tracked, fact, observedAt, text, citations, channel);
+			this.#holdAsync(tracked, fact, observedAt, answer, channel);
 			return;
 		}
-		await this.#settleReport(tracked, report, text, citations);
+		await this.#settleReport(tracked, report, answer);
 	}
 
 	/** Hold an isolated async delivery until its registry patch arrives; the timeout fails it closed. */
@@ -1083,18 +1162,11 @@ export class AttemptCollector {
 		tracked: TrackedAttempt,
 		job: AsyncJobFact,
 		observedAt: number,
-		text: string | undefined,
-		citations: AnswerCitation[],
+		answer: DeliveredAnswer,
 		channel: "async-result" | "wait-result",
 	): void {
 		if (tracked.pending !== undefined) return;
-		const pending: PendingAsync = {
-			job,
-			observedAt,
-			channel,
-			citations,
-			...(text === undefined ? {} : { reportText: text }),
-		};
+		const pending: PendingAsync = { job, observedAt, channel, answer };
 		pending.timer = setTimeout(() => {
 			// The timer callback must not act for a replaced or stopped attempt.
 			if (this.#tracked.get(tracked.spawnKey) !== tracked || this.#stopped) return;
@@ -1135,12 +1207,11 @@ export class AttemptCollector {
 					hostVersion: HOST_VERSION,
 					reason: "patch-artifact-missing",
 				}),
-				pending.reportText,
-				pending.citations,
+				pending.answer,
 			);
 			return;
 		}
-		await this.#settleReport(tracked, report, pending.reportText, pending.citations);
+		await this.#settleReport(tracked, report, pending.answer);
 	}
 
 	async #observeRegistry(event: AttemptRegistryEvent): Promise<void> {
@@ -1188,12 +1259,12 @@ export class AttemptCollector {
 			...(retry === undefined ? {} : { retryAttempt: retry }),
 		});
 		if (report.capture === "observed") {
-			await this.#settleReport(tracked, report, pending.reportText, pending.citations);
+			await this.#settleReport(tracked, report, pending.answer);
 			return;
 		}
 		if (waitablePatch(report.captureError)) return;
 		// A wrong parent, wrong child, empty patch or missing baseline cannot be fixed by another registry event.
-		await this.#settleReport(tracked, report, pending.reportText, pending.citations);
+		await this.#settleReport(tracked, report, pending.answer);
 	}
 
 	#registryCapture(observation: RegistryObservation): RegistryCapture {
@@ -1227,13 +1298,25 @@ export class AttemptCollector {
 				hostVersion: HOST_VERSION,
 				reason: "native-result-missing",
 			}),
-			undefined,
-			[],
+			NO_ANSWER,
 		);
 	}
 
+	/**
+	 * The answer text a settlement carries. A cut delivery is replaced by the whole output read from the host's output
+	 * file for this agent (the delivery's own path, else the registry's); when that cannot be read safely the cut text
+	 * stays and is marked partial, so it is judged only by review with the agent's handle, never accepted or failed.
+	 */
+	async #wholeAnswer(tracked: TrackedAttempt, answer: DeliveredAnswer): Promise<{ text?: string; partial: boolean }> {
+		const delivered = answer.text === undefined ? {} : { text: answer.text };
+		if (answer.cut === undefined) return { ...delivered, partial: false };
+		const path = answer.outputPath ?? tracked.registry?.outputPath ?? declaredPath(this.#registry?.get(tracked.spawnKey)?.history?.outputPath);
+		const whole = path === undefined ? undefined : await readWholeOutput(path, tracked.spawnKey, answer);
+		return whole === undefined ? { ...delivered, partial: true } : { text: whole, partial: false };
+	}
+
 	/** The only settlement path. One dispatch settles once; a controller failure leaves it closed, never retried. */
-	async #settleReport(tracked: TrackedAttempt, report: AttemptReport, reportText: string | undefined, citations: AnswerCitation[]): Promise<void> {
+	async #settleReport(tracked: TrackedAttempt, report: AttemptReport, answer: DeliveredAnswer): Promise<void> {
 		if (tracked.settled) return;
 		tracked.settled = true;
 		this.#clearPending(tracked);
@@ -1254,6 +1337,10 @@ export class AttemptCollector {
 			}
 		}
 		try {
+			// Only a usable attempt's text can become evidence; nothing is read for a failed or unbound one.
+			const final = attemptUsable(report) ? await this.#wholeAnswer(tracked, answer) : { ...(answer.text === undefined ? {} : { text: answer.text }), partial: false };
+			const reportText = final.text;
+			const citations = answerCitations(answer.data, reportText);
 			await this.#deps.port.settle({
 				runId: tracked.runId,
 				lane: tracked.lane,
@@ -1264,6 +1351,7 @@ export class AttemptCollector {
 				observedAt: report.observedAt,
 				report,
 				...(reportText === undefined ? {} : { reportText }),
+				...(final.partial ? { reportPartial: true as const } : {}),
 				citations,
 			});
 		} catch {

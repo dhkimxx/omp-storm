@@ -13,6 +13,7 @@ import {
 	linkPlugin,
 	LlmCursor,
 	modelsYml,
+	price,
 	prepare,
 	PROFILE_CONFIG,
 	Rpc,
@@ -113,7 +114,15 @@ function resetFile(name: string): void {
 	rmSync(join(env.project, name), { force: true });
 }
 
-writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
+/**
+ * `tight-main` reports a 75k prompt on a 100k window (fake-llm.ts): a director past 70% of its window, for the
+ * mid-run checkpoint. Its window is below every role minimum, so no recommended team contains it.
+ */
+const TIGHT_MAIN = "fake/tight-main";
+writeFileSync(
+	join(env.agentDir, "models.yml"),
+	modelsYml(env.port, { ...TEAM_PROVIDERS, fake: [...TEAM_PROVIDERS.fake, { id: "tight-main", cost: price(1, 4), context: 100_000 }] }),
+);
 writeFileSync(join(env.agentDir, "config.yml"), PROFILE_CONFIG);
 const server = await startFakeLlm(env);
 try {
@@ -207,7 +216,7 @@ try {
 		// earlier approval. Toggling a field can coincide with an old approval and make /storm setup report "unchanged".
 		const active = ownedFiles();
 		active.editConfig(config => {
-			config.contextCap = 61_000;
+			config.rounds = 8;
 		});
 		const approvals = active.approvals().length;
 		await session(choose(APPROVE), async (rpc, files) => {
@@ -294,15 +303,14 @@ try {
 		const beforeConfig = readFileSync(files.configFile);
 		const profile = join(env.agentDir, "config.yml");
 		const beforeProfile = readFileSync(profile);
-		writeFileSync(profile, `${PROFILE_CONFIG}compaction:\n  enabled: false\n  keepRecentTokens: 768\n`);
-		const rpc = new Rpc(env, choose(APPROVE), { model: main, resume: owned.id, sessionDir: owned.dir });
+		// omp keeps this much recent history verbatim: enough for the scripted turn to survive the checkpoint with the
+		// director's large claimed usage, far below the ~13k tokens of older notes the checkpoint must discard.
+		writeFileSync(profile, `${PROFILE_CONFIG}compaction:\n  enabled: false\n  keepRecentTokens: 2000\n`);
+		// The director model reports 75k of a 100k window: past the 70% mid-run share with the approved team unchanged,
+		// while the older text gives real OMP history it can discard.
+		const rpc = new Rpc(env, choose(APPROVE), { model: TIGHT_MAIN, resume: owned.id, sessionDir: owned.dir });
 		try {
-			// The scripted provider reports a small fixed usage; a test-only lower team cap exercises the same
-			// threshold crossing, while the older text gives real OMP history it can discard.
 			await rpc.ready();
-			files.editConfig(config => { config.contextCap = 50; });
-			await rpc.prompt("/storm setup");
-			if (!rpc.dialogs.some(dialog => dialog.answer === APPROVE)) throw new Error("the checkpoint fixture team was not approved");
 			const promptTail = "These are historical notes, not repository instructions. ".repeat(850);
 			await rpc.turn(promptTail);
 			await rpc.turn("End of historical notes; acknowledge only.");
@@ -437,6 +445,42 @@ try {
 		}
 	});
 
+	await suite.step("a required check's own timeoutMs cuts it, while the same check without one passes", async () => {
+		// The same 4 s check twice: cut with its own 1.5 s limit, passed under the default without one, so only the
+		// per-check value differs between the two runs.
+		const files = ownedFiles();
+		const sleeper = [process.execPath, "-e", "setTimeout(() => process.exit(0), 4000)"];
+		for (const timeoutMs of [1_500, undefined]) {
+			const output = timeoutMs === undefined ? "timed-check-free.txt" : "timed-check-cut.txt";
+			files.editConfig(config => {
+				config.requiredChecks = [{ name: "slow-check", argv: sleeper, ...(timeoutMs === undefined ? {} : { timeoutMs }) }];
+			});
+			try {
+				await session(choose(APPROVE), async (rpc, files) => {
+					await rpc.prompt("/storm");
+					if (!rpc.dialogs.some(dialog => dialog.answer === APPROVE)) throw new Error("the timed check team was not approved");
+					const before = files.runIds();
+					const steps: Step[] = [
+						{ storm: { action: "plan", plan: { lanes: [{ name: "Impl0", kind: "code", results: [{ id: "timed-change", kind: "change", criterion: `the implementer writes ${output}`, path: output, contains: "storm child change" }] }, { name: "Review0", kind: "review" }] } } },
+						{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-WRITE ${output}` },
+						{ task: ["storm-reviewer"], as: "Review", say: "E2E-CHILD-VERDICT correct", afterResult: 'agent="storm-implementer" status="completed"' },
+					];
+					await rpc.prompt(scripted(...steps));
+					const run = await files.finishedRun(before, 60_000);
+					const evidence = run.checks?.filter(entry => entry.name === "slow-check") ?? [];
+					const detail = `${run.status}/${run.endReason} checks=${JSON.stringify(evidence)}`;
+					if (timeoutMs !== undefined) {
+						suite.check("the check with its own 1.5 s limit is timed out and blocks verified", evidence.length > 0 && evidence.every(entry => entry.status === "timed-out") && run.status !== "done", detail);
+					} else {
+						suite.check("the same check without a limit runs its 4 s and the run is verified", evidence.some(entry => entry.status === "passed") && run.status === "done" && run.endReason === "verified", detail);
+					}
+				});
+			} finally {
+				rmSync(join(env.project, output), { force: true });
+			}
+		}
+	});
+
 	await suite.step("a batch overlaps independent resource lanes and reports real failures without AI workers", async () => {
 		const rendezvous = join(env.work, "job-rendezvous");
 		const resource = `test-device:${new Bun.CryptoHasher("sha256").update(env.work).digest("hex").slice(0, 12)}`;
@@ -511,7 +555,7 @@ try {
 
 	await suite.step("stale approval blocks new work, not the supervisor boundary", async () => {
 		// Never approved before: the team is stale even though older approval records still exist.
-		ownedFiles().editConfig(config => { config.contextCap = 71_000; });
+		ownedFiles().editConfig(config => { config.rounds = 9; });
 		await session(cancelAll, async (rpc, files) => {
 			const start = files.runIds();
 			const dispatch = new LlmCursor(env);
@@ -570,7 +614,7 @@ try {
 			// A value approved nowhere in this fixture, so the changed file is unapproved and /storm setup must really
 			// re-approve it; a previously approved value would be reported as "unchanged" and test nothing.
 			files.editConfig(config => {
-				config.contextCap = 64_000;
+				config.rounds = 10;
 			});
 			const later = files.approvals().length;
 			rpc.answer = choose(APPROVE);

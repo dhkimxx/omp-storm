@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+	MAX_LANES,
 	MAX_LANE_DEPENDENCIES,
+	MAX_LANE_FILES,
+	MAX_LANE_NAME,
 	MAX_LANE_RESULTS,
 	MAX_LANE_TEXT,
+	MAX_PLAN_BYTES,
 	MAX_RESULT_CONTAINS,
 	MAX_RESULT_CRITERION,
 	MAX_RESULT_ID,
@@ -227,7 +231,7 @@ describe("validatePlan", () => {
 		const bad = (input: unknown) => validatePlan(config, input, NOW);
 		expect(bad({ lanes: [] }).errors).toHaveLength(1);
 		expect(
-			bad({ lanes: Array.from({ length: 51 }, (_, i) => ({ name: `l${i}`, kind: "code", results: contract(`l${i}`) })) }).errors,
+			bad({ lanes: Array.from({ length: MAX_LANES + 1 }, (_, i) => ({ name: `l${i}`, kind: "code", results: contract(`l${i}`) })) }).errors,
 		).toHaveLength(1);
 		const r = bad({
 			lanes: [
@@ -243,6 +247,70 @@ describe("validatePlan", () => {
 		expect(r.plan).toBeUndefined();
 		expect(r.errors).toHaveLength(6);
 		expect(bad({ lanes: [{ name: "a", kind: "code", results: contract("a") }], workers: { implementer: 1.5 } }).errors).toHaveLength(1);
+	});
+
+	test("a plan a large team actually writes validates: 60 lanes, a 600-character goal, 12 results and a 100-file lane", () => {
+		const goal = "g".repeat(600);
+		const lanes = Array.from({ length: 60 }, (_, i) => ({
+			name: `lane-${i}`,
+			kind: "code" as const,
+			...(i === 0 ? { goal } : {}),
+			...(i === 1 ? { files: Array.from({ length: 100 }, (_, j) => `src/module-${j}/file.ts`) } : {}),
+			results:
+				i === 0
+					? Array.from({ length: 12 }, (_, j) => ({ id: `bulk-${j}`, kind: "change" as const, criterion: "the bulk change is in the tree" }))
+					: contract(`lane-${i}`),
+		}));
+		const r = validatePlan(config, { lanes }, NOW);
+		expect(r.errors).toEqual([]);
+		expect(r.plan!.lanes).toHaveLength(60);
+		expect(r.plan!.lanes[0]!.goal).toHaveLength(600);
+		expect(r.plan!.lanes[0]!.results).toHaveLength(12);
+		expect(r.plan!.lanes[1]!.files).toHaveLength(100);
+	});
+
+	test("lane names, write scopes and the plan note carry generous bounds", () => {
+		const one = (lane: Record<string, unknown>, note?: unknown) =>
+			validatePlan(config, { lanes: [{ name: "a", kind: "code", results: contract("a"), ...lane }], ...(note === undefined ? {} : { note }) }, NOW);
+		const files = (n: number) => Array.from({ length: n }, (_, i) => `${i}/src/a.ts`);
+		expect(one({ name: "x".repeat(MAX_LANE_NAME) }).errors).toEqual([]);
+		expect(one({ name: "x".repeat(MAX_LANE_NAME + 1) }).errors.some((error) => error.includes("name"))).toBe(true);
+		expect(one({ files: files(MAX_LANE_FILES) }).errors).toEqual([]);
+		expect(one({ files: files(MAX_LANE_FILES + 1) }).errors.some((error) => error.includes("files"))).toBe(true);
+		// A file path had no bound before this change and gains none: only the total plan size limits one.
+		expect(one({ files: ["x".repeat(MAX_RESULT_PATH + 1)] }).errors).toEqual([]);
+		expect(one({}, `  ${"n".repeat(MAX_LANE_TEXT)}  `).plan!.note).toHaveLength(MAX_LANE_TEXT);
+		expect(one({}, "x".repeat(MAX_LANE_TEXT + 1)).errors.some((error) => error.includes("note"))).toBe(true);
+	});
+
+	test("a plan past the total size bound is refused with its size and the limit", () => {
+		// Every field is legal on its own; the combination is not, because the serialized plan is what the record keeps.
+		const lanes = Array.from({ length: 48 }, (_, i) => ({
+			name: `lane-${i}`,
+			kind: "code" as const,
+			results: Array.from({ length: 48 }, (_, j) => ({
+				id: `r-${i}-${j}`,
+				kind: "change" as const,
+				criterion: "x".repeat(MAX_RESULT_CRITERION),
+			})),
+		}));
+		const r = validatePlan(config, { lanes }, NOW);
+		expect(r.plan).toBeUndefined();
+		expect(r.errors).toHaveLength(1);
+		expect(r.errors[0]).toContain("plan");
+		expect(r.errors[0]).toContain(String(MAX_PLAN_BYTES));
+
+		// The plan text alone is small, but the record copies every result into a row; the count crosses the bound.
+		const tiny = Array.from({ length: MAX_LANES }, (_, i) => ({
+			name: `lane-${i}`,
+			kind: "code" as const,
+			results: Array.from({ length: MAX_LANE_RESULTS }, (_, j) => ({ id: `t-${i}-${j}`, kind: "change" as const, criterion: "c" })),
+		}));
+		expect(Buffer.byteLength(JSON.stringify(tiny), "utf8")).toBeLessThan(MAX_PLAN_BYTES);
+		const many = validatePlan(config, { lanes: tiny }, NOW);
+		expect(many.plan).toBeUndefined();
+		expect(many.errors).toHaveLength(1);
+		expect(many.errors[0]).toContain(String(MAX_PLAN_BYTES));
 	});
 
 	test("no configured role for a kind is an error", () => {
@@ -368,8 +436,8 @@ describe("validatePlan", () => {
 			expect(one([result({ contains: "x".repeat(MAX_RESULT_CONTAINS + 1) })]).errors.some((error) => error.includes("contains"))).toBe(true);
 			expect(one([result({ criterion: "   " })]).errors.some((error) => error.includes("criterion"))).toBe(true);
 			expect(one([result({ contains: "   " })]).errors.some((error) => error.includes("contains"))).toBe(true);
-			expect(one([]).errors.some((error) => error.includes("1~8"))).toBe(true);
-			expect(one(Array.from({ length: MAX_LANE_RESULTS + 1 }, (_, i) => result({ id: `r${i}` }))).errors.some((error) => error.includes("1~8"))).toBe(true);
+			expect(one([]).errors.some((error) => error.includes(`1~${MAX_LANE_RESULTS}`))).toBe(true);
+			expect(one(Array.from({ length: MAX_LANE_RESULTS + 1 }, (_, i) => result({ id: `r${i}` }))).errors.some((error) => error.includes(`1~${MAX_LANE_RESULTS}`))).toBe(true);
 			expect(one(Array.from({ length: MAX_LANE_RESULTS }, (_, i) => result({ id: `r${i}` }))).errors).toEqual([]);
 		});
 
@@ -528,7 +596,7 @@ describe("validatePlan", () => {
 				[{ lane: "produce", need: "done" }],
 				[{ lane: "produce", need: true }],
 				[{ lane: "produce", need: "result", optional: true }],
-				[{ lane: "x".repeat(MAX_LANE_TEXT + 1), need: "result" }],
+				[{ lane: "x".repeat(MAX_LANE_NAME + 1), need: "result" }],
 				[{ lane: "pro\nduce", need: "result" }],
 			]) {
 				const r = bad(value);

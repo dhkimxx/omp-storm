@@ -8,7 +8,10 @@ import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
 import {
 	LANE_NEEDS,
+	MAX_LANES,
 	MAX_LANE_DEPENDENCIES,
+	MAX_LANE_FILES,
+	MAX_LANE_NAME,
 	MAX_LANE_RESULTS,
 	MAX_LANE_TEXT,
 	MAX_RESULT_CONTAINS,
@@ -73,17 +76,17 @@ function stormParams(z: Zod): StormToolSchema {
 	return z.object({
 		action: z.enum(ACTIONS).describe("Operation"),
 		task: z.string().optional().describe("run: the request verbatim"),
-		lanes: z.array(z.string().min(1).max(MAX_LANE_TEXT)).min(1).max(50).optional().describe("execute: planned job lane names"),
+		lanes: z.array(z.string().min(1).max(MAX_LANE_NAME)).min(1).max(MAX_LANES).optional().describe("execute: planned job lane names"),
 		plan: z
 			.object({
 				lanes: z
 					.array(
 						z.object({
-							name: z.string().describe("Unique lane name"),
+							name: z.string().min(1).max(MAX_LANE_NAME).describe("Unique lane name"),
 							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
 							role: z.enum(ROLE_IDS).optional().describe("Role for the lane; default from kind"),
 							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("Approved job name; kind run, no AI worker"),
-							files: z.array(z.string()).optional().describe("Files the lane may change"),
+							files: z.array(z.string()).max(MAX_LANE_FILES).optional().describe("Files the lane may change"),
 							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep on replan"),
 							isolationReason: z
 								.string()
@@ -130,7 +133,7 @@ function stormParams(z: Zod): StormToolSchema {
 								.array(
 									z
 										.object({
-											lane: z.string().min(1).max(MAX_LANE_TEXT).describe("Prerequisite lane in this plan"),
+											lane: z.string().min(1).max(MAX_LANE_NAME).describe("Prerequisite lane in this plan"),
 											need: z
 												.enum(LANE_NEED_IDS)
 												.describe("result|integrated|reviewable before this lane starts"),
@@ -143,9 +146,10 @@ function stormParams(z: Zod): StormToolSchema {
 								.describe("Prerequisite lanes; not proof the need holds"),
 						}),
 					)
-					.describe("1-50 lanes"),
+					.max(MAX_LANES)
+					.describe(`1-${MAX_LANES} lanes`),
 				workers: z.record(z.string(), z.number()).optional().describe("Live agents per lane role"),
-				note: z.string().optional(),
+				note: z.string().max(MAX_LANE_TEXT).optional(),
 			})
 			.optional()
 			.describe("plan: lanes and workers"),
@@ -248,8 +252,7 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput, 
 		case "status":
 			return { outcome: "ok", text: await host.statusText({ quota: false }) };
 		case "agents": {
-			const state = await host.loadState();
-			const rows = agentRows(host.runtime.agents(), state.config.status === "ok" ? state.config.config : undefined);
+			const rows = agentRows(host.runtime.agents());
 			return { outcome: "ok", text: renderAgentRows(rows, host.now()) };
 		}
 		case "run": {
@@ -270,8 +273,8 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput, 
 			return submitPlan(host, params.plan);
 		case "execute": {
 			const lanes = params.lanes;
-			if (lanes === undefined || lanes.length === 0 || lanes.length > 50 || new Set(lanes).size !== lanes.length) {
-				return rejected("실행할 서로 다른 계획 레인 이름 1~50개가 필요합니다.");
+			if (lanes === undefined || lanes.length === 0 || lanes.length > MAX_LANES || new Set(lanes).size !== lanes.length) {
+				return rejected(`실행할 서로 다른 계획 레인 이름 1~${MAX_LANES}개가 필요합니다.`);
 			}
 			const reply = await host.runtime.executeJobs?.(lanes, signal);
 			return reply?.ok === true ? { outcome: "ok", text: reply.text } : rejected(reply?.reason ?? "이 호스트는 정형 실행을 지원하지 않습니다.");

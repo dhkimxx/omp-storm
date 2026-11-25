@@ -1,27 +1,22 @@
 /**
- * The subagent table of status and the storm tool: each agent's state, context against its follow-up cap, and whether
- * a follow-up would pass. The cap rule here is the one Storm enforces (`src/policy/followup.ts` reads these rows).
+ * The subagent table of status and the storm tool: each agent's state, its context, and whether a follow-up would
+ * pass. Context size never refuses one; only cleaned omp records do.
  */
-import { followUpCap, roleTitle } from "../roles.ts";
-import type { AgentEntry, AgentLiveState, InfoLine, InfoSpan, StormConfig } from "../types.ts";
+import { roleTitle } from "../roles.ts";
+import type { AgentEntry, AgentLiveState, InfoLine, InfoSpan } from "../types.ts";
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
 
 export interface AgentRow {
 	entry: AgentEntry;
-	/** Context tokens from which the agent takes no follow-ups. */
-	cap: number;
-	/** ok: a follow-up passes · cap: at or past its cap · cleaned: its omp records were removed. */
-	followUp: "ok" | "cap" | "cleaned";
+	/** ok: a follow-up passes · cleaned: its omp records were removed. */
+	followUp: "ok" | "cleaned";
 }
 
-/** Each entry with its cap and follow-up state, in the same order. */
-export function agentRows(entries: readonly AgentEntry[], config: StormConfig | undefined): AgentRow[] {
-	return entries.map(entry => {
-		const cap = followUpCap(config, entry.role);
-		return { entry, cap, followUp: entry.cleanedAt !== undefined ? "cleaned" : entry.contextTokens >= cap ? "cap" : "ok" };
-	});
+/** Each entry with its follow-up state, in the same order. */
+export function agentRows(entries: readonly AgentEntry[]): AgentRow[] {
+	return entries.map(entry => ({ entry, followUp: entry.cleanedAt !== undefined ? "cleaned" : "ok" }));
 }
 
 export function tokens(n: number): string {
@@ -36,7 +31,7 @@ export function duration(ms: number): string {
 }
 
 const STATE_LABEL: Record<AgentLiveState, string> = { running: "실행 중", idle: "유휴", parked: "보관" };
-const FOLLOW_UP_LABEL: Record<AgentRow["followUp"], string> = { ok: "가능", cap: "상한 도달", cleaned: "정리됨" };
+const FOLLOW_UP_LABEL: Record<AgentRow["followUp"], string> = { ok: "가능", cleaned: "정리됨" };
 
 function cell(s: string): string {
 	return s.replace(/\|/g, "\\|").replace(/\n/g, " ");
@@ -47,19 +42,19 @@ const NO_AGENTS = "- 이 세션에서 아직 실행된 서브에이전트가 없
 /** A compact markdown table, one row per agent. */
 export function renderAgentRows(rows: readonly AgentRow[], now: number): string {
 	if (!rows.length) return NO_AGENTS;
-	const out = ["| 서브에이전트 | 역할 | 모델 | 상태 | 유휴 | 컨텍스트/상한 | 후속 지시 | 후속 가능 |", "|---|---|---|---|---|---|---|---|"];
-	for (const { entry: e, cap, followUp } of rows) {
+	const out = ["| 서브에이전트 | 역할 | 모델 | 상태 | 유휴 | 컨텍스트 | 후속 지시 | 후속 가능 |", "|---|---|---|---|---|---|---|---|"];
+	for (const { entry: e, followUp } of rows) {
 		const idle = e.state === "running" ? "—" : duration(now - e.lastActivityAt);
 		const role = e.role === undefined ? e.name : roleTitle(e.role);
 		out.push(
-			`| ${cell(e.id)} | ${cell(role)} | ${cell(e.model ?? "—")} | ${STATE_LABEL[e.state]} | ${idle} | ${tokens(e.contextTokens)}/${tokens(cap)} | ${e.followUps} | ${FOLLOW_UP_LABEL[followUp]} |`,
+			`| ${cell(e.id)} | ${cell(role)} | ${cell(e.model ?? "—")} | ${STATE_LABEL[e.state]} | ${idle} | ${tokens(e.contextTokens)} | ${e.followUps} | ${FOLLOW_UP_LABEL[followUp]} |`,
 		);
 	}
 	return out.join("\n");
 }
 
 /** Stacked rows for the interactive status report; long IDs and model names wrap independently. */
-export function agentStatusSpans({ entry, cap, followUp }: AgentRow, now: number): readonly (readonly InfoSpan[])[] {
+export function agentStatusSpans({ entry, followUp }: AgentRow, now: number): readonly (readonly InfoSpan[])[] {
 	const role = entry.role === undefined ? entry.name : roleTitle(entry.role);
 	const state = entry.state === "running" ? STATE_LABEL[entry.state]
 		: entry.state === "idle" ? `유휴 ${duration(now - entry.lastActivityAt)}`
@@ -69,8 +64,8 @@ export function agentStatusSpans({ entry, cap, followUp }: AgentRow, now: number
 			{ text: `- ${entry.id}`, tone: "accent" },
 			{ text: ` · ${role} · ${state}`, tone: entry.state === "running" ? "success" : "muted" },
 		],
-		[{ text: `  ${entry.model ?? "—"} · 컨텍스트 ${tokens(entry.contextTokens)}/${tokens(cap)}`, tone: "muted" }],
-		[{ text: `  후속 지시 ${entry.followUps}회 · ${FOLLOW_UP_LABEL[followUp]}`, tone: followUp === "cap" ? "warning" : "muted" }],
+		[{ text: `  ${entry.model ?? "—"} · 컨텍스트 ${tokens(entry.contextTokens)}`, tone: "muted" }],
+		[{ text: `  후속 지시 ${entry.followUps}회 · ${FOLLOW_UP_LABEL[followUp]}`, tone: followUp === "cleaned" ? "warning" : "muted" }],
 	];
 }
 

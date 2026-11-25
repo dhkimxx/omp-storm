@@ -2,7 +2,7 @@ import { shortHash } from "../config/canonical.ts";
 import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
-import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
+import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
@@ -176,6 +176,17 @@ function unknownText(config: StormConfig): string {
 		.join(", ");
 }
 
+const RETIRED = "(더는 쓰지 않는 필드)";
+
+/**
+ * The stored value of a retired key, which the types no longer declare and the schema does not check: any JSON
+ * shows as it is, so the approval never hides what the hash covers.
+ */
+function retiredText(holder: object | undefined, key: string): string {
+	const value = holder === undefined ? undefined : (holder as Record<string, unknown>)[key];
+	return value === undefined ? "없음" : typeof value === "string" ? value : JSON.stringify(value);
+}
+
 /** Every difference the config hash covers, one row each; with no `prev`, every set field of `next`. */
 function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false): DiffRow[] {
 	const rows: DiffRow[] = [];
@@ -196,8 +207,8 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 			const a = beforeByName.get(name);
 			const b = afterByName.get(name);
 			const field = `필수 검사 ${name}`;
-			const aText = a === undefined ? undefined : JSON.stringify(a.argv);
-			const bText = b === undefined ? undefined : JSON.stringify(b.argv);
+			const aText = a === undefined ? undefined : checkSpec(a);
+			const bText = b === undefined ? undefined : checkSpec(b);
 			if (prev === undefined) {
 				if (b !== undefined) rows.push({ field, text: `- ${field}: ${bText}` });
 			} else if (a === undefined) rows.push({ field, text: `- ${field} 추가: ${bText}` });
@@ -241,13 +252,10 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 		// Role-level effort is only a default for entries without a suffix; Storm no longer writes it.
 		if (a?.effort !== undefined || b?.effort !== undefined) line(`${title} effort`, a ? (a.effort ?? DASH) : undefined, b?.effort ?? DASH);
 		line(`${title} 워커`, a ? workerText(id, a) : undefined, b ? workerText(id, b) : DASH);
-		if (a?.contextCap !== undefined || b?.contextCap !== undefined) {
-			line(`${title} 컨텍스트 상한`, a ? capText(a.contextCap) : undefined, b ? capText(b.contextCap) : DASH);
-		}
+		if (prev !== undefined) line(`${title} contextCap${RETIRED}`, retiredText(a, "contextCap"), retiredText(b, "contextCap"));
 	}
 	if (prev !== undefined || next.disabledRoles?.length) line("사용 안 함", prev && (disabledTitles(prev) || "없음"), disabledTitles(next) || "없음");
 	line("추가 라운드", prev && roundsText(prev.rounds), roundsText(next.rounds));
-	if (prev?.contextCap !== undefined || next.contextCap !== undefined) line("컨텍스트 상한", prev && capText(prev.contextCap), capText(next.contextCap));
 	line("격리", prev && ISOLATION[prev.isolation], ISOLATION[next.isolation]);
 	line("예산", prev && (prev.budget ? budgetText(prev.budget) : "없음"), next.budget ? budgetText(next.budget) : "없음");
 	line("실행 중 다른 에이전트", prev && fallbackText(prev.fallbackRole), fallbackText(next.fallbackRole));
@@ -267,8 +275,8 @@ function diffRows(prev: StormConfig | undefined, next: StormConfig, rich = false
 	}
 	if (prev !== undefined) {
 		// Ignored since 0.10, but still hashed: a change here is why an otherwise equal config needs approval.
-		for (const key of ["contract", "runtime"] as const) {
-			line(`${key}(더는 쓰지 않는 필드)`, String(prev[key] ?? "없음"), String(next[key] ?? "없음"));
+		for (const key of ["contract", "runtime", "contextCap"] as const) {
+			line(`${key}${RETIRED}`, retiredText(prev, key), retiredText(next, key));
 		}
 	}
 	const unknownPrev = prev && unknownText(prev);
@@ -325,25 +333,27 @@ export function workerText(id: string, role: RoleConfig | undefined): string {
 	return w.min === w.max ? String(w.min) : `${w.min}~${w.max}`;
 }
 
-/** Tokens of a context cap; unset → the default it falls back to. */
-function capText(cap: number | undefined): string {
-	return cap === undefined ? `기본(${int(DEFAULT_CONTEXT_CAP)})` : int(cap);
-}
-
 /** The extra-rounds setting: the number in force; an absent one is no limit. */
 function roundsText(rounds: number | undefined): string {
 	return rounds === undefined ? "제한 없음" : String(rounds);
 }
 
-/** One status line of a role: models, effort, worker range and its own context cap. */
+/** One status line of a role: models, effort and worker range. */
 function roleLine(id: string, r: RoleConfig): string {
-	const cap = r.contextCap !== undefined ? ` · 컨텍스트 상한 ${int(r.contextCap)}` : "";
-	return visible(`- ${roleTitle(id)}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""} · 워커 ${workerText(id, r)}${cap}`);
+	return visible(`- ${roleTitle(id)}: ${r.models.join(" → ") || DASH}${r.effort ? ` · ${r.effort}` : ""} · 워커 ${workerText(id, r)}`);
 }
 
 /** A required check with its exact executable and arguments: the obligation the user approves, never a shell string. */
 export function checkText(check: RequiredCheck): string {
-	return visible(`${check.name}: ${JSON.stringify(check.argv)}`);
+	return visible(`${check.name}: ${checkSpec(check)}`);
+}
+
+/** What the hash covers of one check besides its name: the argv, and its own time limit when it sets one. */
+function checkSpec(check: RequiredCheck): string {
+	const argv = JSON.stringify(check.argv);
+	if (check.timeoutMs === undefined) return argv;
+	const seconds = check.timeoutMs % 1000 === 0 ? `${check.timeoutMs / 1000}초` : `${check.timeoutMs}ms`;
+	return `${argv} · 제한 시간 ${seconds}`;
 }
 
 function versionLine(newer: string | undefined): string {
@@ -642,7 +652,6 @@ export function renderStatus(
 		out.push(
 			`- 격리: ${ISOLATION[team.isolation]}`,
 			`- 추가 라운드: ${team.rounds ?? "제한 없음"}`,
-			`- 컨텍스트 상한: ${int(team.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`,
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,
 			`- 실행 중 다른 에이전트: ${visible(fallbackText(team.fallbackRole))}`,
 			`- 실행이 끝나면 정리: ${team.cleanup === true ? "켬" : "끔"} · 문서 정합: ${team.docs === false ? "끔" : "켬"}`,
@@ -691,7 +700,7 @@ export function renderStatus(
 	if (view.agents?.length) {
 		out.push("");
 		heading("서브에이전트", "runtime", "status.running");
-		const agents = agentRows(view.agents, c.status === "ok" ? c.config : undefined);
+		const agents = agentRows(view.agents);
 		if (model) out.push(...renderAgentRows(agents, now).split("\n"));
 		else for (const agent of agents) for (const spans of agentStatusSpans(agent, now)) styled(spans);
 	}
@@ -1042,6 +1051,8 @@ function lastRunLines(run: RunRecord, details: boolean): string[] {
 const DETAIL_ENTRY_MAX = 16;
 /** One director draft field on the status: the draft's own bound, never longer. */
 const DRAFT_FIELD_MAX = 400;
+/** A plan may now carry a long isolation reason; the status shows its start, the plan keeps the whole text. */
+const ISOLATION_REASON_MAX = 120;
 
 /** One bounded, single-line display fragment of a recorded value. */
 function oneLine(value: string, max: number): string {
@@ -1199,7 +1210,7 @@ export function isolationLaneLines(plan: RunPlan, run?: RunRecord): string[] {
 				: spawn.outcome === "blocked"
 					? `시작하지 못함: ${visible(refusal ? refusal : "이유가 기록되지 않았습니다")}`
 					: "분리 체크아웃에서 시작함";
-		return `- 격리 레인: ${visible(lane.name)} — ${visible(reason)} · ${state}`;
+		return `- 격리 레인: ${visible(lane.name)} — ${oneLine(reason, ISOLATION_REASON_MAX)} · ${state}`;
 	});
 }
 

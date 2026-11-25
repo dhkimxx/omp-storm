@@ -124,16 +124,16 @@ async function main(): Promise<void> {
 			check("an empty id is rejected", (() => { try { sessionStoreDir(env.agentDir, " "); return false; } catch { return true; } })());
 			check("the second session starts with no config, approval or run", second.files.configBytes() === null && second.files.approvals().length === 0 && second.files.runs().length === 0);
 
-			// The first session: its own team (a distinct context cap) and automatic delegation off.
+			// The first session: its own team (a distinct round limit) and automatic delegation off.
 			await approveTeam(first.rpc, "on");
 			first.files.editConfig(config => {
-				config.contextCap = 50_000;
+				config.rounds = 7;
 			});
 			first.rpc.answer = choose(APPROVE);
 			await first.rpc.prompt("/storm");
 			first.rpc.answer = choose(AUTO_OFF_LABEL);
 			await first.rpc.prompt("/storm auto");
-			check("the first session's edited team is approved in its own store", first.files.approvals().length === 2 && first.files.config().contextCap === 50_000, `approvals=${first.files.approvals().length}`);
+			check("the first session's edited team is approved in its own store", first.files.approvals().length === 2 && first.files.config().rounds === 7, `approvals=${first.files.approvals().length}`);
 			check("the first session's automatic delegation is off", (await readAutoDelegationChoice(first.files.sessionDir)) === "off");
 
 			// A real run, so history is not just an empty state directory.
@@ -152,7 +152,7 @@ async function main(): Promise<void> {
 			second.rpc.answer = choose(AUTO_ON_LABEL);
 			await second.rpc.prompt("/storm auto");
 			check("the second session approved its own team", second.files.approvals().length === 1, `approvals=${second.files.approvals().length}`);
-			check("the second session's team differs from the first", second.files.config().contextCap !== first.files.config().contextCap, `${second.files.config().contextCap} vs ${first.files.config().contextCap}`);
+			check("the second session's team differs from the first", second.files.config().rounds !== first.files.config().rounds, `${second.files.config().rounds} vs ${first.files.config().rounds}`);
 			check("automatic delegation is per session", (await readAutoDelegationChoice(second.files.sessionDir)) === "on" && (await readAutoDelegationChoice(first.files.sessionDir)) === "off");
 			check("the second session has no run history", second.files.runs().length === 0 && second.files.index().length === 0);
 
@@ -227,7 +227,7 @@ async function main(): Promise<void> {
 		try {
 			check("the resumed process reports the same native id", resumed.rpc.sessionId === a.id, `${resumed.rpc.sessionId} vs ${a.id}`);
 			check("the id, not the transcript path, picks the store", resumed.files.sessionDir === a.sessionDir, resumed.files.sessionDir);
-			check("the team is the session's own", readFileSync(resumed.files.configFile, "utf8") === a.config && resumed.files.config().contextCap === 50_000);
+			check("the team is the session's own", readFileSync(resumed.files.configFile, "utf8") === a.config && resumed.files.config().rounds === 7);
 			check("approvals and automatic delegation survived", resumed.files.approvals().length === 2 && (await readAutoDelegationChoice(resumed.files.sessionDir)) === "off");
 			check("run history survived", resumed.files.runs().length === 1 && resumed.files.index().length === 1, `runs=${resumed.files.runs().length}`);
 			const status = await resumed.rpc.prompt("/storm status");
@@ -273,12 +273,12 @@ async function main(): Promise<void> {
 			check("both resumed sessions read their own approved team", first.files.approvals().length === 2 && second.files.approvals().length === 1);
 			first.rpc.answer = choose("초기화");
 			second.files.editConfig(config => {
-				config.contextCap = 66_000;
+				config.rounds = 9;
 			});
 			second.rpc.answer = choose(APPROVE);
 			await Promise.all([first.rpc.prompt("/storm reset"), second.rpc.prompt("/storm")]);
 			check("the reset deleted only its own session store", !existsSync(first.files.sessionDir) && first.files.approvals().length === 0 && first.files.configBytes() === null);
-			check("the approving session kept its new approved team", second.files.config().contextCap === 66_000 && second.files.approvals().length === 2, `approvals=${second.files.approvals().length}`);
+			check("the approving session kept its new approved team", second.files.config().rounds === 9 && second.files.approvals().length === 2, `approvals=${second.files.approvals().length}`);
 			check(
 				"neither concurrent write touched the old sentinels",
 				sameHashes(legacy, new Map([...treeHashes(join(env.project, ".omp", "storm")), ...treeHashes(join(env.agentDir, "storm", "approvals", (await resolveRepo(env.project, exec)).repoId))])),

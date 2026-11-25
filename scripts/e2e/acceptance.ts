@@ -25,11 +25,16 @@
  *
  * T01c (contract only) is the scoped answer review: a cited prose answer S1 cannot match mechanically stays
  * `reviewable`. A generic tree-only `correct` from the approved reviewer must not accept it; in a second run the
- * scripted director waits for Storm's own scoped template (`reviewFor`), forwards what Storm wrote, and the reviewer
+ * scripted director writes a plain review task once Storm's round says answers wait for review, Storm itself appends
+ * the packet to the approved reviewer's task (the director never forwards an answer or a receipt), and the reviewer
  * copies id/receipt/citation from the packet it actually received into `results`. The receipt is never hardcoded: the
  * fixture recomputes it from the persisted row (run, result id, host attempt, content version) with the pure
  * `answerReviewReceipt` oracle and requires the reviewer's received packet, its yield and its stored review log to
  * name exactly that receipt, the cited anchor and the producer's exact answer text before the run may verify.
+ *
+ * T01d-T01f (contract only) remove size limits from that path: nine reviewable answers settle in one reviewer turn
+ * under a stated 30-round limit, an answer omp delivers as a preview is judged on the whole output, and a prose
+ * answer that states the required value beside other numbers goes to review instead of failing.
  *
  * Every wait is for a named native state; a timeout is a harness failure, never evidence that an admission was safe.
  *
@@ -74,6 +79,8 @@ const MAIN = "fake/general-b";
 const REPORT = "report.json";
 const REPORT_CONTENT = '{\n  "total": 42,\n  "source": "user owning this file"\n}\n';
 const CONTRACT = process.env.E2E_CONTRACT === "1";
+/** The round instruction's words when reviewable answers wait for a reviewer turn (src/runtime/rounds.ts). */
+const REVIEW_BATCH_CUE = "waiting for review";
 const mode = CONTRACT ? "contract" : "baseline";
 
 interface Observation {
@@ -576,8 +583,8 @@ async function main(): Promise<void> {
 				const steps: Step[] = [
 					answerPlan(),
 					explainer,
-					// Held until Storm itself names the scope for this id; what Storm wrote is forwarded, nothing is composed.
-					{ task: ["storm-reviewer"], as: "Scoped", say: "E2E-CHILD-ANSWER-VERDICT correct", reviewFor: answerId },
+					// A plain review task, held until Storm's round says an answer waits; Storm appends the packet itself.
+					{ task: ["storm-reviewer"], as: "Scoped", say: "E2E-CHILD-ANSWER-VERDICT correct", after: REVIEW_BATCH_CUE },
 				];
 				const run = await runOf(rpc, files, runRequest(steps));
 				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
@@ -612,8 +619,8 @@ async function main(): Promise<void> {
 					JSON.stringify({ submission, spawnKey: producer?.spawnKey ?? null }),
 				);
 				check(
-					"T01c scoped: Storm named this exact receipt to the director, which forwarded it to the approved reviewer",
-					expected !== undefined && reviewSpawn !== undefined && reviewSpawn.outcome !== "blocked" && directed.some(args => args.includes(expected)),
+					"T01c scoped: the director sent a plain review task and Storm, not the director, supplied the receipt",
+					expected !== undefined && reviewSpawn !== undefined && reviewSpawn.outcome !== "blocked" && directed.length > 0 && directed.every(args => !args.includes(expected)),
 					JSON.stringify({ expected: expected ?? null, spawn: reviewSpawn?.outcome ?? null, directed: directed.map(args => args.slice(0, 400)) }),
 				);
 				check(
@@ -659,6 +666,115 @@ async function main(): Promise<void> {
 					summary === undefined ? "no index line" : `${summary.status}/${summary.endReason}`,
 				);
 				check("T01c scoped: the user's report.json bytes are unchanged", before.equals(after), `before=${hash(before)} after=${hash(after)}`);
+			});
+		});
+	}
+
+	if (CONTRACT) {
+		const reviewLane = { name: "review", kind: "review", goal: "Judge every cited answer against its current source" } as const;
+
+		await suite.step("T01d: nine reviewable answers settle in one reviewer turn under a stated 30-round limit", async () => {
+			const ids = Array.from({ length: 9 }, (_, index) => `report-angle-${index + 1}`);
+			const text = `The report.json source field says a user owns this file, so its figures stay untouched (${REPORT}:3)`;
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					planFor([
+						{
+							name: "nine-angles",
+							kind: "explore",
+							goal: "Explain who owns report.json from nine angles, citing the file",
+							results: ids.map((id, index) =>
+								requiredResult(id, "answer", `Angle ${index + 1}: the answer explains from report.json who owns it and why its figures stay untouched; an independent reviewer judges the prose.`, { path: REPORT }),
+							),
+						},
+						reviewLane,
+					]),
+					{ task: ["storm-explorer"], as: "Nine", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-CLAIM ${text}` },
+					{ task: ["storm-reviewer"], as: "Batch", say: "E2E-CHILD-ANSWER-VERDICT-ALL correct", after: REVIEW_BATCH_CUE },
+				];
+				const run = await runOf(rpc, files, runRequest(steps, 30));
+				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+				const reviewSpawns = run.spawns.filter(entry => entry.agent === "storm-reviewer" && entry.outcome !== "blocked");
+				const yields = reviewerYields(llm.of("child"));
+				const yielded = yields.at(-1)?.data.results;
+				const stored = storedScopes(reviewer);
+				const states = ids.map(id => resultFor(run, id)?.state ?? "none");
+				observe("T01d nine answers", run, `limits=${JSON.stringify(run.limits ?? null)} maxRounds=${run.maxRounds} reviewSpawns=${reviewSpawns.length} yielded=${Array.isArray(yielded) ? yielded.length : "none"} stored=${stored.scopes.length}`);
+				check("T01d: the stated 30-round limit is accepted and becomes the run's round limit", run.limits?.rounds === 30 && run.maxRounds === 30, `limits=${JSON.stringify(run.limits ?? null)} maxRounds=${run.maxRounds}`);
+				check("T01d: the plan kept all nine answer results on one lane", ids.every(id => hasRequiredResult(run, "nine-angles", id, "answer")), JSON.stringify(laneOf(run, "nine-angles") ?? null).slice(0, 400));
+				check(
+					"T01d: one approved reviewer turn received and judged all nine answers",
+					reviewSpawns.length === 1 && Array.isArray(yielded) && yielded.length === ids.length && stored.scopes.filter(scope => scope.correct && ids.includes(scope.id)).length === ids.length,
+					JSON.stringify({ spawns: reviewSpawns.length, yielded: Array.isArray(yielded) ? yielded.length : null, stored: stored.scopes.map(scope => scope.id) }),
+				);
+				check("T01d: all nine answers are accepted", states.every(state => state === "accepted"), JSON.stringify(states));
+				check("T01d: the run closes done/verified", run.status === "done" && run.endReason === "verified", `observed ${run.status}/${run.endReason} turns=${run.turns}`);
+			});
+		});
+
+		await suite.step("T01e: an answer omp delivers as a preview is judged on the whole output", async () => {
+			const answerId = "long-answer";
+			const claim = `The total is 42 (${REPORT}:2)`;
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					planFor([
+						{
+							name: "long-read",
+							kind: "explore",
+							goal: "Answer what report.json says after a long preamble, citing the file",
+							results: [requiredResult(answerId, "answer", "the answer states report.json's total and cites report.json", { path: REPORT, contains: '"total": 42' })],
+						},
+						reviewLane,
+					]),
+					// 14,000 characters of digit-free preamble put the claim and its only citation past omp's async preview.
+					{ task: ["storm-explorer"], as: "Long", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-PAD 14000 E2E-CHILD-CLAIM ${claim}` },
+					{ task: ["storm-reviewer"], as: "Whole", say: "E2E-CHILD-ANSWER-VERDICT correct", after: REVIEW_BATCH_CUE },
+				];
+				const run = await runOf(rpc, files, runRequest(steps));
+				const delivered = rpc.frames.filter(frame => customMessage(frame) === "async-result").map(frame => JSON.stringify(frame)).join("\n");
+				// A packet for a partial answer says so instead of "Answer as submitted", so the parser finds none for it.
+				const packet = llm.of("child").flatMap(entry => (entry.reviewPacket === undefined ? [] : [entry.reviewPacket])).at(-1);
+				const raw = (run.results ?? []).find(row => row.id === answerId);
+				observe("T01e preview answer", run, `previewed=${delivered.includes("<preview full-output=")} deliveredChars=${delivered.length} packetChars=${packet?.answer.length ?? 0}`);
+				check("T01e: omp delivered the long answer as a preview with a full-output handle", delivered.includes("<preview full-output=") && delivered.includes("agent://"), delivered.slice(0, 300));
+				check(
+					"T01e: the reviewer received the whole answer, with the claim and citation past the preview",
+					packet?.id === answerId && packet.answer.length >= 14_000 && packet.answer.endsWith(claim) && packet.citation === `${REPORT}:2`,
+					JSON.stringify(packet === undefined ? null : { ...packet, answer: `${packet.answer.length} chars, ends ${JSON.stringify(packet.answer.slice(-60))}` }),
+				);
+				check("T01e: the scoped correct verdict accepts the whole answer", raw?.state === "accepted" && raw.origin === "review", JSON.stringify(raw ?? null));
+				check("T01e: the run closes done/verified", run.status === "done" && run.endReason === "verified", `observed ${run.status}/${run.endReason}`);
+			});
+		});
+
+		await suite.step("T01f: a prose answer stating the value beside other numbers is reviewed, and a scoped verdict accepts it", async () => {
+			const answerId = "total-with-context";
+			const text = `The total is 42 but the retry budget is 7 (${REPORT}:2)`;
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					planFor([
+						{
+							name: "total-read",
+							kind: "explore",
+							goal: "Answer report.json's total with context, citing the file",
+							results: [requiredResult(answerId, "answer", "the answer states report.json's total and cites report.json", { path: REPORT, contains: '"total": 42' })],
+						},
+						reviewLane,
+					]),
+					{ task: ["storm-explorer"], as: "Prose", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-CLAIM ${text}` },
+					{ task: ["storm-reviewer"], as: "Judge", say: "E2E-CHILD-ANSWER-VERDICT correct", after: REVIEW_BATCH_CUE },
+				];
+				const run = await runOf(rpc, files, runRequest(steps));
+				const packet = llm.of("child").flatMap(entry => (entry.reviewPacket === undefined ? [] : [entry.reviewPacket])).at(-1);
+				const stored = storedScopes(run.agents?.find(agent => agent.role === "reviewer"));
+				const raw = (run.results ?? []).find(row => row.id === answerId);
+				observe("T01f prose with numbers", run, `packet=${packet?.id ?? "none"} stored=${stored.scopes.length} origin=${raw?.origin ?? "none"}`);
+				check("T01f: the answer went to review with its exact text, not to unmet", packet?.id === answerId && packet.answer === text, JSON.stringify(packet ?? null));
+				check("T01f: the scoped correct verdict accepted it", raw?.state === "accepted" && raw.origin === "review" && stored.scopes.some(scope => scope.id === answerId && scope.correct), JSON.stringify({ row: raw ?? null, stored }));
+				check("T01f: the run closes done/verified", run.status === "done" && run.endReason === "verified", `observed ${run.status}/${run.endReason}`);
 			});
 		});
 	}

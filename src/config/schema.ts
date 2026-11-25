@@ -18,7 +18,7 @@ export function teamPriority(config: StormConfig): Priority {
 	return config.priority === "speed" || config.priority === "quota" ? "balanced" : config.priority;
 }
 
-// `contract` and `runtime` are deprecated: accepted without a warning and ignored.
+// `contract`, `runtime` and `contextCap` are retired: accepted without a warning and ignored.
 const TOP_KEYS = [
 	"version",
 	"priority",
@@ -38,10 +38,8 @@ const TOP_KEYS = [
 	"jobs",
 ];
 const ROLE_KEYS = ["agent", "models", "effort", "workers", "contextCap"];
-const CHECK_KEYS = ["name", "argv"];
+const CHECK_KEYS = ["name", "argv", "timeoutMs"];
 const JOB_KEYS = ["name", "argv", "resources", "timeoutMs"];
-/** Highest `contextCap` a config may set (team or role), in tokens. */
-export const MAX_CONTEXT_CAP = 10_000_000;
 /** Bounds on `requiredChecks`: an approval row must stay readable and a run's obligations enumerable. */
 export const MAX_REQUIRED_CHECKS = 8;
 export const MAX_CHECK_NAME_LENGTH = 80;
@@ -199,8 +197,9 @@ function validateDisabled(disabled: unknown, roleKeys: string[] | undefined, err
 }
 
 /**
- * `requiredChecks`: bounded ordered commands with unique names and unique argv. Each argv is run directly, so no
- * element may carry a control character (the whole config's strings are already checked by `unsafeText`).
+ * `requiredChecks`: bounded ordered commands with unique names and unique argv, and an optional per-check time limit
+ * bounded like a job's. Each argv is run directly, so no element may carry a control character (the whole config's
+ * strings are already checked by `unsafeText`).
  */
 function validateRequiredChecks(checks: unknown, errors: string[]): void {
 	if (!Array.isArray(checks)) {
@@ -257,6 +256,9 @@ function validateRequiredChecks(checks: unknown, errors: string[]): void {
 		if (total > MAX_CHECK_ARGV_LENGTH) {
 			errors.push(`${path}.argv: 실행 파일과 인자를 합쳐 ${MAX_CHECK_ARGV_LENGTH}자 이하여야 합니다`);
 			valid = false;
+		}
+		if (check.timeoutMs !== undefined && !isIntIn(check.timeoutMs, 1, MAX_JOB_TIMEOUT_MS)) {
+			errors.push(`${path}.timeoutMs: 1~${MAX_JOB_TIMEOUT_MS} 사이 정수여야 합니다`);
 		}
 		if (!valid) return;
 		const command = JSON.stringify(argv);
@@ -343,7 +345,8 @@ function validateJobs(jobs: unknown, errors: string[]): void {
 
 /**
  * Checks a parsed config against schema version 1. Unknown fields only warn; they still count toward the hash.
- * Fields earlier versions wrote (`contract`, `runtime`, the priorities "speed" and "quota", `workers: n`) stay valid.
+ * Fields earlier versions wrote (`contract`, `runtime`, `contextCap`, the priorities "speed" and "quota",
+ * `workers: n`) stay valid.
  * No message carries a raw unsafe character: what a message quotes from the config is escaped.
  */
 export function validateConfig(value: unknown): ConfigValidation {
@@ -385,15 +388,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 				errors.push(`${path}.effort: ${EFFORTS.join("|")} 중 하나여야 합니다`);
 			}
 			if (role.workers !== undefined) validateWorkers(role.workers, `${path}.workers`, errors);
-			if (role.contextCap !== undefined && !isIntIn(role.contextCap, 1, MAX_CONTEXT_CAP)) {
-				errors.push(`${path}.contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
-			}
 		}
 	}
 
-	if (value.contextCap !== undefined && !isIntIn(value.contextCap, 1, MAX_CONTEXT_CAP)) {
-		errors.push(`contextCap: 1~${MAX_CONTEXT_CAP} 사이 정수여야 합니다`);
-	}
 	if (value.rounds !== undefined && !isIntIn(value.rounds, 0, MAX_EXTRA_ROUNDS)) {
 		errors.push(`rounds: 0~${MAX_EXTRA_ROUNDS} 사이 정수여야 합니다`);
 	}

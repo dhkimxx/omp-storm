@@ -26,8 +26,13 @@ export interface TreeReading {
 	state: TreeState;
 }
 
-/** A tree read that does not finish in this time is no tree at all. */
-const TIMEOUT_MS = 10_000;
+/**
+ * The whole git side of one tree read shares this budget, so a slow diff no longer stacks on a slow listing. A run's
+ * round decision runs inside omp's ~30 s `agent_end` handler: 20 s leaves room for the gate, the record write and the
+ * notices that follow the read. Content hashing is separate and bounded by BIG_FILE and MANY_FILES. Callers that race
+ * a read with their own timer take their bound from here, so the timer never cuts a read this budget would finish.
+ */
+export const TREE_READ_TIMEOUT_MS = 20_000;
 
 /** A file this large contributes its size and mtime: reading a huge artifact on every round costs more than it tells. */
 const BIG_FILE = 2 * 1024 * 1024;
@@ -39,10 +44,12 @@ const PROJECT_ONLY = [".", ":(exclude,glob)**/.omp/**"];
 
 const hash = (data: string | Uint8Array): string => createHash("sha256").update(data).digest("hex").slice(0, 16);
 
-async function read(exec: Exec, root: string, args: string[]): Promise<string | undefined> {
+async function read(exec: Exec, root: string, args: string[], deadline: number): Promise<string | undefined> {
+	const remaining = deadline - Date.now();
+	if (remaining <= 0) return undefined;
 	try {
 		// `diff.autoRefreshIndex=false`: a plain `git diff` rewrites `.git/index` and takes its lock; Storm only reads.
-		const res = await exec("git", ["-c", "diff.autoRefreshIndex=false", "-C", root, ...args], { timeout: TIMEOUT_MS });
+		const res = await exec("git", ["-c", "diff.autoRefreshIndex=false", "-C", root, ...args], { timeout: remaining });
 		if (res.code !== 0 || res.killed) return undefined;
 		return res.stdout;
 	} catch {
@@ -83,15 +90,16 @@ async function filesHash(root: string, names: string[]): Promise<Pick<TreeState,
  * work tree, in a repo without a commit, or when git fails or times out.
  */
 export async function treeAgainst(exec: Exec, root: string, base?: string): Promise<TreeReading | undefined> {
-	const commit = base ?? (await read(exec, root, ["rev-parse", "--verify", "HEAD"]))?.trim();
+	const deadline = Date.now() + TREE_READ_TIMEOUT_MS;
+	const commit = base ?? (await read(exec, root, ["rev-parse", "--verify", "HEAD"], deadline))?.trim();
 	if (commit === undefined || commit === "") return undefined;
 	const [diff, added, untracked] = await Promise.all([
 		// `--diff-filter=a` leaves added files out, so committing one moves nothing; `--no-textconv` keeps a
 		// non-deterministic filter from changing the hash on every read.
-		read(exec, root, ["diff", commit, "--no-renames", "--diff-filter=a", "--no-ext-diff", "--no-textconv", "--binary", "--", ...PROJECT_ONLY]),
+		read(exec, root, ["diff", commit, "--no-renames", "--diff-filter=a", "--no-ext-diff", "--no-textconv", "--binary", "--", ...PROJECT_ONLY], deadline),
 		// A file added since the base, committed or not: `git diff` sees the index and the tree, `ls-files` the rest.
-		read(exec, root, ["diff", commit, "--name-only", "-z", "--no-renames", "--diff-filter=A", "--", ...PROJECT_ONLY]),
-		read(exec, root, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...PROJECT_ONLY]),
+		read(exec, root, ["diff", commit, "--name-only", "-z", "--no-renames", "--diff-filter=A", "--", ...PROJECT_ONLY], deadline),
+		read(exec, root, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...PROJECT_ONLY], deadline),
 	]);
 	if (diff === undefined || added === undefined || untracked === undefined) return undefined;
 	const names = [...new Set([...paths(added), ...paths(untracked)])].sort();

@@ -1224,7 +1224,7 @@ describe("a run through the hooks", () => {
 
 	test("the idle hint needs an approved team, without its approval", async () => {
 		await approve(TEAM);
-		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 200_000 });
+		await writeConfig(project.sessionDir, { ...TEAM, rounds: 9 });
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.emit("session_start", {}, main);
@@ -1735,35 +1735,32 @@ describe("a run through the hooks", () => {
 		await omp.emit("session_shutdown", {}, main);
 	});
 
-	test("a follow-up to an agent past its cap is refused and counted; one below it passes", async () => {
-		await approve({ ...TEAM, contextCap: 20_000 });
+	test("a follow-up passes at any worker context size; omp compacts the worker itself", async () => {
+		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.command("task", main);
 		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
-		// Both workers are concrete planned lanes so their follow-ups can resolve to an authorized target.
+		// A concrete planned lane so the follow-up resolves to an authorized target.
 		await applyRunPlan(omp, main, {
-			lanes: [
-				{ name: "Big", kind: "code", role: "implementer", files: ["big.txt"], results: changeFor("big-change") },
-				{ name: "Small", kind: "code", role: "implementer", files: ["small.txt"], results: changeFor("small-change") },
-			],
-			workers: { implementer: 2 },
+			lanes: [{ name: "Big", kind: "code", role: "implementer", files: ["big.txt"], results: changeFor("big-change") }],
+			workers: { implementer: 1 },
 		});
-		for (const [id, tokens] of [["Big", 20_000], ["Small", 19_999]] as const) {
-			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", id), main))).toBe("route:a/i");
-			const ctx = child.ctx(sub(id));
-			admitChild(runId, id);
-			await child.emit("before_agent_start", { systemPrompt: [] }, ctx);
-			await child.emit("message_end", assistant("a", "i", tokens, 0), ctx);
-			await child.emit("agent_end", {}, ctx);
-		}
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Big"), main))).toBe("route:a/i");
+		const ctx = child.ctx(sub("Big"));
+		admitChild(runId, "Big");
+		await child.emit("before_agent_start", { systemPrompt: [] }, ctx);
+		// Far above the retired 200k cap, and above a 200k model's whole window.
+		await child.emit("message_end", assistant("a", "i", 900_000, 0), ctx);
+		await child.emit("agent_end", {}, ctx);
 		const write = (target: string) => omp.emit("tool_call", { toolName: "write", input: { path: target } }, main);
-		expect(verdict(await write("agent://Big"))).toBe("followup-cap");
-		expect(verdict(await write("agent://Small"))).toBe("pass");
+		expect(verdict(await write("agent://Big"))).toBe("pass");
 		expect(verdict(await write("agent://Nobody"))).toBe("pass");
 		await omp.emit("session_shutdown", {}, main);
-		expect(await lastRun(project.sessionDir)).toMatchObject({ status: "stopped", endReason: "shutdown", blockedFollowUps: 1 });
+		const run = await lastRun(project.sessionDir);
+		expect(run).toMatchObject({ status: "stopped", endReason: "shutdown" });
+		expect(run?.blockedFollowUps ?? 0).toBe(0);
 	});
 
 	test("a run the tool queues starts only when the turn settles; a subagent session closing does not end it", async () => {
@@ -1872,7 +1869,7 @@ describe("the spawn hook", () => {
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("route:a/i");
-		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 150_000 });
+		await writeConfig(project.sessionDir, { ...TEAM, rounds: 9 });
 		setSystemTime(new Date(T0 + 1_999));
 		expect(verdict(await omp.emit("before_subagent_spawn", implementer, main))).toBe("route:a/i");
 		setSystemTime(new Date(T0 + 2_000));
@@ -2223,7 +2220,7 @@ describe("automatic delegation", () => {
 		await enableAuto();
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		omp.usage.current = { tokens: 206_512, contextWindow: 400_000, percent: 52 };
+		omp.usage.current = { tokens: 286_512, contextWindow: 400_000, percent: 72 };
 		omp.holdCompactions.value = true;
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
@@ -2260,7 +2257,7 @@ describe("automatic delegation", () => {
 		await omp.emit("session_shutdown", {}, main);
 		const record = await lastRun(project.sessionDir);
 		expect(record).toMatchObject({ runId: runId as string, turns: 1, endReason: "shutdown" });
-		expect(record?.checkpoints).toEqual([expect.objectContaining({ before: 206_512, after: 30_000 })]);
+		expect(record?.checkpoints).toEqual([expect.objectContaining({ before: 286_512, after: 30_000 })]);
 		expect(omp.sent).toEqual([]);
 	});
 
@@ -2296,10 +2293,10 @@ describe("automatic delegation", () => {
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
 		expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).outcome).toBe("ok");
-		// Under the cap at plan time: no summary yet.
+		// Under 70% of the window at plan time: no summary yet.
 		expect(omp.compactions).toEqual([]);
 		// The run grows while it waits synchronously; the wait tool's start is a real boundary.
-		omp.usage.current = { tokens: 205_000, contextWindow: 400_000, percent: 51 };
+		omp.usage.current = { tokens: 285_000, contextWindow: 400_000, percent: 71 };
 		// A subagent session shares this extension instance but never owns the run: its wait changes nothing.
 		await omp.emit("tool_execution_start", { toolName: "wait", toolCallId: "w0", args: {} }, omp.ctx(sub("Worker")));
 		expect(omp.compactions).toEqual([]);
@@ -2329,8 +2326,8 @@ describe("automatic delegation", () => {
 		expect(omp.sent).toHaveLength(1);
 		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
 		expect(runId).toBeDefined();
-		// The manual run was under both preflight thresholds; its director now grows past the cap.
-		omp.usage.current = { tokens: 210_000, contextWindow: 400_000, percent: 53 };
+		// The manual run started under half its window; its director now grows past 70% of it.
+		omp.usage.current = { tokens: 290_000, contextWindow: 400_000, percent: 73 };
 		await omp.emit("agent_start", {}, main);
 		await omp.emit("agent_end", { awaitingAsyncWork: true }, main);
 		// Public manual behavior is unchanged: one recorded checkpoint, with the run ledger in the summary focus.
@@ -2352,7 +2349,7 @@ describe("automatic delegation", () => {
 		await enableAuto();
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		omp.usage.current = { tokens: 210_000, contextWindow: 400_000, percent: 53 };
+		omp.usage.current = { tokens: 290_000, contextWindow: 400_000, percent: 73 };
 		omp.holdCompactions.value = true;
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
@@ -2463,7 +2460,7 @@ describe("automatic delegation", () => {
 		const main = omp.ctx(MAIN);
 		await omp.emit("session_start", {}, main);
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "first", systemPrompt: [] }, main);
-		await writeConfig(project.sessionDir, { ...TEAM, contextCap: 200_000 });
+		await writeConfig(project.sessionDir, { ...TEAM, rounds: 9 });
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "second", systemPrompt: [] }, main);
 		expect(verdict(await omp.emit("tool_call", { toolName: "bash", input: { command: "npm test" } }, main))).toBe("auto");
 		const plan = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);

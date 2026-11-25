@@ -2,8 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ApprovalStore } from "../src/approval/store.ts";
 import { canonicalJson, configHash, escapeUnsafe, parseStrictJson } from "../src/config/canonical.ts";
-import { teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
+import { MAX_JOB_TIMEOUT_MS, teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
 import { configPath, loadConfig, serializeConfig, writeConfig } from "../src/config/store.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
@@ -130,12 +131,14 @@ describe("validateConfig", () => {
 		]);
 	});
 
-	test("the 0.8 team validates, warns only about the retired team cap, and keeps its hash", () => {
+	test("the 0.8 team validates, warns only about the retired parallelism key, and keeps its hash", () => {
 		const r = validateConfig(parsed(TEAM_08));
 		expect(r.errors).toEqual([]);
 		// `parallelism` is no longer a known field, so it follows the ordinary unknown-key policy: warned and hashed.
 		expect(paths(r.warnings)).toEqual(["parallelism"]);
 		expect(Object.keys(r.config?.roles ?? {})).toHaveLength(5);
+		// The retired team cap is accepted and ignored, not stripped: it stays in the value the hash covers.
+		expect((r.config as unknown as Record<string, unknown>).contextCap).toBe(200_000);
 		// The hash covers the file's own content, deprecated fields included: an approval given by 0.8 still matches it.
 		expect(configHash(parsed(TEAM_08))).toBe(TEAM_08_HASH);
 		const { contract: _contract, ...withoutContract } = JSON.parse(TEAM_08);
@@ -193,6 +196,23 @@ describe("validateConfig", () => {
 		}
 	});
 
+	test("contextCap is retired: any value is accepted and stays in the hashed value", () => {
+		for (const cap of [200_000, 0, -1, 1.5, 10_000_001, "large", null]) {
+			const c = clone();
+			c.contextCap = cap;
+			c.roles.reviewer.contextCap = cap;
+			const r = validateConfig(c);
+			expect(r.errors).toEqual([]);
+			expect(r.warnings).toEqual([]);
+			const kept = r.config as unknown as Record<string, any>;
+			expect(kept.contextCap).toEqual(cap);
+			expect(kept.roles.reviewer.contextCap).toEqual(cap);
+			// serializeConfig is what an approval snapshot stores; the key is not stripped from it.
+			expect(configHash(parsed(serializeConfig(r.config!)))).toBe(configHash(c));
+			expect(unknownFields(c)).toEqual([]);
+		}
+	});
+
 	test("old priorities are read as balanced", () => {
 		expect(teamPriority({ ...base, priority: "speed" })).toBe("balanced");
 		expect(teamPriority({ ...base, priority: "quota" })).toBe("balanced");
@@ -231,9 +251,6 @@ describe("validateConfig", () => {
 		["workers max 17", c => (c.roles.reviewer.workers = { min: 1, max: 17 }), "roles.reviewer.workers:"],
 		["workers min zero", c => (c.roles.reviewer.workers = { min: 0, max: 2 }), "roles.reviewer.workers:"],
 		["workers range missing max", c => (c.roles.reviewer.workers = { min: 1 }), "roles.reviewer.workers:"],
-		["team contextCap zero", c => (c.contextCap = 0), "contextCap:"],
-		["team contextCap fraction", c => (c.contextCap = 1.5), "contextCap:"],
-		["role contextCap too big", c => (c.roles.reviewer.contextCap = 10_000_001), "roles.reviewer.contextCap:"],
 		["fallbackRole unknown", c => (c.fallbackRole = "architect"), "fallbackRole:"],
 		["fallbackRole non-string", c => (c.fallbackRole = 1), "fallbackRole:"],
 		["fallbackRole prototype key", c => (c.fallbackRole = "toString"), "fallbackRole:"],
@@ -332,6 +349,29 @@ describe("validateConfig", () => {
 		]);
 	});
 
+	test("requiredChecks may set their own time limit, bounded like a job's", () => {
+		const c = (requiredChecks: unknown) => ({ ...clone(), requiredChecks });
+		const of = (timeoutMs: unknown) => validateConfig(c([{ name: "long", argv: ["bun", "test"], timeoutMs }]));
+
+		const long = of(1_800_000);
+		expect(long.errors).toEqual([]);
+		expect(long.warnings).toEqual([]);
+		expect(long.config?.requiredChecks?.[0]?.timeoutMs).toBe(1_800_000);
+		expect(of(MAX_JOB_TIMEOUT_MS).errors).toEqual([]);
+		// The key is known now, so it is not an unknown-field warning; it is still part of the hash.
+		expect(unknownFields(c([{ name: "long", argv: ["bun", "test"], timeoutMs: 1_800_000 }]))).toEqual([]);
+
+		for (const bad of [0, -1, 1.5, MAX_JOB_TIMEOUT_MS + 1, "60000", null]) {
+			expect(paths(of(bad).errors)).toEqual(["requiredChecks[0].timeoutMs"]);
+		}
+
+		// A config stored before the field existed is unchanged by the new option: absent stays absent in the hash.
+		const old = validateConfig(c([{ name: "unit", argv: ["bun", "test"] }]));
+		expect(old.errors).toEqual([]);
+		expect(old.config?.requiredChecks?.[0]).not.toHaveProperty("timeoutMs");
+		expect(configHash(old.config!)).toBe(configHash(c([{ name: "unit", argv: ["bun", "test"] }])));
+	});
+
 	test("accepts workers, fallbackRole and trials, and warns on unknown trial fields", () => {
 		const c = clone();
 		c.roles.reviewer.workers = 16;
@@ -386,6 +426,39 @@ describe("config store", () => {
 		expect(loaded.hash).toBe(written.hash);
 		expect(loaded.config.requiredChecks).toEqual(config.requiredChecks);
 		expect(serializeConfig(loaded.config)).toBe(serializeConfig(config));
+	});
+
+	test("the 0.8 team with its retired contextCap loads approved under its recorded hash", async () => {
+		const root = await tempRoot();
+		const session = sessionOf(root);
+		await fs.mkdir(session, { recursive: true });
+		await fs.writeFile(configPath(session), TEAM_08);
+		const loaded = await loadConfig(session);
+		expect(loaded.status).toBe("ok");
+		if (loaded.status !== "ok") return;
+		expect(loaded.hash).toBe(TEAM_08_HASH);
+		expect(paths(loaded.warnings)).toEqual(["parallelism"]);
+		const store = new ApprovalStore(session, { repoId: "dir-legacy", kind: "dir", root: path.join(root, "target") });
+		await store.approve({ configHash: loaded.hash, config: loaded.config, scope: { shadowedAgents: [] } });
+		expect((await store.active(TEAM_08_HASH))?.status).toBe("active");
+		// The snapshot keeps the retired key, so rollback and the approval diff see what was approved.
+		const snapshot = await store.snapshot(TEAM_08_HASH);
+		expect(snapshot).toMatchObject({ contextCap: 200_000 });
+		expect(configHash(snapshot)).toBe(TEAM_08_HASH);
+	});
+
+	test("an absurd contextCap still loads with the hash of its exact bytes", async () => {
+		for (const cap of [0, 1.5, 10_000_001]) {
+			const session = sessionOf(await tempRoot());
+			const text = JSON.stringify({ ...base, contextCap: cap });
+			await fs.mkdir(session, { recursive: true });
+			await fs.writeFile(configPath(session), text);
+			const loaded = await loadConfig(session);
+			expect(loaded.status).toBe("ok");
+			if (loaded.status !== "ok") continue;
+			expect(loaded.hash).toBe(configHash(parsed(text)));
+			expect((loaded.config as unknown as Record<string, unknown>).contextCap).toBe(cap);
+		}
 	});
 
 	test("never writes into the target and leaves an old .omp/storm byte-untouched", async () => {

@@ -410,8 +410,6 @@ export interface RoleConfig {
 	 * A bare number n (configs before v0.8) means { min: n, max: n }; read it through `workerRange`.
 	 */
 	workers?: number | WorkerRange;
-	/** Context ceiling in tokens for this role's agents; overrides `StormConfig.contextCap`. */
-	contextCap?: number;
 }
 
 export interface WorkerRange {
@@ -457,6 +455,8 @@ export interface RequiredCheck {
 	name: string;
 	/** Executable first, then its arguments, in order. */
 	argv: string[];
+	/** Time limit of this check in milliseconds; absent → the runner's default. Covered by the config hash. */
+	timeoutMs?: number;
 }
 
 /**
@@ -501,11 +501,6 @@ export interface StormConfig {
 	 * borrow the nearest configured stand-in's models (`ROLE_STAND_INS`).
 	 */
 	disabledRoles?: string[];
-	/**
-	 * Context ceiling in tokens (default `DEFAULT_CONTEXT_CAP`): a subagent at or past it takes no follow-ups during
-	 * a run (`followUpCap`), and the director is compacted at it or at 70% of its window (`directorCap`).
-	 */
-	contextCap?: number;
 	trials?: TrialConfig[];
 	/** "실행이 끝나면 정리": the run-end janitor also removes omp records of older Storm runs' parked agents. Absent → off. */
 	cleanup?: boolean;
@@ -617,7 +612,7 @@ export type SpawnBlockCode =
 	| "internal";
 
 /** Why Storm refused a director's tool call during a run. */
-export type ToolBlockCode = "director-edit" | "read-large" | "followup-cap" | "followup-cleaned";
+export type ToolBlockCode = "director-edit" | "read-large" | "followup-cleaned";
 
 /** A refusal: the stable code and the sentence that teaches the model what to do instead. */
 export interface Block<Code extends string = SpawnBlockCode | ToolBlockCode> {
@@ -917,7 +912,7 @@ export interface RunRecord {
 	blockedEdits?: number;
 	/** The run plan in force when the run ended (the last one the director submitted). */
 	plan?: RunPlan;
-	/** Follow-ups to agents past their context cap, or cleaned, that Storm sent back to a fresh agent. */
+	/** Follow-ups to cleaned agents that Storm sent back to a fresh agent. */
 	blockedFollowUps?: number;
 	/** ISO 8601 of the last write while the run was active: the end time of a run whose process died. */
 	updatedAt?: string;

@@ -18,6 +18,7 @@
  * this module reads no file, calls no model and decides nothing beyond which recorded verdict applies.
  */
 import { createHash } from "node:crypto";
+import { MAX_RESULT_CRITERION } from "../plan/validate.ts";
 import { usableRole } from "../policy/spawn.ts";
 import type { AgentEntry, StormConfig } from "../types.ts";
 import { reviewEvidenceOf } from "./review.ts";
@@ -92,27 +93,47 @@ export function answerReviewVerdict(agents: readonly AgentEntry[], config: Storm
 	return { state: best.correct ? "correct" : "incorrect", at: best.at, author: best.author };
 }
 
-/** The bounded packet text a reviewer needs; the answer is quoted verbatim, never summarized by Storm. */
+/** The criterion on one line, within the plan's own criterion bound: a stored contract never widens the packet. */
+function criterionLine(criterion: string): string {
+	const line = criterion.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu, " ").trim();
+	return line.length > MAX_RESULT_CRITERION ? `${line.slice(0, MAX_RESULT_CRITERION - 1)}…` : line;
+}
+
+/**
+ * The packet text a reviewer needs for one answer; the answer is quoted verbatim, never summarized by Storm. With an
+ * output handle and a quote bound, a longer answer is quoted as its head and the reviewer reads the whole text at the
+ * producer's handle. The receipt is bound to the digest of the whole text either way, so a cut quote is never what is
+ * judged. Without a handle the answer is always quoted whole: nothing is cut that the reviewer could not read.
+ */
 export function answerReviewPacket(input: {
 	resultId: string;
 	criterion: string;
 	answer: string;
 	receipt: string;
 	citation: { path: string; line?: number };
-	/** Defaults to S1's own answer bound (8192), so an answer S1 accepted for judgement is never cut. */
-	maxAnswerChars?: number;
+	/** The producer's output handle (`agent://<id>`), where the whole submitted answer can be read. */
+	output?: string;
+	/** Longest answer quoted whole when `output` is given. */
+	quoteChars?: number;
+	/** `answer` is only the part of the output the host delivered; with `output`, the reviewer judges the whole there. */
+	partial?: boolean;
 }): string {
-	const max = Math.max(1, Math.min(input.maxAnswerChars ?? 8_192, 8_192));
-	const answer = input.answer.length > max ? `${input.answer.slice(0, max)}\n[... answer cut at ${max} chars ...]` : input.answer;
 	const anchor = answerReviewAnchor(input.citation);
+	const max = input.quoteChars === undefined ? undefined : Math.max(1, Math.floor(input.quoteChars));
+	const cut = input.output !== undefined && max !== undefined && input.answer.length > max;
+	const shown = cut ? input.answer.slice(0, max) : input.answer;
+	const read = `Read the whole answer with \`read ${input.output ?? ""}\` in bounded ranges and judge all of it, not only this part:`;
+	const quoted =
+		input.partial === true && input.output !== undefined
+			? [`The host delivered only part of this answer${cut ? ` (first ${max} chars of that part shown)` : ""}. ${read}`, "<<<", shown, ">>>"]
+			: cut
+				? [`Answer as submitted, first ${max} of ${input.answer.length} chars. ${read}`, "<<<", shown, ">>>"]
+				: ["Answer as submitted:", "<<<", input.answer, ">>>"];
 	return [
 		`Answer review for result \`${input.resultId}\` (receipt ${input.receipt}).`,
-		`Criterion: ${input.criterion}`,
+		`Criterion: ${criterionLine(input.criterion)}`,
 		`Cited source: ${anchor}. Read it yourself and judge the answer only against the current content there.`,
-		"Answer as submitted:",
-		"<<<",
-		answer,
-		">>>",
+		...quoted,
 		`In your final yield add results: [{ "id": "${input.resultId}", "receipt": "${input.receipt}", "citation": "${anchor}", "verdict": "correct" | "incorrect" }].`,
 	].join("\n");
 }

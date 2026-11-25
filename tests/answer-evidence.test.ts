@@ -10,9 +10,14 @@
  *   moved source settles nothing, and the reviewer receives the verbatim answer through Storm's packet;
  * - a resumed run cannot rebind an earlier run's answer review: the answer reopens to its producer, which resubmits and
  *   is reviewed under the new run's receipt;
- * - a source edited before a drained verified recheck still leaves the accepted answer marked revoked.
+ * - a source edited before a drained verified recheck still leaves the accepted answer marked revoked;
+ * - length never makes an answer unmet: a long answer is checked and digested whole, and one no check decides goes to
+ *   review under the receipt of its whole text;
+ * - every reviewable answer of a round gets a packet, split over reviewer turns, each handed out exactly once, and a
+ *   long verdict list settles every answer it scopes.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -108,8 +113,12 @@ describe("deterministic answer agreement", () => {
 		for (const text of ["The total is not 42 (report.json:2).", "42 was the old total; the report now differs", "Roughly 42 or so, per report.json:2"]) {
 			expect((await evaluate(total(), text, totalLine)).state).toBe("reviewable");
 		}
-		// A copied number beside a different one is a contradiction of the declared literal, not support.
-		expect((await evaluate(total(), "The total is 42 but the retry budget is 7", totalLine)).state).toBe("unmet");
+		// Prose is not decided by its numbers: other counts beside the fact neither support nor contradict it.
+		for (const text of ["The total is 42 but the retry budget is 7", "The report lists 42 as the total across 3 sections and 120 lines (report.json:2)."]) {
+			expect((await evaluate(total(), text, totalLine)).state).toBe("reviewable");
+		}
+		// A typed answer is still decided by its value, with or without a trailing reference.
+		for (const text of ["7", "total: 7", "The total is 7 (report.json:2)."]) expect((await evaluate(total(), text, totalLine)).state).toBe("unmet");
 		// Without contains, a copied number inside prose is not proof either.
 		expect((await evaluate(total({ contains: undefined }), "The total is 42 only if you ignore the retries", totalLine)).state).toBe("reviewable");
 	});
@@ -165,6 +174,58 @@ describe("answer receipts", () => {
 		const deleted = await verifyAnswerReceipt({ root, receipt: item });
 		expect(deleted.ok).toBe(false);
 		if (!deleted.ok) expect(deleted.reason).toContain("삭제");
+	});
+});
+
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+describe("answer length", () => {
+	test("a 30,000-character answer that matches its contains is accepted, judged and digested whole", async () => {
+		const line = `"settings": "${"x".repeat(30_000)}", "total": 42`;
+		await writeFile(path.join(root, NOTE), `${line}\n`);
+		const settings: PlanLaneResult = { id: "settings", kind: "answer", criterion: "quotes the settings line", path: NOTE, contains: '"total": 42' };
+		const item = await evaluate(settings, line, [{ path: NOTE, line: 1 }]);
+		expect(line.length).toBeGreaterThan(30_000);
+		expect(item.state).toBe("accepted");
+		expect(item.digest).toBe(sha256(line));
+		// Length does not stop the typed check: a padded typed answer with another value is still a contradiction.
+		const wrong = `${" ".repeat(30_000)}"total": 7`;
+		expect((await evaluate(settings, wrong, [{ path: NOTE, line: 1 }])).state).toBe("unmet");
+	});
+
+	test("a long answer no check decides is reviewable, never unmet for its length", async () => {
+		const auth: PlanLaneResult = { id: "auth", kind: "answer", criterion: "explains the authentication setup", path: AUTH };
+		const prose = `Authentication is off here. ${"The deployment notes explain why it stays off. ".repeat(700)}`;
+		expect(prose.length).toBeGreaterThan(30_000);
+		const item = await evaluate(auth, prose, authLine);
+		expect(item.state).toBe("reviewable");
+		expect(item.digest).toBe(sha256(prose));
+		expect(item.citation?.digest).toBeDefined();
+	});
+
+	test("a part the host delivered is never accepted or failed on its own: it goes to review", async () => {
+		const part = async (text: string, citations: AnswerCitation[]) => {
+			const out = await evaluateSettledResults({ lane: "read", attemptId: "attempt-1", results: [total()], shared: { root }, answer: { text, citations, partial: true } });
+			if (!out.ok) throw new Error(out.reason);
+			return out.report.results[0];
+		};
+		// A head that would be accepted whole, or contradicted whole, is only a part.
+		for (const text of ["42", "-42"]) expect(await part(text, totalLine)).toMatchObject({ state: "reviewable", digest: sha256(text), citation: { path: REPORT, line: 2 } });
+		// The part names no verifiable source; the whole may, so it is not unmet either.
+		expect((await part("The answer begins here", [{ path: "missing.md", line: 1 }]))?.state).toBe("reviewable");
+	});
+
+	test("past the scan bound an answer goes to review bound to its whole text, with its source still verified", async () => {
+		const text = `42 ${"padding ".repeat(50)}`;
+		const scan = async (citations: AnswerCitation[]) => {
+			const out = await evaluateSettledResults({ lane: "read", attemptId: "attempt-1", results: [total()], shared: { root }, answer: { text, citations }, limits: { answerChars: 100 } });
+			if (!out.ok) throw new Error(out.reason);
+			return out.report.results[0];
+		};
+		const item = await scan(totalLine);
+		expect(item).toMatchObject({ state: "reviewable", digest: sha256(text) });
+		// The bound skips only the text comparison: an answer without a verifiable source is still unmet.
+		expect((await scan([{ path: "missing.md", line: 1 }]))?.state).toBe("unmet");
 	});
 });
 
@@ -362,7 +423,7 @@ describe("answer review bound to the current submission", () => {
 
 	test("the reviewer's packet quotes the exact answer with its receipt and anchor", async () => {
 		const { h, runId } = await submitted();
-		const packets = h.controller.answerReviewPackets();
+		const packets = h.controller.takeAnswerReviewBatch();
 		expect(packets).toContain(ANSWER);
 		expect(packets).toContain(receiptFor(h, runId, "auth"));
 		expect(packets).toContain(`"citation": "${AUTH}:1"`);
@@ -478,7 +539,7 @@ describe("answer review bound to the current submission", () => {
 		// Not restored as reviewable or accepted: the earlier run's receipt cannot be rebound and no packet is offered.
 		expect(reopened?.state).toBe("pending");
 		expect(reopened?.reason).toContain("다시 제출");
-		expect(h.controller.answerReviewPackets()).toBeUndefined();
+		expect(h.controller.takeAnswerReviewBatch()).toBeUndefined();
 		// The old run's scoped verdict settles nothing in the new run.
 		agents.push(verdict(h, SUBMITTED + 5, true, [scopedEntry("auth", oldReceipt, "correct")]));
 		await h.turn();
@@ -490,7 +551,7 @@ describe("answer review bound to the current submission", () => {
 		expect(row(h, "auth")?.state).toBe("reviewable");
 		const receipt = receiptFor(h, runId, "auth");
 		expect(receipt).not.toBe(oldReceipt);
-		expect(h.controller.answerReviewPackets()).toContain(receipt);
+		expect(h.controller.takeAnswerReviewBatch()).toContain(receipt);
 		agents.push({ ...verdict(h, SUBMITTED + 9, true, [scopedEntry("auth", receipt, "correct")]), id: "Rev5" } as AgentEntry);
 		await h.turn();
 		expect((await readRun(h.sessionDir, runId))?.results?.find(item => item.id === "auth")).toMatchObject({ state: "accepted", origin: "review" });
@@ -517,5 +578,125 @@ describe("answer review bound to the current submission", () => {
 		const final = await readRun(h.sessionDir, runId);
 		expect(final?.endReason).not.toBe("verified");
 		expect(final?.results?.find(item => item.id === "total")).toMatchObject({ state: "unmet", finalized: "revoked" });
+	});
+});
+
+describe("answer review batches", () => {
+	const SUBMITTED = T0 + 10;
+	const authLines: AnswerCitation[] = [{ path: AUTH, line: 1 }];
+	const RECEIPT = /\(receipt ([0-9a-f]{32})\)/gu;
+	const receiptsIn = (batch: string | undefined): string[] => [...(batch ?? "").matchAll(RECEIPT)].map(match => match[1] as string);
+	const answerResults = (prefix: string, count: number): PlanLaneResult[] =>
+		Array.from({ length: count }, (_, index) => ({ id: `${prefix}${index}`, kind: "answer", criterion: `explains authentication aspect ${index}`, path: AUTH }));
+
+	/** One lane per result group; every answer is reviewable prose citing the same line. */
+	async function reviewable(groups: number[], answer: string): Promise<{ h: FakeSession; agents: AgentEntry[]; runId: string; ids: string[]; spawnKeys: string[] }> {
+		const agents: AgentEntry[] = [];
+		const h = fakeSession({ root, agents, tree, now: () => SUBMITTED });
+		const runId = await h.start({ task: "t", rounds: 3 });
+		const lanes = groups.map((count, lane) => ({
+			name: `read${lane}`,
+			kind: "explore" as const,
+			role: "explorer",
+			goal: "Explain the authentication setup",
+			results: answerResults(`a${lane}-`, count),
+		}));
+		const plan = planFor(lanes, { explorer: groups.length });
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKeys: string[] = [];
+		for (const lane of lanes) {
+			const spawnKey = await admit(h, plan, agents, lane.name);
+			spawnKeys.push(spawnKey);
+			await answerAttempt(h, runId, lane.name, spawnKey, `d-${lane.name}`, answer, authLines);
+		}
+		const ids = lanes.flatMap(lane => lane.results.map(result => result.id));
+		for (const id of ids) expect(row(h, id)?.state).toBe("reviewable");
+		return { h, agents, runId, ids, spawnKeys };
+	}
+
+	test("a 30,000-character answer is handed to review as its head with the producer's handle, and a scoped verdict accepts it", async () => {
+		const long = `Authentication is turned off. ${"The deployment notes explain why it stays off. ".repeat(700)}END`;
+		const { h, agents, runId, ids, spawnKeys } = await reviewable([1], long);
+		const id = ids[0] as string;
+		const receipt = receiptFor(h, runId, id);
+		const batch = h.controller.takeAnswerReviewBatch();
+		expect(receiptsIn(batch)).toEqual([receipt]);
+		expect(batch).toContain(`agent://${spawnKeys[0]}`);
+		expect(batch).not.toContain("END");
+		expect((batch ?? "").length).toBeLessThan(long.length);
+		agents.push(verdict(h, SUBMITTED + 5, true, [scopedEntry(id, receipt, "correct")]));
+		await h.turn();
+		expect((await readRun(h.sessionDir, runId))?.results?.find(item => item.id === id)).toMatchObject({ state: "accepted", origin: "review" });
+	});
+
+	test("nine reviewable answers all get packets in one round, over several reviewer turns, each exactly once", async () => {
+		const answer = `Authentication is turned off. ${"Login is not required anywhere. ".repeat(160)}`;
+		const { h, runId, ids } = await reviewable([9], answer);
+		const expected = ids.map(id => receiptFor(h, runId, id)).sort();
+		const batches: string[][] = [];
+		for (let batch = h.controller.takeAnswerReviewBatch(); batch !== undefined; batch = h.controller.takeAnswerReviewBatch()) {
+			batches.push(receiptsIn(batch));
+			expect(batches.length).toBeLessThanOrEqual(ids.length);
+		}
+		expect(batches.length).toBeGreaterThan(1);
+		const handed = batches.flat();
+		expect(handed).toHaveLength(ids.length);
+		expect([...handed].sort()).toEqual(expected);
+
+		// The round tells the director how many reviewer turns the answers take; with no reviewer running it re-offers all.
+		const before = h.sent.length;
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length > before);
+		const message = h.sent.at(-1) ?? "";
+		expect(message).toContain(`${ids.length} reviewable answers`);
+		expect(message).toContain(`${batches.length} review tasks`);
+		expect(receiptsIn(h.controller.takeAnswerReviewBatch()).length).toBe(batches[0]?.length);
+		await h.controller.finish("interrupted");
+	});
+
+	test("a batch handed to a reviewer still running is not re-offered when the next round starts", async () => {
+		const answer = `Authentication is turned off. ${"Login is not required anywhere. ".repeat(160)}`;
+		const { h, agents, ids } = await reviewable([9], answer);
+		const first = receiptsIn(h.controller.takeAnswerReviewBatch());
+		agents.push(agentEntry({ id: "RevBusy", name: h.config.roles.reviewer?.agent ?? "storm-reviewer", role: "reviewer", state: "running", requests: 1, lastActivityAt: SUBMITTED }));
+		const before = h.sent.length;
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length > before);
+		expect(h.sent.at(-1)).toContain(`${ids.length - first.length} reviewable answers`);
+		const rest: string[] = [];
+		for (let batch = h.controller.takeAnswerReviewBatch(); batch !== undefined; batch = h.controller.takeAnswerReviewBatch()) rest.push(...receiptsIn(batch));
+		expect(rest).toHaveLength(ids.length - first.length);
+		for (const receipt of first) expect(rest).not.toContain(receipt);
+		await h.controller.finish("interrupted");
+	});
+
+	test("one verdict list of 20 scoped entries settles all 20 answers", async () => {
+		const { h, agents, runId, ids } = await reviewable([10, 10], "Authentication is turned off in this deployment.");
+		expect(ids).toHaveLength(20);
+		agents.push(verdict(h, SUBMITTED + 5, true, ids.map(id => scopedEntry(id, receiptFor(h, runId, id), "correct"))));
+		await h.turn();
+		const run = await readRun(h.sessionDir, runId);
+		for (const id of ids) expect(run?.results?.find(item => item.id === id)).toMatchObject({ state: "accepted", origin: "review" });
+	});
+
+	test("a foreign or stale receipt in a long verdict list settles nothing", async () => {
+		const { h, agents, runId, ids } = await reviewable([10, 10], "Authentication is turned off in this deployment.");
+		const [stale, foreign, ...good] = ids as [string, string, ...string[]];
+		const staleReceipt = receiptFor(h, runId, stale, { contentVersion: "f".repeat(64) });
+		const foreignReceipt = answerReviewReceipt({ runId: "run-20261119-090000-zzzz", resultId: foreign, attemptId: row(h, foreign)!.attemptId!, contentVersion: row(h, foreign)!.contentVersion! })!;
+		agents.push(verdict(h, SUBMITTED + 5, true, [
+			scopedEntry(stale, staleReceipt, "correct"),
+			scopedEntry(foreign, foreignReceipt, "correct"),
+			...good.map(id => scopedEntry(id, receiptFor(h, runId, id), "correct")),
+		]));
+		await h.turn();
+		// The run stays open on the two unsettled answers, so the live rows are the state to read.
+		expect(row(h, stale)?.state).toBe("reviewable");
+		expect(row(h, foreign)?.state).toBe("reviewable");
+		for (const id of good) expect(row(h, id)).toMatchObject({ state: "accepted", origin: "review" });
+		expect(h.controller.active()?.runId).toBe(runId);
+		await h.controller.finish("interrupted");
 	});
 });

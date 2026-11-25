@@ -22,7 +22,7 @@ import {
 	noteVerdictTree,
 	resetAgents,
 } from "../src/runtime/agents.ts";
-import type { AgentEntry, InfoLine, StormConfig } from "../src/types.ts";
+import type { AgentEntry, InfoLine } from "../src/types.ts";
 import { RichFrame } from "../src/view/info.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
@@ -225,42 +225,28 @@ const NOW = T0 + HOUR;
 const entry = (over: Partial<AgentEntry> = {}): AgentEntry =>
 	agentEntry({ id: "A", model: "anthropic/sonnet", startedAt: T0, lastActivityAt: NOW - MIN, contextTokens: 30_000, requests: 3, costUsd: 0.05, ...over });
 
-const config: StormConfig = teamOf({ implementer: "anthropic/sonnet", quick: { models: ["mistral/small"], contextCap: 40_000 } }, { contextCap: 150_000 });
-
 describe("agentRows", () => {
-	test("the cap is the role's, else the team's, else the default; without a team the default", () => {
-		const caps = (c: StormConfig | undefined) => agentRows([entry(), entry({ role: "quick" }), entry({ role: "ghost" })], c).map(r => r.cap);
-		expect(caps(config)).toEqual([150_000, 40_000, 150_000]);
-		const { contextCap: _cap, ...noTeamCap } = config;
-		expect(caps(noTeamCap)).toEqual([200_000, 40_000, 200_000]);
-		expect(caps(undefined)).toEqual([200_000, 200_000, 200_000]);
-	});
-
-	test("follow-up state is what enforcement uses: ok below the cap, cap from it on, cleaned whatever the context", () => {
-		const states = agentRows(
-			[
-				entry({ contextTokens: 149_999 }),
-				entry({ contextTokens: 150_000 }),
-				entry({ contextTokens: 10, cleanedAt: NOW }),
-				entry({ contextTokens: 900_000, cleanedAt: NOW }),
-				entry({ role: "quick", contextTokens: 40_000 }),
-				entry({ state: "running", contextTokens: 1 }),
-			],
-			config,
-		).map(r => r.followUp);
-		expect(states).toEqual(["ok", "cap", "cleaned", "cleaned", "cap", "ok"]);
+	test("a follow-up is possible whatever the context; only cleaned omp records end it", () => {
+		const states = agentRows([
+			entry({ contextTokens: 149_999 }),
+			entry({ contextTokens: 900_000 }),
+			entry({ contextTokens: 10, cleanedAt: NOW }),
+			entry({ contextTokens: 900_000, cleanedAt: NOW }),
+			entry({ state: "running", contextTokens: 1 }),
+		]).map(r => r.followUp);
+		expect(states).toEqual(["ok", "ok", "cleaned", "cleaned", "ok"]);
 	});
 
 	test("rows keep the entries and their order", () => {
 		const entries = [entry({ id: "B" }), entry({ id: "A" })];
-		const rows = agentRows(entries, config);
+		const rows = agentRows(entries);
 		expect(rows.map(r => r.entry)).toEqual(entries);
 	});
 });
 
 describe("renderAgentRows", () => {
-	test("one table row per agent with its id, context and cap; no advice text after the table", () => {
-		const rows = agentRows([entry({ id: "Impl|1", followUps: 3 }), entry({ id: "Rev", state: "running", contextTokens: 151_000 })], config);
+	test("one table row per agent with its id and context; no advice text after the table", () => {
+		const rows = agentRows([entry({ id: "Impl|1", followUps: 3 }), entry({ id: "Rev", state: "running", contextTokens: 151_000, cleanedAt: NOW })]);
 		const lines = renderAgentRows(rows, NOW).split("\n");
 		// Header, separator, one line per agent, nothing else.
 		expect(lines).toHaveLength(4);
@@ -269,9 +255,9 @@ describe("renderAgentRows", () => {
 		expect(new Set(lines.map(columns)).size).toBe(1);
 		// A pipe in an id cannot break the table.
 		expect(lines[2]).toContain("Impl\\|1");
-		expect(lines[2]).toContain(`${tokens(30_000)}/${tokens(150_000)}`);
+		expect(lines[2]).toContain(tokens(30_000));
 		expect(lines[2]).toContain(duration(MIN));
-		expect(lines[3]).toContain(`${tokens(151_000)}/${tokens(150_000)}`);
+		expect(lines[3]).toContain(tokens(151_000));
 		// The two rows differ in their follow-up verdict.
 		expect(lines[2]!.split("|").at(-2)).not.toBe(lines[3]!.split("|").at(-2));
 	});
@@ -303,9 +289,8 @@ describe("renderAgentReport", () => {
 		const rows = agentRows(
 			[
 				entry({ id: "0-Implementer-2", followUps: 3, changes: 4, review: { reviews: 2, passed: 1, failed: 1, findings: [0, 1, 0, 0] }, lastWorkFailed: true }),
-				entry({ id: "1-Reviewer", role: "reviewer", state: "running", contextTokens: 151_000 }),
+				entry({ id: "1-Reviewer", role: "reviewer", state: "running", contextTokens: 151_000, cleanedAt: NOW }),
 			],
-			config,
 		);
 		const { md, info, lines } = report(rows);
 		// No table: three status rows per agent plus one evidence row for the agent that left evidence.
@@ -316,19 +301,19 @@ describe("renderAgentReport", () => {
 		// Agents start a list item; their details are indented under it.
 		expect(lines.filter(line => line.startsWith("- ")).map(line => line.split(" · ")[0])).toEqual(["- 0-Implementer-2", "- 1-Reviewer"]);
 		expect(lines.filter(line => !line.startsWith("- ")).every(line => line.startsWith("  "))).toBe(true);
-		// Korean role titles, the model and context against its cap, the follow-up verdict.
+		// Korean role titles, the model and context, the follow-up verdict.
 		expect(lines[0]).toContain(roleTitle("implementer"));
-		expect(lines[1]).toContain(`anthropic/sonnet · 컨텍스트 ${tokens(30_000)}/${tokens(150_000)}`);
+		expect(lines[1]).toContain(`anthropic/sonnet · 컨텍스트 ${tokens(30_000)}`);
 		expect(lines[2]).toContain("3회");
 		expect(lines[4]).toContain(roleTitle("reviewer"));
-		// The running agent reads as running; the one past its cap warns on its follow-up row.
+		// The running agent reads as running; the cleaned one warns on its follow-up row.
 		expect(info[4]!.spans.at(-1)?.tone).toBe("success");
 		expect(info[6]!.spans.at(-1)?.tone).toBe("warning");
 	});
 
 	test("the evidence row names changes, review verdicts and a failed last turn, warning only on what needs attention", () => {
 		const evidence = (over: Partial<AgentEntry>) => {
-			const { lines, info } = report(agentRows([entry(over)], config));
+			const { lines, info } = report(agentRows([entry(over)]));
 			return lines.length === 4 ? { text: lines[3]!, spans: info[3]!.spans } : undefined;
 		};
 		expect(evidence({})).toBeUndefined();
@@ -349,7 +334,6 @@ describe("renderAgentReport", () => {
 				entry({ id: "0-Implementer-with-a-rather-long-generated-handle", model: "openrouter/anthropic/claude-sonnet-5-5-preview", contextTokens: 148_500 }),
 				entry({ id: "1-Explorer", role: "explorer", state: "parked", lastActivityAt: NOW - 2 * HOUR }),
 			],
-			config,
 		);
 		expect(renderAgentRows(rows, NOW).split("\n").some(line => visibleWidth(line) > 60)).toBe(true);
 		const { md, info } = report(rows);
@@ -361,12 +345,12 @@ describe("renderAgentReport", () => {
 			"0-Implementer-with-a-rather-long-generated-handle",
 			"openrouter/anthropic/claude-sonnet-5-5-preview",
 			`${roleTitle("explorer")}·보관·유휴${duration(2 * HOUR)}`,
-			`컨텍스트${tokens(148_500)}/${tokens(150_000)}`,
+			`컨텍스트${tokens(148_500)}`,
 		]) expect(flat).toContain(shown.replace(/\s/g, ""));
 	});
 
 	test("control characters in an id or model cannot add rows or shift the annotations", () => {
-		const { lines, info } = report(agentRows([entry({ id: "A\nB", model: "x/\u001b[31mred" })], config));
+		const { lines, info } = report(agentRows([entry({ id: "A\nB", model: "x/\u001b[31mred" })]));
 		expect(lines).toHaveLength(3);
 		for (const line of info) expect(joined(line)).toBe(lines[line.index]!);
 		expect(lines[0]).toContain("A\\u000aB");

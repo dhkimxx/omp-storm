@@ -16,7 +16,7 @@ import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
 import { clearWorkerSlots, formatUsd, reservedWorkers, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
 import { tokens } from "../report/agents.ts";
-import { directorCap, PREFLIGHT_SHARE, PREFLIGHT_TOKENS, roleTitle } from "../roles.ts";
+import { MID_RUN_WINDOW_SHARE, RUN_START_WINDOW_SHARE, roleTitle, windowThreshold, workerRange } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import { assertSessionStoreSafe } from "../session-scope.ts";
 import type { RunRequestResult } from "../tool/host.ts";
@@ -280,7 +280,11 @@ interface PreparedAttempt {
 interface SettledAttempt {
 	prepared: PreparedAttempt;
 	attemptId: string;
+	/** The host agent that produced it; its `agent://` output is where a reviewer reads an answer too long to quote. */
+	spawnKey: string;
 	reportText?: string;
+	/** `reportText` is only the part of the output the host delivered; see `AttemptSettlement.reportPartial`. */
+	reportPartial?: true;
 	citations: readonly AnswerCitation[];
 	artifact?: ArtifactEvidenceSource;
 	/** The lane declared a check and no approved report existed at settlement; one re-evaluation is owed. */
@@ -300,11 +304,47 @@ interface AnswerSubject {
 	seenAt: number;
 	/** The submitted answer, kept only when its sha256 is exactly the digest S1 judged; the review packet quotes it. */
 	answer?: string;
+	/** The producer's output handle (`agent://<id>`): a reviewer reads an answer too long to quote whole there. */
+	output?: string;
+	/** `answer` is only the host's part of the output; the reviewer must judge the whole at `output`. */
+	partial?: true;
 }
 
-/** At most this many scoped answer packets ride on one reviewer task or follow-up, and at most this many chars. */
-const ANSWER_PACKETS_MAX = 4;
-const ANSWER_PACKETS_CHARS = 24_000;
+/**
+ * Model-facing size of the answer packets one reviewer task or follow-up carries. It splits the work, it never limits
+ * it: every reviewable answer gets a packet in the round, over as many reviewer turns as this budget needs.
+ */
+const ANSWER_BATCH_CHARS = 24_000;
+/** Head quoted for an answer whose whole packet would not fit one batch; the reviewer reads the rest at its producer. */
+const ANSWER_EXCERPT_CHARS = 4_000;
+const ANSWER_BATCH_HEAD = "[storm:answer-review] Storm's scoped answer review input (not a verdict). Judge every answer below and add one results entry for each.";
+
+/** One reviewable answer's packet with the receipt that marks it handed out. */
+interface AnswerPacket {
+	receipt: string;
+	packet: string;
+}
+
+/**
+ * Splits packets in row order into reviewer batches: a batch closes before a packet would pass the budget, and a
+ * packet alone always forms a batch, so nothing is dropped and the split is the same for a count and a hand-out.
+ */
+function answerBatches(packets: readonly AnswerPacket[]): AnswerPacket[][] {
+	const batches: AnswerPacket[][] = [];
+	let current: AnswerPacket[] = [];
+	let chars = 0;
+	for (const packet of packets) {
+		if (current.length > 0 && chars + packet.packet.length > ANSWER_BATCH_CHARS) {
+			batches.push(current);
+			current = [];
+			chars = 0;
+		}
+		current.push(packet);
+		chars += packet.packet.length;
+	}
+	if (current.length > 0) batches.push(current);
+	return batches;
+}
 
 /** One result reason is one compact record and closeout line: no newlines, no unbounded model or host text. */
 function compactResultReason(text: string): string {
@@ -498,6 +538,11 @@ interface OwnRun {
 	restoredLanes: Set<string>;
 	/** The answer submission each answer row currently stands on; see `AnswerSubject`. */
 	answerSubjects?: Map<string, AnswerSubject>;
+	/**
+	 * Review receipts already handed to a reviewer task or follow-up, so no answer goes to two reviewers. A round that
+	 * starts with no reviewer running releases them: a reviewer that ended without judging its batch does not keep it.
+	 */
+	answerHandout?: Set<string>;
 	/** Lanes whose settlement is being evaluated now; a consumer admission waits for these before reading rows. */
 	settling: Set<string>;
 	/** Aborts checks and other bounded work as soon as the run starts stopping. */
@@ -1096,7 +1141,9 @@ export class RunController {
 	 */
 	async #compactFirst(ctx: ExtensionContext, ui: UiPort): Promise<void> {
 		const usage = ctx.getContextUsage();
-		if (!usage || !(usage.tokens >= PREFLIGHT_TOKENS || usage.percent >= PREFLIGHT_SHARE * 100)) return;
+		// Only a share of the model's own window: with no known window Storm starts no compaction.
+		const threshold = windowThreshold(RUN_START_WINDOW_SHARE, usage?.contextWindow);
+		if (!usage || threshold === undefined || usage.tokens < threshold) return;
 		ui.notify(`감독 컨텍스트가 ${tokens(usage.tokens)} 토큰(창의 ${Math.round(usage.percent)}%)이라 실행 전에 먼저 압축합니다.`);
 		try {
 			await ctx.compact(PREFLIGHT_INSTRUCTIONS);
@@ -1483,7 +1530,9 @@ export class RunController {
 			const settled: SettledAttempt = {
 				prepared,
 				attemptId: report.attemptId,
+				spawnKey: input.spawnKey,
 				...(input.reportText === undefined ? {} : { reportText: input.reportText }),
+				...(input.reportPartial === true ? { reportPartial: true as const } : {}),
 				citations: [...input.citations],
 				...(artifact === undefined ? {} : { artifact }),
 			};
@@ -1774,7 +1823,7 @@ export class RunController {
 	 * or no issuable receipt. Without it no verdict can be bound, so the row goes back to its producer (`work`) instead
 	 * of a review that could never settle it.
 	 */
-	#answerReviewSubject(own: OwnRun, row: RunResult): (AnswerReviewSubject & { receipt: string; answer: string }) | undefined {
+	#answerReviewSubject(own: OwnRun, row: RunResult): (AnswerReviewSubject & { receipt: string; answer: string; output?: string; partial?: true }) | undefined {
 		if (row.state !== "reviewable" || row.attemptId === undefined || row.contentVersion === undefined) return undefined;
 		if ((this.#plannedResult(own, row.id) ?? row.contract)?.kind !== "answer") return undefined;
 		const subject = own.answerSubjects?.get(row.id);
@@ -1791,38 +1840,63 @@ export class RunController {
 			seenAt: subject.seenAt,
 		};
 		const receipt = answerReviewReceipt(scoped);
-		return receipt === undefined ? undefined : { ...scoped, receipt, answer: subject.answer };
+		return receipt === undefined
+			? undefined
+			: {
+					...scoped,
+					receipt,
+					answer: subject.answer,
+					...(subject.output === undefined ? {} : { output: subject.output }),
+					...(subject.partial === true ? { partial: true as const } : {}),
+				};
 	}
 
 	/**
-	 * The bounded review packets for the reviewable answers this run can currently bind a verdict to: each quotes the
-	 * answer exactly as submitted and names its receipt and anchor. It rides only on the approved reviewer's own task or
-	 * follow-up (per-task context, never a system prompt), is Storm's input rather than a verdict, and proves nothing:
-	 * only the reviewer's final yield entry for that receipt, re-checked against the cited bytes, settles the answer.
+	 * The packets of every reviewable answer this run can bind a verdict to and has not handed out yet, in row order.
+	 * Each quotes the answer exactly as submitted and names its receipt and anchor; an answer whose whole packet would
+	 * not fit one batch is quoted as its head with its producer's output handle, under the receipt of the whole text.
 	 */
-	answerReviewPackets(): string | undefined {
-		const own = this.#own;
-		if (own === undefined) return undefined;
+	#pendingAnswerPackets(own: OwnRun): AnswerPacket[] {
 		const rows = own.record.results ?? [];
-		const packets: string[] = [];
-		const skipped: string[] = [];
-		let chars = 0;
+		const packets: AnswerPacket[] = [];
 		for (const row of rows) {
 			if (row.scope === "excluded-by-user" || hasStaleInputs(row, rows)) continue;
 			const subject = this.#answerReviewSubject(own, row);
-			if (subject === undefined) continue;
+			if (subject === undefined || own.answerHandout?.has(subject.receipt) === true) continue;
 			const criterion = (this.#plannedResult(own, row.id) ?? row.contract)?.criterion ?? row.id;
-			const packet = answerReviewPacket({ resultId: row.id, criterion, answer: subject.answer, receipt: subject.receipt, citation: subject.citation });
-			if (packets.length >= ANSWER_PACKETS_MAX || chars + packet.length > ANSWER_PACKETS_CHARS) {
-				skipped.push(row.id);
-				continue;
-			}
-			packets.push(packet);
-			chars += packet.length;
+			const input = { resultId: row.id, criterion, answer: subject.answer, receipt: subject.receipt, citation: subject.citation };
+			// A host part always names the handle: the reviewer judges the whole output, never the part alone.
+			const whole = subject.partial === true && subject.output !== undefined
+				? answerReviewPacket({ ...input, output: subject.output, partial: true })
+				: answerReviewPacket(input);
+			const packet = whole.length <= ANSWER_BATCH_CHARS || subject.output === undefined
+				? whole
+				: answerReviewPacket({ ...input, output: subject.output, quoteChars: ANSWER_EXCERPT_CHARS, ...(subject.partial === true ? { partial: true } : {}) });
+			packets.push({ receipt: subject.receipt, packet });
 		}
-		if (packets.length === 0) return undefined;
-		const tail = skipped.length === 0 ? [] : [`(Not in this packet; review them in a later turn: ${skipped.slice(0, 8).join(", ")}.)`];
-		return ["[storm:answer-review] Storm's scoped answer review input (not a verdict).", ...packets, ...tail].join("\n\n");
+		return packets;
+	}
+
+	/** How many reviewable answers still wait for a reviewer and how many reviewer tasks or follow-ups they need. */
+	#answerReviewLoad(own: OwnRun): { answers: number; batches: number } {
+		const packets = this.#pendingAnswerPackets(own);
+		return { answers: packets.length, batches: answerBatches(packets).length };
+	}
+
+	/**
+	 * Hands the next batch of answer review packets not yet handed out to one approved reviewer task or follow-up, and
+	 * marks it handed out so no other reviewer turn gets the same answer. It rides only on the reviewer's own task or
+	 * follow-up (per-task context, never a system prompt), is Storm's input rather than a verdict, and proves nothing:
+	 * only the reviewer's final yield entry for a receipt, re-checked against the cited bytes, settles that answer.
+	 */
+	takeAnswerReviewBatch(): string | undefined {
+		const own = this.#own;
+		if (own === undefined) return undefined;
+		const batch = answerBatches(this.#pendingAnswerPackets(own))[0];
+		if (batch === undefined) return undefined;
+		const handed = (own.answerHandout ??= new Set<string>());
+		for (const packet of batch) handed.add(packet.receipt);
+		return [ANSWER_BATCH_HEAD, ...batch.map(packet => packet.packet)].join("\n\n");
 	}
 
 	/** Why an answer row's recorded anchor no longer holds now, or undefined when its cited bytes still match. */
@@ -2234,7 +2308,9 @@ export class RunController {
 			...(prepared.laneFiles === undefined ? {} : { laneFiles: prepared.laneFiles }),
 			...(checks === undefined ? {} : { checks }),
 			...(settled.artifact === undefined ? {} : { artifact: settled.artifact }),
-			...(wantsAnswer ? { answer: { text: settled.reportText ?? "", citations: [...settled.citations] } } : {}),
+			...(wantsAnswer
+				? { answer: { text: settled.reportText ?? "", citations: [...settled.citations], ...(settled.reportPartial === true ? { partial: true } : {}) } }
+				: {}),
 		});
 		// What the producers satisfy now is read after the evidence, so no await separates it from the fences below.
 		const satisfied = this.#own === own ? await this.#settledInputSatisfaction(own, prepared) : undefined;
@@ -2290,7 +2366,7 @@ export class RunController {
 			if (proof !== undefined) row.proof = proof;
 			else delete row.proof;
 			delete row.restoredFrom;
-			if (item.kind === "answer") this.#noteAnswerSubject(own, row, item, settled.reportText);
+			if (item.kind === "answer") this.#noteAnswerSubject(own, row, item, settled);
 		}
 	}
 
@@ -2299,7 +2375,8 @@ export class RunController {
 	 * A reviewable answer is told what the reviewer must see: the answer as submitted and its anchor citation, judged
 	 * against the current bytes. No acceptance is granted here.
 	 */
-	#noteAnswerSubject(own: OwnRun, row: RunResult, item: ResultEvidenceItem, answer: string | undefined): void {
+	#noteAnswerSubject(own: OwnRun, row: RunResult, item: ResultEvidenceItem, settled: SettledAttempt): void {
+		const answer = settled.reportText;
 		const subjects = (own.answerSubjects ??= new Map<string, AnswerSubject>());
 		const usable = (item.state === "accepted" || item.state === "reviewable") && row.state === item.state &&
 			row.attemptId !== undefined && item.contentVersion !== undefined && row.contentVersion === item.contentVersion &&
@@ -2311,7 +2388,14 @@ export class RunController {
 		// The packet quotes exactly the text S1 judged; any other text (or none) leaves the submission unreviewable.
 		const verbatim = typeof answer === "string" && item.digest !== undefined &&
 			createHash("sha256").update(answer).digest("hex") === item.digest ? answer : undefined;
-		subjects.set(row.id, { attemptId: row.attemptId as string, item, seenAt: this.deps.now(), ...(verbatim === undefined ? {} : { answer: verbatim }) });
+		subjects.set(row.id, {
+			attemptId: row.attemptId as string,
+			item,
+			seenAt: this.deps.now(),
+			...(verbatim === undefined ? {} : { answer: verbatim }),
+			output: `agent://${settled.spawnKey}`,
+			...(settled.reportPartial === true ? { partial: true as const } : {}),
+		});
 		const citation = item.citation;
 		if (row.state === "reviewable" && citation !== undefined) {
 			const anchor = `${citation.path}${citation.line === undefined ? "" : `:${citation.line}`}`;
@@ -2490,7 +2574,7 @@ export class RunController {
 		});
 	}
 
-	/** A follow-up to an agent past its context cap, or cleaned, that Storm sent back to a fresh agent. */
+	/** A follow-up to a cleaned agent that Storm sent back to a fresh agent. */
 	noteBlockedFollowUp(): void {
 		this.#update(record => {
 			record.blockedFollowUps = (record.blockedFollowUps ?? 0) + 1;
@@ -2541,7 +2625,7 @@ export class RunController {
 	}
 
 	/**
-	 * Starts one background director checkpoint when this run's context is at its cap and none is in flight.
+	 * Starts one background director checkpoint when this run's context is at 70% of its window and none is in flight.
 	 * omp prepares a handoff summary without interrupting the live turn and commits it at the next natural
 	 * boundary (a continuing tool loop's turn end, or idle); this returns at once and never awaits that commit,
 	 * so a caller inside a tool call or an event handler cannot deadlock. Only a commit that reported completion
@@ -2558,7 +2642,8 @@ export class RunController {
 		const before = usage.tokens;
 		const last = own.record.checkpoints?.at(-1);
 		const lastAt = last === undefined ? undefined : Date.parse(last.at);
-		const cap = directorCap(own.config, usage.contextWindow);
+		const cap = windowThreshold(MID_RUN_WINDOW_SHARE, usage.contextWindow);
+		if (cap === undefined) return false;
 		if (
 			!shouldCheckpoint({
 				tokens: usage.tokens,
@@ -3218,13 +3303,13 @@ export class RunController {
 		const turns = own.record.turns ?? 0;
 		// The turn settled: the live line moves to the round decision before any tree read or check starts.
 		this.#emitPhase(own);
-		const decision = await this.#roundDecision(own, aborted, false);
+		const { decision, tree } = await this.#roundDecision(own, aborted, false);
 		// The tree read may have outlasted the round: a new turn or an end decided meanwhile owns the run now.
 		if (!this.#live(own, turns)) return;
 		if (decision.action === "end") {
 			// A ready required check is verification, not another model round. Give it one timer look before a budget
 			// end, so a last-round review can still be proven or honestly fail.
-			if ((decision.reason === "round-limit" || decision.reason === "no-progress") && (await this.#hasPendingCheck(own))) {
+			if ((decision.reason === "round-limit" || decision.reason === "no-progress") && this.#hasPendingCheck(own, tree)) {
 				if (!this.#live(own, turns)) return;
 				own.checksOnlyEnd = decision.reason;
 				this.#arm(own, ctx, ROUND_DELAY_MS);
@@ -3239,10 +3324,10 @@ export class RunController {
 	 * Whether a required check is ready to run for this tree and could still change the gate. It is not a review,
 	 * another model round, or a reason to replay a check already attempted for this tree.
 	 */
-	async #hasPendingCheck(own: OwnRun): Promise<boolean> {
+	#hasPendingCheck(own: OwnRun, now: TreeReading | undefined): boolean {
 		if ((own.config.requiredChecks?.length ?? 0) === 0) return false;
 		if (own.ending !== undefined || own.abort.signal.aborted) return false;
-		const now = await this.#treeAt(own.root, own.base);
+		// The decision's own reading: a second read in the same host handler could double a slow repository's wait.
 		if (now === undefined) return false;
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const planLanes = this.#planLanes(own, agents);
@@ -3267,7 +3352,7 @@ export class RunController {
 	}
 
 	/** The round's decision from the tree now and the gate as the ledger has it after that. */
-	async #roundDecision(own: OwnRun, aborted: boolean, allowChecks: boolean): Promise<RoundDecision> {
+	async #roundDecision(own: OwnRun, aborted: boolean, allowChecks: boolean): Promise<{ decision: RoundDecision; tree: TreeReading | undefined }> {
 		await this.#revokeUnlocatedAccepted(own, true);
 		let now = await this.#treeAt(own.root, own.base);
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
@@ -3300,7 +3385,7 @@ export class RunController {
 		};
 		const coverage = this.#coverage(own, now?.state, planLanes);
 		const gate = reviewGate(agents, own.config, currentTree, coverage);
-		return decideRound({
+		const decision = decideRound({
 			gate,
 			turns: own.record.turns ?? 0,
 			...(own.maxRounds === undefined ? {} : { maxRounds: own.maxRounds }),
@@ -3311,6 +3396,7 @@ export class RunController {
 			...(own.progress ? { progressSince: own.progress } : {}),
 			...(own.stalled === undefined ? {} : { stalled: own.stalled }),
 		});
+		return { decision, tree: now };
 	}
 
 	/** Plan lanes as coverage evidence: a settled worker is not done while a declared row is pending or unmet. */
@@ -3660,7 +3746,7 @@ export class RunController {
 		if (this.#held(ctx)) return this.#arm(own, ctx, HOLD_MS);
 		const turns = own.record.turns ?? 0;
 		const checkOnly = own.checksOnlyEnd;
-		const decision = await this.#roundDecision(own, false, true);
+		const { decision } = await this.#roundDecision(own, false, true);
 		if (!this.#live(own, turns)) return;
 		if (checkOnly !== undefined) {
 			delete own.checksOnlyEnd;
@@ -3755,6 +3841,13 @@ export class RunController {
 				delete own.lastRetry;
 			}
 		}
+		// A round re-offers every answer still waiting for a verdict. While an approved reviewer still runs or holds a
+		// slot, its batch stays its own, so no answer goes to two reviewers; the next round re-offers it otherwise.
+		const reviewing =
+			(this.deps.agents?.(own.record.runId, own.sessionDir) ?? []).some(agent => agent.role === "reviewer" && agent.state === "running") ||
+			reservedWorkers(own.record.runId).some(slot => slot.role === "reviewer");
+		if (!reviewing) delete own.answerHandout;
+		const load = this.#answerReviewLoad(own);
 		const base = buildRoundMessage({
 			runId: own.record.runId,
 			round,
@@ -3762,6 +3855,7 @@ export class RunController {
 			gate,
 			...(reviewer !== undefined ? { reviewer } : {}),
 			stalled,
+			...(reviewer !== undefined && load.answers > 0 ? { answerReviews: { ...load, slots: this.#reviewerSlots(own) } } : {}),
 		});
 		const extra = [...notes, ...(retryNote === undefined ? [] : [retryNote])].join("\n\n");
 		this.deps.pi.sendUserMessage(extra === "" ? base : `${base}\n\n${extra}`).catch((error: unknown) => {
@@ -3775,6 +3869,15 @@ export class RunController {
 			ui.notify(`라운드 메시지를 보내지 못했습니다: ${errorText(error)}`, "warning");
 			this.#stopSoon(own, "no-progress", ctx);
 		});
+	}
+
+	/**
+	 * Reviewers that may run at once in this run: the plan's reviewer workers, or the role's approved maximum when the
+	 * plan gives it none. Spawn admission enforces the same ceiling; more review batches than this queue.
+	 */
+	#reviewerSlots(own: OwnRun): number {
+		const planned = own.record.plan?.workers.reviewer ?? 0;
+		return Math.max(1, planned > 0 ? planned : workerRange("reviewer", own.config.roles.reviewer).max);
 	}
 
 	/** Ends `own` for `reason` unless an earlier reason stands; a run that is no longer this session's is left alone. */

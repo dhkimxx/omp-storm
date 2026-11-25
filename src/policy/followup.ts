@@ -1,11 +1,11 @@
 /**
- * Follow-ups (`write agent://<id>`) from a directing session. An agent at or past its context cap, or one whose omp
- * records the run-end janitor removed, takes no more: the director starts a fresh agent that reads the old one's
- * result (`agent://<id>`). The rule covers every agent of the process ledger, whichever run started it.
+ * Follow-ups (`write agent://<id>`) from a directing session. An agent whose omp records the run-end janitor removed
+ * takes no more: the director starts a fresh agent that reads the old one's result (`agent://<id>`). Context size
+ * never refuses a follow-up: omp compacts a subagent session itself. The rule covers every agent of the process
+ * ledger, whichever run started it.
  */
-import { agentRows, tokens } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle } from "../roles.ts";
-import type { AgentEntry, Block, StormConfig } from "../types.ts";
+import type { AgentEntry, Block } from "../types.ts";
 import { pathOf } from "./director.ts";
 
 const AGENT_URL = "agent://";
@@ -30,23 +30,15 @@ export function followUpBlock(
 	toolName: string,
 	input: unknown,
 	agents: readonly AgentEntry[],
-	config: StormConfig,
-): Block<"followup-cap" | "followup-cleaned"> | undefined {
+): Block<"followup-cleaned"> | undefined {
 	const id = followUpTarget(toolName, input);
 	const agent = id === undefined ? undefined : followUpAgent(agents, id);
 	if (!agent) return undefined;
-	const [row] = agentRows([agent], config);
-	if (!row || row.followUp === "ok") return undefined;
+	if (agent.cleanedAt === undefined) return undefined;
 	const who = `${agent.id}(${agent.role === undefined ? agent.name : roleTitle(agent.role)})`;
 	const fresh = agent.role === undefined ? agent.name : `${ROLE_AGENT_PREFIX}${agent.role}`;
 	const next = `새 ${fresh} 를 띄워 agent://${agent.id} 의 결과를 읽고 이어 가게 하세요. 요약을 따로 넘길 필요는 없습니다.`;
-	if (row.followUp === "cleaned") {
-		return { code: "followup-cleaned", reason: `${who}는 정리로 omp 기록이 지워져 후속 지시를 받을 수 없습니다. ${next}` };
-	}
-	return {
-		code: "followup-cap",
-		reason: `${who}의 컨텍스트가 ${tokens(agent.contextTokens)} 토큰으로 상한 ${tokens(row.cap)} 토큰에 닿아 후속 지시를 막았습니다. ${next}`,
-	};
+	return { code: "followup-cleaned", reason: `${who}는 정리로 omp 기록이 지워져 후속 지시를 받을 수 없습니다. ${next}` };
 }
 
 /**

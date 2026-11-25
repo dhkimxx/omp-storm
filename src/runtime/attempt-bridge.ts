@@ -49,7 +49,12 @@ export interface AttemptSettlement {
 	startedAt: number;
 	observedAt: number;
 	report: AttemptReport;
-	/** Bounded host-authored output/content (<= 16 KiB), for answer evidence. */
+	/** The host-authored output/content, whole: answer evidence digests and checks the full text. */
 	reportText?: string;
+	/**
+	 * The host delivered only part of the output (a preview or a tail) and the whole could not be read safely from its
+	 * output file: `reportText` is that part, judged only by review with the agent's handle.
+	 */
+	reportPartial?: true;
 	citations: readonly AnswerCitation[];
 }

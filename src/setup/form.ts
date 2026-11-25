@@ -1,10 +1,10 @@
 /** Pure forms and answer mapping for the role-by-role setup interview. */
-import { MAX_CONTEXT_CAP, validateConfig } from "../config/schema.ts";
+import { validateConfig } from "../config/schema.ts";
 import { ON_EXCEED, pct, quotaText, speedText, tierLabel, usd, visible } from "../view/render.ts";
 import { scoreText } from "../lineage/metrics.ts";
 import { dropAdoptedTrials, providerOf } from "../proposals/build.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
-import { DEFAULT_CONTEXT_CAP, MAX_WORKERS, REQUIRED_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
+import { MAX_WORKERS, REQUIRED_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
 import { MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { entryEffort, formatModelEntry, type ModelEntry, parseModelEntry } from "../selector.ts";
 import { type Analysis, type BudgetConfig, type Candidate, EFFORTS, type Effort, type FormData, type InfoLine, type InfoSpan, type ModelInfo, type RoleConfig, type RoleId, type RoleRecommendation, type StormConfig, type WorkerRange } from "../types.ts";
@@ -51,7 +51,6 @@ export const FIELD = {
 	effort: "effort",
 	workersMin: (id: RoleId) => `workers_min_${id}`,
 	workersMax: (id: RoleId) => `workers_max_${id}`,
-	contextCap: "context_cap",
 	rounds: "rounds",
 	budget: "budget_usd",
 	budgetWarn: "budget_warn_usd",
@@ -63,7 +62,6 @@ export const FIELD = {
 const LABEL = {
 	workersMin: "워커 최소",
 	workersMax: "워커 최대",
-	contextCap: "팀 컨텍스트 상한",
 	rounds: "검증이 안 됐을 때 추가 라운드",
 	budget: "실행당 예산",
 	budgetWarn: "예산 경고 수준",
@@ -295,7 +293,6 @@ export function commonSettingsForm(input: SetupFormInput, retry?: FormRetry): st
 	const budget = base.budget;
 	out.push(
 		"<fieldset><legend>실행</legend>",
-		numberInput(FIELD.contextCap, `${LABEL.contextCap} (토큰. 넘은 서브에이전트는 후속 지시를 받지 않습니다)`, typed(retry, FIELD.contextCap, base.contextCap ?? DEFAULT_CONTEXT_CAP), 1, MAX_CONTEXT_CAP),
 		// Blank is a valid answer here: no limit. The form hands an empty number input back as "" and `typed` re-renders it as is.
 		numberInput(FIELD.rounds, `${LABEL.rounds} (비우면 제한 없음, 0이면 다시 보내지 않음)`, typed(retry, FIELD.rounds, base.rounds ?? ""), 0, MAX_EXTRA_ROUNDS, true),
 		"</fieldset>",
@@ -394,13 +391,10 @@ export function setupConfig(input: SetupFormInput, answers: RoleAnswers, data: F
 			roles[id] = structuredClone(before);
 			continue;
 		}
-		roles[id] = { agent, models: picked.map(formatModelEntry), workers, ...(before?.contextCap !== undefined ? { contextCap: before.contextCap } : {}) };
+		roles[id] = { agent, models: picked.map(formatModelEntry), workers };
 	}
 
 	const config: StormConfig = { ...structuredClone(base), roles };
-	const contextCap = whole(data, errors, FIELD.contextCap, LABEL.contextCap, 1, MAX_CONTEXT_CAP);
-	// The default stays unwritten, as in a team that never set it.
-	if (base.contextCap !== undefined || contextCap !== DEFAULT_CONTEXT_CAP) config.contextCap = contextCap;
 	// A limit exists only when the user typed one; a blank field removes it.
 	const typedRounds = data[FIELD.rounds];
 	if (typedRounds === undefined || (typeof typedRounds === "string" && typedRounds.trim() === "")) delete config.rounds;

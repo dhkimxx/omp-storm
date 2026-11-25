@@ -809,17 +809,22 @@ describe("run start", () => {
 		await other.controller.finish("no-changes");
 	});
 
-	test("below both thresholds nothing is compacted; 150k tokens or half the window is heavy", async () => {
-		const compactions = async (tokens: number, percent: number): Promise<number> => {
-			const h = session({ usage: usage(tokens, percent) });
+	test("the run start compacts only at half the model's window; an unknown window compacts nothing", async () => {
+		const compactions = async (tokens: number, percent: number, window?: number): Promise<number> => {
+			const h = session({ usage: usage(tokens, percent, window) });
 			await h.start();
 			expect(h.sent).toHaveLength(1);
 			await h.controller.finish("no-changes");
 			return h.events.filter(event => event === "compact").length;
 		};
-		expect(await compactions(149_999, 49)).toBe(0);
-		expect(await compactions(150_000, 10)).toBe(1);
-		expect(await compactions(60_000, 50)).toBe(1);
+		expect(await compactions(199_999, 49)).toBe(0);
+		expect(await compactions(200_000, 50)).toBe(1);
+		// A 1M-token model is not compacted at the token counts that fill a 200k model.
+		expect(await compactions(150_000, 15, 1_000_000)).toBe(0);
+		expect(await compactions(499_999, 49, 1_000_000)).toBe(0);
+		expect(await compactions(500_000, 50, 1_000_000)).toBe(1);
+		// The host knows no window: Storm cannot tell how full the context is and starts no compaction.
+		expect(await compactions(900_000, 0, 0)).toBe(0);
 		// No usage known (a fresh session): nothing to compact.
 		const blind = session();
 		await blind.start();
@@ -830,7 +835,7 @@ describe("run start", () => {
 	test("a heavy context is compacted first: the size is announced, then the compaction, then the handoff", async () => {
 		const seen: Array<{ notices: number; sent: number; directing: boolean; instructions: number }> = [];
 		const h = session({
-			usage: usage(160_000, 40),
+			usage: usage(240_000, 60),
 			compact: async instructions => {
 				seen.push({ notices: h.notices.length, sent: h.sent.length, directing: h.controller.directing(), instructions: instructions.length });
 			},
@@ -840,7 +845,7 @@ describe("run start", () => {
 		expect(seen).toHaveLength(1);
 		expect(seen[0]).toMatchObject({ notices: 1, sent: 0, directing: false });
 		expect(seen[0]?.instructions).toBeGreaterThan(0);
-		expect(h.notices[0]?.text).toContain(tokens(160_000));
+		expect(h.notices[0]?.text).toContain(tokens(240_000));
 		expect(h.events).toEqual(["compact", "send"]);
 		await h.controller.finish("no-changes");
 	});
@@ -1058,7 +1063,7 @@ describe("start with plan", () => {
 
 	test("a team change after the plan was checked refuses instead of using the new authority", async () => {
 		const first = approvedState(root, SESSION_TEAM);
-		const changed = approvedState(root, { ...SESSION_TEAM, contextCap: 300_000 });
+		const changed = approvedState(root, { ...SESSION_TEAM, rounds: 9 });
 		let loads = 0;
 		const h = session({ loadState: async () => (++loads === 1 ? first : changed) });
 		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
@@ -1144,7 +1149,7 @@ describe("lease, drain and required checks", () => {
 
 	test("a plan hash other than the approved team refuses before taking the lease", async () => {
 		const h = session();
-		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash({ ...h.config, contextCap: 300_000 }));
+		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash({ ...h.config, rounds: 9 }));
 		expect(result.ok).toBe(false);
 		expect(h.leases.acquired).toEqual([]);
 		expect(h.controller.directing()).toBe(false);
@@ -2510,8 +2515,8 @@ describe("director counters", () => {
 			const started = await h.controller.startWithPlan(h.ctx, ask("probe"), plan, configHash(h.config));
 			if (!started.ok) throw new Error(started.reason);
 		};
-		// Below the director cap nothing is asked of the host.
-		const small = session({ usage: usage(199_999, 49), now: () => at });
+		// Below 70% of the window nothing is asked of the host.
+		const small = session({ usage: usage(279_999, 69), now: () => at });
 		const smallCalls: CompactOptions[] = [];
 		small.ctx.compact = options => {
 			smallCalls.push(checkpointOptions(options));
@@ -2521,8 +2526,19 @@ describe("director counters", () => {
 		expect(small.controller.startCheckpoint()).toBe(false);
 		expect(smallCalls).toEqual([]);
 		await small.controller.finish("no-changes");
+		// Without a known window there is no share to measure, so no mid-run compaction either.
+		const blind = session({ usage: usage(900_000, 0, 0), now: () => at });
+		const blindCalls: CompactOptions[] = [];
+		blind.ctx.compact = options => {
+			blindCalls.push(checkpointOptions(options));
+			return Promise.resolve();
+		};
+		await startAuto(blind);
+		expect(blind.controller.startCheckpoint()).toBe(false);
+		expect(blindCalls).toEqual([]);
+		await blind.controller.finish("no-changes");
 
-		const heavy = usage(206_512, 51);
+		const heavy = usage(286_512, 71);
 		const h = session({ usage: heavy, now: () => at });
 		const calls: CompactOptions[] = [];
 		const pending: Array<PromiseWithResolvers<void>> = [];
@@ -2548,7 +2564,7 @@ describe("director counters", () => {
 		calls[0]?.onComplete?.({} as never);
 		pending[0]?.resolve();
 		await until(() => h.controller.active()?.checkpoints?.length === 1);
-		expect(h.controller.active()?.checkpoints).toEqual([{ at: new Date(at).toISOString(), before: 206_512, after: 30_000 }]);
+		expect(h.controller.active()?.checkpoints).toEqual([{ at: new Date(at).toISOString(), before: 286_512, after: 30_000 }]);
 		// The record and the summary carry the applied compaction only.
 		const record = await h.controller.finish("no-changes");
 		expect(record?.checkpoints).toHaveLength(1);
@@ -2558,7 +2574,7 @@ describe("director counters", () => {
 	test("a rejected or no-op host compaction leaves no mark and holds the retry off for the min gap", async () => {
 		let now = T0;
 		const plan: RunPlan = { lanes: [{ name: "probe", kind: "code", role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
-		const h = session({ usage: usage(210_000, 55), now: () => now });
+		const h = session({ usage: usage(290_000, 72), now: () => now });
 		const calls: Array<{ options: CompactOptions; wait: PromiseWithResolvers<void> }> = [];
 		h.ctx.compact = options => {
 			const wait = Promise.withResolvers<void>();
@@ -2592,7 +2608,7 @@ describe("director counters", () => {
 	test("a stop cancels the run's checkpoint; its late commit never marks the next run", async () => {
 		const at = T0;
 		const plan: RunPlan = { lanes: [{ name: "probe", kind: "code", role: "implementer" }], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };
-		const h = session({ usage: usage(220_000, 58), now: () => at });
+		const h = session({ usage: usage(300_000, 75), now: () => at });
 		const calls: Array<{ options: CompactOptions; wait: PromiseWithResolvers<void> }> = [];
 		h.ctx.compact = options => {
 			const wait = Promise.withResolvers<void>();

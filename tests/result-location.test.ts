@@ -12,6 +12,7 @@ import {
 	type ResultLocationCode,
 	type ResultLocationResult,
 } from "../src/runtime/result-location.ts";
+import { MAX_RESULT_CONTAINS, MAX_RESULT_CRITERION } from "../src/plan/validate.ts";
 import type { PlanLaneResult } from "../src/types.ts";
 
 const dirs: string[] = [];
@@ -465,6 +466,21 @@ describe("fail-closed evidence", () => {
 
 		const reviewable = { ...acceptedOf(changeResult("pending", "tracked.txt"), { digest: sha256("base\n") }), state: "reviewable" as const };
 		expectFailure(await locateResult({ mode: "integrated", parentRoot: repo.root, accepted: reviewable }), "not-accepted");
+	});
+
+	test("a contract as long as the plan allows is judged on its evidence, never refused for its length", async () => {
+		const contents = "{\"value\":42}\n";
+		const repo = await newRepo("long-contract", { "report.json": contents });
+		const long: PlanLaneResult = {
+			...changeResult("long-change", "report.json"),
+			criterion: "c".repeat(MAX_RESULT_CRITERION),
+			contains: "v".repeat(MAX_RESULT_CONTAINS),
+		};
+		const facts = acceptedOf(long, { digest: sha256(contents), previousDigest: sha256(contents) });
+		// The same code a short contract gets: the length did not turn it into invalid evidence.
+		expectFailure(await locateResult({ mode: "integrated", parentRoot: repo.root, accepted: facts }), "reverted");
+		const over = acceptedOf({ ...long, criterion: "c".repeat(MAX_RESULT_CRITERION + 1) }, { digest: sha256(contents), previousDigest: sha256(contents) });
+		expectFailure(await locateResult({ mode: "integrated", parentRoot: repo.root, accepted: over }), "invalid-evidence");
 	});
 
 	test("failure codes stay fail-closed for bad identity and unsupported retained changes", async () => {

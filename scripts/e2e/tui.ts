@@ -651,7 +651,7 @@ async function main(): Promise<void> {
 						mark = await submitForm(tui, mark, model.selector, 1);
 					}
 				}
-				const settings = await submitForm(tui, mark, "예산", 7);
+				const settings = await submitForm(tui, mark, "예산", 6);
 				await tui.selector(settings);
 				check("role and effort pages don't save without approval", files.approvals().length === approvals && JSON.stringify(files.config()) === JSON.stringify(before));
 				await answer(tui, settings, APPROVE);

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
-import { MAX_LANE_DEPENDENCIES, MAX_LANE_RESULTS, MAX_LANE_TEXT, MAX_RESULT_CRITERION, MAX_RESULT_ID } from "../src/plan/validate.ts";
+import { MAX_LANES, MAX_LANE_DEPENDENCIES, MAX_LANE_FILES, MAX_LANE_NAME, MAX_LANE_RESULTS, MAX_LANE_TEXT, MAX_RESULT_CRITERION, MAX_RESULT_ID } from "../src/plan/validate.ts";
 import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { runChange } from "../src/request/actions.ts";
@@ -147,7 +147,7 @@ describe("tool definition", () => {
 		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: true }])).success).toBe(false);
 		expect(tool.parameters.safeParse(withDeps([{ lane: "produce", need: "result", optional: true }])).success).toBe(false);
 		expect(tool.parameters.safeParse(withDeps([{ lane: "", need: "result" }])).success).toBe(false);
-		expect(tool.parameters.safeParse(withDeps([{ lane: "x".repeat(MAX_LANE_TEXT + 1), need: "result" }])).success).toBe(false);
+		expect(tool.parameters.safeParse(withDeps([{ lane: "x".repeat(MAX_LANE_NAME + 1), need: "result" }])).success).toBe(false);
 		const many = Array.from({ length: MAX_LANE_DEPENDENCIES + 1 }, (_, i) => ({ lane: `p${i}`, need: "reviewable" }));
 		expect(tool.parameters.safeParse(withDeps(many)).success).toBe(false);
 		const longBrief = { result: "x".repeat(CLOSEOUT_RESULT_MAX + 1), verification: "v" };
@@ -156,6 +156,28 @@ describe("tool definition", () => {
 		expect(tool.parameters.safeParse({ action: "brief", brief: longCheck }).success).toBe(false);
 		const longNext = { result: "r", verification: "v", next: [{ kind: "run", task: "x".repeat(CLOSEOUT_NEXT_MAX + 1) }] };
 		expect(tool.parameters.safeParse({ action: "brief", brief: longNext }).success).toBe(false);
+	});
+
+	test("the schema accepts the same 60-lane, 600-character-goal, 12-result plan with a 100-file lane that the validator accepts", () => {
+		const lane = (i: number) => ({
+			name: `lane-${i}`,
+			kind: "code" as const,
+			...(i === 0 ? { goal: "g".repeat(600) } : {}),
+			...(i === 1 ? { files: Array.from({ length: 100 }, (_, j) => `src/module-${j}/file.ts`) } : {}),
+			results:
+				i === 0
+					? Array.from({ length: 12 }, (_, j) => ({ id: `bulk-${j}`, kind: "change" as const, criterion: "the bulk change is in the tree" }))
+					: [{ id: `r-${i}`, kind: "change" as const, criterion: "the lane delivered" }],
+		});
+		const planOf = (n: number) => ({ action: "plan", plan: { lanes: Array.from({ length: n }, (_, i) => lane(i)) } });
+		expect(tool.parameters.safeParse(planOf(60)).success).toBe(true);
+		expect(tool.parameters.safeParse(planOf(MAX_LANES)).success).toBe(true);
+		expect(tool.parameters.safeParse(planOf(MAX_LANES + 1)).success).toBe(false);
+		expect(tool.parameters.safeParse({ action: "plan", plan: { lanes: [{ name: "x".repeat(MAX_LANE_NAME + 1), kind: "code" }] } }).success).toBe(false);
+		expect(
+			tool.parameters.safeParse({ action: "plan", plan: { lanes: [{ name: "core", kind: "code", files: Array.from({ length: MAX_LANE_FILES + 1 }, (_, i) => `f${i}.ts`) }] } }).success,
+		).toBe(false);
+		expect(tool.parameters.safeParse({ action: "plan", plan: { lanes: [{ name: "core", kind: "code" }], note: "x".repeat(MAX_LANE_TEXT + 1) } }).success).toBe(false);
 	});
 
 	test("reports are read tier; a run, a plan or a brief is write tier", () => {
@@ -183,12 +205,12 @@ describe("read actions", () => {
 	test("agents returns the subagent table and nothing else", async () => {
 		const agents = [agentEntry({ id: "Imp1" }), agentEntry({ id: "Full", contextTokens: 250_000 }), agentEntry({ id: "Gone", cleanedAt: NOW })];
 		const f = fakeHost({ agents });
-		expect(await run(f, { action: "agents" })).toEqual({ outcome: "ok", text: renderAgentRows(agentRows(agents, base), NOW) });
+		expect(await run(f, { action: "agents" })).toEqual({ outcome: "ok", text: renderAgentRows(agentRows(agents), NOW) });
 		expect(f.prepares()).toBe(0);
 		expect(f.selects).toEqual([]);
 		expect((await run(fakeHost(), { action: "agents" })).outcome).toBe("ok");
-		// Without a team the default cap applies.
-		expect(await run(fakeHost({ config: null, agents }), { action: "agents" })).toEqual({ outcome: "ok", text: renderAgentRows(agentRows(agents, undefined), NOW) });
+		// The table needs no team config.
+		expect(await run(fakeHost({ config: null, agents }), { action: "agents" })).toEqual({ outcome: "ok", text: renderAgentRows(agentRows(agents), NOW) });
 	});
 });
 

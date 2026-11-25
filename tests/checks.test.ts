@@ -1,9 +1,17 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { configHash } from "../src/config/canonical.ts";
-import { checkGate, type CheckReport, type RequiredChecksInput, runRequiredChecks } from "../src/runtime/checks.ts";
+import {
+	checkGate,
+	checkTimeoutMs,
+	DEFAULT_CHECK_TIMEOUT_MS,
+	MAX_CHECK_TIMEOUT_MS,
+	type CheckReport,
+	type RequiredChecksInput,
+	runRequiredChecks,
+} from "../src/runtime/checks.ts";
 import { renderConfigDiff, renderStatus } from "../src/view/render.ts";
 import type { ApprovalRecord, ConfigLoad, RequiredCheck, StatusView, StormConfig } from "../src/types.ts";
 import { approvalRecord } from "./fixtures.ts";
@@ -24,6 +32,7 @@ async function tempRoot(): Promise<string> {
 	return dir;
 }
 afterEach(async () => {
+	vi.useRealTimers();
 	for (const dir of dirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 });
 
@@ -114,14 +123,69 @@ describe("runRequiredChecks", () => {
 	test("a timeout ends the process group and is failed, complete evidence", async () => {
 		// The limit bounds a spawned OS process, which fake timers cannot advance; keep the real wait short.
 		const root = await tempRoot();
-		const config = loaded(checks([{ name: "slow", argv: [process.execPath, "-e", "setTimeout(() => {}, 10000)"] }]));
-		const report = await reportOf({ config, approval: approved(config.hash), cwd: root, fingerprint: "tree-3", timeoutMs: 50 });
+		const config = loaded(checks([{ name: "slow", argv: [process.execPath, "-e", "setTimeout(() => {}, 10000)"], timeoutMs: 50 }]));
+		const report = await reportOf({ config, approval: approved(config.hash), cwd: root, fingerprint: "tree-3" });
 		expect(report.status).toBe("failed");
 		expect(report.complete).toBe(true);
 		expect(report.aborted).toBe(false);
 		expect(report.checks[0]!.status).toBe("timed-out");
 		expect(report.checks[0]!.durationMs).toBeLessThan(8000);
 		expect(report.checks[0]!.note).toContain("시간 한도");
+	});
+
+	test("a check's own limit is used, and an absent one is the job's ten minutes", () => {
+		const plain: RequiredCheck = { name: "unit", argv: ["bun", "test"] };
+		expect(DEFAULT_CHECK_TIMEOUT_MS).toBe(10 * 60_000);
+		expect(MAX_CHECK_TIMEOUT_MS).toBe(6 * 60 * 60 * 1000);
+		expect(checkTimeoutMs(plain)).toBe(DEFAULT_CHECK_TIMEOUT_MS);
+		expect(checkTimeoutMs({ ...plain, timeoutMs: 1_800_000 })).toBe(1_800_000);
+		// A programmatically built config that skipped validation still cannot run past the job maximum.
+		expect(checkTimeoutMs({ ...plain, timeoutMs: MAX_CHECK_TIMEOUT_MS + 1 })).toBe(MAX_CHECK_TIMEOUT_MS);
+	});
+
+	test("a limit above the old two-minute cut is not shortened", async () => {
+		const root = await tempRoot();
+		const config = loaded(checks([
+			{ name: "long", argv: [process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"], timeoutMs: 1_800_000 },
+		]));
+		// Only the runner's deadline is on the fake clock; the child's own timer is real so it exits promptly.
+		vi.useFakeTimers();
+		try {
+			const running = reportOf({ config, approval: approved(config.hash), cwd: root, fingerprint: "tree-3a" });
+			// Past the 10-minute job default: an ignored per-check value would have killed the child here.
+			vi.advanceTimersByTime(10 * 60_000 + 1);
+			const report = await running;
+			expect(report.status).toBe("passed");
+			expect(report.checks[0]!.status).toBe("passed");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("a check without a limit is not cut at two minutes", async () => {
+		const root = await tempRoot();
+		const config = loaded(checks([{ name: "plain", argv: [process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"] }]));
+		vi.useFakeTimers();
+		try {
+			const running = reportOf({ config, approval: approved(config.hash), cwd: root, fingerprint: "tree-3b" });
+			vi.advanceTimersByTime(120_001);
+			const report = await running;
+			expect(report.status).toBe("passed");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("a timed-out check does not lend its limit to the next check", async () => {
+		const root = await tempRoot();
+		const config = loaded(checks([
+			{ name: "short", argv: [process.execPath, "-e", "setTimeout(() => {}, 10000)"], timeoutMs: 50 },
+			{ name: "next", argv: [process.execPath, "-e", "process.exit(0)"] },
+		]));
+		const report = await reportOf({ config, approval: approved(config.hash), cwd: root, fingerprint: "tree-3c" });
+		expect(report.status).toBe("failed");
+		expect(report.complete).toBe(true);
+		expect(report.checks.map((check) => check.status)).toEqual(["timed-out", "passed"]);
 	});
 
 	test("abort cancels the running child and leaves later checks unrun", async () => {

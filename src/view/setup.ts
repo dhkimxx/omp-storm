@@ -19,7 +19,7 @@ export function recommendedModels(rec: RoleRecommendation): string[] | undefined
 }
 
 /**
- * Storm's own team for `priority`. Only the models are new: what the user chose before (worker ranges, context caps,
+ * Storm's own team for `priority`. Only the models are new: what the user chose before (worker ranges,
  * disabled roles, run settings, budget, the docs and cleanup switches, a deliberate block of other agents, trials)
  * carries over from `current`. A first setup recommends cleanup on.
  */
@@ -35,7 +35,6 @@ export function recommendedConfig(recs: RoleRecommendation[], priority: Priority
 			agent: rec.role.agent,
 			models,
 			workers: prev ? workerRange(id, prev) : { ...DEFAULT_WORKERS[id] },
-			...(prev?.contextCap !== undefined ? { contextCap: prev.contextCap } : {}),
 		};
 	}
 	const config: StormConfig = {
@@ -45,7 +44,6 @@ export function recommendedConfig(recs: RoleRecommendation[], priority: Priority
 		isolation: current?.isolation ?? FIRST_ISOLATION,
 	};
 	if (current?.budget) config.budget = { ...current.budget };
-	if (current?.contextCap !== undefined) config.contextCap = current.contextCap;
 	if (current?.rounds !== undefined) config.rounds = current.rounds;
 	if (current ? current.cleanup === true : true) config.cleanup = true;
 	if (current?.docs === false) config.docs = false;

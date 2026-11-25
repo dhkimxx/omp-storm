@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { LaneKind, RoleConfig, RoleId, RoleSpec, StormConfig, WorkerRange } from "./types.ts";
+import type { LaneKind, RoleConfig, RoleId, RoleSpec, WorkerRange } from "./types.ts";
 
 /** This plugin's package.json: the one source of the version, and after `omp plugin install` the place a newer one shows up. */
 export const PACKAGE_JSON = fileURLToPath(new URL("../package.json", import.meta.url));
@@ -112,14 +112,18 @@ export const DEFAULT_WORKERS: Readonly<Record<RoleId, WorkerRange>> = {
 /** Highest `workers.max` a config may set. */
 export const MAX_WORKERS = 16;
 
-/** Default context ceiling in tokens (team setting `contextCap`). */
-export const DEFAULT_CONTEXT_CAP = 200_000;
-/** Share of the main session's window past which the director is compacted mid-run: omp's own compaction gets close there. */
-const DIRECTOR_WINDOW_SHARE = 0.7;
+/**
+ * Share of the main session's model window at which Storm compacts the director: at run start, and mid-run while it
+ * waits on subagents (omp's own compaction gets close past the mid-run share). Only a share: a fixed token count
+ * fits one window and not another.
+ */
+export const RUN_START_WINDOW_SHARE = 0.5;
+export const MID_RUN_WINDOW_SHARE = 0.7;
 
-/** The main session counts as heavy at run start from this many context tokens or this share of its window. */
-export const PREFLIGHT_TOKENS = 150_000;
-export const PREFLIGHT_SHARE = 0.5;
+/** Tokens at `share` of the window; undefined when the window is unknown, and Storm then starts no compaction. */
+export function windowThreshold(share: number, contextWindow: number | undefined): number | undefined {
+	return contextWindow !== undefined && contextWindow > 0 ? Math.floor(contextWindow * share) : undefined;
+}
 
 /** A role's worker range: a bare number n (pre-v0.8 configs) is { min: n, max: n }; absent → the role's default. */
 export function workerRange(roleId: string, role: RoleConfig | undefined): WorkerRange {
@@ -127,21 +131,6 @@ export function workerRange(roleId: string, role: RoleConfig | undefined): Worke
 	if (typeof w === "number") return { min: w, max: w };
 	if (w) return { min: w.min, max: w.max };
 	return DEFAULT_WORKERS[roleId as RoleId] ?? { min: 1, max: 1 };
-}
-
-/**
- * Tokens past which a subagent of `roleId` takes no follow-ups: the role's cap, else the team's. No share of the
- * model's window: omp compacts small-window agents itself, and this cap exists for cost.
- */
-export function followUpCap(config: Pick<StormConfig, "roles" | "contextCap"> | undefined, roleId: string | undefined): number {
-	const role = roleId === undefined ? undefined : config?.roles[roleId];
-	return role?.contextCap ?? config?.contextCap ?? DEFAULT_CONTEXT_CAP;
-}
-
-/** Tokens past which the director is compacted while it waits on subagents: the team's cap, and 70% of its window when known. */
-export function directorCap(config: Pick<StormConfig, "contextCap">, contextWindow: number | undefined): number {
-	const cap = config.contextCap ?? DEFAULT_CONTEXT_CAP;
-	return contextWindow ? Math.min(cap, Math.floor(contextWindow * DIRECTOR_WINDOW_SHARE)) : cap;
 }
 
 export const ROLE_AGENT_PREFIX = "storm-";

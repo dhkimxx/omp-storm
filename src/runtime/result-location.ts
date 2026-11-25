@@ -23,7 +23,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
-import { RESULT_ID_RE } from "../plan/validate.ts";
+import { MAX_RESULT_CONTAINS, MAX_RESULT_CRITERION, RESULT_ID_RE } from "../plan/validate.ts";
 import type { LaneResultKind, PlanLaneResult, RunResult, RunResultState } from "../types.ts";
 import {
 	type ArtifactEvidenceSource,
@@ -653,12 +653,13 @@ function resultProblem(result: unknown, limits: ReadEvidenceLimits): string | un
 	if (!isPlainObject(result)) return "결과 계약이 객체가 아닙니다.";
 	if (typeof result.id !== "string" || !RESULT_ID_RE.test(result.id)) return "결과 id가 올바르지 않습니다.";
 	if (typeof result.kind !== "string" || !(KINDS as readonly string[]).includes(result.kind)) return "결과 종류가 올바르지 않습니다.";
-	const criterion = labelProblem(result.criterion, 300, "결과 기준");
+	// The plan wire's own bounds: a contract the plan accepted is never invalid evidence for its length here.
+	const criterion = labelProblem(result.criterion, MAX_RESULT_CRITERION, "결과 기준");
 	if (criterion !== undefined) return criterion;
 	if (result.path !== undefined && safeRelative(result.path, limits.pathChars) !== result.path) {
 		return "결과 경로가 안전한 상대 경로가 아닙니다.";
 	}
-	if (result.contains !== undefined && (typeof result.contains !== "string" || result.contains.length > 500)) {
+	if (result.contains !== undefined && (typeof result.contains !== "string" || result.contains.length > MAX_RESULT_CONTAINS)) {
 		return "결과 contains 값이 올바르지 않습니다.";
 	}
 	if (result.check !== undefined && (typeof result.check !== "string" || result.check === "")) {

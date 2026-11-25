@@ -245,10 +245,16 @@ describe("source-citing answers", () => {
 		expect(prose.ok).toBe(true);
 		if (prose.ok) expect(prose.report.results[0]?.state).toBe("reviewable");
 
-		for (const wrong of ["7", "142", "14", "7 and 42"]) {
+		for (const wrong of ["7", "142", "14", "-42", "total=7"]) {
 			const contradictory = await evaluate(wrong, [{ path: "report.json", line: 2, quote: '"total": 42' }]);
 			expect(contradictory.ok).toBe(true);
 			if (contradictory.ok) expect(contradictory.report.results[0]?.state).toBe("unmet");
+		}
+		// Prose with other numbers is neither contradicted nor accepted: it goes to review.
+		for (const text of ["7 and 42", "42, measured over 3 runs in 120 ms"]) {
+			const prose = await evaluate(text, [{ path: "report.json", line: 2, quote: '"total": 42' }]);
+			expect(prose.ok).toBe(true);
+			if (prose.ok) expect(prose.report.results[0]?.state).toBe("reviewable");
 		}
 
 		const otherLine = await evaluate("42", [{ path: "report.json", line: 3 }]);

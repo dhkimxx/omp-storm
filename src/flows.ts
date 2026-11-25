@@ -742,10 +742,8 @@ export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 
 /** The subagents of this session with their context and follow-up state. */
 export async function agentsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
-	const state = await loadProjectState(env);
-	const config = state.config.status === "ok" ? state.config.config : undefined;
 	const info: InfoLine[] = [];
-	const markdown = renderAgentReport(agentRows(env.agents?.() ?? [], config), env.now(), info);
+	const markdown = renderAgentReport(agentRows(env.agents?.() ?? []), env.now(), info);
 	await ui.report("서브에이전트", markdown, info);
 }
 

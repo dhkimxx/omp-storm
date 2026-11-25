@@ -29,12 +29,17 @@
  *                           newest scoped answer-review template the child actually received (Storm's review packet or
  *                           round instruction); with no template in its context it yields no `results` at all, so a
  *                           missing packet shows up as an unsettled answer, never as a fabricated scope
+ *   E2E-CHILD-ANSWER-VERDICT-ALL <correct|incorrect>
+ *                           the same, but one `results` entry per distinct result id among every scoped template the
+ *                           child received (the newest receipt per id), so one reviewer turn can judge a whole batch
  *   E2E-CHILD-YIELD {json}  yield that exact value as `data` when the child has an output schema (a strict schema
  *                           violation then fails the run in the host, not in the text)
  *   E2E-CHILD-YIELD-ERROR <text>
  *                           yield that failure reason instead of data
  *   E2E-CHILD-CLAIM <text>  final assistant text (the whole result without a schema; ignored by a yielding run)
  *   E2E-CHILD-BIG <chars>    final assistant text with that many varied characters, for spill/limit probes
+ *   E2E-CHILD-PAD <chars>   that many characters of digit-free prose before the final claim, so the claim sits past
+ *                           the host's inline preview of a long answer
  *   E2E-CHILD-429-ONCE <key>
  *                           fail this child's first provider request with a retryable 429, once per key, so a retry
  *                           can be watched without duplicating its native job/result
@@ -422,13 +427,15 @@ function extensionCall(tools: Tool[] | undefined, name: string, args: Record<str
 	return writeCall(`xd://${name}`, JSON.stringify(args));
 }
 
-function yieldCall(schema: JsonSchema, correct = false, scoped?: ReviewScope & { verdict: "correct" | "incorrect" }): Decision {
+function yieldCall(schema: JsonSchema, correct = false, scoped?: ReadonlyArray<ReviewScope & { verdict: "correct" | "incorrect" }>): Decision {
 	const args = requiredArgs(schema);
 	if (!JSON.stringify(schema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
 	const data = {
 		...REVIEW_VERDICT,
 		overall_correctness: correct ? "correct" : "incorrect",
-		...(scoped === undefined ? {} : { results: [{ id: scoped.id, receipt: scoped.receipt, citation: scoped.citation, verdict: scoped.verdict }] }),
+		...(scoped === undefined || scoped.length === 0
+			? {}
+			: { results: scoped.map(scope => ({ id: scope.id, receipt: scope.receipt, citation: scope.citation, verdict: scope.verdict })) }),
 	};
 	// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
 	return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data } };
@@ -582,11 +589,13 @@ function childDecision(request: ChatRequest): Decision {
 	const sh = lastCapture(text, /E2E-CHILD-SH[ \t]+(\S+)/);
 	const commit = lastCapture(text, /E2E-CHILD-COMMIT[ \t]+(\S+)/);
 	const answerVerdict = lastCapture(text, /E2E-CHILD-ANSWER-VERDICT[ \t]+(correct|incorrect)\b/) as "correct" | "incorrect" | undefined;
-	const correct = lastCapture(text, /E2E-CHILD-VERDICT[ \t]+(correct)\b/) === "correct" || answerVerdict === "correct";
+	const allVerdict = lastCapture(text, /E2E-CHILD-ANSWER-VERDICT-ALL[ \t]+(correct|incorrect)\b/) as "correct" | "incorrect" | undefined;
+	const correct = lastCapture(text, /E2E-CHILD-VERDICT[ \t]+(correct)\b/) === "correct" || answerVerdict === "correct" || allVerdict === "correct";
 	const report = lastPayload(text, "E2E-CHILD-YIELD");
 	const yieldError = lastCapture(text, /E2E-CHILD-YIELD-ERROR[ \t]+([^\n]+)/);
 	const claim = lastCapture(text, /E2E-CHILD-CLAIM[ \t]+([^\n]+)/);
 	const big = Number(lastCapture(text, /E2E-CHILD-BIG[ \t]+(\d+)/) ?? 0);
+	const pad = Number(lastCapture(text, /E2E-CHILD-PAD[ \t]+(\d+)/) ?? 0);
 	const calls = callNames(messages);
 	const done = calls.filter(name => name === "read").length;
 	const last = messages.at(-1);
@@ -602,10 +611,16 @@ function childDecision(request: ChatRequest): Decision {
 		if (yieldError !== undefined) return { kind: "tool", name: "yield", args: { error: yieldError } };
 		if (report !== undefined) return { kind: "tool", name: "yield", args: { data: report } };
 	}
+	if (yieldSchema && allVerdict !== undefined) {
+		// Every scope Storm wrote into this child's context, one entry per result id; a newer receipt replaces an older one.
+		const latest = new Map<string, ReviewScope>();
+		for (const scope of scopesIn(heardText(messages))) latest.set(scope.id, scope);
+		return yieldCall(yieldSchema, correct, [...latest.values()].map(scope => ({ ...scope, verdict: allVerdict })));
+	}
 	if (yieldSchema && answerVerdict !== undefined) {
 		// Only a scope Storm actually wrote into this child's context; the newest one wins, as a re-sent packet would.
 		const scope = scopesIn(heardText(messages)).at(-1);
-		return yieldCall(yieldSchema, correct, scope === undefined ? undefined : { ...scope, verdict: answerVerdict });
+		return yieldCall(yieldSchema, correct, scope === undefined ? undefined : [{ ...scope, verdict: answerVerdict }]);
 	}
 	if (yieldSchema) return yieldCall(yieldSchema, correct);
 	if (big > 0) {
@@ -616,6 +631,11 @@ function childDecision(request: ChatRequest): Decision {
 			at += line.length + 1;
 		}
 		return { kind: "text", text: lines.join("\n").slice(0, big) };
+	}
+	if (pad > 0) {
+		// No digits: a padded answer must not state numbers beyond its claim.
+		const filler = "This padding line only lengthens the answer past the host preview.\n";
+		return { kind: "text", text: `${filler.repeat(Math.ceil(pad / filler.length)).slice(0, pad)}\n${claim ?? "OK"}` };
 	}
 	return { kind: "text", text: claim ?? "OK" };
 }
@@ -705,9 +725,16 @@ function chunk(id: string, model: string, delta: Record<string, unknown>, finish
 	return `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
 }
 
-/** Usage the fake reports: `heavy-main` claims a large prompt so Storm's run-start check sees a heavy main session. */
+/**
+ * Prompt tokens a model claims, so Storm's context checks see a known size without a real history that large. The
+ * window each one is measured against is the drivers' `models.yml`: `heavy-main` 35k on 60k (past half at run start),
+ * `tight-main` 75k on 100k (past 70% mid-run), `wide-main` 150k on 1M (the old fixed run-start number, 15% of its
+ * window), `wide-worker` 250k on 1M (a worker past the retired 200k follow-up cap).
+ */
+const CLAIMED_PROMPT: Record<string, number> = { [HEAVY_MAIN]: 35_000, "tight-main": 75_000, "wide-main": 150_000, "wide-worker": 250_000 };
+
 function usageOf(model: string): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
-	const prompt = model === HEAVY_MAIN ? 35_000 : 100;
+	const prompt = CLAIMED_PROMPT[model] ?? 100;
 	return { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10 };
 }
 

@@ -7,12 +7,16 @@
  * fingerprint to the tree it trusts and rejects failed, stale or unrun evidence.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { MAX_JOB_TIMEOUT_MS } from "../config/schema.ts";
 import type { ApprovalRecord, ConfigLoad, RequiredCheck } from "../types.ts";
 
-/** Per-check wall clock when the caller does not choose one. */
-export const DEFAULT_CHECK_TIMEOUT_MS = 120_000;
-/** A caller may ask for a longer check, but never an unbounded one. */
-export const MAX_CHECK_TIMEOUT_MS = 600_000;
+/**
+ * Per-check wall clock when the check sets none: the job default. Spelled out rather than imported because the job
+ * executor imports this module, so a check cannot depend on its own caller.
+ */
+export const DEFAULT_CHECK_TIMEOUT_MS = 10 * 60_000;
+/** A check may take as long as a configured job, never longer. */
+export const MAX_CHECK_TIMEOUT_MS = MAX_JOB_TIMEOUT_MS;
 /** Bytes kept from each stream; the rest is counted and dropped rather than carried into a conversation. */
 export const DEFAULT_CHECK_OUTPUT_BYTES = 4_096;
 export const MAX_CHECK_OUTPUT_BYTES = 65_536;
@@ -80,8 +84,6 @@ export interface RequiredChecksInput {
 	fingerprint: string;
 	/** Cancels the run and terminates its current process group with bounded teardown. */
 	signal?: AbortSignal;
-	/** Per-check limit; clamped to 1..`MAX_CHECK_TIMEOUT_MS`. */
-	timeoutMs?: number;
 	/** Bytes kept from each output stream; clamped to 1..`MAX_CHECK_OUTPUT_BYTES`. */
 	outputLimitBytes?: number;
 }
@@ -108,6 +110,11 @@ export function checkGate(config: ConfigLoad, approval: ApprovalRecord | undefin
 function numberIn(value: number | undefined, fallback: number, max: number): number {
 	if (value === undefined || !Number.isFinite(value)) return fallback;
 	return Math.min(Math.max(Math.floor(value), 1), max);
+}
+
+/** The wall clock one configured check may use: its own limit, or the job default when it sets none. */
+export function checkTimeoutMs(check: RequiredCheck): number {
+	return numberIn(check.timeoutMs, DEFAULT_CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS);
 }
 
 function unrun(check: RequiredCheck): CheckEvidence {
@@ -388,14 +395,14 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 }
 
 /**
- * Runs every configured check in order, or explains why none ran. Failures and timeouts do not stop later checks: the
- * complete set of evidence is what the runtime decides on. Cancellation marks the current check `cancelled` and every
- * later one `unrun`, and makes the report `aborted`.
+ * Runs every configured check in order, or explains why none ran. Each check uses its own time limit, or the job
+ * default when it sets none. Failures and timeouts do not stop later checks: the complete set of evidence is what the
+ * runtime decides on. Cancellation marks the current check `cancelled` and every later one `unrun`, and makes the
+ * report `aborted`.
  */
 export async function runRequiredChecks(input: RequiredChecksInput): Promise<RequiredChecksResult> {
 	const gate = checkGate(input.config, input.approval);
 	if (gate.status === "skipped") return gate;
-	const timeoutMs = numberIn(input.timeoutMs, DEFAULT_CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS);
 	const outputLimitBytes = numberIn(input.outputLimitBytes, DEFAULT_CHECK_OUTPUT_BYTES, MAX_CHECK_OUTPUT_BYTES);
 	const startedAt = new Date().toISOString();
 	const began = performance.now();
@@ -411,7 +418,7 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 		const result = await runBoundedProcess({
 			argv: check.argv,
 			cwd: input.cwd,
-			timeoutMs,
+			timeoutMs: checkTimeoutMs(check),
 			outputLimitBytes,
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 		});

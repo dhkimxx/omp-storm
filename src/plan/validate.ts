@@ -30,16 +30,34 @@ export interface PlanCheck {
 	warnings: string[];
 }
 
-export const MAX_LANES = 50;
-/** Lane goal and progress are one-line labels, not reports; both trim and share this bound. */
-export const MAX_LANE_TEXT = 200;
-/** A lane names a bounded set of required results; each is one observable claim, not a report. */
-export const MAX_LANE_RESULTS = 8;
+/**
+ * Plan-size bounds: per-field sanity limits, not targets, plus one total-size limit. A real plan is a few tens of KiB
+ * and any single field here is far beyond what one uses. Per-field limits alone cannot protect the record because
+ * they multiply; MAX_PLAN_BYTES is the bound that does.
+ */
+export const MAX_LANES = 256;
+/** Lane goal, progress, isolation reason and the plan note are prose, not reports; all trim and share this bound. */
+export const MAX_LANE_TEXT = 4_000;
+/** A lane name is a handle repeated by every dependency edge and message; long enough for any real one. */
+export const MAX_LANE_NAME = 512;
+/** A lane names required results; each is one observable claim, not a report. */
+export const MAX_LANE_RESULTS = 48;
 /** Stable ids are plan-wide identifiers, not prose: bounded and restricted so a typo cannot silently retarget one. */
 export const MAX_RESULT_ID = 64;
-export const MAX_RESULT_CRITERION = 300;
-export const MAX_RESULT_CONTAINS = 500;
+export const MAX_RESULT_CRITERION = 4_000;
+export const MAX_RESULT_CONTAINS = 4_000;
 export const MAX_RESULT_PATH = 256;
+/** A lane's write scope may name a large subsystem; the total plan bound, not this count, protects the record. */
+export const MAX_LANE_FILES = 5_000;
+/**
+ * The plan's total charge in UTF-8 bytes: the serialized plan, its per-result contracts once more (the record keeps a
+ * row per result with the contract), and a fixed row envelope (id, lane, state, 64-character identity, keys) per
+ * result. At 2 MiB the largest plan and record this admits stay near 2.4 MB, about 29 % of RUN_RECORD_MAX_BYTES
+ * (8 MiB); a real plan is a few tens of KiB.
+ */
+export const MAX_PLAN_BYTES = 2 * 1024 * 1024;
+/** The fixed part of one result row in the record, measured on `{id, lane, state, identity, contract}` at ~274 bytes. */
+const RESULT_ROW_BYTES = 512;
 export const RESULT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const RESULT_KINDS = ["change", "artifact", "answer"] as const satisfies readonly LaneResultKind[];
 const RESULT_KEYS: Readonly<Record<string, true>> = {
@@ -51,7 +69,7 @@ const RESULT_KEYS: Readonly<Record<string, true>> = {
 	check: true,
 };
 /** A lane names a bounded set of prerequisites; one edge per prerequisite lane. */
-export const MAX_LANE_DEPENDENCIES = 8;
+export const MAX_LANE_DEPENDENCIES = 48;
 /** The states a consumer may wait for. A prerequisite edge is plan input, never proof that its need holds. */
 export const LANE_NEEDS = ["result", "integrated", "reviewable"] as const satisfies readonly LaneNeed[];
 const DEPENDENCY_KEYS: Readonly<Record<string, true>> = { lane: true, need: true };
@@ -336,8 +354,8 @@ function readLaneDependencies(value: unknown, path: string, errors: string[]): P
 			errors.push(`${at}.lane: 비어 있지 않은 레인 이름이어야 합니다`);
 		} else if (UNSAFE_LINE.test(lane)) {
 			errors.push(`${at}.lane: 제어 문자나 줄바꿈 없이 한 줄이어야 합니다`);
-		} else if (lane.length > MAX_LANE_TEXT) {
-			errors.push(`${at}.lane: ${MAX_LANE_TEXT}자 이하여야 합니다`);
+		} else if (lane.length > MAX_LANE_NAME) {
+			errors.push(`${at}.lane: ${MAX_LANE_NAME}자 이하여야 합니다`);
 		} else if (seen.has(lane)) {
 			errors.push(`${at}.lane: 같은 선행 레인을 중복 참조했습니다 (${lane})`);
 		} else {
@@ -450,6 +468,7 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		}
 		const name = typeof l.name === "string" ? l.name.trim() : "";
 		if (!name) errors.push(`${path}.name: 비어 있지 않은 문자열이어야 합니다`);
+		else if (name.length > MAX_LANE_NAME) errors.push(`${path}.name: ${MAX_LANE_NAME}자 이하여야 합니다`);
 		else if (names.has(name)) errors.push(`${path}.name: 중복된 이름입니다 (${name})`);
 		names.add(name);
 		const kind = l.kind;
@@ -461,6 +480,13 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		if (files !== undefined && !(Array.isArray(files) && files.every((f) => typeof f === "string"))) {
 			errors.push(`${path}.files: 문자열 배열이어야 합니다`);
 			return;
+		}
+		if (files !== undefined) {
+			const list = files as string[];
+			if (list.length > MAX_LANE_FILES) {
+				errors.push(`${path}.files: 파일 ${MAX_LANE_FILES}개 이하여야 합니다`);
+				return;
+			}
 		}
 		const job = l.job;
 		if (job !== undefined && (kind !== "run" || typeof job !== "string" || !config.jobs?.some(candidate => candidate.name === job))) {
@@ -572,8 +598,27 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		}
 	}
 
+	const note = typeof input.note === "string" ? input.note.trim() : "";
+	if (note.length > MAX_LANE_TEXT) errors.push(`plan.note: ${MAX_LANE_TEXT}자 이하여야 합니다`);
 	if (errors.length) return { errors, outOfBounds, warnings };
 	const plan: RunPlan = { lanes, workers, submittedAt: new Date(now).toISOString() };
-	if (typeof input.note === "string" && input.note.trim()) plan.note = input.note.trim();
+	if (note) plan.note = note;
+	// Every field may be legal on its own and the record still be unreadable: the record keeps the plan, a row per
+	// result with that contract again, and a fixed row envelope. Charge all three, in the UTF-8 bytes actually written
+	// (a character count would miss CJK text), so one number bounds the record whatever the mix.
+	const results = lanes.flatMap(lane => lane.results ?? []);
+	const bytes =
+		Buffer.byteLength(JSON.stringify(plan), "utf8") +
+		Buffer.byteLength(JSON.stringify(results), "utf8") +
+		results.length * RESULT_ROW_BYTES;
+	if (bytes > MAX_PLAN_BYTES) {
+		return {
+			errors: [
+				`plan: 계획 전체 크기(결과 계약 사본 포함)가 ${bytes}바이트로 한도 ${MAX_PLAN_BYTES}바이트를 ${bytes - MAX_PLAN_BYTES}바이트 초과했습니다. 레인·필수 결과·텍스트·파일 목록을 줄여 다시 제출하세요`,
+			],
+			outOfBounds,
+			warnings,
+		};
+	}
 	return { plan, errors, outOfBounds, warnings };
 }

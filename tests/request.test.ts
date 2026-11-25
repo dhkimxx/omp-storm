@@ -46,7 +46,8 @@ describe("run spec", () => {
 		expect(spec("t", { rounds: 3 })).toEqual({ task: "t", rounds: 3 });
 		expect(spec("t", { minutes: 30 })).toEqual({ task: "t", minutes: 30 });
 		expect(spec("t", { rounds: 1, minutes: 0.5 })).toEqual({ task: "t", rounds: 1, minutes: 0.5 });
-		expect(spec("t", { rounds: 20, minutes: 1440 })).toEqual({ task: "t", rounds: 20, minutes: 1440 });
+		// A stated limit has no upper bound: more rounds or minutes than any earlier fixed cap still run.
+		expect(spec("t", { rounds: 30, minutes: 3_000 })).toEqual({ task: "t", rounds: 30, minutes: 3_000 });
 	});
 
 	test("a non-empty resumeOf is passed through; an empty one is no resume", () => {
@@ -55,9 +56,9 @@ describe("run spec", () => {
 		expect(spec("t", undefined, "   ")).toEqual({ task: "t" });
 	});
 
-	test("a limit outside what a run accepts is an error", () => {
-		for (const rounds of [0, -1, 2.5, 21, Number.NaN]) expect(spec("t", { rounds })).toBeUndefined();
-		for (const minutes of [0, -1, 1441, Number.POSITIVE_INFINITY, Number.NaN]) expect(spec("t", { minutes })).toBeUndefined();
+	test("a round count that is not a positive integer, or a minute limit that is not positive and finite, is an error", () => {
+		for (const rounds of [0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) expect(spec("t", { rounds })).toBeUndefined();
+		for (const minutes of [0, -1, Number.POSITIVE_INFINITY, Number.NaN]) expect(spec("t", { minutes })).toBeUndefined();
 	});
 });
 
@@ -86,15 +87,14 @@ describe("route: the side turn's reply", () => {
 		expect(parseRouteReply('{"action":"run","rounds":3}', TEXT)).toEqual({ action: "run", spec: { task: TEXT, rounds: 3 } });
 		expect(parseRouteReply('{"action":"run","minutes":30}', TEXT)).toEqual({ action: "run", spec: { task: TEXT, minutes: 30 } });
 		expect(parseRouteReply('{"action":"run","rounds":3,"minutes":30}', TEXT)).toEqual({ action: "run", spec: { task: TEXT, rounds: 3, minutes: 30 } });
+		expect(parseRouteReply('{"action":"run","rounds":30,"minutes":3000}', TEXT)).toEqual({ action: "run", spec: { task: TEXT, rounds: 30, minutes: 3000 } });
 		expect(parseRouteReply('{"action":"run","rounds":null,"minutes":null}', TEXT)).toEqual({ action: "run", spec: { task: TEXT } });
 		const invalid = [
 			'{"action":"run","rounds":"3"}',
 			'{"action":"run","rounds":0}',
 			'{"action":"run","rounds":2.5}',
-			'{"action":"run","rounds":21}',
 			'{"action":"run","minutes":-1}',
 			'{"action":"run","minutes":0}',
-			'{"action":"run","minutes":1441}',
 			'{"action":"run","minutes":"30"}',
 		];
 		for (const reply of invalid) expect(parseRouteReply(reply, TEXT)).toBeUndefined();

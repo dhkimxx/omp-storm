@@ -558,29 +558,19 @@ describe("activeAgents", () => {
 
 describe("follow-ups", () => {
 	const write = (id: string) => ({ path: `agent://${id}`, content: "fix the findings" });
-	const blockOf = (agents: AgentEntry[], c: StormConfig = config, id = "Rev") => followUpBlock("write", write(id), agents, c)?.code;
+	const blockOf = (agents: AgentEntry[], id = "Rev") => followUpBlock("write", write(id), agents)?.code;
 
-	test("an agent at or past the team cap takes no follow-up; below it one passes", () => {
+	test("context size never refuses a follow-up, however far past the old 200k cap", () => {
 		expect(blockOf([ledgerAgent({ contextTokens: 199_999 })])).toBeUndefined();
-		expect(blockOf([ledgerAgent({ contextTokens: 200_000 })])).toBe("followup-cap");
-		expect(blockOf([ledgerAgent({ contextTokens: 60_000 })], { ...config, contextCap: 50_000 })).toBe("followup-cap");
-	});
-
-	test("the role's cap overrides the team's", () => {
-		const roleCap: StormConfig = { ...config, contextCap: 50_000, roles: { ...config.roles, reviewer: { ...config.roles.reviewer!, contextCap: 300_000 } } };
-		expect(blockOf([ledgerAgent({ contextTokens: 250_000 })], roleCap)).toBeUndefined();
-		expect(blockOf([ledgerAgent({ contextTokens: 300_000 })], roleCap)).toBe("followup-cap");
-	});
-
-	test("the cap has no share of the model's window: a small-window agent is allowed far past 70% of it", () => {
-		// 95k of a 100k window was blocked at 70k before; omp compacts such agents itself.
+		expect(blockOf([ledgerAgent({ contextTokens: 200_000 })])).toBeUndefined();
+		expect(blockOf([ledgerAgent({ contextTokens: 900_000 })])).toBeUndefined();
 		expect(blockOf([ledgerAgent({ contextTokens: 95_000, model: "mistral/small-100k" })])).toBeUndefined();
 	});
 
-	test("the cap covers agents of earlier runs and agents no run started", () => {
-		expect(blockOf([ledgerAgent({ runId: "run-0", contextTokens: 400_000 })])).toBe("followup-cap");
+	test("agents of earlier runs and agents no run started take follow-ups too", () => {
+		expect(blockOf([ledgerAgent({ runId: "run-0", contextTokens: 400_000 })])).toBeUndefined();
 		const { runId: _runId, ...noRun } = ledgerAgent({ contextTokens: 400_000 });
-		expect(blockOf([noRun])).toBe("followup-cap");
+		expect(blockOf([noRun])).toBeUndefined();
 	});
 
 	test("a cleaned agent takes none, whatever its context", () => {
@@ -589,18 +579,18 @@ describe("follow-ups", () => {
 	});
 
 	test("the reason names the handle a fresh agent reads", () => {
-		const block = followUpBlock("write", write("Rev"), [ledgerAgent({ contextTokens: 200_000 })], config);
+		const block = followUpBlock("write", write("Rev"), [ledgerAgent({ cleanedAt: NOW })]);
 		expect(block?.reason).toContain("agent://Rev");
 		expect(block?.reason).toContain("storm-reviewer");
 	});
 
 	test("other tools, other paths and unknown agents pass; ids match as omp resolves them", () => {
-		const capped = [ledgerAgent({ contextTokens: 900_000 })];
-		expect(followUpBlock("read", write("Rev"), capped, config)).toBeUndefined();
-		expect(followUpBlock("write", { path: "local://notes.md", content: "x" }, capped, config)).toBeUndefined();
-		expect(blockOf(capped, config, "Nobody")).toBeUndefined();
-		expect(blockOf(capped, config, "rev")).toBe("followup-cap");
-		expect(followUpBlock("write", { path: "agent://Rev?progress", content: "x" }, capped, config)?.code).toBe("followup-cap");
+		const cleaned = [ledgerAgent({ cleanedAt: NOW })];
+		expect(followUpBlock("read", write("Rev"), cleaned)).toBeUndefined();
+		expect(followUpBlock("write", { path: "local://notes.md", content: "x" }, cleaned)).toBeUndefined();
+		expect(blockOf(cleaned, "Nobody")).toBeUndefined();
+		expect(blockOf(cleaned, "rev")).toBe("followup-cleaned");
+		expect(followUpBlock("write", { path: "agent://Rev?progress", content: "x" }, cleaned)?.code).toBe("followup-cleaned");
 		expect(followUpAgent([ledgerAgent({ id: "rev" }), ledgerAgent({ id: "Rev" })], "Rev")?.id).toBe("Rev");
 	});
 
