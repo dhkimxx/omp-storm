@@ -24,7 +24,16 @@ import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { type ActionOutcome, type ActionReply, NO_CONFIG } from "../request/actions.ts";
 import { runSpec } from "../request/args.ts";
 import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
-import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, closeoutSessionId, parseCloseout } from "../runtime/closeout.ts";
+import {
+	CLOSEOUT_NEXT_COUNT,
+	CLOSEOUT_NEXT_MAX,
+	CLOSEOUT_RESULT_MAX,
+	CLOSEOUT_TEXT_MAX,
+	CLOSEOUT_WHY_MAX,
+	type CloseoutNext,
+	closeoutSessionId,
+	parseCloseout,
+} from "../runtime/closeout.ts";
 import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { StormToolHost } from "./host.ts";
@@ -49,12 +58,13 @@ const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
 const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
+const NEXT_KINDS = ["resume", "run", "user"] as const satisfies readonly CloseoutNext["kind"][];
 
 const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
 - run {task}: queue the request verbatim, then end the turn.
 - plan {plan}: before work; it opens this request's run. Non-review lanes need results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
 - execute {lanes}: planned job lanes, not AI workers; exit and an exact stdout marker prove execution only.
-- brief {brief}: stages result, verification, remaining? and three next directions (first recommended); never verifies or ends the run. Skip trivial.
+- brief {brief}: stages result, verification, remaining? and 0-3 next, best first: resume, run {task} for new scope, user {text} for the user; never verifies or ends the run. Skip trivial.
 - status: team, approval, runs and approved job names.
 - agents: existing workers and follow-up allowance.
 Team changes: /storm.`;
@@ -141,18 +151,31 @@ function stormParams(z: Zod): StormToolSchema {
 			.describe("plan: lanes and workers"),
 		brief: z
 			.object({
-				result: z.string().max(CLOSEOUT_TEXT_MAX).describe("What the run delivered, with locations"),
+				result: z.string().max(CLOSEOUT_RESULT_MAX).describe("What the run delivered, with locations"),
 				verification: z.string().max(CLOSEOUT_TEXT_MAX).describe("What proves it, with locations"),
-				remaining: z.string().max(CLOSEOUT_TEXT_MAX).optional().describe("Still open; omit if none"),
+				remaining: z.string().max(CLOSEOUT_RESULT_MAX).optional().describe("Still open; omit if none"),
 				next: z
-					.array(z.string().max(CLOSEOUT_NEXT_MAX))
-					.refine(directions => directions.length === 3, "next: 정확히 세 방향이어야 합니다")
-					.transform(directions => directions as [string, string, string])
-					.describe("Three concrete directions; first recommended"),
+					.array(
+						z
+							.object({
+								kind: z.enum(NEXT_KINDS),
+								task: z.string().max(CLOSEOUT_NEXT_MAX).optional(),
+								why: z.string().max(CLOSEOUT_WHY_MAX).optional(),
+								text: z.string().max(CLOSEOUT_NEXT_MAX).optional(),
+							})
+							.strict(),
+					)
+					.max(CLOSEOUT_NEXT_COUNT)
+					.optional()
+					.describe("0-3 distinct, best first"),
 			})
 			.transform(value => {
-				const { remaining, ...rest } = value;
-				return remaining === undefined ? rest : { ...rest, remaining };
+				const { remaining, next, ...rest } = value;
+				// Explicit undefined fields are dropped so the domain parser sees only what was sent.
+				const directions = (next ?? []).map(item =>
+					Object.fromEntries(Object.entries(item).filter(([, field]) => field !== undefined)),
+				) as unknown as CloseoutNext[];
+				return remaining === undefined ? { ...rest, next: directions } : { ...rest, remaining, next: directions };
 			})
 			.optional()
 			.describe("brief: result, verification and next directions"),
@@ -202,11 +225,11 @@ const AUTO_RUN_REJECTED =
 const AUTO_NO_TASK =
 	"자동 위임에서 실행을 열 사용자 요청을 찾지 못했습니다. 계획을 저장하지 않았습니다. 사용자에게 요청을 새로 입력해 달라고 안내하세요. 사진이나 첨부만 있고 글이 없는 요청은 실행으로 열 수 없습니다.";
 const BRIEF_INVALID =
-	"마무리 보고가 올바르지 않습니다. result(결과), verification(검증 근거), next(구체적인 다음 방향 3개, 첫 번째가 추천)를 증거 위치와 함께 적어 다시 제출하세요. 단순 조회에는 쓰지 않습니다.";
+	"마무리 보고가 올바르지 않습니다. result(결과)와 verification(검증 근거)을 증거 위치와 함께 한 줄씩 적고, next는 서로 다른 0~3개로 다시 제출하세요. 이어 가기는 {kind:\"resume\"}, 새 범위 작업은 {kind:\"run\", task}, 사용자가 직접 할 일은 {kind:\"user\", text}입니다. 단순 조회에는 쓰지 않습니다.";
 const BRIEF_NO_HOST =
 	"이 호스트에서는 마무리 보고를 준비할 수 없습니다. 보고 내용은 응답에 직접 적고, 실행 종료는 Storm에 맡기세요.";
 const BRIEF_STAGED =
-	"마무리 보고를 준비했습니다. 최종 검증과 실행 종료는 Storm 검증 게이트가 결정합니다. 다음 방향 메뉴는 실행이 끝난 뒤 Storm이 사용자에게 보여주므로 응답에 번호 목록을 다시 쓰지 말고, 검증 전에는 검증됐다고 말하지 마세요. 이후 라운드에서 결과가 바뀌면 새 보고로 다시 제출하세요.";
+	"마무리 보고를 준비했습니다. 최종 판정과 실행 종료는 Storm 검증 게이트가 결정하고, 실행이 끝나면 Storm이 공식 결과를 먼저 보여줍니다. 짧고 깨끗하게 끝나면 한 줄 기록만 남으니 평소처럼 설명하고, 미해결·잔여 위험이 있거나 오래 걸린 실행은 카드에 이 보고의 결과와 남은 일이 실리므로 응답은 짧게 마치세요. 응답에 번호 목록을 다시 쓰지 말고, 검증 전에는 검증됐다고 말하지 마세요. 이후 라운드에서 결과가 바뀌면 새 보고로 다시 제출하세요.";
 
 interface Current {
 	state: ProjectState;

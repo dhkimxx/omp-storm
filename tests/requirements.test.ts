@@ -14,7 +14,19 @@ import type { AttemptSettlement } from "../src/runtime/attempt-bridge.ts";
 import type { AttemptReport } from "../src/runtime/attempt-report.ts";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { resetLedger } from "../src/runtime/ledger.ts";
-import { currentInputVersion, requirementConflict, staleRequirementIds } from "../src/runtime/requirements.ts";
+import {
+	attemptInputsCurrent,
+	changedInputRequirements,
+	currentInputVersion,
+	declaredInputFingerprint,
+	declaredInputs,
+	recordedInputsMatch,
+	requirementConflict,
+	resultInputs,
+	sameDeclaredInputs,
+	staleRequirementIds,
+	staleRequirementIdsForPlan,
+} from "../src/runtime/requirements.ts";
 import { resultContractIdentity } from "../src/runtime/result-evidence.ts";
 import type { AgentEntry, RunPlan, RunResult, StormConfig } from "../src/types.ts";
 import { fakeSession, until, type FakeSession } from "./fake-session.ts";
@@ -152,6 +164,121 @@ describe("requirement identity and dependency fingerprints", () => {
 		expect([...staleRequirementIds(missing)]).toEqual(["a"]);
 		missing[0] = { id: "b", state: "accepted", contentVersion: "v1" };
 		expect([...staleRequirementIds(missing)]).toEqual(["a"]);
+	});
+});
+
+describe("logical upstream identity and strength", () => {
+	const contract = (id: string) => ({ id, kind: "change" as const, criterion: `${id} is visible`, path: `${id}.txt`, contains: "ok" });
+	type Edge = NonNullable<RunPlan["lanes"][number]["dependsOn"]>[number];
+	const planWith = (consumer: string, producer: string, edges: Edge[]): RunPlan =>
+		planFor(
+			[
+				{ name: producer, kind: "code", role: "implementer", results: [contract("b-result")] },
+				{ name: "c", kind: "code", role: "explorer", results: [contract("c-result")] },
+				{ name: consumer, kind: "code", role: "quick", results: [contract("a-result")], dependsOn: edges },
+				{ name: "d", kind: "code", role: "reviewer", results: [contract("d-result")], dependsOn: [{ lane: consumer, need: "result" }] },
+			],
+			{},
+		);
+	const laneOf = (plan: RunPlan, name: string) => plan.lanes.find(lane => lane.name === name)!;
+
+	test("producer and consumer renames keep the exact logical input fingerprint", () => {
+		const base = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const renamed = planWith("a-moved", "b-moved", [{ lane: "b-moved", need: "result" }]);
+		const before = declaredInputs(base, laneOf(base, "a"));
+		expect(before).toEqual([{ id: "b-result", need: "result" }]);
+		expect(sameDeclaredInputs(before, declaredInputs(renamed, laneOf(renamed, "a-moved")))).toBe(true);
+		expect(declaredInputFingerprint(before)).toBe(declaredInputFingerprint(declaredInputs(renamed, laneOf(renamed, "a-moved"))));
+		expect([...changedInputRequirements(base, renamed)]).toEqual([]);
+		expect(resultInputs(renamed, "a-result")).toEqual(before);
+		expect(attemptInputsCurrent(renamed, ["a-result"], before)).toBe(true);
+	});
+
+	test("order and duplicate weaker edges are equivalent; added, removed, swapped or re-levelled inputs change", () => {
+		const base = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const before = declaredInputs(base, laneOf(base, "a"));
+		const reversed = planWith("a", "b", [{ lane: "c", need: "integrated" }, { lane: "b", need: "result" }]);
+		const two = planWith("a", "b", [{ lane: "b", need: "result" }, { lane: "c", need: "integrated" }]);
+		expect(declaredInputFingerprint(declaredInputs(reversed, laneOf(reversed, "a"))))
+			.toBe(declaredInputFingerprint(declaredInputs(two, laneOf(two, "a"))));
+		const duplicate = planWith("a", "b", [{ lane: "b", need: "reviewable" }, { lane: "b", need: "result" }]);
+		expect(sameDeclaredInputs(before, declaredInputs(duplicate, laneOf(duplicate, "a")))).toBe(true);
+		expect([...changedInputRequirements(base, duplicate)]).toEqual([]);
+
+		const swapped = planWith("a", "b", [{ lane: "c", need: "result" }]);
+		const added = planWith("a", "b", [{ lane: "b", need: "result" }, { lane: "c", need: "result" }]);
+		const removed = planWith("a", "b", []);
+		const weaker = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
+		for (const next of [swapped, added, removed, weaker]) {
+			expect([...changedInputRequirements(base, next)]).toEqual(["a-result"]);
+			expect(attemptInputsCurrent(next, ["a-result"], before)).toBe(false);
+		}
+		expect(resultInputs(swapped, "z-result")).toBeUndefined();
+		expect(attemptInputsCurrent(swapped, ["z-result"], before)).toBe(false);
+	});
+
+	test("the recorded producer-id snapshot compares as an unordered identity set; versions are not its half", () => {
+		const base = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const before = declaredInputs(base, laneOf(base, "a"));
+		expect(recordedInputsMatch(before, [{ id: "b-result", version: "v1" }])).toBe(true);
+		expect(recordedInputsMatch(before, [{ id: "b-result", version: "missing" }])).toBe(true);
+		expect(recordedInputsMatch(before, [])).toBe(false);
+		expect(recordedInputsMatch(before, undefined)).toBe(false);
+		expect(recordedInputsMatch(before, [{ id: "c-result", version: "v1" }])).toBe(false);
+		expect(recordedInputsMatch([], undefined)).toBe(true);
+		const two = planWith("a", "b", [{ lane: "b", need: "result" }, { lane: "c", need: "integrated" }]);
+		const both = declaredInputs(two, laneOf(two, "a"));
+		expect(recordedInputsMatch(both, [{ id: "c-result", version: "vc" }, { id: "b-result", version: "vb" }])).toBe(true);
+		expect(recordedInputsMatch(both, [{ id: "b-result", version: "vb" }, { id: "b-result", version: "vb" }])).toBe(false);
+	});
+
+	test("a replanned input swap reopens the consumer and its consumers before any row write", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const next = planWith("a", "b", [{ lane: "c", need: "result" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "c-result", state: "accepted", contentVersion: "vc" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+			{ id: "d-result", state: "accepted", contentVersion: "vd", consumed: [{ id: "a-result", version: "va" }] },
+		];
+		expect([...staleRequirementIds(rows)]).toEqual([]);
+		expect([...staleRequirementIdsForPlan(rows, previous)]).toEqual([]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous)].sort()).toEqual(["a-result", "d-result"]);
+		const renamed = planWith("a-moved", "b-moved", [{ lane: "b-moved", need: "result" }]);
+		expect([...staleRequirementIdsForPlan(rows, renamed, previous)]).toEqual([]);
+	});
+
+	test("a different edge level or a weaker current producer state reopens even with the same content version", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
+		const next = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+			{ id: "d-result", state: "accepted", contentVersion: "vd", consumed: [{ id: "a-result", version: "va" }] },
+			{ id: "c-result", state: "accepted", contentVersion: "vc" },
+		];
+		expect([...changedInputRequirements(previous, next)]).toEqual(["a-result"]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous)].sort()).toEqual(["a-result", "d-result"]);
+		// Same plan, same bytes: an accepted producer downgraded to reviewable no longer satisfies a `result` edge.
+		const lowered = rows.map(row => (row.id === "b-result" ? { ...row, state: "reviewable" as const } : row));
+		expect([...staleRequirementIds(lowered)]).toEqual([]);
+		expect([...staleRequirementIdsForPlan(lowered, next)].sort()).toEqual(["a-result", "d-result"]);
+		// A reviewable producer remains usable for a `reviewable` edge.
+		const weak = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
+		expect([...staleRequirementIdsForPlan(lowered, weak)]).toEqual([]);
+	});
+
+	test("a missing recorded fingerprint, a finalized marker, or an orphan id does not exempt plan invalidation", () => {
+		const plan = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", finalized: "revoked" },
+			{ id: "d-result", state: "accepted", contentVersion: "vd", consumed: [{ id: "a-result", version: "va" }] },
+			{ id: "orphan-result", state: "accepted", contentVersion: "vo" },
+			{ id: "c-result", state: "accepted", contentVersion: "vc" },
+		];
+		expect([...staleRequirementIdsForPlan(rows, plan)].sort()).toEqual(["a-result", "d-result"]);
+		expect([...staleRequirementIdsForPlan(rows, undefined)]).toEqual([]);
 	});
 });
 

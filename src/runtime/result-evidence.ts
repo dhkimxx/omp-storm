@@ -1163,56 +1163,138 @@ interface VerifiedCitation {
 
 /**
  * Numeric facts only: file names and citation line references are stripped first so `report.json:2` cannot make the
- * answer look like it states `2`. A decimal is one fact; a number inside a longer token (`142`, `v2`) is not split.
+ * answer look like it states `2`. A decimal is one fact; a number inside a longer token (`142`, `v2`) is not split. A
+ * leading sign that is not part of a range or identifier is part of the fact, so `-42` and `42` are different facts
+ * (U+2212 is a minus; `+42` and `-0` are the unsigned value).
  */
 function numericFacts(text: string): string[] {
 	const cleaned = text
 		.replace(/\b[A-Za-z][A-Za-z0-9._/-]*\.(?:json|md|txt|ts|tsx|js|jsx|mjs|cjs|yaml|yml|toml|log|patch|diff)(?::\d+)?/giu, " ")
 		.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/\S+/gu, " ");
 	const values: string[] = [];
-	for (const match of cleaned.matchAll(/(?:^|[^\p{L}\p{N}_.])(\d+(?:\.\d+)?)(?![\p{L}\p{N}_.])/gu)) {
-		if (match[1] !== undefined) values.push(match[1]);
+	for (const match of cleaned.matchAll(/(?<![\p{L}\p{N}_.])([-+\u2212](?=\d))?(\d+(?:\.\d+)?)(?![\p{L}\p{N}_.])/gu)) {
+		const digits = match[2];
+		if (digits === undefined) continue;
+		values.push(signedNumber(match[1], digits));
 	}
 	return values;
 }
 
-function wholeWord(text: string, token: string): boolean {
-	const escaped = token.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-	return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}([^\\p{L}\\p{N}_]|$)`, "iu").test(text);
+function signedNumber(sign: string | undefined, digits: string): string {
+	const negative = sign === "-" || sign === "\u2212";
+	return negative && /[1-9]/u.test(digits) ? `-${digits}` : digits;
 }
 
+/** A spelled-out sign makes a bare digit unreliable as a numeric fact; such an answer is never judged by its digits. */
+const SIGN_WORD = /(?:^|[^\p{L}])(?:minus|negative|positive|음수|양수|마이너스|플러스)(?:[^\p{L}]|$)/iu;
+
+/** Comparison form: case, whitespace, wrapping quotes/backticks and one trailing sentence stop are not content. */
+function canonicalText(value: string): string {
+	return value
+		.normalize("NFKC")
+		.replace(/\u2212/gu, "-")
+		.replace(/\s+/gu, " ")
+		.trim()
+		.replace(/[.。!！]+$/u, "")
+		.trim()
+		.replace(/^[`"'\u201c\u2018]+|[`"'\u201d\u2019]+$/gu, "")
+		.trim()
+		.toLowerCase();
+}
+
+/** One typed scalar: a signed number, a boolean, null or a quoted string. Bare prose is never a scalar. */
+type Scalar = { type: "number" | "boolean" | "null" | "string"; value: string };
+
+function scalarOf(raw: string): Scalar | undefined {
+	const text = raw.normalize("NFKC").replace(/\u2212/gu, "-").trim().replace(/[,;]$/u, "").trim();
+	const number = /^([-+]?)(\d+(?:\.\d+)?)$/u.exec(text);
+	if (number !== null) return { type: "number", value: signedNumber(number[1], number[2] as string) };
+	const lower = text.toLowerCase();
+	if (lower === "true" || lower === "false") return { type: "boolean", value: lower };
+	if (lower === "null") return { type: "null", value: "null" };
+	const quoted = /^(["'`])(.*)\1$/u.exec(text);
+	if (quoted !== null && quoted[2] !== undefined && !/["'`]/u.test(quoted[2])) return { type: "string", value: quoted[2] };
+	return undefined;
+}
+
+/** `key: value`, `key = value` or `"key": value` on one line, with a typed scalar value. Anything else is not typed. */
+function typedPairOf(raw: string): { key: string; value: Scalar } | undefined {
+	const text = raw.trim();
+	if (text.includes("\n")) return undefined;
+	const pair = /^["'`]?([A-Za-z_][A-Za-z0-9_.-]*)["'`]?\s*[:=]\s*(.+)$/u.exec(text);
+	if (pair === null || pair[1] === undefined || pair[2] === undefined) return undefined;
+	const value = scalarOf(pair[2]);
+	return value === undefined ? undefined : { key: pair[1].toLowerCase(), value };
+}
+
+/** The typed value a whole text states: a bare scalar or one `key: value` pair; prose has none. */
+function typedValueOf(text: string): { key?: string; value: Scalar } | undefined {
+	const scalar = scalarOf(text.trim().replace(/[.。]$/u, ""));
+	if (scalar !== undefined) return { value: scalar };
+	return typedPairOf(text);
+}
+
+/** A trailing `(file.ext:line)` reference list is the answer's citation, not its content. */
+const TRAILING_REFERENCE = /\s*\((?:[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?)(?:\s*,\s*[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?)*\)\s*([.。]?)\s*$/u;
+
 /**
- * A factual answer may be accepted without `contains` only when a verified citation's own excerpt supports it. A
- * numeric fact must match exactly (never as a substring of another number); otherwise a distinctive word must match.
+ * The typed value a whole answer states: what `typedValueOf` reads, or exactly `[the] <key> is|equals <scalar>` with at
+ * most a trailing citation reference. Any other word (`not`, `about`, a second clause) leaves the answer untyped.
  */
-function answerAligns(answer: string, excerpt: string): boolean {
-	const answerFacts = numericFacts(answer);
-	const excerptFacts = numericFacts(excerpt);
-	if (excerptFacts.length > 0) {
-		return answerFacts.length > 0 && answerFacts.every(fact => excerptFacts.includes(fact));
-	}
-	const tokens = excerpt.match(/[\p{L}_][\p{L}\p{N}_.-]{3,}/gu) ?? [];
-	return tokens.some(token => wholeWord(answer, token));
+function answerTypedValueOf(answer: string): { key?: string; value: Scalar } | undefined {
+	const text = answer.replace(TRAILING_REFERENCE, "$1").trim();
+	const typed = typedValueOf(text);
+	if (typed !== undefined) return typed;
+	const statement = /^(?:the\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s+(?:is|equals)\s+(.+?)\s*[.。]?$/iu.exec(text);
+	if (statement === null || statement[1] === undefined || statement[2] === undefined) return undefined;
+	const value = scalarOf(statement[2]);
+	return value === undefined ? undefined : { key: statement[1].toLowerCase(), value };
 }
 
 type AnswerAgreement = "supported" | "contradicted" | "unverifiable";
 
 /**
- * A declared `contains` must support the reported answer, not only exist somewhere in the file. With numbers, the
- * answer's numeric facts must be exactly the declared ones (so `7` and `142` never pass for `42`); without numbers,
- * only the literal itself counts as support. Anything else is reviewable, never automatically accepted.
+ * Deterministic agreement between a whole answer and one cited statement, with no token-overlap heuristic:
+ * - the same text (after `canonicalText`) is support;
+ * - a typed answer (a bare scalar, `key: value` or `the key is value` for the cited key) against the cited
+ *   statement's typed value is support when equal and a contradiction when it differs;
+ * - everything else, including prose that repeats a cited word or number, is unverifiable and needs review.
  */
-function containsAgreement(answer: string, contains: string): AnswerAgreement {
-	const answerFacts = numericFacts(answer);
+function typedAgreement(answer: string, statement: string): AnswerAgreement {
+	if (canonicalText(answer) !== "" && canonicalText(answer) === canonicalText(statement)) return "supported";
+	const cited = typedValueOf(statement);
+	const given = answerTypedValueOf(answer);
+	if (cited === undefined || given === undefined) return "unverifiable";
+	if (given.key !== undefined && cited.key !== undefined && given.key !== cited.key) return "unverifiable";
+	if (given.key !== undefined && cited.key === undefined) return "unverifiable";
+	return given.value.type === cited.value.type && given.value.value === cited.value.value ? "supported" : "contradicted";
+}
+
+/**
+ * A factual answer without `contains` is accepted only on exact or typed agreement with a verified citation's own
+ * excerpt. A typed mismatch is not proof of a wrong answer here (the cited line may not be the deciding one), so it
+ * stays reviewable like any natural-language answer.
+ */
+function answerAligns(answer: string, excerpt: string): boolean {
+	return typedAgreement(answer, excerpt) === "supported";
+}
+
+/**
+ * A declared `contains` must support the reported answer, not only exist somewhere in the file. Support is the
+ * literal itself, the cited line verbatim, or the same typed value (so `7`, `142` and `-42` never pass for `42`). An
+ * answer whose signed numbers include one the literal does not state contradicts it; prose that merely repeats the
+ * literal's number or words is unverifiable and goes to review instead of being accepted.
+ */
+function containsAgreement(answer: string, contains: string, excerpt: string | undefined): AnswerAgreement {
+	const literal = typedAgreement(answer, contains);
+	if (literal !== "unverifiable") return literal;
+	if (excerpt !== undefined && typedAgreement(answer, excerpt) === "supported") return "supported";
 	const requiredFacts = numericFacts(contains);
-	if (requiredFacts.length > 0) {
-		if (answerFacts.length === 0) return "unverifiable";
-		// A new number in the answer contradicts the declared fact; merely not repeating one is under-answering.
-		if (answerFacts.some(fact => !requiredFacts.includes(fact))) return "contradicted";
-		return requiredFacts.every(fact => answerFacts.includes(fact)) ? "supported" : "unverifiable";
-	}
-	const normalize = (value: string): string => value.replace(/\s+/gu, " ").trim().toLowerCase();
-	return normalize(answer).includes(normalize(contains)) ? "supported" : "unverifiable";
+	if (requiredFacts.length === 0 || SIGN_WORD.test(answer)) return "unverifiable";
+	const answerFacts = numericFacts(answer);
+	// A new (or sign-flipped) number in the answer contradicts the declared fact; merely repeating one is not support.
+	if (answerFacts.some(fact => !requiredFacts.includes(fact))) return "contradicted";
+	return "unverifiable";
 }
 
 async function evaluateAnswer(
@@ -1286,10 +1368,10 @@ async function evaluateAnswer(
 				? { state: "reviewable", reason: "출처가 읽기 한도를 넘어 요구 내용을 확인하지 못했습니다.", digest, citation: citationView }
 				: { state: "unmet", reason: "인용한 위치에서 요구 내용을 확인하지 못했습니다.", digest, citation: citationView };
 		}
-		const agreement = containsAgreement(answer.text, contains);
+		const agreement = containsAgreement(answer.text, contains, anchor.excerpt);
 		if (agreement === "supported") return { state: "accepted", digest, citation: viewOf(anchor) };
 		if (agreement === "contradicted") {
-			return { state: "unmet", reason: "답변의 수치가 인용한 요구 내용과 다릅니다.", digest, citation: viewOf(anchor) };
+			return { state: "unmet", reason: "답변의 값(수치·부호·타입)이 인용한 요구 내용과 다릅니다.", digest, citation: viewOf(anchor) };
 		}
 		return { state: "reviewable", reason: "출처는 요구 내용을 포함하지만 답변과의 일치를 기계적으로 확인하지 못했습니다. 자연어 판단이 필요합니다.", digest, citation: viewOf(anchor) };
 	}
@@ -1301,6 +1383,72 @@ async function evaluateAnswer(
 		digest,
 		citation: citationView,
 	};
+}
+
+// ── Answer receipt re-verification ─────────────────────────────────────────────────────────
+
+/** The recorded answer evidence a caller re-checks: the anchor citation S1 read and the content version it formed. */
+export interface AnswerReceipt {
+	kind: LaneResultKind;
+	/** The declared result path; when present the anchor must cite exactly it. */
+	path?: string;
+	/** sha256 of the answer text S1 judged. */
+	digest?: string;
+	citation?: ResultCitationView;
+	contentVersion?: string;
+}
+
+export type AnswerReceiptCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Re-reads an answer's recorded anchor citation now, with the evaluator's own bounded, contained reader, and compares
+ * the bytes S1 judged. A deleted, replaced, symlinked or otherwise unreadable source, a receipt whose content version
+ * no longer describes its own answer/citation digests, or (with `expectedVersion`) a receipt for another submission
+ * is not a usable answer. Nothing is searched for a different citation and no answer text is re-judged here.
+ */
+export async function verifyAnswerReceipt(input: {
+	root: string;
+	receipt: AnswerReceipt;
+	/** The content version the caller's row holds; the receipt must be for exactly that submission. */
+	expectedVersion?: string | undefined;
+	limits?: Partial<ResultEvidenceLimits>;
+}): Promise<AnswerReceiptCheck> {
+	const limits = resolveResultLimits(input.limits);
+	const receipt = input.receipt;
+	if (typeof receipt !== "object" || receipt === null || receipt.kind !== "answer") return { ok: false, reason: "답변 근거가 아닙니다." };
+	const citation = receipt.citation;
+	if (citation === undefined || typeof citation.digest !== "string" || !DIGEST.test(citation.digest)) {
+		return { ok: false, reason: "답변 출처의 저장된 다이제스트가 없습니다." };
+	}
+	if (typeof receipt.digest !== "string" || !DIGEST.test(receipt.digest)) return { ok: false, reason: "답변 내용의 저장된 다이제스트가 없습니다." };
+	const cited = safeRelativePath(citation.path, limits.pathChars);
+	if (cited === undefined) return { ok: false, reason: "답변 출처 경로가 안전한 상대 경로가 아닙니다." };
+	if (receipt.path !== undefined && receipt.path !== cited) return { ok: false, reason: "답변 출처가 요구 경로와 다릅니다." };
+	const version = contentVersionOf({
+		kind: "answer",
+		...(receipt.path === undefined ? {} : { path: receipt.path }),
+		digest: receipt.digest,
+		citation,
+	} as Omit<ResultEvidenceItem, "contentVersion">);
+	if (receipt.contentVersion !== undefined && receipt.contentVersion !== version) {
+		return { ok: false, reason: "답변 근거의 내용 버전이 답변·출처 다이제스트와 다릅니다." };
+	}
+	if (input.expectedVersion !== undefined && input.expectedVersion !== version) {
+		return { ok: false, reason: "답변 근거가 현재 제출과 다릅니다." };
+	}
+	if (typeof input.root !== "string" || input.root === "") return { ok: false, reason: "작업 트리 경로가 비어 있습니다." };
+	let root: string;
+	try {
+		root = await fs.realpath(input.root);
+		if (!(await fs.stat(root)).isDirectory()) return { ok: false, reason: "작업 트리가 디렉터리가 아닙니다." };
+	} catch {
+		return { ok: false, reason: "작업 트리를 확인할 수 없습니다." };
+	}
+	const state = await readContained(root, cited, limits, { remaining: limits.totalBytes });
+	if (state.kind === "absent") return { ok: false, reason: `답변 출처 ${cited}이(가) 삭제되었습니다.` };
+	if (state.kind !== "file") return { ok: false, reason: `답변 출처를 일반 파일로 읽을 수 없습니다(${unsafeDetail(state) ?? state.kind}).` };
+	if (state.digest !== citation.digest) return { ok: false, reason: `답변 출처 ${cited}의 내용이 답변 당시와 다릅니다.` };
+	return { ok: true };
 }
 
 // ── Settled evaluation ──────────────────────────────────────────────────────────────────────

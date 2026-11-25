@@ -40,7 +40,6 @@ import {
 	type Answer,
 	cancelAll,
 	choose,
-	customMessage,
 	type Frame,
 	type LlmEntry,
 	LlmCursor,
@@ -57,7 +56,9 @@ import {
 	TRACKED_FILE,
 	TRACKED_TEXT,
 	until,
+	closeoutOf,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
 const LABEL = { autoOn: "자동 위임 켜기", autoOff: "자동 위임 끄기" } as const;
 const MAIN = "fake/general-b";
@@ -67,6 +68,7 @@ const CONTRACT = process.env.E2E_CONTRACT === "1";
 const MODE = CONTRACT ? "contract" : "baseline";
 
 const env = prepare("storm-e2e-admission", 18782);
+seedFact(env.project);
 const suite = new Suite(`E2E (task admission, ${MODE})`, env);
 const check = suite.check.bind(suite);
 /** The one native session this file drives; every case resumes its approved team. */
@@ -74,6 +76,10 @@ let owned: { id: string; dir: string } | undefined;
 const profileFile = join(env.agentDir, "config.yml");
 const modelsFile = join(env.agentDir, "models.yml");
 const exitCodes: number[] = [];
+/** `task.agentIdleTtlMs` of the temp profile; see `hostSettings`. */
+const IDLE_TTL_MS = 1_000;
+/** The host's task-isolation sandboxes of the temp profile; each one an owned isolated run left. */
+const isolationRoot = join(dirname(env.agentDir), "wt");
 
 /** The host settings file of the temp profile: what a user would set through `omp config set`. */
 function hostSettings(isolation: { enabled: boolean; apply?: boolean } = { enabled: true, apply: false }): void {
@@ -83,6 +89,12 @@ function hostSettings(isolation: { enabled: boolean; apply?: boolean } = { enabl
 		"  workerThreads: 4",
 		// The native subagent ceiling this fixture needs: eight independent reads plus the experiment.
 		"  maxConcurrency: 12",
+		// The host parks an idle subagent after this TTL (default 7 min). A kept-alive subagent still homed on a
+		// worker thread when stdin closes is released through a cross-thread dispose the host does not keep its
+		// event loop alive for (OMP 19.0.1 and 19.1.1): the loop drains, `omp launch` exits 1 and the isolated
+		// worktree it owns is never released. Parked while the client is still connected, its EOF release only
+		// runs the main-thread isolation capture and cleanup. `closeSession` waits for that park.
+		`  agentIdleTtlMs: ${IDLE_TTL_MS}`,
 		"  isolation:",
 		`    enabled: ${isolation.enabled}`,
 	];
@@ -97,20 +109,39 @@ async function session<T>(answer: Answer, body: (rpc: Rpc, files: StormFiles) =>
 		await rpc.ready();
 		return await body(rpc, new StormFiles(env, rpc.sessionId));
 	} finally {
-		exitCodes.push(await rpc.close());
+		exitCodes.push(await closeSession(rpc));
 		if (owned === undefined) owned = { id: rpc.sessionId, dir: rpc.sessionDir };
 	}
+}
+
+/**
+ * Closes the client once the host has parked every subagent session it homed on a worker thread (see
+ * `hostSettings`). A park that never comes only skips the wait: the exit code and the sandbox check still judge it.
+ */
+async function closeSession(rpc: Rpc): Promise<number> {
+	const open = (): string[] => {
+		const records = logRecords().filter(record => record.pid === rpc.pid);
+		const exited = new Set(records.filter(record => record.message === "Session exit recorded").map(record => record.sessionId));
+		const homed = records.filter(record => typeof record.thread === "string" && /^w\d+$/.test(record.thread) && typeof record.sessionId === "string");
+		return [...new Set(homed.map(record => String(record.sessionId)))].filter(id => !exited.has(id));
+	};
+	await until(() => (open().length === 0 ? true : undefined), IDLE_TTL_MS + 15_000, "the host to park its worker-homed subagents").catch(() => {
+		console.log(`worker-homed subagent sessions still open at close: ${open().join(",")}`);
+	});
+	return rpc.close();
 }
 
 const startRun = (sequence: Step[]): string => `/storm E2E-ROUTE ${JSON.stringify({ action: "run" })} E2E-STEPS ${JSON.stringify(sequence)}`;
 const planFor = (lanes: readonly ContractLane[], workers?: Record<string, number>): Step =>
 	contractPlan(lanes, { contract: CONTRACT, ...(workers !== undefined ? { workers } : {}) });
 
-/** A real read-only answer obligation: the child reads this line and cites it, so the result is not a fake pass. */
-const TRACKED_LINE = TRACKED_TEXT.trim();
-const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
+/**
+ * A real read-only answer obligation: the child reads this typed line and cites it, so the result is not a fake pass.
+ * The claim restates the line's signed typed value, which the official answer evidence accepts without a reviewer.
+ */
+const TRACKED_CLAIM = FACT_CLAIM;
 const trackedAnswer = (id: string) =>
-	requiredResult(id, "answer", `report what ${TRACKED_FILE} line 1 says`, { path: TRACKED_FILE, contains: TRACKED_LINE });
+	requiredResult(id, "answer", `report what ${FACT_FILE} line 1 says`, { path: FACT_FILE, contains: FACT_LINE });
 
 /** Waits for the durable automatic-delegation choice a slash command writes before it returns. */
 async function waitAuto(files: StormFiles, expected: "on" | "off", timeoutMs = 10_000): Promise<void> {
@@ -230,21 +261,13 @@ function planField(run: RunRecord, laneName: string, field: string): unknown {
 	return lane === undefined ? undefined : Reflect.get(lane, field);
 }
 
-/** The run's end report, once Storm writes it. */
+/**
+ * The run's settled-run record, once Storm writes it. The compact card no longer repeats the run id in its text; its
+ * presentation metadata names the run, and the start of this prompt anchors a record that has none.
+ */
 async function reportOf(rpc: Rpc, runId: string, from: number, timeoutMs = 20_000): Promise<string> {
-	const text = await until(
-		() => {
-			const reports = rpc.frames
-				.slice(from)
-				.filter(frame => customMessage(frame) === "storm-report")
-				.map(frame => JSON.stringify(frame))
-				.join("\n");
-			return reports.includes("### Storm 실행 결과") && reports.includes(runId) ? reports : undefined;
-		},
-		timeoutMs,
-		`the end report of ${runId}`,
-	).catch(() => "");
-	return text;
+	const record = await until(() => closeoutOf(rpc.frames, runId, from), timeoutMs, `the end report of ${runId}`).catch(() => undefined);
+	return record?.text ?? "";
 }
 
 /** The omp log files of this profile (one per session), where a worker thread's forwarded records land. */
@@ -357,14 +380,14 @@ async function main(): Promise<void> {
 			...Array.from({ length: 5 }, (_, index) => ({
 				name: `F${index}`,
 				agent: "storm-explorer",
-				task: `Read ${TRACKED_FILE} independently`,
-				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${TRACKED_FILE} E2E-FILLER-READ-${index} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
+				task: `Read ${FACT_FILE} independently`,
+				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-FILLER-READ-${index} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
 			})),
 			{
 				name: "F5",
 				agent: "storm-architect",
-				task: `Read ${TRACKED_FILE} independently`,
-				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${TRACKED_FILE} E2E-FILLER-READ-5 E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
+				task: `Read ${FACT_FILE} independently`,
+				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-FILLER-READ-5 E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
 			},
 			{
 				name: "F6",
@@ -453,7 +476,7 @@ async function main(): Promise<void> {
 			const compareWithRef = [...earlyCompare, ...lateCompare].filter(entry => entry.lastUser.includes("experiment-patch"));
 			const worker = await until(() => workerSession("E0"), 15_000, "the E0 worker-thread log record").catch(() => undefined);
 			const quick = run.agents?.find(agent => agent.id === "E0");
-			const fillerReads = llm.of("child").filter(entry => entry.lastUser.includes("E2E-FILLER-READ") && entry.lastTool.includes("storm e2e tracked file"));
+			const fillerReads = llm.of("child").filter(entry => entry.lastUser.includes("E2E-FILLER-READ") && entry.lastTool.includes(FACT_LINE));
 
 			check(
 				"T02: the result/dependency plan is admitted natively without an unknown-schema refusal",
@@ -611,7 +634,7 @@ async function main(): Promise<void> {
 		const steps: Step[] = [
 			planFor(lanes, { implementer: 1, quick: 1, explorer: 1 }),
 			{ task: ["storm-implementer"], as: "P", say: "E2E-CHILD-DELAY 1500 E2E-PRODUCER-NO-REPORT" },
-			{ task: ["storm-quick"], as: "Q", say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${TRACKED_FILE} E2E-MISSING-FILLER E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+			{ task: ["storm-quick"], as: "Q", say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-MISSING-FILLER E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 			{ task: ["storm-explorer"], as: "C", say: "E2E-MISSING-CONSUMER", afterResult: 'id="P0"' },
 		];
 		await session(cancelAll, async (rpc, files) => {
@@ -902,8 +925,8 @@ async function main(): Promise<void> {
 			planFor(lanes, { explorer: 2 }),
 			{
 				tasks: [
-					{ name: "R0", agent: "storm-explorer", task: `Read ${TRACKED_FILE}`, say: `E2E-READ-A E2E-CHILD-DELAY 2500 E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
-					{ name: "R1", agent: "storm-explorer", task: `Read ${TRACKED_FILE}`, say: `E2E-READ-B E2E-CHILD-DELAY 2500 E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+					{ name: "R0", agent: "storm-explorer", task: `Read ${FACT_FILE}`, say: `E2E-READ-A E2E-CHILD-DELAY 2500 E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+					{ name: "R1", agent: "storm-explorer", task: `Read ${FACT_FILE}`, say: `E2E-READ-B E2E-CHILD-DELAY 2500 E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 				],
 			},
 		];
@@ -914,8 +937,8 @@ async function main(): Promise<void> {
 			const run = await files.finishedRun(before, 180_000);
 			const readsA = childRequests(llm, "E2E-READ-A");
 			const readsB = childRequests(llm, "E2E-READ-B");
-			const contentA = readsA.some(entry => entry.lastTool.includes("storm e2e tracked file"));
-			const contentB = readsB.some(entry => entry.lastTool.includes("storm e2e tracked file"));
+			const contentA = readsA.some(entry => entry.lastTool.includes(FACT_LINE));
+			const contentB = readsB.some(entry => entry.lastTool.includes(FACT_LINE));
 			const agentA = run.agents?.find(agent => agent.id === "R0");
 			const agentB = run.agents?.find(agent => agent.id === "R1");
 			const overlapped = agentA !== undefined && agentB !== undefined && agentA.lastActivityAt > agentB.startedAt && agentB.lastActivityAt > agentA.startedAt;
@@ -1006,9 +1029,17 @@ async function main(): Promise<void> {
 		}
 	});
 
-	await suite.step("omp exit codes", async () => {
-		check("every omp session exited 0", exitCodes.length > 0 && exitCodes.every(code => code === 0), `exit=${exitCodes.join(",")}`);
-	});
+	// Always runs: a focused scenario's sessions must exit cleanly too.
+	await suite.step(
+		"omp exit codes",
+		async () => {
+			check("every omp session exited 0", exitCodes.length > 0 && exitCodes.every(code => code === 0), `exit=${exitCodes.join(",")}`);
+			const sandboxes = existsSync(isolationRoot) ? readdirSync(isolationRoot) : [];
+			check("the host released every isolation sandbox", sandboxes.length === 0, `${isolationRoot}: ${sandboxes.join(",") || "empty"}`);
+		},
+		120_000,
+		{ always: true },
+	);
 }
 
 let code = 1;

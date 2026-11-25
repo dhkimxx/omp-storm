@@ -380,6 +380,9 @@ test("B2 dependencies: an orphaned producer reversion reopens its accepted consu
 		{ implementer: 1, reviewer: 1 },
 	);
 	expect(await h.controller.setPlan(h.ctx, orphaned)).toEqual({ ok: true });
+	// Dropping the consumer's declared input is itself a changed input declaration: the consumer reopens at the replan.
+	expect(row(h, "c-change")?.state).not.toBe("accepted");
+	expect(row(h, "c-change")?.reason).toContain("선행 입력");
 	// A second replan still omits the producer: the obligation and its bounded contract survive both.
 	expect(await h.controller.setPlan(h.ctx, { ...orphaned, note: "still missing the producer" })).toEqual({ ok: true });
 	expect(row(h, "p-change")).toMatchObject({ state: "accepted", contract: { id: "p-change", kind: "change" } });
@@ -389,7 +392,7 @@ test("B2 dependencies: an orphaned producer reversion reopens its accepted consu
 	expect(final?.endReason).toBe("no-progress");
 	expect(final?.results?.find(item => item.id === "p-change")).toMatchObject({ state: "unmet" });
 	expect(final?.results?.find(item => item.id === "c-change")).toMatchObject({ state: "unmet" });
-	expect(final?.results?.find(item => item.id === "c-change")?.reason).toContain("선행 결과");
+	expect(final?.results?.find(item => item.id === "c-change")?.reason).toContain("선행 입력");
 });
 
 test("B2 review-origin: a review-accepted orphan reopens when the tree digest it was bound to no longer matches", async () => {

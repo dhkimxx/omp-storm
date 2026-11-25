@@ -18,9 +18,25 @@ interface Assignment {
 	lane: string;
 	key: string;
 	agent: string;
+	/** The host tool call that placed it, so that call's failure releases exactly its own placement. */
+	callId?: string;
 }
 
-export type LaneBlockCode = "lane-dependency" | "lane-write" | "lane-capability" | "lane-job" | "lane-capacity";
+/** A lane's logical reservation: a placed task awaiting spawn correlation, or a follow-up awaiting its turn's start. */
+interface LaneHold {
+	/** Identity: a stale release never removes a newer hold of the same lane. */
+	id: number;
+	at: number;
+	/** Handle the placed task carries (a task hold only). */
+	name?: string;
+	callId?: string;
+	/** The idle agent a work-bearing follow-up reactivates (a follow hold only). */
+	agentId?: string;
+	/** The reactivated turn was seen starting; from then on the agent's own state is the reservation. */
+	started?: boolean;
+}
+
+export type LaneBlockCode = "lane-dependency" | "lane-write" | "lane-capability" | "lane-job" | "lane-capacity" | "lane-busy";
 
 type TaskBinding =
 	| { ok: true; input: Record<string, unknown> }
@@ -50,6 +66,8 @@ export interface TaskPlacementOptions {
 	readiness?: LaneReadinessView;
 	/** Live agents of this run, used only to expire reservations whose worker has already settled. */
 	agents?: readonly AgentEntry[];
+	/** The host's tool-call id: its failure releases exactly the placements this call made. */
+	callId?: string;
 	now?: number;
 }
 
@@ -452,6 +470,10 @@ function conflictText(lane: PlanLane | undefined, agent: string, scope: WriteSco
 
 interface WriteReservation {
 	scope: WriteScope;
+	/** Placed by this tool call (task) or follow-up delivery. */
+	callId?: string;
+	/** A work follow-up admitted but whose reactivated turn has not started: settled state must not release it yet. */
+	awaiting?: boolean;
 	lane?: string;
 	agentId?: string;
 	/** The handle reserved for this spawn before the host allocates its id; used only for release matching. */
@@ -482,6 +504,15 @@ export interface FollowUpGateInput {
 	policy?: LanePolicy;
 	/** Canonical workspace-relative files for that policy. */
 	canonicalFiles?: readonly string[];
+	/**
+	 * A quiet `?progress` note. It still passes capability, job, dependency and (for an idle recipient) capacity gates,
+	 * but it carries no work: it takes no lane hold, write reservation or worker slot of its own.
+	 */
+	progress?: boolean;
+	/** The host's tool-call id of this write, so its failure releases exactly this admission. */
+	callId?: string;
+	/** Automatic delegation: every shared writer is one global serial scope, exactly as for a fresh task placement. */
+	auto?: boolean;
 	/** The plan in force when the lane was resolved; absent means no planned lane. */
 	plan?: RunPlan;
 	/** The approved team, for the plan's role caps. */
@@ -507,6 +538,16 @@ export type FollowUpGate =
 /** One spawn's admission result: a lane when bound, or the reason a late reservation conflict refused it. */
 export type LaneAdmission = { ok: true; lane?: string } | { ok: false; code: LaneBlockCode; reason: string };
 
+const liveLanes = new Map<string, WeakRef<RunLanes>>();
+
+/**
+ * A child session loads the extension on its own and holds no run, yet its turn start is the fact that ends a follow-up's
+ * admission window in the run's lanes. The newest lanes of the run id receive it; an unknown agent changes nothing.
+ */
+export function noteLaneAgentStart(runId: string, agentId: string): void {
+	liveLanes.get(runId)?.deref()?.agentStarted(agentId);
+}
+
 /**
  * Correlates director task items to the actual ids OMP allocates. The host emits the allocated id, not the
  * planned lane name, in before_subagent_spawn. Reserve distinct valid names for each task even across replans.
@@ -520,15 +561,29 @@ export class RunLanes {
 	readonly #admitted = new Map<string, Assignment>();
 	/** Latest admitted agent of a lane: a read-only handle a consumer may inspect (`agent://<id>`). */
 	readonly #agents = new Map<string, string>();
+	/** When each lane's latest agent was admitted: an agent the host list does not show yet only counts as live briefly. */
+	readonly #agentAt = new Map<string, number>();
 	/** Shared write scopes placed but not yet released; private/read-only work never appears here. */
 	readonly #writes = new Map<string, WriteReservation>();
+	/**
+	 * Logical lanes placed by a task call whose spawn has not been correlated yet. Read-only and private lanes reserve
+	 * no write scope, so this is what makes a second independent dispatch of the same lane visible before the host
+	 * allocates the first one's id. Cleared by the matching admission, cancel or release; expires like a pending write.
+	 */
+	readonly #held = new Map<string, LaneHold>();
 	/** Follow-up admission tokens; only a failed preflight releases the write/capacity reservations it created. */
-	readonly #followTokens = new Map<string, { key?: string; created: boolean; capacityKey?: string; lane?: string }>();
+	readonly #followTokens = new Map<
+		string,
+		{ key?: string; created: boolean; capacityKey?: string; lane?: string; reservation?: WriteReservation; holdLane?: string; holdId?: number }
+	>();
 	#serial = 0;
+	#holdSerial = 0;
 	#writeSerial = 0;
 	#tokenSerial = 0;
 
-	constructor(private readonly runId: string) {}
+	constructor(private readonly runId: string) {
+		liveLanes.set(runId, new WeakRef(this));
+	}
 
 	/** Automatic delegation: bind every item to a lane, reserve a unique spawn name, and set its isolation placement. */
 	assign(
@@ -625,7 +680,7 @@ export class RunLanes {
 				// Every auto item was accepted only after matching a lane above.
 				const lane = entry.lane as PlanLane;
 				const name = `${this.runId}-lane-${++this.#serial}`;
-				this.#assigned.set(name, { key: key(lane), lane: lane.name, agent: entry.agent });
+				this.#assigned.set(name, { key: key(lane), lane: lane.name, agent: entry.agent, ...(options.callId === undefined ? {} : { callId: options.callId }) });
 				next = { ...next, name };
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
@@ -633,7 +688,16 @@ export class RunLanes {
 			if (refs !== undefined && typeof next.task === "string" && next.task.trim() !== "") {
 				next = { ...next, task: `${next.task.trimEnd()}\n\n${refs}` };
 			}
-			this.#reserveWrite(entry, now);
+			this.#reserveWrite(entry, now, options.callId);
+			if (entry.lane !== undefined) {
+				const handle = typeof next.name === "string" ? next.name : undefined;
+				this.#held.set(entry.lane.name, {
+					id: ++this.#holdSerial,
+					at: now,
+					...(handle === undefined ? {} : { name: handle }),
+					...(options.callId === undefined ? {} : { callId: options.callId }),
+				});
+			}
 			return next;
 		});
 		if (!batch) return { ok: true, input: mapped[0]! };
@@ -685,6 +749,8 @@ export class RunLanes {
 			this.#releaseSpawn(spawn.spawnKey, assignment?.lane);
 			return { ok: true };
 		}
+		// The spawn is correlated: from here the admitted agent's own state, not the placement hold, says the lane is busy.
+		if (assignment !== undefined && this.#held.get(assignment.lane)?.agentId === undefined) this.#held.delete(assignment.lane);
 		// A manual unplanned child still holds the unknown shared scope reserved at placement; bind it to this id.
 		this.#bindWrite(spawn.spawnKey, assignment?.lane);
 		if (!assignment) return { ok: true };
@@ -706,6 +772,7 @@ export class RunLanes {
 		}
 		this.#admitted.set(spawn.spawnKey, assignment);
 		this.#agents.set(assignment.lane, spawn.spawnKey);
+		this.#agentAt.set(assignment.lane, Date.now());
 		return { ok: true, lane: assignment.lane };
 	}
 
@@ -729,6 +796,18 @@ export class RunLanes {
 			if (entry.lane === undefined) continue;
 			const reason = dependencyBlock(entry.lane, options.readiness);
 			if (reason !== undefined) return { ok: false, reason, code: "lane-dependency", retry: false };
+		}
+		// One logical lane has one live attempt: an independent dispatch of a reserved or running lane would displace it,
+		// whether or not the lane writes. Continuing it is a follow-up to its own agent, never a second task.
+		for (const entry of scopes) {
+			if (entry.lane === undefined || !this.#laneLive(entry.lane.name, options.agents, now)) continue;
+			const handle = this.#agents.get(entry.lane.name);
+			return {
+				ok: false,
+				code: "lane-busy",
+				retry: false,
+				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `write agent://${handle} 로`} 후속 지시를 보내세요.`,
+			};
 		}
 		for (let i = 0; i < scopes.length; i++) {
 			const a = scopes[i]!;
@@ -757,7 +836,7 @@ export class RunLanes {
 	}
 
 	/** Hold one placed item's shared write scope until its worker settles, fails, or the pending window expires. */
-	#reserveWrite(entry: PlacedEntry, now: number): void {
+	#reserveWrite(entry: PlacedEntry, now: number, callId?: string): void {
 		const scope = entry.scope;
 		if (scope.kind === "read" || scope.kind === "private") return;
 		const name = typeof entry.item.name === "string" ? entry.item.name : undefined;
@@ -770,14 +849,33 @@ export class RunLanes {
 			scope,
 			...(entry.lane === undefined ? {} : { lane: entry.lane.name }),
 			...(name === undefined ? {} : { name }),
+			...(callId === undefined ? {} : { callId }),
 			at: now,
 		});
 	}
 
-	/** Expire a reservation whose worker is known to have settled, or whose host start never arrived. */
+	/**
+	 * Expire a reservation whose worker is known to have settled, or whose host start never arrived. A follow-up admission
+	 * is different: until its reactivated turn starts, the worker still looks settled, so only its start (or the pending
+	 * window) decides, never the stale idle state.
+	 */
 	#pruneWrites(agents: readonly AgentEntry[] | undefined, now: number): void {
-		if (this.#writes.size === 0) return;
 		const byId = new Map((agents ?? []).map(agent => [agent.id, agent]));
+		for (const [lane, hold] of this.#held) {
+			const age = now - hold.at;
+			if (hold.agentId === undefined) {
+				if (age >= PENDING_WRITE_MS) this.#held.delete(lane);
+				continue;
+			}
+			const agent = byId.get(hold.agentId);
+			if (agent?.state === "running") hold.started = true;
+			if (hold.started) {
+				if (agents !== undefined && agent?.state !== "running") this.#held.delete(lane);
+			} else if (age >= PENDING_WRITE_MS) {
+				this.#held.delete(lane);
+			}
+		}
+		if (this.#writes.size === 0) return;
 		for (const [key, reservation] of this.#writes) {
 			const age = now - reservation.at;
 			if (reservation.agentId === undefined) {
@@ -787,10 +885,43 @@ export class RunLanes {
 			const agent = byId.get(reservation.agentId);
 			if (agent === undefined) {
 				if (age >= PENDING_WRITE_MS) this.#writes.delete(key);
-			} else if (agent.state !== "running") {
+			} else if (agent.state === "running") {
+				delete reservation.awaiting;
+			} else if (reservation.awaiting !== true || age >= PENDING_WRITE_MS) {
 				this.#writes.delete(key);
 			}
 		}
+	}
+
+	/** The reactivated turn of a follow-up began: the agent's own running state is now the lane's reservation. */
+	agentStarted(agentId: string): void {
+		for (const hold of this.#held.values()) if (hold.agentId === agentId) hold.started = true;
+		for (const reservation of this.#writes.values()) if (reservation.agentId === agentId) delete reservation.awaiting;
+	}
+
+	/**
+	 * A host tool call failed or was cancelled: release exactly what that call placed and nothing a newer call owns.
+	 * Placements already admitted to a worker are the worker's, and a follow-up whose turn started is running work.
+	 * Returns the spawn handles it released, so the caller can free any slot those handles took.
+	 */
+	releaseCall(callId: string): string[] {
+		const names: string[] = [];
+		for (const [lane, hold] of this.#held) {
+			if (hold.callId !== callId || hold.started === true) continue;
+			this.#held.delete(lane);
+			if (hold.name !== undefined) names.push(hold.name);
+		}
+		for (const [key, reservation] of this.#writes) {
+			if (reservation.callId !== callId || (reservation.agentId !== undefined && reservation.awaiting !== true)) continue;
+			this.#writes.delete(key);
+			if (reservation.name !== undefined) names.push(reservation.name);
+		}
+		for (const [name, assignment] of this.#assigned) {
+			if (assignment.callId !== callId) continue;
+			this.#assigned.delete(name);
+			names.push(name);
+		}
+		return [...new Set(names)];
 	}
 
 	/** Bind a placed write reservation to the child id the host admitted. */
@@ -816,15 +947,31 @@ export class RunLanes {
 	}
 
 	/** Drop every reservation a refused or finished spawn still holds; the lane assignment is not evidence. */
-	#releaseSpawn(spawnKey: string, lane: string | undefined): void {
-		if (lane !== undefined) this.#writes.delete(`lane:${lane}`);
+	#releaseSpawn(spawnKey: string, lane: string | undefined, settledTurn = false): void {
+		if (lane !== undefined) {
+			if (this.#writes.get(`lane:${lane}`)?.awaiting !== true) this.#writes.delete(`lane:${lane}`);
+			// A follow-up's hold belongs to its agent and ends with that agent's started turn, not with a spawn's cleanup.
+			if (this.#held.get(lane)?.agentId === undefined) this.#held.delete(lane);
+		}
+		for (const [name, hold] of this.#held) if (hold.agentId === undefined && hold.name === spawnKey) this.#held.delete(name);
 		for (const [key, reservation] of this.#writes) {
+			// A settled-turn event is the previous turn's: it never ends a follow-up admitted after it and not yet started.
+			if (settledTurn && reservation.awaiting === true) continue;
 			if (reservation.agentId === spawnKey || reservation.name === spawnKey || key === `spawn:${spawnKey}`) {
 				this.#writes.delete(key);
 			}
 		}
 		// The same event is the only release of its concurrency slot: a failed spawn, a settled turn, or a park.
+		// ...nor frees the slot that reactivation took.
+		if (settledTurn && this.#awaitingStart(spawnKey)) return;
 		releaseWorkerSlot(this.runId, spawnKey);
+	}
+
+	/** A work follow-up to this agent was admitted and its turn has not started yet. */
+	#awaitingStart(agentId: string): boolean {
+		for (const hold of this.#held.values()) if (hold.agentId === agentId && hold.started !== true) return true;
+		for (const reservation of this.#writes.values()) if (reservation.agentId === agentId && reservation.awaiting === true) return true;
+		return false;
 	}
 
 	/**
@@ -840,7 +987,7 @@ export class RunLanes {
 
 	/** The worker's turn settled: its lane is free for the next planned writer. */
 	releaseAgent(agentId: string): void {
-		this.#releaseSpawn(agentId, undefined);
+		this.#releaseSpawn(agentId, undefined, true);
 	}
 
 	/**
@@ -852,22 +999,41 @@ export class RunLanes {
 		this.#pruneWrites(agents, now);
 		for (const assignment of this.#assigned.values()) if (assignment.lane === laneName) return true;
 		for (const entry of this.#followTokens.values()) if (entry.lane === laneName) return true;
+		return this.#laneLive(laneName, agents, now);
+	}
+
+	/**
+	 * A lane's live attempt apart from the auto-assignment table: a placement hold, a follow-up in flight, the lane's
+	 * own write reservation, or a running admitted worker of the lane (the latest one, or an earlier one a follow-up
+	 * reactivated). A settled idle worker is not live.
+	 */
+	#laneLive(laneName: string, agents: readonly AgentEntry[] | undefined, now: number): boolean {
+		this.#pruneWrites(agents, now);
+		if (this.#held.has(laneName)) return true;
+		for (const entry of this.#followTokens.values()) if (entry.lane === laneName) return true;
+		const known = agents ?? [];
 		for (const reservation of this.#writes.values()) {
 			if (reservation.lane !== laneName) continue;
 			if (reservation.agentId === undefined) return true;
-			const agent = agents.find(candidate => candidate.id === reservation.agentId);
+			const agent = known.find(candidate => candidate.id === reservation.agentId);
 			if (agent === undefined || agent.state === "running") return true;
 		}
 		const latest = this.#agents.get(laneName);
-		if (latest === undefined) return false;
-		const agent = agents.find(candidate => candidate.id === latest);
-		return agent === undefined || agent.state === "running";
+		if (latest !== undefined) {
+			const agent = known.find(candidate => candidate.id === latest);
+			if (agent?.state === "running") return true;
+			// With a host list in hand, an admitted agent it does not show yet is still starting; without one, say nothing.
+			if (agent === undefined && agents !== undefined && now - (this.#agentAt.get(laneName) ?? 0) < PENDING_WRITE_MS) return true;
+		}
+		return known.some(agent => agent.state === "running" && this.#admitted.get(agent.id)?.lane === laneName);
 	}
 
 	/**
 	 * Any message that can start a turn (including native quiet writes) passes the same admission rules:
 	 * the target lane's prerequisites must hold, and a shared write reserves its scope before omp delivers the turn.
-	 * Its own in-flight reservation never blocks the continuation.
+	 * Its own in-flight reservation never blocks the continuation. A progress-only note still passes the capacity gate
+	 * when it would wake an idle recipient, but it carries no work: it holds no lane, reserves no write scope and takes
+	 * no worker slot of its own.
 	 */
 	checkFollowUp(input: FollowUpGateInput): FollowUpGate {
 		const lane = input.lane;
@@ -884,14 +1050,13 @@ export class RunLanes {
 			if (reason !== undefined) return { ok: false, reason, code: "lane-dependency" };
 		}
 		const now = input.now ?? Date.now();
-		this.#pruneWrites(input.agents, now);
 		const role = input.role ?? lane?.role;
 		const target = input.agents?.find(agent => agent.id === input.agentId);
 		const running = target?.state === "running";
 		const reserved = input.runId === undefined ? [] : reservedWorkers(input.runId);
 		const hasSlot = reserved.some(slot => slot.key === input.agentId);
-		// A worker already running, or one that already holds a slot, is not a second worker: a work-bearing note to it
-		// charges no new slot. A genuine reactivation of an idle/parked worker checks and takes a slot like a fresh start.
+		// A worker already running, or one that already holds a slot, is not a second worker: a follow-up to it charges no
+		// new slot. A genuine reactivation, including the native wake turn of a progress note, checks the ceiling first.
 		const needsCapacity = input.runId !== undefined && !running && !hasSlot;
 		if (needsCapacity) {
 			const active = activeAgents([], input.agents ?? [], now, reserved);
@@ -916,21 +1081,47 @@ export class RunLanes {
 				};
 			}
 		}
+		// A progress-only note wakes an idle recipient but carries no work: it holds no lane, never collides with the
+		// writer that owns the shared tree, and takes no write lease or worker slot of its own.
+		if (input.progress === true) return { ok: true, token: `follow:${++this.#tokenSerial}` };
+		this.#pruneWrites(input.agents, now);
 		const scope = writeScope(
 			lane,
 			input.role,
 			input.isolated || lane?.isolationReason !== undefined,
 			input.policy,
 			input.canonicalFiles,
+			input.auto === true,
 		);
+		// A work-bearing note to a settled worker reserves its lane from this admission until the reactivated turn starts;
+		// a note to an already running worker reserves nothing beyond the gate itself.
+		const awaits = !running;
+		if (awaits && lane !== undefined) {
+			const current = this.#held.get(lane.name);
+			if (current !== undefined && current.agentId !== input.agentId && !(current.agentId !== undefined && current.started === true)) {
+				return {
+					ok: false,
+					code: "lane-busy",
+					reason: `레인 '${lane.name}'에 이미 예약된 ${current.agentId === undefined ? "독립 작업" : "후속 작업"}이 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 그 작업이 시작·종료된 뒤 같은 write를 다시 보내세요.`,
+				};
+			}
+		}
 		const token = `follow:${++this.#tokenSerial}`;
 		const capacityKey = needsCapacity ? input.agentId : undefined;
+		const holdFollow = (): { holdLane?: string; holdId?: number } => {
+			if (!awaits || lane === undefined) return {};
+			const current = this.#held.get(lane.name);
+			if (current !== undefined && current.agentId === input.agentId) return {};
+			const hold: LaneHold = { id: ++this.#holdSerial, at: now, agentId: input.agentId, ...(input.callId === undefined ? {} : { callId: input.callId }) };
+			this.#held.set(lane.name, hold);
+			return { holdLane: lane.name, holdId: hold.id };
+		};
 		const slot = input.runId !== undefined && !hasSlot
 			? { runId: input.runId, key: input.agentId, ...(role === undefined ? {} : { role }), ...(lane === undefined ? {} : { lane: lane.name }), now }
 			: undefined;
 		if (scope.kind === "read" || scope.kind === "private") {
 			if (slot !== undefined) reserveWorkerSlot(slot);
-			this.#followTokens.set(token, { created: false, ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
+			this.#followTokens.set(token, { created: false, ...holdFollow(), ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
 			return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 		}
 		for (const reservation of this.#writes.values()) {
@@ -941,9 +1132,17 @@ export class RunLanes {
 		}
 		const key = lane !== undefined ? `lane:${lane.name}` : `spawn:${input.agentId}`;
 		const existing = this.#writes.get(key);
-		this.#writes.set(key, { scope, ...(lane === undefined ? {} : { lane: lane.name }), agentId: input.agentId, at: now });
+		const reservation: WriteReservation = {
+			scope,
+			...(lane === undefined ? {} : { lane: lane.name }),
+			agentId: input.agentId,
+			...(input.callId === undefined ? {} : { callId: input.callId }),
+			...(awaits ? { awaiting: true } : {}),
+			at: now,
+		};
+		this.#writes.set(key, reservation);
 		if (slot !== undefined) reserveWorkerSlot(slot);
-		this.#followTokens.set(token, { key, created: existing === undefined, ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
+		this.#followTokens.set(token, { key, reservation, created: existing === undefined, ...holdFollow(), ...(capacityKey === undefined ? {} : { capacityKey }), ...(lane === undefined ? {} : { lane: lane.name }) });
 		return { ok: true, token, ...(capacityKey === undefined ? {} : { reserved: true }) };
 	}
 
@@ -953,7 +1152,9 @@ export class RunLanes {
 		if (entry === undefined) return;
 		this.#followTokens.delete(token);
 		if (keep) return;
-		if (entry.created && entry.key !== undefined) this.#writes.delete(entry.key);
+		// Identity-checked: only what this admission created, never a newer admission's reservation or hold.
+		if (entry.created && entry.key !== undefined && this.#writes.get(entry.key) === entry.reservation) this.#writes.delete(entry.key);
+		if (entry.holdLane !== undefined && this.#held.get(entry.holdLane)?.id === entry.holdId) this.#held.delete(entry.holdLane);
 		if (entry.capacityKey !== undefined) releaseWorkerSlot(this.runId, entry.capacityKey);
 	}
 

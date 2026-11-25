@@ -108,6 +108,13 @@ export interface StormModelPick {
 	effort?: Effort;
 }
 
+/** Presentation metadata for a persisted closeout; its plain text remains the fallback on every host. */
+export interface CloseoutRecordStyle {
+	readonly kind: "closeout";
+	readonly runId: string;
+	readonly info: readonly InfoLine[];
+}
+
 /** The subset of omp's `ctx.ui` Storm uses, plus Storm's own views. */
 export interface UiPort {
 	/** Resolves to the chosen label, or undefined when cancelled or when no UI can answer. */
@@ -129,7 +136,7 @@ export interface UiPort {
 	/** A view to read and close. TUI: a scrollable overlay that leaves nothing in the transcript; other hosts: a transcript message. Resolves once closed. */
 	report(title: string, markdown: string, info?: readonly InfoLine[]): Promise<void>;
 	/** Kept in the transcript, never sent to the model: run results and other records. Keep it to a few lines. */
-	record(title: string, markdown: string): void;
+	record(title: string, markdown: string, style?: CloseoutRecordStyle): void;
 	/** Draws an HTML `<form>` and resolves to its answers, or undefined when cancelled or timed out. Absent when the host has no form surface. */
 	form?(html: string): Promise<FormData | undefined>;
 	/**
@@ -660,6 +667,8 @@ export interface StatusView {
 	runPhase?: RunPhase;
 	/** The most recent finished run. */
 	lastRun?: RunRecord;
+	/** Bounded final facts, supplied only after the model status caller validates the run's native session and target. */
+	lastHandoff?: string;
 	trials?: TrialView[];
 	/** Active quota marks only. */
 	quotaMarks?: QuotaMark[];
@@ -737,6 +746,8 @@ export interface RunSpec {
 	resumeOf?: string;
 	/** What the user said when asking to resume, shown to the director in the resume block. */
 	resumeNote?: string;
+	/** Previous settled run explicitly selected as background for a new scope; never restores its state. */
+	followUpOf?: string;
 }
 
 /** One spawn Storm decided: every storm-* spawn, and non-Storm spawns during a run. */
@@ -814,6 +825,8 @@ export interface RunResult {
 	scope?: "excluded-by-user";
 	/** Short reason anchored in the current attempt when the requirement is pending or unmet. */
 	reason?: string;
+	/** How finalization changed this row, separate from its evidence state. Never carried into a continuation. */
+	finalized?: "unsettled" | "revoked";
 	/** Host-bound attempt this state was observed in; absent until an attempt is bound. */
 	attemptId?: string;
 	/** Content identity of the contract this row was observed for; a changed contract invalidates the row. */
@@ -881,6 +894,8 @@ export interface RunRecord {
 	request?: string;
 	/** The run this one continues. */
 	resumeOf?: string;
+	/** Target-checked context source for a new scoped follow-up, not a continuation. */
+	followUpOf?: string;
 	/** List-price spend of every assistant message in this process while the run was active. */
 	costUsd: number;
 	/** Spend by "provider/model". */
@@ -925,8 +940,45 @@ export interface RunRecord {
 	endReason?: RunEndReason;
 	/** The director's bounded, evidence-based briefing for this run; not approval or verification evidence. */
 	closeout?: CloseoutDraft;
+	/** Facts captured at finish, before the session's team or target can change. */
+	closeoutFacts?: CloseoutFacts;
 	/** The limits the user stated with the request. */
 	limits?: { rounds?: number; minutes?: number };
+}
+
+/** Facts that cannot be faithfully rebuilt from today's session settings. */
+export interface CloseoutFacts {
+	readonly target: string;
+	readonly pendingLanes: readonly string[];
+	readonly requiredChecks: readonly string[];
+}
+
+/** Only these actions receive a number. User-owned work is prose, never dispatched. */
+export type CloseoutAction =
+	| { readonly kind: "resume"; readonly label: string }
+	| { readonly kind: "run"; readonly label: string; readonly task: string };
+
+export interface CloseoutBrief {
+	readonly runId: string;
+	readonly tier: "none" | "line" | "card";
+	readonly request: string;
+	readonly target?: string;
+	readonly startedAt: string;
+	readonly endedAt?: string;
+	readonly official: {
+		readonly label: string;
+		readonly tone: NonNullable<InfoSpan["tone"]>;
+		readonly hasResults: boolean;
+		readonly accepted: number;
+		readonly inScope: number;
+		readonly excluded: number;
+		readonly open: Readonly<Record<"unsettled" | "revoked" | "blocked" | "retry" | "reviewable" | "pending" | "unmet", number>>;
+	};
+	readonly residual: readonly string[];
+	readonly proof?: string;
+	readonly director?: { readonly result: string; readonly remaining?: string; readonly stale: boolean };
+	readonly userActions: readonly string[];
+	readonly actions: readonly CloseoutAction[];
 }
 
 export interface RunJob {

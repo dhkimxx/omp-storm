@@ -229,6 +229,8 @@ test("a reverted shared change reopens at the verified gate and blocks a result 
 	const persisted = await readRun(h.sessionDir, runId);
 	expect(persisted?.endReason).toBe("no-progress");
 	expect(persisted?.results?.find(item => item.id === "c-change")).toMatchObject({ state: "accepted" });
+	// A row finalization did not change carries no marker.
+	expect(persisted?.results?.find(item => item.id === "c-change")?.finalized).toBeUndefined();
 });
 
 test("an ordinary turn cannot verify a tree whose accepted shared change was reverted", async () => {
@@ -365,6 +367,9 @@ test("a vanished retained artifact is not verified and reopens its row", async (
 	const row = final?.results?.find(item => item.id === "experiment-patch");
 	expect(row).toMatchObject({ state: "unmet" });
 	expect(row?.reason).toContain("보존");
+	// Finalization reopened accepted evidence: the closeout can tell it apart from a judged miss.
+	expect(row?.finalized).toBe("revoked");
+	expect((await readRun(h.sessionDir, runId))?.results?.find(item => item.id === "experiment-patch")?.finalized).toBe("revoked");
 });
 
 test("an accepted answer is proof at the verified gate and is not treated like a missing patch", async () => {
@@ -388,13 +393,14 @@ test("an accepted answer is proof at the verified gate and is not treated like a
 		startedAt: T0,
 		observedAt: T0 + 1,
 		report: report({ runId, spawnKey, attemptId: `job:answer:${spawnKey}` }),
-		reportText: "The current report.json total is 42 (report.json:2).",
+		reportText: "The total is 42 (report.json:2).",
 		citations: [{ path: REPORT, line: 2 }],
 	});
 
 	const final = await h.controller.finish("verified");
 	expect(final).toMatchObject({ status: "done", endReason: "verified" });
 	expect(final?.results?.find(item => item.id === "report-answer")).toMatchObject({ state: "accepted" });
+	expect(final?.results?.find(item => item.id === "report-answer")?.finalized).toBeUndefined();
 });
 
 test("a result edge needs the accepted result's current location, not only its ledger state", () => {

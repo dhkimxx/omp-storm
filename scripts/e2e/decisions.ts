@@ -29,7 +29,6 @@ import {
 	approveTeam,
 	cancelAll,
 	choose,
-	customMessage,
 	focused,
 	type Frame,
 	KEY,
@@ -46,6 +45,15 @@ import {
 	TEAM_PROVIDERS,
 	Tui,
 	until,
+	CLOSEOUT_HEADING,
+	closeoutBody,
+	closeoutOf,
+	isOneLineCloseout,
+	offeredDirections,
+	persistedStormRecords,
+	runNext,
+	sessionFileIn,
+	userNext,
 } from "./harness.ts";
 
 const env = prepare("storm-e2e-decisions", 18564);
@@ -57,6 +65,10 @@ const HOST_FILE = `${FIXTURES}/host-check.txt`;
 const DEVICE_FILE = `${FIXTURES}/device-verify.txt`;
 const HOST_TOKEN = "E2E-HOST-CHECK-OK";
 const DEVICE_TOKEN = "E2E-DEVICE-VERIFY-OK";
+// The fixture line is a typed field (`key: "value"`), so a cited answer is fast-accepted only by exact typed agreement,
+// never by prose that repeats the token.
+const HOST_LINE = `host_check: "${HOST_TOKEN}"`;
+const DEVICE_LINE = `device_verify: "${DEVICE_TOKEN}"`;
 const SENTINEL = "e2e-decision-sentinel.txt";
 const DECISION_KEY = "e2e-sentinel-decision-v1";
 const PRESELECT_KEY = "e2e-preselect-v1";
@@ -105,7 +117,7 @@ function hostTask(outputName = "host-check.out"): Step {
 	return {
 		task: ["storm-quick"],
 		as: "host-check",
-		say: `E2E-CHILD-SH ${encoded(`cat ${HOST_FILE} > ${JSON.stringify(output)}`)} E2E-CHILD-READ ${HOST_FILE} E2E-CHILD-CLAIM ${HOST_TOKEN} is line 1 of ${HOST_FILE} (${HOST_FILE}:1).`,
+		say: `E2E-CHILD-SH ${encoded(`cat ${HOST_FILE} > ${JSON.stringify(output)}`)} E2E-CHILD-READ ${HOST_FILE} E2E-CHILD-CLAIM ${HOST_LINE} (${HOST_FILE}:1)`,
 	};
 }
 
@@ -114,7 +126,7 @@ function deviceTask(outputName = "device-verify.out"): Step {
 	return {
 		task: ["storm-quick"],
 		as: "device-check",
-		say: `E2E-CHILD-SH ${encoded(`cat ${DEVICE_FILE} > ${JSON.stringify(output)}`)} E2E-CHILD-READ ${DEVICE_FILE} E2E-CHILD-CLAIM ${DEVICE_TOKEN} is line 1 of ${DEVICE_FILE} (${DEVICE_FILE}:1).`,
+		say: `E2E-CHILD-SH ${encoded(`cat ${DEVICE_FILE} > ${JSON.stringify(output)}`)} E2E-CHILD-READ ${DEVICE_FILE} E2E-CHILD-CLAIM ${DEVICE_LINE} (${DEVICE_FILE}:1)`,
 	};
 }
 
@@ -122,15 +134,20 @@ const checkBrief = {
 	result: "E2E-BRIEF-RESULT: the host and local device fixture checks ran.",
 	verification: "E2E-BRIEF-EVIDENCE: both commands wrote their exact fixture token; no real device was used.",
 	remaining: "E2E-BRIEF-REMAINING: nothing beyond this disposable local fixture.",
-	next: ["Inspect the recorded fixture output", "Repeat the same bounded check", "Stop and document the local fixture"],
-} as const;
+	// Typed next actions: one bounded new-scope run (numbered, recommended) and one user-owned step (never numbered).
+	next: [
+		runNext("Inspect the recorded fixture output", "E2E-WHY: the receipts are the only evidence"),
+		userNext("Connect the real device yourself before repeating the check"),
+	],
+};
 
 const decisionBrief = {
 	result: "E2E-BRIEF-DECISION: the irreversible removal was offered once and not applied.",
 	verification: "E2E-BRIEF-DECISION-EVIDENCE: the sentinel still exists after the denial.",
 	remaining: "E2E-BRIEF-DECISION-REMAINING: the user may choose the removal in a later request.",
-	next: ["Keep the sentinel", "Review the fixture again", "Stop without changing the tree"],
-} as const;
+	// Only a user-owned step: nothing to dispatch, so the record must not invent numbered defaults.
+	next: [userNext("Request the removal later if it is still wanted")],
+};
 
 const hostLanes = [
 	{
@@ -138,14 +155,14 @@ const hostLanes = [
 		kind: "run",
 		files: [HOST_FILE],
 		goal: "Run the host fixture check and report its exact token",
-		results: [{ id: "host-check-ok", kind: "answer", criterion: `report ${HOST_FILE} from source`, path: HOST_FILE, contains: HOST_TOKEN }],
+		results: [{ id: "host-check-ok", kind: "answer", criterion: `report ${HOST_FILE} from source`, path: HOST_FILE, contains: HOST_LINE }],
 	},
 	{
 		name: "device-check0",
 		kind: "run",
 		files: [DEVICE_FILE],
 		goal: "Run the benign local device fixture verification",
-		results: [{ id: "device-verify-ok", kind: "answer", criterion: `report ${DEVICE_FILE} from source`, path: DEVICE_FILE, contains: DEVICE_TOKEN }],
+		results: [{ id: "device-verify-ok", kind: "answer", criterion: `report ${DEVICE_FILE} from source`, path: DEVICE_FILE, contains: DEVICE_LINE }],
 	},
 ];
 
@@ -153,15 +170,15 @@ const decisionLane = {
 	name: "decision0",
 	kind: "run",
 	goal: "Read the fixture before asking the one irreversible decision",
-	results: [{ id: "decision-check-ok", kind: "answer", criterion: `report ${HOST_FILE} from source`, path: HOST_FILE, contains: HOST_TOKEN }],
+	results: [{ id: "decision-check-ok", kind: "answer", criterion: `report ${HOST_FILE} from source`, path: HOST_FILE, contains: HOST_LINE }],
 };
 
 async function main(): Promise<void> {
 	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
 	writeFileSync(join(env.agentDir, "config.yml"), PROFILE_CONFIG);
 	mkdirSync(join(env.project, FIXTURES), { recursive: true });
-	writeFileSync(join(env.project, HOST_FILE), `${HOST_TOKEN}\n`);
-	writeFileSync(join(env.project, DEVICE_FILE), `${DEVICE_TOKEN}\n`);
+	writeFileSync(join(env.project, HOST_FILE), `${HOST_LINE}\n`);
+	writeFileSync(join(env.project, DEVICE_FILE), `${DEVICE_LINE}\n`);
 	// The disposable quick definition declares `ask`, so the child tool-list assertion proves the real host still does
 	// not expose the interactive tool to a managed task subagent. No worker-ask call is faked.
 	const agents = join(env.project, ".omp", "agents");
@@ -198,11 +215,7 @@ async function main(): Promise<void> {
 			const steps: Step[] = [over, bounded, hostTask(), deviceTask(), { storm: { action: "brief", brief: checkBrief } }];
 			const frameStart = rpc!.frames.length;
 			const { run, frames } = await runOf(rpc!, files, scripted(...steps));
-			await until(
-				() => (rpc!.frames.slice(frameStart).some(frame => customMessage(frame) === "storm-report" && JSON.stringify(frame).includes(checkBrief.next[0])) ? true : undefined),
-				30_000,
-				"the automatic closeout card",
-			);
+			const closeout = await until(() => closeoutOf(rpc!.frames, run.runId, frameStart), 30_000, "the automatic closeout record");
 			const dialogs = frames.filter(frame => frame.type === "extension_ui_request" && UI_METHODS[String(frame.method)] === true);
 			check("no approval dialog, form, select or input opened during the automatic turn", dialogs.length === 0, JSON.stringify(dialogs.map(frame => [frame.method, frame.title ?? frame.message ?? ""])));
 			check(
@@ -228,8 +241,8 @@ async function main(): Promise<void> {
 				["host-check0", "device-check0"].every(name => routed.some(spawn => spawn.lane === name)) && routed.every(spawn => spawn.outcome === "routed"),
 				JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.lane, spawn.outcome])),
 			);
-			check("the host-check command actually ran", existsSync(join(env.work, "host-check.out")) && readFileSync(join(env.work, "host-check.out"), "utf8").trim() === HOST_TOKEN);
-			check("the local device verification actually ran", existsSync(join(env.work, "device-verify.out")) && readFileSync(join(env.work, "device-verify.out"), "utf8").trim() === DEVICE_TOKEN);
+			check("the host-check command actually ran", existsSync(join(env.work, "host-check.out")) && readFileSync(join(env.work, "host-check.out"), "utf8").trim() === HOST_LINE);
+			check("the local device verification actually ran", existsSync(join(env.work, "device-verify.out")) && readFileSync(join(env.work, "device-verify.out"), "utf8").trim() === DEVICE_LINE);
 			const resultStates = new Map((run.results ?? []).map(result => [result.id, result.state]));
 			check("both required worker outcomes are visible on the run record", resultStates.get("host-check-ok") !== undefined && resultStates.get("device-verify-ok") !== undefined, JSON.stringify(run.results ?? null));
 			const childTools = llm.of("child").map(entry => entry.tools);
@@ -238,7 +251,18 @@ async function main(): Promise<void> {
 				childTools.length > 0 && childTools.every(tools => !tools.includes("ask")),
 				JSON.stringify([...new Set(childTools.map(tools => tools.join(",")))]),
 			);
-			check("the closeout brief survived the run", run.closeout !== undefined && run.closeout.result === checkBrief.result && run.closeout.next[0] === checkBrief.next[0], JSON.stringify(run.closeout ?? null));
+			check(
+				"the typed closeout brief survived the run",
+				run.closeout !== undefined && run.closeout.result === checkBrief.result && JSON.stringify(run.closeout.next) === JSON.stringify(checkBrief.next),
+				JSON.stringify(run.closeout ?? null),
+			);
+			// Numbers go only to dispatchable actions: at most the one run plus a code-added resume, never the user step.
+			const offers = offeredDirections(closeoutBody(closeout.text));
+			check(
+				"the record numbers no user-owned step and fabricates no default offers",
+				offers.length <= 2 && !offers.some(offer => offer.includes("real device yourself")),
+				closeout.text.slice(-600),
+			);
 			check("no decision form rendered on the RPC surface", !JSON.stringify(frames).includes(DECISION_HEADING));
 		}, 300_000);
 
@@ -289,11 +313,19 @@ async function main(): Promise<void> {
 			started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 			await submitTextForm(tui, started, DECISION_HEADING, "deny");
 			const run = await before.finishedRun(runs, 180_000);
-			await tui.shows("다음으로 무엇을 할까요?", started, 60_000);
+			// The tier is the code's: a short clean verified run is one saved fact line (no title, no directions on screen);
+			// anything else is a card under its title. A denied decision is not a caution, so either tier can follow it.
+			const kept = await until(() => {
+				const file = sessionFileIn(owned!.dir, owned!.id);
+				return (file === undefined ? [] : persistedStormRecords(file)).filter(entry => entry.details?.runId === run.runId).at(-1);
+			}, 30_000, "the saved closeout record");
+			const oneLine = isOneLineCloseout(kept);
+			const fact = closeoutBody(kept.text)[0]?.replace(/^[-*]\s+/, "") ?? "";
+			await tui.shows(oneLine ? fact.slice(0, 24) : CLOSEOUT_HEADING, started, 60_000);
 			check("the marked decision really rendered as one native HTML form", tui.text(started).includes(DECISION_HEADING) && tui.text(started).includes("E2E-DECISION-VALUE"));
 			check("the unmarked routine ask never rendered a form", !tui.text(started).includes(ROUTINE_HEADING));
 			check("a high-risk preselected form never rendered", !tui.text(started).includes("E2E preselected removal"));
-			check("both local fixture checks ran on the TUI path", readFileSync(join(env.work, "tui-host-check.out"), "utf8").trim() === HOST_TOKEN && readFileSync(join(env.work, "tui-device-verify.out"), "utf8").trim() === DEVICE_TOKEN);
+			check("both local fixture checks ran on the TUI path", readFileSync(join(env.work, "tui-host-check.out"), "utf8").trim() === HOST_LINE && readFileSync(join(env.work, "tui-device-verify.out"), "utf8").trim() === DEVICE_LINE);
 			const childTools = llm.of("child").map(entry => entry.tools);
 			check(
 				"OMP exposes no native ask to a managed task worker, so no worker dialog can open",
@@ -322,13 +354,19 @@ async function main(): Promise<void> {
 			check("the denial was read as no approval, so the effect command was not run", effect?.decision.tool === "storm" && (effect.decision.args as { action?: string } | undefined)?.action === "status", JSON.stringify(effect?.decision ?? null));
 			const afterRepeat = asks[1] === undefined ? undefined : main.find(entry => entry.ts > asks[1]!.ts && entry.lastTool.includes("[storm:"));
 			check("the repeat did not open a second form", afterRepeat !== undefined && /이미|already|한 번|once|ask|결정|decision/i.test(afterRepeat.lastTool), afterRepeat?.lastTool.slice(0, 500) ?? "the repeat waited for a second form");
-			check("the closeout card still follows the decision", run.closeout?.result === decisionBrief.result && tui.text(started).includes("E2E-BRIEF-DECISION"), JSON.stringify(run.closeout ?? null));
+			const shownRecord = oneLine ? kept.text : tui.text(started).split(CLOSEOUT_HEADING).at(-1) ?? "";
+			check(
+				"the closeout still follows the decision, with the user-owned step left unnumbered",
+				run.closeout?.result === decisionBrief.result && fact !== "" &&
+					!offeredDirections((oneLine ? closeoutBody(kept.text) : shownRecord.split("\n")).map(line => line.replace(/[│|]/g, "").trim())).some(offer => offer.includes("removal later")),
+				`tier=${oneLine ? "line" : "card"} ${JSON.stringify(run.closeout ?? null)} shown=${shownRecord.slice(0, 600)}`,
+			);
 
 			// A new user request resets only the asked-key memory: the same stable key must be offered again.
 			const secondRuns = before.runIds();
 			const secondSteps: Step[] = [
 				{ storm: { action: "plan", plan: { lanes: [decisionLane], workers: { quick: 1 } } } },
-				{ task: ["storm-quick"], as: "decision", say: `E2E-CHILD-READ ${HOST_FILE} E2E-CHILD-CLAIM ${HOST_TOKEN} is line 1 of ${HOST_FILE} (${HOST_FILE}:1).` },
+				{ task: ["storm-quick"], as: "decision", say: `E2E-CHILD-READ ${HOST_FILE} E2E-CHILD-CLAIM ${HOST_LINE} (${HOST_FILE}:1)` },
 				{ ask: DECISION_FORM },
 				{ ifAskApproved: `rm -f ${SENTINEL}` },
 				{ storm: { action: "brief", brief: decisionBrief } },

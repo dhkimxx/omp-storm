@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
-import { agentRows, duration, renderAgentRows, tokens } from "../src/report/agents.ts";
+import { stripTerminalSequences, visibleWidth } from "@oh-my-pi/pi-tui";
+import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
+import { agentRows, duration, renderAgentReport, renderAgentRows, tokens } from "../src/report/agents.ts";
+import { roleTitle } from "../src/roles.ts";
 import { bindLedgerChild, resetLedger, startLedgerRun } from "../src/runtime/ledger.ts";
 import { RunLanes } from "../src/runtime/lanes.ts";
 import { reviewEvidenceOf } from "../src/runtime/review.ts";
@@ -19,8 +22,12 @@ import {
 	noteVerdictTree,
 	resetAgents,
 } from "../src/runtime/agents.ts";
-import type { AgentEntry, StormConfig } from "../src/types.ts";
+import type { AgentEntry, InfoLine, StormConfig } from "../src/types.ts";
+import { RichFrame } from "../src/view/info.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
+
+// The rich frame draws with omp's theme.
+ensureThemeSync();
 
 const T0 = Date.parse("2026-11-20T09:00:00Z");
 const MIN = 60_000;
@@ -281,6 +288,95 @@ describe("renderAgentRows", () => {
 		const texts = [duration(30_000), duration(5 * MIN), duration(2 * HOUR), duration(1.5 * HOUR)];
 		expect(texts.map(Number.parseFloat)).toEqual([30, 5, 2, 1.5]);
 		expect(new Set(texts.map(text => text.replace(/[\d.]/g, ""))).size).toBe(3);
+	});
+});
+
+describe("renderAgentReport", () => {
+	const joined = (line: InfoLine) => line.spans.map(span => span.text).join("");
+	const report = (rows: ReturnType<typeof agentRows>) => {
+		const info: InfoLine[] = [];
+		const md = renderAgentReport(rows, NOW, info);
+		return { md, info, lines: md.split("\n") };
+	};
+
+	test("each agent is a stack of short rows, every one annotated with exactly its own text", () => {
+		const rows = agentRows(
+			[
+				entry({ id: "0-Implementer-2", followUps: 3, changes: 4, review: { reviews: 2, passed: 1, failed: 1, findings: [0, 1, 0, 0] }, lastWorkFailed: true }),
+				entry({ id: "1-Reviewer", role: "reviewer", state: "running", contextTokens: 151_000 }),
+			],
+			config,
+		);
+		const { md, info, lines } = report(rows);
+		// No table: three status rows per agent plus one evidence row for the agent that left evidence.
+		expect(md).not.toContain("|");
+		expect(lines).toHaveLength(7);
+		expect(info.map(line => line.index)).toEqual(lines.map((_, index) => index));
+		for (const line of info) expect(joined(line)).toBe(lines[line.index]!);
+		// Agents start a list item; their details are indented under it.
+		expect(lines.filter(line => line.startsWith("- ")).map(line => line.split(" · ")[0])).toEqual(["- 0-Implementer-2", "- 1-Reviewer"]);
+		expect(lines.filter(line => !line.startsWith("- ")).every(line => line.startsWith("  "))).toBe(true);
+		// Korean role titles, the model and context against its cap, the follow-up verdict.
+		expect(lines[0]).toContain(roleTitle("implementer"));
+		expect(lines[1]).toContain(`anthropic/sonnet · 컨텍스트 ${tokens(30_000)}/${tokens(150_000)}`);
+		expect(lines[2]).toContain("3회");
+		expect(lines[4]).toContain(roleTitle("reviewer"));
+		// The running agent reads as running; the one past its cap warns on its follow-up row.
+		expect(info[4]!.spans.at(-1)?.tone).toBe("success");
+		expect(info[6]!.spans.at(-1)?.tone).toBe("warning");
+	});
+
+	test("the evidence row names changes, review verdicts and a failed last turn, warning only on what needs attention", () => {
+		const evidence = (over: Partial<AgentEntry>) => {
+			const { lines, info } = report(agentRows([entry(over)], config));
+			return lines.length === 4 ? { text: lines[3]!, spans: info[3]!.spans } : undefined;
+		};
+		expect(evidence({})).toBeUndefined();
+		expect(evidence({ changes: 0, review: { reviews: 0, passed: 0, failed: 0, findings: [0, 0, 0, 0] } })).toBeUndefined();
+
+		const clean = evidence({ changes: 2, review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] } })!;
+		expect(clean.text).toBe("  파일 변경 2건 · 리뷰 1회: 통과 1 · 수정 필요 0");
+		expect(clean.spans.some(span => span.tone === "warning")).toBe(false);
+
+		const failing = evidence({ review: { reviews: 3, passed: 1, failed: 2, findings: [1, 0, 0, 0] }, lastWorkFailed: true })!;
+		expect(failing.text).toBe("  리뷰 3회: 통과 1 · 수정 필요 2 · 마지막 작업 실패");
+		expect(failing.spans.filter(span => span.tone === "warning").map(span => span.text)).toEqual([" · 수정 필요 2", "마지막 작업 실패"]);
+	});
+
+	test("at 60 columns long ids and model names wrap inside the frame where the table would not fit", () => {
+		const rows = agentRows(
+			[
+				entry({ id: "0-Implementer-with-a-rather-long-generated-handle", model: "openrouter/anthropic/claude-sonnet-5-5-preview", contextTokens: 148_500 }),
+				entry({ id: "1-Explorer", role: "explorer", state: "parked", lastActivityAt: NOW - 2 * HOUR }),
+			],
+			config,
+		);
+		expect(renderAgentRows(rows, NOW).split("\n").some(line => visibleWidth(line) > 60)).toBe(true);
+		const { md, info } = report(rows);
+		const frame = new RichFrame("서브에이전트", md, info).render(60);
+		expect(frame.every(row => visibleWidth(row) <= 60)).toBe(true);
+		// Read the content back across wrapped rows: no frame border, no padding, no break position assumed.
+		const flat = frame.map(row => stripTerminalSequences(row)).join("").replace(/[\s\u2500-\u257f]/g, "");
+		for (const shown of [
+			"0-Implementer-with-a-rather-long-generated-handle",
+			"openrouter/anthropic/claude-sonnet-5-5-preview",
+			`${roleTitle("explorer")}·보관·유휴${duration(2 * HOUR)}`,
+			`컨텍스트${tokens(148_500)}/${tokens(150_000)}`,
+		]) expect(flat).toContain(shown.replace(/\s/g, ""));
+	});
+
+	test("control characters in an id or model cannot add rows or shift the annotations", () => {
+		const { lines, info } = report(agentRows([entry({ id: "A\nB", model: "x/\u001b[31mred" })], config));
+		expect(lines).toHaveLength(3);
+		for (const line of info) expect(joined(line)).toBe(lines[line.index]!);
+		expect(lines[0]).toContain("A\\u000aB");
+		expect(lines.join("\n")).not.toContain("\u001b");
+	});
+
+	test("no agents: the same single line as the table, quietly", () => {
+		const { md, info } = report([]);
+		expect(md).toBe(renderAgentRows([], NOW));
+		expect(info).toEqual([{ index: 0, spans: [{ text: md, tone: "muted" }] }]);
 	});
 });
 

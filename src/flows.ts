@@ -1,7 +1,7 @@
 /**
  * /storm flows: setup (the recommended team, a one-slot model edit from the native picker, or the role-by-role
  * interview), status, approval of a config changed by hand, rollback, trial decisions, automatic-delegation consent,
- * template export and reset. None of them calls a model or sends a message. Everything they persist belongs to the
+ * and reset. None of them calls a model or sends a message. Everything they persist belongs to the
  * current native OMP session under its profile (`ProjectState.sessionDir`); the current work tree is only the target
  * an approval is bound to, never a storage key. A config is approved only by the exact "승인" in Storm's dialog; the
  * first such approval initializes automatic delegation, later changes need its own exact choice, and reset deletes
@@ -12,7 +12,7 @@ import { join, relative } from "node:path";
 import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation } from "./approval/auto.ts";
 import { configHash, shortHash } from "./config/canonical.ts";
 import { teamPriority, validateConfig } from "./config/schema.ts";
-import { configPath, serializeConfig, writeConfig } from "./config/store.ts";
+import { configPath, writeConfig } from "./config/store.ts";
 import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
@@ -23,13 +23,14 @@ import { recommendedConfig } from "./view/setup.ts";
 import { buildTrialEnd, modelWarnings } from "./proposals/build.ts";
 import { type DecideHost, type Decision, decideProposal, movedSince } from "./proposals/decide.ts";
 import { APPROVE, CANCEL, renderApproval } from "./proposals/present.ts";
-import { agentRows, renderAgentRows } from "./report/agents.ts";
+import { agentRows, renderAgentReport } from "./report/agents.ts";
 import { renderModelCheck } from "./report/models.ts";
 import { ompSettingsAdvice } from "./report/omp-settings.ts";
 import { roleTitle } from "./roles.ts";
+import { closeoutHandoff } from "./runtime/closeout.ts";
 import { acquireSessionLease } from "./runtime/lease.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
-import { findResumeCandidate, resumeSpec } from "./runtime/resume.ts";
+import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
 import { formatStorage, readStorage, storageDetailLines } from "./runtime/janitor.ts";
 import { readRunIndex } from "./runtime/run-index.ts";
 import { readQuotaMarks } from "./runtime/state-files.ts";
@@ -702,13 +703,23 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 }
 
 /**
- * The status as text from one project read. `info` collects the TUI's semantic spans for the same Markdown; the
- * storm tool's model view still passes none, so its payload is unchanged and names no path. The user's full status
- * ends by naming the one target this session's approval covers, so a target change is visible before acting.
+ * The status as text from one project read. `info` collects TUI semantic spans. The model can read the bounded final
+ * handoff on explicit status only for this session and target; an unrelated active run does not get that handoff.
+ * The full user report names the target this session's approval covers.
  */
 async function statusMarkdown(env: FlowEnv, opts: { quota: boolean }, info?: InfoLine[]): Promise<string> {
 	const state = await loadProjectState(env);
 	const view = await statusView(env, state, { quota: opts.quota, user: opts.quota, storage: opts.quota });
+	if (!opts.quota) {
+		const last = view.lastRun;
+		if (
+			last !== undefined &&
+			(view.run === undefined || (view.run.followUpOf ?? view.run.resumeOf) === last.runId) &&
+			(await trustedResume(state.sessionDir, state.repo, last))
+		) {
+			view.lastHandoff = closeoutHandoff(last);
+		}
+	}
 	const body = renderStatus(view, env.now(), opts.quota ? "user" : "model", info);
 	return opts.quota ? `${body}\n\n### 적용 범위\n- ${targetScopeLine(state.repo.root)}` : body;
 }
@@ -733,79 +744,18 @@ export async function statusFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 export async function agentsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
 	const config = state.config.status === "ok" ? state.config.config : undefined;
-	await ui.report("서브에이전트", renderAgentRows(agentRows(env.agents?.() ?? [], config), env.now()));
+	const info: InfoLine[] = [];
+	const markdown = renderAgentReport(agentRows(env.agents?.() ?? [], config), env.now(), info);
+	await ui.report("서브에이전트", markdown, info);
 }
 
 /** Read-only model check without the LLM: newer or better-ranked models than the team's current ones. */
 export async function modelsFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 	const state = await loadProjectState(env);
 	const ctx = await prepareAnalysis(env, ui);
-	await ui.report("Storm 모델 점검", renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined));
-}
-
-/**
- * Only the team options a person may share: known config fields with no unknown fields, no session or target path,
- * no approval/hash/history/queue, no trial experiment and no required-check argv (which is target-bound and may name
- * a private path). The result is serialized as text; nothing here is read back by Storm.
- */
-function exportableTeam(config: StormConfig): StormConfig {
-	const roles: StormConfig["roles"] = {};
-	for (const [id, role] of Object.entries(config.roles)) {
-		roles[id] = {
-			agent: role.agent,
-			models: [...role.models],
-			...(role.effort !== undefined ? { effort: role.effort } : {}),
-			...(role.workers !== undefined ? { workers: typeof role.workers === "number" ? role.workers : { ...role.workers } } : {}),
-			...(role.contextCap !== undefined ? { contextCap: role.contextCap } : {}),
-		};
-	}
-	return {
-		version: config.version,
-		priority: config.priority,
-		roles,
-		isolation: config.isolation,
-		...(config.budget
-			? {
-					budget: {
-						perRunUsd: config.budget.perRunUsd,
-						...(config.budget.warnAtUsd !== undefined ? { warnAtUsd: config.budget.warnAtUsd } : {}),
-						onExceed: config.budget.onExceed,
-					},
-				}
-			: {}),
-		...(config.fallbackRole !== undefined ? { fallbackRole: config.fallbackRole } : {}),
-		...(config.disabledRoles?.length ? { disabledRoles: [...config.disabledRoles] } : {}),
-		...(config.contextCap !== undefined ? { contextCap: config.contextCap } : {}),
-		...(config.cleanup !== undefined ? { cleanup: config.cleanup } : {}),
-		...(config.docs !== undefined ? { docs: config.docs } : {}),
-		...(config.rounds !== undefined ? { rounds: config.rounds } : {}),
-	};
-}
-
-/**
- * `/storm export`: a human-only, explicit copy of this session's team options for sharing by hand. It writes nothing
- * and is not offered to the model or the storm tool; the text excludes approval, hashes, history, queues, credentials,
- * checks and every path. No import or inheritance exists on the other side.
- */
-export async function exportFlow(env: FlowEnv, ui: UiPort): Promise<void> {
-	const state = await loadProjectState(env);
-	if (state.config.status !== "ok" || !isApproved(state)) {
-		ui.notify("내보낼 승인된 팀 설정이 없습니다. /storm 에서 팀을 설정하고 승인한 뒤 다시 실행하세요.", "warning");
-		return;
-	}
-	const template = serializeConfig(exportableTeam(state.config.config)).trimEnd();
-	const markdown = [
-		"### 복사용 팀 옵션",
-		"",
-		"- 모델·effort·워커·예산·실행 설정처럼 나눌 수 있는 값만 담았습니다.",
-		"- 승인 기록, 설정 해시, 실행·시험 기록, 자동 위임 선택, 필수 검사 명령, 자격 증명, 세션·작업 대상 경로는 들어 있지 않습니다.",
-		"- Storm은 이 내용을 읽어 들이거나 자동으로 물려받지 않습니다. 필요하면 사람이 직접 비교해 옮겨 적으세요.",
-		"",
-		"```json",
-		template,
-		"```",
-	].join("\n");
-	await ui.report("Storm 팀 템플릿", markdown);
+	const info: InfoLine[] = [];
+	const markdown = renderModelCheck(ctx, state.config.status === "ok" ? state.config.config : undefined, info);
+	await ui.report("Storm 모델 점검", markdown, info);
 }
 
 const TRIAL = { adopt: "후보로 교체", keep: "지금 모델 유지", later: "나중에" } as const;

@@ -27,7 +27,7 @@ export type Routed =
 	| { action: "change"; change: ChangeAction };
 
 /** Subcommands of earlier versions: typed alone they open the menu instead of becoming a task. */
-const HUB_WORDS: readonly string[] = ["run", "rollback", "approve", "review"];
+const HUB_WORDS: readonly string[] = ["run", "rollback", "approve", "review", "export"];
 
 export const FALLBACK = { run: "작업으로 실행", menu: "메뉴 열기", cancel: "취소" } as const;
 /** Asked before a quota mark the classifier proposed is written. */

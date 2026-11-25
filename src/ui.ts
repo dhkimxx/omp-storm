@@ -38,7 +38,8 @@ import {
 	type UiContext,
 	type UiPort,
 } from "./types.ts";
-import { infoSymbol, infoSections, RichFrame } from "./view/info.ts";
+import { closeoutDetails, readCloseoutRecord } from "./view/closeout.ts";
+import { describeInfoLine, infoSymbol, infoSections, renderInfoLine, RichFrame } from "./view/info.ts";
 import { visible } from "./view/render.ts";
 
 const REPORT_TYPE = "storm-report";
@@ -71,12 +72,35 @@ const NATIVE_SLACK = 3;
 /** A stable context for describing rich nodes; none of them consult it. */
 const NATIVE_CX: DescribeContext = { cols: 80, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
 
-/** Draws Storm's transcript records in omp's own frame, headed by Storm's mark and name instead of a package glyph and the raw type. */
+/**
+ * Draws Storm's transcript records in omp's own frame, headed by Storm's mark and name instead of a package glyph and the
+ * raw type. The validated closeout is either one inline fact or a structured frame with its title once. Old
+ * and malformed records keep the plain frame; all structured records use semantic spans on both hosts.
+ */
 export function registerReportRenderer(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer(
-		REPORT_TYPE,
-		message => new FramedMessageComponent({ message: { ...message, customType: "Storm" }, icon: REPORT_ICON, role: "omp.custom" }),
-	);
+	pi.registerMessageRenderer(REPORT_TYPE, message => {
+		const closeout = readCloseoutRecord(message.content, message.details);
+		if (closeout !== undefined) {
+			const [only] = closeout.info;
+			if (only !== undefined && closeout.info.length === 1) {
+				const line: InfoLine = { ...only, spans: [{ text: "Storm · ", tone: "muted" }, ...only.spans] };
+				return {
+					// One fact is one row. The mark yields first: where the line with it would wrap and the bare fact still
+					// fits, the fact stands alone rather than breaking its last word onto a second row.
+					render: width => {
+						const named = renderInfoLine(line, width);
+						if (named.length <= 1) return named;
+						const bare = renderInfoLine(only, width);
+						return bare.length < named.length ? bare : named;
+					},
+					describe: () => describeInfoLine(line),
+					invalidate() {},
+				};
+			}
+			return new RichFrame(frameTag(rowText(closeout.title)), closeout.markdown, closeout.info, REPORT_ICON);
+		}
+		return new FramedMessageComponent({ message: { ...message, customType: "Storm" }, icon: REPORT_ICON, role: "omp.custom" });
+	});
 }
 
 function frame(title: string, markdown: string, info?: readonly InfoLine[]): Component {
@@ -773,9 +797,15 @@ function modelPickerRegistry(registry: ExtensionContext["modelRegistry"]): Model
  * other hosts cannot draw components, so they get transcript messages (never sent to the model).
  */
 export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
-	const transcript = (title: string, markdown: string): void => {
+	const transcript = (title: string, markdown: string, details?: unknown): void => {
 		pi.sendMessage(
-			{ customType: REPORT_TYPE, content: `### ${title}\n\n${markdown}`, display: true, excludeFromContext: true },
+			{
+				customType: REPORT_TYPE,
+				content: `### ${title}\n\n${markdown}`,
+				display: true,
+				excludeFromContext: true,
+				...(details !== undefined && { details }),
+			},
 			{ triggerTurn: false },
 		);
 	};
@@ -858,7 +888,9 @@ export function createUiPort(pi: ExtensionAPI, ctx: ExtensionContext): UiPort {
 		// Outside the TUI a notification may go nowhere (ACP only logs it), and it is the only word on how a flow ended.
 		notify: (message, level = "info") => (drawsComponents ? ctx.ui.notify(message, level) : transcript(NOTICE_TITLE[level], message)),
 		report,
-		record: transcript,
+		// Always transcript-only. A closeout's styling is persisted only when it matches the text it styles; the plain
+		// content stays the whole record for RPC, ACP and any renderer that cannot use the details.
+		record: (title, markdown, style) => transcript(title, markdown, closeoutDetails(markdown, style)),
 		...(drawsComponents
 			? {
 					pickModel: (title: string, current?: { selector: string; effort?: Effort }) =>

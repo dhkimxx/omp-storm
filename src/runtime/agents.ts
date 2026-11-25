@@ -200,7 +200,13 @@ export function noteAgentReview(id: string, input: unknown, now: number, scope: 
 		// Findings yielded before this verdict are this review's; the verdict's tree then binds them.
 		const carried = log.filter(candidate => candidate.correct === undefined).flatMap(candidate => candidate.findings);
 		const kept = log.filter(candidate => candidate.correct !== undefined);
-		kept.push({ at: now, correct: part.correct, findings: [...carried, ...part.findings] });
+		// Scoped result verdicts stay on this verdict's record only; a later plain verdict never inherits them.
+		kept.push({
+			at: now,
+			correct: part.correct,
+			findings: [...carried, ...part.findings],
+			...(part.results === undefined ? {} : { results: part.results.map(result => ({ ...result })) }),
+		});
 		log.length = 0;
 		log.push(...kept);
 		e.lastVerdict = { at: now, correct: part.correct };

@@ -6,7 +6,7 @@
  * Two modes, deliberately separate:
  *   E2E_REWORK_MODE=baseline (default)
  *     Record what v0.21.0 (`1965f71`) actually does. Native task admission, worker output, run records and the
- *     closeout pending-lane line are checked. The S3 product expectations are still evaluated and reported as
+ *     unfinished lanes are checked (the final ledger's `closeoutFacts`, or that binary's own card line). The S3 product expectations are still evaluated and reported as
  *     failures when unmet: a discrepancy is a reproduction, never a product PASS.
  *   E2E_REWORK_MODE=accept
  *     Assert the intended T05/T04 behavior. This is the pass/fail test for the implementation.
@@ -37,7 +37,6 @@ import {
 	type Answer,
 	cancelAll,
 	choose,
-	customMessage,
 	type Frame,
 	LlmCursor,
 	linkPlugin,
@@ -54,13 +53,18 @@ import {
 	TRACKED_FILE,
 	TRACKED_TEXT,
 	until,
+	closeoutBody,
+	closeoutOf,
+	pendingLanesOf,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, seedFact } from "./typed-fixture.ts";
 
 const MODE = (process.env.E2E_REWORK_MODE ?? "baseline").trim().toLowerCase();
 const ACCEPT = MODE === "accept";
 const LABEL = { autoOff: "자동 위임 끄기" } as const;
 const MAIN = "fake/general-b";
 const env = prepare("storm-e2e-rework", 18783);
+seedFact(env.project);
 const suite = new Suite(`E2E (rework, ${MODE})`, env);
 const check = suite.check.bind(suite);
 /** The one native session this file drives; every case resumes its approved team. */
@@ -125,13 +129,6 @@ async function waitAuto(files: StormFiles, expected: "on" | "off", timeoutMs = 1
 	}
 }
 
-/** The text a custom transcript message carries; JSON.stringify would turn its newlines into escape noise. */
-function customText(frame: Frame): string {
-	const message = frame.message;
-	if (typeof message === "object" && message !== null && "content" in message && typeof message.content === "string") return message.content;
-	return JSON.stringify(frame);
-}
-
 /** A tool result's user-facing text, which is what a client shows (`result.content`). */
 function resultText(frame: Frame): string {
 	const result = frame.result;
@@ -143,20 +140,10 @@ function resultText(frame: Frame): string {
 		.join("\n");
 }
 
-/** The run's end report (closeout card), once Storm writes it. */
+/** The run's settled-run record (its closeout), once Storm writes it. */
 async function reportOf(rpc: Rpc, runId: string, from: number, timeoutMs = 20_000): Promise<string> {
-	return until(
-		() => {
-			const reports = rpc.frames
-				.slice(from)
-				.filter(frame => customMessage(frame) === "storm-report")
-				.map(customText)
-				.join("\n");
-			return reports.includes("### Storm 실행 결과") ? reports : undefined;
-		},
-		timeoutMs,
-		`the end report of ${runId}`,
-	).catch(() => "");
+	const record = await until(() => closeoutOf(rpc.frames, runId, from), timeoutMs, `the end report of ${runId}`).catch(() => undefined);
+	return record?.text ?? "";
 }
 
 const children = (llm: LlmCursor): string[] => [...new Set(llm.of("child").map(entry => entry.lastUser))];
@@ -184,10 +171,25 @@ function cleanupProject(...names: string[]): void {
 	for (const name of names) rmSync(join(env.project, name), { force: true });
 }
 
-/** Storm's official pending-lane line in the closeout card, if any. */
-function pendingLanes(report: string): string[] {
+/**
+ * The lanes a settled run left unfinished. The current card no longer lists them: they are read from the final
+ * on-disk ledger (`closeoutFacts`). A baseline binary predates those facts and still printed its official
+ * `- 미완료 레인:` card line, which stays the evidence for that historical mode only.
+ */
+function pendingLanes(run: RunRecord, report: string): string[] {
+	const recorded = pendingLanesOf(run);
+	if (recorded !== undefined) return recorded;
 	const found = /- 미완료 레인: ([^\n]+)/.exec(report)?.[1];
 	return found === undefined ? [] : found.split(",").map(name => name.trim()).filter(Boolean);
+}
+
+/**
+ * Whether a settled run reports `row` as still open: the final ledger keeps the row unaccepted, and the run's record
+ * is a whole card rather than the one-line clean tier. Row ids and their reasons are ledger and `/storm status`
+ * detail; the compact card carries only the official aggregate.
+ */
+function closeoutKeepsOpen(row: ResultRow | undefined, report: string): boolean {
+	return row !== undefined && row.state !== "accepted" && closeoutBody(report).length > 1;
 }
 
 /** Lanes whose plan is bound to a non-blocked native spawn. */
@@ -239,11 +241,15 @@ function resultRowText(row: ResultRow | undefined): string {
 	return `${row.id} lane=${row.lane ?? "-"} state=${row.state} attempt=${row.attemptId ?? "-"} version=${row.contentVersion?.slice(0, 12) ?? "-"} consumed=[${consumed}] reason=${JSON.stringify(row.reason ?? "")}`;
 }
 
-/** The one read-only answer claim: the real tracked line, cited at its actual location. */
-const TRACKED_CLAIM = `Line 1 of ${TRACKED_FILE} says: ${TRACKED_TEXT.trim()} (${TRACKED_FILE}:1)`;
+/**
+ * The one read-only answer claim: the typed fixture line's signed value, cited at its actual location. A prose
+ * claim about untyped prose would be `reviewable`; this one agrees mechanically with the cited source, so the rework
+ * rows under test see a genuinely accepted `c-answer` / `a-answer`.
+ */
+const TRACKED_CLAIM = FACT_CLAIM;
 
 function observationOf(prefix: string, run: RunRecord, report: string): void {
-	const pending = pendingLanes(report);
+	const pending = pendingLanes(run, report);
 	const line = `${prefix} run=${run.runId} status=${run.status} endReason=${run.endReason ?? "?"} turns=${run.turns ?? "?"}/${run.maxRounds ?? "?"} pending=[${pending.join(",")}]`;
 	note(line);
 	console.log(`OBSERVATION ${line}`);
@@ -446,7 +452,7 @@ async function main(): Promise<void> {
 			contractPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }),
 			{ task: ["storm-implementer"], as: "T5B1", say: `E2E-CHILD-SH ${b64(b1)}` },
 			{ task: ["storm-quick"], as: "T5A1", say: `E2E-CHILD-SH ${b64(a1)}`, after: 'round="2/4"' },
-			{ task: ["storm-explorer"], as: "T5C", say: `E2E-CHILD-READ ${TRACKED_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/4"' },
+			{ task: ["storm-explorer"], as: "T5C", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/4"' },
 			// No verdict directive: the fake reviewer's default is `incorrect`, which opens round 3.
 			{ task: ["storm-reviewer"], as: "T5Rev1", after: 'round="2/4"' },
 			// A's accepted result is already bound to B v1. B v2 starts only after A settled: the approved capability
@@ -461,7 +467,7 @@ async function main(): Promise<void> {
 			await session(cancelAll, async (rpc, files) => {
 				const { run, from } = await runOf(rpc, files, startRun(steps, 4));
 				const report = await reportOf(rpc, run.runId, from);
-				const pending = pendingLanes(report);
+				const pending = pendingLanes(run, report);
 				const bOutput = readProject("b-output.txt");
 				const aReport = readProject("a-report.txt");
 				const snapshot = readProject("a-input-snapshot.txt");
@@ -487,7 +493,7 @@ async function main(): Promise<void> {
 					aNeeds !== undefined && aNeeds.version !== bRow.contentVersion && typeof aNeeds.version === "string" && aNeeds.version !== "" &&
 					cRow?.state === "accepted" && cRow.lane === "c-independent" && typeof cRow.contentVersion === "string" &&
 					explorerAgents.length === 1 && aSpawns.length === 1;
-				const closeoutOpen = report.includes("a-result") && (aRow?.reason === undefined || report.includes(aRow.reason.slice(0, 16)));
+				const closeoutOpen = closeoutKeepsOpen(aRow, report);
 				observationOf("T05", run, report);
 				check("T05: the plan persisted all four native lanes", run.plan?.lanes.length === 4, JSON.stringify(run.plan?.lanes.map(lane => lane.name)));
 				// The downstream review is only attempted: a valid S2 implementation may block it while A is invalid.
@@ -543,7 +549,7 @@ async function main(): Promise<void> {
 						rows,
 					);
 					check(
-						"T05 accept: the closeout names the open a-result and its readable reason",
+						"T05 accept: the final ledger keeps a-result open and the closeout is a whole card",
 						closeoutOpen,
 						`reason=${JSON.stringify(aRow?.reason ?? "")} reportTail=${JSON.stringify(report.slice(-500))}`,
 					);
@@ -576,7 +582,7 @@ async function main(): Promise<void> {
 			contractPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }),
 			{ task: ["storm-implementer"], as: "T5RB1", say: `E2E-CHILD-SH ${b64(b1)}` },
 			{ task: ["storm-quick"], as: "T5RA1", say: `E2E-CHILD-SH ${b64(a1)}`, after: 'round="2/5"' },
-			{ task: ["storm-explorer"], as: "T5RC", say: `E2E-CHILD-READ ${TRACKED_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/5"' },
+			{ task: ["storm-explorer"], as: "T5RC", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/5"' },
 			{ task: ["storm-reviewer"], as: "T5RRev1", after: 'round="2/5"' },
 			{ task: ["storm-implementer"], as: "T5RB2", say: `E2E-CHILD-SH ${b64(b2)}`, after: 'round="3/5"' },
 			// B v2 is current now; this retry is admissible and really runs against v2, but its own result is rejected.
@@ -587,7 +593,7 @@ async function main(): Promise<void> {
 			await session(cancelAll, async (rpc, files) => {
 				const { run, from } = await runOf(rpc, files, startRun(steps, 5));
 				const report = await reportOf(rpc, run.runId, from);
-				const pending = pendingLanes(report);
+				const pending = pendingLanes(run, report);
 				const aReport = readProject("a-report.txt");
 				const bOutput = readProject("b-output.txt");
 				const quickAgents = agentRows(run, "quick");
@@ -609,7 +615,7 @@ async function main(): Promise<void> {
 					aNeeds !== undefined && aNeeds.version === bRow.contentVersion &&
 					cRow?.state === "accepted" && cRow.lane === "c-independent" &&
 					explorerAgents.length === 1 && aSpawns.length === 2;
-				const closeoutOpen = report.includes("a-result") && (aRow?.reason === undefined || report.includes(aRow.reason.slice(0, 16)));
+				const closeoutOpen = closeoutKeepsOpen(aRow, report);
 				observationOf("T05-retry", run, report);
 				check(
 					"T05 retry: A's first success and its retry both ran; the retry consumed B v2",
@@ -645,7 +651,7 @@ async function main(): Promise<void> {
 						rows,
 					);
 					check(
-						"T05 retry accept: the closeout names the open a-result and its readable reason",
+						"T05 retry accept: the final ledger keeps a-result open and the closeout is a whole card",
 						closeoutOpen,
 						`reason=${JSON.stringify(aRow?.reason ?? "")} reportTail=${JSON.stringify(report.slice(-500))}`,
 					);
@@ -674,7 +680,7 @@ async function main(): Promise<void> {
 			{ task: ["storm-implementer"], as: "T5CB", say: `E2E-CHILD-SH ${b64(b)}` },
 			// A and C run first; the run only reaches round 3 after they settle and the review lane is still pending.
 			{ task: ["storm-quick"], as: "T5CA", say: `E2E-CHILD-SH ${b64(a)}`, after: 'round="2/3"' },
-			{ task: ["storm-explorer"], as: "T5CC", say: `E2E-CHILD-READ ${TRACKED_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/3"' },
+			{ task: ["storm-explorer"], as: "T5CC", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/3"' },
 			// The progress edit is submitted only now, after A's settled result is already in the run.
 			{ ...contractPlan(progressLanes, { contract: ACCEPT, workers: t05Workers }), after: 'round="3/3"' },
 			{ task: ["storm-reviewer"], as: "T5CRev", say: `E2E-CHILD-VERDICT correct E2E-CHILD-SH ${b64(reviewWaits)}`, after: 'round="3/3"' },
@@ -683,7 +689,7 @@ async function main(): Promise<void> {
 			await session(cancelAll, async (rpc, files) => {
 				const { run, from } = await runOf(rpc, files, startRun(steps, 3));
 				const report = await reportOf(rpc, run.runId, from);
-				const pending = pendingLanes(report);
+				const pending = pendingLanes(run, report);
 				const quick = agentRows(run, "quick");
 				const aSpawns = run.spawns.filter(spawn => spawn.lane === "a-consume" && spawn.outcome !== "blocked");
 				const progress = run.plan?.lanes.find(lane => lane.name === "b-produce")?.progress;
@@ -762,7 +768,7 @@ async function main(): Promise<void> {
 		const llm = new LlmCursor(env);
 		const steps: Step[] = [
 			contractPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, reviewer: 1 } }),
-			{ task: ["storm-explorer"], as: "T4DA", say: `E2E-CHILD-READ ${TRACKED_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+			{ task: ["storm-explorer"], as: "T4DA", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 			// No directive: the child's first request hits the approved 429 model and the native job fails.
 			{ task: ["storm-implementer"], as: "T4DB" },
 			{ ...contractPlan(t04Replan(false), { contract: ACCEPT, workers: { explorer: 1, reviewer: 1 } }), after: 'round="2/4"' },
@@ -773,7 +779,7 @@ async function main(): Promise<void> {
 			await session(cancelAll, async (rpc, files) => {
 				const { run, frames, from } = await runOf(rpc, files, startRun(steps, 4));
 				const report = await reportOf(rpc, run.runId, from);
-				const pending = pendingLanes(report);
+				const pending = pendingLanes(run, report);
 				const replanFrame = frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "storm").at(-1);
 				const replanReply = replanFrame === undefined ? "" : resultText(replanFrame);
 				const replanOutcome = replanFrame?.result?.details?.outcome;
@@ -792,7 +798,7 @@ async function main(): Promise<void> {
 				const claimSeen = children(llm).some(user => user.includes(TRACKED_CLAIM));
 				const tracked = readProject(TRACKED_FILE);
 				const rows = `b=${resultRowText(bRow)} a=${resultRowText(aRow)}`;
-				const closeoutOpen = bRow !== undefined && report.includes("b-result") && (bRow.reason === undefined || report.includes(bRow.reason.slice(0, 16)));
+				const closeoutOpen = closeoutKeepsOpen(bRow, report);
 				observationOf("T04-drop", run, report);
 				check(
 					"T04 drop: A ran once and stayed intact while B failed",
@@ -839,7 +845,7 @@ async function main(): Promise<void> {
 						rows,
 					);
 					check(
-						"T04 drop accept: the closeout names the orphaned b-result and its readable reason",
+						"T04 drop accept: the final ledger keeps the orphaned b-result open and the closeout is a whole card",
 						closeoutOpen,
 						`reason=${JSON.stringify(bRow?.reason ?? "")} reportTail=${JSON.stringify(report.slice(-500))}`,
 					);
@@ -862,7 +868,7 @@ async function main(): Promise<void> {
 		const repair = quickRepair(root);
 		const steps: Step[] = [
 			contractPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, quick: 1, reviewer: 1 } }),
-			{ task: ["storm-explorer"], as: "T4TA", say: `E2E-CHILD-READ ${TRACKED_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+			{ task: ["storm-explorer"], as: "T4TA", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 			{ task: ["storm-implementer"], as: "T4TB" },
 			{ ...contractPlan(t04Replan(true), { contract: ACCEPT, workers: { explorer: 1, quick: 1, reviewer: 1 } }), after: 'round="2/4"' },
 			{ task: ["storm-quick"], as: "T4TRepair", say: `E2E-CHILD-SH ${b64(repair)}`, after: 'round="2/4"' },
@@ -872,7 +878,7 @@ async function main(): Promise<void> {
 			await session(cancelAll, async (rpc, files) => {
 				const { run, from } = await runOf(rpc, files, startRun(steps, 4));
 				const report = await reportOf(rpc, run.runId, from);
-				const pending = pendingLanes(report);
+				const pending = pendingLanes(run, report);
 				const explorer = agentRows(run, "explorer");
 				const quick = agentRows(run, "quick");
 				const implementers = agentRows(run, "implementer");

@@ -11,7 +11,7 @@
  *
  * Contract (`E2E_CONTRACT=1`, after S1): the same scenarios submit the optional `lane.results` wire through
  * `contract-fixture.ts`, and assert the official `RunRecord.results` obligations
- * (`id`, `lane`, `state`, `reason`, host-owned `attemptId`) and the unresolved ids/reasons in official progress.
+ * (`id`, `lane`, `state`, `reason`, host-owned `attemptId`) and the unresolved ids/reasons in `/storm status`.
  * Use only after the product change; baseline itself must not require these fields to exist.
  *
  * T06 uses a qualitative prose criterion (no `path`/`contains`/`check`): submission alone stays `reviewable`, an
@@ -22,6 +22,14 @@
  * are `tests/rounds.test.ts:550` ("a failed, skipped, missing or mismatched check blocks verified"), `:602`
  * ("a configured check with no report blocks a bound review") and `:583` ("a check older than the last file change
  * is stale even when its tree matches"); this file does not claim an E2E for those unreachable conditions.
+ *
+ * T01c (contract only) is the scoped answer review: a cited prose answer S1 cannot match mechanically stays
+ * `reviewable`. A generic tree-only `correct` from the approved reviewer must not accept it; in a second run the
+ * scripted director waits for Storm's own scoped template (`reviewFor`), forwards what Storm wrote, and the reviewer
+ * copies id/receipt/citation from the packet it actually received into `results`. The receipt is never hardcoded: the
+ * fixture recomputes it from the persisted row (run, result id, host attempt, content version) with the pure
+ * `answerReviewReceipt` oracle and requires the reviewer's received packet, its yield and its stored review log to
+ * name exactly that receipt, the cited anchor and the producer's exact answer text before the run may verify.
  *
  * Every wait is for a named native state; a timeout is a harness failure, never evidence that an admission was safe.
  *
@@ -34,19 +42,22 @@ import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
-import type { RunRecord, RunSummary } from "../../src/types.ts";
+import { answerReviewReceipt } from "../../src/runtime/answer-review.ts";
+import { reviewEvidenceOf } from "../../src/runtime/review.ts";
+import type { AgentEntry, RunRecord, RunSummary } from "../../src/types.ts";
 import { contractPlan, type ContractLane, type LaneResultKind, requiredResult } from "./contract-fixture.ts";
 import {
 	type Answer,
 	cancelAll,
 	choose,
 	customMessage,
-	type Frame,
 	LlmCursor,
+	type LlmEntry,
 	linkPlugin,
 	modelsYml,
 	prepare,
 	PROFILE_CONFIG,
+	stormRecords,
 	ROOT,
 	Rpc,
 	type Step,
@@ -167,6 +178,33 @@ function resultFor(run: RunRecord, id: string): RunResultWire | undefined {
 	return runResults(run).find(result => result.id === id);
 }
 
+/** The persisted row's own submission identity, read without making the contract fields required by the baseline. */
+function submissionOf(run: RunRecord, id: string): { attemptId?: string; contentVersion?: string } {
+	const raw: unknown = run;
+	const rows = typeof raw === "object" && raw !== null && "results" in raw && Array.isArray(raw.results) ? (raw.results as unknown[]) : [];
+	const row = rows.find((value): value is Record<string, unknown> => value !== null && typeof value === "object" && (value as Record<string, unknown>).id === id);
+	return {
+		...(typeof row?.attemptId === "string" ? { attemptId: row.attemptId } : {}),
+		...(typeof row?.contentVersion === "string" ? { contentVersion: row.contentVersion } : {}),
+	};
+}
+
+/** A reviewer child's verdict yield as the provider sent it: the request that made it and its `data`. */
+function reviewerYields(entries: readonly LlmEntry[]): Array<{ entry: LlmEntry; data: Record<string, unknown> }> {
+	return entries.flatMap(entry => {
+		const data = entry.decision.tool === "yield" ? entry.decision.args?.data : undefined;
+		if (typeof data !== "object" || data === null || !("overall_correctness" in data)) return [];
+		return [{ entry, data: data as Record<string, unknown> }];
+	});
+}
+
+/** The scoped verdicts a reviewer's stored review log holds, as Storm parsed them. */
+function storedScopes(agent: AgentEntry | undefined): { complete: boolean; scopes: Array<{ id: string; receipt: string; citation: string; correct: boolean }> } {
+	if (agent === undefined) return { complete: false, scopes: [] };
+	const ledger = reviewEvidenceOf(agent);
+	return { complete: ledger.complete, scopes: ledger.records.flatMap(record => (record.correct === undefined ? [] : (record.results ?? []))) };
+}
+
 /**
  * The host-owned attempt reference must resolve to exactly this native child: `task:<toolCallId>:<childId>` or
  * `job:<jobId>:<childId>`, where the last segment is the admitted spawn key. Prefixes never collide (`Read1` cannot
@@ -178,15 +216,14 @@ function attemptMatches(attemptId: string | undefined, spawnKey: string | undefi
 	return (parts[0] === "task" || parts[0] === "job") && parts.length === 3 && parts[2] === spawnKey;
 }
 
-function officialReportText(frames: readonly Frame[]): string {
-	return frames
-		.filter(frame => customMessage(frame) === "storm-report")
-		.map(frame => {
-			const message = frame.message;
-			const content = typeof message === "object" && message !== null && "content" in message ? message.content : undefined;
-			return typeof content === "string" ? content : JSON.stringify(frame);
-		})
-		.join("\n");
+/**
+ * The official per-result detail of the session's latest run: `/storm status`. The closeout card carries only the
+ * official aggregate (state, counts by cause) and points here; result ids and their reasons are status detail.
+ */
+async function officialStatusText(rpc: Rpc): Promise<string> {
+	const from = rpc.frames.length;
+	await rpc.prompt("/storm status");
+	return stormRecords(rpc.frames, from).map(record => record.text).join("\n");
 }
 
 function gitStatus(): string {
@@ -283,7 +320,7 @@ async function main(): Promise<void> {
 			const spawn = run.spawns.find(entry => entry.agent === "storm-implementer");
 			const summary = summaryOf(files, run.runId);
 			const lane = laneOf(run, "report");
-			const progress = officialReportText(rpc.frames);
+			const progress = await officialStatusText(rpc);
 			const detail = `bytes=${before.length}->${after.length} sha=${hash(before)}->${afterHash} planFiles=${JSON.stringify(lane?.files ?? null)} spawn=${spawn?.outcome ?? "none"} workerRequests=${implementer?.requests ?? "none"} workerChanges=${implementer?.changes ?? 0} git=${JSON.stringify(gitStatus())}`;
 			observe("T01a existing-dirty/no-op-worker", run, detail);
 			check(
@@ -335,7 +372,7 @@ async function main(): Promise<void> {
 					JSON.stringify({ obligation: obligation ?? null, spawnKey: spawn?.spawnKey ?? null, worker: implementer?.name ?? null }),
 				);
 				check(
-					"T01a contract: official progress names the unresolved id and its reason",
+					"T01a contract: official status names the unresolved id and its reason",
 					obligation?.reason !== undefined && progress.includes("report-change") && progress.includes(obligation.reason),
 					`progress=${progress.slice(0, 500)}`,
 				);
@@ -363,7 +400,7 @@ async function main(): Promise<void> {
 						results: [requiredResult("report-answer", "answer", "the answer states report.json's total and cites report.json", { path: REPORT, contains: '"total": 42' })],
 					},
 				]),
-				{ task: ["storm-explorer"], as: "Reader", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-CLAIM The current report.json total is 42 (report.json:2).` },
+				{ task: ["storm-explorer"], as: "Reader", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-CLAIM The total is 42 (report.json:2)` },
 			];
 			const run = await runOf(rpc, files, runRequest(steps));
 			const after = readFileSync(reportPath);
@@ -400,7 +437,7 @@ async function main(): Promise<void> {
 			const delivered = rpc.frames.filter(frame => customMessage(frame) === "async-result").map(frame => JSON.stringify(frame)).join("\n");
 			check(
 				"T01b: the parent received the worker's source-citing answer",
-				delivered.includes("The current report.json total is 42") && delivered.includes("report.json:2"),
+				delivered.includes("The total is 42") && delivered.includes("report.json:2"),
 				`asyncResults=${delivered.slice(0, 400)}`,
 			);
 			check(
@@ -444,6 +481,188 @@ async function main(): Promise<void> {
 		);
 	});
 
+	// T01c · a cited prose answer needs the approved reviewer's verdict scoped to that exact submission (contract only:
+	// the baseline plan has no results). Both runs come before the T06 required-check approvals, so no check is configured.
+	if (CONTRACT) {
+		const answerId = "report-explained";
+		const answerLane = "explain-report";
+		// The anchor S1 judges is the producer's own citation; no number is stated, so S1 cannot match it mechanically.
+		const answerCitation = `${REPORT}:3`;
+		const answerText = `The report.json source field says a user owns this file, so Storm must leave its figures untouched (${answerCitation})`;
+		const answerPlan = (): Step =>
+			planFor([
+				{
+					name: answerLane,
+					kind: "explore",
+					goal: "Explain who owns report.json and why its figures stay untouched, citing the file",
+					results: [
+						requiredResult(
+							answerId,
+							"answer",
+							"The answer explains, from report.json itself, who owns the file and why its figures must stay untouched; an independent reviewer judges the prose.",
+							{ path: REPORT },
+						),
+					],
+				},
+				{ name: "review", kind: "review", goal: "Judge the cited answer against its current source" },
+			]);
+		const explainer: Step = { task: ["storm-explorer"], as: "Explainer", say: `E2E-CHILD-READ ${REPORT} E2E-CHILD-CLAIM ${answerText}` };
+
+		await suite.step("T01c: a generic tree-only reviewer verdict does not accept a cited prose answer", async () => {
+			const before = readFileSync(reportPath);
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					answerPlan(),
+					explainer,
+					{ task: ["storm-reviewer"], as: "Generic", say: "E2E-CHILD-VERDICT correct", afterResult: 'agent="storm-explorer" status="completed"' },
+				];
+				const run = await runOf(rpc, files, runRequest(steps, 1));
+				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+				const producer = run.spawns.find(entry => entry.agent === "storm-explorer");
+				const obligation = resultFor(run, answerId);
+				const summary = summaryOf(files, run.runId);
+				const progress = await officialStatusText(rpc);
+				const yields = reviewerYields(llm.of("child"));
+				const stored = storedScopes(reviewer);
+				const after = readFileSync(reportPath);
+				observe(
+					"T01c generic-only/answer",
+					run,
+					`verdict=${JSON.stringify(reviewer?.lastVerdict ?? null)} reviewerChanges=${reviewer?.changes ?? 0} storedScopes=${stored.scopes.length} yields=${yields.length}`,
+				);
+				check(
+					"T01c generic: the plan preserved the cited answer result without a machine literal",
+					hasRequiredResult(run, answerLane, answerId, "answer") && plannedResult(run, answerLane, answerId)?.contains === undefined,
+					JSON.stringify(plannedResult(run, answerLane, answerId) ?? null),
+				);
+				check(
+					"T01c generic: the approved reviewer gave a correct current-tree verdict without changing files",
+					reviewer !== undefined && (reviewer.changes ?? 0) === 0 && reviewer.lastVerdict?.correct === true && reviewer.lastVerdict.tree !== undefined,
+					`reviewer=${JSON.stringify(reviewer?.lastVerdict ?? null)} changes=${reviewer?.changes}`,
+				);
+				check(
+					"T01c generic: the verdict scoped no answer (no results in the yield or the stored review log)",
+					yields.length > 0 && yields.every(item => item.data.results === undefined) && stored.complete && stored.scopes.length === 0,
+					JSON.stringify({ yields: yields.map(item => item.data.results ?? null), stored }),
+				);
+				check(
+					"T01c generic: the answer stays reviewable on the producer's native attempt",
+					obligation !== undefined &&
+						obligation.state === "reviewable" &&
+						obligation.lane === answerLane &&
+						attemptMatches(obligation.attemptId, producer?.spawnKey),
+					JSON.stringify({ obligation: obligation ?? null, spawnKey: producer?.spawnKey ?? null }),
+				);
+				check(
+					"T01c generic: a tree-only verdict cannot close the answer run done/verified",
+					run.status !== "done" && run.endReason !== "verified",
+					`observed ${run.status}/${run.endReason} run=${run.runId}`,
+				);
+				check("T01c generic: official status names the open answer", progress.includes(answerId), `progress=${progress.slice(0, 500)}`);
+				check(
+					"T01c generic: the run summary index agrees with the record",
+					summary !== undefined && summary.status === run.status && summary.endReason === run.endReason,
+					summary === undefined ? "no index line" : `${summary.status}/${summary.endReason}`,
+				);
+				check("T01c generic: the user's report.json bytes are unchanged", before.equals(after), `before=${hash(before)} after=${hash(after)}`);
+			});
+		});
+
+		await suite.step("T01c: the approved reviewer's verdict scoped to the exact answer and receipt verifies it", async () => {
+			const before = readFileSync(reportPath);
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					answerPlan(),
+					explainer,
+					// Held until Storm itself names the scope for this id; what Storm wrote is forwarded, nothing is composed.
+					{ task: ["storm-reviewer"], as: "Scoped", say: "E2E-CHILD-ANSWER-VERDICT correct", reviewFor: answerId },
+				];
+				const run = await runOf(rpc, files, runRequest(steps));
+				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
+				const producer = run.spawns.find(entry => entry.agent === "storm-explorer");
+				const reviewSpawn = run.spawns.find(entry => entry.agent === "storm-reviewer");
+				const obligation = resultFor(run, answerId);
+				const submission = submissionOf(run, answerId);
+				const summary = summaryOf(files, run.runId);
+				const after = readFileSync(reportPath);
+				// The oracle: the receipt for this exact persisted submission, never a value the fixture wrote down.
+				const expected =
+					submission.attemptId === undefined || submission.contentVersion === undefined
+						? undefined
+						: answerReviewReceipt({ runId: run.runId, resultId: answerId, attemptId: submission.attemptId, contentVersion: submission.contentVersion });
+				const directed = llm
+					.of("main")
+					.filter(entry => entry.decision.tool === "task" && JSON.stringify(entry.decision.args ?? {}).includes("storm-reviewer"))
+					.map(entry => JSON.stringify(entry.decision.args));
+				const packets = llm.of("child").flatMap(entry => (entry.reviewPacket === undefined ? [] : [entry.reviewPacket]));
+				const packet = packets.at(-1);
+				const yields = reviewerYields(llm.of("child"));
+				const yielded = yields.at(-1)?.data.results;
+				const stored = storedScopes(reviewer);
+				observe(
+					"T01c scoped/answer",
+					run,
+					`expected=${expected ?? "none"} packet=${JSON.stringify(packet === undefined ? null : { ...packet, answer: packet.answer.slice(0, 80) })} yielded=${JSON.stringify(yielded ?? null)} stored=${JSON.stringify(stored)} verdict=${JSON.stringify(reviewer?.lastVerdict ?? null)}`,
+				);
+				check(
+					"T01c scoped: the persisted row identifies the exact submission (host attempt and content version)",
+					expected !== undefined && attemptMatches(submission.attemptId, producer?.spawnKey),
+					JSON.stringify({ submission, spawnKey: producer?.spawnKey ?? null }),
+				);
+				check(
+					"T01c scoped: Storm named this exact receipt to the director, which forwarded it to the approved reviewer",
+					expected !== undefined && reviewSpawn !== undefined && reviewSpawn.outcome !== "blocked" && directed.some(args => args.includes(expected)),
+					JSON.stringify({ expected: expected ?? null, spawn: reviewSpawn?.outcome ?? null, directed: directed.map(args => args.slice(0, 400)) }),
+				);
+				check(
+					"T01c scoped: the approved reviewer received Storm's packet with the exact answer, receipt and current citation",
+					packet !== undefined &&
+						packet.id === answerId &&
+						packet.receipt === expected &&
+						packet.citation === answerCitation &&
+						packet.answer === answerText,
+					JSON.stringify({ packet: packet ?? null, expected: expected ?? null, answer: answerText }),
+				);
+				check(
+					"T01c scoped: the reviewer's final yield scoped exactly that id, receipt and citation as correct",
+					Array.isArray(yielded) &&
+						yielded.length === 1 &&
+						JSON.stringify(yielded[0]) === JSON.stringify({ id: answerId, receipt: expected, citation: answerCitation, verdict: "correct" }),
+					JSON.stringify(yielded ?? null),
+				);
+				check(
+					"T01c scoped: the approved reviewer's stored review log holds the scoped correct verdict and changed no file",
+					reviewer !== undefined &&
+						(reviewer.changes ?? 0) === 0 &&
+						stored.complete &&
+						stored.scopes.some(scope => scope.id === answerId && scope.receipt === expected && scope.citation === answerCitation && scope.correct),
+					JSON.stringify({ stored, changes: reviewer?.changes ?? null }),
+				);
+				check(
+					"T01c scoped: the answer is accepted on the producer's native attempt",
+					obligation !== undefined &&
+						obligation.state === "accepted" &&
+						obligation.lane === answerLane &&
+						attemptMatches(obligation.attemptId, producer?.spawnKey),
+					JSON.stringify({ obligation: obligation ?? null, spawnKey: producer?.spawnKey ?? null }),
+				);
+				check(
+					"T01c scoped: the exact reviewed submission closes the no-write run done/verified",
+					run.status === "done" && run.endReason === "verified",
+					`observed ${run.status}/${run.endReason} run=${run.runId}`,
+				);
+				check(
+					"T01c scoped: the run summary index agrees with the record",
+					summary !== undefined && summary.status === run.status && summary.endReason === run.endReason,
+					summary === undefined ? "no index line" : `${summary.status}/${summary.endReason}`,
+				);
+				check("T01c scoped: the user's report.json bytes are unchanged", before.equals(after), `before=${hash(before)} after=${hash(after)}`);
+			});
+		});
+	}
+
 	// T06 · the result criterion is qualitative prose, not a machine `contains`; the first case stops before a verdict.
 	const qualitativeTarget = "acceptance-qualitative.md";
 	const qualitativeText = "The user report already records total 42; nothing needs rewriting, and this submission explains why.";
@@ -480,7 +699,7 @@ async function main(): Promise<void> {
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "submit", "qualitative-submission");
 				const content = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : "";
-				const progress = officialReportText(rpc.frames);
+				const progress = await officialStatusText(rpc);
 				const detail = `writerRequests=${writer?.requests ?? "none"} spawn=${spawn?.outcome ?? "none"} reviewer=${reviewer} artifactBytes=${content.length} git=${JSON.stringify(gitStatus())}`;
 				observe("T06 qualitative-reviewable", run, detail);
 				check(
@@ -526,7 +745,7 @@ async function main(): Promise<void> {
 						JSON.stringify({ obligation: obligation ?? null, spawnKey: spawn?.spawnKey ?? null }),
 					);
 					check(
-						"T06 contract: official progress names the pending obligation",
+						"T06 contract: official status names the pending obligation",
 						progress.includes("qualitative-submission"),
 						`progress=${progress.slice(0, 500)}`,
 					);
@@ -562,7 +781,7 @@ async function main(): Promise<void> {
 				const spawn = run.spawns.find(entry => entry.lane === "write");
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "write", "incorrect-change");
-				const progress = officialReportText(rpc.frames);
+				const progress = await officialStatusText(rpc);
 				const detail = `verdict=${JSON.stringify(reviewer?.lastVerdict ?? null)} reviewerChanges=${reviewer?.changes ?? 0} git=${JSON.stringify(gitStatus())}`;
 				observe("T06 incorrect-verdict", run, detail);
 				check(
@@ -598,7 +817,7 @@ async function main(): Promise<void> {
 						JSON.stringify({ obligation: obligation ?? null, spawnKey: spawn?.spawnKey ?? null }),
 					);
 					check(
-						"T06 contract: official progress names the unresolved id and reason",
+						"T06 contract: official status names the unresolved id and reason",
 						obligation?.reason !== undefined && progress.includes("incorrect-change") && progress.includes(obligation.reason),
 						`progress=${progress.slice(0, 500)}`,
 					);
@@ -641,7 +860,7 @@ async function main(): Promise<void> {
 				const currentAttempt = laneAttempts.at(-1)?.spawnKey;
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "write", "stale-change");
-				const progress = officialReportText(rpc.frames);
+				const progress = await officialStatusText(rpc);
 				const content = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : "";
 				const mtime = existsSync(targetPath) ? statSync(targetPath).mtimeMs : "none";
 				const detail = `markers=${content.split("storm-child-bash").length - 1} verdict=${JSON.stringify(reviewer?.lastVerdict ?? null)} mtime=${mtime} git=${JSON.stringify(gitStatus())}`;
@@ -686,7 +905,7 @@ async function main(): Promise<void> {
 						JSON.stringify({ obligation: obligation ?? null, laneAttempts: laneAttempts.map(entry => entry.spawnKey) }),
 					);
 					check(
-						"T06 contract: official progress names the unresolved obligation",
+						"T06 contract: official status names the unresolved obligation",
 						progress.includes("stale-change"),
 						`progress=${progress.slice(0, 500)}`,
 					);

@@ -23,6 +23,16 @@ import {
 	cancelAll,
 	COMMIT_FILE,
 	customMessage,
+	CLOSEOUT_DETAIL,
+	CLOSEOUT_HEADING,
+	closeoutBody,
+	hubLabel,
+	closeoutOf,
+	offeredDirections,
+	pendingLanesOf,
+	runNext,
+	stormRecords,
+	userNext,
 	choose,
 	type Frame,
 	LlmCursor,
@@ -47,6 +57,7 @@ import {
 	TRACKED_TEXT,
 	until,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
 /** Option labels Storm does not export. */
 const LABEL = {
@@ -61,6 +72,7 @@ const LABEL = {
 const AUTO_DISCLOSURE = "승인하면 이 세션의 자동 위임이 켜집니다";
 
 const env = prepare("storm-e2e", 18556);
+seedFact(env.project);
 const suite = new Suite("E2E (rpc)", env);
 const check = suite.check.bind(suite);
 
@@ -112,19 +124,22 @@ type LaneSpec = { name: string; kind: string; role?: string; files?: string[]; r
 const plan = (lanes: LaneSpec[], workers?: Record<string, number>): Extract<Step, { storm: unknown }> => ({
 	storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } },
 });
-/** The one tracked fixture line the read-only lanes report; a claim cites the exact line so an answer is verifiable. */
-const TRACKED_LINE = TRACKED_TEXT.trim();
-const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
+/**
+ * The one typed fixture line the read-only lanes report (see typed-fixture.ts). The claim restates the line's signed
+ * typed value and cites its real location, so the official answer evidence accepts it mechanically; a prose claim
+ * about an untyped line is a reviewable submission and belongs to the scoped-review scenarios, not these.
+ */
+const TRACKED_CLAIM = FACT_CLAIM;
 /** A real answer obligation: the child reads this line and cites it, so the result is not a fake pass. */
-const trackedAnswer = (id: string, criterion = `report what ${TRACKED_FILE} line 1 says`): PlanLaneResult => ({
+const trackedAnswer = (id: string, criterion = `report what ${FACT_FILE} line 1 says`): PlanLaneResult => ({
 	id,
 	kind: "answer",
 	criterion,
-	path: TRACKED_FILE,
-	contains: TRACKED_LINE,
+	path: FACT_FILE,
+	contains: FACT_LINE,
 });
 /** A child instruction that first reads the tracked fixture and then claims its exact cited line. */
-const READ_AND_CLAIM = `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
+const READ_AND_CLAIM = `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
 /** A change the scripted child really writes or appends, with the content the result must exhibit. */
 const changeResult = (id: string, path: string, contains: string, criterion: string): PlanLaneResult => ({
 	id,
@@ -148,9 +163,9 @@ async function runOf(rpc: Rpc, files: StormFiles, message: string): Promise<RunR
 	await rpc.prompt(message);
 	const run = await files.finishedRun(before);
 	const reported = (): true | undefined => {
-		// A final report can arrive before the last agent_end, and an unresolved/verified closeout menu does not repeat
-		// the run id. Anchor to this prompt's start and look for the final-report header, not at the last turn.
-		return rpc.frames.slice(start).some(frame => customMessage(frame) === "storm-report" && text(frame).includes("### Storm 실행 결과")) ? true : undefined;
+		// A final report can arrive before the last agent_end, and the compact record's text does not repeat the run
+		// id. Anchor to this prompt's start and look for the settled-run title, not at the last turn.
+		return closeoutOf(rpc.frames, run.runId, start) !== undefined ? true : undefined;
 	};
 	await until(reported, 60_000, `the report of ${run.runId}`);
 	return run;
@@ -797,16 +812,70 @@ async function main(): Promise<void> {
 
 	await suite.step("a run that stopped is resumed", async () => {
 		const limited = join(env.project, "e2e-limited.txt");
+		// The director's typed brief: one numbered new-scope run and one user-owned step. The change is never reviewed,
+		// so the run ends at its round limit with a measurable open state: the whole card, never the one-line tier.
+		const limitBrief = {
+			result: "E2E-LIMIT-RESULT: the change was written but no reviewer judged it.",
+			verification: "E2E-LIMIT-EVIDENCE: only the child's own write was observed.",
+			remaining: "E2E-LIMIT-REMAINING: the change still needs a review.",
+			next: [runNext("E2E-LIMIT-NEXT review the limited change only", "E2E-LIMIT-WHY: the change is unreviewed"), userNext("E2E-LIMIT-USER decide whether the change should stay")],
+		};
 		const steps: Step[] = [
 			plan([{ name: "impl", kind: "code", results: [changeResult("limited-change", "e2e-limited.txt", "storm-child-bash", "the implementer appends its change to e2e-limited.txt")] }]),
 			{ task: ["storm-implementer"], as: "Impl", say: "E2E-CHILD-BASH e2e-limited.txt" },
+			{ storm: { action: "brief", brief: limitBrief } },
 		];
 		try {
 			// The old run stops at its own two-round limit, so its record keeps a limit for the resume to carry.
 			let origin: { id: string; dir: string } | undefined;
 			const old = await session(cancelAll, async (rpc, files) => {
 				origin = { id: rpc.sessionId, dir: rpc.sessionDir };
-				return runOf(rpc, files, runRequest({ action: "run", rounds: 2 }, steps));
+				const from = rpc.frames.length;
+				const run = await runOf(rpc, files, runRequest({ action: "run", rounds: 2 }, steps));
+				const card = closeoutOf(rpc.frames, run.runId, from);
+				const body = closeoutBody(card?.text ?? "");
+				const offers = offeredDirections(body);
+				check(
+					"the stopped run's closeout is a whole card whose plain text is the readable fallback",
+					card !== undefined && card.text.trimStart().startsWith(`### ${CLOSEOUT_HEADING}`) && card.details?.kind === "closeout" && card.details.runId === run.runId && body.length > 1,
+					JSON.stringify(card ?? null).slice(0, 800),
+				);
+				const directorAt = card?.text.indexOf("E2E-LIMIT-RESULT") ?? -1;
+				check(
+					"the official state leads, the director's bounded text follows, and detail is one status pointer",
+					directorAt > 0 && !(body[0] ?? "").includes("E2E-LIMIT-RESULT") && card?.text.includes(CLOSEOUT_DETAIL) === true && card.text.includes("E2E-LIMIT-REMAINING"),
+					card?.text.slice(0, 900) ?? "no card",
+				);
+				check(
+					"verification prose, unfinished lanes and receipts moved off the card",
+					card !== undefined && !card.text.includes("E2E-LIMIT-EVIDENCE") && !card.text.includes("미완료 레인") && !card.text.includes("잡 영수증"),
+					card?.text.slice(0, 900) ?? "no card",
+				);
+				check(
+					"the closed-out run leaves exactly one settled-run message",
+					stormRecords(rpc.frames, from).filter(record => record.text.includes(CLOSEOUT_HEADING)).length === 1,
+					JSON.stringify(stormRecords(rpc.frames, from).map(record => record.text.slice(0, 80))),
+				);
+				check(
+					"only dispatchable actions are offered: the proposed run first, the user-owned step as prose",
+					offers.length >= 1 && offers.length <= 3 && offers[0]?.includes("E2E-LIMIT-NEXT") === true &&
+						!offers.some(offer => offer.includes("E2E-LIMIT-USER")) && card?.text.includes("E2E-LIMIT-USER") === true,
+					JSON.stringify(offers),
+				);
+				check("the record left the round-limit facts on disk", pendingLanesOf(run) !== undefined, JSON.stringify(run.closeoutFacts ?? null));
+				// Settling makes no model call of its own, and the status view is read from disk without one either.
+				const quiet = new LlmCursor(env);
+				await Bun.sleep(1_500);
+				const statusFrom = rpc.frames.length;
+				await rpc.prompt("/storm status");
+				const status = stormRecords(rpc.frames, statusFrom).at(-1)?.text ?? "";
+				check(
+					"the status view carries what left the card: the director's verification and the open result",
+					status.includes("E2E-LIMIT-EVIDENCE") && status.includes("limited-change"),
+					status.slice(0, 1200),
+				);
+				check("neither settling nor the status view asked the model anything", quiet.all().length === 0, JSON.stringify(quiet.all().map(entry => [entry.who, entry.lastUser.slice(0, 80)])));
+				return run;
 			});
 			if (origin === undefined) throw new Error("the old run's session was not captured");
 			const stopped = origin;
@@ -823,7 +892,7 @@ async function main(): Promise<void> {
 				const menu = rpc.dialogs.at(-1)?.options ?? [];
 				check(
 					"the hub offers the stopped run first, as one more option",
-					menu[0] === LABEL.resume && same(menu.slice(1), hubWithoutResume.filter(option => option !== LABEL.resume)),
+					hubLabel(menu[0], LABEL.resume) && same(menu.slice(1), hubWithoutResume.filter(option => !hubLabel(option, LABEL.resume))),
 					`menu=${JSON.stringify(menu)} without=${JSON.stringify(hubWithoutResume)}`,
 				);
 				const before = files.runIds();
@@ -887,7 +956,7 @@ async function main(): Promise<void> {
 				const menu = rpc.dialogs.at(-1)?.options ?? [];
 				check(
 					"a planted record does not displace a trusted earlier candidate",
-					menu[0] === LABEL.resume && files.runs().at(-1)?.runId === plantedId,
+					hubLabel(menu[0], LABEL.resume) && files.runs().at(-1)?.runId === plantedId,
 					`menu=${JSON.stringify(menu)} last=${files.runs().at(-1)?.runId}`,
 				);
 				const before = files.runIds();
@@ -932,7 +1001,7 @@ async function main(): Promise<void> {
 			);
 			await rpc.prompt("/storm");
 			const menu = rpc.dialogs.at(-1)?.options ?? [];
-			check("the dead run is offered first", menu[0] === LABEL.resume, JSON.stringify(menu));
+			check("the dead run is offered first", hubLabel(menu[0], LABEL.resume), JSON.stringify(menu));
 			const started = files.runIds();
 			rpc.answer = choose(LABEL.resume);
 			await rpc.prompt("/storm");
@@ -1500,7 +1569,7 @@ async function main(): Promise<void> {
 					plan([{ name: "impl", kind: "code", results: [trackedAnswer("fresh-report", "the fresh implementer reports the tracked fixture from source")] }]),
 					{ task: ["storm-implementer"], as: "Cap" },
 					{ followUp: "agent://Cap0" },
-					{ task: ["storm-implementer"], as: "Fresh", say: `E2E-CHILD-READ agent://Cap0,${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
+					{ task: ["storm-implementer"], as: "Fresh", say: `E2E-CHILD-READ agent://Cap0,${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 				]),
 			);
 			const reason = mains(llm.all()).find(entry => entry.lastTool.includes("[storm:followup-cap]"))?.lastTool ?? "";

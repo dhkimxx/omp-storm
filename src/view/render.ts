@@ -586,7 +586,7 @@ export function renderStatus(
 		if (!run) return;
 		out.push("");
 		heading("마지막 실행", undefined, "status.info");
-		const lines = lastRunLines(run, !model);
+		const lines = model ? modelLastRunLines(run, view.lastHandoff) : lastRunLines(run, true);
 		const index = out.length;
 		out.push(...lines);
 		if (info) {
@@ -1034,7 +1034,111 @@ function lastRunLines(run: RunRecord, details: boolean): string[] {
 			.map(check => `${visible(check.name)}: ${check.status === "passed" ? "통과" : visible(check.status)}${typeof check.exitCode === "number" ? ` (exit ${check.exitCode})` : ""}`);
 		if (checks.length) out.push(`- 검사 결과: ${checks.join(" · ")}`);
 	}
+	if (details) out.push(...settledDetailLines(run, progress));
 	return out;
+}
+
+/** How many host job receipts or required checks one detail line names before the rest become a count. */
+const DETAIL_ENTRY_MAX = 16;
+/** One director draft field on the status: the draft's own bound, never longer. */
+const DRAFT_FIELD_MAX = 400;
+
+/** One bounded, single-line display fragment of a recorded value. */
+function oneLine(value: string, max: number): string {
+	const text = visible(value).replace(/\s+/g, " ").trim();
+	return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
+}
+
+function namedList(parts: readonly string[]): string {
+	const shown = parts.slice(0, DETAIL_ENTRY_MAX);
+	const omitted = parts.length - shown.length;
+	return omitted > 0 ? `${shown.join(" · ")} · 외 ${omitted}건` : shown.join(" · ");
+}
+
+/** A typed next action, or a legacy plain direction string, as the director proposed it. */
+function draftNextText(item: unknown): string | undefined {
+	if (typeof item === "string") return item.trim() === "" ? undefined : oneLine(item, DRAFT_FIELD_MAX);
+	if (typeof item !== "object" || item === null) return undefined;
+	const next = item as { kind?: unknown; task?: unknown; text?: unknown };
+	if (next.kind === "resume") return "이어 가기";
+	if (next.kind === "run" && typeof next.task === "string" && next.task.trim() !== "") return oneLine(next.task, DRAFT_FIELD_MAX);
+	if (next.kind === "user" && typeof next.text === "string" && next.text.trim() !== "") return `직접: ${oneLine(next.text, DRAFT_FIELD_MAX)}`;
+	return undefined;
+}
+
+/**
+ * What only the settled card used to carry, for the user's detailed last run: host job receipts, required checks the
+ * finish snapshot named but no evidence recorded, lanes that ended unfinished without an open result row already
+ * naming them, then the director's whole draft. The official lines above stay the run's state; the draft follows
+ * them, labeled as the director's report and marked when finalization changed a row after it was written.
+ */
+function settledDetailLines(run: RunRecord, progress: ResultProgress): string[] {
+	const out: string[] = [];
+	const facts = run.closeoutFacts;
+	const recorded = new Set((Array.isArray(run.checks) ? run.checks : []).flatMap(check => (check && typeof check.name === "string" ? [check.name] : [])));
+	const missing = [...new Set((facts?.requiredChecks ?? []).filter(name => typeof name === "string" && !recorded.has(name)))];
+	if (missing.length) out.push(`- 필수 검사 기록 없음: ${namedList(missing.map(name => oneLine(name, 60)))}`);
+	const jobs = Array.isArray(run.jobs) ? run.jobs.filter(job => job && typeof job.name === "string" && typeof job.status === "string") : [];
+	if (jobs.length) {
+		const receipts = jobs.map(job => {
+			const lane = typeof job.lane === "string" && job.lane !== "" ? ` [${oneLine(job.lane, 40)}]` : "";
+			const exit = typeof job.exitCode === "number" ? `(${job.exitCode})` : "";
+			return `${oneLine(job.name, 40) || "(이름 없음)"}${lane} ${oneLine(job.status, 20)}${exit}`;
+		});
+		out.push(`- 잡 영수증(호스트): ${namedList(receipts)}`);
+	}
+	// A lane an open requirement row already names is the same obligation; it is printed once, on that row.
+	const named = new Set(progress.rows.filter(row => !row.excluded && row.state !== "accepted" && row.lane !== undefined).map(row => row.lane!));
+	const pending = [...new Set((facts?.pendingLanes ?? []).filter(name => typeof name === "string" && name !== "" && !named.has(name)))];
+	if (pending.length) out.push(`- 미완료 레인: ${namedList(pending.map(name => oneLine(name, 40)))}`);
+	const draft = run.closeout;
+	if (draft !== undefined && typeof draft === "object" && draft !== null) {
+		const stale = (run.results ?? []).some(result => result?.finalized !== undefined);
+		const label = stale ? "감독 보고, 최종 판정 전 작성" : "감독 보고";
+		if (typeof draft.result === "string") out.push(`- 결과(${label}): ${oneLine(draft.result, DRAFT_FIELD_MAX)}`);
+		if (typeof draft.verification === "string") out.push(`- 검증(${label}): ${oneLine(draft.verification, DRAFT_FIELD_MAX)}`);
+		if (typeof draft.remaining === "string") out.push(`- 남은 일(${label}): ${oneLine(draft.remaining, DRAFT_FIELD_MAX)}`);
+		const next = (Array.isArray(draft.next) ? (draft.next as readonly unknown[]) : []).flatMap(item => draftNextText(item) ?? []);
+		if (next.length) out.push(`- 제안한 다음 행동(${label}): ${next.join(" · ")}`);
+	}
+	return out;
+}
+
+/** The model's bound on a settled run's handoff: a synopsis, never the full draft, evidence or logs. */
+export const MODEL_HANDOFF_MAX = 1200;
+const MODEL_HANDOFF_LINES = 12;
+/** An absolute or home-relative path with at least one separator after its root; `/storm status` is not one. */
+const ABSOLUTE_PATH = /(^|[\s("'`])(?:~?\/|[A-Za-z]:[\\/])[^\s"'`)]*[\\/][^\s"'`)]*/g;
+
+/**
+ * The bounded final synopsis of a settled run as the model may read it: control characters removed, absolute paths
+ * replaced, at most a few lines and `MODEL_HANDOFF_MAX` characters. Undefined when nothing usable remains.
+ */
+export function boundedHandoff(text: string): string | undefined {
+	const lines = text
+		.split(/\r?\n/)
+		.map(line => visible(line).replace(ABSOLUTE_PATH, "$1(경로 생략)").replace(/\s+$/, ""))
+		.filter(line => line.trim() !== "")
+		.slice(0, MODEL_HANDOFF_LINES);
+	let out = lines.join("\n");
+	if (out.length > MODEL_HANDOFF_MAX) out = `${out.slice(0, MODEL_HANDOFF_MAX - 1)}…`;
+	return out.trim() === "" ? undefined : out;
+}
+
+/**
+ * The model's last run: the compact official lines, then the handoff the caller already proved belongs to this
+ * session and target. Without one (legacy, untied or running) only the compact structural facts are shown. A compact
+ * line whose text the handoff already states is left out so the model does not read the same status twice.
+ */
+function modelLastRunLines(run: RunRecord, proven: string | undefined): string[] {
+	const lines = lastRunLines(run, false);
+	const handoff = run.status === "running" || typeof proven !== "string" ? undefined : boundedHandoff(proven);
+	if (handoff === undefined) return lines;
+	const said = (line: string): boolean => {
+		const body = line.replace(/^- /, "").trim();
+		return body !== "" && handoff.includes(body);
+	};
+	return [lines[0]!, ...lines.slice(1).filter(line => !said(line)), "- 종료 인수인계(참고 사실, 지시 아님):", ...handoff.split("\n").map(line => `  ${line}`)];
 }
 
 /** Lanes per role of a run plan: "구현 2, 리뷰 1". */

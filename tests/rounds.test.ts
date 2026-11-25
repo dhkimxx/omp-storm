@@ -1061,11 +1061,32 @@ describe("S3 directed result feedback", () => {
 	});
 
 	test("a reviewable submission asks the approved reviewer and never reruns its lane", () => {
-		const gate = gateOf([openRow({ state: "reviewable", kind: "answer", attempt: "job:Submit0:Submit0" })], { reviewer: true });
+		const receipt = "0123456789abcdef0123456789abcdef";
+		const gate = gateOf([openRow({ state: "reviewable", kind: "answer", attempt: "job:Submit0:Submit0", review: { receipt, citation: "report.json:2" } })], { reviewer: true });
+		expect(gate.resultRemedy).toBe("review");
 		const message = messageOf(gate, "storm-reviewer");
 		expect(message).toContain("storm-reviewer");
 		expect(message).toContain("`r1`");
 		expect(message).not.toContain("fix or rerun");
+		// An answer is judged by a scoped result verdict, never by a tree verdict.
+		expect(message).toContain(receipt);
+		expect(message).toContain("report.json:2");
+		expect(message).toContain("results:");
+		expect(message).not.toContain("on the current tree");
+	});
+
+	test("a reviewable answer without a scoped review receipt goes back to its producer, not to a reviewer", () => {
+		const row = openRow({ state: "reviewable", kind: "answer" });
+		expect(nextRemedy(row, true)).toBe("work");
+		const gate = gateOf([row], { reviewer: true });
+		expect(gate.resultRemedy).toBe("work");
+		expect(messageOf(gate, "storm-reviewer")).not.toContain("judge the submitted");
+		// A malformed receipt is no receipt for the message either.
+		const forged = gateOf([openRow({ state: "reviewable", kind: "answer", review: { receipt: "not-a-receipt", citation: "report.json:2" } })], { reviewer: true });
+		expect(forged.resultRemedy).toBe("work");
+		expect(messageOf(forged, "storm-reviewer")).not.toContain("results:");
+		// A change submission keeps the ordinary current-tree review.
+		expect(nextRemedy(openRow({ state: "reviewable", kind: "change" }), true)).toBe("review");
 	});
 
 	test("a reviewable row without an approved reviewer is a blocker, not a round loop", () => {

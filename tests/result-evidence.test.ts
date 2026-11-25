@@ -235,9 +235,15 @@ describe("source-citing answers", () => {
 		if (!correct.ok) return;
 		expect(correct.report.results[0]?.state).toBe("accepted");
 
-		const citationNumberIgnored = await evaluate("report.json:2 shows total=42", [{ path: "report.json", line: 2, quote: '"total": 42' }]);
+		// The cited line number is a reference, not content: a typed answer with a trailing reference still decides on 42.
+		const citationNumberIgnored = await evaluate("total=42 (report.json:2)", [{ path: "report.json", line: 2, quote: '"total": 42' }]);
 		expect(citationNumberIgnored.ok).toBe(true);
 		if (citationNumberIgnored.ok) expect(citationNumberIgnored.report.results[0]?.state).toBe("accepted");
+
+		// Free prose that merely mentions the value and the line is no longer fast-accepted; it needs scoped review.
+		const prose = await evaluate("report.json:2 shows total=42", [{ path: "report.json", line: 2, quote: '"total": 42' }]);
+		expect(prose.ok).toBe(true);
+		if (prose.ok) expect(prose.report.results[0]?.state).toBe("reviewable");
 
 		for (const wrong of ["7", "142", "14", "7 and 42"]) {
 			const contradictory = await evaluate(wrong, [{ path: "report.json", line: 2, quote: '"total": 42' }]);

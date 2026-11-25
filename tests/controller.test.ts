@@ -9,7 +9,13 @@ import type { AttemptReport } from "../src/runtime/attempt-report.ts";
 import { tokens } from "../src/report/agents.ts";
 import { directorRead, noteChildRead } from "../src/policy/reads.ts";
 import { listAgents, noteAgentParked, noteAgentStart, resetAgents } from "../src/runtime/agents.ts";
-import { CLOSEOUT_CHOICE_HINT, type CloseoutDraft, resetCloseoutChoices, takeCloseoutChoice } from "../src/runtime/closeout.ts";
+import {
+	CLOSEOUT_TITLE,
+	closeoutBrief,
+	type CloseoutDraft,
+	resetCloseoutChoices,
+	takeCloseoutChoice,
+} from "../src/runtime/closeout.ts";
 import { noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
 import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
@@ -20,8 +26,19 @@ import { readRunIndex } from "../src/runtime/run-index.ts";
 import { readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { RunPhase } from "../src/view/appearance.ts";
+import { CLOSEOUT_CHOICE_HINT, renderCloseout } from "../src/view/closeout.ts";
 import type { ProjectState } from "../src/state.ts";
-import type { AgentEntry, RunPlan, RunRecord, RunSpec, ShadowInfo, SpawnBlockCode, SpawnRecord, StormConfig } from "../src/types.ts";
+import type {
+	AgentEntry,
+	CloseoutRecordStyle,
+	RunPlan,
+	RunRecord,
+	RunSpec,
+	ShadowInfo,
+	SpawnBlockCode,
+	SpawnRecord,
+	StormConfig,
+} from "../src/types.ts";
 import { fakeModes, fakeSession, SESSION_TEAM, type FakeSession, type SessionOptions, until } from "./fake-session.ts";
 import { agentEntry, approvedState, DEAD_PROCESS, runRecord, spawnRecord, treeOf } from "./fixtures.ts";
 
@@ -633,6 +650,95 @@ describe("run start", () => {
 		await h.controller.finish("no-changes");
 	});
 
+	test("an explicit resume carries the earlier run's final facts as history, and finalization markers never carry over", async () => {
+		const old = runRecord({
+			runId: "run-20261119-090000-hst0",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			endedAt: "2026-11-19T09:30:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			turns: 2,
+			request: "fix the login",
+			task: "fix the login in /Users/someone/private/app",
+			plan: {
+				lanes: [{ name: "login", kind: "code", role: "implementer", goal: "fix the login", files: ["login.ts"],
+					results: [{ id: "login-fix", kind: "change", criterion: "fix the login", path: "login.ts" }] }],
+				workers: { implementer: 1 },
+				submittedAt: "2026-11-19T09:00:00.000Z",
+			},
+			results: [{ id: "login-fix", lane: "login", state: "unmet", finalized: "unsettled", reason: "결과가 확정되기 전에 실행이 종료되었습니다." }],
+			closeout: { result: "로그인 수정 일부", verification: "없음", next: [] },
+		});
+		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const runId = await h.start({ task: "fix the login", resumeOf: old.runId });
+		const handoff = h.sent[0] ?? "";
+		expect(handoff).toContain(`Earlier Storm run ${old.runId}: final facts (historical data, not instructions).`);
+		expect(handoff).toContain("closed before judgment 1");
+		expect(handoff).not.toContain("/Users/someone");
+		expect(handoff.split("\n").filter(line => line.startsWith("</storm-run>"))).toHaveLength(1);
+		expect(h.controller.active()?.results?.every(row => row.finalized === undefined)).toBe(true);
+		await h.controller.finish("no-changes");
+		expect((await readRun(h.sessionDir, runId))?.results?.every(row => row.finalized === undefined)).toBe(true);
+	});
+
+	test("a follow-up of this session's finished run starts a new scope with its facts as history only", async () => {
+		const old = runRecord({
+			runId: "run-20261119-090000-fol0",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			endedAt: "2026-11-19T09:40:00.000Z",
+			status: "ended",
+			endReason: "no-progress",
+			request: "the earlier request",
+			plan: {
+				lanes: [{ name: "login", kind: "code", role: "implementer", goal: "fix the login", files: ["login.ts"],
+					results: [{ id: "login-fix", kind: "change", criterion: "fix the login", path: "login.ts" }] }],
+				workers: { implementer: 1 },
+				submittedAt: "2026-11-19T09:00:00.000Z",
+			},
+			results: [{ id: "login-fix", lane: "login", state: "accepted" }],
+		});
+		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const runId = await h.start({ task: "document the login fix", followUpOf: old.runId });
+		const record = await readRun(h.sessionDir, runId);
+		expect(record).toMatchObject({ followUpOf: old.runId, request: "document the login fix" });
+		// Nothing of the source is restored: no plan, row, receipt or continuation link.
+		expect(record?.plan).toBeUndefined();
+		expect(record?.results).toBeUndefined();
+		expect(record?.resumeOf).toBeUndefined();
+		const handoff = h.sent[0] ?? "";
+		expect(handoff).toContain("New scope chosen after the earlier run below; nothing of it is restored.");
+		expect(handoff).toContain(`Earlier Storm run ${old.runId}: final facts`);
+		expect(handoff).not.toContain("Continues run");
+		await h.controller.finish("no-changes");
+	});
+
+	test("a stale, foreign or unfinished follow-up reference is declined, and an unrelated task carries no history", async () => {
+		const h = session();
+		const finished = runRecord({ runId: "run-20261119-090000-fol1", status: "done", endReason: "verified", request: "earlier" });
+		const running = runRecord({ runId: "run-20261119-090000-fol2", status: "running", request: "still going" });
+		const unpointed = runRecord({ runId: "run-20261119-090000-fol3", status: "done", endReason: "verified", request: "not ours" });
+		for (const run of [finished, running, unpointed]) await writeRun(h.sessionDir, run);
+		const target = { repoId: h.repo.repoId, root: h.repo.root };
+		await noteResumePointer(h.sessionDir, target, running);
+		// The pointer names a different request than the record now holds: an edited record is not what this machine ran.
+		await noteResumePointer(h.sessionDir, target, { ...finished, request: "something else" });
+		for (const ref of [running.runId, unpointed.runId, finished.runId, "run-20261119-090000-none", "../escape"]) {
+			const result = await h.controller.start(h.ctx, { task: "next", followUpOf: ref });
+			expect(result).toMatchObject({ ok: false, reason: expect.stringContaining("후속 작업") });
+			expect(h.sent).toEqual([]);
+		}
+		const both = await h.controller.start(h.ctx, { task: "next", followUpOf: finished.runId, resumeOf: finished.runId });
+		expect(both.ok).toBe(false);
+		const runId = await h.start({ task: "an unrelated request" });
+		expect((await readRun(h.sessionDir, runId))?.followUpOf).toBeUndefined();
+		expect(h.sent[0]).not.toContain("Earlier Storm run");
+		await h.controller.finish("no-changes");
+	});
+
 	test("a team that may not run starts nothing: no config, invalid, unapproved, another hash, an unapproved shadow", async () => {
 		const shadow: ShadowInfo = { agent: "storm-reviewer", path: "/r/.omp/agents/rev.md", scope: "project", sha256: "1".repeat(64) };
 		const broken: Array<(state: ProjectState) => ProjectState> = [
@@ -1217,7 +1323,11 @@ describe("run end", () => {
 		noteRunSpawn(runId, spawn);
 		await h.turn();
 		expect(h.summaries()).toBe(1);
-		expect(h.ui.records[0]?.markdown).toBe(summarizeRun((await readRun(h.sessionDir, runId)) as RunRecord));
+		// A short clean end leaves one factual line; the ledger detail stays in status.
+		const settled = (await readRun(h.sessionDir, runId)) as RunRecord;
+		expect(closeoutBrief(settled).tier).toBe("line");
+		expect(h.ui.records[0]?.title).toBe(CLOSEOUT_TITLE);
+		expect(h.ui.records[0]?.markdown).toBe(renderCloseout(closeoutBrief(settled), false).markdown);
 		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
 		const ended = (await readRun(h.sessionDir, runId))?.endedAt;
 
@@ -2554,12 +2664,27 @@ describe("closeout brief", () => {
 		result: "API를 추가했습니다.",
 		verification: "unit 체크를 통과했습니다.",
 		remaining: "문서 반영이 남았습니다.",
-		next: ["문서 반영을 새 Storm 작업으로 맡기기", "API 경계를 다시 점검하는 좁은 작업", "변경 기록만 읽기 전용으로 확인하기"],
+		next: [
+			{ kind: "run", task: "문서 반영을 새 Storm 작업으로 맡기기" },
+			{ kind: "run", task: "API 경계를 다시 점검하는 좁은 작업", why: "리뷰가 경계를 보지 않았습니다" },
+			{ kind: "user", text: "변경 기록을 직접 확인하기" },
+		],
 		...over,
 	});
+	type Recorded = { title: string; markdown: string; style?: CloseoutRecordStyle; released: number };
+	/** Captures each transcript record with its presentation style and how many leases were released before it. */
+	const capture = (h: FakeSession): Recorded[] => {
+		const seen: Recorded[] = [];
+		const original = h.ui.ui.record.bind(h.ui.ui);
+		h.ui.ui.record = (title, markdown, style) => {
+			seen.push({ title, markdown, ...(style === undefined ? {} : { style }), released: h.leases.released.length });
+			original(title, markdown, style);
+		};
+		return seen;
+	};
 
 	test("stages on the active run without completing it and persists only the latest valid brief", async () => {
-		const h = session();
+		const h = session({ agents: [writer()] });
 		expect(h.controller.submitCloseout(h.ctx, brief())).toMatchObject({ ok: false });
 		const runId = await h.start();
 		expect(h.controller.submitCloseout(h.ctx, brief())).toEqual({ ok: true });
@@ -2568,40 +2693,50 @@ describe("closeout brief", () => {
 		expect(active !== undefined && "endReason" in active).toBe(false);
 		expect(h.controller.directing()).toBe(true);
 		expect(h.summaries()).toBe(0);
-		const rejected = brief({ next: ["같은 방향", " 같은 방향 ", "다른 방향"] });
+		const rejected = brief({ next: [{ kind: "run", task: "같은 방향" }, { kind: "run", task: " 같은 방향 " }] });
 		expect(h.controller.submitCloseout(h.ctx, rejected)).toMatchObject({ ok: false });
+		// Older three-string drafts are read from stored records only; a new submission must be typed.
+		expect(h.controller.submitCloseout(h.ctx, { ...brief(), next: ["a", "b", "c"] } as unknown as CloseoutDraft)).toMatchObject({ ok: false });
 		const latest = brief({ result: "최신 결과입니다." });
 		expect(h.controller.submitCloseout(h.ctx, latest)).toEqual({ ok: true });
-		const record = await h.controller.finish("no-changes", h.ctx);
-		expect(record).toMatchObject({ status: "ended", endReason: "no-changes", closeout: latest });
+		const record = await h.controller.finish("interrupted", h.ctx);
+		expect(record).toMatchObject({ status: "stopped", endReason: "interrupted", closeout: latest });
 		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: latest });
 		expect(h.summaries()).toBe(1);
-		expect(h.ui.records[0]?.markdown).toContain("- 결과(감독 보고): 최신 결과입니다.");
+		expect(h.ui.records[0]?.markdown).toContain("최신 결과입니다.");
 		expect(h.ui.records[0]?.markdown).not.toContain("API를 추가했습니다.");
+		// Verification is detail: it stays in the record, never on the card.
+		expect(h.ui.records[0]?.markdown).not.toContain("unit 체크를 통과했습니다.");
 	});
 
-	test("a settled substantive card is the only record, comes after the lease release, and resolves one choice", async () => {
-		const h = session({ artifactsDir: root, sessionId: "session-closeout" });
+	test("the record snapshots its own target and team facts at finish", async () => {
+		const h = session({ config: { ...SESSION_TEAM, requiredChecks: [{ name: "unit", argv: ["true"] }] } });
+		const runId = await h.start();
+		await h.controller.finish("no-changes", h.ctx);
+		const stored = await readRun(h.sessionDir, runId);
+		expect(stored?.closeoutFacts).toEqual({ target: path.basename(h.repo.root), pendingLanes: [], requiredChecks: ["unit"] });
+		expect(stored?.closeoutFacts?.target).not.toContain("/");
+	});
+
+	test("a card comes after the lease release, carries its style, and a non-interactive host registers no number", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-closeout", agents: [writer()] });
 		const runId = await h.start();
 		const draft = brief();
 		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
-		let releasedAtRecord = -1;
-		const original = h.ui.ui.record.bind(h.ui.ui);
-		h.ui.ui.record = (title, markdown) => {
-			releasedAtRecord = h.leases.released.length;
-			original(title, markdown);
-		};
-		expect(await h.controller.finish("verified", h.ctx)).toMatchObject({ status: "done", endReason: "verified" });
-		expect(h.summaries()).toBe(1);
-		expect(h.ui.records[0]?.title).toBe("Storm 실행 결과");
-		expect(releasedAtRecord).toBe(1);
-		expect(h.ui.records[0]?.markdown).toContain(`1. 추천 — ${draft.next[0]}`);
-		expect(h.ui.records[0]?.markdown).not.toContain(CLOSEOUT_CHOICE_HINT);
-		expect(takeCloseoutChoice(h.ctx, "1")).toBe(draft.next[0]);
-		expect(takeCloseoutChoice(h.ctx, "2")).toBeUndefined();
-		// Another session cannot consume this one's settled choice.
-		const other = { ...h.ctx, sessionManager: { getSessionId: () => "session-other" } } as unknown as ExtensionContext;
-		expect(takeCloseoutChoice(other, "1")).toBeUndefined();
+		const seen = capture(h);
+		expect(await h.controller.finish("interrupted", h.ctx)).toMatchObject({ status: "stopped", endReason: "interrupted" });
+		expect(seen).toHaveLength(1);
+		expect(seen[0]?.title).toBe(CLOSEOUT_TITLE);
+		expect(seen[0]?.released).toBe(1);
+		expect(seen[0]?.style).toMatchObject({ kind: "closeout", runId });
+		expect(Array.isArray(seen[0]?.style?.info)).toBe(true);
+		const stored = (await readRun(h.sessionDir, runId)) as RunRecord;
+		const shown = closeoutBrief(stored, { resumable: true });
+		expect(shown.tier).toBe("card");
+		expect(seen[0]?.markdown).toBe(renderCloseout(shown, false).markdown);
+		expect(seen[0]?.markdown).not.toContain(CLOSEOUT_CHOICE_HINT);
+		// The fake host has a UI but is not the interactive TUI: nothing is answerable by number.
+		expect(takeCloseoutChoice(h.ctx, "1")).toBeUndefined();
 		expect(h.controller.runId()).toBeUndefined();
 		await h.controller.finish("verified", h.ctx);
 		expect(h.summaries()).toBe(1);
@@ -2609,18 +2744,78 @@ describe("closeout brief", () => {
 		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
-	test("a substantive run without a brief shows one conservative fallback card and never claims verification", async () => {
-		const h = session({ agents: [writer()] });
-		await h.start();
-		expect(await h.controller.finish("interrupted", h.ctx)).toMatchObject({ status: "stopped", endReason: "interrupted" });
+	test("an interactive TUI card numbers the director's runs, then the exact trusted resume, once and same-session only", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-tui", agents: [writer()] });
+		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
+		const runId = await h.start();
+		const draft = brief();
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
+		expect(await h.controller.finish("interrupted", tui)).toMatchObject({ status: "stopped" });
+		const stored = (await readRun(h.sessionDir, runId)) as RunRecord;
+		expect(h.ui.records[0]?.markdown).toBe(renderCloseout(closeoutBrief(stored, { resumable: true }), true).markdown);
+		// Another session cannot consume this one's settled choice.
+		const other = { ...tui, sessionManager: { getSessionId: () => "session-other" } } as unknown as ExtensionContext;
+		expect(takeCloseoutChoice(other, "1")).toBeUndefined();
+		expect(takeCloseoutChoice(tui, "3")).toEqual({ runId, action: expect.objectContaining({ kind: "resume" }) });
+		expect(takeCloseoutChoice(tui, "1")).toBeUndefined();
+	});
+
+	test("the first numbered pick is the director's first run direction; user-owned work is never numbered", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-pick", agents: [writer()] });
+		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
+		const runId = await h.start();
+		expect(h.controller.submitCloseout(h.ctx, brief())).toEqual({ ok: true });
+		await h.controller.finish("interrupted", tui);
+		expect(takeCloseoutChoice(tui, "1")).toEqual({
+			runId,
+			action: { kind: "run", label: "문서 반영을 새 Storm 작업으로 맡기기", task: "문서 반영을 새 Storm 작업으로 맡기기" },
+		});
+		const stored = (await readRun(h.sessionDir, runId)) as RunRecord;
+		const shown = closeoutBrief(stored, { resumable: true });
+		expect(shown.actions.map(action => action.kind)).toEqual(["run", "run", "resume"]);
+		expect(shown.userActions).toEqual(["변경 기록을 직접 확인하기"]);
+	});
+
+	test("a draft's resume is dropped when this run is not the session's trusted resume candidate", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-no-pointer", agents: [writer()] });
+		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
+		// The pointer cannot be written, so nothing proves this machine may continue the run.
+		await mkdir(resumePointerFile(h.sessionDir), { recursive: true });
+		const runId = await h.start();
+		const draft = brief({ next: [{ kind: "resume" }, { kind: "run", task: "좁게 다시 맡기기" }] });
+		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
+		await h.controller.finish("interrupted", tui);
+		expect(takeCloseoutChoice(tui, "1")).toEqual({ runId, action: expect.objectContaining({ kind: "run", task: "좁게 다시 맡기기" }) });
+	});
+
+	test("a substantive run without a brief has no director prose and offers only the exact resume", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-nobrief", agents: [writer()] });
+		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
+		const runId = await h.start();
+		expect(await h.controller.finish("interrupted", tui)).toMatchObject({ status: "stopped", endReason: "interrupted" });
 		expect(h.summaries()).toBe(1);
-		const text = h.ui.records[0]?.markdown ?? "";
-		expect(text).toContain("- 결과: 검증된 결과 브리프가 제출되지 않았습니다.");
-		expect(text).toContain("- 상태(공식): 중단 · 사용자가 중단");
-		expect(text).toContain("다음으로 무엇을 할까요?");
-		expect(text).toContain("1. 추천 —");
-		expect(text.match(/^[1-3]\. /gm)).toHaveLength(3);
-		expect(text).not.toContain("리뷰 통과");
+		const stored = (await readRun(h.sessionDir, runId)) as RunRecord;
+		const shown = closeoutBrief(stored, { resumable: true });
+		expect(shown.tier).toBe("card");
+		expect(shown.director).toBeUndefined();
+		expect(shown.actions).toHaveLength(1);
+		expect(shown.residual.some(text => text.includes("검증되지 않은 변경"))).toBe(true);
+		expect(takeCloseoutChoice(tui, "2")).toBeUndefined();
+	});
+
+	test("a short clean run leaves one line, no director prose and no numbers, even on the TUI", async () => {
+		const h = session({ artifactsDir: root, sessionId: "session-line" });
+		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
+		const runId = await h.start();
+		expect(h.controller.submitCloseout(h.ctx, brief())).toEqual({ ok: true });
+		await h.controller.finish("no-changes", tui);
+		expect(h.summaries()).toBe(1);
+		const stored = (await readRun(h.sessionDir, runId)) as RunRecord;
+		const shown = closeoutBrief(stored);
+		expect(shown.tier).toBe("line");
+		expect(shown.actions).toEqual([]);
+		expect(h.ui.records[0]?.markdown).not.toContain("API를 추가했습니다.");
+		expect(takeCloseoutChoice(tui, "1")).toBeUndefined();
 	});
 
 	test("a shutdown without a context writes the brief but opens no card", async () => {
@@ -2634,24 +2829,12 @@ describe("closeout brief", () => {
 	});
 
 	test("a session switch ends as shutdown and opens no card even though a context is available", async () => {
-		const h = session();
+		const h = session({ agents: [writer()] });
 		const runId = await h.start();
 		const draft = brief();
 		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		expect(await h.controller.finish("shutdown", h.ctx)).toMatchObject({ status: "stopped", endReason: "shutdown" });
 		expect(h.summaries()).toBe(0);
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
-	});
-
-	test("a TUI card tells the user how to pick only when the choice is registered", async () => {
-		const h = session({ artifactsDir: root, sessionId: "session-tui" });
-		const tui: ExtensionContext = { ...h.ctx, mode: "tui" };
-		const runId = await h.start();
-		const draft = brief();
-		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
-		expect(await h.controller.finish("verified", tui)).toMatchObject({ status: "done" });
-		expect(h.ui.records[0]?.markdown).toContain(CLOSEOUT_CHOICE_HINT);
-		expect(takeCloseoutChoice(tui, "3")).toBe(draft.next[2]);
 		expect(await readRun(h.sessionDir, runId)).toMatchObject({ closeout: draft });
 	});
 
@@ -2661,6 +2844,7 @@ describe("closeout brief", () => {
 		const draft = brief();
 		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
 		const other: ExtensionContext = Object.assign({}, h.ctx, {
+			mode: "tui",
 			sessionManager: { getSessionId: () => "session-new" },
 		});
 		expect(await h.controller.finish("interrupted", other)).toMatchObject({ status: "stopped", endReason: "interrupted" });
@@ -2673,7 +2857,7 @@ describe("closeout brief", () => {
 	test("a session manager changing in place cannot open a closeout in the new conversation", async () => {
 		const h = session({ artifactsDir: root, sessionId: "session-original" });
 		let active = "session-original";
-		Object.assign(h.ctx, { sessionManager: { ...h.ctx.sessionManager, getSessionId: () => active, getArtifactsDir: () => root } });
+		Object.assign(h.ctx, { mode: "tui", sessionManager: { ...h.ctx.sessionManager, getSessionId: () => active, getArtifactsDir: () => root } });
 		const runId = await h.start();
 		const draft = brief();
 		expect(h.controller.submitCloseout(h.ctx, draft)).toEqual({ ok: true });
@@ -2804,7 +2988,8 @@ describe("declared results", () => {
 			startedAt: T0,
 			observedAt: T0 + 1,
 			report: report({ runId, spawnKey, attemptId: `job:job-1:${spawnKey}` }),
-			reportText: "The current report.json total is 42 (report.json:2).",
+			// The typed `"total": 42` statement restated for its key; extra words would leave the answer reviewable.
+			reportText: "The total is 42 (report.json:2).",
 			citations: [{ path: REPORT, line: 2 }],
 		});
 		await h.turn();
@@ -3426,7 +3611,7 @@ describe("declared results", () => {
 		const final = await h.controller.finish("verified");
 		expect(final).toMatchObject({ status: "stopped", endReason: "no-progress" });
 		const row = (await readRun(h.sessionDir, runId))?.results?.find(item => item.id === "report-change");
-		expect(row).toMatchObject({ state: "unmet" });
+		expect(row).toMatchObject({ state: "unmet", finalized: "unsettled" });
 		expect(row?.reason).toContain("확정되기 전에");
 		expect(row?.attemptId).toBeUndefined();
 

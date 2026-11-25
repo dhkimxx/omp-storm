@@ -15,10 +15,12 @@ import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../
 import { APPROVE } from "../src/proposals/present.ts";
 import { ROLES } from "../src/roles.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
+import { RichFrame } from "../src/view/info.ts";
 import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
 import type { InfoLine, UiContext, UiPort } from "../src/types.ts";
-import { createUiPort } from "../src/ui.ts";
+import { createUiPort, registerReportRenderer } from "../src/ui.ts";
+import { renderCloseout } from "../src/view/closeout.ts";
 import { renderStatus } from "../src/view/render.ts";
 import { makeProject, TEAM, type TestProject } from "./support.ts";
 
@@ -1030,6 +1032,154 @@ describe("hosts that draw no components", () => {
 			expect(content).not.toContain("\x1b");
 		}
 		expect(host.overlays).toBe(0);
+	});
+});
+
+describe("closeout records", () => {
+	const TITLE = "Storm 실행 결과";
+	const BRIEF = {
+		runId: "run-7",
+		tier: "card",
+		request: "결제 API 재시도 정책 정리",
+		target: "omp-storm",
+		startedAt: "2026-11-25T09:00:00Z",
+		endedAt: "2026-11-25T09:42:00Z",
+		official: {
+			label: "완료 아님 · 라운드 한도",
+			tone: "warning",
+			hasResults: true,
+			accepted: 1,
+			inScope: 3,
+			excluded: 0,
+			open: { unsettled: 2, revoked: 0, blocked: 0, retry: 0, reviewable: 0, pending: 0, unmet: 0 },
+		},
+		residual: ["검증되지 않은 변경이 작업 트리에 남아 있습니다"],
+		director: { result: "핵심 경로를 고쳤습니다.", stale: true },
+		userActions: [],
+		actions: [{ kind: "resume", label: "이어 가기" }],
+	} as const;
+	const { markdown, info } = renderCloseout(BRIEF, true);
+	const style = { kind: "closeout", runId: "run-7", info } as const;
+
+	/** The renderer Storm registers for its transcript type, as omp would call it. */
+	function renderer() {
+		let draw: ((message: Record<string, unknown>) => Component | undefined) | undefined;
+		registerReportRenderer({
+			registerMessageRenderer(_type: string, fn: (message: Record<string, unknown>) => Component | undefined) {
+				draw = fn;
+			},
+		} as unknown as ExtensionAPI);
+		return (message: Record<string, unknown>) => draw!({ role: "custom", customType: "storm-report", display: true, timestamp: 0, ...message })!;
+	}
+
+	for (const mode of ["tui", "rpc"] as const) {
+		test(`${mode}: the record keeps its plain text, carries validated details, and never enters the model's context`, () => {
+			const host = fakeHost({ mode, hasUI: true });
+			createUiPort(host.pi, host.ctx).record(TITLE, markdown, style);
+			expect(host.sent).toHaveLength(1);
+			const [{ message, options }] = host.sent as [FakeHost["sent"][number]];
+			expect(message.content).toBe(`### ${TITLE}\n\n${markdown}`);
+			expect(message.excludeFromContext).toBe(true);
+			expect(message.display).toBe(true);
+			expect(options?.triggerTurn).toBe(false);
+			expect((message as { details?: unknown }).details).toEqual({ v: 1, kind: "closeout", runId: "run-7", info });
+			expect(String(message.content)).not.toContain("\x1b");
+			expect(host.overlays).toBe(0);
+		});
+	}
+
+	test("plain records and styling that does not match its text persist no details", () => {
+		const host = fakeHost({ mode: "tui", hasUI: true });
+		const ui = createUiPort(host.pi, host.ctx);
+		ui.record("record-title", "record-body");
+		ui.record(TITLE, `${markdown}\n- 덧붙인 줄`, style);
+		ui.record(TITLE, markdown, { ...style, info: [{ index: 0, spans: [{ text: "[실행]" }] }] });
+		expect(host.sent).toHaveLength(3);
+		for (const { message } of host.sent) {
+			expect("details" in message).toBe(false);
+			expect(message.excludeFromContext).toBe(true);
+		}
+	});
+
+	test("a short settled run draws one inline fact, not a second frame under the answer", () => {
+		const { markdown: body, info: spans } = renderCloseout({
+			...BRIEF, tier: "line", official: { ...BRIEF.official, label: "완료", tone: "success", accepted: 1, inScope: 1,
+				open: { ...BRIEF.official.open, unsettled: 0 } },
+		}, false);
+		const host = fakeHost({ mode: "tui", hasUI: true });
+		createUiPort(host.pi, host.ctx).record(TITLE, body, { ...style, info: spans });
+		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
+		const rows = component.render(60).map(stripTerminalSequences);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toContain("Storm · 완료 · 수용 1/1");
+		expect(rows[0]).not.toMatch(/[│╭╰]/u);
+		expect(component.describe?.(describeContext(60))).toMatchObject({ k: "text" });
+	});
+
+	test("a settled fact too long for the row with Storm's mark drops the mark instead of wrapping, and keeps it where it fits", () => {
+		const { markdown: body, info: spans } = renderCloseout({
+			...BRIEF, tier: "line", official: { ...BRIEF.official, label: "완료 · 필수 결과 이행 · 1/4라운드", tone: "success", accepted: 2, inScope: 2,
+				open: { ...BRIEF.official.open, unsettled: 0 } },
+		}, false);
+		const host = fakeHost({ mode: "tui", hasUI: true });
+		createUiPort(host.pi, host.ctx).record(TITLE, body, { ...style, info: spans });
+		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
+		const fact = stripTerminalSequences(component.render(200)[0]!);
+		expect(fact).toContain("Storm · ");
+		// Exactly as wide as the line with the mark needs: at 60 columns the mark would push the last word to a second row.
+		const tight = Bun.stringWidth(fact) - 1;
+		const rows = component.render(tight).map(stripTerminalSequences);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).not.toContain("Storm");
+		expect(rows[0]).toContain("수용 2/2");
+		expect(Bun.stringWidth(rows[0]!)).toBeLessThanOrEqual(tight);
+		expect(rows[0]).not.toMatch(/[│╭╰]/u);
+		// A width no single row can hold still wraps, keeping the whole fact and the mark.
+		expect(component.render(20).length).toBeGreaterThan(1);
+	});
+
+	test("a closeout draws its title once as the frame heading, styled from details, with a native card free of ANSI", () => {
+		const host = fakeHost({ mode: "tui", hasUI: true });
+		createUiPort(host.pi, host.ctx).record(TITLE, markdown, style);
+		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
+		for (const width of [60, 100]) {
+			const rows = component.render(width);
+			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+			const visible = stripTerminalSequences(rows.join("\n"));
+			expect(visible.split(TITLE)).toHaveLength(2);
+			expect(visible).not.toContain("###");
+			expect(visible).toContain("수용 1/3");
+		}
+		const wide = component.render(100).join("\n");
+		expect(stripTerminalSequences(wide)).toContain("수용 1/3 · 판정 전 종료 2");
+		expect(stripTerminalSequences(wide)).toContain("감독 설명(최종 판정 전 작성): 핵심 경로를 고쳤습니다.");
+		expect(wide).toContain(theme.fg("warning", theme.bold("완료 아님 · 라운드 한도")));
+		const native = component.describe?.(describeContext(60));
+		expect(native).toMatchObject({ k: "card" });
+		const spans = nativeSpans(native);
+		expect(spans).toContainEqual({ t: "완료 아님 · 라운드 한도", s: "warning strong" });
+		expect(spans.every(run => !run.t.includes("\x1b"))).toBe(true);
+		expect(nativeMds(native)).toEqual([]);
+	});
+
+	test("older records and malformed details keep the existing plain frame with their raw content", () => {
+		const draw = renderer();
+		const content = `### ${TITLE}\n\n${markdown}`;
+		const cases: unknown[] = [
+			undefined,
+			{ v: 2, kind: "closeout", runId: "run-7", info },
+			{ v: 1, kind: "closeout", runId: "run-7", info: "nope" },
+			{ v: 1, kind: "closeout", runId: "run-7", info: [{ ...info[0]!, spans: [{ text: "\x1b[2J가짜" }] }, ...info.slice(1)] },
+			{ v: 1, kind: "closeout", runId: "run-7", info: [{ ...info[0]!, meter: { fraction: 1, tone: "success" } }, ...info.slice(1)] },
+		];
+		for (const details of cases) {
+			const component = draw({ content, ...(details === undefined ? {} : { details }) });
+			expect(component).not.toBeInstanceOf(RichFrame);
+			const visible = stripTerminalSequences(component.render(100).join("\n"));
+			expect(visible).toContain("Storm");
+			expect(visible).toContain("결제 API 재시도 정책 정리");
+			expect(visible).not.toContain("가짜");
+		}
 	});
 });
 

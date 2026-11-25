@@ -181,12 +181,18 @@ export interface CoverageResult {
 	/** What must change outside the team before a blocked row can continue; never a retry instruction. */
 	unblock?: string;
 	/**
-	 * Whether the approved reviewer's current-tree verdict can accept this submitted row. False for evidence the tree
-	 * cannot show (an answer's wording, an isolated artifact, or a requirement whose lane left the plan); such a row is
-	 * blocked, never sent to a reviewer who cannot judge it. Absent keeps the caller's old behavior (a change row
-	 * judged by the reviewer).
+	 * Whether the approved reviewer can settle this submitted row. False for evidence no verdict can be bound to (an
+	 * isolated artifact, a requirement whose lane left the plan, or an answer without a scoped review receipt); such a
+	 * row is blocked, never sent to a reviewer who cannot judge it. A reviewable answer is judgeable only with `review`,
+	 * and only a final verdict that scopes exactly that receipt settles it, never a tree verdict. Absent keeps the
+	 * caller's old behavior (a change row judged by the reviewer).
 	 */
 	judgeable?: boolean;
+	/**
+	 * For a reviewable answer: the review receipt Storm issued for this exact submission and the anchor citation the
+	 * reviewer must judge it against. The round message names both; neither is proof by itself.
+	 */
+	review?: { receipt: string; citation: string };
 	/**
 	 * Short content or dependency witness used only to decide whether another round made real progress (for example
 	 * the accepted content version, or the producer result version a consumer observed). Never proof, never rendered.
@@ -267,6 +273,8 @@ export type Gate =
 			resultProgress?: string;
 			/** The runtime's bounded reason for the open requirement. */
 			resultReason?: string;
+			/** A reviewable answer's scoped review receipt and anchor citation. */
+			resultReview?: { receipt: string; citation: string };
 	  };
 
 /** The gate's unverified shape, the only one a round message is built from. */
@@ -370,7 +378,13 @@ const REMEDY_ORDER: Readonly<Record<ResultRemedy, number>> = { work: 0, replan: 
 export function nextRemedy(row: CoverageResult, reviewer?: boolean): ResultRemedy {
 	if (row.remedy === "review" && (reviewer === false || row.judgeable === false)) return "blocked";
 	if (row.remedy !== undefined) return row.remedy;
-	if (row.state === "reviewable") return reviewer === false || row.judgeable === false ? "blocked" : "review";
+	if (row.state === "reviewable") {
+		if (reviewer === false || row.judgeable === false) return "blocked";
+		// An answer with no scoped review receipt cannot be bound to any verdict: the producer resubmits it instead of
+		// waiting on a review that could never settle it.
+		if (row.kind === "answer" && (row.review === undefined || !REVIEW_RECEIPT.test(row.review.receipt))) return "work";
+		return "review";
+	}
 	if (row.blockedBy !== undefined) return "producer";
 	return "work";
 }
@@ -433,6 +447,7 @@ function withResults(gate: Gate, coverage: CoverageInput | undefined): Gate {
 		...(open.unblock === undefined ? {} : { resultUnblock: open.unblock }),
 		resultProgress: resultWitness(open, remedy),
 		...(open.reason === undefined ? {} : { resultReason: open.reason.slice(0, 200) }),
+		...(open.review === undefined ? {} : { resultReview: { receipt: open.review.receipt, citation: open.review.citation } }),
 	};
 }
 
@@ -672,6 +687,19 @@ function detail(value: unknown, max = DETAIL_MAX): string | undefined {
 	return redacted.length > max ? `${redacted.slice(0, Math.max(1, max - 1))}…` : redacted;
 }
 
+const REVIEW_RECEIPT = /^[0-9a-f]{32}$/u;
+
+/** A reviewable answer's receipt and anchor when both are safe to name; anything else is no scoped review. */
+function answerReview(gate: Unverified): { receipt: string; citation: string } | undefined {
+	if (gate.resultKind !== "answer" || gate.resultReview === undefined || gate.result === undefined) return undefined;
+	const { receipt, citation } = gate.resultReview;
+	if (typeof receipt !== "string" || !REVIEW_RECEIPT.test(receipt)) return undefined;
+	const anchor = detail(citation, 120);
+	// The anchor is repeated verbatim by the reviewer; a redacted or cut spelling could never match.
+	if (anchor === undefined || anchor !== citation || detail(gate.result, 48) !== gate.result) return undefined;
+	return { receipt, citation };
+}
+
 /** The short, safe parts of an open requirement a round may name; an attempt is a token, never a path. */
 function resultTarget(gate: Unverified): { id?: string; lane?: string; attempt?: string } {
 	const id = detail(gate.result, 48);
@@ -716,10 +744,21 @@ function resultInstruction(gate: Unverified, reviewer?: string): string {
 				? `Next: complete the prerequisite result ${label} needs; do not rerun the consumer until that input lands.`
 				: `Next: have lane \`${producer}\` produce the input ${label} needs; do not rerun ${label} or spawn its replacement until that input lands.`;
 		}
-		case "review":
+		case "review": {
+			const scoped = answerReview(gate);
+			if (scoped !== undefined) {
+				const reviewer = who === undefined ? "an approved reviewer" : `\`${who}\``;
+				return `Next: send ${reviewer} the answer ${label} exactly as its producer returned it and its cited source \`${scoped.citation}\` (receipt \`${scoped.receipt}\`); its final yield must add \`results: [{"id": "${target.id ?? ""}", "receipt": "${scoped.receipt}", "citation": "${scoped.citation}", "verdict": "correct" | "incorrect"}]\`. A tree or change verdict does not settle an answer; do not rerun its producing lane.`;
+			}
+			if (gate.resultKind === "answer") {
+				// No usable receipt: no verdict could ever bind, so a tree review would only loop.
+				const where = target.lane === undefined ? `assign ${label} to a lane` : `rerun only ${label} in lane \`${target.lane}\``;
+				return `Next: ${where} with its cited source so Storm can issue a review receipt; a tree or change verdict does not settle an answer.`;
+			}
 			return who === undefined
 				? `Next: have an approved reviewer judge the submitted ${label} on the current tree; do not rerun its producing lane.`
 				: `Next: have \`${who}\` judge the submitted ${label} on the current tree; do not rerun its producing lane.`;
+		}
 		case "retry":
 			return `Next: do not respawn the same work for ${label}. The host's native retry/fallback is exhausted for the failing attempt${target.attempt === undefined ? "" : ` \`${target.attempt}\``}; Storm will not retry it automatically. Replan it to a different approved lane, role or model, or report the blocker.`;
 		case "blocked": {

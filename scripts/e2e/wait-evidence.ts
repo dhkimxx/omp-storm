@@ -44,11 +44,13 @@ import {
 	TRACKED_TEXT,
 	until,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, FACT_TEXT, seedFact } from "./typed-fixture.ts";
 
 const AUTO_OFF = "자동 위임 끄기";
 const MAIN = "fake/general-b";
-const CLAIM = `${TRACKED_TEXT.trim()} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
-const READ = `E2E-CHILD-READ ${TRACKED_FILE}`;
+/** The typed fixture line's signed value and its citation: accepted mechanically by the official answer evidence. */
+const CLAIM = FACT_CLAIM;
+const READ = `E2E-CHILD-READ ${FACT_FILE}`;
 const FAIL = "E2E-CHILD-YIELD-ERROR E2E wait failure control";
 
 interface WaitJob {
@@ -90,7 +92,7 @@ const runRequest = (steps: Step[], rounds?: number): string =>
 const planFor = (lanes: readonly ContractLane[], workers?: Record<string, number>): Step =>
 	contractPlan(lanes, { contract: true, ...(workers === undefined ? {} : { workers }) });
 const trackedAnswer = (id: string) =>
-	requiredResult(id, "answer", `report what ${TRACKED_FILE} line 1 says, from source`, { path: TRACKED_FILE, contains: TRACKED_TEXT.trim() });
+	requiredResult(id, "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE });
 
 async function runOf(rpc: Rpc, files: StormFiles, message: string): Promise<RunRecord> {
 	const before = files.runIds();
@@ -436,11 +438,13 @@ async function main(): Promise<void> {
 		check("no session exited non-zero", exitCodes.length > 0 && exitCodes.every(code => code === 0), `exit=${exitCodes.join(",")}`);
 		// The project's tracked fixture is read-only in this exercise; no wait path changed it.
 		check("the tracked fixture stayed byte-identical", readFileSync(join(env.project, TRACKED_FILE), "utf8") === TRACKED_TEXT, `bytes=${readFileSync(join(env.project, TRACKED_FILE)).length}`);
+		check("the typed answer fixture stayed byte-identical", readFileSync(join(env.project, FACT_FILE), "utf8") === FACT_TEXT, `bytes=${readFileSync(join(env.project, FACT_FILE)).length}`);
 	});
 }
 
 if (import.meta.main) {
 	env = prepare("storm-e2e-wait", 18786);
+	seedFact(env.project);
 	suite = new Suite("E2E (native wait delivery)", env);
 	check = suite.check.bind(suite);
 	let code = 1;

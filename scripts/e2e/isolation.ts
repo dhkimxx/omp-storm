@@ -47,6 +47,8 @@ import {
 	TRACKED_FILE,
 	TRACKED_TEXT,
 	until,
+	closeoutOf,
+	pendingLanesOf,
 } from "./harness.ts";
 
 const LABEL = { autoOn: "자동 위임 켜기", autoOff: "자동 위임 끄기" } as const;
@@ -86,16 +88,21 @@ const startRun = (sequence: Step[]): string => `/storm E2E-ROUTE ${JSON.stringif
 const plan = (lanes: unknown[], workers?: Record<string, number>): Step => ({ storm: { action: "plan", plan: { lanes, ...(workers ? { workers } : {}) } } });
 
 /**
+ * The parent's dirty line is a typed `key: "value"` pair, so a claim that states its value agrees with it
+ * mechanically (an exact typed match is what the answer evidence accepts without a reviewer).
+ */
+const dirtyLine = (marker: string): string => `parent_dirty: "${marker}"`;
+/**
  * The shared lane's deliverable is a sourced observation of the parent's dirty line: the child reads the file and
  * cites that exact line, so the result is real evidence rather than the lane merely ending.
  */
-const sharedClaim = (marker: string): string => `${marker} is line 2 of ${TRACKED_FILE} (${TRACKED_FILE}:2)`;
+const sharedClaim = (marker: string): string => `The parent_dirty is "${marker}" (${TRACKED_FILE}:2)`;
 const sharedResult = (marker: string): PlanLaneResult => ({
 	id: "shared-observation",
 	kind: "answer",
 	criterion: `report the parent's ${marker} line in ${TRACKED_FILE} with its source`,
 	path: TRACKED_FILE,
-	contains: marker,
+	contains: dirtyLine(marker),
 });
 /** The experiment's deliverable lives in the retained patch/directory, not in the parent tree. */
 const experimentResult = (): PlanLaneResult => ({
@@ -127,23 +134,12 @@ async function waitAuto(files: StormFiles, expected: "on" | "off", timeoutMs = 1
 }
 
 /**
- * The run's end report, once Storm writes it. The start notice also carries the run id, so selecting by id can return
- * that notice instead of the result; wait for the result heading itself.
+ * The run's settled-run record, once Storm writes it. The start notice also carries the run id, so selecting by id can
+ * return that notice instead of the result; wait for the result heading itself.
  */
 async function reportOf(rpc: Rpc, runId: string, from: number, timeoutMs = 20_000): Promise<string> {
-	const text = await until(
-		() => {
-			const reports = rpc.frames
-				.slice(from)
-				.filter(frame => customMessage(frame) === "storm-report")
-				.map(frame => JSON.stringify(frame))
-				.join("\n");
-			return reports.includes("### Storm 실행 결과") ? reports : undefined;
-		},
-		timeoutMs,
-		`the end report of ${runId}`,
-	).catch(() => "");
-	return text;
+	const record = await until(() => closeoutOf(rpc.frames, runId, from), timeoutMs, `the end report of ${runId}`).catch(() => undefined);
+	return record?.text ?? "";
 }
 
 /** A tool result's user-facing text, which is what a client shows (`result.content`). */
@@ -260,7 +256,7 @@ function checkMixedLaneRun(
 	const isolatedCwd = readMarker(dirs.experiment, "proof").split("|")[0] ?? "";
 	check(`${prefix}: the ordinary lane ran in the parent checkout`, sharedCwd !== "" && real(sharedCwd) === real(env.project), `cwd=${sharedCwd} parent=${env.project}`);
 	const sharedLines = sharedRead.split("\n").map(line => line.trim());
-	check(`${prefix}: the ordinary lane saw the parent's dirty edit`, sharedLines.includes(dirty), sharedRead.slice(0, 200));
+	check(`${prefix}: the ordinary lane saw the parent's dirty edit`, sharedLines.includes(dirtyLine(dirty)), sharedRead.slice(0, 200));
 	check(
 		`${prefix}: the exceptional lane ran in a different native checkout outside the parent`,
 		isolatedCwd !== "" && outsideProject(isolatedCwd),
@@ -279,7 +275,13 @@ function checkMixedLaneRun(
 		run.status === "ended" || run.status === "done",
 		`status=${run.status} endReason=${run.endReason} turns=${run.turns ?? "?"}`,
 	);
-	check(`${prefix}: the run report leaves no lane unfinished`, report !== "" && !report.includes("미완료 레인"), report.slice(-1200));
+	// Unfinished lanes left the card; the final on-disk ledger is where they are recorded now.
+	const pendingLanes = pendingLanesOf(run);
+	check(
+		`${prefix}: the run is reported and its final ledger leaves no lane unfinished`,
+		report !== "" && pendingLanes !== undefined && pendingLanes.length === 0,
+		`pending=${JSON.stringify(pendingLanes ?? "no closeoutFacts")} report=${report.slice(-600)}`,
+	);
 	const outputPath = /Isolation: changes captured at `([^`]+)`/.exec(said(frames))?.[1] ?? "";
 	const artifact = artifactProof(outputPath);
 	check(
@@ -367,7 +369,7 @@ async function main(): Promise<void> {
 		const experimentDir = markerDir("selective-experiment");
 		const experimentCommand = probeCommand(experimentDir);
 		const tracked = join(env.project, TRACKED_FILE);
-		writeFileSync(tracked, `${TRACKED_TEXT}E2E-PARENT-DIRTY\n`);
+		writeFileSync(tracked, `${TRACKED_TEXT}${dirtyLine("E2E-PARENT-DIRTY")}\n`);
 		try {
 			await session(cancelAll, async (rpc, files) => {
 				const llm = new LlmCursor(env);
@@ -426,7 +428,7 @@ async function main(): Promise<void> {
 		const experimentDir = markerDir("auto-experiment");
 		const experimentCommand = probeCommand(experimentDir);
 		const tracked = join(env.project, TRACKED_FILE);
-		writeFileSync(tracked, `${TRACKED_TEXT}E2E-AUTO-PARENT-DIRTY\n`);
+		writeFileSync(tracked, `${TRACKED_TEXT}${dirtyLine("E2E-AUTO-PARENT-DIRTY")}\n`);
 		try {
 			await session(cancelAll, async (rpc, files) => {
 				rpc.answer = choose(LABEL.autoOn);

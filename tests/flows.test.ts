@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, type Dirent } from "node:fs";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmodSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
 import { type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
@@ -8,7 +8,7 @@ import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
-import { agentsFlow, approveAndSave, autoDelegationFlow, type FlowEnv, exportFlow, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
+import { agentsFlow, approveAndSave, autoDelegationFlow, type FlowEnv, hubFlow, resetFlow, resumeFlow, setupFlow, statusFlow, statusText } from "../src/flows.ts";
 import { initializeAutoDelegation, readAutoDelegationChoice, writeAutoDelegation } from "../src/approval/auto.ts";
 import { ROLES, roleTitle } from "../src/roles.ts";
 import { writeRun } from "../src/runtime/run.ts";
@@ -1131,6 +1131,31 @@ describe("status and agents", () => {
 		expect(full.split("\n").filter(line => line.startsWith("### "))).toEqual(expect.arrayContaining(text.split("\n").filter(line => line.startsWith("### "))));
 	});
 
+	test("the model reads the durable handoff only for the selected or idle native target", async () => {
+		await gitRepo(project.root);
+		const other = path.join(project.tmp, "other-worktree");
+		await git(project.root, "worktree", "add", "-b", "other", other);
+		await approve(TEAM);
+		const state = await load();
+		const previous = runRecord({
+			runId: "run-20261120-090000-abcd",
+			status: "done",
+			endReason: "verified",
+			endedAt: new Date(NOW - 60_000).toISOString(),
+			task: "Prepare the deployment health checklist",
+			request: "Prepare the deployment health checklist",
+		});
+		await writeRun(state.sessionDir, previous);
+		const status = async (context: FlowEnv) => statusText(context, { quota: false });
+		expect(await status(env)).not.toContain(previous.task);
+		await noteResumePointer(state.sessionDir, state.repo, previous);
+		expect(await status(env)).toContain(previous.task);
+		expect(await status({ ...env, cwd: other })).not.toContain(previous.task);
+		const active = runRecord({ runId: "run-20261120-093000-bcde", status: "running" });
+		expect(await status({ ...env, activeRun: () => active })).not.toContain(previous.task);
+		expect(await status({ ...env, activeRun: () => ({ ...active, followUpOf: previous.runId }) })).toContain(previous.task);
+	});
+
 	test("the user's storage inventory scans the named project session dir and the model receives none of it", async () => {
 		await approve(TEAM);
 		const projectDir = path.join(env.agentDir, "sessions", "proj");
@@ -1215,12 +1240,13 @@ describe("status and agents", () => {
 		expect(text.indexOf("- 다음:")).toBeLessThan(text.indexOf("### 팀 설정"));
 	});
 
-	test("agentsFlow reports the subagents table and asks nothing", async () => {
+	test("agentsFlow gives the user compact agent details without opening a choice", async () => {
 		await approve(TEAM);
 		const f = scriptedUi();
 		await agentsFlow({ ...env, agents: () => [agent] }, f.ui);
 		expect(f.reports).toHaveLength(1);
 		expect(f.reports[0]?.markdown).toContain("agent-one");
+		expect(f.reports[0]?.markdown).not.toContain("|");
 		expect(f.selects).toEqual([]);
 	});
 });
@@ -1457,85 +1483,6 @@ describe("stale dialog owner", () => {
 		expect(after.config.status === "ok" && after.config.hash).toBe(configHash(newer));
 		expect((await after.store.list()).length).toBe(2);
 		expect(f.notices.at(-1)?.text).toContain("대화가 바뀌어");
-	});
-});
-
-describe("team export", () => {
-	/** Every regular file below `dir` and its bytes, so "writes nothing" is checked on the whole tree. */
-	async function snapshot(dir: string): Promise<Map<string, string>> {
-		const out = new Map<string, string>();
-		const walk = async (current: string): Promise<void> => {
-			let entries: Dirent[];
-			try {
-				entries = await readdir(current, { withFileTypes: true });
-			} catch {
-				return;
-			}
-			for (const entry of entries) {
-				const file = path.join(current, entry.name);
-				if (entry.isDirectory()) await walk(file);
-				else if (entry.isFile()) out.set(path.relative(dir, file), await readFile(file, "utf8"));
-			}
-		};
-		await walk(dir);
-		return out;
-	}
-
-	test("renders only shareable team options, writes nothing, and leaves approval, hashes, checks and paths out", async () => {
-		const secret = {
-			...TEAM,
-			requiredChecks: [{ name: "private-check /Users/dhkim", argv: ["/Users/dhkim/bin/secret", "TOKEN=abcdef"] }],
-			trials: [
-				{
-					id: "trial-export",
-					role: "implementer",
-					model: "pa/alpha-big",
-					share: 0.5,
-					maxSpawns: 3,
-					startsAt: "2026-11-20T09:00:00.000Z",
-					endsAt: "2026-11-30T09:00:00.000Z",
-					budgetUsd: 1,
-				},
-			],
-			unknownCredential: "SECRET-VALUE",
-			parallelism: 9,
-		} as unknown as StormConfig;
-		await approve(secret);
-		const before = await snapshot(project.tmp);
-		const f = scriptedUi();
-		await exportFlow(env, f.ui);
-		expect(f.selects).toEqual([]);
-		expect(f.reports).toHaveLength(1);
-		expect(f.reports[0]?.title).toBe("Storm 팀 템플릿");
-		const markdown = f.reports[0]!.markdown;
-		expect(markdown).toContain('"version": 1');
-		expect(markdown).toContain('"implementer"');
-		expect(markdown).toContain('"models"');
-		expect(markdown).not.toContain("parallelism");
-		expect(markdown).not.toContain("병렬도");
-		expect(markdown).not.toContain("requiredChecks");
-		expect(markdown).not.toContain("argv");
-		expect(markdown).not.toContain("private-check");
-		expect(markdown).not.toContain("TOKEN=abcdef");
-		expect(markdown).not.toContain("trials");
-		expect(markdown).not.toContain("trial-export");
-		expect(markdown).not.toContain("unknownCredential");
-		expect(markdown).not.toContain("SECRET-VALUE");
-		expect(markdown).not.toContain("jcs-sha256");
-		expect(markdown).not.toContain(project.root);
-		expect(markdown).not.toContain(env.agentDir);
-		// A report, never a file: every byte under the temp profile and target is unchanged.
-		expect(await snapshot(project.tmp)).toEqual(before);
-	});
-
-	test("without a valid team it says so and still writes nothing", async () => {
-		const before = await snapshot(project.tmp);
-		const f = scriptedUi();
-		await exportFlow(env, f.ui);
-		expect(f.reports).toEqual([]);
-		expect(f.notices.at(-1)?.level).toBe("warning");
-		expect(f.notices.at(-1)?.text).toContain("내보낼 승인된 팀 설정");
-		expect(await snapshot(project.tmp)).toEqual(before);
 	});
 });
 

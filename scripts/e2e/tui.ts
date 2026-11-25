@@ -3,6 +3,9 @@
  * OMP Storm end-to-end check in omp's interactive TUI, on a pty: what only that host has. Setup through Storm's
  * approval, role interviews, a plain request, a run Storm sends back until its changes are reviewed, a native ask
  * that holds and then resumes the same run, shutdown while it waits, and narrow motion-off runs in dark and light.
+ * Settled runs: a short clean run leaves one factual line and no menu; an incomplete run keeps the whole closeout
+ * card at 60 columns, its first numbered direction starts one related follow-up, a restart draws the card again but
+ * restores no choice, and an interrupted run's only numbered action is the recorded resume.
  * Same isolated profile and fake LLM as run.ts; Storm is installed as a plugin.
  *
  * Usage: npm run e2e:tui   (env: see harness.ts)
@@ -21,7 +24,15 @@ import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
 import { priorityLabel } from "../../src/view/render.ts";
-import { focused, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, price, PROFILE_CONFIG, prepare, Rpc, type Step, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, TRACKED_FILE, TRACKED_TEXT, Tui, until, cancelAll } from "./harness.ts";
+import { CLOSEOUT_NEXT_MAX } from "../../src/runtime/closeout.ts";
+import { CLOSEOUT_CHOICE_HINT } from "../../src/view/closeout.ts";
+import { STATUS_LABEL } from "../../src/runtime/rounds.ts";
+import {
+	CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutBody, focused, isOneLineCloseout, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, numberedOffers, offeredDirections, persistedStormRecords,
+	price, PROFILE_CONFIG, prepare, Rpc, runNext, sessionFileIn, type Step, type StormRecord, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui,
+	until, userNext, cancelAll,
+} from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
 /** Option labels Storm does not export: the one that opens the setup forms, and the one that opens a cut context. */
 const PICK_BY_ROLE = "역할별로 고르기";
@@ -40,6 +51,7 @@ const FORM_SUBMIT = "Submit";
 const SESSION_SEED = "Storm TUI fixture transcript.";
 
 const env = prepare("storm-e2e-tui", 18559);
+seedFact(env.project);
 const suite = new Suite("E2E (tui)", env);
 const check = suite.check.bind(suite);
 
@@ -53,13 +65,14 @@ let ownedSession: { id: string; dir: string } | undefined;
 const b64 = (value: unknown): string => `b64:${Buffer.from(JSON.stringify(value)).toString("base64")}`;
 const mains = (entries: LlmEntry[]): LlmEntry[] => entries.filter(entry => entry.who === "main");
 /**
- * The read-only probes in this TUI file deliver one sourced observation: the child reads the tracked file and cites
- * its exact line, so every probing lane has a real, observable result instead of merely ending.
+ * The read-only probes in this TUI file deliver one sourced observation: the child reads the typed fixture file and
+ * cites its exact line, restating its signed typed value, so every probing lane has a real result that the official
+ * answer evidence accepts mechanically. The fixture file name is as wide as the old tracked file's (15 columns), so
+ * the result label and every width/wrap measurement below render exactly as before.
  */
-const TRACKED_LINE = TRACKED_TEXT.trim();
-const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
-const trackedAnswer = (id: string): Record<string, unknown> => ({ id, kind: "answer", criterion: `report what ${TRACKED_FILE} line 1 says`, path: TRACKED_FILE, contains: TRACKED_LINE });
-const readProbe = `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
+const TRACKED_CLAIM = FACT_CLAIM;
+const trackedAnswer = (id: string): Record<string, unknown> => ({ id, kind: "answer", criterion: `report what ${FACT_FILE} line 1 says`, path: FACT_FILE, contains: FACT_LINE });
+const readProbe = `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
 const plan = (name: string, kind: string): Step => ({ storm: { action: "plan", plan: { lanes: [{ name, kind, results: [trackedAnswer(`${name}-answer`)] }] } } });
 const primary = (config: StormConfig | undefined, role: string): string | undefined => modelId(config?.roles[role]?.models[0]);
 const OUTSIDE = "interview-outside";
@@ -71,6 +84,12 @@ const RESUME = idleAppearance({ team: "approved", auto: "on", resume: true });
  * the managed-decision marker a Storm director must use for a genuine user choice. */
 const ASK_FORM = '<form data-storm-decision="e2e-tui-ask-v1" data-storm-reason="user-choice"><fieldset><legend>E2E 확인</legend><label>E2E-QUESTION <input name="e2e-answer" placeholder="E2E-ANSWER"></label></fieldset></form>';
 const ASK_ANSWER = "resume-ok";
+/** The file the 60-column card scenario's implementer writes and no reviewer ever judges. */
+const CARD_FILE = "e2e-card.txt";
+/** The official label of a done run, as the settled record and the status view print it. */
+const STATUS_DONE = STATUS_LABEL.done;
+/** The incomplete run whose card offered a related follow-up; later unrelated handoffs must not carry its facts. */
+let cardRunId: string | undefined;
 
 /** The widget's static header text: the shared mark, then the shared phase label. */
 const phaseHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARANCE[phase].label}`;
@@ -98,6 +117,143 @@ function phaseRow(text: string, phase: RunPhase): string | undefined {
 		.at(-1);
 }
 
+/** Screen rows without frame edges or padding, empty rows dropped: what a person reads of a framed record. */
+function screenRows(text: string): string[] {
+	return text
+		.split("\n")
+		.map(row => row.replace(/^[\s│|]+|[\s│|]+$/g, ""))
+		.filter(row => row !== "" && !/^[╭╮╰╯─+\-]+$/.test(row));
+}
+
+/** The raw painted rows of a closeout from its first row through its status pointer, frame edges kept, for width checks. */
+function cardRows(text: string): string[] {
+	const rows = text.split("\n");
+	const end = rows.findIndex(row => row.includes(CLOSEOUT_DETAIL));
+	return rows.slice(0, end < 0 ? rows.length : end + 1).filter(row => row.trim() !== "");
+}
+
+/**
+ * The terminal screen a pty log paints, as rows of text: `scrollback` (rows scrolled off the top) then `viewport`.
+ * `Tui.text` is only the byte stream with escapes removed, where one painted row can appear many times, wrapped
+ * rows look like separate rows and cursor moves are lost; a visual claim (one row, no frame, nothing around it)
+ * needs the rows a person actually sees. This replays the cursor moves, line edits and scrolling omp's renderer
+ * uses (CUP/CUU/CUD/CUF/CUB/CHA, EL, ED, IL, DL, SU, DECSC/DECRC, CR/LF, auto-wrap) and ignores colours and modes.
+ */
+function replayScreen(raw: string, cols: number, rows: number): { scrollback: string[]; viewport: string[] } {
+	const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+	const blank = (): string[] => Array.from({ length: cols }, () => " ");
+	const grid: string[][] = Array.from({ length: rows }, blank);
+	const scrollback: string[][] = [];
+	let row = 0;
+	let col = 0;
+	let saved: [number, number] = [0, 0];
+	const scrollUp = (): void => {
+		scrollback.push(grid.shift() ?? blank());
+		grid.push(blank());
+	};
+	const lineFeed = (): void => {
+		if (row === rows - 1) scrollUp();
+		else row++;
+	};
+	const put = (grapheme: string): void => {
+		const width = Bun.stringWidth(grapheme);
+		if (width === 0) return;
+		if (col + width > cols) {
+			col = 0;
+			lineFeed();
+		}
+		grid[row]![col] = grapheme;
+		for (let at = 1; at < width; at++) grid[row]![col + at] = "";
+		col += width;
+	};
+	const clamp = (value: number, max: number): number => Math.min(max, Math.max(0, value));
+	let at = 0;
+	while (at < raw.length) {
+		const char = raw[at]!;
+		if (char === "\x1b") {
+			const kind = raw[at + 1];
+			if (kind === "[") {
+				const csi = /^\x1b\[([0-9;?<>=:]*)([ -/]*[@-~])/.exec(raw.slice(at, at + 64));
+				if (csi === null) {
+					at++;
+					continue;
+				}
+				at += csi[0].length;
+				const args = csi[1]!.replace(/^[?<>=]/, "").split(";").map(part => (part === "" ? 0 : Number(part)));
+				const count = Math.max(1, args[0] ?? 0);
+				switch (csi[2]) {
+					case "H":
+					case "f":
+						row = clamp((args[0] || 1) - 1, rows - 1);
+						col = clamp((args[1] || 1) - 1, cols - 1);
+						break;
+					case "A": row = clamp(row - count, rows - 1); break;
+					case "B": row = clamp(row + count, rows - 1); break;
+					case "C": col = clamp(col + count, cols - 1); break;
+					case "D": col = clamp(col - count, cols - 1); break;
+					case "G": col = clamp((args[0] || 1) - 1, cols - 1); break;
+					case "K": {
+						const mode = args[0] ?? 0;
+						for (let cell = mode === 0 ? col : 0; cell < (mode === 1 ? col + 1 : cols); cell++) grid[row]![cell] = " ";
+						break;
+					}
+					case "J": {
+						const mode = args[0] ?? 0;
+						for (let line = 0; line < rows; line++) {
+							if (mode >= 2 || (mode === 0 && line > row) || (mode === 1 && line < row)) grid[line] = blank();
+						}
+						if (mode === 0) for (let cell = col; cell < cols; cell++) grid[row]![cell] = " ";
+						if (mode === 1) for (let cell = 0; cell <= col; cell++) grid[row]![cell] = " ";
+						break;
+					}
+					case "L":
+						for (let n = 0; n < count; n++) {
+							grid.splice(rows - 1, 1);
+							grid.splice(row, 0, blank());
+						}
+						break;
+					case "M":
+						for (let n = 0; n < count; n++) {
+							grid.splice(row, 1);
+							grid.push(blank());
+						}
+						break;
+					case "S":
+						for (let n = 0; n < count; n++) scrollUp();
+						break;
+					default:
+						break;
+				}
+				continue;
+			}
+			if (kind === "]" || kind === "_" || kind === "P") {
+				const bell = raw.indexOf("\x07", at);
+				const terminator = raw.indexOf("\x1b\\", at + 2);
+				const ends = [bell < 0 ? Number.POSITIVE_INFINITY : bell + 1, terminator < 0 ? Number.POSITIVE_INFINITY : terminator + 2];
+				const end = Math.min(...ends);
+				at = Number.isFinite(end) ? end : raw.length;
+				continue;
+			}
+			if (kind === "7") saved = [row, col];
+			if (kind === "8") [row, col] = saved;
+			at += 2;
+			continue;
+		}
+		if (char === "\r") col = 0;
+		else if (char === "\n") lineFeed();
+		if (char < " ") {
+			at++;
+			continue;
+		}
+		const stop = raw.slice(at).search(/[\x00-\x1f]/);
+		const text = stop < 0 ? raw.slice(at) : raw.slice(at, at + stop);
+		for (const { segment } of graphemes.segment(text)) put(segment);
+		at += text.length;
+	}
+	const rowText = (cells: string[]): string => cells.join("").replace(/\s+$/, "");
+	return { scrollback: scrollback.map(rowText), viewport: grid.map(rowText) };
+}
+
 /**
  * Whether the footer names the approved team's idle state, calm or resumable. The head must be exact: a live
  * widget's `≋ STORM · 다음 라운드 대기 …` also contains "대기" and must not pass for a restored idle footer.
@@ -117,9 +273,14 @@ async function readyForSubmission(tui: Tui): Promise<void> {
 	await tui.shows(SESSION_SEED);
 }
 
-async function session<T>(body: (tui: Tui, files: StormFiles) => Promise<T>, model = "fake/general-b", flags: string[] = []): Promise<T> {
+async function session<T>(
+	body: (tui: Tui, files: StormFiles) => Promise<T>,
+	model = "fake/general-b",
+	flags: string[] = [],
+	view: { columns: number; rows: number } | undefined = undefined,
+): Promise<T> {
 	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
-	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags], resume: ownedSession.id, sessionDir: ownedSession.dir });
+	const tui = new Tui(env, { model, flags: ["--motion", "full", ...flags], resume: ownedSession.id, sessionDir: ownedSession.dir, ...view });
 	try {
 		await readyForSubmission(tui);
 		return await body(tui, new StormFiles(env, tui.sessionId));
@@ -297,7 +458,7 @@ async function asciiDashboard(): Promise<void> {
 	writeFileSync(profile, `${original.trimEnd()}\nsymbolPreset: ascii\n`);
 	const columns = 60;
 	const resume = ownedSession;
-	const resultPrefix = `> report what ${TRACKED_FILE} line 1 says `;
+	const resultPrefix = `> report what ${FACT_FILE} line 1 says `;
 
 	/**
 	 * At 60 columns the result form intentionally owns the metrics row; the same run at 120 proves the ASCII round,
@@ -576,20 +737,21 @@ async function main(): Promise<void> {
 		240_000,
 	);
 
-	await suite.step("a substantial automatic run hands back three choices without starting another run", async () => {
+	await suite.step("a short clean automatic run leaves one factual line and registers no numbered choice", async () => {
 		const llm = new LlmCursor(env);
+		const columns = 60;
+		const viewRows = 40;
 		await session(async (tui, files) => {
 			const scope = { name: "scope", kind: "explore", goal: "Locate the first input boundary", results: [trackedAnswer("scope-answer")] };
 			const compare = { name: "compare", kind: "code", goal: "Compare the current evidence without changing files", results: [trackedAnswer("compare-answer")] };
 			const setPlan = (...lanes: Array<typeof scope & { progress?: string }>): Step => ({ storm: { action: "plan", plan: { lanes } } });
-			// The next direction must fit the brief's 240-character limit; a pure review gate is the compact authorized
-			// run that still proves the one-shot choice opens a real plan and spawns its worker.
-			const chosen = `E2E-NEXT E2E-STEPS ${b64([{ storm: { action: "plan", plan: { lanes: [{ name: "gate", kind: "review" }] } } }, { task: ["storm-reviewer"], as: "gate", say: "E2E-CHILD-VERDICT correct" }])}`;
+			// A typed brief on a clean run under ten minutes: the draft is kept on disk, but the record is one factual
+			// line. Neither the director's prose nor its directions become a card or a numbered offer.
 			const brief = {
 				result: "E2E-BRIEF-RESULT: the current comparison has one unresolved boundary.",
 				verification: "E2E-BRIEF-EVIDENCE: two local records were compared.",
 				remaining: "E2E-BRIEF-REMAINING: device latency was not measured.",
-				next: [chosen, "Compare the missing boundary offline", "Document the limits and stop"],
+				next: [runNext("E2E-NEXT compare the missing boundary offline"), userNext("Measure the device latency yourself")],
 			};
 			const steps: Step[] = [
 				setPlan(scope),
@@ -602,12 +764,50 @@ async function main(): Promise<void> {
 			const before = files.runIds();
 			const started = await tui.submit(`E2E-STEPS ${b64(steps)}`);
 			const run = await files.finishedRun(before, 60_000);
-			await tui.seen(started, text =>
-				text.includes("E2E-BRIEF-RESULT") && text.includes("E2E-BRIEF-REMAINING") && text.includes("Document the limits and stop")
-					? true : undefined,
-				"the settled closeout with all three next directions", 20_000);
-			const shown = tui.text(started);
-			check("automatic investigation reports the outcome once with option 1 recommended", shown.match(/E2E-BRIEF-RESULT/g)?.length === 1 && /추천[^\n]*E2E-NEXT/u.test(shown));
+			// The saved record is the source of the proof line: the resumed session also repaints earlier runs' records,
+			// and an earlier short clean run has its own one-line fact, so this run's row is found by this run's saved fact.
+			const sessionFile = sessionFileIn(ownedSession!.dir, ownedSession!.id);
+			const kept = await until(
+				() => (sessionFile === undefined ? [] : persistedStormRecords(sessionFile)).filter(entry => entry.details?.runId === run.runId).at(-1),
+				20_000,
+				"this run's saved settled record",
+			);
+			const fact = closeoutBody(kept.text)[0]?.replace(/^[-*]\s+/, "") ?? "";
+			// What a person sees, not the byte stream: the painted rows of the 60-column pty, replayed. The proof line is
+			// found by its own saved text, once the idle footer is back so nothing else is still being drawn.
+			// At 60 columns the fact fills the row and Storm's mark yields; wider, the row begins `Storm · `. Either is the same one row.
+			const PROOF = /(?:^|\s)완료 · 필수 결과 이행 · /u;
+			const ours = (row: string): boolean => fact !== "" && PROOF.test(row) && row.includes(fact);
+			const view = (): string[] => {
+				const painted = replayScreen(tui.raw.slice(started), columns, viewRows);
+				return [...painted.scrollback, ...painted.viewport];
+			};
+			await until(() => (view().some(ours) && idleFooter(view().findLast(row => row.includes(STORM_MARK) && row.includes("대기"))?.trim()) ? true : undefined), 20_000, "the settled record and the idle footer on the screen");
+			const screen = view();
+			const at = screen.findIndex(ours);
+			const record = screen[at] ?? "";
+			const around = [screen[at - 1], screen[at + 1]];
+			check(
+				"the proof line is exactly one painted row at 60 columns: it fits, once, with nothing wrapped or stacked around it",
+				screen.filter(ours).length === 1 && Bun.stringWidth(record) <= columns && /수용\s*2\/2/u.test(record) && around.every(row => row !== undefined && row.trim() === ""),
+				`width=${Bun.stringWidth(record)} fact=${fact} rows=${JSON.stringify(screen.slice(Math.max(0, at - 1), at + 3))}`,
+			);
+			check(
+				"the proof line has no frame, title bar or menu: no border character on its row or any row around it, and no card or director text anywhere on the screen",
+				!/[│╭╮╰╯─┃┌┐└┘|]/u.test(`${screen[at - 1] ?? ""}${record}${screen[at + 1] ?? ""}`) &&
+					screen.every(row => !(/[│╭╮╰╯┃|]/u.test(row) && /수용\s*\d|완료 ·|Storm 실행 결과/u.test(row))) &&
+					screen.every(row => !/E2E-BRIEF-(?:RESULT|EVIDENCE|REMAINING)/.test(row) && !row.includes("추천") && !row.includes(CLOSEOUT_CHOICE_HINT) && !row.includes(CLOSEOUT_DETAIL) && !row.includes("직접:")) &&
+					offeredDirections(screen.map(row => row.trim())).length === 0,
+				JSON.stringify(screen.slice(Math.max(0, at - 2), at + 3)),
+			);
+			// The saved fact is the proof line's body; the fake model never said it, so it cannot be an echo of model text.
+			check(
+				"the painted row is the saved record itself, drawn by Storm, not text the model said",
+				kept !== undefined && isOneLineCloseout(kept) && fact !== "" && record.includes(fact) &&
+					!mains(llm.all()).some(entry => entry.lastTool.includes(fact) || entry.lastUser.includes(fact)),
+				`row=${record} saved=${kept?.text ?? "no saved record"}`,
+			);
+			check("the typed draft is still kept on disk", JSON.stringify(run.closeout?.next ?? null) === JSON.stringify(brief.next), JSON.stringify(run.closeout ?? null));
 			check(
 				"updating progress preserves real completed coverage even though a changed goal was refused",
 				run.endReason === "verified" && run.turns === 1 && run.spawns.filter(spawn => spawn.outcome === "routed").length === 2 &&
@@ -616,21 +816,123 @@ async function main(): Promise<void> {
 			);
 			check("the director was told to leave an assigned goal alone", mains(llm.all()).some(entry => entry.lastTool.includes("계획 레인 'scope'") && entry.lastTool.includes("progress")));
 			check("briefing itself neither starts a run nor uses a classifier", files.runIds().size === before.size + 1 && llm.of("route").length === 0);
-			const withCompleted = files.runIds();
-			const selected = await tui.submit("1");
-			const next = await files.finishedRun(withCompleted, 60_000);
-			check("the chosen direction starts one new authorized Storm run", next.runId !== run.runId && next.task.startsWith("E2E-NEXT") && next.spawns.some(spawn => spawn.outcome === "routed"));
-			// The chosen run gets its own settled card; any ordinary text consumes it, and a later number is model input.
-			await tui.shows("다음으로 무엇을 할까요?", selected, 20_000);
+			// No menu was registered, so a bare number is ordinary model input and dispatches nothing.
 			const ordinary = new LlmCursor(env);
-			await tui.submit("a routine follow-up after the chosen run");
-			await until(() => mains(ordinary.all()).find(entry => entry.lastUser.includes("a routine follow-up after the chosen run")), 15_000, "ordinary text after the chosen run");
 			const after = files.runIds().size;
 			await tui.submit("1");
-			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 15_000, "an ordinary number after the one-shot card");
-			check("a number after the one-shot card is ordinary model input and starts no run", files.runIds().size === after);
-		});
+			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 15_000, "a number after a one-line record");
+			check("a number after the one-line record is ordinary model input and starts no run", files.runIds().size === after && ordinary.of("route").length === 0);
+		}, "fake/general-b", [], { columns, rows: viewRows });
 	}, 180_000);
+
+	await suite.step("an incomplete run keeps the whole card at 60 columns, and its first direction starts one related follow-up", async () => {
+		if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+		const resume = ownedSession;
+		const files = new StormFiles(env, resume.id);
+		requireApprovedTeam(files, "the 60-column closeout card");
+		const columns = 60;
+		const changed = join(env.project, CARD_FILE);
+		// The chosen direction is a typed `run` within the brief's task bound; inline JSON keeps it short. A review gate
+		// is the compact authorized run that still proves the choice opens a real plan and spawns its worker.
+		const chosen = `E2E-NEXT E2E-STEPS ${JSON.stringify([{ storm: { action: "plan", plan: { lanes: [{ name: "g", kind: "review" }] } } }, { task: ["storm-reviewer"], say: "E2E-CHILD-VERDICT correct" }])}`;
+		if (chosen.length > CLOSEOUT_NEXT_MAX) throw new Error(`the chosen direction exceeds the brief bound: ${chosen.length} > ${CLOSEOUT_NEXT_MAX}`);
+		const brief = {
+			result: "E2E-CARD-RESULT: the change was written; no reviewer judged it.",
+			verification: "E2E-CARD-EVIDENCE: only the child's own write was observed.",
+			remaining: "E2E-CARD-REMAINING: the change still needs one review.",
+			next: [runNext(chosen), userNext("E2E-CARD-USER keep or drop the change yourself")],
+		};
+		// The declared file change is accepted, but the run is still incomplete: no independent review was performed.
+		const steps: Step[] = [
+			{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code", results: [{ id: "card-change", kind: "change", criterion: `the implementer wrote ${CARD_FILE}`, path: CARD_FILE, contains: "storm child change" }] }] } } },
+			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-WRITE ${CARD_FILE}` },
+			{ storm: { action: "brief", brief } },
+		];
+		let card: RunRecord | undefined;
+		const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 40, resume: resume.id, sessionDir: resume.dir });
+		try {
+			await readyForSubmission(tui);
+			const before = files.runIds();
+			const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run", rounds: 2 })} E2E-STEPS ${b64(steps)}`);
+			card = await files.finishedRun(before, 150_000);
+			check("the accepted result does not certify an unreviewed run", card.status === "stopped" && card.endReason === "round-limit" && card.results?.some(row => row.id === "card-change" && row.state === "accepted") === true, `${card.status}/${card.endReason}`);
+			const shown = await tui.seen(started, text => {
+				const at = text.lastIndexOf(CLOSEOUT_HEADING);
+				const tail = at < 0 ? "" : text.slice(at);
+				return tail.includes(CLOSEOUT_DETAIL) && tail.includes("E2E-CARD-USER") ? tail : undefined;
+			}, "the whole closeout card at 60 columns", 30_000);
+			const rows = screenRows(shown);
+			const region = rows.slice(0, rows.findIndex(row => row.includes(CLOSEOUT_DETAIL)) + 1);
+			check("every card row fits 60 columns", region.length > 2 && cardRows(shown).every(row => Bun.stringWidth(row) <= columns), cardRows(shown).find(row => Bun.stringWidth(row) > columns) ?? `rows=${region.length}`);
+			check(
+				"the card distinguishes the accepted result from the unfinished run and the residual risk",
+				/수용\s*1\/1/u.test(shown) && region.some(row => row.includes("주의") && row.includes("검증되지 않은")),
+				region.join("\n"),
+			);
+			const sessionFile = sessionFileIn(resume.dir, resume.id);
+			const savedOf = (): StormRecord[] => (sessionFile === undefined ? [] : persistedStormRecords(sessionFile).filter(record => record.details?.runId === card!.runId));
+			const saved = await until(() => (savedOf().length > 0 ? savedOf() : undefined), 10_000, "the closeout in the session file").catch(() => savedOf());
+			check(
+				"the closed-out run is one saved message that carries the director's bounded text",
+				saved.length === 1 && saved[0]!.text.includes("E2E-CARD-RESULT") && saved[0]!.text.includes("E2E-CARD-REMAINING") && shown.includes("E2E-CARD-RESULT"),
+				`file=${sessionFile ?? "missing"} saved=${saved.length} ${saved.map(record => record.text.slice(0, 120)).join(" | ")}`,
+			);
+			check("verification prose moved to the status view", !shown.includes("E2E-CARD-EVIDENCE"), region.join("\n"));
+			const offers = numberedOffers(region);
+			check(
+				"the proposed run is offered first as the recommendation; the user-owned step is never numbered",
+				offers.length >= 1 && offers.length <= 3 && /^1\.\s*추천/u.test(offers[0] ?? "") && !offers.some(offer => offer.includes("E2E-CARD-USER")) && region.some(row => row.includes("직접:")),
+				region.join("\n"),
+			);
+			// Settling makes no model call of its own: nothing reaches the provider until the user types.
+			const quiet = new LlmCursor(env);
+			await Bun.sleep(1_500);
+			check("settling the run asked the model nothing more", quiet.all().length === 0, JSON.stringify(quiet.all().map(entry => [entry.who, entry.lastUser.slice(0, 80)])));
+
+			const picked = new LlmCursor(env);
+			const withCard = files.runIds();
+			await tui.submit("1");
+			const followUp = await files.finishedRun(withCard, 120_000);
+			check(
+				"the first direction starts one new authorized run that names its source and is not a resume",
+				followUp.task.startsWith("E2E-NEXT") && followUp.followUpOf === card.runId && followUp.resumeOf === undefined && followUp.spawns.some(spawn => spawn.outcome === "routed"),
+				`task=${followUp.task.slice(0, 40)} followUpOf=${followUp.followUpOf} resumeOf=${followUp.resumeOf}`,
+			);
+			check("the choice used no classifier side turn", picked.of("route").length === 0);
+			const handoff = mains(picked.all()).map(entry => entry.lastUser).find(user => user.includes(`<storm-run id="${followUp.runId}"`)) ?? "";
+			check(
+				"only that related handoff carries the earlier run's bounded final facts, without its verification prose",
+				handoff.split(card.runId).length === 2 && handoff.includes("E2E-CARD-RESULT") && !handoff.includes("E2E-CARD-EVIDENCE"),
+				handoff.slice(0, 1600),
+			);
+			cardRunId = card.runId;
+		} finally {
+			await tui.close();
+			rmSync(changed, { force: true });
+		}
+
+		// A restart draws the persisted record again (rich, or as its readable plain text) but restores no choice.
+		const again = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 40, resume: resume.id, sessionDir: resume.dir });
+		try {
+			await readyForSubmission(again);
+			const replay = await again.seen(0, text => text.split(CLOSEOUT_HEADING).findLast(part => {
+				const body = cardRows(part).join("\n");
+				return body.includes("감독 설명: E2E-CARD-RESULT") && body.includes(CLOSEOUT_DETAIL);
+			}), "the structured closeout card drawn again after a restart", 30_000);
+			check(
+				"after a restart the card is readable again within 60 columns",
+				cardRows(replay).some(row => row.includes("E2E-CARD-USER")) && cardRows(replay).every(row => Bun.stringWidth(row) <= columns),
+				screenRows(replay).slice(0, 16).join("\n"),
+			);
+			const runs = files.runIds().size;
+			const ordinary = new LlmCursor(env);
+			await again.submit("1");
+			await until(() => mains(ordinary.all()).find(entry => /(?:^|\n)1\s*$/.test(entry.lastUser)), 20_000, "a number after the restart");
+			check("a restart restores no numbered choice: the number is model input and starts no run", files.runIds().size === runs && ordinary.of("route").length === 0);
+		} finally {
+			await again.close();
+		}
+	}, 360_000);
 
 	await suite.step(
 		"a native ask pauses the run and its answer resumes it",
@@ -706,6 +1008,12 @@ async function main(): Promise<void> {
 				await until(answerArrived, 30_000, "the named answer to reach the director");
 				const run = await files.finishedRun(before, 150_000);
 				check("the answer resumed the same run", run.runId === live.runId && run.status !== "running", `${run.runId} vs ${live.runId} ${run.status}`);
+				const unrelated = mains(llm.all()).map(entry => entry.lastUser).find(user => user.includes(`<storm-run id="${run.runId}"`)) ?? "";
+				check(
+					"an unrelated new run's handoff carries no earlier run's final facts",
+					run.followUpOf === undefined && run.resumeOf === undefined && unrelated !== "" && !unrelated.includes("E2E-CARD-RESULT") && (cardRunId === undefined || !unrelated.includes(cardRunId)),
+					unrelated.slice(0, 800),
+				);
 				check("the answered run verifies its result after one round", run.endReason === "verified" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
 				await suite.eventually("the footer returns after the answered run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
 			});
@@ -777,9 +1085,14 @@ async function main(): Promise<void> {
 					const currentCheck = "e2e-verify-hold passed(0)";
 					check("verification in flight does not display this run's final evidence", !verifying.includes(currentCheck));
 					const run = await files.finishedRun(before, 240_000);
-					await tui.shows(currentCheck, started, 20_000);
-					const completed = tui.text(started).split("### Storm 실행 결과").at(-1) ?? "";
-					check("the fallback brief names the actual verified result and check", completed.includes("상태(공식): 완료") && completed.includes("e2e-verify-hold passed(0)"));
+					const completed = await tui.seen(started, text => text.split("\n").findLast(row => row.includes("Storm ·") && /수용\s*1\/1/u.test(row)),
+						"the settled record of the verified run", 20_000);
+					// Short and verified: one factual line. The check evidence is status detail (asserted on the overview below).
+					check(
+						"the verified run's record is one factual line without check receipts or a menu",
+						completed.includes(STATUS_DONE) && !completed.includes(currentCheck) && !completed.includes(CLOSEOUT_DETAIL) && offeredDirections(screenRows(completed)).length === 0,
+						completed.slice(0, 500),
+					);
 					await suite.eventually(
 						"the status line returns to idle after the run",
 						() => idleFooter(statusLine(tui.raw)),
@@ -817,6 +1130,7 @@ async function main(): Promise<void> {
 					const head = top.indexOf(heading);
 					check("the overview leads with the shared state and last run, without the team detail", head >= 0 && top.includes("마지막 실행") && !top.includes("역할별 모델"), top.slice(0, 300));
 					check("the budget amount and partially filled meter are visible together", top.includes("$0.01") && top.includes(run.runId) && /█+░+/.test(top));
+					check("the required check's evidence lives on the status overview", /e2e-verify-hold[^\n]*통과/u.test(top), top.slice(0, 1200));
 					const team = await tui.press("2", text => text.includes("팀 설정") && text.includes("승인됨"), "team tab with the approved configuration");
 					check("the team tab keeps the approved priority and roles", tui.text(team).includes(`우선순위 ${priorityLabel(files.config().priority)}`));
 					const overview = await tui.press("\x1b[D", text => text.includes("마지막 실행"), "Left to return to the overview");
@@ -845,7 +1159,8 @@ async function main(): Promise<void> {
 	await suite.step("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
 		await session(async (tui, files) => {
 			const before = files.runIds();
-			const steps: Step[] = [plan("scan", "explore"), { ask: ASK_FORM }, { awaitChild: true }];
+			// The fresh card is for substantive work; it must not pick a different older unfinished run.
+			const steps: Step[] = [plan("scan", "design"), { ask: ASK_FORM }, { awaitChild: true }];
 			const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 			await tui.seen(
 				started,
@@ -864,8 +1179,38 @@ async function main(): Promise<void> {
 				"the resumable footer after cancelling",
 				30_000,
 			);
+			// An interrupted run with no draft keeps the whole card, and its only numbered action is the code-written
+			// resume: nothing is invented to fill three slots.
+			const shown = await tui.seen(cancelled, text => {
+				const at = text.lastIndexOf(CLOSEOUT_HEADING);
+				const tail = at < 0 ? "" : text.slice(at);
+				return tail.includes(CLOSEOUT_DETAIL) ? tail : undefined;
+			}, "the interrupted run's closeout card", 30_000);
+			const rows = screenRows(shown);
+			const region = rows.slice(0, rows.findIndex(row => row.includes(CLOSEOUT_DETAIL)) + 1);
+			const offers = numberedOffers(region);
+			check(
+				"the interrupted card offers exactly one numbered action, the recorded resume",
+				offers.length === 1 && /^1\.\s*추천/u.test(offers[0] ?? "") && offers[0]!.includes("이어 가기") && !region.some(row => row.includes("감독 설명")),
+				region.join("\n"),
+			);
+			// Choosing it goes through the existing resume path: the recorded same-target candidate, revalidated at start.
+			const resumeLlm = new LlmCursor(env);
+			const withStopped = files.runIds();
+			await tui.submit("1");
+			const resumed = await until(() => files.runs().find(candidate => !withStopped.has(candidate.runId)), 20_000, "the chosen run to be recorded");
+			const handoff = await until(
+				() => mains(resumeLlm.all()).map(entry => entry.lastUser).find(user => user.includes(`<storm-run id="${resumed.runId}"`)),
+				20_000,
+				"the trusted resume handoff to reach the director",
+			);
+			check(
+				"the numbered resume continues the interrupted run's own request through the resume path",
+				resumed.resumeOf === run.runId && resumed.followUpOf === undefined && resumed.request === run.request && handoff.includes(run.runId) && resumeLlm.of("route").length === 0,
+				`resumeOf=${resumed.resumeOf} followUpOf=${resumed.followUpOf} request=${resumed.request === run.request} handoff=${handoff.slice(0, 400)}`,
+			);
 		});
-	}, 90_000);
+	}, 210_000);
 
 	await suite.step(
 		"shutdown while an ask waits ends the run and leaves it resumable",

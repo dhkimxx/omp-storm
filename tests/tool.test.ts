@@ -6,7 +6,7 @@ import { NEEDS_APPROVAL } from "../src/proposals/decide.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { runChange } from "../src/request/actions.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
-import { CLOSEOUT_NEXT_MAX, CLOSEOUT_TEXT_MAX, type CloseoutDraft } from "../src/runtime/closeout.ts";
+import { CLOSEOUT_NEXT_MAX, CLOSEOUT_RESULT_MAX, CLOSEOUT_TEXT_MAX, type CloseoutDraft } from "../src/runtime/closeout.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { RunRequestResult, StormToolHost } from "../src/tool/host.ts";
 import { createStormTool, runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
@@ -98,7 +98,7 @@ describe("tool definition", () => {
 	});
 
 	test("the schema accepts run fields but strips modes and unknown top-level fields", () => {
-		const draft = { result: "r", verification: "v", next: ["a", "b", "c"] };
+		const draft = { result: "r", verification: "v", next: [{ kind: "run", task: "a" }, { kind: "resume" }, { kind: "user", text: "c" }] };
 		const parsed = tool.parameters.parse({ action: "run", task: "t", plan: { lanes: [] }, brief: draft, mode: "loop", iterations: 3, minutes: 5, tokenBudget: 10 });
 		expect(Object.keys(parsed).sort()).toEqual(["action", "brief", "plan", "task"]);
 		expect(parsed).not.toHaveProperty("mode");
@@ -106,12 +106,15 @@ describe("tool definition", () => {
 		expect(parsed).not.toHaveProperty("while");
 		expect(tool.parameters.safeParse({ action: "run", task: "t", mode: "forever" }).success).toBe(true);
 
-		// brief.next is exactly three directions; plan lanes carry optional status progress.
+		// brief.next is 0-3 typed directions; plain strings are not accepted from the model.
 		expect(tool.parameters.safeParse({ action: "brief", brief: draft }).success).toBe(true);
-		for (const next of [["a", "b"], ["a", "b", "c", "d"]]) {
+		expect(tool.parameters.parse({ action: "brief", brief: { result: "r", verification: "v" } }).brief).toEqual({ result: "r", verification: "v", next: [] });
+		const four = [1, 2, 3, 4].map(i => ({ kind: "run", task: `t${i}` }));
+		for (const next of [["a", "b", "c"], four, [{ kind: "stop" }], [{ kind: "run", task: "a", extra: 1 }]]) {
 			expect(tool.parameters.safeParse({ action: "brief", brief: { result: "r", verification: "v", next } }).success).toBe(false);
 		}
-		expect(tool.parameters.safeParse({ action: "brief", brief: { result: "r", verification: "v" } }).success).toBe(false);
+		// Explicit undefined optional fields never reach the domain parser.
+		expect(tool.parameters.parse({ action: "brief", brief: { result: "r", verification: "v", next: [{ kind: "resume" }] } }).brief?.next).toEqual([{ kind: "resume" }]);
 		expect(tool.parameters.safeParse({ action: "plan", plan: { lanes: [{ name: "core", kind: "code", progress: "절반" }] } }).success).toBe(true);
 		// The schema caps match the domain parser, so an oversized label or brief fails before the action runs.
 		const lane = (field: "goal" | "progress" | "isolationReason", length: number) => ({
@@ -147,9 +150,11 @@ describe("tool definition", () => {
 		expect(tool.parameters.safeParse(withDeps([{ lane: "x".repeat(MAX_LANE_TEXT + 1), need: "result" }])).success).toBe(false);
 		const many = Array.from({ length: MAX_LANE_DEPENDENCIES + 1 }, (_, i) => ({ lane: `p${i}`, need: "reviewable" }));
 		expect(tool.parameters.safeParse(withDeps(many)).success).toBe(false);
-		const longBrief = { result: "x".repeat(CLOSEOUT_TEXT_MAX + 1), verification: "v", next: ["a", "b", "c"] };
+		const longBrief = { result: "x".repeat(CLOSEOUT_RESULT_MAX + 1), verification: "v" };
 		expect(tool.parameters.safeParse({ action: "brief", brief: longBrief }).success).toBe(false);
-		const longNext = { result: "r", verification: "v", next: ["a", "b", "x".repeat(CLOSEOUT_NEXT_MAX + 1)] };
+		const longCheck = { result: "r", verification: "x".repeat(CLOSEOUT_TEXT_MAX + 1) };
+		expect(tool.parameters.safeParse({ action: "brief", brief: longCheck }).success).toBe(false);
+		const longNext = { result: "r", verification: "v", next: [{ kind: "run", task: "x".repeat(CLOSEOUT_NEXT_MAX + 1) }] };
 		expect(tool.parameters.safeParse({ action: "brief", brief: longNext }).success).toBe(false);
 	});
 
@@ -482,13 +487,20 @@ describe("brief", () => {
 		};
 		return { f, host, staged };
 	}
-	const draft = { result: " 결과 ", verification: " 검증 ", remaining: " 남음 ", next: ["첫째", "둘째", "셋째"] as const };
+	const draft: CloseoutDraft = {
+		result: " 결과 ",
+		verification: " 검증 ",
+		remaining: " 남음 ",
+		next: [{ kind: "run", task: " 첫째 " }, { kind: "resume" }, { kind: "user", text: "셋째" }],
+	};
 
 	test("a valid brief is parsed and staged once, with no run, plan or approval", async () => {
 		const { f, host, staged } = briefHost();
 		const r = await run({ host }, { action: "brief", brief: draft });
 		expect(r.outcome).toBe("ok");
-		expect(staged).toEqual([{ result: "결과", verification: "검증", remaining: "남음", next: ["첫째", "둘째", "셋째"] }]);
+		expect(staged).toEqual([
+			{ result: "결과", verification: "검증", remaining: "남음", next: [{ kind: "run", task: "첫째" }, { kind: "resume" }, { kind: "user", text: "셋째" }] },
+		]);
 		expect(f.runs).toEqual([]);
 		expect(f.plans).toEqual([]);
 		expect(f.saved).toEqual([]);
@@ -500,13 +512,18 @@ describe("brief", () => {
 
 	test("a malformed brief is rejected before the host sees it", async () => {
 		const { host, staged } = briefHost();
-		const shortNext = { action: "brief", brief: { result: "결과", verification: "검증", next: ["a", "b"] } } as unknown as StormToolInput;
+		const untyped = { action: "brief", brief: { result: "결과", verification: "검증", next: ["a", "b", "c"] } } as unknown as StormToolInput;
+		const mixed = { action: "brief", brief: { result: "결과", verification: "검증", next: [{ kind: "user", task: "a" }] } } as unknown as StormToolInput;
+		const direction = (task: string) => ({ kind: "run" as const, task });
 		const bad: StormToolInput[] = [
 			{ action: "brief" },
-			shortNext,
-			{ action: "brief", brief: { result: " ", verification: "검증", next: ["a", "b", "c"] } },
-			{ action: "brief", brief: { result: "결과", verification: "검증", next: ["a", "a", "b"] } },
-			{ action: "brief", brief: { result: "결과\n둘째 줄", verification: "검증", next: ["a", "b", "c"] } },
+			untyped,
+			mixed,
+			{ action: "brief", brief: { result: " ", verification: "검증", next: [] } },
+			{ action: "brief", brief: { result: "결과", verification: "검증", next: [direction("a"), direction(" A ")] } },
+			{ action: "brief", brief: { result: "결과", verification: "검증", next: [{ kind: "resume" }, { kind: "resume" }] } },
+			{ action: "brief", brief: { result: "결과", verification: "검증", next: [direction("a"), direction("b"), direction("c"), direction("d")] } },
+			{ action: "brief", brief: { result: "결과\n둘째 줄", verification: "검증", next: [] } },
 		];
 		for (const params of bad) expect((await run({ host }, params)).outcome).toBe("rejected");
 		expect(staged).toEqual([]);

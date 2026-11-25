@@ -22,6 +22,7 @@ import { assertSessionStoreSafe } from "../session-scope.ts";
 import type { RunRequestResult } from "../tool/host.ts";
 import type {
 	AgentEntry,
+	CloseoutFacts,
 	PlanLaneResult,
 	ResultInputVersion,
 	RunCheckpoint,
@@ -60,16 +61,18 @@ import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.t
 import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
 import { runConfiguredJob, targetJobBlock } from "./job-executor.ts";
 import {
-	CLOSEOUT_CHOICE_HINT,
 	CLOSEOUT_TITLE,
-	closeoutCard,
+	closeoutBrief,
 	type CloseoutDraft,
+	closeoutHandoff,
 	closeoutSessionId,
+	closeoutTargetName,
 	isSubstantiveRun,
 	parseCloseout,
 	rememberCloseoutReport,
 	resetCloseoutChoices,
 } from "./closeout.ts";
+import { renderCloseout } from "../view/closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
 import {
 	captureCheckpointProof,
@@ -78,7 +81,17 @@ import {
 	revalidateCheckpointProof,
 } from "./checkpoint-import.ts";
 import { dependencyBlock, laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
-import { hasStaleInputs, inputSnapshot, requirementConflict, staleRequirementIds, currentInputVersion } from "./requirements.ts";
+import {
+	attemptInputsCurrent,
+	changedInputRequirements,
+	currentInputVersion,
+	declaredInputs,
+	type DeclaredInput,
+	hasStaleInputs,
+	inputSnapshot,
+	requirementConflict,
+	staleRequirementIdsForPlan,
+} from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
 import { reviewLine } from "./review.ts";
@@ -102,11 +115,12 @@ import {
 	type Gate,
 	type RoundDecision,
 } from "./rounds.ts";
-import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
+import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "./answer-review.ts";
+import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
-import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, RUN_KEEP, writeRun } from "./run.ts";
+import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
-import { noteResumePointer, protectedResumeRunIds, trustedResume, type ResumeTarget } from "./resume.ts";
+import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
@@ -191,6 +205,9 @@ export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 
 /** How much of the request a run record keeps. */
 const TASK_CHARS = 200;
+/** A follow-up reference that is not this session's own finished run on this target; nothing of it was read in. */
+const FOLLOW_UP_DECLINED =
+	"이전 실행을 이 세션과 이 작업 트리의 끝난 실행으로 확인하지 못해 후속 작업으로 시작하지 않았습니다. 요청을 새로 입력해 시작하세요.";
 
 /** Whether a turn ended because it was interrupted: omp closes it with an assistant message marked aborted. */
 export function turnAborted(messages: readonly unknown[] | undefined): boolean {
@@ -245,6 +262,12 @@ interface PreparedAttempt {
 	laneFiles?: readonly string[];
 	/** Producer result versions this attempt started from; absent when the lane declared no prerequisites. */
 	consumed?: readonly ResultInputVersion[];
+	/**
+	 * The logical inputs (producer result id + edge level) the plan declared for this lane when the attempt started.
+	 * A replan that swaps, adds, removes or re-levels an input supersedes the attempt even while every recorded producer
+	 * version is unchanged; a pure lane rename keeps it, because result ids locate the lane.
+	 */
+	declaredInputs: readonly DeclaredInput[];
 	/** Captured immediately before the attempt; absent for a legacy lane with no declared results. */
 	baseline?: ResultBaseline;
 }
@@ -259,6 +282,25 @@ interface SettledAttempt {
 	/** The lane declared a check and no approved report existed at settlement; one re-evaluation is owed. */
 	checkDeferred?: boolean;
 }
+
+/**
+ * The exact answer submission S1 judged for one row: its evidence item (answer text digest, anchor citation path and
+ * byte digest, content version), the verbatim answer text whose digest S1 judged, and when this run first held it. A
+ * reviewer verdict can settle a reviewable answer only when it scopes this exact submission's receipt and anchor, was
+ * given after `seenAt`, and the anchor bytes still match. It lives only for this run and is never restored: the answer
+ * text is not persisted, so a resumed run cannot hand the same submission to a reviewer and reopens it to its producer.
+ */
+interface AnswerSubject {
+	attemptId: string;
+	item: ResultEvidenceItem;
+	seenAt: number;
+	/** The submitted answer, kept only when its sha256 is exactly the digest S1 judged; the review packet quotes it. */
+	answer?: string;
+}
+
+/** At most this many scoped answer packets ride on one reviewer task or follow-up, and at most this many chars. */
+const ANSWER_PACKETS_MAX = 4;
+const ANSWER_PACKETS_CHARS = 24_000;
 
 /** One result reason is one compact record and closeout line: no newlines, no unbounded model or host text. */
 function compactResultReason(text: string): string {
@@ -424,6 +466,8 @@ interface OwnRun {
 	settled: Map<string, SettledAttempt>;
 	/** Revalidated lanes owe no new worker attempt unless their results are reopened. */
 	restoredLanes: Set<string>;
+	/** The answer submission each answer row currently stands on; see `AnswerSubject`. */
+	answerSubjects?: Map<string, AnswerSubject>;
 	/** Lanes whose settlement is being evaluated now; a consumer admission waits for these before reading rows. */
 	settling: Set<string>;
 	/** Aborts checks and other bounded work as soon as the run starts stopping. */
@@ -762,6 +806,21 @@ export class RunController {
 			if (continued !== undefined && !(await trustedResume(sessionDir, target, continued))) {
 				return refuse("이 세션과 이 작업 트리에서 시작한 실행만 이어갈 수 있습니다.");
 			}
+			// A fresh direction picked from a settled card may name its source for background only. The source must be a
+			// finished record of this session's own store that this machine started on this same target; a stale or
+			// foreign reference is declined rather than read into the handoff. Nothing of it is restored: no plan, row,
+			// receipt or exclusion. An automatic probe or a resume never carries one.
+			let followUp: RunRecord | undefined;
+			if (requested.followUpOf !== undefined) {
+				if (auto || requested.resumeOf !== undefined) return refuse(FOLLOW_UP_DECLINED);
+				const source = await readRun(sessionDir, requested.followUpOf).catch(() => undefined);
+				if (stale()) return gone();
+				if (source === undefined || source.status === "running") return refuse(FOLLOW_UP_DECLINED);
+				const trusted = await trustedResume(sessionDir, target, source).catch(() => false);
+				if (stale()) return gone();
+				if (!trusted) return refuse(FOLLOW_UP_DECLINED);
+				followUp = source;
+			}
 			const restoredPlan = continued?.plan === undefined ? undefined : normalizeCheckpointPlan(gate.config, continued.plan);
 			if (restoredPlan !== undefined && planNeedsWrite(restoredPlan)) {
 				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
@@ -831,6 +890,7 @@ export class RunController {
 				task: task.slice(0, TASK_CHARS),
 				request: task.slice(0, REQUEST_LIMIT),
 				...(requested.resumeOf !== undefined ? { resumeOf: requested.resumeOf } : {}),
+				...(followUp !== undefined ? { followUpOf: followUp.runId } : {}),
 				costUsd: 0,
 				costByModel: {},
 				...(config.budget ? { budget: config.budget } : {}),
@@ -901,8 +961,13 @@ export class RunController {
 								laneNames: plan?.lanes.filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name) ?? [],
 								...(plan === undefined ? { planUnavailable: true as const } : {}),
 							};
+					// The earlier run's final facts are history for an explicit resume or a chosen follow-up only; an
+					// unrelated task carries none.
+					const earlier = continued ?? followUp;
+					const history = earlier === undefined ? undefined : closeoutHandoff(earlier);
 					handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit,
-						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }) });
+						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }),
+						...(history === undefined || history === "" ? {} : { history: { text: history, ...(followUp !== undefined ? { followUp: true } : {}) } }) });
 				} catch (error) {
 					return refuse(`실행 계약을 만들지 못해 시작하지 않았습니다: ${errorText(error)}`);
 				}
@@ -1057,6 +1122,10 @@ export class RunController {
 		// actually reads, and never past a bounded window: a running producer still blocks.
 		await this.#awaitSettlements(own, needed, ADMISSION_SETTLE_WAIT_MS);
 		this.#syncResults(own);
+		// A consumer reads answers only at their recorded cited bytes: an edited or deleted source reopens that answer
+		// (and, transitively, what already consumed it) in the record before any readiness is reported.
+		await this.#revokeUnlocatedAccepted(own, true);
+		if (this.#own !== own) return view;
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const coverage = new Map((this.#planLanes(own, agents) ?? []).map(lane => [lane.name, lane.state === "done"]));
 		const sharedTeam = own.config.isolation !== "isolated";
@@ -1082,6 +1151,13 @@ export class RunController {
 						integrated = location.integrated;
 						retained = location.retained;
 					}
+				} else if (result.kind === "answer" && state === "reviewable" && row !== undefined) {
+					// A consumer that may start from a reviewable answer still starts only from the cited bytes S1 read.
+					const problem = await this.#answerReceiptProblem(own, row);
+					if (problem !== undefined) {
+						state = "unmet";
+						retainedReason = problem;
+					}
 				} else if (isolated && result.kind === "artifact" && state === "reviewable") {
 					// A reviewable isolated artifact is not a usable source: its submission has no accepted digest to read.
 					const evidence = row?.proof;
@@ -1090,7 +1166,7 @@ export class RunController {
 						? "보존된 산출물의 시도 근거를 확인하지 못했습니다."
 						: "보존된 산출물의 근거가 현재 계약과 다릅니다.";
 				}
-				const citation = row?.proof?.item.citation;
+				const citation = (row?.proof?.item ?? (row !== undefined && result.kind === "answer" ? this.#answerReceipt(own, row) : undefined))?.citation;
 				results.push({
 					id: result.id,
 					kind: result.kind,
@@ -1124,7 +1200,7 @@ export class RunController {
 	/**
 	 * One accepted result's current, usable location, re-read from S1 evidence rather than a status claim: an isolated
 	 * artifact only from its verified retained source, shared content from the current parent, and an answer from its
-	 * own recorded proof (which has no file location to lose). A review-accepted row has no attempt digest to
+	 * recorded anchor citation, whose bytes must still match what S1 judged (also for a review-accepted answer). A review-accepted row has no attempt digest to
 	 * re-locate; its bound current-tree verdict is the authority and `#refreshResultReviews` reopens it when the tree
 	 * moves. `isolated` is the planned lane's mode; a row whose lane left the plan infers it from the artifact evidence
 	 * S1 bound to the accepted attempt, never from a path or a claim.
@@ -1150,14 +1226,19 @@ export class RunController {
 			if (!source.ok) return source;
 			if (row.state === "reviewable") return { ok: true, integrated: true };
 		}
-		if (row.origin === "review") return { ok: true, integrated: false };
 		if (result.kind === "answer") {
-			if (row.restoredFrom !== undefined && row.proof !== undefined) {
+			// An answer has no tree location, but it does have the exact cited bytes S1 judged. A live, restored or
+			// review-accepted answer is usable only while that anchor still reads the same; a deleted or edited source
+			// is no longer proof for a consumer or for the final label.
+			if (row.restoredFrom !== undefined && row.proof !== undefined && row.origin !== "review") {
 				const source = await revalidateCheckpointProof({ row, result, root: own.root, isolated: false });
 				if (!source.ok) return source;
 			}
+			const problem = await this.#answerReceiptProblem(own, row);
+			if (problem !== undefined) return { ok: false, reason: problem };
 			return { ok: true, integrated: false };
 		}
+		if (row.origin === "review") return { ok: true, integrated: false };
 		const evidence = row.proof;
 		if (evidence === undefined || evidence.item.identity !== row.identity || evidence.item.attemptId !== row.attemptId) {
 			return { ok: false, reason: "수용 당시의 시도 근거를 확인하지 못했습니다." };
@@ -1289,6 +1370,7 @@ export class RunController {
 		const epoch = ++own.attemptSerial;
 		own.laneAttempt.set(lane.name, epoch);
 		const consumed = inputSnapshot(own.record.plan, lane, own.record.results);
+		const declared = declaredInputs(own.record.plan, lane);
 		own.attempts.set(input.dispatch, {
 			lane: lane.name,
 			spawnKey: input.spawnKey,
@@ -1300,6 +1382,7 @@ export class RunController {
 			artifactMode: input.artifactMode,
 			results: lane.results,
 			...(consumed.length === 0 ? {} : { consumed }),
+			declaredInputs: declared,
 			...(lane.files === undefined ? {} : { laneFiles: lane.files }),
 			baseline: capture.baseline,
 		});
@@ -1328,6 +1411,13 @@ export class RunController {
 				report.runId === input.runId &&
 				report.parentId === input.parentId &&
 				report.spawnKey === input.spawnKey;
+			// The plan replaced this attempt's logical inputs after it started (B@1 → C@1, an added/removed input or a
+			// changed level). Whatever the host says about it, its output answers the old contract: it can neither settle
+			// the new one nor leave an exhausted-route remedy that would block the rerun the replan asked for.
+			if (!this.#declaredInputsCurrent(own, prepared)) {
+				this.#applySupersededAttempt(own, prepared, exact ? report.attemptId : undefined);
+				return;
+			}
 			if (!exact || report.attemptId === undefined) {
 				this.#applyUnusableAttempt(own, prepared, report);
 				return;
@@ -1447,7 +1537,12 @@ export class RunController {
 				const identical = old != null && old.lane === lane.name && old.identity === row.identity;
 				const consumed = identical ? previousInputs(old) : false;
 				const forReview = result.kind === "change" && (old?.state === "reviewable" || old?.origin === "review");
-				if (identical && (old.state === "accepted" || (forReview && old.state === "reviewable")) && consumed !== false &&
+				// A reviewable or review-accepted answer cannot be rebound here: its verdict scoped a receipt of the previous
+				// run, and the verbatim answer a new review would need was never persisted. It reopens to its producer
+				// (the lane stays outside `restoredLanes` and reruns) instead of waiting on a review nobody can bind.
+				const answerReview = identical && result.kind === "answer" && (old.state === "reviewable" || old.origin === "review");
+				if (answerReview) row.reason = compactResultReason("이전 실행의 답변 리뷰 근거는 이어받지 않습니다. 생산 레인이 답변을 다시 제출해야 합니다.");
+				if (!answerReview && identical && (old.state === "accepted" || (forReview && old.state === "reviewable")) && consumed !== false &&
 					typeof old.attemptId === "string" && ATTEMPT_REF.test(old.attemptId) &&
 					typeof old.contentVersion === "string" && PROOF_DIGEST.test(old.contentVersion)) {
 					const valid = job === undefined
@@ -1490,7 +1585,16 @@ export class RunController {
 				});
 			}
 		}
-		this.#invalidateConsumers(own);
+		// The recorded producer ids already reject an added, removed or swapped input above; only the stored plan can
+		// reveal a level change under the same ids. It is untrusted input, so it seeds the transition only once it
+		// normalizes; otherwise the current declaration alone is checked.
+		let storedPlan: RunPlan | undefined;
+		try {
+			storedPlan = previous.plan === undefined ? undefined : normalizeCheckpointPlan(own.config, previous.plan);
+		} catch {
+			storedPlan = undefined;
+		}
+		this.#invalidateConsumers(own, storedPlan);
 		for (const lane of plan.lanes) {
 			const results = lane.results ?? [];
 			if (results.length > 0 && results.every(result => {
@@ -1512,7 +1616,7 @@ export class RunController {
 	 * never rewritten while the identity matches. A changed contract under the same id is a new requirement: its old
 	 * contract, attempt evidence and accepted proof are dropped, never inherited.
 	 */
-	#syncResults(own: OwnRun): boolean {
+	#syncResults(own: OwnRun, previousPlan?: RunPlan): boolean {
 		const rows = own.record.results ?? [];
 		const byId = new Map(rows.map(row => [row.id, row]));
 		const assigned = new Set<string>();
@@ -1605,13 +1709,130 @@ export class RunController {
 			else delete own.record.results;
 			this.#scheduleFlush(own);
 		}
-		// A plan change can leave an already-invalid consumer in the ledger (a legacy row, a removed producer). The
-		// rows are re-read after the plan edit, never assumed fresh.
-		if (this.#invalidateConsumers(own)) changed = true;
+		// A plan change can leave an already-invalid consumer in the ledger (a legacy row, a removed producer, or an
+		// input the replan swapped, added, removed or re-levelled). The rows are re-read after the plan edit, never
+		// assumed fresh, and the plan just replaced (when given) seeds the transition before any downstream is judged.
+		if (this.#invalidateConsumers(own, previousPlan)) changed = true;
 		return changed;
 	}
 
 	/** The current plan's declaration for one result id, wherever its lane now is. */
+	/**
+	 * The answer evidence a row currently stands on: the persisted accepted proof for exactly this content version, or
+	 * this run's recorded submission for the same attempt and version. Nothing is reconstructed from model text.
+	 */
+	#answerReceipt(own: OwnRun, row: RunResult): ResultEvidenceItem | undefined {
+		if (row.contentVersion === undefined || row.attemptId === undefined) return undefined;
+		const proof = row.proof?.item;
+		if (proof !== undefined && proof.kind === "answer" && proof.id === row.id && proof.attemptId === row.attemptId &&
+			proof.contentVersion === row.contentVersion) return proof;
+		const subject = own.answerSubjects?.get(row.id);
+		if (subject !== undefined && subject.attemptId === row.attemptId && subject.item.contentVersion === row.contentVersion) {
+			return subject.item;
+		}
+		return undefined;
+	}
+
+	/**
+	 * The exact review subject of a reviewable answer, or undefined when this run cannot hand that submission to a
+	 * reviewer: no recorded submission for this attempt and content version, no anchor citation, no verbatim answer text
+	 * or no issuable receipt. Without it no verdict can be bound, so the row goes back to its producer (`work`) instead
+	 * of a review that could never settle it.
+	 */
+	#answerReviewSubject(own: OwnRun, row: RunResult): (AnswerReviewSubject & { receipt: string; answer: string }) | undefined {
+		if (row.state !== "reviewable" || row.attemptId === undefined || row.contentVersion === undefined) return undefined;
+		if ((this.#plannedResult(own, row.id) ?? row.contract)?.kind !== "answer") return undefined;
+		const subject = own.answerSubjects?.get(row.id);
+		if (subject === undefined || subject.item.state !== "reviewable" || subject.attemptId !== row.attemptId ||
+			subject.item.contentVersion !== row.contentVersion || subject.answer === undefined) return undefined;
+		const citation = subject.item.citation;
+		if (citation === undefined || citation.digest === undefined) return undefined;
+		const scoped: AnswerReviewSubject = {
+			runId: own.record.runId,
+			resultId: row.id,
+			attemptId: subject.attemptId,
+			contentVersion: row.contentVersion,
+			citation: { path: citation.path, ...(citation.line === undefined ? {} : { line: citation.line }) },
+			seenAt: subject.seenAt,
+		};
+		const receipt = answerReviewReceipt(scoped);
+		return receipt === undefined ? undefined : { ...scoped, receipt, answer: subject.answer };
+	}
+
+	/**
+	 * The bounded review packets for the reviewable answers this run can currently bind a verdict to: each quotes the
+	 * answer exactly as submitted and names its receipt and anchor. It rides only on the approved reviewer's own task or
+	 * follow-up (per-task context, never a system prompt), is Storm's input rather than a verdict, and proves nothing:
+	 * only the reviewer's final yield entry for that receipt, re-checked against the cited bytes, settles the answer.
+	 */
+	answerReviewPackets(): string | undefined {
+		const own = this.#own;
+		if (own === undefined) return undefined;
+		const rows = own.record.results ?? [];
+		const packets: string[] = [];
+		const skipped: string[] = [];
+		let chars = 0;
+		for (const row of rows) {
+			if (row.scope === "excluded-by-user" || hasStaleInputs(row, rows)) continue;
+			const subject = this.#answerReviewSubject(own, row);
+			if (subject === undefined) continue;
+			const criterion = (this.#plannedResult(own, row.id) ?? row.contract)?.criterion ?? row.id;
+			const packet = answerReviewPacket({ resultId: row.id, criterion, answer: subject.answer, receipt: subject.receipt, citation: subject.citation });
+			if (packets.length >= ANSWER_PACKETS_MAX || chars + packet.length > ANSWER_PACKETS_CHARS) {
+				skipped.push(row.id);
+				continue;
+			}
+			packets.push(packet);
+			chars += packet.length;
+		}
+		if (packets.length === 0) return undefined;
+		const tail = skipped.length === 0 ? [] : [`(Not in this packet; review them in a later turn: ${skipped.slice(0, 8).join(", ")}.)`];
+		return ["[storm:answer-review] Storm's scoped answer review input (not a verdict).", ...packets, ...tail].join("\n\n");
+	}
+
+	/** Why an answer row's recorded anchor no longer holds now, or undefined when its cited bytes still match. */
+	async #answerReceiptProblem(own: OwnRun, row: RunResult): Promise<string | undefined> {
+		// A result declared by an approved job lane is proven by the host's native job receipt, never by a citation; it
+		// is judged only there (fail closed) and never falls through to the citation path, nor the other way around.
+		const jobProblem = this.#jobAnswerProblem(own, row);
+		if (jobProblem !== false) return jobProblem;
+		const receipt = this.#answerReceipt(own, row);
+		if (receipt === undefined) return "답변이 근거로 삼은 출처 기록이 없어 현재 근거로 다시 확인할 수 없습니다.";
+		const check = await verifyAnswerReceipt({ root: own.root, receipt, expectedVersion: row.contentVersion });
+		return check.ok ? undefined : check.reason;
+	}
+
+	/**
+	 * For an answer declared by an approved job lane of the current plan: why its acceptance is no longer backed by the
+	 * host's own job receipt, or undefined when it still is. `false` means the row is not a job answer (its proof is a
+	 * citation). The row must map to exactly the run's current receipt for that lane and job: the same attempt (issued by
+	 * this run's `executeJobs`, or carried by a validated checkpoint import), the current approved definition, a clean
+	 * passed exit with no fence, and an observed stdout digest equal to the row's content version under the current
+	 * contract. A missing, mismatched, superseded or uncertain receipt reopens the row; nothing is re-run here.
+	 */
+	#jobAnswerProblem(own: OwnRun, row: RunResult): string | undefined | false {
+		const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(result => result.id === row.id));
+		if (lane?.job === undefined) return false;
+		const result = lane.results?.find(candidate => candidate.id === row.id);
+		const missing = "정형 작업의 실행 기록과 결과를 대조할 수 없어 현재 근거로 다시 확인할 수 없습니다.";
+		if (result === undefined || result.kind !== "answer" || result.contains === undefined ||
+			row.identity !== resultContractIdentity(result) || row.attemptId === undefined || !ATTEMPT_REF.test(row.attemptId) ||
+			row.contentVersion === undefined || !PROOF_DIGEST.test(row.contentVersion)) return missing;
+		// A live row was bound by this run's own executeJobs; only a row a checkpoint import validated may carry an
+		// attempt issued by an earlier run.
+		if (row.restoredFrom === undefined && !row.attemptId.startsWith(`job:${own.record.runId}:`)) return missing;
+		const job = own.config.jobs?.find(candidate => candidate.name === lane.job);
+		const receipt = historicalJob(own.record, lane.job);
+		if (job === undefined || receipt === undefined) return missing;
+		if (receipt.lane !== lane.name || (row.lane !== undefined && row.lane !== lane.name) || receipt.attemptId !== row.attemptId ||
+			receipt.jobSha256 !== jobDigest(job)) return missing;
+		if (receipt.status !== "passed" || receipt.exitCode !== 0 || receipt.fence !== undefined) {
+			return "정형 작업의 현재 실행 기록이 성공 종료를 보여주지 않습니다.";
+		}
+		if (receipt.stdoutSha256 !== row.contentVersion) return "정형 작업의 관측된 출력이 수용된 결과와 다릅니다.";
+		return undefined;
+	}
+
 	#plannedResult(own: OwnRun, id: string): PlanLaneResult | undefined {
 		for (const lane of own.record.plan?.lanes ?? []) {
 			const found = lane.results?.find(result => result.id === id);
@@ -1620,8 +1841,17 @@ export class RunController {
 		return undefined;
 	}
 
-	/** Whether a prepared attempt's declared producer versions changed after it started. */
+	/**
+	 * Whether the plan still declares, for every result this attempt can produce, exactly the logical inputs it started
+	 * under. Result ids locate the owning lane, so a pure rename of the producer or consumer lane keeps the attempt.
+	 */
+	#declaredInputsCurrent(own: OwnRun, prepared: PreparedAttempt): boolean {
+		return attemptInputsCurrent(own.record.plan, prepared.results.map(result => result.id), prepared.declaredInputs);
+	}
+
+	/** Whether a prepared attempt's declared inputs or producer versions changed after it started. */
 	#staleInputs(own: OwnRun, prepared: PreparedAttempt): boolean {
+		if (!this.#declaredInputsCurrent(own, prepared)) return true;
 		if ((prepared.consumed ?? []).length === 0) return false;
 		const byId = new Map((own.record.results ?? []).map(row => [row.id, row]));
 		return (prepared.consumed ?? []).some(input => currentInputVersion(byId.get(input.id)) !== input.version);
@@ -1641,6 +1871,31 @@ export class RunController {
 	 * recorded, but the row is unmet and every consumer of it is reopened transitively.
 	 */
 	#applyStaleInput(own: OwnRun, prepared: PreparedAttempt, attemptId: string): void {
+		this.#recordUnusableInputs(own, prepared, attemptId, "선행 결과가 시도 시작 뒤에 바뀌어 이 시도의 결과를 수용하지 않았습니다.", false);
+	}
+
+	/**
+	 * A settlement of an attempt whose declared inputs the plan has since replaced. The requirement now consumes other
+	 * inputs, so this output is recorded as unmet (an exact host attempt id is still a fact worth showing) and never
+	 * evaluated, accepted, or turned into a retry remedy.
+	 */
+	#applySupersededAttempt(own: OwnRun, prepared: PreparedAttempt, attemptId: string | undefined): void {
+		// Without an exact host attempt there is no fact to record: the replan already reopened any evidence that stood
+		// on the old declaration, and a pending or unmet row keeps what it says.
+		if (attemptId === undefined) {
+			if (this.#invalidateConsumers(own)) this.#scheduleFlush(own);
+			return;
+		}
+		this.#recordUnusableInputs(own, prepared, attemptId, "계획의 선행 입력이 시도 시작 뒤에 바뀌어 이 시도의 결과를 수용하지 않았습니다.", true);
+	}
+
+	#recordUnusableInputs(
+		own: OwnRun,
+		prepared: PreparedAttempt,
+		attemptId: string,
+		why: string,
+		superseded: boolean,
+	): void {
 		const rows = own.record.results ?? [];
 		let changed = false;
 		for (const result of prepared.results) {
@@ -1648,8 +1903,12 @@ export class RunController {
 			if (row === undefined) continue;
 			const identity = resultContractIdentity(result);
 			if (row.identity !== undefined && row.identity !== identity) continue;
+			// Evidence another attempt earned under the new declaration (for example under a renamed lane that the
+			// per-lane epoch cannot fence) is judged by its own recorded inputs; a superseded attempt never downgrades it.
+			if (superseded && (row.state === "accepted" || row.state === "reviewable") && row.attemptId !== undefined &&
+				row.attemptId !== attemptId) continue;
 			row.state = "unmet";
-			row.reason = compactResultReason("선행 결과가 시도 시작 뒤에 바뀌어 이 시도의 결과를 수용하지 않았습니다.");
+			row.reason = compactResultReason(why);
 			delete row.remedy;
 			delete row.retryRoute;
 			delete row.unblock;
@@ -1668,22 +1927,39 @@ export class RunController {
 	}
 
 	/**
-	 * Reopens rows whose recorded producer versions no longer describe the ledger. Only accepted/reviewable evidence is
-	 * touched: a pending row invents nothing and an already-unmet row stays as it is. The pass is transitive because a
-	 * reopened row is no longer a usable input.
+	 * Reopens rows whose evidence no longer stands on what the plan and ledger say now: a recorded producer version that
+	 * changed, a recorded producer set that differs from the logical inputs the current plan declares for the
+	 * requirement (by result id, so a pure lane rename keeps it), a declared level the producer no longer meets, and —
+	 * when `previousPlan` is the plan just replaced — an input set or level that changed in that transition. Only
+	 * accepted/reviewable evidence is touched: a pending row invents nothing and an already-unmet row stays as it is.
+	 * The pass is transitive because a reopened row is no longer a usable input.
 	 */
-	#invalidateConsumers(own: OwnRun): boolean {
+	#invalidateConsumers(own: OwnRun, previousPlan?: RunPlan): boolean {
 		const rows = own.record.results ?? [];
 		if (rows.length === 0) return false;
-		const stale = staleRequirementIds(rows);
+		const stale = staleRequirementIdsForPlan(rows, own.record.plan, previousPlan);
 		if (stale.size === 0) return false;
+		const replanned = own.record.plan === undefined || previousPlan === undefined
+			? new Set<string>()
+			: changedInputRequirements(previousPlan, own.record.plan);
 		let changed = false;
 		for (const row of rows) {
 			if (!stale.has(row.id)) continue;
+			// An exhausted native retry was a fact about the old inputs: the route fingerprint has no inputs in it, so
+			// left in place it would refuse the very rerun a changed input declaration owes.
+			if (replanned.has(row.id) && row.state === "unmet" && row.remedy === "retry") {
+				delete row.remedy;
+				delete row.retryRoute;
+				row.reason = compactResultReason("계획에서 이 결과의 선행 입력이 바뀌어 새 입력으로 다시 수행해야 합니다.");
+				changed = true;
+				continue;
+			}
 			if (row.state !== "accepted" && row.state !== "reviewable") continue;
 			row.state = "unmet";
 			row.origin = "plan";
-			row.reason = compactResultReason("입력으로 쓴 선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다.");
+			row.reason = compactResultReason(replanned.has(row.id)
+				? "계획에서 이 결과의 선행 입력이 바뀌어 새 입력으로 다시 수행해야 합니다."
+				: "입력으로 쓴 선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다.");
 			delete row.remedy;
 			delete row.retryRoute;
 			delete row.unblock;
@@ -1933,6 +2209,32 @@ export class RunController {
 			if (proof !== undefined) row.proof = proof;
 			else delete row.proof;
 			delete row.restoredFrom;
+			if (item.kind === "answer") this.#noteAnswerSubject(own, row, item, settled.reportText);
+		}
+	}
+
+	/**
+	 * Records the exact answer submission a row now stands on, or forgets it when the row holds no usable submission.
+	 * A reviewable answer is told what the reviewer must see: the answer as submitted and its anchor citation, judged
+	 * against the current bytes. No acceptance is granted here.
+	 */
+	#noteAnswerSubject(own: OwnRun, row: RunResult, item: ResultEvidenceItem, answer: string | undefined): void {
+		const subjects = (own.answerSubjects ??= new Map<string, AnswerSubject>());
+		const usable = (item.state === "accepted" || item.state === "reviewable") && row.state === item.state &&
+			row.attemptId !== undefined && item.contentVersion !== undefined && row.contentVersion === item.contentVersion &&
+			item.citation?.digest !== undefined;
+		if (!usable) {
+			subjects.delete(row.id);
+			return;
+		}
+		// The packet quotes exactly the text S1 judged; any other text (or none) leaves the submission unreviewable.
+		const verbatim = typeof answer === "string" && item.digest !== undefined &&
+			createHash("sha256").update(answer).digest("hex") === item.digest ? answer : undefined;
+		subjects.set(row.id, { attemptId: row.attemptId as string, item, seenAt: this.deps.now(), ...(verbatim === undefined ? {} : { answer: verbatim }) });
+		const citation = item.citation;
+		if (row.state === "reviewable" && citation !== undefined) {
+			const anchor = `${citation.path}${citation.line === undefined ? "" : `:${citation.line}`}`;
+			row.reason = compactResultReason(`답변 원문과 출처 ${anchor}를 리뷰어에게 그대로 전달해 판정받으세요.`);
 		}
 	}
 
@@ -1985,6 +2287,10 @@ export class RunController {
 			if (row.state === "accepted" && row.origin !== "review") continue;
 			// A reviewer on the current tree is not proof that a result built from replaced inputs is still correct.
 			if (hasStaleInputs(row, rows)) continue;
+			const planned = this.#plannedResult(own, row.id);
+			// An answer is never bound to, settled by or reopened from a tree: its verdict scopes its exact submission
+			// (`#refreshAnswerReviews`) and its cited bytes are re-read by `#revokeUnlocatedAccepted`.
+			if ((planned ?? row.contract)?.kind === "answer") continue;
 			// A review state was bound to an older tree: the submission itself is still there, so reopen it for judgement.
 			if (row.origin === "review" && row.reviewTree !== treeNow) {
 				row.state = "reviewable";
@@ -1997,9 +2303,8 @@ export class RunController {
 				changed = true;
 			}
 			if (treeNow === undefined) continue;
-			// A tree verdict judges only what the reviewer can actually see in the integrated tree. An answer's wording
-			// and an isolated artifact's content are not in it, so those rows stay reviewable instead of borrowing proof.
-			const planned = this.#plannedResult(own, row.id);
+			// A tree verdict judges only what the reviewer can actually see in the integrated tree. An isolated
+			// artifact's content is not in it, so that row never borrows it here.
 			if (planned?.kind !== "change") continue;
 			if (proof.state === "current") {
 				if (row.state !== "accepted" || row.origin !== "review" || row.reviewTree !== treeNow) {
@@ -2026,6 +2331,53 @@ export class RunController {
 		if (this.#invalidateConsumers(own)) changed = true;
 		if (changed) this.#scheduleFlush(own);
 		return changed;
+	}
+
+	/**
+	 * Settles a reviewable answer only with the approved reviewer's final verdict that explicitly scopes it: an entry
+	 * naming this result id with the receipt Storm issued for this exact run, attempt and content version (answer digest
+	 * plus anchor path, line and bytes) and this anchor, given after this run first held the submission
+	 * (`answerReviewVerdict`). A generic change/tree verdict, another answer's entry, an outdated receipt or an older
+	 * verdict settles nothing. The anchor bytes are re-read immediately before a verdict applies; a moved source is the
+	 * revocation pass's to reopen. No `reviewTree` is recorded: a later tree move does not reopen an answer, a changed
+	 * cited source does.
+	 */
+	async #refreshAnswerReviews(own: OwnRun, agents: readonly AgentEntry[]): Promise<boolean> {
+		const rows = own.record.results ?? [];
+		const subjects = own.answerSubjects;
+		if (rows.length === 0 || subjects === undefined || subjects.size === 0) return false;
+		let changed = false;
+		for (const row of rows) {
+			if (row.state !== "reviewable" || row.scope === "excluded-by-user") continue;
+			if (hasStaleInputs(row, rows)) continue;
+			const subject = this.#answerReviewSubject(own, row);
+			if (subject === undefined) continue;
+			const verdict = answerReviewVerdict(agents, own.config, subject);
+			if (verdict.state === "none") continue;
+			const item = subjects.get(row.id)?.item;
+			if (item === undefined) continue;
+			const check = await verifyAnswerReceipt({ root: own.root, receipt: item, expectedVersion: subject.contentVersion });
+			if (this.#own !== own) return changed;
+			// The row may have moved during the read; a moved anchor is the revocation pass's to reopen, never judged here.
+			if (!check.ok || row.state !== "reviewable" || row.attemptId !== subject.attemptId || row.contentVersion !== subject.contentVersion) continue;
+			row.origin = "review";
+			delete row.reviewTree;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			if (verdict.state === "correct") {
+				row.state = "accepted";
+				delete row.reason;
+			} else {
+				row.state = "unmet";
+				row.reason = compactResultReason("독립 리뷰가 이 답변을 incorrect로 판정했습니다.");
+			}
+			changed = true;
+		}
+		if (!changed) return false;
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+		return true;
 	}
 
 	/** Changes this session's run record and schedules its live rewrite; a no-op without a run. */
@@ -2405,11 +2757,13 @@ export class RunController {
 		if (!setLedgerPlan(own.record.runId, plan)) {
 			return { ok: false, reason: "실행이 끝나는 중이라 계획을 적용하지 않았습니다." };
 		}
+		const previousPlan = own.record.plan;
 		own.record.plan = plan;
 		own.planRevision += 1;
 		// Required results are obligations, not plan text: adding a lane seeds pending rows, and a removed lane keeps
-		// every requirement it still owed.
-		this.#syncResults(own);
+		// every requirement it still owed. A requirement whose logical inputs changed (B@1 → C@1, an added/removed
+		// input, a different level) reopens with everything that consumed it; a pure lane rename reopens nothing.
+		this.#syncResults(own, previousPlan);
 		for (const lane of plan.lanes) {
 			if (lane.job === undefined || historicalJob(own.record, lane.job)?.status !== "unknown") continue;
 			for (const row of own.record.results ?? []) if (row.lane === lane.name) blockedJobRow(row, UNCERTAIN_JOB);
@@ -2473,7 +2827,7 @@ export class RunController {
 		// A user intervention is a new external fact for the round witness: clear only the progress baseline, never a
 		// round counter, role, budget or approval. It does not reset the run or authorize any new scope.
 		delete own.progress;
-		this.#syncResults(own);
+		this.#syncResults(own, plan);
 		this.#recordAdjustment(own, "exclude", target);
 		this.#scheduleFlush(own);
 		try {
@@ -2689,7 +3043,7 @@ export class RunController {
 		if (parsed === undefined) {
 			return {
 				ok: false,
-				reason: "결과 브리프가 올바르지 않습니다. 결과·검증은 비어 있지 않은 한 줄, next는 서로 다른 세 방향이어야 합니다.",
+				reason: "결과 브리프가 올바르지 않습니다. 결과·검증은 비어 있지 않은 한 줄, next는 서로 다른 0~3개 방향(resume, run, user)이어야 합니다.",
 			};
 		}
 		own.closeout = parsed;
@@ -2840,6 +3194,7 @@ export class RunController {
 		// reads rows: a reviewable submission becomes accepted here, never by the round rules guessing.
 		await this.#refreshCheckedResults(own);
 		this.#refreshResultReviews(own, agents, now?.state);
+		await this.#refreshAnswerReviews(own, agents);
 		const currentTree = {
 			...(tree.start !== undefined ? { start: tree.start } : {}),
 			...(now !== undefined ? { now: now.state } : {}),
@@ -3040,6 +3395,9 @@ export class RunController {
 			// A requirement whose lane left the plan is still owed, but nothing in the team can run or review it. Name
 			// the one action that can clear it instead of the old lane's work or a review the planned tree cannot bind.
 			const orphan = row.state !== "accepted" && row.lane === undefined && result === undefined;
+			// A reviewable answer names the receipt and anchor of its exact submission. Without them no verdict can be
+			// bound, and the round sends it back to its producer instead of to a review that could never settle it.
+			const answerReview = row.state === "reviewable" && !orphan && result?.kind === "answer" ? this.#answerReviewSubject(own, row) : undefined;
 			out.push({
 				id: row.id,
 				state: row.state,
@@ -3054,7 +3412,10 @@ export class RunController {
 						? blockedBy === undefined ? {} : { remedy: "producer" as const }
 						: { remedy: row.remedy }),
 				...(row.unblock === undefined ? {} : { unblock: row.unblock }),
-				...(row.state === "reviewable" && (orphan || (result !== undefined && result.kind !== "change")) ? { judgeable: false } : {}),
+				...(row.state === "reviewable" && (orphan || (result !== undefined && result.kind !== "change" && result.kind !== "answer"))
+					? { judgeable: false }
+					: {}),
+				...(answerReview === undefined ? {} : { review: { receipt: answerReview.receipt, citation: answerReviewAnchor(answerReview.citation) } }),
 				...(evidence === undefined || evidence === "" ? {} : { evidence }),
 			});
 		}
@@ -3342,8 +3703,11 @@ export class RunController {
 		}
 		const task = (async () => {
 			let finalReason = own.ending ?? reason;
+			// What each row held before the drain recheck re-reads anything: a result that recheck reopens (an edited
+			// answer source, a reverted change) is still marked revoked in the final record.
+			const held = this.#heldStates(own);
 			if (finalReason === "verified" && own.drained === true) finalReason = await this.#recheckVerified(own);
-			return this.#finalize(own, finalReason, own.finishCtx);
+			return this.#finalize(own, finalReason, own.finishCtx, held);
 		})();
 		this.#finishing = task;
 		try {
@@ -3391,8 +3755,9 @@ export class RunController {
 		if (this.#own !== own) return undefined;
 		const task = (async () => {
 			let finalReason = own.ending ?? "no-progress";
+			const held = this.#heldStates(own);
 			if (finalReason === "verified" && own.drained === true) finalReason = await this.#recheckVerified(own);
-			return this.#finalize(own, finalReason, own.finishCtx);
+			return this.#finalize(own, finalReason, own.finishCtx, held);
 		})();
 		this.#finishing = task;
 		try {
@@ -3413,6 +3778,7 @@ export class RunController {
 		const planLanes = this.#planLanes(own, agents);
 		await this.#refreshCheckedResults(own);
 		this.#refreshResultReviews(own, agents, now?.state);
+		await this.#refreshAnswerReviews(own, agents);
 		const coverage = this.#coverage(own, now?.state, planLanes);
 		const gate = reviewGate(
 			agents,
@@ -3495,8 +3861,9 @@ export class RunController {
 	 * Re-reads every accepted row at its current source before the final record is written. A reverted shared change or
 	 * a vanished retained artifact reopens that row and, transitively, the rows that consumed its version; an
 	 * independent accepted row stays. The contract comes from the plan in force, else from the bounded copy the row
-	 * persisted, so a lane removed after acceptance cannot hide its proof. An answer has no patch to miss. A
-	 * review-accepted row's digest is its bound tree: a current tree that no longer matches reopens the submission for
+	 * persisted, so a lane removed after acceptance cannot hide its proof. An answer (accepted, review-accepted or a
+	 * reviewable submission with a recorded anchor) is re-read at its cited bytes on every pass, live or restored. A
+	 * review-accepted change's digest is its bound tree: a current tree that no longer matches reopens the submission for
 	 * judgement instead of carrying the old verdict into the record.
 	 */
 	async #revokeUnlocatedAccepted(own: OwnRun, restoredOnly = false): Promise<void> {
@@ -3511,35 +3878,53 @@ export class RunController {
 			return treeNow;
 		};
 		for (const row of own.record.results ?? []) {
-			if (restoredOnly && row.restoredFrom === undefined) continue;
-			if (row.state !== "accepted" && !(row.state === "reviewable" && row.restoredFrom !== undefined)) continue;
+			if (row.state !== "accepted" && row.state !== "reviewable") continue;
 			const planned = this.#plannedResult(own, row.id) ?? row.contract;
+			// An answer's receipt is always re-read (live, restored or review-accepted): its only location is the cited
+			// bytes, and a source edited or deleted after acceptance must reopen it and what consumed its version.
+			const answer = planned?.kind === "answer";
+			if (restoredOnly && row.restoredFrom === undefined && !answer) continue;
+			if (row.state !== "accepted" && !(row.state === "reviewable" && (row.restoredFrom !== undefined || answer))) continue;
 			// A legacy row that never recorded its contract is not reconstructed from plan text; there is no safe
 			// historical source to re-locate it against and no new evidence is invented here.
 			if (planned === undefined) continue;
-			if (row.origin === "review") {
+			// A review-accepted answer is bound to its submission and cited bytes, never to a tree: it goes straight to
+			// the receipt re-read below.
+			if (row.origin === "review" && !answer) {
 				const tree = await currentTree();
 				// Without a current reading the gate cannot have an honest verified label; leave the row to it rather
 				// than guessing that an unread tree matches.
-				if (tree === undefined || row.reviewTree === tree) continue;
-				row.state = "reviewable";
-				row.origin = "attempt";
-				row.reason = compactResultReason("리뷰 이후 트리가 바뀌어 새 판단이 필요합니다.");
-				delete row.reviewTree;
-				delete row.remedy;
-				delete row.retryRoute;
-				delete row.unblock;
-				changed = true;
-				if (row.restoredFrom === undefined) continue;
+				const moved = tree !== undefined && row.reviewTree !== tree;
+				if (moved) {
+					row.state = "reviewable";
+					row.origin = "attempt";
+					row.reason = compactResultReason("리뷰 이후 트리가 바뀌어 새 판단이 필요합니다.");
+					delete row.reviewTree;
+					delete row.remedy;
+					delete row.retryRoute;
+					delete row.unblock;
+					changed = true;
+				}
+				if (!moved || row.restoredFrom === undefined) continue;
 			}
-			if (planned.kind === "answer" && (row.restoredFrom === undefined || row.proof === undefined)) continue;
-			const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(result => result.id === row.id));
-			const isolated = lane === undefined ? undefined : lane.isolationReason !== undefined || own.config.isolation === "isolated";
-			const location = await this.#acceptedLocation(own, planned, isolated, row);
+			let location: AcceptedLocation;
+			if (answer && row.state === "reviewable") {
+				// A submission with no recorded anchor was never judgeable; it stays as it is. One whose anchor moved is
+				// no longer the submission a reviewer would judge.
+				if (this.#answerReceipt(own, row) === undefined) continue;
+				const problem = await this.#answerReceiptProblem(own, row);
+				location = problem === undefined ? { ok: true, integrated: false } : { ok: false, reason: problem };
+			} else {
+				const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(result => result.id === row.id));
+				const isolated = lane === undefined ? undefined : lane.isolationReason !== undefined || own.config.isolation === "isolated";
+				location = await this.#acceptedLocation(own, planned, isolated, row);
+			}
 			if (location.ok) continue;
+			const held = row.state === "accepted" ? "수용된 결과가 현재 위치에서 확인되지 않았습니다" : "제출된 결과의 근거가 현재와 다릅니다";
 			row.state = "unmet";
 			row.origin = "attempt";
-			row.reason = compactResultReason(`수용된 결과가 현재 위치에서 확인되지 않았습니다: ${location.reason}`);
+			row.reason = compactResultReason(`${held}: ${location.reason}`);
+			own.answerSubjects?.delete(row.id);
 			delete row.contentVersion;
 			delete row.reviewTree;
 			delete row.remedy;
@@ -3573,6 +3958,8 @@ export class RunController {
 				row.reason = compactResultReason("결과가 확정되기 전에 실행이 종료되었습니다.");
 				row.identity = identity;
 				row.origin = "attempt";
+				// Finalization, not a judgment, closed this attempt: the closeout tells it apart from a judged miss.
+				row.finalized = "unsettled";
 				delete row.attemptId;
 				this.#bindConsumed(row, prepared);
 				delete row.remedy;
@@ -3588,8 +3975,21 @@ export class RunController {
 		return changed;
 	}
 
-	/** Writes the final record and releases the lease; only runs after owned work has settled. */
-	async #finalize(own: OwnRun, reason: RunEndReason, ctx: ExtensionContext | undefined): Promise<RunRecord | undefined> {
+	/** Each result row's state now, the baseline finalization compares against to mark a reopened result revoked. */
+	#heldStates(own: OwnRun): Map<RunResult, RunResult["state"]> {
+		return new Map((own.record.results ?? []).map(row => [row, row.state] as const));
+	}
+
+	/**
+	 * Writes the final record and releases the lease; only runs after owned work has settled. `heldBefore` is the row
+	 * baseline taken before a drain recheck, so a result that recheck already reopened is still marked revoked.
+	 */
+	async #finalize(
+		own: OwnRun,
+		reason: RunEndReason,
+		ctx: ExtensionContext | undefined,
+		heldBefore?: ReadonlyMap<RunResult, RunResult["state"]>,
+	): Promise<RunRecord | undefined> {
 		if (this.#own !== own) return undefined;
 		// A settlement that entered `settleAttempt` after the caller's live-work check is still current evidence. Keep the
 		// run stopping and let the drain timer retry; the final record never lands on top of a record still being written.
@@ -3614,6 +4014,11 @@ export class RunController {
 		this.#flushTimer = undefined;
 		liveWriters.delete(own.record.runId);
 		const ledger = endLedgerRun(own.record.runId);
+		// What each row held before finalization touched it: a held result this step reopens is marked revoked. The
+		// marker classifies the closeout only; it is never evidence and is never carried into a continuation.
+		const held = new Map(this.#heldStates(own));
+		// A row the drain recheck already reopened keeps the state it held before that recheck.
+		for (const [row, state] of heldBefore ?? []) if (held.has(row)) held.set(row, state);
 		// No verified close can race an attempt whose terminal metadata never arrived: the row is unmet, and the run
 		// records the honest no-progress end instead of a stale verification label.
 		this.#closePendingAttempts(own);
@@ -3624,6 +4029,15 @@ export class RunController {
 		// Vanished evidence reopens the row and what consumed its version; a verified label additionally requires every
 		// row to still be accepted after that re-read.
 		await this.#revokeUnlocatedAccepted(own);
+		for (const row of own.record.results ?? []) {
+			const before = held.get(row);
+			if (row.finalized !== undefined || row.scope === "excluded-by-user" || before === undefined) continue;
+			// A judged miss (a scoped `incorrect` verdict applied during the recheck) is a verdict, not a revocation.
+			if (row.state === "unmet" && row.origin === "review") continue;
+			if ((before === "accepted" || before === "reviewable") && row.state !== before && row.state !== "accepted") {
+				row.finalized = "revoked";
+			}
+		}
 		const finalRows = own.record.results ?? [];
 		const inScopeRows = finalRows.filter(row => row.scope !== "excluded-by-user");
 		// Excluded rows are not proof obligations, but they are never proof either: when every declared result was
@@ -3656,12 +4070,22 @@ export class RunController {
 			spawns,
 			...(agents.length ? { agents } : {}),
 			...(own.closeout !== undefined ? { closeout: own.closeout } : {}),
+			// The run's own target and team snapshot: a later status or closeout must not read today's settings.
+			closeoutFacts: {
+				target: closeoutTargetName(own.root),
+				pendingLanes,
+				requiredChecks: own.config.requiredChecks?.map(check => check.name) ?? [],
+			} satisfies CloseoutFacts,
 		};
 		if (own.checkEvidence?.length) record.checks = own.checkEvidence;
-		// A routine probe keeps the existing quiet/summary behavior. Real work gets one card, and only that card: the
-		// routine summary below is skipped for it so the transcript never carries both.
-		const requiredChecks = own.config.requiredChecks?.map(check => check.name) ?? [];
-		const card = isSubstantiveRun(record) ? closeoutCard(record, pendingLanes, requiredChecks) : undefined;
+		// An automatic probe stays out of the main transcript while it is routine; a blocked spawn is not routine, and
+		// the live status line already carried the rest.
+		const quietAuto =
+			!isSubstantiveRun(record) &&
+			own.auto === true &&
+			(record.endReason === "no-changes" || record.endReason === "verified") &&
+			!record.spawns.some(spawn => spawn.outcome === "blocked");
+		let resumable = false;
 		try {
 			await this.#liveWrite;
 			// Only runs this session recorded are ever cleaned later: its own store is not another session's.
@@ -3683,30 +4107,35 @@ export class RunController {
 			const protect = await protectedResumeRunIds(own.sessionDir).catch(() => []);
 			await pruneRuns(own.sessionDir, RUN_KEEP, protect);
 			if (cleaned.length) markAgentsCleaned(cleaned, this.deps.now(), own.sessionDir);
-			// An automatic probe stays out of the main transcript while it is routine; a blocked spawn is not routine, and
-			// the live status line already carried the rest. The substantive card waits for the lease release below.
-			const quietAuto =
-				card === undefined &&
-				own.auto === true &&
-				(record.endReason === "no-changes" || record.endReason === "verified") &&
-				!record.spawns.some(spawn => spawn.outcome === "blocked");
-			if (ctx && card === undefined && !quietAuto) this.deps.ui(ctx).record(CLOSEOUT_TITLE, summarizeRun(record));
+			// A resume is offered only for the exact run the session's own trusted candidate search returns now, with
+			// the same ordering the resume path validates against. Read while the record and pointers are settled.
+			if (ctx !== undefined && !quietAuto && finalReason !== "shutdown" && resumableRun(record)) {
+				const candidate = await findResumeCandidate(own.sessionDir, { repoId: own.repoId, root: own.root }).catch(() => undefined);
+				resumable = candidate?.runId === record.runId;
+			}
 		} finally {
 			if (own.lease !== undefined) await this.#releaseLease(own.lease, ctx);
 		}
-		// The transcript card is the last word of a settled run: the record is on disk and no lease is held. A shutdown
+		// The transcript record is the last word of a settled run: the record is on disk and no lease is held. A shutdown
 		// (or a switch, which ends as one) opens no new UI: the transcript it belonged to is already gone. A stable
 		// identity that differs from the one that directed the run is the same case even when the reason was not shutdown.
 		const showingSession = ctx === undefined ? undefined : closeoutSessionId(ctx);
 		const sameSession = own.sessionId === showingSession;
-		if (ctx !== undefined && finalReason !== "shutdown" && sameSession && card !== undefined) {
-			const registered = rememberCloseoutReport(ctx, record.runId, card.options);
-			const hint = ctx.mode === "tui" && registered ? `\n\n${CLOSEOUT_CHOICE_HINT}` : "";
-			try {
-				this.deps.ui(ctx).record(CLOSEOUT_TITLE, `${card.text}${hint}`);
-			} catch (error) {
-				if (registered) resetCloseoutChoices(ctx);
-				throw error;
+		if (ctx !== undefined && finalReason !== "shutdown" && sameSession && !quietAuto) {
+			const brief = closeoutBrief(record, { resumable });
+			if (brief.tier !== "none") {
+				// Numbers are offered only where this host can actually take a typed pick from this session's owner.
+				const interactive = ctx.mode === "tui" && ctx.hasUI;
+				const registered = interactive && brief.actions.length > 0 && rememberCloseoutReport(ctx, record.runId, brief.actions);
+				// A newer record without numbers must not leave an older card's numbers answerable.
+				if (!registered) resetCloseoutChoices(ctx);
+				try {
+					const view = renderCloseout(brief, registered);
+					this.deps.ui(ctx).record(CLOSEOUT_TITLE, view.markdown, { kind: "closeout", runId: record.runId, info: view.info });
+				} catch (error) {
+					if (registered) resetCloseoutChoices(ctx);
+					throw error;
+				}
 			}
 		}
 		return record;
@@ -3874,7 +4303,10 @@ function tally<K extends string>(keys: readonly K[], label: (key: K) => string):
 	return [...counts].map(([key, n]) => `${label(key)} ${n}`).join(" · ");
 }
 
-/** The run's record in the transcript: at most five lines, the one Storm output that stays there. */
+/**
+ * A run's ledger in at most five lines: spend, spawns, director economy and subagents. Detail for status and
+ * diagnostics; the transcript keeps the closeout record instead.
+ */
 export function summarizeRun(run: RunRecord): string {
 	const blockCodes = run.spawns.flatMap(spawn => (spawn.outcome === "blocked" && spawn.code ? [spawn.code] : []));
 	const spawnLine = run.spawns.length

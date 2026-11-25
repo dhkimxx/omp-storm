@@ -298,6 +298,35 @@ function resumeBlock(resume: ResumeInfo): string[] {
 	];
 }
 
+/** The history block's own bound, on top of the producer's: markup and line breaks never pass through. */
+const HISTORY_CHARS = 1_200;
+const HISTORY_LINES = 14;
+
+/**
+ * A prior run's final facts as clearly historical data. Each line is made single-line and stripped of angle brackets
+ * here too, so the block can never close the surrounding run tag or add a rule of its own.
+ */
+function historyBlock(history: { text: string; followUp?: boolean } | undefined): string[] {
+	if (history === undefined || typeof history.text !== "string") return [];
+	const lines = history.text
+		.split("\n")
+		.map(text => text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ").replace(/[<>]/g, " ").trim())
+		.filter(text => text !== "")
+		.slice(0, HISTORY_LINES);
+	if (lines.length === 0) return [];
+	const lead = history.followUp === true
+		? ["New scope chosen after the earlier run below; nothing of it is restored. Plan this task on its own."]
+		: [];
+	let used = 0;
+	const kept: string[] = [];
+	for (const text of lines) {
+		if (used + text.length > HISTORY_CHARS) break;
+		kept.push(text);
+		used += text.length + 1;
+	}
+	return [...lead, ...kept];
+}
+
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
  * rules are taught by their block reasons, so each has at most one clause here. `maxRounds` is the run's whole round
@@ -312,6 +341,11 @@ export function buildHandoff(input: {
 	task: string;
 	maxRounds: number;
 	resume?: ResumeInfo;
+	/**
+	 * The bounded final facts of the run this one resumes or explicitly follows (`closeoutHandoff`). Shown as history
+	 * only: a follow-up restores nothing of that run, and a resume restores only what its checkpoint revalidated.
+	 */
+	history?: { text: string; followUp?: boolean };
 }): string {
 	const { config } = input;
 	const team = Object.entries(config.roles).flatMap(([id, role]) => {
@@ -330,7 +364,7 @@ export function buildHandoff(input: {
 			: "- Share this checkout, reviewer too; sequence overlapping edits. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
 		`- Resolve \`incorrect\` reviews and open P0s${docsEnabled(config) ? ", including doc findings" : ""}.`,
 		"- Finish every lane or report its blocker.",
-		"- Stage `storm brief` from evidence, best next first; Storm reports after it settles.",
+		"- Stage `storm brief` from evidence, 0-3 typed next; Storm reports after it settles.",
 	];
 	if (config.jobs?.length) {
 		rules.push(`- Approved project jobs: ${JSON.stringify(config.jobs.map(job => job.name))}. Plan kind run with job and use storm execute instead of spawning a worker.`);
@@ -349,11 +383,13 @@ export function buildHandoff(input: {
 		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; past it ${past}.`);
 	}
 	const resume = input.resume ? resumeBlock(input.resume) : [];
+	const history = historyBlock(input.history);
 	return [
 		`<storm-run id="${input.runId}" config="${shortHash(input.hash)}">`,
 		"Task:",
 		input.task,
 		...(resume.length ? ["", ...resume] : []),
+		...(history.length ? ["", ...history] : []),
 		"",
 		"Team (spawn only these):",
 		...team,

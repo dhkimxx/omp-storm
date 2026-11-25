@@ -24,6 +24,11 @@
  *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
+ *   E2E-CHILD-ANSWER-VERDICT <correct|incorrect>
+ *                           yield that review verdict plus `results: [{id, receipt, citation, verdict}]` copied from the
+ *                           newest scoped answer-review template the child actually received (Storm's review packet or
+ *                           round instruction); with no template in its context it yields no `results` at all, so a
+ *                           missing packet shows up as an unsettled answer, never as a fabricated scope
  *   E2E-CHILD-YIELD {json}  yield that exact value as `data` when the child has an output schema (a strict schema
  *                           violation then fails the run in the host, not in the text)
  *   E2E-CHILD-YIELD-ERROR <text>
@@ -98,6 +103,10 @@ export interface ScriptedTask {
  * `afterResult` holds it until a later user message (an async result) carries that text.
  * A task step's `awaitChildren` waits for the listed gate keys to be held at the provider before sending the tool
  * call. A wait step's `releaseChildren` opens those gates once its own `after`/`afterResult` condition is met.
+ * A task step's `reviewFor` (a result id) holds it until a later non-assistant message (a tool result or a user
+ * message) carries Storm's scoped answer-review template for that id, then appends what Storm wrote to the
+ * assignment: the whole answer-review packet when that message holds one, else the template line. Nothing is
+ * composed here; a receipt the fake never saw cannot be forwarded.
  */
 export type Step = (
 	| { storm: Record<string, unknown> }
@@ -114,6 +123,8 @@ export type Step = (
 ) & {
 	after?: string;
 	afterResult?: string;
+	/** Task steps: wait for Storm's scoped answer-review template for this result id and forward it verbatim. */
+	reviewFor?: string;
 	/** After a host receipt, park an unmet `after` reply until the PTY driver signals release. */
 	releaseFile?: { name: string; receipt: string };
 };
@@ -174,7 +185,24 @@ export interface LlmEntry {
 	lastTool: string;
 	/** What extensions added to a compaction request (`<additional-context>`), verbatim. */
 	compactionContext: string;
+	/**
+	 * A child only, and only when its context holds one: the newest answer-review packet it received, parsed from
+	 * Storm's own wording (`answerReviewPacket`), with the answer exactly as quoted between `<<<` and `>>>`.
+	 */
+	reviewPacket?: ReviewPacket;
 	decision: { tool?: string; args?: Record<string, unknown>; text?: string };
+}
+
+/** One scoped answer-review subject as Storm spelled it: result id, receipt and citation anchor. */
+export interface ReviewScope {
+	id: string;
+	receipt: string;
+	citation: string;
+}
+
+/** A parsed answer-review packet: its scope and the answer text it quotes. */
+export interface ReviewPacket extends ReviewScope {
+	answer: string;
 }
 
 const PORT = Number(process.env.FAKE_LLM_PORT);
@@ -292,6 +320,56 @@ function lastCapture(text: string, pattern: RegExp): string | undefined {
 	return [...text.matchAll(new RegExp(pattern.source, flags))].at(-1)?.[1];
 }
 
+/**
+ * Storm's scoped answer-review template in either of its spellings: the packet's
+ * `results: [{ "id": "…", "receipt": "…", "citation": "…", …` and the round instruction's `results: [{"id": "…", …`.
+ */
+const SCOPE_TEMPLATE = /"id":\s*"([A-Za-z0-9._:-]{1,64})",\s*"receipt":\s*"([0-9a-f]{32})",\s*"citation":\s*"([^"\n]{1,300})"/gu;
+/** The packet `answerReviewPacket` writes (src/runtime/answer-review.ts), up to its closing template. */
+const PACKET =
+	/Answer review for result `([^`\n]{1,64})` \(receipt ([0-9a-f]{32})\)\.\n[^\n]*\nCited source: ([^\n]{1,300})\. Read it yourself[^\n]*\nAnswer as submitted:\n<<<\n([\s\S]*?)\n>>>\nIn your final yield add results: \[[^\n]*\]\./gu;
+
+/** Every scoped template in `text`, oldest first. */
+function scopesIn(text: string): ReviewScope[] {
+	return [...text.matchAll(SCOPE_TEMPLATE)].map(match => ({ id: match[1] ?? "", receipt: match[2] ?? "", citation: match[3] ?? "" }));
+}
+
+/** Every whole review packet in `text`, oldest first, with the span it occupies. */
+function packetsIn(text: string): Array<ReviewPacket & { block: string }> {
+	return [...text.matchAll(PACKET)].map(match => ({
+		id: match[1] ?? "",
+		receipt: match[2] ?? "",
+		citation: match[3] ?? "",
+		answer: match[4] ?? "",
+		block: match[0],
+	}));
+}
+
+/** The text of every non-assistant, non-system message: what a model has been told by its user, host and tools. */
+function heardText(messages: Message[]): string {
+	return messages
+		.filter(message => message.role === "user" || message.role === "tool")
+		.map(message => textOf(message.content))
+		.join("\n");
+}
+
+/**
+ * What a director forwards for `id`: the newest message that carries Storm's scoped template for it, as the packet when
+ * that message holds the whole packet for the same id, else as the template's own line. Undefined until Storm said it.
+ */
+function forwardedReview(later: Message[], id: string): string | undefined {
+	for (let index = later.length - 1; index >= 0; index--) {
+		const message = later[index];
+		if (message === undefined || (message.role !== "user" && message.role !== "tool")) continue;
+		const text = textOf(message.content);
+		if (!scopesIn(text).some(scope => scope.id === id)) continue;
+		const packet = packetsIn(text).findLast(entry => entry.id === id);
+		if (packet !== undefined) return packet.block;
+		return text.split("\n").filter(line => scopesIn(line).some(scope => scope.id === id)).join("\n");
+	}
+	return undefined;
+}
+
 function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say?: string, isolated?: boolean[]): Decision {
 	const item = (agent: string, index: number) => ({
 		name: `${prefix}${index}`,
@@ -344,10 +422,14 @@ function extensionCall(tools: Tool[] | undefined, name: string, args: Record<str
 	return writeCall(`xd://${name}`, JSON.stringify(args));
 }
 
-function yieldCall(schema: JsonSchema, correct = false): Decision {
+function yieldCall(schema: JsonSchema, correct = false, scoped?: ReviewScope & { verdict: "correct" | "incorrect" }): Decision {
 	const args = requiredArgs(schema);
 	if (!JSON.stringify(schema).includes("overall_correctness")) return { kind: "tool", name: "yield", args };
-	const data = { ...REVIEW_VERDICT, overall_correctness: correct ? "correct" : "incorrect" };
+	const data = {
+		...REVIEW_VERDICT,
+		overall_correctness: correct ? "correct" : "incorrect",
+		...(scoped === undefined ? {} : { results: [{ id: scoped.id, receipt: scoped.receipt, citation: scoped.citation, verdict: scoped.verdict }] }),
+	};
 	// Strict schemas make every key required but nullable: null out the others so `data` stands alone (data xor error).
 	return { kind: "tool", name: "yield", args: { ...Object.fromEntries(Object.keys(args).map(key => [key, null])), data } };
 }
@@ -469,6 +551,11 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 		// The step still consumes its slot on a denial, so the script proceeds without applying the proposed effect.
 		return approvedByAsk(lastAskResult(later) ?? "") ? bashCall(tools, step.ifAskApproved) : extensionCall(tools, "storm", { action: "status" });
 	}
+	if (step.reviewFor !== undefined && "task" in step) {
+		const forwarded = forwardedReview(later, step.reviewFor);
+		if (forwarded === undefined) return { kind: "text", text: "waiting" };
+		return stepCall({ ...step, say: `${step.say ?? ""}\n${forwarded}` }, tools);
+	}
 	return stepCall(step, tools);
 }
 
@@ -494,7 +581,8 @@ function childDecision(request: ChatRequest): Decision {
 	const bash = lastCapture(text, /E2E-CHILD-BASH[ \t]+(\S+)/);
 	const sh = lastCapture(text, /E2E-CHILD-SH[ \t]+(\S+)/);
 	const commit = lastCapture(text, /E2E-CHILD-COMMIT[ \t]+(\S+)/);
-	const correct = lastCapture(text, /E2E-CHILD-VERDICT[ \t]+(correct)\b/) === "correct";
+	const answerVerdict = lastCapture(text, /E2E-CHILD-ANSWER-VERDICT[ \t]+(correct|incorrect)\b/) as "correct" | "incorrect" | undefined;
+	const correct = lastCapture(text, /E2E-CHILD-VERDICT[ \t]+(correct)\b/) === "correct" || answerVerdict === "correct";
 	const report = lastPayload(text, "E2E-CHILD-YIELD");
 	const yieldError = lastCapture(text, /E2E-CHILD-YIELD-ERROR[ \t]+([^\n]+)/);
 	const claim = lastCapture(text, /E2E-CHILD-CLAIM[ \t]+([^\n]+)/);
@@ -513,6 +601,11 @@ function childDecision(request: ChatRequest): Decision {
 	if (yieldSchema) {
 		if (yieldError !== undefined) return { kind: "tool", name: "yield", args: { error: yieldError } };
 		if (report !== undefined) return { kind: "tool", name: "yield", args: { data: report } };
+	}
+	if (yieldSchema && answerVerdict !== undefined) {
+		// Only a scope Storm actually wrote into this child's context; the newest one wins, as a re-sent packet would.
+		const scope = scopesIn(heardText(messages)).at(-1);
+		return yieldCall(yieldSchema, correct, scope === undefined ? undefined : { ...scope, verdict: answerVerdict });
 	}
 	if (yieldSchema) return yieldCall(yieldSchema, correct);
 	if (big > 0) {
@@ -569,6 +662,7 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 	const system = request.messages.filter(message => message.role === "system" || message.role === "developer").map(message => textOf(message.content)).join("\n");
 	const stormTool = request.tools?.find(tool => tool.function.name === "storm");
 	const storm = stormTool?.function;
+	const packet = who === "child" ? packetsIn(heardText(request.messages)).at(-1) : undefined;
 	const entry: LlmEntry = {
 		ts: Date.now(),
 		who,
@@ -598,6 +692,7 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 			? (users.at(-1)?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ??
 				users.at(-1)?.text.match(/Additional focus: ([\s\S]*?)<\/instruction>/)?.[1] ?? "")
 			: "",
+		...(packet === undefined ? {} : { reviewPacket: { id: packet.id, receipt: packet.receipt, citation: packet.citation, answer: packet.answer } }),
 		decision: decision.kind === "tool" ? { tool: decision.name, args: decision.args } : { text: decision.text.slice(0, 200) },
 	};
 	appendFileSync(LOG, `${JSON.stringify(entry)}\n`);

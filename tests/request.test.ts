@@ -67,8 +67,8 @@ describe("route: fixed prefixes", () => {
 	});
 
 	test("old subcommand words alone open the menu; with more text they are a request", () => {
-		for (const word of ["run", "rollback", "approve", "review", " Review "]) expect(routePrefix(word)).toEqual({ action: "menu" });
-		for (const text of ["review the auth module", "run the tests", "vibecheck", "looping is slow", "fix the bug"]) expect(routePrefix(text)).toBeUndefined();
+		for (const word of ["run", "rollback", "approve", "review", " Review ", "export"]) expect(routePrefix(word)).toEqual({ action: "menu" });
+		for (const text of ["review the auth module", "run the tests", "vibecheck", "looping is slow", "fix the bug", "export the measurements to CSV"]) expect(routePrefix(text)).toBeUndefined();
 	});
 });
 

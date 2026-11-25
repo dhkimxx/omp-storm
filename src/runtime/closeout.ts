@@ -1,40 +1,75 @@
 /**
- * A run's closeout brief: the director's own last word on what it delivered, with the three next directions the user
- * may pick from the settled run's transcript card. Briefs are validated before they are staged so a malformed or
- * multi-line value can never forge card lines or choices, and the choice state is keyed by the public session id so a
- * selection made in another session can never resolve this session's card.
+ * A settled run's closeout: the code-built brief every surface reads, the director's bounded draft, the bounded
+ * historical handoff a later run or compaction may carry, and the one-shot numbered choice of a shown card.
+ *
+ * Official facts come only from the run record: status, end reason, result rows and the snapshot of facts taken at
+ * finish (`closeoutFacts`). The director's draft is presentation data; it never changes a count, a state or a tier.
+ * Drafts are validated before they are staged, so a malformed or multi-line value can never forge card lines or
+ * choices, and the choice state is keyed by the public session id so a selection made in another session can never
+ * resolve this session's card.
  */
+import * as path from "node:path";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { AgentEntry, LaneResultKind, RunJob, RunRecord, RunResult } from "../types.ts";
-import { resultProgress, resultRowText, RESULT_LANE_MAX, type ResultRow } from "../view/results.ts";
+import type {
+	AgentEntry,
+	CloseoutAction,
+	CloseoutBrief,
+	CloseoutFacts,
+	InfoTone,
+	LaneResultKind,
+	RunRecord,
+	RunResult,
+} from "../types.ts";
+import { MAX_RESULT_ID } from "../plan/validate.ts";
+import { resultProgress, type ResultRow } from "../view/results.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
 
-/** Bounded fields: a brief is a card, not a report. */
+/** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
-export const CLOSEOUT_NEXT_MAX = 240;
-/** How many required-result rows one card line names before the rest become a count. */
-export const CLOSEOUT_RESULT_ENTRY_MAX = 3;
-/** How many host job receipts one card line names before the rest become a count. */
-export const CLOSEOUT_JOB_ENTRY_MAX = 3;
-const JOB_NAME_MAX = 40;
-const JOB_STATUS_MAX = 20;
+/** Result and remaining are the only director prose a card carries. */
+export const CLOSEOUT_RESULT_MAX = 240;
+/** One direction's task or user text. */
+export const CLOSEOUT_NEXT_MAX = 160;
+/** Why a run direction is suggested. */
+export const CLOSEOUT_WHY_MAX = 120;
+/** At most this many directions; zero is valid. */
+export const CLOSEOUT_NEXT_COUNT = 3;
+/** A clean run shorter than this leaves one line; at or past it, a durable card. */
+export const CLOSEOUT_CARD_MINUTES = 10;
+/** The historical handoff is model context: bounded in UTF-8 bytes. */
+export const CLOSEOUT_HANDOFF_MAX_BYTES = 1024;
+
+/** Records written before typed directions kept these bounds; they are still read, never re-submitted. */
+const LEGACY_TEXT_MAX = 400;
+const LEGACY_NEXT_MAX = 240;
+const RESIDUAL_MAX = 3;
+const USER_ACTION_MAX = 2;
+const REQUEST_MAX = 120;
+const TARGET_MAX = 60;
+const NAME_MAX = 40;
+const PROOF_MAX = 120;
+
+/** One direction the director suggests. Only `resume` and `run` can ever become a numbered action. */
+export type CloseoutNext =
+	| { readonly kind: "resume" }
+	| { readonly kind: "run"; readonly task: string; readonly why?: string }
+	| { readonly kind: "user"; readonly text: string };
 
 /** The staged summary of one settled run, as the director submitted it. */
 export interface CloseoutDraft {
 	result: string;
 	verification: string;
 	remaining?: string;
-	next: readonly [string, string, string];
+	/** 0–3 distinct directions, best first. */
+	next: readonly CloseoutNext[];
 }
 
-/** The title of the one transcript record a settled substantive run leaves. */
+/** The title of the one transcript record a settled run leaves. */
 export const CLOSEOUT_TITLE = "Storm 실행 결과";
-/** Shown only where a typed choice can actually be taken; never as a false affordance on other hosts. */
-export const CLOSEOUT_CHOICE_HINT = "1~3 또는 원하는 방향을 입력하세요";
 
 // Control characters would either break the card into arbitrary lines or hide content; line separators count too.
 const UNSAFE = /[\u0000-\u001f\u007f\u2028\u2029]/;
-const UNSAFE_ALL = /[\u0000-\u001f\u007f\u2028\u2029]/g;
+const UNSAFE_ALL = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
 
 function line(value: unknown, max: number): string | undefined {
 	if (typeof value !== "string") return undefined;
@@ -43,34 +78,118 @@ function line(value: unknown, max: number): string | undefined {
 	return text;
 }
 
-/**
- * `parseCloseout` accepts only a complete, single-line brief with three distinct directions. It never fills a missing
- * field: no draft is the same as no verified brief, never a synthetic one. Returns undefined for anything else.
- */
-export function parseCloseout(value: unknown): CloseoutDraft | undefined {
+interface Bounds {
+	result: number;
+	verification: number;
+	next: number;
+}
+const SUBMITTED: Bounds = { result: CLOSEOUT_RESULT_MAX, verification: CLOSEOUT_TEXT_MAX, next: CLOSEOUT_NEXT_MAX };
+const STORED: Bounds = { result: LEGACY_TEXT_MAX, verification: LEGACY_TEXT_MAX, next: LEGACY_NEXT_MAX };
+
+const NEXT_FIELDS: Readonly<Record<CloseoutNext["kind"], readonly string[]>> = {
+	resume: [],
+	run: ["task", "why"],
+	user: ["text"],
+};
+
+function nextItem(value: unknown, bounds: Bounds, legacy: boolean): CloseoutNext | undefined {
+	// Records written before typed directions held three plain strings: each was a new Storm task.
+	if (typeof value === "string") {
+		if (!legacy) return undefined;
+		const task = line(value, bounds.next);
+		return task === undefined ? undefined : { kind: "run", task };
+	}
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const item = value as Record<string, unknown>;
+	const kind = item.kind;
+	if (kind !== "resume" && kind !== "run" && kind !== "user") return undefined;
+	const allowed = NEXT_FIELDS[kind];
+	// A field of another kind is a malformed direction, not one to reinterpret.
+	for (const [key, field] of Object.entries(item)) {
+		if (key !== "kind" && field !== undefined && !allowed.includes(key)) return undefined;
+	}
+	if (kind === "resume") return { kind };
+	if (kind === "user") {
+		const text = line(item.text, bounds.next);
+		return text === undefined ? undefined : { kind, text };
+	}
+	const task = line(item.task, bounds.next);
+	if (task === undefined) return undefined;
+	if (item.why === undefined) return { kind, task };
+	const why = line(item.why, CLOSEOUT_WHY_MAX);
+	return why === undefined ? undefined : { kind, task, why };
+}
+
+const sameText = (text: string): string => text.toLocaleLowerCase().replace(/\s+/g, " ");
+
+function parseDraft(value: unknown, bounds: Bounds, legacy: boolean): CloseoutDraft | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const input = value as Record<string, unknown>;
-	const result = line(input.result, CLOSEOUT_TEXT_MAX);
-	const verification = line(input.verification, CLOSEOUT_TEXT_MAX);
+	const result = line(input.result, bounds.result);
+	const verification = line(input.verification, bounds.verification);
 	if (result === undefined || verification === undefined) return undefined;
 	let remaining: string | undefined;
 	if (input.remaining !== undefined) {
-		remaining = line(input.remaining, CLOSEOUT_TEXT_MAX);
+		remaining = line(input.remaining, bounds.result);
 		if (remaining === undefined) return undefined;
 	}
-	const raw = input.next;
-	if (!Array.isArray(raw) || raw.length !== 3) return undefined;
-	const next = raw.map(item => line(item, CLOSEOUT_NEXT_MAX));
-	if (next.some(item => item === undefined)) return undefined;
-	const options = next as [string, string, string];
-	if (new Set(options.map(item => item.toLocaleLowerCase().replace(/\s+/g, " "))).size !== options.length) return undefined;
-	return { result, verification, ...(remaining !== undefined ? { remaining } : {}), next: options };
+	const raw = input.next === undefined ? [] : input.next;
+	if (!Array.isArray(raw) || raw.length > CLOSEOUT_NEXT_COUNT) return undefined;
+	const next: CloseoutNext[] = [];
+	const seen = new Set<string>();
+	for (const value of raw) {
+		const item = nextItem(value, bounds, legacy);
+		if (item === undefined) return undefined;
+		const key = item.kind === "resume" ? "\u0000resume" : sameText(item.kind === "run" ? item.task : item.text);
+		if (seen.has(key)) return undefined;
+		seen.add(key);
+		next.push(item);
+	}
+	return { result, verification, ...(remaining !== undefined ? { remaining } : {}), next };
 }
 
-/** Presentation-safe local text: one line, bounded, no control characters. */
-function clean(value: string, max: number): string {
+/**
+ * `parseCloseout` accepts only a complete, single-line draft with 0–3 distinct typed directions. It never fills a
+ * missing field: no draft is the same as no brief, never a synthetic one. Returns undefined for anything else.
+ */
+export function parseCloseout(value: unknown): CloseoutDraft | undefined {
+	return parseDraft(value, SUBMITTED, false);
+}
+
+/**
+ * The draft a stored record carries, read as untrusted input. A record written before typed directions keeps its
+ * plain-string directions as new-run tasks and its earlier length bounds; anything malformed is no draft at all.
+ */
+export function storedCloseout(value: unknown): CloseoutDraft | undefined {
+	return parseDraft(value, STORED, true);
+}
+
+/** Presentation-safe local text: one line, bounded by code points, no control or bidi characters. */
+function clean(value: unknown, max: number): string {
+	if (typeof value !== "string") return "";
 	const text = value.replace(UNSAFE_ALL, " ").replace(/\s+/g, " ").trim();
-	return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
+	const points = Array.from(text);
+	return points.length > max ? `${points.slice(0, Math.max(1, max - 1)).join("")}…` : text;
+}
+
+/** A target's display name: its last path component only, never a path. */
+export function closeoutTargetName(root: string): string {
+	return clean(path.basename(root), TARGET_MAX);
+}
+
+/** The facts a record stored at finish, read as untrusted input. */
+function storedFacts(value: unknown): CloseoutFacts | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const input = value as Record<string, unknown>;
+	const names = (list: unknown): string[] =>
+		Array.isArray(list) ? [...new Set(list.map(item => clean(item, NAME_MAX)).filter(item => item !== ""))].slice(0, 50) : [];
+	// A stored target is a display name; anything path-like is dropped rather than shown.
+	const target = clean(input.target, TARGET_MAX);
+	return {
+		target: /[\\/]/.test(target) ? "" : target,
+		pendingLanes: names(input.pendingLanes),
+		requiredChecks: names(input.requiredChecks),
+	};
 }
 
 /** The media a declared result was planned in: the row's bounded contract first, then the plan in force. */
@@ -106,129 +225,316 @@ function runReasonLabel(run: RunRecord): string {
 }
 
 function statusLine(run: RunRecord): string {
-	const status = STATUS_LABEL[run.status] ?? run.status;
-	const label = runReasonLabel(run);
+	const status = STATUS_LABEL[run.status] ?? clean(run.status, NAME_MAX);
+	const label = clean(runReasonLabel(run), NAME_MAX);
 	const reason = label === "" ? "" : ` · ${label}`;
 	const rounds =
-		run.turns === undefined ? "" : run.maxRounds !== undefined ? ` · ${run.turns}/${run.maxRounds}라운드` : ` · ${run.turns}라운드`;
+		typeof run.turns !== "number"
+			? ""
+			: typeof run.maxRounds === "number"
+				? ` · ${run.turns}/${run.maxRounds}라운드`
+				: ` · ${run.turns}라운드`;
 	return `${status}${reason}${rounds}`;
 }
 
-function checksLine(run: RunRecord, required: readonly string[]): string | undefined {
-	const evidence = new Map((run.checks ?? []).map(check => [check.name, check]));
-	const names = [...new Set([...required, ...evidence.keys()])];
-	if (names.length === 0) return undefined;
-	const parts = names.map(name => {
-		const check = evidence.get(name);
-		if (check === undefined) return `${clean(name, 40)} 기록 없음`;
-		const exit = check.exitCode !== null && check.exitCode !== undefined ? `(${check.exitCode})` : "";
-		return `${clean(check.name, 40)} ${clean(check.status, 40)}${exit}`;
-	});
-	return `- 체크(공식): ${parts.join(" · ")}`;
-}
-
-function lanesLine(pending: readonly string[]): string | undefined {
-	if (pending.length === 0) return undefined;
-	return `- 미완료 레인: ${pending.map(name => clean(name, 40)).join(", ")}`;
-}
+type OpenKind = keyof CloseoutBrief["official"]["open"];
 
 /**
- * Host-observed named-job receipts: an exit status and code, never a conclusion. They follow the result rows because
- * an accepted result is the completion signal; a passing job by itself does not prove any requirement or claim.
+ * Why an in-scope row is still open, exactly one cause each: finalization closed its attempt before a judgment, or
+ * revoked evidence it had; a known structured block; an exhausted host retry; a submission awaiting judgment; no
+ * judgment recorded yet; or judged and not met. The finalization marker classifies; it is never evidence.
  */
-function jobsLine(jobs: readonly RunJob[] | undefined): string | undefined {
-	if (jobs === undefined || jobs.length === 0) return undefined;
-	const shown = jobs.slice(0, CLOSEOUT_JOB_ENTRY_MAX);
-	const parts = shown.map(job => {
-		const name = clean(job.name, JOB_NAME_MAX) || "(이름 없음)";
-		const lane = clean(job.lane, RESULT_LANE_MAX);
-		const where = lane === "" ? "" : ` [${lane}]`;
-		const exit = typeof job.exitCode === "number" ? `(${job.exitCode})` : "";
-		return `${name}${where} ${clean(job.status, JOB_STATUS_MAX)}${exit}`;
-	});
-	const omitted = jobs.length - shown.length;
-	if (omitted > 0) parts.push(`외 ${omitted}건`);
-	return `- 잡 영수증(호스트): ${parts.join(" · ")}`;
+function openKind(row: ResultRow, finalized: RunResult["finalized"] | undefined): OpenKind {
+	if (finalized === "unsettled") return "unsettled";
+	if (finalized === "revoked") return "revoked";
+	if (row.remedy === "blocked") return "blocked";
+	if (row.remedy === "retry") return "retry";
+	if (row.state === "reviewable") return "reviewable";
+	if (row.state === "pending") return "pending";
+	return "unmet";
 }
 
-function resultLine(
-	header: string,
-	entries: readonly ResultRow[],
-	shownLanes: Set<string>,
-	includeState: boolean,
-): string | undefined {
-	if (entries.length === 0) return undefined;
-	const shown = entries.slice(0, CLOSEOUT_RESULT_ENTRY_MAX);
-	for (const result of shown) {
-		if (result.lane !== undefined) shownLanes.add(result.lane);
+/** The first stored row per id, as the projection dedupes them; only a known finalization marker is read. */
+function finalizedById(run: RunRecord): Map<string, RunResult["finalized"]> {
+	const out = new Map<string, RunResult["finalized"]>();
+	for (const value of Array.isArray(run.results) ? run.results : []) {
+		if (typeof value !== "object" || value === null || typeof value.id !== "string") continue;
+		const id = clean(value.id, MAX_RESULT_ID);
+		if (out.has(id)) continue;
+		const marker = value.finalized;
+		out.set(id, marker === "unsettled" || marker === "revoked" ? marker : undefined);
 	}
-	const parts = shown.map(result => resultRowText(result, { includeState }));
-	const omitted = entries.length - shown.length;
-	if (omitted > 0) parts.push(`외 ${omitted}건`);
-	return `${header}${parts.join(" · ")}`;
+	return out;
 }
 
-interface ResultBrief {
-	lines: string[];
-	/** Lanes already named on a result line: the pending-lane line must not repeat them. */
-	lanes: ReadonlySet<string>;
+function namesText(names: readonly string[], shown = 2): string {
+	const head = names.slice(0, shown).join(", ");
+	return names.length > shown ? `${head} 외 ${names.length - shown}개` : head;
 }
 
 /**
- * The official ledger's requirements by state, read from the shared result projection. Unmet/pending obligations keep
- * their criterion and runtime reason; reviewable submissions stay on their own line and are never called verified;
- * accepted outputs show their state and, when the host recorded one, a bounded attempt/source reference. An operator
- * excluded row is visibly listed last and never counted as an in-scope obligation. No row claims the run is done.
+ * Risks the record itself supports, never an inference about external state: writes that no verification covered,
+ * host jobs whose end was never observed, planned lanes no open row already names, and a budget stop.
  */
-function resultBrief(run: RunRecord): ResultBrief {
+function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes: ReadonlySet<string>): string[] {
+	const out: string[] = [];
+	const agents: readonly AgentEntry[] = Array.isArray(run.agents) ? run.agents : [];
+	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick").length;
+	if (run.endReason !== "verified" && writers > 0) {
+		out.push(`검증되지 않은 변경이 작업 트리에 남아 있을 수 있습니다(변경한 워커 ${writers}개).`);
+	}
+	const jobs = (Array.isArray(run.jobs) ? run.jobs : []).filter(job => job?.status === "started" || job?.status === "unknown");
+	if (jobs.length > 0) {
+		const names = jobs.map(job => clean(job.name, NAME_MAX) || "(이름 없음)");
+		out.push(`끝났는지 확인하지 못한 정형 작업 ${jobs.length}건: ${namesText(names)}(외부 상태는 확인하지 않았습니다).`);
+	}
+	const lanes = (facts?.pendingLanes ?? []).filter(name => !openLanes.has(name));
+	if (lanes.length > 0) out.push(`끝내지 못한 레인 ${lanes.length}개: ${namesText(lanes)}.`);
+	if (run.status === "budget-exceeded" || run.endReason === "budget") out.push("실행 예산 한도에서 끝났습니다.");
+	return out.slice(0, RESIDUAL_MAX);
+}
+
+/** Ends that settle without anything left to judge; every other end leaves a durable card. */
+const CLEAN_ENDS: ReadonlySet<string> = new Set(["verified", "no-changes", "unreviewed"]);
+
+function minutesOf(run: RunRecord): number | undefined {
+	const start = Date.parse(run.startedAt);
+	const end = typeof run.endedAt === "string" ? Date.parse(run.endedAt) : Number.NaN;
+	if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return undefined;
+	return (end - start) / 60_000;
+}
+
+function toneOf(run: RunRecord, open: number, residual: number): InfoTone {
+	if (run.status === "running") return "muted";
+	if (open > 0 || residual > 0 || run.status === "stopped" || run.status === "budget-exceeded") return "warning";
+	return run.status === "done" ? "success" : "accent";
+}
+
+/** The code-written resume label: what the existing resume path does, never a selective acceptance. */
+function resumeLabel(accepted: number, inScope: number): string {
+	if (inScope === 0) return "이어 가기 — 중단된 같은 요청을 이어서 진행합니다";
+	return `이어 가기 — 수용 ${accepted}건은 현재 증거로 다시 확인하고 나머지 ${inScope - accepted}건을 다시 엽니다`;
+}
+
+function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
+	const task = clean(item.task, CLOSEOUT_NEXT_MAX);
+	return item.why === undefined ? task : `${task} — ${clean(item.why, CLOSEOUT_WHY_MAX)}`;
+}
+
+/**
+ * The brief of a settled run, from its record alone. `resumable` is the caller's proof that this exact run is the
+ * session's trusted resume candidate; without it no resume action is offered, whatever the draft says.
+ *
+ * - `none`: the record is not settled.
+ * - `line`: a clean end (verified, no changes, or quick-only), nothing open or excluded, no residual, under ten
+ *   minutes. One factual line; no prose, no menu.
+ * - `card`: everything else. The director's result and remaining appear only here, marked stale when finalization
+ *   changed a row after the draft could have been written.
+ */
+export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } = {}): CloseoutBrief {
 	const progress = resultProgress(run);
-	const inScope = progress.rows.filter(row => !row.excluded);
-	const unresolved = inScope.filter(row => row.state !== "accepted" && row.state !== "reviewable");
-	const reviewable = inScope.filter(row => row.state === "reviewable");
-	const accepted = inScope.filter(row => row.state === "accepted");
-	const excluded = progress.rows.filter(row => row.excluded);
-	const lanes = new Set<string>();
-	const lines: string[] = [];
-	const unmet = resultLine("- 미해결 필수 결과(공식): ", unresolved, lanes, true);
-	if (unmet !== undefined) lines.push(unmet);
-	const pending = resultLine("- 검토 가능 필수 결과(공식): ", reviewable, lanes, false);
-	if (pending !== undefined) lines.push(pending);
-	// Accepted and excluded lanes are not unfinished; a throwaway set keeps them from hiding a pending lane.
-	const settled = resultLine("- 이행 필수 결과(공식): ", accepted, new Set<string>(), true);
-	if (settled !== undefined) lines.push(settled);
-	const scoped = resultLine("- 사용자 제외 필수 결과(공식): ", excluded, new Set<string>(), false);
-	if (scoped !== undefined) lines.push(scoped);
-	return { lines, lanes };
+	const markers = finalizedById(run);
+	const facts = storedFacts(run.closeoutFacts);
+	const open: Record<OpenKind, number> = { unsettled: 0, revoked: 0, blocked: 0, retry: 0, reviewable: 0, pending: 0, unmet: 0 };
+	const openLanes = new Set<string>();
+	let stale = false;
+	for (const row of progress.rows) {
+		const marker = markers.get(row.id);
+		if (marker !== undefined) stale = true;
+		if (row.excluded || row.state === "accepted") continue;
+		open[openKind(row, marker)]++;
+		if (row.lane !== undefined) openLanes.add(row.lane);
+	}
+	const openTotal = Object.values(open).reduce((sum, n) => sum + n, 0);
+	const residual = residualOf(run, facts, openLanes);
+	const minutes = minutesOf(run);
+	const settled =
+		run.status !== "budget-exceeded" &&
+		run.endReason !== undefined &&
+		CLEAN_ENDS.has(run.endReason) &&
+		openTotal === 0 &&
+		progress.counts.excluded === 0 &&
+		residual.length === 0;
+	const tier: CloseoutBrief["tier"] =
+		run.status === "running" ? "none" : settled && (minutes === undefined || minutes < CLOSEOUT_CARD_MINUTES) ? "line" : "card";
+	const draft = storedCloseout(run.closeout);
+	const delivered = progress.delivered;
+	const proof =
+		delivered?.source === undefined
+			? undefined
+			: clean(`${delivered.label}${delivered.labelIsId ? "" : ` [${delivered.id}]`} · ${delivered.source}`, PROOF_MAX);
+	const card = tier === "card";
+	const userActions: string[] = [];
+	const actions: CloseoutAction[] = [];
+	if (card) {
+		const seen = new Set<string>();
+		const addUser = (text: string): void => {
+			const key = sameText(text);
+			if (text === "" || seen.has(key) || userActions.length >= USER_ACTION_MAX) return;
+			seen.add(key);
+			userActions.push(text);
+		};
+		// A known blocker's condition is code-owned and comes before anything the director wrote.
+		for (const row of progress.rows) {
+			if (!row.excluded && row.state !== "accepted" && row.remedy === "blocked" && row.unblock !== undefined) addUser(row.unblock);
+		}
+		for (const item of draft?.next ?? []) if (item.kind === "user") addUser(clean(item.text, CLOSEOUT_NEXT_MAX));
+		const resume: CloseoutAction | undefined =
+			options.resumable === true
+				? { kind: "resume", label: resumeLabel(progress.counts.accepted, progress.counts.inScope) }
+				: undefined;
+		let resumed = false;
+		for (const item of draft?.next ?? []) {
+			if (item.kind === "resume") {
+				if (resume !== undefined && !resumed) {
+					actions.push(resume);
+					resumed = true;
+				}
+			} else if (item.kind === "run") {
+				actions.push({ kind: "run", label: runLabel(item), task: item.task });
+			}
+		}
+		if (resume !== undefined && !resumed && actions.length < CLOSEOUT_NEXT_COUNT) actions.push(resume);
+	}
+	const target = facts?.target;
+	return {
+		runId: run.runId,
+		tier,
+		request: clean(run.task, REQUEST_MAX),
+		...(target ? { target } : {}),
+		startedAt: run.startedAt,
+		...(typeof run.endedAt === "string" ? { endedAt: run.endedAt } : {}),
+		official: {
+			label: statusLine(run),
+			tone: toneOf(run, openTotal, residual.length),
+			hasResults: progress.present,
+			accepted: progress.counts.accepted,
+			inScope: progress.counts.inScope,
+			excluded: progress.counts.excluded,
+			open,
+		},
+		residual,
+		...(proof ? { proof } : {}),
+		...(card && draft !== undefined
+			? {
+					director: {
+						result: clean(draft.result, CLOSEOUT_RESULT_MAX),
+						...(draft.remaining !== undefined ? { remaining: clean(draft.remaining, CLOSEOUT_RESULT_MAX) } : {}),
+						stale,
+					},
+				}
+			: {}),
+		userActions,
+		actions: actions.slice(0, CLOSEOUT_NEXT_COUNT),
+	};
 }
 
-/** Three distinct conservative directions that never presume a resume or claim work Storm did not verify. */
-function fallbackNext(run: RunRecord, pending: readonly string[]): readonly [string, string, string] {
-	const label = runReasonLabel(run);
-	const reason = label === "" ? (STATUS_LABEL[run.status] ?? run.status) : label;
-	const task = clean(run.task, 80);
-	const request = task === "" ? "원래 요청" : `원래 요청 "${task}"`;
-	const lane = pending[0] === undefined ? undefined : clean(pending[0], 40);
-	const inspect = `기록·검증 근거를 먼저 확인하고(종료 사유: ${clean(reason, 40)}) 다음 범위를 정하는 읽기 전용 새 Storm 작업`;
-	const scoped =
-		lane !== undefined
-			? `미완료 레인 "${lane}"만 새 Storm 작업으로 좁게 다시 맡기기`
-			: `${request}의 남은 부분 중 한 가지를 골라 좁게 다시 맡기는 새 Storm 작업`;
-	const closeNote = `추가 실행과 검증을 반복하지 않고 지금까지의 상태·보류 사유·남은 범위를 기록으로 남기는 마무리 새 Storm 작업`;
-	return [inspect, scoped, closeNote];
+// ── Historical handoff ───────────────────────────────────────────────────────────────────────────
+
+/** A token that names an absolute or home-relative location; the handoff never carries one. */
+const ABSOLUTE_TOKEN = /(^|[\s"'`(\[{=,;])(?:~[\\/]|[A-Za-z]:[\\/]|[\\/][^\s"'`()\[\]{},;\\/]+[\\/])[^\s"'`()\[\]{},;]*/g;
+
+/** Model-context text: one line, bounded, no markup that could close a surrounding block, no absolute path. */
+function scrub(value: unknown, max: number): string {
+	const text = clean(value, 10_000)
+		.replace(ABSOLUTE_TOKEN, (_match, lead: string) => `${lead}‹경로›`)
+		.replace(/</g, "‹")
+		.replace(/>/g, "›");
+	return clean(text, max);
 }
 
-export interface CloseoutCard {
-	text: string;
-	options: readonly [string, string, string];
+const encoder = new TextEncoder();
+const bytesOf = (text: string): number => encoder.encode(text).length;
+
+function clipBytes(text: string, max: number): string {
+	if (bytesOf(text) <= max) return text;
+	let out = "";
+	let used = bytesOf("…");
+	for (const point of Array.from(text)) {
+		const size = bytesOf(point);
+		if (used + size > max) break;
+		out += point;
+		used += size;
+	}
+	return `${out}…`;
 }
 
-/** Whether a settled run left work worth a closeout card: a submitted brief, an accepted output, several lanes, or real non-quick work. */
+const OPEN_WORDS: Readonly<Record<OpenKind, string>> = {
+	unsettled: "closed before judgment",
+	revoked: "evidence revoked at finish",
+	blocked: "blocked",
+	retry: "retry exhausted",
+	reviewable: "awaiting review",
+	pending: "pending",
+	unmet: "unmet",
+};
+
+/**
+ * The bounded final facts of a settled run, for model context: an explicit resume or a chosen follow-up handoff, a
+ * compaction, or a status read. Deterministic and about 1 KiB. Data, not instructions: no absolute path, no raw log,
+ * no markup. Official counts lead; the director's own words follow as unverified and, when finalization changed a row
+ * after they were written, as superseded by those counts.
+ */
+export function closeoutHandoff(run: RunRecord): string {
+	const brief = closeoutBrief(run);
+	const official = brief.official;
+	const draft = storedCloseout(run.closeout);
+	const runRef = /^run-[0-9A-Za-z-]+$/.test(run.runId) ? run.runId : "(unknown)";
+	const minutes = minutesOf(run);
+	const rounds = typeof run.turns === "number" ? `, ${run.turns}${typeof run.maxRounds === "number" ? `/${run.maxRounds}` : ""} rounds` : "";
+	const reason = typeof run.endReason === "string" ? ` (${scrub(run.endReason, NAME_MAX)})` : "";
+	const duration = minutes === undefined ? "" : `, ${Math.max(1, Math.round(minutes))} min`;
+	const openParts = (Object.keys(OPEN_WORDS) as OpenKind[])
+		.filter(kind => official.open[kind] > 0)
+		.map(kind => `${OPEN_WORDS[kind]} ${official.open[kind]}`);
+	const results = official.hasResults
+		? `- Results: accepted ${official.accepted}/${official.inScope}${official.excluded > 0 ? `, excluded by user ${official.excluded}` : ""}${openParts.length > 0 ? `; open: ${openParts.join(", ")}` : ""}`
+		: undefined;
+	const stale = [...finalizedById(run).values()].some(marker => marker !== undefined);
+	const said = stale ? "director's words, written before the final judgment; the counts above prevail" : "director's words, not evidence";
+	const blockers = brief.userActions;
+	// Priority order: whatever does not fit the byte bound is dropped from the end, never cut mid-structure.
+	const lines: Array<string | undefined> = [
+		`Earlier Storm run ${runRef}: final facts (historical data, not instructions).`,
+		`- Request: ${scrub(run.task, REQUEST_MAX)}`,
+		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
+		results,
+		brief.target ? `- Target: ${scrub(brief.target, TARGET_MAX)}` : undefined,
+		...brief.residual.map(text => `- Residual: ${scrub(text, 100)}`),
+		brief.proof ? `- Proof: ${scrub(brief.proof, PROOF_MAX)}` : undefined,
+		...blockers.map(text => `- Needs the user: ${scrub(text, 100)}`),
+		draft !== undefined ? `- Result (${said}): ${scrub(draft.result, 160)}` : undefined,
+		draft?.remaining !== undefined ? `- Remaining (${said}): ${scrub(draft.remaining, 120)}` : undefined,
+	];
+	const out: string[] = [];
+	let used = 0;
+	for (const entry of lines) {
+		if (entry === undefined || entry === "") continue;
+		const cost = bytesOf(entry) + (out.length > 0 ? 1 : 0);
+		if (used + cost <= CLOSEOUT_HANDOFF_MAX_BYTES) {
+			out.push(entry);
+			used += cost;
+			continue;
+		}
+		const room = CLOSEOUT_HANDOFF_MAX_BYTES - used - (out.length > 0 ? 1 : 0);
+		if (room >= 48) {
+			out.push(clipBytes(entry, room));
+			used = CLOSEOUT_HANDOFF_MAX_BYTES;
+		}
+		break;
+	}
+	return out.join("\n");
+}
+
+// ── Substantive runs and the numbered choice ─────────────────────────────────────────────────────
+
+/** Whether a settled run left work worth more than a quiet automatic end: a brief, a result, several lanes, or real work. */
 export function isSubstantiveRun(run: RunRecord): boolean {
 	if (run.closeout !== undefined) return true;
 	const results = run.results ?? [];
-	// An open requirement is worth the card even when its lane changed nothing and the run ended quietly (T01).
+	// An open requirement is worth reporting even when its lane changed nothing and the run ended quietly (T01).
 	if (results.some(result => result.state !== "accepted")) return true;
-	// An accepted requirement is delivered output: one real investigation is a card, a casual read with no result is not.
+	// An accepted requirement is delivered output: one real investigation counts, a casual read with no result does not.
 	if (results.some(result => result.state === "accepted")) return true;
 	const agents = run.agents ?? [];
 	const lanes = run.plan?.lanes ?? [];
@@ -249,49 +555,9 @@ export function isSubstantiveRun(run: RunRecord): boolean {
 	);
 }
 
-/** The one transcript card of a settled substantive run; the draft's own directions when one was submitted. */
-export function closeoutCard(
-	run: RunRecord,
-	pending: readonly string[] = [],
-	requiredChecks: readonly string[] = [],
-): CloseoutCard {
-	const draft = run.closeout;
-	const options = draft?.next ?? fallbackNext(run, pending);
-	const lines = [`- 상태(공식): ${statusLine(run)}`];
-	const results = resultBrief(run);
-	const report =
-		draft !== undefined
-			? [
-					`- 결과(감독 보고): ${draft.result}`,
-					`- 검증(감독 보고): ${draft.verification}`,
-					`- 남은 일(감독 보고): ${draft.remaining ?? "미기재 — 남은 작업이 없다는 증거는 아닙니다."}`,
-				]
-			: ["- 결과: 검증된 결과 브리프가 제출되지 않았습니다."];
-	if (results.lines.length > 0) {
-		// The official disposition leads; the director's report cannot precede or stand in for it.
-		lines.push(...results.lines);
-		const checks = checksLine(run, requiredChecks);
-		if (checks !== undefined) lines.push(checks);
-		lines.push(...report);
-	} else {
-		// Legacy record with no observed result ledger: the established order and text stay intact.
-		lines.push(...report);
-		const checks = checksLine(run, requiredChecks);
-		if (checks !== undefined) lines.push(checks);
-	}
-	// Receipts are host facts about process exit, not evidence for a result or a scientific conclusion.
-	const receipts = jobsLine(run.jobs);
-	if (receipts !== undefined) lines.push(receipts);
-	// A lane already named by an open requirement is the same obligation; print it once, on the result row.
-	const unfinished = lanesLine(pending.filter(name => !results.lanes.has(name)));
-	if (unfinished !== undefined) lines.push(unfinished);
-	lines.push("", "다음으로 무엇을 할까요?", `1. 추천 — ${options[0]}`, `2. ${options[1]}`, `3. ${options[2]}`);
-	return { text: lines.join("\n"), options };
-}
-
 interface ShownCloseout {
 	runId: string;
-	options: readonly [string, string, string];
+	actions: readonly CloseoutAction[];
 }
 
 /** The newest shown closeout per public session id; never keyed by cwd or a process-wide "current" run. */
@@ -308,34 +574,40 @@ export function closeoutSessionId(ctx: ExtensionContext): string | undefined {
 }
 
 /**
- * Makes a shown card answerable in exactly the session that saw it. Returns false when the host exposes no public
- * session identity: the card is still useful, but a number from any session must not be resolved as its choice.
+ * Makes a shown card's numbered actions answerable in exactly the session that saw it. Returns false when there is
+ * nothing to number or the host exposes no public session identity: the card is still useful, but a number from any
+ * session must not be resolved as its choice. The caller registers only on an interactive host it actually drew on.
  */
-export function rememberCloseoutReport(
-	ctx: ExtensionContext,
-	runId: string,
-	options: readonly [string, string, string],
-): boolean {
+export function rememberCloseoutReport(ctx: ExtensionContext, runId: string, actions: readonly CloseoutAction[]): boolean {
 	const id = closeoutSessionId(ctx);
 	if (id === undefined) return false;
-	shownBySession.set(id, { runId, options });
+	const valid = actions
+		.slice(0, CLOSEOUT_NEXT_COUNT)
+		.filter(action => action.kind === "resume" || (action.kind === "run" && typeof action.task === "string" && action.task !== ""));
+	if (valid.length === 0) {
+		shownBySession.delete(id);
+		return false;
+	}
+	shownBySession.set(id, { runId, actions: valid.map(action => ({ ...action })) });
 	return true;
 }
 
 /**
- * Resolves a freshly submitted `1`, `2` or `3` against the most recent same-session settled card, once. Any other
- * input, any later use, and every approach from another session consume or miss the choice instead of acting on it.
- * Returning undefined never means "choose nothing": the caller must continue with its normal input handling.
+ * Resolves a freshly submitted number against the most recent same-session card, once. Any other input, any later
+ * use, and every approach from another session consume or miss the choice instead of acting on it. Returning
+ * undefined never means "choose nothing": the caller must continue with its normal input handling. A `resume` pick
+ * still has to pass the caller's exact resume validation for `runId`; a `run` pick is a new task.
  */
-export function takeCloseoutChoice(ctx: ExtensionContext, text: string): string | undefined {
+export function takeCloseoutChoice(ctx: ExtensionContext, text: string): { runId: string; action: CloseoutAction } | undefined {
 	const id = closeoutSessionId(ctx);
 	if (id === undefined) return undefined;
 	const pending = shownBySession.get(id);
 	if (pending === undefined) return undefined;
 	shownBySession.delete(id);
 	const picked = text.trim();
-	if (picked !== "1" && picked !== "2" && picked !== "3") return undefined;
-	return pending.options[Number(picked) - 1];
+	if (!/^[1-9]$/.test(picked)) return undefined;
+	const action = pending.actions[Number(picked) - 1];
+	return action === undefined ? undefined : { runId: pending.runId, action };
 }
 
 /** Drops pending choices at a session lifecycle boundary; without a usable identity, every session is cleared. */

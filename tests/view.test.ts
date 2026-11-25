@@ -586,6 +586,106 @@ describe("status", () => {
 		expect(runStatusText(active, NOW)).toContain("결과 API 검증 (api-check) · 이행 1/2 · 미충족 1");
 	});
 
+	describe("settled run detail and handoff", () => {
+		const results: NonNullable<RunRecord["results"]> = [
+			{ id: "api-check", lane: "api", state: "unmet", reason: "응답 계약이 다릅니다", contract: { id: "api-check", kind: "answer", criterion: "API 검증" }, finalized: "revoked" },
+			{ id: "docs", lane: "docs", state: "accepted", contract: { id: "docs", kind: "artifact", criterion: "API 문서" } },
+		];
+		const jobs: NonNullable<RunRecord["jobs"]> = [
+			{ lane: "bench", name: "bench-run", status: "passed", exitCode: 0, startedAt: null, finishedAt: null },
+			{ lane: "bench", name: "bench-gpu", status: "unknown", exitCode: null, startedAt: null, finishedAt: null },
+		];
+		const draft = {
+			result: "API 문서를 고쳤습니다",
+			verification: "문서 링크를 직접 열어 확인했습니다",
+			remaining: "API 검증 레인 재시도",
+			next: [{ kind: "resume" }, { kind: "run", task: "응답 계약만 다시 맞추기" }, { kind: "user", text: "벤치 장비 전원 확인" }],
+		} satisfies NonNullable<RunRecord["closeout"]>;
+		const settled = runRecord({
+			runId: "run-9",
+			status: "ended",
+			endReason: "round-limit",
+			results,
+			jobs,
+			checks: [{ name: "unit", status: "passed", exitCode: 0, tree: "test-tree" }],
+			closeout: draft,
+			closeoutFacts: { target: "repo", pendingLanes: ["api", "bench"], requiredChecks: ["unit", "e2e"] },
+		});
+
+		test("the user's last run carries the former card-only facts after the official lines, without repeating rows", () => {
+			const md = renderStatus(view({ lastRun: settled }), NOW);
+			const section = md.slice(md.indexOf("### 마지막 실행"), md.indexOf("### 팀 설정"));
+			// Detailed official rows keep their ids, reasons and states.
+			expect(section).toContain("- API 검증 [api-check] [api] 미충족 — 응답 계약이 다릅니다");
+			expect(section).toContain("API 문서 [docs] [docs] 이행");
+			expect(section).toContain("- 검사 결과: unit: 통과 (exit 0)");
+			expect(section).toContain("- 필수 검사 기록 없음: e2e");
+			expect(section).not.toContain("unit 기록 없음");
+			expect(section).toContain("- 잡 영수증(호스트): bench-run [bench] passed(0) · bench-gpu [bench] unknown");
+			// "api" is already named by its open result row; only the lane no row covers is listed.
+			expect(section).toContain("- 미완료 레인: bench\n");
+			expect(section.match(/\[api\]/g)).toHaveLength(1);
+			// The director's whole draft follows the official state, marked because finalization changed a row after it.
+			const official = section.indexOf("- 결과(공식)");
+			const report = section.indexOf("- 결과(감독 보고, 최종 판정 전 작성): API 문서를 고쳤습니다");
+			expect(official).toBeGreaterThan(-1);
+			expect(report).toBeGreaterThan(official);
+			expect(report).toBeGreaterThan(section.indexOf("- 미완료 레인"));
+			expect(section).toContain("- 검증(감독 보고, 최종 판정 전 작성): 문서 링크를 직접 열어 확인했습니다");
+			expect(section).toContain("- 남은 일(감독 보고, 최종 판정 전 작성): API 검증 레인 재시도");
+			expect(section).toContain("- 제안한 다음 행동(감독 보고, 최종 판정 전 작성): 이어 가기 · 응답 계약만 다시 맞추기 · 직접: 벤치 장비 전원 확인");
+		});
+
+		test("a legacy draft with plain directions and no finish facts still renders, unmarked", () => {
+			const legacy = runRecord({
+				runId: "run-8",
+				status: "done",
+				closeout: { result: "결과", verification: "검증", next: ["첫 방향", "둘째 방향", "셋째 방향"] } as unknown as NonNullable<RunRecord["closeout"]>,
+			});
+			const md = renderStatus(view({ lastRun: legacy }), NOW);
+			expect(md).toContain("- 결과(감독 보고): 결과");
+			expect(md).toContain("- 검증(감독 보고): 검증");
+			expect(md).not.toContain("- 남은 일(");
+			expect(md).toContain("- 제안한 다음 행동(감독 보고): 첫 방향 · 둘째 방향 · 셋째 방향");
+			expect(md).not.toContain("필수 검사 기록 없음");
+			expect(md).not.toContain("미완료 레인");
+			expect(md).not.toContain("잡 영수증");
+		});
+
+		test("the model reads no draft, receipts or lanes, and no handoff the caller did not prove", () => {
+			const model = renderStatus(view({ lastRun: settled }), NOW, "model");
+			expect(model).toContain("- run-9 · ");
+			expect(model).toContain("- 결과(공식)");
+			for (const hidden of ["감독 보고", "잡 영수증", "미완료 레인", "필수 검사 기록 없음", "종료 인수인계", "API 문서를 고쳤습니다"]) {
+				expect(model).not.toContain(hidden);
+			}
+		});
+
+		test("a proven handoff is the model's bounded synopsis, once, with paths removed and repeated lines dropped", () => {
+			const plain = renderStatus(view({ lastRun: settled }), NOW, "model");
+			const resultLine = plain.split("\n").find(line => line.startsWith("- 결과(공식)"))!;
+			const handoff = `${resultLine.slice(2)}\n남은 일: /Users/me/repo/src/api.ts 의 응답 계약\n다음: /storm status`;
+			const model = renderStatus(view({ lastRun: settled, lastHandoff: handoff } as Partial<StatusView>), NOW, "model");
+			expect(model.match(/종료 인수인계/g)).toHaveLength(1);
+			// The official result line is already in the handoff: the model reads it once.
+			expect(model.split(resultLine.slice(2))).toHaveLength(2);
+			expect(model).not.toContain("/Users/me");
+			expect(model).toContain("(경로 생략)");
+			expect(model).toContain("/storm status");
+			expect(model).not.toContain("감독 보고");
+
+			const huge = renderStatus(view({ lastRun: settled, lastHandoff: Array.from({ length: 40 }, (_, i) => `${i}:${"가".repeat(200)}`).join("\n") } as Partial<StatusView>), NOW, "model");
+			const block = huge.slice(huge.indexOf("종료 인수인계"));
+			expect(block.length).toBeLessThan(1400);
+			expect(block).not.toContain("39:");
+
+			// A running record has no settled handoff, and the user's view never prints the model synopsis.
+			const running = renderStatus(view({ lastRun: { ...settled, status: "running" }, lastHandoff: handoff } as Partial<StatusView>), NOW, "model");
+			expect(running).not.toContain("종료 인수인계");
+			expect(renderStatus(view({ lastRun: settled, lastHandoff: handoff } as Partial<StatusView>), NOW)).not.toContain("종료 인수인계");
+		});
+	});
+
 	test("a settled run drops a repeated refusal only when an exception lane row reports the same spawn", () => {
 		const lane = { name: "격리 실험", kind: "code" as const, role: "implementer", goal: "compare", isolationReason: "별도 체크아웃에서만 비교" };
 		const plan: RunPlan = { lanes: [lane], workers: { implementer: 1 }, submittedAt: "2026-11-20T09:00:00.000Z" };

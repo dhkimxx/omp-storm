@@ -28,13 +28,15 @@ import {
 	Suite,
 	startFakeLlm,
 	TEAM_PROVIDERS,
-	TRACKED_FILE,
-	TRACKED_TEXT,
 	Tui,
 	until,
+	CLOSEOUT_DETAIL,
+	CLOSEOUT_HEADING,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
 const env = prepare("storm-e2e-result-direction", 18562);
+seedFact(env.project);
 const suite = new Suite("E2E (result-direction)", env);
 const check = suite.check.bind(suite);
 
@@ -49,9 +51,8 @@ const LABELS = [ORIGIN_LABEL, API_LABEL, UI_LABEL] as const;
 /** Key hints of Storm's report overlay, which Enter closes. */
 const OVERLAY_HINT = "PgDn";
 
-const TRACKED_LINE = TRACKED_TEXT.trim();
-const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
-const READ_AND_CLAIM = `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`;
+/** The typed fixture line and a claim that restates its signed typed value: accepted mechanically, no reviewer needed. */
+const READ_AND_CLAIM = `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${FACT_CLAIM}`;
 /** No source citation: the answer evaluator records this attempt as genuinely unmet, not as a host failure. */
 const API_UNMET = "E2E-CHILD-DELAY 15000 E2E-CHILD-CLAIM API 검증 결과는 아직 확인하지 못했습니다";
 const API_RETRY = `Retry the failed API verification against source. ${READ_AND_CLAIM}`;
@@ -95,8 +96,8 @@ const answer = (id: string, criterion: string): Record<string, unknown> => ({
 	id,
 	kind: "answer",
 	criterion,
-	path: TRACKED_FILE,
-	contains: TRACKED_LINE,
+	path: FACT_FILE,
+	contains: FACT_LINE,
 });
 
 /** One manual run: an accepted investigation, a failing API verification, and an undispatched UI leaf. */
@@ -331,7 +332,7 @@ async function main(): Promise<void> {
 				check("the retry accepts only after the source-citing attempt", finalApi?.state === "accepted" && finalApi.proof === true && finalApi.attempt !== undefined && finalApi.attempt !== apiFirst?.attempt, `${JSON.stringify(apiFirst)} → ${JSON.stringify(finalApi)}`);
 				check(
 					"the retry's final proof cites the declared source",
-					row(final, "api-check")?.proof?.item.criterion === API_LABEL && row(final, "api-check")?.proof?.item.citation?.path === TRACKED_FILE,
+					row(final, "api-check")?.proof?.item.criterion === API_LABEL && row(final, "api-check")?.proof?.item.citation?.path === FACT_FILE,
 					JSON.stringify(row(final, "api-check")?.proof),
 				);
 				check("the retry did not start a separate run", files.index().filter(line => line.runId === runId).length === 1, JSON.stringify(files.index().filter(line => line.runId === runId)));
@@ -345,17 +346,23 @@ async function main(): Promise<void> {
 				);
 				check("the final run carries no remaining open requirement", results(final).every(value => value.state === "accepted" || value.scope === "excluded-by-user"), JSON.stringify(results(final).map(value => [value.id, value.state, value.scope])));
 
+				// Per-result labels are ledger and status detail now (checked on the final record above). The compact card
+				// keeps the official aggregate, where an operator exclusion stays a separate count, never an accepted one.
 				const finalText = await tui.seen(
 					started,
 					text => {
-						const at = text.lastIndexOf("### Storm 실행 결과");
-						return at >= 0 && allLabels(text.slice(at)) ? text : undefined;
+						const at = text.lastIndexOf(CLOSEOUT_HEADING);
+						return at >= 0 && /제외\s*1/u.test(text.slice(at)) ? text : undefined;
 					},
-					"the final brief with all three declared result labels",
+					"the final closeout with the exclusion counted separately",
 					60_000,
 				);
-				const report = finalText.slice(finalText.lastIndexOf("### Storm 실행 결과"));
-				check("the final brief keeps all three declared result labels", allLabels(report), report.slice(-600));
+				const report = finalText.slice(finalText.lastIndexOf(CLOSEOUT_HEADING));
+				check(
+					"the final closeout counts the exclusion apart and points to the status view for the rows",
+					/제외\s*1/u.test(report) && report.includes(CLOSEOUT_DETAIL),
+					report.slice(0, 900),
+				);
 
 				const mainEntries = llm.of("main");
 				const retryNudge = mainEntries.find(entry => entry.users.some(value => value.includes("<storm-adjust") && value.includes('action="retry"')) || (entry.lastUser.includes("<storm-adjust") && entry.lastUser.includes('action="retry"')));

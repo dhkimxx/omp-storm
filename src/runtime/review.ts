@@ -1,4 +1,5 @@
 /** Reviewer yields from omp's `yield` tool args counted as reviews, and the one line the summary and status show. */
+import { RESULT_ID_RE } from "../plan/validate.ts";
 import type { AgentEntry, ReviewTally } from "../types.ts";
 
 /** The parts of omp's `yield` args Storm reads; every field is checked before use. */
@@ -9,6 +10,7 @@ interface YieldArgs {
 interface FinalPayload {
 	overall_correctness?: unknown;
 	findings?: unknown;
+	results?: unknown;
 }
 interface Finding {
 	priority?: unknown;
@@ -43,6 +45,52 @@ export interface ReviewFinding {
 }
 
 /**
+ * One explicitly scoped result verdict from a final payload's `results`: the declared result id, the review receipt
+ * Storm issued for that exact pending submission, and the citation anchor the reviewer judged it against. It is a
+ * claim about that one submission only; Storm accepts it only when all three still match what is pending now.
+ */
+export interface ReviewedResult {
+	id: string;
+	/** 32 lowercase hex characters, copied from Storm's review packet; never computed by the reviewer. */
+	receipt: string;
+	/** `path` or `path:line`, exactly as the packet named it. */
+	citation: string;
+	correct: boolean;
+}
+
+/** At most this many scoped result verdicts are read from one payload; a longer list is not a scoped review. */
+export const REVIEWED_RESULTS_MAX = 16;
+const RECEIPT_RE = /^[0-9a-f]{32}$/u;
+const CITATION_MAX = 300;
+const CITATION_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+/** One scoped verdict, or undefined for an entry that does not name exactly one result, receipt, anchor and verdict. */
+function reviewedResultOf(value: unknown): ReviewedResult | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const { id, receipt, citation, verdict, correct } = value as Record<string, unknown>;
+	if (typeof id !== "string" || !RESULT_ID_RE.test(id)) return undefined;
+	if (typeof receipt !== "string" || !RECEIPT_RE.test(receipt)) return undefined;
+	if (typeof citation !== "string" || citation === "" || citation.length > CITATION_MAX || citation.trim() !== citation ||
+		CITATION_UNSAFE.test(citation)) return undefined;
+	// The wire spells it `verdict`; a stored record keeps the parsed boolean.
+	const ok = verdict === "correct" ? true : verdict === "incorrect" ? false : typeof correct === "boolean" ? correct : undefined;
+	if (ok === undefined) return undefined;
+	return { id, receipt, citation, correct: ok };
+}
+
+/**
+ * The scoped result verdicts of one payload. A malformed entry scopes nothing, and an id named twice is ambiguous: every
+ * entry for it is dropped, so one review never settles a result it did not judge exactly once.
+ */
+export function reviewedResultsIn(list: unknown): ReviewedResult[] {
+	if (!Array.isArray(list) || list.length > REVIEWED_RESULTS_MAX) return [];
+	const parsed = list.map(reviewedResultOf).filter((entry): entry is ReviewedResult => entry !== undefined);
+	const counts = new Map<string, number>();
+	for (const entry of parsed) counts.set(entry.id, (counts.get(entry.id) ?? 0) + 1);
+	return parsed.filter(entry => counts.get(entry.id) === 1);
+}
+
+/**
  * One review event: a findings yield before a verdict, or a final verdict. A verdict's `tree` is the exact
  * `<diff>:<files>` fingerprint Storm read when the verdict was given; without it the review is not proof.
  */
@@ -54,6 +102,8 @@ export interface ReviewEvidence {
 	findings: ReviewFinding[];
 	/** The exact tree the verdict was given against; absent when it could not be read then. */
 	tree?: string;
+	/** A final verdict's explicitly scoped result verdicts; absent for a plain change review. */
+	results?: ReviewedResult[];
 }
 
 /**
@@ -69,7 +119,7 @@ export interface ReviewEvidenceEntry extends AgentEntry {
 /** The structured part of one `yield`: either findings before a verdict or the verdict itself. */
 export type ParsedReview =
 	| { kind: "findings"; findings: ReviewFinding[] }
-	| { kind: "verdict"; findings: ReviewFinding[]; correct: boolean };
+	| { kind: "verdict"; findings: ReviewFinding[]; correct: boolean; results?: ReviewedResult[] };
 
 /** One structured finding, or undefined for an item the schema does not allow. */
 function findingOf(value: unknown): ReviewFinding | undefined {
@@ -138,7 +188,8 @@ export function reviewPart(input: unknown): ParsedReview | undefined {
 	const verdict = verdictPayload(input);
 	if (!verdict) return undefined;
 	const findings = Array.isArray(verdict.payload.findings) ? findingsIn(verdict.payload.findings) : [];
-	return { kind: "verdict", findings, correct: verdict.correct };
+	const results = reviewedResultsIn(verdict.payload.results);
+	return { kind: "verdict", findings, correct: verdict.correct, ...(results.length === 0 ? {} : { results }) };
 }
 
 /** `base` with new finding counts; `docFindings` appears once a doc finding was counted. */
@@ -227,7 +278,7 @@ export function reviewEvidenceOf(agent: AgentEntry): ReviewLedger {
 	const records: ReviewEvidence[] = [];
 	for (const value of raw) {
 		if (typeof value !== "object" || value === null) return { records: [], complete: false };
-		const { at, correct, findings, tree } = value as ReviewEvidence;
+		const { at, correct, findings, tree, results } = value as ReviewEvidence;
 		if (typeof at !== "number" || !Number.isFinite(at)) return { records: [], complete: false };
 		if (correct !== undefined && typeof correct !== "boolean") return { records: [], complete: false };
 		if (tree !== undefined && (typeof tree !== "string" || tree === "")) return { records: [], complete: false };
@@ -239,11 +290,19 @@ export function reviewEvidenceOf(agent: AgentEntry): ReviewLedger {
 			if (!finding) return { records: [], complete: false };
 			parsed.push(finding);
 		}
+		// Scoped result verdicts exist only on a final verdict and are stored already parsed; anything else is not proof.
+		let scoped: ReviewedResult[] | undefined;
+		if (results !== undefined) {
+			if (correct === undefined || !Array.isArray(results) || results.length === 0) return { records: [], complete: false };
+			scoped = reviewedResultsIn(results);
+			if (scoped.length !== results.length) return { records: [], complete: false };
+		}
 		records.push({
 			at,
 			findings: parsed,
 			...(correct !== undefined ? { correct } : {}),
 			...(tree !== undefined ? { tree } : {}),
+			...(scoped !== undefined ? { results: scoped } : {}),
 		});
 	}
 	return { records, complete: true };

@@ -332,15 +332,169 @@ function bounded(value: unknown, max = ATTEMPT_REPORT_TEXT_MAX): string | undefi
 	return clean === "" ? undefined : clean.slice(0, max);
 }
 
-/** A text part list from an extension content field. */
-function contentText(value: unknown): string | undefined {
-	if (typeof value === "string") return bounded(value);
+/** The raw text of an extension content field (string or text parts), before any cleaning. */
+function rawContentText(value: unknown): string | undefined {
+	if (typeof value === "string") return value === "" ? undefined : value;
 	if (!Array.isArray(value)) return undefined;
 	const parts: string[] = [];
 	for (const part of value) {
 		if (record(part) && part.type === "text" && typeof part.text === "string") parts.push(part.text);
 	}
-	return bounded(parts.join("\n"));
+	return parts.length === 0 ? undefined : parts.join("\n");
+}
+
+/*
+ * Native result framing. OMP 19 renders a settled task job's result as the `task-summary.md` envelope
+ * (`<task-result id agent status duration>` … `<output>`/`<preview>` … `</task-result>`) followed by the
+ * `task-follow-up.md` hint line, and an `async-result` notice wraps one or more such results in `async-result.md`
+ * (`<system-notice>`, a per-job `── Job <id> (<label>) ──` header when batched, optional `Agent:` / `Structured
+ * output:` suffixes). The child's own output inside `<output>` is escaped only for harness tags, so it can contain any
+ * other text, including a quoted `<task-result>` of another job. The envelope is therefore anchored at the host-rendered
+ * start and end only, located from the host's structured `details.jobs[]`, never searched for in model text. A shape
+ * that cannot be attributed to exactly one job yields no text (the answer stays missing, never accepted).
+ */
+
+/** `task-follow-up.md` lead-ins after `{{agentId}} `. */
+const FOLLOW_UP_HINTS = [
+	"is now idle",
+	"was stopped but is still resumable",
+	"was aborted",
+	"ran isolated and cannot be resumed or messaged",
+	"stopped and cannot be messaged",
+] as const;
+/** OMP's `escapeHarnessTags`: applied to every label/result rendered into the notice. */
+const HARNESS_TAG_START = /<(?=\s*\/?\s*(?:irc|tangent-notice|system-[a-z][a-z-]*)(?![\w-]))/gi;
+const TASK_RESULT_OPEN = /^<task-result id="([^"\n]*)" agent="[^"\n]*" status="[^"\n]*" duration="[^"\n]*">\n/;
+const TASK_RESULT_CLOSE = "</task-result>";
+/** `formatResultOutputFallback` for a child that produced nothing. */
+const NO_OUTPUT = /^\(no output\)(?: after \d+ req)?$/;
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function countOf(haystack: string, needle: string): number {
+	let count = 0;
+	for (let at = haystack.indexOf(needle); at >= 0; at = haystack.indexOf(needle, at + needle.length)) count += 1;
+	return count;
+}
+
+/** Removes the host's own trailing follow-up hint for exactly this agent; anything else is kept. */
+function withoutFollowUpHint(value: string, agentId: string): string {
+	const hint = new RegExp(`\\n\\n${escapeRegExp(agentId)} (?:${FOLLOW_UP_HINTS.map(escapeRegExp).join("|")}) — [^\\n]*$`);
+	const match = hint.exec(value);
+	return match === null ? value : value.slice(0, match.index);
+}
+
+/** Skips one optional host-authored `<tag>…</tag>` preamble element at `at`. */
+function skipElement(inner: string, at: number, tag: string): number | undefined {
+	if (!inner.startsWith(`<${tag}>`, at)) return at;
+	const close = inner.indexOf(`</${tag}>\n`, at);
+	return close < 0 ? undefined : close + tag.length + 4;
+}
+
+function skipBlankLines(inner: string, at: number): number {
+	while (inner[at] === "\n") at += 1;
+	return at;
+}
+
+/**
+ * The worker output of one native task-job result string (a wait row's `resultText`/`errorText`, or one job's result
+ * isolated from an `async-result` notice). A bare result (no envelope) is the host's genuine shape for follow-up turns
+ * and failures and is returned as-is; a wrapped result must be this exact agent's well-formed envelope.
+ */
+export function nativeJobOutput(result: string, agentId: string): string | undefined {
+	const value = withoutFollowUpHint(result.trimEnd(), agentId).trim();
+	if (!value.startsWith("<task-result")) return value === "" ? undefined : value;
+	const open = TASK_RESULT_OPEN.exec(value);
+	// Another job's (or a malformed/truncated) envelope is never this agent's answer.
+	if (open === null || open[1] !== agentId || !value.endsWith(TASK_RESULT_CLOSE)) return undefined;
+	const inner = value.slice(open[0].length, value.length - TASK_RESULT_CLOSE.length);
+	// Front: host preamble (optional meta, abort reason, error), then exactly one body opener.
+	let at: number | undefined = skipBlankLines(inner, 0);
+	if (/^<meta lines="\d+" size="[^"\n]*" \/>\n/.test(inner.slice(at))) at = skipBlankLines(inner, inner.indexOf("\n", at) + 1);
+	at = skipElement(inner, at, "abort-reason");
+	if (at === undefined) return undefined;
+	at = skipElement(inner, skipBlankLines(inner, at), "error");
+	if (at === undefined) return undefined;
+	at = skipBlankLines(inner, at);
+	const previewOpen = `<preview full-output="agent://${agentId}">\n`;
+	const kind = inner.startsWith("<output>\n", at) ? "output" : inner.startsWith(previewOpen, at) ? "preview" : undefined;
+	if (kind === undefined) return undefined;
+	const start = at + (kind === "output" ? "<output>\n".length : previewOpen.length);
+	// Back: the body closes at the real end of the envelope (optionally before the host's merge summary), so a closing
+	// tag quoted inside the child's own output stays part of that output.
+	const close = `\n</${kind}>\n`;
+	let end: number;
+	if (inner.endsWith(close)) end = inner.length - close.length;
+	else if (inner.endsWith("\n</merge-summary>\n")) end = inner.lastIndexOf(`${close}<merge-summary>\n`);
+	else return undefined;
+	if (end < start) return undefined;
+	const body = inner.slice(start, end).trim();
+	return body === "" || NO_OUTPUT.test(body) ? undefined : body;
+}
+
+/**
+ * The result of `jobs[index]` isolated from an `async-result` notice by re-deriving the `async-result.md` frame from
+ * the host's own `details.jobs[]`. Returns undefined when the frame does not match or the job's segment is ambiguous.
+ */
+function asyncJobResult(content: string, jobs: readonly unknown[], index: number): string | undefined {
+	const job = jobs[index];
+	if (!record(job) || typeof job.jobId !== "string") return undefined;
+	const text = content.trim();
+	// An unframed single delivery (older host or adapter) is the result itself; a batch cannot be attributed.
+	if (!text.startsWith("<system-notice>")) return jobs.length === 1 ? text : undefined;
+	const framed = text.startsWith("<system-notice>\n") && text.endsWith("\n</system-notice>");
+	if (!framed) return undefined;
+	const body = text.slice("<system-notice>\n".length, text.length - "\n</system-notice>".length);
+	let segment: string;
+	if (jobs.length === 1) {
+		const header = `Background job ${job.jobId} has completed.\nResume your work using the result below.\n`;
+		if (!body.startsWith(header)) return undefined;
+		segment = body.slice(header.length);
+	} else {
+		const intro = `${jobs.length} background jobs have completed. Resume your work using the results below.\n\n`;
+		if (!body.startsWith(intro)) return undefined;
+		const headerOf = (candidate: unknown): string | undefined => {
+			if (!record(candidate) || typeof candidate.jobId !== "string") return undefined;
+			const label = typeof candidate.label === "string" && candidate.label !== "" ? candidate.label.replace(HARNESS_TAG_START, "&lt;") : undefined;
+			return `── Job ${candidate.jobId}${label === undefined ? "" : ` (${label})`} ──\n`;
+		};
+		const header = headerOf(job);
+		if (header === undefined || countOf(body, header) !== 1) return undefined;
+		const start = body.indexOf(header);
+		if (index === 0 ? start !== intro.length : body[start - 1] !== "\n") return undefined;
+		let end = body.length;
+		if (index < jobs.length - 1) {
+			const next = headerOf(jobs[index + 1]);
+			if (next === undefined || countOf(body, next) !== 1) return undefined;
+			const nextAt = body.indexOf(next);
+			if (nextAt <= start || body[nextAt - 1] !== "\n") return undefined;
+			end = nextAt - 1;
+		}
+		segment = body.slice(start + header.length, end);
+	}
+	// Host suffixes after `{{this.result}}`: the structured-output block (only when the job row carries a schema) and
+	// the `Agent:` handles line.
+	const agentUrlId = typeof job.agentId === "string" ? job.agentId : job.jobId;
+	if (record(job.schema) && job.schema.status !== undefined) {
+		const marker = "\n\nStructured output: ";
+		if (countOf(segment, marker) !== 1) return undefined;
+		segment = segment.slice(0, segment.indexOf(marker));
+	}
+	for (const handles of [`\n\nAgent: agent://${agentUrlId}, history://${agentUrlId}`, `\n\nAgent: history://${agentUrlId}`]) {
+		if (segment.endsWith(handles)) {
+			segment = segment.slice(0, segment.length - handles.length);
+			break;
+		}
+	}
+	return segment;
+}
+
+/** Bounded worker output for one correlated async job, or undefined when the host shape cannot be attributed. */
+function asyncJobText(content: unknown, jobs: readonly unknown[], index: number, agentId: string): string | undefined {
+	const raw = rawContentText(content);
+	if (raw === undefined) return undefined;
+	const result = asyncJobResult(raw, jobs, index);
+	return result === undefined ? undefined : bounded(nativeJobOutput(result, agentId));
 }
 
 /** An absolute host path within the adapter's own declared-path bound. */
@@ -651,7 +805,16 @@ export class AttemptCollector {
 				});
 			}
 		}
-		const fallbackText = contentText(input.content);
+		// The sync tool content is the host's `<task-result>` summary; only a single-result call can be attributed.
+		const rawContent = rawContentText(input.content);
+		const fallbackText =
+			rawContent === undefined
+				? undefined
+				: results?.length === 1 && typeof results[0]?.id === "string"
+					? bounded(nativeJobOutput(rawContent, results[0].id))
+					: rawContent.includes("<task-result")
+						? undefined
+						: bounded(rawContent);
 		for (const tracked of [...this.#tracked.values()]) {
 			if (tracked.settled || tracked.followUp || tracked.runId !== input.runId) continue;
 			if (tracked.parentId !== input.parentId) continue;
@@ -704,14 +867,14 @@ export class AttemptCollector {
 		if (envelope === undefined) return;
 		const jobs = envelope.jobs;
 		if (!Array.isArray(jobs)) return;
-		const text = contentText(envelope.content);
-		for (const job of jobs) {
+		for (const [index, job] of jobs.entries()) {
 			if (!record(job)) continue;
 			const agentId = typeof job.agentId === "string" ? job.agentId : undefined;
 			if (agentId === undefined) continue;
 			const tracked = this.#tracked.get(agentId);
 			if (tracked === undefined || tracked.runId !== input.runId || tracked.settled) continue;
-			await this.#observeAsyncJob(tracked, job, input.observedAt, text);
+			// Only this job's own output, never the notice frame or a sibling job's answer.
+			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobText(envelope.content, jobs, index, agentId));
 		}
 	}
 
@@ -736,7 +899,8 @@ export class AttemptCollector {
 			// The wait snapshot is the delivery only when the host still holds a result for this row; a later aggregate
 			// row of an independently delivered job carries no text and must not replace that completion.
 			const status = typeof job.status === "string" ? job.status : undefined;
-			const text = bounded(job.resultText) ?? bounded(job.errorText);
+			const raw = typeof job.resultText === "string" && job.resultText !== "" ? job.resultText : job.errorText;
+			const text = typeof raw === "string" ? bounded(nativeJobOutput(raw, agentId)) : undefined;
 			if (status === "completed" && !waitDeliverable(job)) continue;
 			// The job can be enqueued just before `before_subagent_spawn`; admission is the child-start epoch, so the
 			// terminal settlement must not precede it. A pre-admission job (another turn or a reused child) is ignored.

@@ -23,25 +23,32 @@ import {
 	startFakeLlm,
 	TEAM_PROVIDERS,
 	TRACKED_FILE,
-	TRACKED_TEXT,
 	until,
+	CLOSEOUT_DETAIL,
+	closeoutBody,
+	closeoutOf,
+	isOneLineCloseout,
 } from "./harness.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
 const env = prepare("storm-e2e-auto", 18558);
+seedFact(env.project);
 const suite = new Suite("E2E (automatic delegation)", env);
 const main = "fake/general-b";
 /** The one native session this suite drives; every scenario resumes it, so its approvals and choice persist. */
 let owned: { id: string; dir: string } | undefined;
-/** The tracked fixture line and the exact citation a read-only probe reports; both make the result verifiable. */
-const TRACKED_LINE = TRACKED_TEXT.trim();
-const TRACKED_CLAIM = `${TRACKED_LINE} is line 1 of ${TRACKED_FILE} (${TRACKED_FILE}:1)`;
+/**
+ * The typed fixture line and the exact citation a read-only probe reports. The claim restates the line's signed typed
+ * value, so the official answer evidence accepts it mechanically rather than leaving it for a reviewer.
+ */
+const TRACKED_CLAIM = FACT_CLAIM;
 const plan = {
 	storm: {
 		action: "plan",
-		plan: { lanes: [{ name: "Probe0", kind: "explore", results: [{ id: "probe-answer", kind: "answer", criterion: "report the tracked fixture from source", path: TRACKED_FILE, contains: TRACKED_LINE }] }] },
+		plan: { lanes: [{ name: "Probe0", kind: "explore", results: [{ id: "probe-answer", kind: "answer", criterion: "report the tracked fixture from source", path: FACT_FILE, contains: FACT_LINE }] }] },
 	},
 } as const;
-const probe = { task: ["storm-explorer"], as: "Probe", say: `E2E-CHILD-READ ${TRACKED_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` };
+const probe = { task: ["storm-explorer"], as: "Probe", say: `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` };
 const scripted = (...steps: Step[]) => `E2E-STEPS ${JSON.stringify(steps)}`;
 
 /** Option labels Storm does not export. */
@@ -268,8 +275,10 @@ try {
 			const run = await files.finishedRun(before, 20_000);
 			suite.check("first plan opens one run and dispatches one approved worker", run.request === prompt && run.plan?.lanes[0]?.name === "Probe0" && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1 && dispatch.of("child").length > 0);
 			suite.check("routing used the original user turn, not a classifier or a duplicated handoff", dispatch.of("route").length === 0 && dispatch.of("main").some(entry => entry.lastUser.includes(prompt)) && dispatch.of("main").every(entry => !entry.lastUser.includes("<storm-run id=")));
-			const outcome = await until(() => reports(rpc.frames).find(report => report.includes("Storm 실행 결과")), 5_000, "read-only result closeout");
-			suite.check("a source-backed answer closes as a result even without a repo change", run.endReason === "verified" && run.results?.some(row => row.id === "probe-answer" && row.state === "accepted") === true && outcome.includes("probe-answer"));
+			const outcome = await until(() => closeoutOf(rpc.frames, run.runId), 5_000, "read-only result closeout");
+			suite.check("a source-backed answer closes as a result even without a repo change", run.endReason === "verified" && run.results?.some(row => row.id === "probe-answer" && row.state === "accepted") === true, JSON.stringify(run.results));
+			// Short and clean: one factual line, no rich card, no numbered offer. The accepted row id is ledger detail.
+			suite.check("the short clean automatic run leaves one factual line without a menu", isOneLineCloseout(outcome), outcome.text.slice(-400));
 			suite.check("a fresh small automatic run needs no checkpoint", dispatch.of("compaction").length === 0 && !run.checkpoints?.length);
 			const child = dispatch.of("child")[0];
 			if (child) console.log(`     scripted auto: first worker ${Math.max(0, child.ts - receivedAt)}ms · main requests ${dispatch.of("main").length} · compactions ${dispatch.of("compaction").length}`);
@@ -484,8 +493,16 @@ try {
 					JSON.stringify(run.results));
 				suite.check("only planned jobs run once; retrying accepted lanes has no side effect",
 					existsSync(join(rendezvous, "events")) && same(readFileSync(join(rendezvous, "events"), "utf8").trim().split("\n").sort(), ["a", "b", "c"]));
-				const card = await until(() => reports(rpc.frames).find(report => report.includes("result-c") && report.includes("Storm 실행 결과")), 5_000, "partial-result closeout");
-				suite.check("the final card exposes the failed result", card.includes("result-c"));
+				const card = await until(() => closeoutOf(rpc.frames, run.runId), 5_000, "partial-result closeout");
+				// The failed row stays named in the final ledger (checked above); the card keeps the whole official
+				// aggregate and points to the status view instead of listing result ids or job receipts.
+				const body = closeoutBody(card.text);
+				suite.check(
+					"an incomplete run keeps the whole card: official state, open count and the status pointer",
+					!isOneLineCloseout(card) && body.length > 1 && card.text.includes(CLOSEOUT_DETAIL) && /2\s*\/\s*3/.test(card.text),
+					card.text.slice(-600),
+				);
+				suite.check("the compact card no longer repeats job receipts", !card.text.includes("잡 영수증"), card.text.slice(-600));
 			});
 		} finally {
 			rmSync(rendezvous, { recursive: true, force: true });

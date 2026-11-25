@@ -13,9 +13,11 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
+import { CLOSEOUT_TITLE } from "../../src/runtime/closeout.ts";
 import { sessionStoreDir } from "../../src/session-scope.ts";
 import type { Effort, RunSummary, RunRecord, StormConfig } from "../../src/types.ts";
 import { STORM_MARK } from "../../src/view/appearance.ts";
+import { CLOSEOUT_CHOICE_HINT, CLOSEOUT_STATUS_COMMAND } from "../../src/view/closeout.ts";
 import type { LlmEntry, ScriptedTask, Step } from "./fake-llm.ts";
 
 export type { LlmEntry, ScriptedTask, Step };
@@ -45,6 +47,134 @@ export interface Frame {
 /** The custom type of a finished session message (`storm-report`, `async-result`), else undefined. */
 export function customMessage(frame: Frame): string | undefined {
 	return frame.type === "message_end" && typeof frame.message === "object" ? frame.message.customType : undefined;
+}
+
+// ── settled-run records (the closeout) ─────────────────────────────────────────────────────
+
+/** The title every settled-run record keeps, on the rich card and on its plain fallback alike. */
+export const CLOSEOUT_HEADING = CLOSEOUT_TITLE;
+/** The one pointer a closeout card leaves to the detail it no longer carries. */
+export const CLOSEOUT_DETAIL = CLOSEOUT_STATUS_COMMAND;
+
+/** A typed next action as the director submits it in `storm brief`; only `run` and `resume` ever receive a number. */
+export type BriefNext = { kind: "run"; task: string; why?: string } | { kind: "resume" } | { kind: "user"; text: string };
+export const runNext = (task: string, why?: string): BriefNext => (why === undefined ? { kind: "run", task } : { kind: "run", task, why });
+export const RESUME_NEXT: BriefNext = { kind: "resume" };
+export const userNext = (text: string): BriefNext => ({ kind: "user", text });
+
+/** The text of a session message: a plain string, or the joined text parts. */
+export function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.map(part => (part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : "")).join("\n");
+}
+
+/** One `storm-report` transcript record as the RPC host delivered it. */
+export interface StormRecord {
+	text: string;
+	details: Record<string, unknown> | undefined;
+}
+
+/** Every finished `storm-report` record after frame `from`, oldest first. */
+export function stormRecords(frames: readonly Frame[], from = 0): StormRecord[] {
+	return frames.slice(from).flatMap(frame => {
+		if (customMessage(frame) !== "storm-report" || typeof frame.message !== "object") return [];
+		const details = frame.message.details;
+		return [{ text: messageText(frame.message.content), details: details !== null && typeof details === "object" && !Array.isArray(details) ? (details as Record<string, unknown>) : undefined }];
+	});
+}
+
+/**
+ * The settled-run record of `runId` after frame `from`: the newest record carrying the closeout title. A record with
+ * presentation metadata must name this run; one without it (the plain fallback, or the one-line tier) is accepted by
+ * its title alone, which is why callers anchor `from` at the prompt that started the run.
+ */
+export function closeoutOf(frames: readonly Frame[], runId: string, from = 0): StormRecord | undefined {
+	return stormRecords(frames, from).findLast(record => {
+		if (!record.text.includes(CLOSEOUT_HEADING)) return false;
+		const id = record.details?.runId;
+		return id === undefined || id === runId;
+	});
+}
+
+/** The record's body: what follows its title, as non-empty trimmed lines. */
+export function closeoutBody(text: string): string[] {
+	const at = text.lastIndexOf(CLOSEOUT_HEADING);
+	const body = at < 0 ? text : text.slice(at + CLOSEOUT_HEADING.length);
+	return body.split("\n").map(line => line.trim()).filter(line => line !== "" && !/^#+$/.test(line));
+}
+
+/** Numbered offers (`1. …`, `- 2. …`) in a record body; the user-owned line is never numbered. */
+export function numberedOffers(lines: readonly string[]): string[] {
+	return lines.filter(line => /^(?:[-*]\s+)?[1-9][.)]\s/.test(line));
+}
+
+/**
+ * The directions a card offers, numbered or not: a host that registered no choice lists them as unnumbered direction
+ * lines instead of numbers, so a test asserts the order and kind of what is offered, not one surface's numbering.
+ */
+export function offeredDirections(lines: readonly string[]): string[] {
+	return lines.filter(line => numberedOffers([line]).length === 1 || /^(?:[-*]\s+)?[^\s:]+ 방향:\s/.test(line));
+}
+
+/**
+ * Whether a settled-run record is the compact one-line tier: one factual body line, no numbered offer, no choice
+ * hint, no status pointer. A short clean run gets exactly this, and a card never does.
+ */
+export function isOneLineCloseout(record: StormRecord): boolean {
+	const body = closeoutBody(record.text);
+	return body.length === 1 && offeredDirections(body).length === 0 && !record.text.includes(CLOSEOUT_CHOICE_HINT) && !record.text.includes(CLOSEOUT_DETAIL);
+}
+
+/** Every object in a parsed JSON value, depth first; a session file's entry shape is the host's, not Storm's. */
+function* jsonObjects(value: unknown): Generator<Record<string, unknown>> {
+	if (Array.isArray(value)) {
+		for (const item of value) yield* jsonObjects(item);
+	} else if (value !== null && typeof value === "object") {
+		yield value as Record<string, unknown>;
+		for (const item of Object.values(value)) yield* jsonObjects(item);
+	}
+}
+
+/**
+ * The `storm-report` messages a native session file saved, oldest first: what a restarted host replays. Read as
+ * saved facts, independent of how a terminal happened to repaint them.
+ */
+export function persistedStormRecords(sessionFile: string): StormRecord[] {
+	if (!existsSync(sessionFile)) return [];
+	const out: StormRecord[] = [];
+	for (const line of readFileSync(sessionFile, "utf8").split("\n")) {
+		if (line.trim() === "") continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		for (const node of jsonObjects(entry)) {
+			if (node.customType !== "storm-report") continue;
+			const details = node.details;
+			out.push({ text: messageText(node.content), details: details !== null && typeof details === "object" && !Array.isArray(details) ? (details as Record<string, unknown>) : undefined });
+			break;
+		}
+	}
+	return out;
+}
+
+/** The native session file of `sessionId` in a transcript directory; the host names it `<time>_<id>.jsonl`. */
+export function sessionFileIn(dir: string, sessionId: string): string | undefined {
+	if (!existsSync(dir)) return undefined;
+	const name = readdirSync(dir).find(file => file.endsWith(`_${sessionId}.jsonl`));
+	return name === undefined ? undefined : join(dir, name);
+}
+
+/**
+ * Lanes a settled run left unfinished, from its final on-disk ledger (`closeoutFacts`, captured before the session's
+ * team or target can change). The card no longer lists them; undefined means the record carries no such facts.
+ */
+export function pendingLanesOf(run: RunRecord): string[] | undefined {
+	const lanes = run.closeoutFacts?.pendingLanes;
+	return Array.isArray(lanes) ? [...lanes] : undefined;
 }
 
 export const ROOT = resolve(import.meta.dir, "..", "..");
@@ -350,11 +480,21 @@ export interface Dialog {
 export type Answer = (dialog: { title: string; options: string[] }) => string | undefined;
 
 export const cancelAll: Answer = () => undefined;
-/** Picks `label` wherever it is offered and cancels every other dialog. */
+/** Rich hub rows carry a description in RPC labels; the RPC reply must use the exact offered option. */
+export function hubLabel(option: string | undefined, label: string): boolean {
+	return option === label || option?.startsWith(`${label} — `) === true;
+}
+
+/** Picks the first matching label and cancels every other dialog. */
 export const choose =
 	(...labels: string[]): Answer =>
-	dialog =>
-		labels.find(label => dialog.options.includes(label));
+	dialog => {
+		for (const label of labels) {
+			const option = dialog.options.find(value => dialog.title === "Storm 메뉴" ? hubLabel(value, label) : value === label);
+			if (option !== undefined) return option;
+		}
+		return undefined;
+	};
 
 /** The native `/storm auto` switch labels; a scenario counting dialogs must not count a fixture's own approvals. */
 export const AUTO_ON_LABEL = "자동 위임 켜기";
@@ -446,6 +586,11 @@ export class Rpc {
 
 	get sessionFile(): string | undefined {
 		return this.#session?.sessionFile;
+	}
+
+	/** The omp process id: what its profile log records carry as `pid`. */
+	get pid(): number {
+		return this.#proc.pid;
 	}
 
 	/** Reads the native session identity through the host's public `get_state`, never by guessing a file name. */

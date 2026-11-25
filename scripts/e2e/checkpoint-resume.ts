@@ -1,10 +1,16 @@
 #!/usr/bin/env bun
-/** One real OMP restart: attached evidence skips successful jobs, not the one that failed. */
+/**
+ * One real OMP restart: attached evidence skips successful jobs, not the one that failed. The stopped run's closeout
+ * is checked as saved facts: its plain text and validated presentation metadata are in the native session file, so a
+ * restarted host can draw it again (or show the readable plain text), and the status view read after the restart
+ * carries the receipts the compact card no longer lists.
+ */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
 import {
-	choose, linkPlugin, LlmCursor, modelsYml, prepare, PROFILE_CONFIG, Rpc, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS,
+	choose, CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutOf, linkPlugin, LlmCursor, modelsYml, persistedStormRecords, prepare, PROFILE_CONFIG, Rpc, StormFiles, stormRecords,
+	Suite, startFakeLlm, TEAM_PROVIDERS,
 } from "./harness.ts";
 
 const env = prepare("storm-e2e-checkpoint", 18569);
@@ -51,7 +57,14 @@ try {
 					first.jobs?.some(job => job.name === "first" && job.status === "passed") === true &&
 					first.jobs.some(job => job.name === "retry" && job.status === "failed" && job.exitCode === 7) &&
 					starts().join(",") === "first,retry", JSON.stringify(first.jobs));
-				return { resume: original.sessionId, sessionDir: original.sessionDir, first };
+				const card = closeoutOf(original.frames, first.runId);
+				suite.check("the stopped run leaves one whole closeout card with its status pointer", card !== undefined &&
+					card.details?.kind === "closeout" && card.details.runId === first.runId && card.text.includes(CLOSEOUT_DETAIL) &&
+					stormRecords(original.frames).filter(record => record.text.includes(CLOSEOUT_HEADING)).length === 1,
+					JSON.stringify(card ?? null).slice(0, 800));
+				// The host may write its transcript lazily: ask again now that the run has ended.
+				const sessionFile = (await original.identify()).sessionFile;
+				return { resume: original.sessionId, sessionDir: original.sessionDir, first, sessionFile, cardText: card?.text ?? "" };
 			} finally {
 				await original.close();
 			}
@@ -60,7 +73,18 @@ try {
 		const resumed = new Rpc(env, choose("끝나지 않은 실행 이어 가기"), { model, resume: identity.resume, sessionDir: identity.sessionDir });
 		try {
 			await resumed.ready();
+			const savedRecords = identity.sessionFile === undefined ? [] : persistedStormRecords(identity.sessionFile).filter(record => record.details?.runId === identity.first.runId);
+			const saved = savedRecords.length === 1 ? savedRecords[0] : undefined;
+			suite.check("the closeout survives the restart as saved plain text with its validated metadata", saved !== undefined &&
+				saved.text.trimStart().startsWith(`### ${CLOSEOUT_HEADING}`) && saved.text.includes(CLOSEOUT_DETAIL) &&
+				saved.details?.kind === "closeout" && Array.isArray(saved.details.info) && identity.cardText.includes(saved.text.trim().slice(-40)),
+				JSON.stringify(saved ?? { sessionFile: identity.sessionFile ?? "unknown", records: savedRecords.length }).slice(0, 800));
 			const files = new StormFiles(env, resumed.sessionId);
+			const statusFrom = resumed.frames.length;
+			await resumed.prompt("/storm status");
+			const status = stormRecords(resumed.frames, statusFrom).at(-1)?.text ?? "";
+			suite.check("after the restart the status view still names the stopped run and its retried lane; the card listed no receipts", status.includes(identity.first.runId) &&
+				status.includes("retry") && !identity.cardText.includes("잡 영수증"), status.slice(0, 1200));
 			const before = files.runIds();
 			await resumed.prompt("/storm");
 			const second = await files.finishedRun(before, 30_000);

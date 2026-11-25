@@ -18,7 +18,6 @@ import {
 	agentsFlow,
 	approveAndSave,
 	autoDelegationFlow,
-	exportFlow,
 	type FlowEnv,
 	hubFlow,
 	modelsFlow,
@@ -80,16 +79,17 @@ import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
-import { replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
+import { noteLaneAgentStart, replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
-import { closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
+import { closeoutHandoff, closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
 import { DecisionRequests, decisionAsk } from "./runtime/decisions.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
-import { findResumeCandidate } from "./runtime/resume.ts";
+import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
+import { isRunId, readRun } from "./runtime/run.ts";
 import { treeAgainst, type TreeReading } from "./runtime/tree.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
@@ -115,7 +115,7 @@ import type {
 import { createUiPort, registerReportRenderer } from "./ui.ts";
 import { isLiveTui, LiveStatus } from "./view/live.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./view/appearance.ts";
-import { runStatusText } from "./view/render.ts";
+import { boundedHandoff, runStatusText } from "./view/render.ts";
 import { plannedResultLabels } from "./view/results.ts";
 import {
 	activeWorkerRunInTree,
@@ -138,7 +138,6 @@ const SHORTCUTS = [
 	{ value: "status", label: "status", description: "현황만 보기(메뉴 없음)" },
 	{ value: "models", label: "models", description: "모델 점검" },
 	{ value: "auto", label: "auto", description: "자동 위임 켜기/끄기(이 세션)" },
-	{ value: "export", label: "export", description: "팀 옵션을 복사용으로 내보내기(사람만)" },
 	{ value: "setup", label: "setup", description: "팀 다시 설정" },
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
@@ -388,6 +387,26 @@ function otherNativeWorkers(ctx: ExtensionContext, known: ReadonlySet<string>): 
 /** The approved reviewer agent of a run's team; a disabled or modelless reviewer is not authority. */
 function approvedReviewer(config: StormConfig | undefined): string | undefined {
 	return config === undefined ? undefined : usableRole(config, "reviewer")?.agent;
+}
+
+/**
+ * The approved reviewer's own task items with Storm's scoped answer review packets appended (see
+ * `RunController.answerReviewPackets`): the exact answer text, its receipt and anchor reach the reviewer in its
+ * per-task context, never a system prompt or another worker. Other items, and a call with no packet, are unchanged.
+ */
+function withAnswerReviewTask(input: Record<string, unknown>, reviewer: string | undefined, packets: string | undefined): Record<string, unknown> {
+	if (reviewer === undefined || packets === undefined) return input;
+	const add = (item: unknown): unknown => {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+		const entry = item as Record<string, unknown>;
+		if (entry.agent !== reviewer || typeof entry.task !== "string" || entry.task.trim() === "") return item;
+		return { ...entry, task: `${entry.task.trimEnd()}\n\n${packets}` };
+	};
+	if (Array.isArray(input.tasks)) {
+		const tasks = input.tasks.map(add);
+		return tasks.some((task, index) => task !== (input.tasks as unknown[])[index]) ? { ...input, tasks } : input;
+	}
+	return add(input) as Record<string, unknown>;
 }
 
 interface ReviewerBaseline {
@@ -1025,8 +1044,12 @@ export default function storm(pi: ExtensionAPI): void {
 		openWait(ctx, "ask", event.toolCallId);
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
-		if (event.toolName !== "ask") return;
-		closeWait(ctx, "ask", event.toolCallId);
+		if (event.toolName === "ask") closeWait(ctx, "ask", event.toolCallId);
+		// A call a hook blocked, or one the host cancelled, ends here with isError and no `tool_result`. A regular failed
+		// delivery also ends here and then reports its result; the release is exact and idempotent either way.
+		if (!event.isError || ctx.agent.kind !== "main") return;
+		const runId = runs.runId();
+		if (runId !== undefined) releaseFailedCall(runId, event.toolCallId);
 	});
 	// A tool approval is emitted only when a prompt is required; a no-UI host cannot answer one and claims no wait.
 	pi.on("tool_approval_requested", (event, ctx) => {
@@ -1529,6 +1552,47 @@ export default function storm(pi: ExtensionAPI): void {
 		});
 	});
 
+	/**
+	 * A child turn is running. The host emits `agent_start` for every turn, but `before_agent_start` only for a fresh
+	 * prompt or revive: a settled agent resumed by `write agent://<id>` never gets the latter. Both call this, so the
+	 * ledger entry turns running and a follow-up admitted for it stops being a pending start, in the run that owns its
+	 * lane. Idempotent; a child without the parent's run binding changes nothing.
+	 */
+	const noteChildTurnStart = (ctx: ExtensionContext, ledger: LedgerRun | undefined = childLedger(ctx)): void => {
+		if (ledger === undefined) return;
+		const { id, name, parentId } = ctx.agent;
+		noteAgentStart({
+			id,
+			name,
+			...(parentId ? { parentId } : {}),
+			...(name.startsWith(ROLE_AGENT_PREFIX) ? { role: name.slice(ROLE_AGENT_PREFIX.length) } : {}),
+			runId: ledger.runId,
+			scope: ledger.sessionDir,
+			now: Date.now(),
+		});
+		noteLaneAgentStart(ledger.runId, id);
+		touchRun(ledger.runId);
+	};
+
+	/**
+	 * Frees exactly what one failed, blocked or cancelled director call reserved, by the host's own call id: its
+	 * follow-up reactivation slot, its unspawned lane placements and its unstarted follow-up admission, plus any spawn
+	 * handles the call names. Work that already started (a running agent, an admitted worker) is never released, and
+	 * running it twice is harmless: the second call finds nothing of this call id left.
+	 */
+	const releaseFailedCall = (runId: string, callId: string, handles: readonly string[] = []): void => {
+		const scope = getLedgerRun(runId)?.sessionDir;
+		const running = new Set(scope === undefined ? [] : listAgents({ runId, scope }).filter(agent => agent.state === "running").map(agent => agent.id));
+		const followKey = `${runId}\0${callId}`;
+		const follow = followCapacityCalls.get(followKey);
+		followCapacityCalls.delete(followKey);
+		if (follow !== undefined && follow.runId === runId && !running.has(follow.agentId)) releaseWorkerSlot(runId, follow.agentId);
+		const placed = runs.runLanes()?.releaseCall(callId) ?? [];
+		for (const name of new Set([...placed, ...handles])) {
+			if (!running.has(name) && workerSlot(runId, name) !== undefined) releaseWorkerSlot(runId, name);
+		}
+	};
+
 	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind === "main") {
@@ -1586,20 +1650,10 @@ export default function storm(pi: ExtensionAPI): void {
 		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
 		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd.
 		if (ledger === undefined) return undefined;
-		const { id, name, parentId } = ctx.agent;
+		const { id, name } = ctx.agent;
 		const artifacts = artifactsOf(ctx);
 		childWorkTrees.set(reviewerBaselineKey(artifacts, id), ctx.cwd);
-		const runId = ledger.runId;
-		noteAgentStart({
-			id,
-			name,
-			...(parentId ? { parentId } : {}),
-			...(name.startsWith(ROLE_AGENT_PREFIX) ? { role: name.slice(ROLE_AGENT_PREFIX.length) } : {}),
-			runId,
-			scope: ledger.sessionDir,
-			now: Date.now(),
-		});
-		touchRun(runId);
+		noteChildTurnStart(ctx, ledger);
 		const roleChild = name.startsWith(ROLE_AGENT_PREFIX);
 		const state = await stateCache.get(runEnv(ledger));
 		const approvedConfig = state.config.status === "ok" && isApproved(state) ? state.config.config : undefined;
@@ -1829,8 +1883,9 @@ export default function storm(pi: ExtensionAPI): void {
 					...(readiness === undefined ? {} : { readiness }),
 					...(policyView === undefined || !policyView.ok ? {} : { policies: policyView.policies, canonicalFiles: policyView.canonicalFiles }),
 					agents: listAgents({ runId, scope: runScope }),
+					...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 					now: Date.now(),
-				};
+					};
 				return autoOn && plan !== undefined
 					? lanes.assign(event.input, plan, config, now)
 					: lanes.place(event.input, plan, config, now);
@@ -1853,9 +1908,11 @@ export default function storm(pi: ExtensionAPI): void {
 			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
 				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 			}
+			// The approved reviewer gets the exact submissions it must judge with its own task, not only an id or hash.
+			const finalInput = withAnswerReviewTask(placed.input, approvedReviewer(config), runs.answerReviewPackets());
 			// The exact toolCallId is host-issued; admitted sync children later carry it into their attempt id.
-			attempts.observeTaskCall({ runId, parentId: ctx.agent.id, toolCallId: event.toolCallId, input: placed.input, startedAt: Date.now() });
-			return placed.input === event.input ? undefined : { input: placed.input };
+			attempts.observeTaskCall({ runId, parentId: ctx.agent.id, toolCallId: event.toolCallId, input: finalInput, startedAt: Date.now() });
+			return finalInput === event.input ? undefined : { input: finalInput };
 		}
 		// Even a quiet `?progress` write can wake an idle OMP recipient. A read is the no-wake status path.
 		const progress = followUpProgress(event.toolName, event.input);
@@ -1924,12 +1981,21 @@ export default function storm(pi: ExtensionAPI): void {
 				for (const slot of reservedWorkers(runId)) known.add(slot.key);
 				nativeOther = otherNativeWorkers(ctx, known);
 			}
+			const authorityPolicy: LanePolicy | undefined = authority?.policy;
 			const gate = followLanes.checkFollowUp({
 				runId,
 				agentId: followAgent.id,
 				agent: followAgent.name,
 				...(followAgent.role === undefined ? {} : { role: followAgent.role }),
 				...(lane === undefined ? {} : { lane }),
+				// The enforced authority this worker actually runs under, with its canonical files, and the same auto
+				// flag a fresh task placement uses: a reactivation takes exactly the shared-write rule of a first task.
+				...(authorityPolicy === undefined ? {} : { policy: authorityPolicy }),
+				...(authorityPolicy?.kind === "paths" ? { canonicalFiles: authorityPolicy.paths } : {}),
+				auto: autoOn,
+				// A quiet progress note passes the gate but reserves nothing; a work note holds its lane until the turn starts.
+				...(progress ? { progress: true } : {}),
+				...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 				...(plan === undefined ? {} : { plan }),
 				config,
 				...(nativeLimit === undefined ? {} : { maxConcurrency: nativeLimit }),
@@ -1991,14 +2057,50 @@ export default function storm(pi: ExtensionAPI): void {
 			}
 		}
 		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
+		// A work-bearing follow-up that wakes the approved reviewer carries the scoped answer packets in that one message,
+		// so a resumed reviewer session judges the exact submissions too. A progress note stays a quiet note.
+		if (!progress && followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
+			const content = (event.input as { content?: unknown }).content;
+			const packets = runs.answerReviewPackets();
+			if (packets !== undefined && typeof content === "string" && content.trim() !== "") {
+				return { input: { ...event.input, content: `${content.trimEnd()}\n\n${packets}` } };
+			}
+		}
 		return undefined;
 	});
 
-	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run.
-	pi.on("session.compacting", () => {
+	/**
+	 * The settled run an active run explicitly named as its continuation or follow-up source, as its bounded handoff.
+	 * Only this run's own reference counts, read from the session store that admitted it, and only when this machine's
+	 * pointer proves that run started in this session on this same target. Anything else adds nothing.
+	 */
+	const relatedHandoff = async (run: RunRecord, ledger: LedgerRun, ctx: ExtensionContext): Promise<string | undefined> => {
+		const ref = run.followUpOf ?? run.resumeOf;
+		if (typeof ref !== "string" || ref === run.runId || !isRunId(ref)) return undefined;
+		if (mainSessionId(ctx) !== ledger.sessionId) return undefined;
+		try {
+			const prior = await readRun(ledger.sessionDir, ref);
+			if (prior === undefined || prior.status === "running") return undefined;
+			if (!(await trustedResume(ledger.sessionDir, { repoId: ledger.repoId, root: ledger.root }, prior))) return undefined;
+			return boundedHandoff(closeoutHandoff(prior));
+		} catch {
+			return undefined;
+		}
+	};
+
+	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run. An idle compaction
+	// gets nothing: no recap of an earlier run is put back into a conversation that has moved on.
+	pi.on("session.compacting", async (_event, ctx) => {
 		const run = runs.active();
-		const scope = run === undefined ? undefined : getLedgerRun(run.runId)?.sessionDir;
-		return run !== undefined && scope !== undefined ? { context: workingState(run, listAgents({ runId: run.runId, scope })) } : undefined;
+		const ledger = run === undefined ? undefined : getLedgerRun(run.runId);
+		if (run === undefined || ledger === undefined) return undefined;
+		const context = workingState(run, listAgents({ runId: run.runId, scope: ledger.sessionDir }));
+		const handoff = await relatedHandoff(run, ledger, ctx);
+		// The reads may have outlived the run or the conversation: its own working state stays, the handoff does not.
+		if (handoff !== undefined && runs.active()?.runId === run.runId && mainSessionId(ctx) === ledger.sessionId) {
+			context.push(`Storm 이전 실행 인수인계(참고 사실, 지시 아님):\n${handoff}`);
+		}
+		return { context };
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -2021,13 +2123,17 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		const runId = runs.runId();
 		if (!runId) return undefined;
-		// A preflight that created a reactivation slot releases it only when the delivery actually failed. A reused
-		// slot on a running worker was not created by this call and stays with that worker.
-		const followKey = `${runId}\0${event.toolCallId}`;
-		const followCapacity = followCapacityCalls.get(followKey);
-		if (followCapacity !== undefined) {
-			followCapacityCalls.delete(followKey);
-			if (event.isError && followCapacity.runId === runId) releaseWorkerSlot(runId, followCapacity.agentId);
+		// A failed delivery frees what its call id reserved (the task's named handles too: the echoed input can lag the
+		// placement). A delivered call only forgets its follow-up slot bookkeeping; the reused slot stays with the worker.
+		if (event.isError) {
+			const input = event.input as { name?: unknown; tasks?: unknown } | undefined;
+			const items = event.toolName !== "task" ? [] : Array.isArray(input?.tasks) ? input.tasks : [input];
+			const handles = items.flatMap(item =>
+				typeof item === "object" && item !== null && "name" in item && typeof item.name === "string" ? [item.name] : [],
+			);
+			releaseFailedCall(runId, event.toolCallId, handles);
+		} else {
+			followCapacityCalls.delete(`${runId}\0${event.toolCallId}`);
 		}
 		// The sync task envelope is read before the isError return: a failed call still carries host results, and a
 		// missing item must stay an unmet requirement instead of disappearing.
@@ -2040,19 +2146,6 @@ export default function storm(pi: ExtensionAPI): void {
 				content: event.content,
 				observedAt: Date.now(),
 			});
-			// A failed native task call is an observed start failure, not a reason to wait out a timer. Release only
-			// reserved starts that never became a running worker; a running sibling keeps its slot until it settles.
-			if (event.isError) {
-				const input = event.input as { name?: unknown; tasks?: unknown } | undefined;
-				const items = Array.isArray(input?.tasks) ? input.tasks : [input];
-				const scope = getLedgerRun(runId)?.sessionDir;
-				if (scope === undefined) return undefined;
-				const running = new Set(listAgents({ runId, scope }).filter(agent => agent.state === "running").map(agent => agent.id));
-				for (const item of items) {
-					const name = typeof item === "object" && item !== null && "name" in item && typeof item.name === "string" ? item.name : undefined;
-					if (name !== undefined && workerSlot(runId, name) !== undefined && !running.has(name)) releaseWorkerSlot(runId, name);
-				}
-			}
 		}
 		// A native `wait` consumes completed background jobs, so its terminal task rows are deliveries even though no
 		// `async-result` message follows. The collector accepts only exact admitted rows with a real deliverable.
@@ -2092,7 +2185,9 @@ export default function storm(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	pi.on("agent_start", () => {
+	pi.on("agent_start", (_event, ctx) => {
+		// Every child turn, including a settled agent resumed by a follow-up (which has no before_agent_start).
+		if (ctx.agent.kind === "sub") noteChildTurnStart(ctx);
 		runs.onAgentStart();
 	});
 
@@ -2262,16 +2357,45 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * A closeout direction is chosen by the user typing its number, not by a model tool. Only direct interactive
-	 * text from this main session can reach it; the controller accepts an exact 1-3 while one just-finished run
-	 * still offers them and invalidates the offer on any other real input. The pick starts asynchronously through
-	 * the same user-authorized path as /storm, so no streaming turn is awaited and no input is generated here.
+	 * A numbered resume continues exactly the run its card named, through the same resume spec /storm uses. Every
+	 * fact is read again after the pick: the conversation and its generation are unchanged, the session is idle, the
+	 * team is approved, and this machine's trusted candidate for the current target is that very run. A different or
+	 * newer candidate is never substituted, and nothing is retargeted.
+	 */
+	const startCloseoutResume = async (ctx: ExtensionContext, runId: string): Promise<RunRequestResult> => {
+		const stale: RunRequestResult = { ok: false, reason: "대화가 바뀌어 이전 카드의 실행을 이어 가지 않았습니다." };
+		const sessionId = mainSessionId(ctx);
+		if (sessionId === undefined) return stale;
+		const generation = sessionGeneration;
+		const current = (): boolean => generation === sessionGeneration && mainSessionId(ctx) === sessionId;
+		const state = await loadProjectState(projectEnv(ctx));
+		if (!current()) return stale;
+		if (!isApproved(state)) {
+			return { ok: false, reason: "팀 설정이 승인되지 않았거나 승인 뒤에 바뀌어 이어 가지 않았습니다. /storm 에서 확인하세요." };
+		}
+		const candidate = await findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root });
+		if (!current()) return stale;
+		if (candidate === undefined || candidate.runId !== runId) {
+			return { ok: false, reason: "카드의 실행은 지금 이 작업 대상에서 이어 갈 실행이 아닙니다. /storm 에서 현황을 확인하세요." };
+		}
+		if (!ctx.isIdle()) return { ok: false, reason: "세션이 응답 중이라 이어 가지 않았습니다. 응답이 끝난 뒤 /storm 에서 이어 가세요." };
+		const spec = resumeSpec(candidate);
+		if (!spec.ok) return { ok: false, reason: spec.error };
+		return startUserRun(ctx, spec.spec);
+	};
+
+	/**
+	 * A closeout action is chosen by the user typing its number, not by a model tool. Only direct interactive text
+	 * from this main session's terminal UI can reach it; the runtime accepts an exact number once, while one
+	 * just-finished run still offers it, and invalidates the offer on any other real input. Another host's input never
+	 * reads, and so never consumes, the offer. The pick starts asynchronously through the same user-authorized path as
+	 * /storm: a new direction carries the settled run only as its follow-up context, a resume is the native resume.
 	 */
 	pi.on("input", (event, ctx) => {
 		// A host with no UI never showed the menu; its text is not a choice, even if a stale card was recorded.
 		if (event.source !== "interactive" || ctx.agent.kind !== "main" || !ctx.hasUI) return undefined;
-		const direction = takeCloseoutChoice(ctx, event.text);
-		if (direction === undefined) {
+		const choice = ctx.mode === "tui" ? takeCloseoutChoice(ctx, event.text) : undefined;
+		if (choice === undefined) {
 			// A direct scope/retry adjustment is a native action at submission, like the closeout pick above. The input
 			// event carries a source but no delivery id, and a later model call is not delivery proof; only this exact
 			// interactive submission can apply it. Unmatched instructions, questions, quotes, code and complex turns
@@ -2297,7 +2421,10 @@ export default function storm(pi: ExtensionAPI): void {
 			if (ctx.hasUI) ctx.ui.notify(`Storm 실행을 시작하지 못했습니다: ${refusal}`, "warning");
 			return { handled: true };
 		}
-		void startUserRun(ctx, { task: direction }).then(
+		const { runId, action } = choice;
+		const started =
+			action.kind === "resume" ? startCloseoutResume(ctx, runId) : startUserRun(ctx, { task: action.task, followUpOf: runId });
+		void started.then(
 			result => {
 				if (!result.ok && ctx.hasUI) ctx.ui.notify(`Storm 실행을 시작하지 못했습니다: ${result.reason}`, "warning");
 			},
@@ -2455,7 +2582,6 @@ export default function storm(pi: ExtensionAPI): void {
 				else if (input === "status") await statusFlow(env, ui);
 				else if (input === "models") await modelsFlow(env, ui);
 				else if (input === "auto") await autoDelegationFlow(env, ui);
-				else if (input === "export") await exportFlow(env, ui);
 				else if (SHORTCUT_NAMES.includes(input)) {
 					if (!ctx.hasUI) ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm 으로 현황은 볼 수 있습니다.", "warning");
 					else if (input === "setup") await setupFlow(env, ui);
