@@ -151,7 +151,7 @@ describe("common settings form", () => {
 		const form = parseHtmlForm(commonSettingsForm(input()));
 		expect(defaultFormData(form)).toEqual({
 			context_cap: 200_000,
-			rounds: 3,
+			rounds: "",
 			budget_usd: 0,
 			budget_warn_usd: 0,
 			budget_exceed: "block-spawns",
@@ -160,7 +160,7 @@ describe("common settings form", () => {
 		});
 		expect(form.fields.map(f => f.name)).toEqual(["context_cap", "rounds", "budget_usd", "budget_warn_usd", "budget_exceed", "cleanup", "docs"]);
 		const rounds = textOf(form, "rounds");
-		expect([rounds.type, rounds.min, rounds.max, rounds.required]).toEqual(["number", 0, 10, true]);
+		expect([rounds.type, rounds.min, rounds.max, rounds.required]).toEqual(["number", 0, 10, false]);
 		expect(textOf(form, "budget_usd").min).toBe(0);
 		expect(values(choiceOf(form, "budget_exceed"))).toEqual(["block-spawns", "stop"]);
 	});
@@ -234,19 +234,34 @@ describe("answers to config", () => {
 		expect(validateConfig(built).warnings).toEqual([]);
 	});
 
-	test("rounds opens on the value in force and is written only when it differs from the default", () => {
+	test("rounds is written only when a number was typed; blank means no limit", () => {
+		// A blank field submits as an empty string, which is how the form parser hands back an untouched number input.
 		expect(configOf(submit(input()))).not.toHaveProperty("rounds");
+		expect(configOf(submit(input(), { rounds: "" }))).not.toHaveProperty("rounds");
 		expect(configOf(submit(input(), { rounds: 0 })).rounds).toBe(0);
+		expect(configOf(submit(input(), { rounds: 3 })).rounds).toBe(3);
 		expect(configOf(submit(input(), { rounds: 10 })).rounds).toBe(10);
-		// Typing the default over an absent setting says nothing new.
-		expect(configOf(submit(input(), { rounds: 3 }))).not.toHaveProperty("rounds");
 		const current: StormConfig = { ...TEAM, rounds: 5 };
+		// An existing value is shown and kept; blanking it removes the limit.
+		expect(defaultFormData(parseHtmlForm(commonSettingsForm(input(current)))).rounds).toBe(5);
 		expect(configOf(submit(input(current)))).toEqual(current);
+		expect(configOf(submit(input(current), { rounds: "" }))).not.toHaveProperty("rounds");
 		expect(configOf(submit(input(current), { rounds: 3 })).rounds).toBe(3);
 	});
 
+	test("a retry after another field's error keeps the rounds field blank", () => {
+		const inp = input();
+		const answers: FormData = { ...defaultFormData(parseHtmlForm(commonSettingsForm(inp))), context_cap: 0 };
+		expect(answers.rounds).toBe("");
+		const built = submit(inp, { context_cap: 0 });
+		expect("errors" in built && built.errors.length).toBeGreaterThan(0);
+		const reopened = parseHtmlForm(commonSettingsForm(inp, { answers, errors: ["error-one"] }));
+		expect(defaultFormData(reopened).rounds).toBe("");
+		expect(textOf(reopened, "rounds").required).toBe(false);
+	});
+
 	test("rounds outside 0~10 is an error and gives no config", () => {
-		for (const rounds of [-1, 11, 2.5, ""]) {
+		for (const rounds of [-1, 11, 2.5]) {
 			const built = submit(input(), { rounds });
 			expect("errors" in built && built.errors).toHaveLength(1);
 			expect("config" in built).toBe(false);

@@ -4,7 +4,7 @@ import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { DEFAULT_CONTEXT_CAP, ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { reviewLine } from "../runtime/review.ts";
-import { DEFAULT_EXTRA_ROUNDS, endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
+import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import { resultProgress, resultRowText, type ResultProgress } from "./results.ts";
 import type {
@@ -330,9 +330,9 @@ function capText(cap: number | undefined): string {
 	return cap === undefined ? `기본(${int(DEFAULT_CONTEXT_CAP)})` : int(cap);
 }
 
-/** The extra-rounds setting: the number in force, an absent one marked as the default like the context cap. */
+/** The extra-rounds setting: the number in force; an absent one is no limit. */
 function roundsText(rounds: number | undefined): string {
-	return rounds === undefined ? `기본(${DEFAULT_EXTRA_ROUNDS})` : String(rounds);
+	return rounds === undefined ? "제한 없음" : String(rounds);
 }
 
 /** One status line of a role: models, effort, worker range and its own context cap. */
@@ -641,7 +641,7 @@ export function renderStatus(
 		heading("실행 설정");
 		out.push(
 			`- 격리: ${ISOLATION[team.isolation]}`,
-			`- 추가 라운드: ${team.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
+			`- 추가 라운드: ${team.rounds ?? "제한 없음"}`,
 			`- 컨텍스트 상한: ${int(team.contextCap ?? DEFAULT_CONTEXT_CAP)} 토큰`,
 			`- 예산: ${team.budget ? budgetText(team.budget) : "없음"}`,
 			`- 실행 중 다른 에이전트: ${visible(fallbackText(team.fallbackRole))}`,

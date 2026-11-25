@@ -233,6 +233,21 @@ describe("the live run widget", () => {
 		live.clear();
 	});
 
+	test("an uncapped run shows the round without a maximum, at 60 cells and in the native chips", () => {
+		vi.useFakeTimers();
+		const host = widgetHost();
+		const live = liveForTest();
+		const { maxRounds: _capped, ...open } = RUN;
+		live.show(host.ctx, { ...open, turns: 2 });
+		const component = host.widgets.get(LIVE_WIDGET_KEY)!;
+		const rows = component.render(60);
+		expect(rows.every(line => visibleWidth(line) <= 60)).toBe(true);
+		expect(plain(rows)[1]).toBe("› ↻ 3라운드 · 👥 1/2 · 💲 $0.1200/$5.00 · ⏱ 3분");
+		const [, metrics] = children(component.describe!(describeContext)!);
+		expect(metricChips(metrics!).map(chip => nativeProps(chip).aria)[0]).toBe("라운드 3");
+		live.clear();
+	});
+
 	test("a still phase stops the one timer immediately and snaps to still; resuming and ending leave no extra", () => {
 		vi.useFakeTimers();
 		const host = widgetHost();

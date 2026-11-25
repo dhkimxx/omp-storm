@@ -11,12 +11,14 @@ import {
 	protectedResumeRunIds,
 	resumeCandidate,
 	resumePointerFile,
+	resumeSpec,
 	RESUME_POINTERS_MAX,
 	type ResumeTarget,
 	trustedResume,
 } from "../src/runtime/resume.ts";
+import { maxRounds } from "../src/runtime/rounds.ts";
 import type { RunRecord } from "../src/types.ts";
-import { runRecord } from "./fixtures.ts";
+import { runRecord, teamOf } from "./fixtures.ts";
 
 let tmp: string;
 let sessionDir: string;
@@ -341,5 +343,23 @@ describe("run record reads", () => {
 		const dirId = "run-20261120-100004-dir";
 		await mkdir(path.join(dir, `${dirId}.json`), { recursive: true });
 		expect(await readRun(sessionDir, dirId)).toBeUndefined();
+	});
+});
+
+describe("resume round limits", () => {
+	const team = teamOf({ implementer: "a/i", reviewer: "a/r" });
+	const capOf = (record: RunRecord): number | undefined => {
+		const spec = resumeSpec({ ...record, request: record.request ?? record.task });
+		if (!spec.ok) throw new Error(spec.error);
+		return maxRounds(spec.spec, team);
+	};
+
+	test("an explicit request limit of the earlier run carries over to the resumed run", () => {
+		expect(capOf(run({ limits: { rounds: 2 }, maxRounds: 2 }))).toBe(2);
+	});
+
+	test("a run without an explicit limit resumes uncapped, even if its record shows an old default cap", () => {
+		expect(capOf(run())).toBeUndefined();
+		expect(capOf(run({ maxRounds: 4, turns: 4, endReason: "round-limit" }))).toBeUndefined();
 	});
 });

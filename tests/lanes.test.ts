@@ -93,7 +93,7 @@ test("shared placement flags only planned isolation lanes and strips an unplanne
 	expect(tasks[0]).not.toHaveProperty("isolated");
 	expect(tasks[1]).toMatchObject({ name: "probe", isolated: true });
 	// The batch placement holds 'probe' until its spawn is correlated; the host never started it here.
-	work.cancel("probe");
+	work.cancel("probe", work.placementOf("probe"));
 	// The manual handle is kept: only a selected lane's placement changes.
 	const flat = work.place({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
 	expect(flat.ok && flat.input).toMatchObject({ name: "probe", isolated: true });
@@ -112,7 +112,7 @@ test("a batch-wide isolated shorthand cannot leak into shared items", () => {
 	expect(plain.input).not.toHaveProperty("isolated");
 	expect((plain.input.tasks as Array<Record<string, unknown>>)[0]).not.toHaveProperty("isolated");
 	// The first placement never became a worker; release its write scope before placing the same lane again.
-	work.cancel("api");
+	work.cancel("api", work.placementOf("api"));
 
 	const selected = plan(lane("api", "Implement API"), { ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent" });
 	const placed = work.place(
@@ -401,7 +401,7 @@ test("a consumer is refused until its declared prerequisite state holds, and mis
 	const accepted = place();
 	expect(accepted.ok).toBe(true);
 	// The accepted placement holds its lane until its spawn is correlated; the host never started it here.
-	work.cancel("consumer");
+	work.cancel("consumer", work.placementOf("consumer"));
 	// A producer that is running again may still change the result: an accepted old row is not final input.
 	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Compare" }, consumerPlan, team, { readiness: readinessOf("accepted", false, true) }).ok).toBe(false);
 	// The accepted reference is short, versioned and path-bearing; a host path or model prose never appears.
@@ -412,7 +412,7 @@ test("a consumer is refused until its declared prerequisite state holds, and mis
 	const ok = work.place({ agent: "storm-explorer", name: "consumer", task: "Build" }, integratedPlan, team, { readiness: readinessOf("accepted", true) });
 	expect(ok.ok).toBe(true);
 	if (ok.ok) expect(String(ok.input.task)).toContain("r1=accepted·통합@01234567 out.txt");
-	work.cancel("consumer");
+	work.cancel("consumer", work.placementOf("consumer"));
 	// `reviewable` admits a submission to judge, including one whose result is only reviewable.
 	expect(work.place({ agent: "storm-explorer", name: "consumer", task: "Review" }, plan(producer, consumer("reviewable")), team, { readiness: readinessOf("reviewable") }).ok).toBe(true);
 });
@@ -487,7 +487,7 @@ test("a cancelled placement releases its write and a work follow-up passes the s
 	);
 	const work = new RunLanes("run-follow");
 	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
-	work.cancel("W0");
+	work.cancel("W0", work.placementOf("W0"));
 	expect(work.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, team).ok).toBe(true);
 	work.admit({ spawnKey: "H0", agent: "storm-implementer", outcome: "routed" }, { plan: shared, config: team });
 	const running = [agentEntry({ id: "H0", state: "running" })];
@@ -517,7 +517,7 @@ test("a reserved or running lane refuses a second independent dispatch even when
 	const batch = work.place({ tasks: [{ agent: "storm-explorer", name: "R0", task: "Read" }, { agent: "storm-explorer", name: "R1", task: "Read" }] }, reads, team);
 	expect(batch.ok).toBe(false);
 	expect(read("R1").ok).toBe(true);
-	work.cancel("R1");
+	work.cancel("R1", work.placementOf("R1"));
 	work.admit({ spawnKey: "R0", agent: "storm-explorer", outcome: "routed" }, { plan: reads, config: team });
 	// Admitted: the agent's own state decides, including the moment before the host list shows it.
 	expect(read("R0", []).ok).toBe(false);
@@ -530,7 +530,7 @@ test("a placement that never reached a spawn stops holding its lane when cancell
 	const work = new RunLanes("run-stale");
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: 0 }).ok).toBe(true);
 	expect(work.laneBusy("R0", [], 1)).toBe(true);
-	work.cancel("R0");
+	work.cancel("R0", work.placementOf("R0"));
 	expect(work.laneBusy("R0", [], 2)).toBe(false);
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: 3 }).ok).toBe(true);
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: PENDING_WRITE_MS + 4 }).ok).toBe(true);
@@ -638,7 +638,7 @@ test("a failed follow-up or task call releases only its own reservation by call 
 	expect(auto.assign({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { callId: "t2" }).ok).toBe(true);
 });
 
-test("a progress-only note passes the writer and pending-lane guards without reserving what the same work cannot", () => {
+test("a progress-only note to an idle agent meets the writer guard but reserves nothing; a running recipient is not a new writer", () => {
 	const bash: LanePolicy = { kind: "unknown", reason: "임의 실행 도구" };
 	const shared = plan(
 		{ name: "H0", kind: "code", role: "implementer", files: ["tracked.txt"] },
@@ -668,35 +668,43 @@ test("a progress-only note passes the writer and pending-lane guards without res
 	const denied = follow(writing, shared.lanes[0]!, { runId, agents: runningW0 });
 	expect(denied.ok).toBe(false);
 	if (!denied.ok) expect(denied.code).toBe("lane-write");
-	// The identical progress note is not work: it is admitted without a write lease, slot or lane hold.
+	// The note wakes an idle recipient into a turn that may write, so it meets the same scope conflict; a refused note
+	// reserves nothing.
 	const note = follow(writing, shared.lanes[0]!, { runId, agents: runningW0, progress: true, callId: "progress-1" });
-	expect(note.ok).toBe(true);
-	if (note.ok) {
-		expect(note.reserved).toBeUndefined();
-		writing.finishFollowUp(note.token, true);
-	}
+	expect(note.ok).toBe(false);
+	if (!note.ok) expect(note.code).toBe("lane-write");
 	expect(reservedWorkers(runId)).toEqual([]);
 	expect(writing.laneBusy("H0", [agentEntry({ id: "H0", state: "idle" })])).toBe(false);
+	// A note to a recipient that is already running adds no writer: it passes without a lease, slot or lane hold.
+	const runningBoth = [...runningW0, agentEntry({ id: "H0", state: "running" })];
+	const live = follow(writing, shared.lanes[0]!, { runId, agents: runningBoth, progress: true, callId: "progress-2" });
+	expect(live.ok).toBe(true);
+	if (live.ok) {
+		expect(live.reserved).toBeUndefined();
+		writing.finishFollowUp(live.token, true);
+	}
+	expect(reservedWorkers(runId)).toEqual([]);
 	// It leaves W0's ownership alone: the same work message is still refused after the note.
 	const after = follow(writing, shared.lanes[0]!, { runId, agents: runningW0 });
 	expect(after.ok).toBe(false);
 	if (!after.ok) expect(after.code).toBe("lane-write");
 
-	// A pending placement of the same logical lane holds it: the work message is lane-busy, the note is not.
+	// A pending placement of the same logical lane holds it: the work message is lane-busy.
 	const pending = new RunLanes("run-progress-pending");
 	expect(pending.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, teamWithQuick, { policies: new Map([["H0", bash]]) }).ok).toBe(true);
 	const idleH0 = [agentEntry({ id: "H0", state: "idle" })];
 	const pendingWork = follow(pending, shared.lanes[0]!, { agents: idleH0 });
 	expect(pendingWork.ok).toBe(false);
 	if (!pendingWork.ok) expect(pendingWork.code).toBe("lane-busy");
+	// The pending placement holds the lane's own write scope, so a note that would wake the idle agent is refused too.
 	const pendingNote = follow(pending, shared.lanes[0]!, { agents: idleH0, progress: true });
-	expect(pendingNote.ok).toBe(true);
-	if (pendingNote.ok) pending.finishFollowUp(pendingNote.token, true);
+	expect(pendingNote.ok).toBe(false);
+	if (!pendingNote.ok) expect(pendingNote.code).toBe("lane-write");
 	// It neither released nor inherited the pending work: the duplicate logical lane is still busy.
 	const duplicate = pending.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, teamWithQuick, { policies: new Map([["H0", bash]]) });
 	expect(duplicate.ok).toBe(false);
 	if (!duplicate.ok) expect(duplicate.code).toBe("lane-busy");
-	pending.cancel("H0");
+	pending.cancel("H0", pending.placementOf("H0"));
 	expect(pending.laneBusy("H0")).toBe(false);
 });
 
@@ -875,4 +883,65 @@ test("approved capability policies drive read-only, path and blocked scopes; a l
 	const lateAdmit = work.admitChecked({ spawnKey: "late", agent: "storm-implementer", outcome: "routed" }, { plan: paths, config: scheduling });
 	expect(lateAdmit.ok).toBe(false);
 	if (!lateAdmit.ok) expect(lateAdmit.code).toBe("lane-write");
+});
+test("a late cancel of an older spawn leaves a newer call's placement of the same name in place", () => {
+	const api = lane("api", "Implement API");
+	const view: PlanLane = { ...lane("view", "Render output"), files: ["api.ts"] };
+	const p = plan(api, view);
+	const work = new RunLanes("run-late-cancel");
+	const place = (now: number) => work.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team, { now });
+	expect(place(0).ok).toBe(true);
+	const older = work.placementOf("api");
+	expect(older).toBeDefined();
+	// The older call never reached a worker and its pending window expired, so the same name is placed again.
+	const later = PENDING_WRITE_MS + 1;
+	expect(place(later).ok).toBe(true);
+	const newer = work.placementOf("api");
+	expect(newer).not.toBe(older);
+	// The older spawn's refusal lands now: the newer hold and its write reservation must both survive.
+	work.cancel("api", older);
+	expect(work.laneBusy("api", [], later + 1)).toBe(true);
+	const conflict = work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team, { now: later + 2 });
+	expect(conflict.ok).toBe(false);
+	if (!conflict.ok) expect(conflict.code).toBe("lane-write");
+	// The newer call's own refusal releases everything it placed.
+	work.cancel("api", newer);
+	expect(work.laneBusy("api", [], later + 3)).toBe(false);
+	expect(work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team, { now: later + 4 }).ok).toBe(true);
+});
+
+test("a cancel stamped with another placement keeps a pending assignment, and its own stamp releases it", () => {
+	const p = plan(lane("api", "Implement API"));
+	const work = new RunLanes("run-assignment");
+	const first = assigned(work, p, "api");
+	const stale = work.placementOf(first);
+	work.cancel(first, stale);
+	const second = assigned(work, p, "api");
+	expect(second).not.toBe(first);
+	work.cancel(second, stale);
+	expect(work.admit({ spawnKey: second, agent: "storm-implementer", outcome: "routed" })).toBe("api");
+});
+
+test("a refused spawn releases the write reservation its admission bound, so the lane's writer slot is free for the next one", () => {
+	const api = lane("api", "Implement API");
+	const view: PlanLane = { ...lane("view", "Render output"), files: ["api.ts"] };
+	const p = plan(api, view);
+	const work = new RunLanes("run-bound-cancel");
+	expect(work.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
+	// Read before the decision awaits; admission later binds the spawn id to the reservation.
+	const stamp = work.placementOf("api");
+	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }).ok).toBe(true);
+	work.cancel("api", stamp);
+	expect(work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team).ok).toBe(true);
+});
+
+test("a cancel for one run's lanes never touches the placement of another run's lanes", () => {
+	const p = plan(lane("api", "Implement API"));
+	const older = new RunLanes("run-older");
+	const current = new RunLanes("run-current");
+	expect(older.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
+	expect(current.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
+	older.cancel("api", older.placementOf("api"));
+	expect(older.laneBusy("api")).toBe(false);
+	expect(current.laneBusy("api")).toBe(true);
 });

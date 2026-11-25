@@ -332,34 +332,19 @@ describe("reviewGate with the work tree", () => {
 		expect(gate && "by" in gate).toBe(false);
 	});
 
-	test("a matching verdict after the one tree re-review passes; a mismatch stops instead of re-reviewing again", () => {
+	test("a re-review that matches the tree passes; a tree that moved again stays tree-stale, never a gate-level stop", () => {
 		const matching = reviewer(T0 + 2, true, { tree: NOW });
 		expect(passing([implementer, matching], {}, { start: CLEAN, now: CHANGED })).toEqual({ state: "passed" });
-		expect(reviewGate([implementer, matching], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 1 }, coverage())).toEqual({ state: "passed" });
-
-		// The one tree-only re-review is already spent: a later verdict on the old tree cannot buy another round.
+		// How many tree-only re-reviews are worth a round is the round rules' progress question, not the gate's.
 		const old = reviewer(T0 + 2, true, { tree: "d0:f0" });
-		expect(passing([implementer, old], {}, { start: CLEAN, now: CHANGED })).toMatchObject({ state: "unverified", cause: "stale-review", by: "tree" });
-		expect(reviewGate([implementer, old], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 1 })).toEqual({
+		expect(passing([implementer, old], {}, { start: CLEAN, now: CHANGED })).toEqual({
 			state: "unverified",
 			cause: "stale-review",
 			by: "tree",
-			exhausted: true,
 			changes: 0,
 			reviews: 1,
 			requests: 2,
 		});
-	});
-
-	test("the one tree re-review does not excuse a verdict older than the last tool change", () => {
-		const gate = reviewGate(
-			[writer({ lastChangeAt: T0 }), reviewer(T0, true, { tree: NOW })],
-			TEAM,
-			{ start: CLEAN, now: CHANGED, rereviewedAt: T0 - 1 },
-		);
-		expect(gate).toMatchObject({ state: "unverified", cause: "stale-review" });
-		expect(gate && "by" in gate).toBe(false);
-		expect(gate && "exhausted" in gate).toBe(false);
 	});
 
 	test("a known start with an unreadable tree now counts as a change", () => {
@@ -389,7 +374,7 @@ describe("reviewGate with the work tree", () => {
 
 	test("an incorrect verdict is incorrect, never tree-stale", () => {
 		const wrong = reviewer(T0 + 2, false, { tree: "d0:f0" });
-		expect(reviewGate([implementer, wrong], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 3 })).toEqual({
+		expect(reviewGate([implementer, wrong], TEAM, { start: CLEAN, now: CHANGED })).toEqual({
 			state: "unverified",
 			cause: "incorrect",
 			changes: 0,
@@ -398,10 +383,10 @@ describe("reviewGate with the work tree", () => {
 		});
 	});
 
-	test("another agent active after the verdict makes a tree change team-stale even after the one tree round", () => {
+	test("another agent active after the verdict makes a tree change team-stale", () => {
 		const rev = reviewer(T0 + 2, true, { tree: "d0:f0" });
 		const worker = agentEntry({ id: "Impl", role: "implementer", changes: 0, lastActivityAt: T0 + 3 });
-		const gate = reviewGate([worker, rev], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 100 });
+		const gate = reviewGate([worker, rev], TEAM, { start: CLEAN, now: CHANGED });
 		expect(gate).toMatchObject({ state: "unverified", cause: "stale-review" });
 		expect(gate && "by" in gate).toBe(false);
 	});
@@ -684,8 +669,8 @@ describe("reviewGate P0 evidence", () => {
 describe("maxRounds", () => {
 	const config = (rounds?: number): StormConfig => teamOf({}, rounds === undefined ? {} : { rounds });
 
-	test("the first round plus the default extra rounds", () => {
-		expect(maxRounds({}, config())).toBe(4);
+	test("a config without rounds and a request without a limit leave the run uncapped", () => {
+		expect(maxRounds({}, config())).toBeUndefined();
 	});
 
 	test("config extra rounds count on top of the first round", () => {
@@ -697,8 +682,12 @@ describe("maxRounds", () => {
 		expect(maxRounds({ rounds: 2 }, config(5))).toBe(2);
 	});
 
-	test("a config value that is not an integer in 0..10 is absent", () => {
-		for (const bad of [-1, 1.5, 99]) expect(maxRounds({}, config(bad))).toBe(4);
+	test("a config value that is not an integer in 0..10 is absent, so the run is uncapped", () => {
+		for (const bad of [-1, 1.5, 99]) expect(maxRounds({}, config(bad))).toBeUndefined();
+	});
+
+	test("a request limit caps a run whose config has no rounds", () => {
+		expect(maxRounds({ rounds: 2 }, config())).toBe(2);
 	});
 });
 
@@ -736,15 +725,6 @@ describe("decideRound", () => {
 		});
 	});
 
-	test("an exhausted tree re-review stops honestly instead of sending another round", () => {
-		const gate = unverified({ cause: "stale-review", by: "tree", exhausted: true });
-		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 1, requests: 1 } })).toEqual({
-			action: "end",
-			reason: "no-progress",
-		});
-		expect(decideRound({ ...base, gate, overBudget: true })).toEqual({ action: "end", reason: "budget" });
-	});
-
 	test("no rounds left ends on the round limit before the time limit", () => {
 		expect(decideRound({ ...base, turns: 4, minutes: 1, elapsedMs: 60_000 })).toEqual({
 			action: "end",
@@ -758,26 +738,92 @@ describe("decideRound", () => {
 	});
 
 	test("no progress needs changes, reviews and requests unchanged", () => {
-		expect(decideRound({ ...base, progressSince: { changes: 1, reviews: 0, requests: 0 } })).toEqual({
+		expect(decideRound({ ...base, progressSince: { changes: 1, reviews: 0, requests: 0 }, stalled: 1 })).toEqual({
 			action: "end",
 			reason: "no-progress",
 		});
-		expect(decideRound({ ...base, progressSince: { changes: 1, reviews: 1, requests: 0 } })).toMatchObject({ action: "continue" });
-		expect(decideRound({ ...base, progressSince: { changes: 2, reviews: 0, requests: 0 } })).toMatchObject({ action: "continue" });
+		expect(decideRound({ ...base, progressSince: { changes: 1, reviews: 1, requests: 0 }, stalled: 1 })).toMatchObject({ action: "continue", stalled: 0 });
+		expect(decideRound({ ...base, progressSince: { changes: 2, reviews: 0, requests: 0 }, stalled: 1 })).toMatchObject({ action: "continue", stalled: 0 });
 	});
 
 	test("an agent request alone is progress, and three unchanged counts are none", () => {
 		const gate = unverified({ changes: 0, reviews: 0, requests: 2 });
-		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1 } })).toMatchObject({ action: "continue" });
-		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 2 } })).toEqual({
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1 }, stalled: 1 })).toMatchObject({ action: "continue", stalled: 0 });
+		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 2 }, stalled: 1 })).toEqual({
 			action: "end",
 			reason: "no-progress",
 		});
 	});
 
+	test("one round without progress continues with a stall count; two in a row end; progress in between resets", () => {
+		// Uncapped, so the only possible end in this sequence is the stall rule.
+		const open = { ...base, maxRounds: undefined };
+		const still = { changes: 1, reviews: 0, requests: 0 };
+		const first = decideRound({ ...open, turns: 2, progressSince: still });
+		expect(first).toMatchObject({ action: "continue", round: 3, stalled: 1 });
+		const stalled = first.action === "continue" ? first.stalled : 0;
+		expect(decideRound({ ...open, turns: 3, progressSince: still, stalled })).toEqual({ action: "end", reason: "no-progress" });
+		// A round that moved anything resets the count, so the next quiet round is a first one again.
+		const moved = decideRound({ ...open, turns: 3, progressSince: { changes: 0, reviews: 0, requests: 0 }, stalled });
+		expect(moved).toMatchObject({ action: "continue", stalled: 0 });
+		const reset = moved.action === "continue" ? moved.stalled : 9;
+		expect(decideRound({ ...open, turns: 4, progressSince: still, stalled: reset })).toMatchObject({ action: "continue", stalled: 1 });
+	});
+
+	test("without a stored baseline a round is progress, whatever the stall count was", () => {
+		expect(decideRound({ ...base, stalled: 1 })).toMatchObject({ action: "continue", stalled: 0 });
+	});
+
+	test("an uncapped run keeps sending rounds past four while each round shows progress", () => {
+		const uncapped = { gate: unverified(), aborted: false, overBudget: false, elapsedMs: 0 };
+		let stalled = 0;
+		for (let turns = 1; turns <= 12; turns++) {
+			const decision = decideRound({ ...uncapped, gate: unverified({ changes: turns + 1 }), turns, progressSince: { changes: turns, reviews: 0, requests: 0 }, stalled });
+			expect(decision).toMatchObject({ action: "continue", round: turns + 1, stalled: 0 });
+			expect(decision.action === "continue" && "maxRounds" in decision).toBe(false);
+			if (decision.action === "continue") stalled = decision.stalled;
+		}
+		expect(decideRound({ ...uncapped, turns: 13, gate: { state: "passed" } })).toEqual({ action: "end", reason: "verified" });
+	});
+
+	test("round-limit ends only a capped run", () => {
+		expect(decideRound({ ...base, turns: 1, maxRounds: 1 })).toEqual({ action: "end", reason: "round-limit" });
+		expect(decideRound({ ...base, turns: 2, maxRounds: 2 })).toEqual({ action: "end", reason: "round-limit" });
+		expect(decideRound({ gate: unverified(), turns: 100, aborted: false, overBudget: false, elapsedMs: 0 })).toMatchObject({ action: "continue", round: 101 });
+	});
+
+	test("a tree an outside writer moved again after a re-review is a round without progress; twice in a row ends the run", () => {
+		// Only the reviewer acted: its new verdict raised the review count, which alone must not keep the run alive.
+		const tree = unverified({ cause: "stale-review", by: "tree", changes: 0, reviews: 2, requests: 3 });
+		const sinceTree = { changes: 0, reviews: 1, requests: 2, tree: true as const };
+		const first = decideRound({ ...base, turns: 2, gate: tree, progressSince: sinceTree });
+		expect(first).toMatchObject({ action: "continue", stalled: 1 });
+		const next = unverified({ cause: "stale-review", by: "tree", changes: 0, reviews: 3, requests: 4 });
+		expect(decideRound({ ...base, turns: 3, gate: next, progressSince: { changes: 0, reviews: 2, requests: 3, tree: true }, stalled: 1 })).toEqual({
+			action: "end",
+			reason: "no-progress",
+		});
+		// The first tree move after other work is a re-review worth a round: the baseline was not tree-only.
+		expect(decideRound({ ...base, turns: 2, gate: tree, progressSince: { changes: 0, reviews: 1, requests: 2 }, stalled: 1 })).toMatchObject({
+			action: "continue",
+			stalled: 0,
+		});
+		// A re-review that found a problem is the team's evidence, not churn.
+		expect(decideRound({ ...base, turns: 2, gate: unverified({ cause: "incorrect", changes: 0, reviews: 2, requests: 3 }), progressSince: sinceTree, stalled: 1 })).toMatchObject({
+			action: "continue",
+			stalled: 0,
+		});
+	});
+
+	test("a blocked-only open requirement ends at once, with no stall needed", () => {
+		const blocked = unverified({ cause: "results", result: "r1", resultState: "unmet", resultRemedy: "blocked" });
+		expect(decideRound({ ...base, gate: blocked })).toEqual({ action: "end", reason: "no-progress" });
+		expect(decideRound({ gate: blocked, turns: 1, aborted: false, overBudget: false, elapsedMs: 0 })).toEqual({ action: "end", reason: "no-progress" });
+	});
+
 	test("otherwise the next round is the one after the turn that ended", () => {
 		const gate = unverified({ cause: "incorrect" });
-		expect(decideRound({ ...base, gate })).toEqual({ action: "continue", gate, round: 2, maxRounds: 4 });
+		expect(decideRound({ ...base, gate })).toEqual({ action: "continue", gate, round: 2, maxRounds: 4, stalled: 0 });
 	});
 });
 
@@ -822,8 +868,17 @@ describe("buildRoundMessage", () => {
 		expect(plain).not.toContain("could not be read");
 	});
 
-	test("the exhausted tree re-review is stated", () => {
-		expect(message(2, 4, unverified({ cause: "stale-review", by: "tree", exhausted: true }))).toContain("one tree-only re-review was already used");
+	test("an uncapped run's round tag carries the round number only and never a last round", () => {
+		const text = buildRoundMessage({ runId: "run-7", round: 6, gate: unverified(), reviewer: "storm-reviewer" });
+		expect(text.startsWith('<storm-run id="run-7" round="6">')).toBe(true);
+		expect(text.split("\n").length).toBe(message(3, 4).split("\n").length);
+	});
+
+	test("a round after one without progress adds the directive; a round after progress does not", () => {
+		const plain = buildRoundMessage({ runId: "run-7", round: 3, gate: unverified(), reviewer: "storm-reviewer", stalled: 0 });
+		const stalled = buildRoundMessage({ runId: "run-7", round: 3, gate: unverified(), reviewer: "storm-reviewer", stalled: 1 });
+		expect(stalled.split("\n").length).toBe(plain.split("\n").length + 1);
+		for (const line of plain.split("\n")) expect(stalled).toContain(line);
 	});
 
 	test("the last-round sentence appears only in the last round", () => {
@@ -866,12 +921,21 @@ describe("declared results", () => {
 		expect(known).toMatchObject({ state: "unverified", cause: "results", result: "r1" });
 	});
 
-	test("a P0 review or an exhausted tree re-review stays first", () => {
+	test("a P0 review stays first", () => {
 		const p0 = passing([writer({ lastChangeAt: T0 }), reviewer(T0 + 2, true, { tree: NOW, findings: findings(0) })], { results: [result("unmet")] });
 		expect(p0).toMatchObject({ cause: "p0" });
+	});
+
+	test("an open result over a tree an outside writer keeps moving still ends by the no-progress rule", () => {
 		const old = reviewer(T0 + 2, true, { tree: "d0:f0" });
-		const exhausted = reviewGate([writer({ lastChangeAt: T0 }), old], TEAM, { start: CLEAN, now: CHANGED, rereviewedAt: T0 + 1 }, { checks: [check()], lanes: [], results: [result("unmet")] });
-		expect(exhausted).toMatchObject({ cause: "stale-review", by: "tree", exhausted: true });
+		const gate = reviewGate([writer({ lastChangeAt: T0 }), old], TEAM, { start: CLEAN, now: CHANGED }, { checks: [check()], lanes: [], results: [result("unmet")] });
+		// The results gate keeps the tree-only mark, so a re-review's verdict count cannot pass for the team's progress.
+		expect(gate).toMatchObject({ state: "unverified", cause: "results", by: "tree" });
+		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
+		const since = { changes: gate.changes, reviews: gate.reviews - 1, requests: gate.requests, result: gate.resultProgress ?? "", tree: true as const };
+		const round = { turns: 3, aborted: false, overBudget: false, elapsedMs: 0, gate, progressSince: since };
+		expect(decideRound(round)).toMatchObject({ action: "continue", stalled: 1 });
+		expect(decideRound({ ...round, stalled: 1 })).toEqual({ action: "end", reason: "no-progress" });
 	});
 
 	test("an open result outranks a waiting lane it may unblock", () => {
@@ -1127,8 +1191,8 @@ describe("S3 directed result feedback", () => {
 		expect(message).not.toContain("attempt `");
 	});
 
-	test("a blocked requirement ends; retry exhaustion gets one directed route-repair round", () => {
-		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+	test("a blocked requirement ends; retry exhaustion gets a directed route-repair round", () => {
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, stalled: 1 }; // the round before was quiet too
 		expect(decideRound({ ...base, gate: gateOf([openRow({ remedy: "blocked" })]), progressSince: { changes: 1, reviews: 1, requests: 1 } })).toEqual({
 			action: "end",
 			reason: "no-progress",
@@ -1147,7 +1211,7 @@ describe("S3 directed result feedback", () => {
 	});
 
 	test("a repeated identical result is no progress even when requests grew; changed evidence is", () => {
-		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, stalled: 1 }; // the round before was quiet too
 		const gate = gateOf([openRow({ attempt: "job:A1:A1" })]);
 		const current = "r1|unmet|work||";
 		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1, result: "r1|unmet|work||v2" } })).toMatchObject({ action: "continue" });
@@ -1158,7 +1222,7 @@ describe("S3 directed result feedback", () => {
 	});
 
 	test("a contracted result never treats request count alone as progress", () => {
-		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+		const base = { turns: 1, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, stalled: 1 }; // the round before was quiet too
 		const gate = gateOf([openRow()]);
 		const witness = "r1|unmet|work||";
 		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 0, result: witness } })).toEqual({ action: "end", reason: "no-progress" });
@@ -1212,7 +1276,7 @@ describe("S3 directed result feedback", () => {
 });
 
 describe("S3 native failure categories", () => {
-	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, stalled: 1 }; // the round before was quiet too
 	const openRow = (over: Partial<CoverageResult> = {}): CoverageResult => ({ id: "r1", lane: "work", state: "unmet", ...over });
 	const gateOf = (row: CoverageResult): Unverified => {
 		const gate = reviewGate([], TEAM, undefined, { lanes: [], reviewer: true, results: [row] });
@@ -1290,7 +1354,7 @@ describe("S3 retry route witness", () => {
 		if (gate.state !== "unverified") throw new Error("expected an unverified gate");
 		return gate;
 	};
-	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0 };
+	const base = { turns: 2, maxRounds: 4, aborted: false, overBudget: false, elapsedMs: 0, stalled: 1 }; // the round before was quiet too
 
 	test("the same exhausted route cannot buy a second allowance; a genuinely different route can", () => {
 		const gate = gateOf(openRow({ remedy: "retry", attempt: "job:T4DB0:T4DB0", evidence: "retry:5774345db23d" }));

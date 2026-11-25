@@ -5,7 +5,7 @@ import { scoreText } from "../lineage/metrics.ts";
 import { dropAdoptedTrials, providerOf } from "../proposals/build.ts";
 import { pickEffort, ROLE_EFFORT } from "../recommend/recommend.ts";
 import { DEFAULT_CONTEXT_CAP, MAX_WORKERS, REQUIRED_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
-import { DEFAULT_EXTRA_ROUNDS, MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
+import { MAX_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { entryEffort, formatModelEntry, type ModelEntry, parseModelEntry } from "../selector.ts";
 import { type Analysis, type BudgetConfig, type Candidate, EFFORTS, type Effort, type FormData, type InfoLine, type InfoSpan, type ModelInfo, type RoleConfig, type RoleId, type RoleRecommendation, type StormConfig, type WorkerRange } from "../types.ts";
 
@@ -168,9 +168,9 @@ function select(name: string, label: string, options: ReadonlyArray<readonly [va
 	return `<label>${esc(label)} <select name="${name}">${items.join("")}</select></label>`;
 }
 
-function numberInput(name: string, label: string, value: string | number, min: number, max?: number): string {
+function numberInput(name: string, label: string, value: string | number, min: number, max?: number, optional = false): string {
 	const bound = max === undefined ? "" : ` max="${max}"`;
-	return `<label>${esc(label)} <input type="number" name="${name}" value="${esc(String(value))}" min="${min}"${bound} required></label>`;
+	return `<label>${esc(label)} <input type="number" name="${name}" value="${esc(String(value))}" min="${min}"${bound}${optional ? "" : " required"}></label>`;
 }
 
 function errorBlock(retry: FormRetry | undefined): string[] {
@@ -204,7 +204,7 @@ function roleFields(input: SetupFormInput, base: StormConfig, id: RoleId, browse
 	return { options, primaries, fallbacks, defaults: modelDefaults(base, id, options, browse) };
 }
 
-function typed(retry: FormRetry | undefined, name: string, fallback: number): string | number {
+function typed(retry: FormRetry | undefined, name: string, fallback: number | ""): string | number {
 	const answer = retry?.answers[name];
 	return typeof answer === "number" || typeof answer === "string" ? answer : fallback;
 }
@@ -296,7 +296,8 @@ export function commonSettingsForm(input: SetupFormInput, retry?: FormRetry): st
 	out.push(
 		"<fieldset><legend>실행</legend>",
 		numberInput(FIELD.contextCap, `${LABEL.contextCap} (토큰. 넘은 서브에이전트는 후속 지시를 받지 않습니다)`, typed(retry, FIELD.contextCap, base.contextCap ?? DEFAULT_CONTEXT_CAP), 1, MAX_CONTEXT_CAP),
-		numberInput(FIELD.rounds, `${LABEL.rounds} (0이면 다시 보내지 않음)`, typed(retry, FIELD.rounds, base.rounds ?? DEFAULT_EXTRA_ROUNDS), 0, MAX_EXTRA_ROUNDS),
+		// Blank is a valid answer here: no limit. The form hands an empty number input back as "" and `typed` re-renders it as is.
+		numberInput(FIELD.rounds, `${LABEL.rounds} (비우면 제한 없음, 0이면 다시 보내지 않음)`, typed(retry, FIELD.rounds, base.rounds ?? ""), 0, MAX_EXTRA_ROUNDS, true),
 		"</fieldset>",
 		"<fieldset><legend>예산</legend>",
 		numberInput(FIELD.budget, `${LABEL.budget} (USD, 0 = 없음)`, typed(retry, FIELD.budget, budget?.perRunUsd ?? 0), 0),
@@ -400,8 +401,10 @@ export function setupConfig(input: SetupFormInput, answers: RoleAnswers, data: F
 	const contextCap = whole(data, errors, FIELD.contextCap, LABEL.contextCap, 1, MAX_CONTEXT_CAP);
 	// The default stays unwritten, as in a team that never set it.
 	if (base.contextCap !== undefined || contextCap !== DEFAULT_CONTEXT_CAP) config.contextCap = contextCap;
-	const rounds = whole(data, errors, FIELD.rounds, LABEL.rounds, 0, MAX_EXTRA_ROUNDS);
-	if (base.rounds !== undefined || rounds !== DEFAULT_EXTRA_ROUNDS) config.rounds = rounds;
+	// A limit exists only when the user typed one; a blank field removes it.
+	const typedRounds = data[FIELD.rounds];
+	if (typedRounds === undefined || (typeof typedRounds === "string" && typedRounds.trim() === "")) delete config.rounds;
+	else config.rounds = whole(data, errors, FIELD.rounds, LABEL.rounds, 0, MAX_EXTRA_ROUNDS);
 	const perRunUsd = amount(FIELD.budget, LABEL.budget);
 	const warnAtUsd = amount(FIELD.budgetWarn, LABEL.budgetWarn);
 	if (perRunUsd === 0) delete config.budget;

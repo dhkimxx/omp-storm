@@ -330,8 +330,8 @@ function historyBlock(history: { text: string; followUp?: boolean } | undefined)
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
  * rules are taught by their block reasons, so each has at most one clause here. `maxRounds` is the run's whole round
- * budget, fixed by the controller when the run starts. `resume` names the run this one continues. Everything sits in
- * one XML section: omp's keyword matcher skips those, so neither this text nor the task can attach an omp workflow
+ * budget, fixed by the controller when the run starts; an uncapped run has none and names no maximum. `resume` names
+ * the run this one continues. Everything sits in one XML section: omp's keyword matcher skips those, so neither this text nor the task can attach an omp workflow
  * notice (whose instructions contradict what Storm enforces).
  */
 export function buildHandoff(input: {
@@ -339,7 +339,7 @@ export function buildHandoff(input: {
 	config: StormConfig;
 	hash: string;
 	task: string;
-	maxRounds: number;
+	maxRounds?: number;
 	resume?: ResumeInfo;
 	/**
 	 * The bounded final facts of the run this one resumes or explicitly follows (`closeoutHandoff`). Shown as history
@@ -373,9 +373,11 @@ export function buildHandoff(input: {
 	if (reviewer) {
 		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;
 		rules.push(
-			input.maxRounds === 1
-				? `${check} Without it the run ends unverified.`
-				: `${check} Without it Storm sends you back, up to ${input.maxRounds} rounds in all.`,
+			input.maxRounds === undefined
+				? `${check} Without it Storm sends you back.`
+				: input.maxRounds === 1
+					? `${check} Without it the run ends unverified.`
+					: `${check} Without it Storm sends you back, up to ${input.maxRounds} rounds in all.`,
 		);
 	}
 	if (config.budget) {

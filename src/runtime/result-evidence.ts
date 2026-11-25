@@ -1188,7 +1188,7 @@ function signedNumber(sign: string | undefined, digits: string): string {
 /** A spelled-out sign makes a bare digit unreliable as a numeric fact; such an answer is never judged by its digits. */
 const SIGN_WORD = /(?:^|[^\p{L}])(?:minus|negative|positive|음수|양수|마이너스|플러스)(?:[^\p{L}]|$)/iu;
 
-/** Comparison form: case, whitespace, wrapping quotes/backticks and one trailing sentence stop are not content. */
+/** Comparison form: whitespace, wrapping quotes/backticks and one trailing sentence stop are not content; case is. */
 function canonicalText(value: string): string {
 	return value
 		.normalize("NFKC")
@@ -1198,8 +1198,7 @@ function canonicalText(value: string): string {
 		.replace(/[.。!！]+$/u, "")
 		.trim()
 		.replace(/^[`"'\u201c\u2018]+|[`"'\u201d\u2019]+$/gu, "")
-		.trim()
-		.toLowerCase();
+		.trim();
 }
 
 /** One typed scalar: a signed number, a boolean, null or a quoted string. Bare prose is never a scalar. */
@@ -1255,9 +1254,12 @@ type AnswerAgreement = "supported" | "contradicted" | "unverifiable";
 
 /**
  * Deterministic agreement between a whole answer and one cited statement, with no token-overlap heuristic:
- * - the same text (after `canonicalText`) is support;
+ * - the same text (after `canonicalText`) is support; letter case is content;
  * - a typed answer (a bare scalar, `key: value` or `the key is value` for the cited key) against the cited
- *   statement's typed value is support when equal and a contradiction when it differs;
+ *   statement's typed value is support when equal; a differing number, boolean or null contradicts (booleans and
+ *   null compare case-insensitively);
+ * - two different strings never contradict: a case-only difference cannot prove an answer wrong, so the pair is
+ *   unverifiable and goes to review like any other string no machine check can settle;
  * - everything else, including prose that repeats a cited word or number, is unverifiable and needs review.
  */
 function typedAgreement(answer: string, statement: string): AnswerAgreement {
@@ -1267,7 +1269,9 @@ function typedAgreement(answer: string, statement: string): AnswerAgreement {
 	if (cited === undefined || given === undefined) return "unverifiable";
 	if (given.key !== undefined && cited.key !== undefined && given.key !== cited.key) return "unverifiable";
 	if (given.key !== undefined && cited.key === undefined) return "unverifiable";
-	return given.value.type === cited.value.type && given.value.value === cited.value.value ? "supported" : "contradicted";
+	if (given.value.type !== cited.value.type) return "contradicted";
+	if (given.value.value !== cited.value.value) return given.value.type === "string" ? "unverifiable" : "contradicted";
+	return "supported";
 }
 
 /**
@@ -1281,9 +1285,9 @@ function answerAligns(answer: string, excerpt: string): boolean {
 
 /**
  * A declared `contains` must support the reported answer, not only exist somewhere in the file. Support is the
- * literal itself, the cited line verbatim, or the same typed value (so `7`, `142` and `-42` never pass for `42`). An
- * answer whose signed numbers include one the literal does not state contradicts it; prose that merely repeats the
- * literal's number or words is unverifiable and goes to review instead of being accepted.
+ * literal itself (case included), the cited line verbatim, or the same typed value (so `7`, `142` and `-42` never
+ * pass for `42`). An answer whose signed numbers include one the literal does not state contradicts it; prose that
+ * merely repeats the literal's number or words is unverifiable and goes to review instead of being accepted.
  */
 function containsAgreement(answer: string, contains: string, excerpt: string | undefined): AnswerAgreement {
 	const literal = typedAgreement(answer, contains);

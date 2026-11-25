@@ -220,7 +220,7 @@ describe("/storm without an approved team", () => {
 		expect(f.selects[0]?.options[0]).toBe(APPROVE);
 		const md = f.selects[0]!.markdown!;
 		// The diff against the last approved team, the unknown field with its value, and a warning per model not usable here.
-		for (const part of ["b/r → z/teammate", "기본(3) → 9", "typo=1", "z/teammate: "]) expect(md).toContain(part);
+		for (const part of ["b/r → z/teammate", "제한 없음 → 9", "typo=1", "z/teammate: "]) expect(md).toContain(part);
 		expect(isApproved(await load())).toBe(false);
 		expect(f.selects).toHaveLength(1);
 	});

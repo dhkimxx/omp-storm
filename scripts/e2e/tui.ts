@@ -96,7 +96,8 @@ const phaseHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARA
 
 const RADAR_FIELD = /\[[\u2801-\u28ff]{18}\]/;
 const metricsRow = (text: string, preset: "unicode" | "ascii" = "unicode"): string | undefined => {
-	const chips = preset === "unicode" ? /↻\s*\d+\/\d+.*👥\s*\d+\/\d+/u : /\bloop\s*\d+\/\d+.*\bAG\s*\d+\/\d+/;
+	// The round chip carries a maximum only for a capped run; the worker chip always shows running over total.
+	const chips = preset === "unicode" ? /↻\s*\d+(?:\/\d+)?.*👥\s*\d+\/\d+/u : /\bloop\s*\d+(?:\/\d+)?.*\bAG\s*\d+\/\d+/;
 	return text.split("\n").map(line => line.trim()).findLast(line => chips.test(line));
 };
 
@@ -486,7 +487,7 @@ async function asciiDashboard(): Promise<void> {
 				"the wider ASCII row leads with the result and keeps round, active workers and spend whole",
 				result.startsWith(resultPrefix) &&
 					/(?:(?:대기|진행 중|미충족|검토 가능) · )?이행 \d\/1$/.test(result.slice(resultPrefix.length)) &&
-					loop === "loop 1/4라운드" &&
+					loop === "loop 1라운드" &&
 					workers === "AG 1/1" &&
 					cost !== undefined && /^\$0\.\d+\/\$0\.\d+$/.test(cost) &&
 					elapsed !== undefined && /^t: \d+분$/.test(elapsed),
@@ -1099,7 +1100,7 @@ async function main(): Promise<void> {
 						() => statusLine(tui.raw) ?? "no status line",
 						60_000,
 					);
-					const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+					const roundTag = `<storm-run id="${run.runId}" round="2">`;
 					const stormMessages = [...new Set(mains(llm.all()).map(entry => entry.lastUser.replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "")))].filter(user => user.startsWith("<storm-run"));
 					check(
 						"Storm sent round 2 by itself, exactly once",

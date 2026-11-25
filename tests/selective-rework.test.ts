@@ -5,7 +5,8 @@
  * - an A attempt admitted under the old declaration cannot settle (accept, or leave an exhausted-route block on) the
  *   new contract, even though every producer version it recorded is still current;
  * - a pure lane rename with the same result ids and levels reopens nothing and does not supersede an in-flight attempt;
- * - an added, removed or re-levelled input reopens A and its consumers.
+ * - an added or removed input reopens A and its consumers; a weaker level keeps them, and a stronger level keeps them
+ *   only while the producer meets it now.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
@@ -317,7 +318,6 @@ describe("S3 changed input declarations", () => {
 	const variants: Array<[string, Edge[]]> = [
 		["an added input", [...ON_B, ...ON_C]],
 		["a removed input", []],
-		["a different level on the same input", [{ lane: "b-produce", need: "reviewable" }]],
 	];
 	for (const [name, edges] of variants) {
 		test(`${name} reopens A and, transitively, D while the producers keep their evidence`, async () => {
@@ -333,4 +333,23 @@ describe("S3 changed input declarations", () => {
 			expect(row(run, "c-result")).toMatchObject({ state: "accepted" });
 		});
 	}
+
+	test("a weaker level on the same input keeps A and D accepted", async () => {
+		const old = s3Plan(ON_B);
+		const run = await begin(old);
+		await acceptAll(run, old);
+		const a = copy(row(run, "a-result"));
+		expect(await run.h.controller.setPlan(run.h.ctx, s3Plan([{ lane: "b-produce", need: "reviewable" }]))).toEqual({ ok: true });
+		expect(row(run, "a-result")).toMatchObject({ state: "accepted", contentVersion: a?.contentVersion, attemptId: a?.attemptId });
+		expect(row(run, "d-result")).toMatchObject({ state: "accepted" });
+	});
+
+	test("a level made integrated keeps A and D while the accepted producer is integrated in the shared tree", async () => {
+		const old = s3Plan(ON_B);
+		const run = await begin(old);
+		await acceptAll(run, old);
+		expect(await run.h.controller.setPlan(run.h.ctx, s3Plan([{ lane: "b-produce", need: "integrated" }]))).toEqual({ ok: true });
+		expect(row(run, "a-result")).toMatchObject({ state: "accepted" });
+		expect(row(run, "d-result")).toMatchObject({ state: "accepted" });
+	});
 });

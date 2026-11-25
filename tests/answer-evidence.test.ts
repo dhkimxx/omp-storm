@@ -72,7 +72,7 @@ const authLine: AnswerCitation[] = [{ path: AUTH, line: 1 }];
 
 describe("deterministic answer agreement", () => {
 	test("typed and signed answers are decided exactly; a flipped sign is never the cited value", async () => {
-		for (const text of ["42", "total: 42", "The total is 42 (report.json:2)."]) {
+		for (const text of ["42", "total: 42", "The total is 42", "The total is 42 (report.json:2)."]) {
 			expect((await evaluate(total(), text, totalLine)).state).toBe("accepted");
 		}
 		for (const text of ["-42", "−42", "The total is -42", "total = -42"]) {
@@ -96,10 +96,12 @@ describe("deterministic answer agreement", () => {
 		const auth: PlanLaneResult = { id: "auth", kind: "answer", criterion: "says whether authentication is enabled", path: AUTH };
 		const contradicted = await evaluate(auth, "authentication is enabled", authLine);
 		expect(contradicted.state).toBe("reviewable");
-		expect((await evaluate(auth, "Authentication is disabled.", authLine)).state).toBe("accepted");
+		expect((await evaluate(auth, "authentication is disabled.", authLine)).state).toBe("accepted");
+		// Exact text keeps letter case; a sentence-cased copy is not the cited bytes and needs review.
+		expect((await evaluate(auth, "Authentication is disabled.", authLine)).state).toBe("reviewable");
 
 		const literal = { ...auth, contains: "authentication is disabled" };
-		for (const text of ["authentication is enabled", "It is not true that authentication is disabled", "authentication is disabled, except it is enabled"]) {
+		for (const text of ["authentication is enabled", "Authentication is disabled.", "It is not true that authentication is disabled", "authentication is disabled, except it is enabled"]) {
 			expect((await evaluate(literal, text, authLine)).state).not.toBe("accepted");
 		}
 
@@ -110,6 +112,36 @@ describe("deterministic answer agreement", () => {
 		expect((await evaluate(total(), "The total is 42 but the retry budget is 7", totalLine)).state).toBe("unmet");
 		// Without contains, a copied number inside prose is not proof either.
 		expect((await evaluate(total({ contains: undefined }), "The total is 42 only if you ignore the retries", totalLine)).state).toBe("reviewable");
+	});
+
+	test("typed scalars compare by value, so booleans and null stay case-insensitive while strings do not", async () => {
+		await writeFile(path.join(root, NOTE), "flag: true\nlabel: \"alpha\"\nmissing: null\n");
+		const flag: PlanLaneResult = { id: "flag", kind: "answer", criterion: "states the flag", path: NOTE, contains: "flag: true" };
+		const flagLine: AnswerCitation[] = [{ path: NOTE, line: 1 }];
+		for (const text of ["true", "TRUE", "True", "flag: TRUE"]) expect((await evaluate(flag, text, flagLine)).state).toBe("accepted");
+		for (const text of ["false", "FALSE", "flag: FALSE"]) {
+			const item = await evaluate(flag, text, flagLine);
+			expect(item.state).toBe("unmet");
+			expect(item.reason).toContain("값");
+		}
+
+		const missing: PlanLaneResult = { id: "missing", kind: "answer", criterion: "states the missing field", path: NOTE, contains: "missing: null" };
+		const missingLine: AnswerCitation[] = [{ path: NOTE, line: 3 }];
+		for (const text of ["null", "NULL", "missing: Null"]) expect((await evaluate(missing, text, missingLine)).state).toBe("accepted");
+		expect((await evaluate(missing, "missing: none", missingLine)).state).not.toBe("accepted");
+
+		const label: PlanLaneResult = { id: "label", kind: "answer", criterion: "states the label", path: NOTE, contains: 'label: "alpha"' };
+		const labelLine: AnswerCitation[] = [{ path: NOTE, line: 2 }];
+		expect((await evaluate(label, '"alpha"', labelLine)).state).toBe("accepted");
+		// A different string is never a contradiction; it cannot be checked and stays reviewable.
+		expect((await evaluate(label, '"Alpha"', labelLine)).state).toBe("reviewable");
+		expect((await evaluate(label, '"beta"', labelLine)).state).toBe("reviewable");
+
+		await writeFile(path.join(root, NOTE), "true\n");
+		const bare: PlanLaneResult = { id: "bare", kind: "answer", criterion: "states the bare flag", path: NOTE };
+		const bareLine: AnswerCitation[] = [{ path: NOTE, line: 1 }];
+		for (const text of ["true", "TRUE"]) expect((await evaluate(bare, text, bareLine)).state).toBe("accepted");
+		expect((await evaluate(bare, "false", bareLine)).state).toBe("reviewable");
 	});
 });
 

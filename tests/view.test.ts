@@ -210,16 +210,16 @@ describe("config diff", () => {
 	test("extra rounds are shown in force, and a change is one row with both numbers", () => {
 		const next = changed(c => (c.rounds = 7));
 		const md = renderConfigDiff(TEAM, next);
-		expect(md).toContain("기본(3) → 7");
+		expect(md).toContain("제한 없음 → 7");
 		expect(changedFields(TEAM, next)).toHaveLength(1);
 		expect(changedFields(next, TEAM)).toHaveLength(1);
 	});
 
-	test("an explicit default is a change, because the hash sees it: absent rounds read 기본(3)", () => {
+	test("absent rounds read as no limit, and typing a number over it is a change", () => {
 		const explicit = changed(c => (c.rounds = 3));
 		expect(configHash(explicit)).not.toBe(configHash(TEAM));
-		expect(renderConfigDiff(TEAM, explicit)).toContain("기본(3) → 3");
-		expect(renderConfigDiff(explicit, TEAM)).toContain("3 → 기본(3)");
+		expect(renderConfigDiff(TEAM, explicit)).toContain("제한 없음 → 3");
+		expect(renderConfigDiff(explicit, TEAM)).toContain("3 → 제한 없음");
 		expect(changedFields(TEAM, explicit)).toHaveLength(1);
 		// The rendered values differ, but two explicit settings of the same number have no row.
 		expect(changedFields(explicit, structuredClone(explicit))).toEqual([]);
@@ -462,7 +462,8 @@ describe("status", () => {
 		const added = set.filter(line => !base.includes(line));
 		expect(removed).toHaveLength(1);
 		expect(added).toHaveLength(1);
-		expect(removed[0]).toContain("3");
+		expect(removed[0]).toContain("제한 없음");
+		expect(removed[0]).not.toMatch(/\d/);
 		expect(added[0]).toContain("7");
 		expect(set.indexOf(added[0]!)).toBe(base.indexOf(removed[0]!));
 	});
@@ -508,6 +509,16 @@ describe("status", () => {
 			expect(renderStatus(view({ lastRun }), NOW)).toContain(lastRun.runId);
 			expect(() => renderStatusBrief(view({ lastRun }), NOW)).not.toThrow();
 			expect(renderStatusBrief(view({ lastRun }), NOW)).toContain(lastRun.runId);
+		}
+	});
+
+	test("an uncapped run reads N라운드 and a capped one N/M라운드, in the status and the hub", () => {
+		const open = { ...run, turns: 2 };
+		const capped = { ...run, turns: 2, maxRounds: 5 };
+		for (const render of [(r: typeof run) => renderStatus(view({ run: r }), NOW), (r: typeof run) => renderStatusBrief(view({ run: r }), NOW, [])]) {
+			expect(render(open)).toContain("3라운드");
+			expect(render(open)).not.toMatch(/\d\/\d라운드/);
+			expect(render(capped)).toContain("3/5라운드");
 		}
 	});
 
@@ -943,8 +954,9 @@ describe("resumeRunLine", () => {
 		expect(line).not.toMatch(ISO_UTC);
 		// Without a round bound only the rounds taken are shown.
 		const unbounded = resumeRunLine(runRecord({ task: "short", request: "short", status: "stopped", endReason: "time-limit", turns: 3 }));
-		expect(unbounded).toContain("short");
+		expect(unbounded).toContain("3라운드");
 		expect(unbounded).not.toContain("3/");
+		expect(line).toContain("2/4라운드");
 	});
 
 	test("control characters in the stored request are made visible", () => {

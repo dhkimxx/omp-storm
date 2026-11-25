@@ -13,8 +13,10 @@
  *   is the host's own worker-tagged log record, not a logical child label.
  * - T03: a native batch whose item overlaps an in-flight shared write is refused before any item is reserved or
  *   started; after the writer settles the valid independent item is submitted again and must start. A work-bearing
- *   `write agent://<id>` follow-up waits, while a native `?progress` note is delivered. Independent isolated
- *   experiments and independent read lanes run in parallel; a progress note neither reserves a write nor starts work.
+ *   `write agent://<id>` follow-up waits, and so does a native `?progress` note: it wakes the idle holder into a turn
+ *   that can write, so it meets the same conflict check and is refused with `lane-write`, reserving nothing.
+ *   Independent isolated experiments and independent read lanes run in parallel; a plan lane's progress note neither
+ *   reserves a write nor starts work.
  *
  * `E2E_CONTRACT=1` submits the shared planned `results`/`dependsOn` wire from contract-fixture.ts and asserts it is
  * kept. The default baseline mode drops only those planned fields for the original pre-contract binary; the current
@@ -777,7 +779,7 @@ async function main(): Promise<void> {
 			planFor(lanes.map(lane => (lane.name === "W0" ? { ...lane, progress } : lane)), workers),
 			// A work-bearing follow-up to the idle holder: its lane owns the file W0 is writing.
 			{ followUp: "agent://H0", content: `E2E-T03-WORK-FOLLOW E2E-CHILD-BASH ${TRACKED_FILE}` },
-			// Native progress note: same agent handle with `?progress`; it is not work and must not reserve a write.
+			// Native progress note: same agent handle with `?progress`. It would wake the idle holder too, so it is refused.
 			{ edit: "agent://H0?progress" },
 			{
 				tasks: [{ name: "X1", agent: "storm-quick", task: "Write the independent file", say: `E2E-T03-INDEPENDENT-LATE E2E-CHILD-SH ${b64(independentCommand)}` }],
@@ -816,10 +818,13 @@ async function main(): Promise<void> {
 					holder !== undefined && (holder.followUps === 0 || (workFollows.length > 0 && workFollows.every(entry => w0DoneAt !== undefined && entry.ts >= w0DoneAt))),
 					`H0=${JSON.stringify(holder)} workFollows=${JSON.stringify(workFollows.map(entry => entry.ts))} w0DoneAt=${w0DoneAt ?? "missing"} run=${run.runId}`,
 				);
+				const mainEntries = llm.of("main");
+				const noteAt = mainEntries.findIndex(entry => entry.decision.tool === "write" && entry.decision.args?.path === "agent://H0?progress");
+				const noteResult = noteAt < 0 ? undefined : mainEntries.slice(noteAt + 1).find(entry => entry.lastTool !== "")?.lastTool;
 				check(
-					"T03 progress: the native ?progress note is delivered without becoming a work follow-up",
-					progressNotes.length > 0 && (!CONTRACT || holder?.followUps === 0) && (w0DoneAt === undefined || progressNotes.some(entry => entry.ts < w0DoneAt)),
-					`progressNotes=${JSON.stringify(progressNotes.map(entry => entry.ts))} followUps=${holder?.followUps} w0DoneAt=${w0DoneAt ?? "missing"} run=${run.runId}`,
+					"T03 progress: the native ?progress note to the idle holder is refused with lane-write while W0 writes",
+					noteResult?.includes("[storm:lane-write]") === true && progressNotes.length === 0 && (!CONTRACT || holder?.followUps === 0),
+					`noteResult=${JSON.stringify(noteResult?.slice(0, 300))} progressNotes=${JSON.stringify(progressNotes.map(entry => entry.ts))} followUps=${holder?.followUps} run=${run.runId}`,
 				);
 				check(
 					"T03 conflict: after W0 settles the valid independent item starts and completes",

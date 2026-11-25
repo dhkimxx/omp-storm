@@ -576,10 +576,11 @@ describe("a run through the hooks", () => {
 				),
 			),
 		).toBe("lane-write");
-		// A work follow-up would wake the idle holder into the writer's scope. A quiet progress note is delivered without
-		// becoming work: it passes the gate, reserves nothing, and the work follow-up stays refused. A read starts no turn.
+		// A work follow-up would wake the idle holder into the writer's scope. A quiet progress note wakes the same idle
+		// holder, so it meets the same conflict check; refused notes reserve nothing. A read starts no turn.
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0", content: "work" } }, main))).toBe("lane-write");
-		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0?progress", content: "status" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0?progress", content: "status" } }, main))).toBe("lane-write");
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0?progress=0", content: "status" } }, main))).toBe("lane-write");
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://H0", content: "work" } }, main))).toBe("lane-write");
 		expect(verdict(await omp.emit("tool_call", { toolName: "read", input: { path: "agent://H0" } }, main))).toBe("pass");
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://all", content: "resume" } }, main))).toBe("lane-capacity");
@@ -679,6 +680,28 @@ describe("a run through the hooks", () => {
 		// Terminal work frees the lane: the clean retry is a fresh dispatch, not a displacement.
 		await child.emit("agent_end", {}, reader);
 		expect(verdict(await dispatch("R0"))).toBe("pass");
+	});
+
+	test("a refused first spawn frees its lane, so the next dispatch of that lane starts instead of reporting busy", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(
+			await omp.tool(
+				{
+					action: "plan",
+					plan: { lanes: [{ name: "R0", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("r0-answer") }], workers: { explorer: 1 } },
+				},
+				main,
+			),
+		).toBe("ok");
+		const dispatch = () => omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "R0", task: "Read" } }, main);
+		expect(verdict(await dispatch())).toBe("pass");
+		expect(verdict(await dispatch())).toBe("lane-busy");
+		// The host's spawn for that placement is refused: its role is not in the plan.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "R0"), main))).not.toMatch(/^route:|^pass$/);
+		expect(verdict(await dispatch())).toBe("pass");
 	});
 
 	/** Two spawned, settled explorer lanes: the idle read-only agents a work follow-up can reactivate. */
@@ -874,7 +897,8 @@ describe("a run through the hooks", () => {
 		const live = omp.statuses.at(-1);
 		expect(live?.startsWith("storm ▶")).toBe(true);
 		expect(live).not.toBe(idle);
-		expect(live).toContain("1/4");
+		// The default team has no rounds limit, so the live round shows no maximum.
+		expect(live).not.toMatch(/\d+\/\d+/);
 
 		await omp.emit("agent_start", {}, main);
 		await omp.emit("agent_end", {}, main);
@@ -1291,7 +1315,7 @@ describe("a run through the hooks", () => {
 		expect(omp.sent).toHaveLength(1);
 		vi.advanceTimersByTime(ROUND_DELAY_MS);
 		await until(() => omp.sent.length === 2);
-		expect(omp.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		expect(omp.sent[1]?.split("\n")[0]).toMatch(/ round="2">$/);
 		expect(activeLedgerRun((await loadProjectState(project.env)).sessionDir)).toBeDefined();
 
 		// The reviewer starts after the change, so its baseline is the tree it is asked to verify.
@@ -1471,7 +1495,7 @@ describe("a run through the hooks", () => {
 		expect(omp.sent).toHaveLength(1);
 		vi.advanceTimersByTime(ROUND_DELAY_MS);
 		await until(() => omp.sent.length === 2);
-		expect(omp.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		expect(omp.sent[1]?.split("\n")[0]).toMatch(/ round="2">$/);
 
 		// The reviewer starts after the change, so its baseline includes the committed work.
 		await child.emit("before_agent_start", { systemPrompt: [] }, rev);

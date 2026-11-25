@@ -20,6 +20,8 @@ interface Assignment {
 	agent: string;
 	/** The host tool call that placed it, so that call's failure releases exactly its own placement. */
 	callId?: string;
+	/** Identity of the placed item: a late cancel of an older spawn never removes a newer placement of the same name. */
+	placement?: number;
 }
 
 /** A lane's logical reservation: a placed task awaiting spawn correlation, or a follow-up awaiting its turn's start. */
@@ -30,6 +32,8 @@ interface LaneHold {
 	/** Handle the placed task carries (a task hold only). */
 	name?: string;
 	callId?: string;
+	/** Identity of the placed item that made this hold (a task hold only). */
+	placement?: number;
 	/** The idle agent a work-bearing follow-up reactivates (a follow hold only). */
 	agentId?: string;
 	/** The reactivated turn was seen starting; from then on the agent's own state is the reservation. */
@@ -478,6 +482,8 @@ interface WriteReservation {
 	agentId?: string;
 	/** The handle reserved for this spawn before the host allocates its id; used only for release matching. */
 	name?: string;
+	/** Identity of the placed item that reserved it; it survives the spawn's admission binding an agent id. */
+	placement?: number;
 	at: number;
 }
 
@@ -505,8 +511,8 @@ export interface FollowUpGateInput {
 	/** Canonical workspace-relative files for that policy. */
 	canonicalFiles?: readonly string[];
 	/**
-	 * A quiet `?progress` note. It still passes capability, job, dependency and (for an idle recipient) capacity gates,
-	 * but it carries no work: it takes no lane hold, write reservation or worker slot of its own.
+	 * A quiet `?progress` note. It passes the same capability, job, dependency, and (for an idle recipient) capacity and
+	 * write-conflict gates, but it carries no work: it takes no lane hold, write reservation or worker slot of its own.
 	 */
 	progress?: boolean;
 	/** The host's tool-call id of this write, so its failure releases exactly this admission. */
@@ -579,9 +585,10 @@ export class RunLanes {
 	#serial = 0;
 	#holdSerial = 0;
 	#writeSerial = 0;
+	#placementSerial = 0;
 	#tokenSerial = 0;
 
-	constructor(private readonly runId: string) {
+	constructor(readonly runId: string) {
 		liveLanes.set(runId, new WeakRef(this));
 	}
 
@@ -676,11 +683,12 @@ export class RunLanes {
 		const now = options.now ?? Date.now();
 		const mapped = placed.map(entry => {
 			let next = withIsolation(entry.item, entry.desired);
+			const placement = ++this.#placementSerial;
 			if (rewrite) {
 				// Every auto item was accepted only after matching a lane above.
 				const lane = entry.lane as PlanLane;
 				const name = `${this.runId}-lane-${++this.#serial}`;
-				this.#assigned.set(name, { key: key(lane), lane: lane.name, agent: entry.agent, ...(options.callId === undefined ? {} : { callId: options.callId }) });
+				this.#assigned.set(name, { key: key(lane), lane: lane.name, agent: entry.agent, placement, ...(options.callId === undefined ? {} : { callId: options.callId }) });
 				next = { ...next, name };
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
@@ -688,12 +696,13 @@ export class RunLanes {
 			if (refs !== undefined && typeof next.task === "string" && next.task.trim() !== "") {
 				next = { ...next, task: `${next.task.trimEnd()}\n\n${refs}` };
 			}
-			this.#reserveWrite(entry, now, options.callId);
+			this.#reserveWrite(entry, now, placement, options.callId);
 			if (entry.lane !== undefined) {
 				const handle = typeof next.name === "string" ? next.name : undefined;
 				this.#held.set(entry.lane.name, {
 					id: ++this.#holdSerial,
 					at: now,
+					placement,
 					...(handle === undefined ? {} : { name: handle }),
 					...(options.callId === undefined ? {} : { callId: options.callId }),
 				});
@@ -806,7 +815,7 @@ export class RunLanes {
 				ok: false,
 				code: "lane-busy",
 				retry: false,
-				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `write agent://${handle} 로`} 후속 지시를 보내세요.`,
+				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `write agent://${handle} 로`} 후속 지시를 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 			};
 		}
 		for (let i = 0; i < scopes.length; i++) {
@@ -836,7 +845,7 @@ export class RunLanes {
 	}
 
 	/** Hold one placed item's shared write scope until its worker settles, fails, or the pending window expires. */
-	#reserveWrite(entry: PlacedEntry, now: number, callId?: string): void {
+	#reserveWrite(entry: PlacedEntry, now: number, placement: number, callId?: string): void {
 		const scope = entry.scope;
 		if (scope.kind === "read" || scope.kind === "private") return;
 		const name = typeof entry.item.name === "string" ? entry.item.name : undefined;
@@ -850,6 +859,7 @@ export class RunLanes {
 			...(entry.lane === undefined ? {} : { lane: entry.lane.name }),
 			...(name === undefined ? {} : { name }),
 			...(callId === undefined ? {} : { callId }),
+			placement,
 			at: now,
 		});
 	}
@@ -975,14 +985,42 @@ export class RunLanes {
 	}
 
 	/**
-	 * A spawn placement that never became a worker (host refused it, the ledger closed, a baseline failed) must not
-	 * keep blocking another writer for the pending window.
+	 * The identity of the placement a spawn key correlates to right now, read before the decision awaits anything.
+	 * A later cancel passes it back, so a refusal that lands after a newer call placed the same name removes nothing
+	 * of that newer call.
 	 */
-	cancel(spawnKey: string): void {
+	placementOf(spawnKey: string): number | undefined {
+		const assigned = this.#assigned.get(spawnKey)?.placement;
+		if (assigned !== undefined) return assigned;
+		for (const hold of this.#held.values()) {
+			if (hold.agentId === undefined && hold.name === spawnKey && hold.placement !== undefined) return hold.placement;
+		}
+		for (const [key, reservation] of this.#writes) {
+			if (reservation.placement !== undefined && (reservation.name === spawnKey || key === `lane:${spawnKey}`)) return reservation.placement;
+		}
+		return undefined;
+	}
+
+	/**
+	 * A spawn placement that never became a worker (host refused it, the ledger closed, a baseline failed) must not
+	 * keep blocking another writer for the pending window. It releases only what that placement made, plus the write
+	 * reservation its own admission bound to the spawn: a placement of a newer call is never touched. The worker slot
+	 * belongs to the decision that reserved it, not to the placement.
+	 */
+	cancel(spawnKey: string, placement: number | undefined): void {
 		const assignment = this.#assigned.get(spawnKey);
-		this.#assigned.delete(spawnKey);
-		const lane = assignment?.lane ?? (this.#writes.has(`lane:${spawnKey}`) ? spawnKey : undefined);
-		this.#releaseSpawn(spawnKey, lane);
+		if (placement !== undefined && assignment?.placement === placement) this.#assigned.delete(spawnKey);
+		if (placement !== undefined) {
+			for (const [lane, hold] of this.#held) if (hold.agentId === undefined && hold.placement === placement) this.#held.delete(lane);
+		}
+		for (const [key, reservation] of this.#writes) {
+			// A follow-up's reservation belongs to its agent and ends with that agent's started turn.
+			if (reservation.awaiting === true) continue;
+			// With a stamp the placement identity decides, even after admission bound this spawn's id to it; without one
+			// only a reservation bound to this very spawn is its own.
+			const own = placement === undefined ? reservation.agentId === spawnKey : reservation.placement === placement;
+			if (own) this.#writes.delete(key);
+		}
 	}
 
 	/** The worker's turn settled: its lane is free for the next planned writer. */
@@ -1031,9 +1069,9 @@ export class RunLanes {
 	/**
 	 * Any message that can start a turn (including native quiet writes) passes the same admission rules:
 	 * the target lane's prerequisites must hold, and a shared write reserves its scope before omp delivers the turn.
-	 * Its own in-flight reservation never blocks the continuation. A progress-only note still passes the capacity gate
-	 * when it would wake an idle recipient, but it carries no work: it holds no lane, reserves no write scope and takes
-	 * no worker slot of its own.
+	 * Its own in-flight reservation never blocks the continuation. A progress-only note to an idle recipient still meets
+	 * the capacity and write-conflict gates, because it starts a turn, but it carries no work: it holds no lane, reserves
+	 * no write scope and takes no worker slot of its own.
 	 */
 	checkFollowUp(input: FollowUpGateInput): FollowUpGate {
 		const lane = input.lane;
@@ -1081,9 +1119,6 @@ export class RunLanes {
 				};
 			}
 		}
-		// A progress-only note wakes an idle recipient but carries no work: it holds no lane, never collides with the
-		// writer that owns the shared tree, and takes no write lease or worker slot of its own.
-		if (input.progress === true) return { ok: true, token: `follow:${++this.#tokenSerial}` };
 		this.#pruneWrites(input.agents, now);
 		const scope = writeScope(
 			lane,
@@ -1093,6 +1128,23 @@ export class RunLanes {
 			input.canonicalFiles,
 			input.auto === true,
 		);
+		// A progress-only note holds no lane and takes no write lease or worker slot of its own. It still wakes an idle
+		// recipient into a turn that may write, so that turn must not start inside another writer's scope; a running
+		// recipient already owns its reservation.
+		if (input.progress === true) {
+			if (!running) {
+				for (const reservation of this.#writes.values()) {
+					if (reservation.agentId === input.agentId || !scopesConflict(scope, reservation.scope)) continue;
+					const other = reservation.lane === undefined ? "진행 중인 공유 작업" : `레인 '${reservation.lane}'`;
+					return {
+						ok: false,
+						code: "lane-write",
+						reason: `${conflictText(lane, input.agent, scope, other, reservation.scope)} 이 진행 메모는 대기 중인 워커의 새 턴을 시작시키므로 보내지 않았습니다. 앞선 쓰기 작업이 끝난 뒤 같은 메모를 다시 보내세요.`,
+					};
+				}
+			}
+			return { ok: true, token: `follow:${++this.#tokenSerial}` };
+		}
 		// A work-bearing note to a settled worker reserves its lane from this admission until the reactivated turn starts;
 		// a note to an already running worker reserves nothing beyond the gate itself.
 		const awaits = !running;
@@ -1102,7 +1154,7 @@ export class RunLanes {
 				return {
 					ok: false,
 					code: "lane-busy",
-					reason: `레인 '${lane.name}'에 이미 예약된 ${current.agentId === undefined ? "독립 작업" : "후속 작업"}이 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 그 작업이 시작·종료된 뒤 같은 write를 다시 보내세요.`,
+					reason: `레인 '${lane.name}'에 이미 예약된 ${current.agentId === undefined ? "독립 작업" : "후속 작업"}이 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 그 작업이 시작·종료된 뒤 같은 write를 다시 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 				};
 			}
 		}

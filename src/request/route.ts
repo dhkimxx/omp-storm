@@ -10,7 +10,6 @@ import { isRecord, teamPriority } from "../config/schema.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { workerRange } from "../roles.ts";
-import { DEFAULT_EXTRA_ROUNDS } from "../runtime/rounds.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import type { RunRequestResult } from "../tool/host.ts";
 import type { RunSpec, StormConfig, UiPort } from "../types.ts";
@@ -51,7 +50,7 @@ export function teamBrief(state: ProjectState): string {
 		? `${formatUsd(config.budget.perRunUsd)} per run${config.budget.warnAtUsd !== undefined ? `, warn at ${formatUsd(config.budget.warnAtUsd)}` : ""}, past it: ${config.budget.onExceed}`
 		: "none";
 	return [
-		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, isolation ${config.isolation}, rounds ${config.rounds ?? DEFAULT_EXTRA_ROUNDS}`,
+		`Team (${isApproved(state) ? "approved" : "NOT approved"}): priority ${teamPriority(config)}, isolation ${config.isolation}, rounds ${config.rounds === undefined ? "no cap" : `${config.rounds} extra`}`,
 		...roles,
 		...(config.disabledRoles?.length ? [`Disabled roles: ${config.disabledRoles.join(", ")}`] : []),
 		...(config.trials ?? []).map(trial => `Trial: ${trial.role} → ${trial.model}, share ${trial.share}, until ${trial.endsAt}`),

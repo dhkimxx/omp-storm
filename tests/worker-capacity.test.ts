@@ -85,11 +85,11 @@ describe("one authoritative worker accounting", () => {
 		expect(reservedWorkers(RUN)).toHaveLength(1);
 	});
 
-	test("a failed start and a settled worker both release; no timer does", () => {
+	test("a settled worker releases its slot; a placement cancel leaves the slot to the decision that reserved it", () => {
 		const lanes = new RunLanes(RUN);
 		reserveWorkerSlot({ runId: RUN, key: "Impl", role: "implementer", now: NOW });
-		lanes.cancel("Impl");
-		expect(workerSlot(RUN, "Impl")).toBeUndefined();
+		lanes.cancel("Impl", undefined);
+		expect(workerSlot(RUN, "Impl")).toMatchObject({ key: "Impl" });
 		reserveWorkerSlot({ runId: RUN, key: "Impl", role: "implementer", now: NOW });
 		lanes.releaseAgent("Impl");
 		expect(workerSlot(RUN, "Impl")).toBeUndefined();

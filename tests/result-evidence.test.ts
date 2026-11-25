@@ -263,6 +263,42 @@ describe("source-citing answers", () => {
 		if (wrongPath.ok) expect(wrongPath.report.results[0]?.state).toBe("unmet");
 	});
 
+	test("a value that differs only by case is never support", async () => {
+		const root = await tempRoot("answer-case");
+		await put(root, "model.md", "model: qwen3-32b\n");
+		const model = (extra: Partial<PlanLaneResult> = {}): PlanLaneResult => ({ id: "model", kind: "answer", criterion: "states the model id", path: "model.md", ...extra });
+		const evaluate = (candidate: PlanLaneResult, text: string) =>
+			evaluateSettledResults({ lane: "read", attemptId: "attempt-1", results: [candidate], shared: { root }, answer: { text, citations: [{ path: "model.md", line: 1 }] } });
+
+		for (const text of ["Qwen3-32B", "model: Qwen3-32B", "the model is Qwen3-32B"]) {
+			for (const candidate of [model({ contains: undefined }), model({ contains: "qwen3-32b" })]) {
+				const out = await evaluate(candidate, text);
+				expect(out.ok).toBe(true);
+				if (out.ok) expect(out.report.results[0]?.state).toBe("reviewable");
+			}
+		}
+
+		// The exact cited text is intact: same case, or whitespace alone.
+		for (const text of ["model: qwen3-32b", "model:\t  qwen3-32b", "model: qwen3-32b."]) {
+			for (const candidate of [model({ contains: undefined }), model({ contains: "qwen3-32b" })]) {
+				const out = await evaluate(candidate, text);
+				expect(out.ok).toBe(true);
+				if (out.ok) expect(out.report.results[0]?.state).toBe("accepted");
+			}
+		}
+
+		await put(root, "model.md", "qwen3-32b\n");
+		const exact = await evaluate(model({ contains: undefined }), "qwen3-32b");
+		expect(exact.ok).toBe(true);
+		if (exact.ok) expect(exact.report.results[0]?.state).toBe("accepted");
+		const cased = await evaluate(model({ contains: undefined }), "Qwen3-32B");
+		expect(cased.ok).toBe(true);
+		if (cased.ok) expect(cased.report.results[0]?.state).toBe("reviewable");
+		const declared = await evaluate(model({ contains: "qwen3-32b" }), "Qwen3-32B");
+		expect(declared.ok).toBe(true);
+		if (declared.ok) expect(declared.report.results[0]?.state).toBe("reviewable");
+	});
+
 	test("a factual answer aligned with its cited line is accepted without contains; ambiguity and false sources stay reviewable", async () => {
 		const root = await rootWithReport();
 		const results = [answer({ contains: undefined })];

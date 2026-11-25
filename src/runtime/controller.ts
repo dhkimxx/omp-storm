@@ -88,8 +88,11 @@ import {
 	declaredInputs,
 	type DeclaredInput,
 	hasStaleInputs,
+	type InputSatisfaction,
 	inputSnapshot,
+	ledgerInputSatisfaction,
 	requirementConflict,
+	resultInputs,
 	staleRequirementIdsForPlan,
 } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
@@ -114,6 +117,7 @@ import {
 	type CoverageResult,
 	type Gate,
 	type RoundDecision,
+	type RoundProgress,
 } from "./rounds.ts";
 import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "./answer-review.ts";
 import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
@@ -419,8 +423,34 @@ function configRefusalReason(text: string): string {
 	return compactResultReason(redacted);
 }
 
-/** The unverified gate a round message is built from, as `decideRound` hands it over. */
-type RoundGate = Extract<RoundDecision, { action: "continue" }>["gate"];
+/** A decision to send another round, as `decideRound` hands it over. */
+type RoundContinue = Extract<RoundDecision, { action: "continue" }>;
+
+/**
+ * Producer result ids that some requirement declared below `integrated` in `previous` and at `integrated` in `next`:
+ * the only strengthening whose satisfaction needs a tree read rather than a row state.
+ */
+function integratedStrengthening(previous: RunPlan, next: RunPlan): Set<string> {
+	const ids = new Set<string>();
+	for (const lane of next.lanes) {
+		for (const result of lane.results ?? []) {
+			const before = new Map((resultInputs(previous, result.id) ?? []).map(input => [input.id, input.need]));
+			for (const input of resultInputs(next, result.id) ?? []) {
+				const old = before.get(input.id);
+				if (input.need === "integrated" && old !== undefined && old !== "integrated") ids.add(input.id);
+			}
+		}
+	}
+	return ids;
+}
+
+/**
+ * What one row's current judgment stands on: its state, origin, attempt and content version. A decision read from an
+ * awaited location check applies only while this is unchanged.
+ */
+function rowWitness(row: RunResult): string {
+	return JSON.stringify([row.state, row.origin ?? null, row.attemptId ?? null, row.contentVersion ?? null]);
+}
 
 /** One accepted row's usable location: a retained isolated artifact, the current parent, or an answer's own proof. */
 type AcceptedLocation =
@@ -506,18 +536,18 @@ interface OwnRun {
 	auto?: boolean;
 	/** Why the run is over, decided while a turn was still running: that turn's end finishes it, its last message counted. */
 	ending?: RunEndReason;
-	/** Most rounds the run may take, fixed at start: a team edited mid-run must not move the goal posts. */
-	maxRounds: number;
+	/** Most rounds the run may take, fixed at start: a team edited mid-run must not move the goal posts. Absent: no cap. */
+	maxRounds?: number;
 	/** The user's wall-time limit in minutes, when the request stated one. */
 	minutes?: number;
 	/** The work tree when the run started: the gate compares it with the tree at each round. */
 	tree?: TreeState;
 	/** The commit the start tree was read against: every later read compares with it, so a commit does not hide a change. */
 	base?: string;
-	/** When Storm first sent a round for a tree-only stale review: a verdict after it is not stale because of the tree. */
-	rereviewedAt?: number;
 	/** The team's activity when Storm sent its last round message: what the next round is expected to move. */
-	progress?: { changes: number; reviews: number; requests: number; result?: string };
+	progress?: RoundProgress;
+	/** Rounds in a row that moved nothing, as of the last round sent; memory only, a resumed run starts at 0. */
+	stalled?: number;
 	/** The pending look timer: the round delay, or the wait while the session is held. */
 	hold?: unknown;
 	/** The last `agent_end` paused the run on async work: a terminal end without a new turn means the user stopped that wait. */
@@ -898,7 +928,7 @@ export class RunController {
 				...artifactsOf(ctx),
 				process: processKey(),
 				turns: 0,
-				maxRounds: roundLimit,
+				...(roundLimit === undefined ? {} : { maxRounds: roundLimit }),
 				...(plan !== undefined ? { plan } : {}),
 				...(limits ? { limits } : {}),
 			};
@@ -927,7 +957,7 @@ export class RunController {
 				turnStarted: auto,
 				inTurn: auto,
 				...(auto ? { auto, roundInFlight: 1 } : {}),
-				maxRounds: roundLimit,
+				...(roundLimit === undefined ? {} : { maxRounds: roundLimit }),
 				awaitingAsync: false,
 				...(startTree !== undefined ? { tree: startTree.state, base: startTree.base } : {}),
 				...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
@@ -965,7 +995,7 @@ export class RunController {
 					// unrelated task carries none.
 					const earlier = continued ?? followUp;
 					const history = earlier === undefined ? undefined : closeoutHandoff(earlier);
-					handoff = buildHandoff({ runId, config, hash, task, maxRounds: roundLimit,
+					handoff = buildHandoff({ runId, config, hash, task, ...(roundLimit === undefined ? {} : { maxRounds: roundLimit }),
 						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }),
 						...(history === undefined || history === "" ? {} : { history: { text: history, ...(followUp !== undefined ? { followUp: true } : {}) } }) });
 				} catch (error) {
@@ -1405,6 +1435,9 @@ export class RunController {
 			// A newer attempt of this lane already started: its settlement governs the requirement. The older attempt
 			// must not reinstate a success (or a failure) even when the host delivers it late.
 			if (prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+			const satisfied = await this.#settledInputSatisfaction(own, prepared);
+			// The integration read awaited: a newer attempt or another owner may have taken over meanwhile.
+			if (this.#own !== own || prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
 			const report = input.report;
 			const exact =
 				attemptUsable(report) &&
@@ -1412,9 +1445,10 @@ export class RunController {
 				report.parentId === input.parentId &&
 				report.spawnKey === input.spawnKey;
 			// The plan replaced this attempt's logical inputs after it started (B@1 → C@1, an added/removed input or a
-			// changed level). Whatever the host says about it, its output answers the old contract: it can neither settle
-			// the new one nor leave an exhausted-route remedy that would block the rerun the replan asked for.
-			if (!this.#declaredInputsCurrent(own, prepared)) {
+			// level strengthened beyond what the producer satisfies). Whatever the host says about it, its output answers
+			// the old contract: it can neither settle the new one nor leave an exhausted-route remedy that would block the
+			// rerun the replan asked for.
+			if (!this.#declaredInputsCurrent(own, prepared, satisfied)) {
 				this.#applySupersededAttempt(own, prepared, exact ? report.attemptId : undefined);
 				return;
 			}
@@ -1431,7 +1465,7 @@ export class RunController {
 			}
 			// A success against a producer version that has since changed is not evidence for the requirement now: the
 			// attempt is recorded honestly as unmet rather than reviving the old input's proof.
-			if (this.#staleInputs(own, prepared)) {
+			if (this.#staleInputs(own, prepared, satisfied)) {
 				this.#applyStaleInput(own, prepared, report.attemptId);
 				return;
 			}
@@ -1586,7 +1620,7 @@ export class RunController {
 			}
 		}
 		// The recorded producer ids already reject an added, removed or swapped input above; only the stored plan can
-		// reveal a level change under the same ids. It is untrusted input, so it seeds the transition only once it
+		// reveal a level that got stronger under the same ids. It is untrusted input, so it seeds the transition only once it
 		// normalizes; otherwise the current declaration alone is checked.
 		let storedPlan: RunPlan | undefined;
 		try {
@@ -1616,7 +1650,7 @@ export class RunController {
 	 * never rewritten while the identity matches. A changed contract under the same id is a new requirement: its old
 	 * contract, attempt evidence and accepted proof are dropped, never inherited.
 	 */
-	#syncResults(own: OwnRun, previousPlan?: RunPlan): boolean {
+	#syncResults(own: OwnRun, previousPlan?: RunPlan, satisfied?: InputSatisfaction): boolean {
 		const rows = own.record.results ?? [];
 		const byId = new Map(rows.map(row => [row.id, row]));
 		const assigned = new Set<string>();
@@ -1710,9 +1744,10 @@ export class RunController {
 			this.#scheduleFlush(own);
 		}
 		// A plan change can leave an already-invalid consumer in the ledger (a legacy row, a removed producer, or an
-		// input the replan swapped, added, removed or re-levelled). The rows are re-read after the plan edit, never
-		// assumed fresh, and the plan just replaced (when given) seeds the transition before any downstream is judged.
-		if (this.#invalidateConsumers(own, previousPlan)) changed = true;
+		// input the replan swapped, added or removed, or strengthened beyond the producer's current facts). The rows are
+		// re-read after the plan edit, never assumed fresh, and the plan just replaced (when given) seeds the transition
+		// before any downstream is judged.
+		if (this.#invalidateConsumers(own, previousPlan, satisfied)) changed = true;
 		return changed;
 	}
 
@@ -1845,16 +1880,45 @@ export class RunController {
 	 * Whether the plan still declares, for every result this attempt can produce, exactly the logical inputs it started
 	 * under. Result ids locate the owning lane, so a pure rename of the producer or consumer lane keeps the attempt.
 	 */
-	#declaredInputsCurrent(own: OwnRun, prepared: PreparedAttempt): boolean {
-		return attemptInputsCurrent(own.record.plan, prepared.results.map(result => result.id), prepared.declaredInputs);
+	#declaredInputsCurrent(own: OwnRun, prepared: PreparedAttempt, satisfied?: InputSatisfaction): boolean {
+		return attemptInputsCurrent(own.record.plan, prepared.results.map(result => result.id), prepared.declaredInputs, satisfied);
 	}
 
-	/** Whether a prepared attempt's declared inputs or producer versions changed after it started. */
-	#staleInputs(own: OwnRun, prepared: PreparedAttempt): boolean {
-		if (!this.#declaredInputsCurrent(own, prepared)) return true;
+	/**
+	 * Whether a prepared attempt's declared inputs or producer versions changed after it started. Without `satisfied`
+	 * a strengthened level counts as a change, which fails closed.
+	 */
+	#staleInputs(own: OwnRun, prepared: PreparedAttempt, satisfied?: InputSatisfaction): boolean {
+		if (!this.#declaredInputsCurrent(own, prepared, satisfied)) return true;
 		if ((prepared.consumed ?? []).length === 0) return false;
 		const byId = new Map((own.record.results ?? []).map(row => [row.id, row]));
 		return (prepared.consumed ?? []).some(input => currentInputVersion(byId.get(input.id)) !== input.version);
+	}
+
+	/**
+	 * What the producers of this attempt's results satisfy now. Row state answers `reviewable` and `result`; only the
+	 * ids whose declared level the current plan made `integrated` after the attempt captured a weaker one need a tree
+	 * read. `laneReadiness` is not used: it waits for settlements, and this attempt is one of them.
+	 */
+	async #settledInputSatisfaction(own: OwnRun, prepared: PreparedAttempt): Promise<InputSatisfaction> {
+		const captured = new Map((prepared.declaredInputs ?? []).map(input => [input.id, input.need]));
+		const needed = new Set<string>();
+		for (const id of prepared.results.map(result => result.id)) {
+			for (const input of resultInputs(own.record.plan, id) ?? []) {
+				if (input.need === "integrated" && captured.get(input.id) !== "integrated") needed.add(input.id);
+			}
+		}
+		const integrated = new Set<string>();
+		for (const id of needed) {
+			const result = this.#plannedResult(own, id);
+			const row = own.record.results?.find(candidate => candidate.id === id);
+			if (result === undefined || row?.state !== "accepted") continue;
+			const lane = own.record.plan?.lanes.find(candidate => candidate.results?.some(item => item.id === id));
+			const isolated = lane === undefined ? undefined : lane.isolationReason !== undefined || own.config.isolation === "isolated";
+			const location = await this.#acceptedLocation(own, result, isolated, row);
+			if (location.ok && location.integrated) integrated.add(id);
+		}
+		return ledgerInputSatisfaction(own.record.results, id => integrated.has(id));
 	}
 
 	/** Bind a row to the producer versions this attempt started from; the attempt's outcome never rewrites that fact. */
@@ -1930,18 +1994,19 @@ export class RunController {
 	 * Reopens rows whose evidence no longer stands on what the plan and ledger say now: a recorded producer version that
 	 * changed, a recorded producer set that differs from the logical inputs the current plan declares for the
 	 * requirement (by result id, so a pure lane rename keeps it), a declared level the producer no longer meets, and —
-	 * when `previousPlan` is the plan just replaced — an input set or level that changed in that transition. Only
+	 * when `previousPlan` is the plan just replaced — an input set change, or a level strengthened beyond what
+	 * `satisfied` confirms the producer meets now, in that transition. Only
 	 * accepted/reviewable evidence is touched: a pending row invents nothing and an already-unmet row stays as it is.
 	 * The pass is transitive because a reopened row is no longer a usable input.
 	 */
-	#invalidateConsumers(own: OwnRun, previousPlan?: RunPlan): boolean {
+	#invalidateConsumers(own: OwnRun, previousPlan?: RunPlan, satisfied?: InputSatisfaction): boolean {
 		const rows = own.record.results ?? [];
 		if (rows.length === 0) return false;
-		const stale = staleRequirementIdsForPlan(rows, own.record.plan, previousPlan);
+		const stale = staleRequirementIdsForPlan(rows, own.record.plan, previousPlan, satisfied);
 		if (stale.size === 0) return false;
 		const replanned = own.record.plan === undefined || previousPlan === undefined
 			? new Set<string>()
-			: changedInputRequirements(previousPlan, own.record.plan);
+			: changedInputRequirements(previousPlan, own.record.plan, satisfied);
 		let changed = false;
 		for (const row of rows) {
 			if (!stale.has(row.id)) continue;
@@ -2171,9 +2236,25 @@ export class RunController {
 			...(settled.artifact === undefined ? {} : { artifact: settled.artifact }),
 			...(wantsAnswer ? { answer: { text: settled.reportText ?? "", citations: [...settled.citations] } } : {}),
 		});
+		// What the producers satisfy now is read after the evidence, so no await separates it from the fences below.
+		const satisfied = this.#own === own ? await this.#settledInputSatisfaction(own, prepared) : undefined;
 		// The run was finalized while the evidence was being read: this settlement is detached and must not mutate the
 		// record already written (or the object a caller still holds).
 		if (this.#own !== own) return;
+		// The evidence read awaited: a newer attempt of this lane, or a producer or plan change since this attempt began,
+		// may have decided the requirement meanwhile. The fences checked before the read hold again here, so a late
+		// evaluation never overwrites the newer judgment.
+		if (prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+		if (!this.#declaredInputsCurrent(own, prepared, satisfied)) {
+			if (own.settled.get(prepared.lane) === settled) own.settled.delete(prepared.lane);
+			this.#applySupersededAttempt(own, prepared, settled.attemptId);
+			return;
+		}
+		if (this.#staleInputs(own, prepared, satisfied)) {
+			if (own.settled.get(prepared.lane) === settled) own.settled.delete(prepared.lane);
+			this.#applyStaleInput(own, prepared, settled.attemptId);
+			return;
+		}
 		if (!evaluation.ok) {
 			const rows = own.record.results ?? [];
 			for (const result of prepared.results) {
@@ -2238,13 +2319,17 @@ export class RunController {
 		}
 	}
 
-	/** Whether a settled lane is still waiting for approved check evidence it declared. */
+	/**
+	 * Whether a settled lane is still waiting for approved check evidence it declared. This is synchronous, so only row
+	 * state answers a strengthened level; a level made `integrated` stays unconfirmed here and fails closed.
+	 */
 	#hasDeferredCheck(own: OwnRun): boolean {
+		const satisfied = ledgerInputSatisfaction(own.record.results, () => false);
 		return [...own.settled.values()].some(
 			settled =>
 				settled.checkDeferred === true &&
 				settled.prepared.epoch >= (own.laneAttempt.get(settled.prepared.lane) ?? 0) &&
-				!this.#staleInputs(own, settled.prepared),
+				!this.#staleInputs(own, settled.prepared, satisfied),
 		);
 	}
 
@@ -2252,9 +2337,12 @@ export class RunController {
 	async #refreshCheckedResults(own: OwnRun): Promise<void> {
 		for (const [lane, settled] of [...own.settled]) {
 			if (settled.checkDeferred !== true) continue;
+			const satisfied = await this.#settledInputSatisfaction(own, settled.prepared);
+			if (this.#own !== own) return;
+			if (own.settled.get(lane) !== settled) continue;
 			// A newer attempt or a changed producer makes this settlement's evidence unusable; re-evaluating it would
 			// revive a result the run already reopened, and keeping it would ask for checks nobody can use.
-			if (settled.prepared.epoch < (own.laneAttempt.get(settled.prepared.lane) ?? 0) || this.#staleInputs(own, settled.prepared)) {
+			if (settled.prepared.epoch < (own.laneAttempt.get(settled.prepared.lane) ?? 0) || this.#staleInputs(own, settled.prepared, satisfied)) {
 				own.settled.delete(lane);
 				continue;
 			}
@@ -2745,6 +2833,7 @@ export class RunController {
 		const conflict = replanConflict(own.record.plan, plan);
 		if (conflict !== undefined) return { ok: false, reason: conflict };
 		const revision = own.planRevision;
+		const previousPlan = own.record.plan;
 		if (planNeedsWrite(plan)) {
 			const upgraded = await this.#upgradeLease(own);
 			if (!upgraded.ok) return upgraded;
@@ -2753,17 +2842,29 @@ export class RunController {
 			// reintroduce it and race the persisted adjustment.
 			if (own.planRevision !== revision) return { ok: false, reason: "계획이 동시에 바뀌어 계획을 적용하지 않았습니다. 현재 계획을 확인한 뒤 다시 제출하세요." };
 		}
+		// A level made `integrated` is kept only when the producer's accepted result is integrated now; that is a tree
+		// fact, read through the same readiness check a consumer admission uses, and only for those producers.
+		const strengthened = previousPlan === undefined ? new Set<string>() : integratedStrengthening(previousPlan, plan);
+		const producers = new Set(plan.lanes.filter(lane => lane.results?.some(result => strengthened.has(result.id))).map(lane => lane.name));
+		const readiness = producers.size === 0 ? undefined : await this.laneReadiness(plan, producers);
+		if (this.#own !== own || own.planRevision !== revision || own.record.plan !== previousPlan) {
+			return { ok: false, reason: "계획이 동시에 바뀌어 계획을 적용하지 않았습니다. 현재 계획을 확인한 뒤 다시 제출하세요." };
+		}
+		const integrated = new Set(
+			[...(readiness?.values() ?? [])].flatMap(lane => lane.results.filter(result => result.integrated).map(result => result.id)),
+		);
+		const satisfied = ledgerInputSatisfaction(own.record.results, id => integrated.has(id));
 		// A stopping run blocks new spawns; its plan is no longer authority for them.
 		if (!setLedgerPlan(own.record.runId, plan)) {
 			return { ok: false, reason: "실행이 끝나는 중이라 계획을 적용하지 않았습니다." };
 		}
-		const previousPlan = own.record.plan;
 		own.record.plan = plan;
 		own.planRevision += 1;
 		// Required results are obligations, not plan text: adding a lane seeds pending rows, and a removed lane keeps
 		// every requirement it still owed. A requirement whose logical inputs changed (B@1 → C@1, an added/removed
-		// input, a different level) reopens with everything that consumed it; a pure lane rename reopens nothing.
-		this.#syncResults(own, previousPlan);
+		// input, or a level stronger than the producer meets now) reopens with everything that consumed it; a weaker
+		// level or a pure lane rename reopens nothing.
+		this.#syncResults(own, previousPlan, satisfied);
 		for (const lane of plan.lanes) {
 			if (lane.job === undefined || historicalJob(own.record, lane.job)?.status !== "unknown") continue;
 			for (const row of own.record.results ?? []) if (row.lane === lane.name) blockedJobRow(row, UNCERTAIN_JOB);
@@ -3154,7 +3255,6 @@ export class RunController {
 			{
 				...(own.tree !== undefined ? { start: own.tree } : {}),
 				now: now.state,
-				...(own.rereviewedAt !== undefined ? { rereviewedAt: own.rereviewedAt } : {}),
 			},
 			this.#coverage(own, undefined, planLanes),
 		);
@@ -3175,7 +3275,6 @@ export class RunController {
 		const tree = {
 			...(own.tree !== undefined ? { start: own.tree } : {}),
 			...(now !== undefined ? { now: now.state } : {}),
-			...(own.rereviewedAt !== undefined ? { rereviewedAt: own.rereviewedAt } : {}),
 		};
 		// The pure gate already knows empty coverage (no checks, no lanes) from the start. Checks run only from the
 		// look timer, never inside omp's agent_end handler: they may take far longer than its budget.
@@ -3198,19 +3297,19 @@ export class RunController {
 		const currentTree = {
 			...(tree.start !== undefined ? { start: tree.start } : {}),
 			...(now !== undefined ? { now: now.state } : {}),
-			...(tree.rereviewedAt !== undefined ? { rereviewedAt: tree.rereviewedAt } : {}),
 		};
 		const coverage = this.#coverage(own, now?.state, planLanes);
 		const gate = reviewGate(agents, own.config, currentTree, coverage);
 		return decideRound({
 			gate,
 			turns: own.record.turns ?? 0,
-			maxRounds: own.maxRounds,
+			...(own.maxRounds === undefined ? {} : { maxRounds: own.maxRounds }),
 			aborted,
 			overBudget: getLedgerRun(own.record.runId)?.exceeded ?? false,
 			elapsedMs: this.deps.now() - Date.parse(own.record.startedAt),
 			...(own.minutes !== undefined ? { minutes: own.minutes } : {}),
 			...(own.progress ? { progressSince: own.progress } : {}),
+			...(own.stalled === undefined ? {} : { stalled: own.stalled }),
 		});
 	}
 
@@ -3571,7 +3670,7 @@ export class RunController {
 			return this.#stop(own, checkOnly, ctx);
 		}
 		if (decision.action === "end") return this.#stop(own, decision.reason, ctx);
-		this.#sendRound(own, ctx, decision.gate, decision.round);
+		this.#sendRound(own, ctx, decision);
 	}
 
 	/**
@@ -3616,9 +3715,10 @@ export class RunController {
 	 * Starts round `round`: remembers what the gate saw, says so, and hands the main session the round's message.
 	 * omp resolves `sendUserMessage` only when the turn it starts is over, so nothing here waits on it.
 	 */
-	#sendRound(own: OwnRun, ctx: ExtensionContext, gate: RoundGate, round: number): void {
+	#sendRound(own: OwnRun, ctx: ExtensionContext, decision: RoundContinue): void {
 		if (own.ending !== undefined || this.#own !== own) return;
 		const ui = this.deps.ui(ctx);
+		const { gate, round, stalled } = decision;
 		// A plain/review round may intervene between two result gates. Keep the last witness so the next result gate does
 		// not look like a brand-new obligation forever; a genuinely changed witness still counts once.
 		const witness = gate.resultProgress ?? own.progress?.result;
@@ -3627,12 +3727,16 @@ export class RunController {
 			reviews: gate.reviews,
 			requests: gate.requests,
 			...(witness === undefined ? {} : { result: witness }),
+			...(gate.by === "tree" ? { tree: true as const } : {}),
 		};
+		own.stalled = stalled;
 		// Only a review repair needs a reviewer name; a lane or check repair round has no review to request.
 		const reviewer = usableRole(own.config, "reviewer")?.agent;
-		// Tree-only staleness is asked about once: a verdict given from now on is honoured whatever the tree does.
-		if (gate.by === "tree" && own.rereviewedAt === undefined) own.rereviewedAt = this.deps.now();
-		ui.notify(`검증되지 않은 변경이 있어 ${round}라운드를 시작합니다(최대 ${own.maxRounds}라운드).`);
+		ui.notify(
+			own.maxRounds === undefined
+				? `검증되지 않은 변경이 있어 ${round}라운드를 시작합니다.`
+				: `검증되지 않은 변경이 있어 ${round}라운드를 시작합니다(최대 ${own.maxRounds}라운드).`,
+		);
 		this.#liveStatus(ctx, this.active());
 		own.awaitingRound = round;
 		this.#emitPhase(own);
@@ -3651,7 +3755,14 @@ export class RunController {
 				delete own.lastRetry;
 			}
 		}
-		const base = buildRoundMessage({ runId: own.record.runId, round, maxRounds: own.maxRounds, gate, ...(reviewer !== undefined ? { reviewer } : {}) });
+		const base = buildRoundMessage({
+			runId: own.record.runId,
+			round,
+			...(own.maxRounds === undefined ? {} : { maxRounds: own.maxRounds }),
+			gate,
+			...(reviewer !== undefined ? { reviewer } : {}),
+			stalled,
+		});
 		const extra = [...notes, ...(retryNote === undefined ? [] : [retryNote])].join("\n\n");
 		this.deps.pi.sendUserMessage(extra === "" ? base : `${base}\n\n${extra}`).catch((error: unknown) => {
 			// No turn started from this message: a later user turn must not be mistaken for the scheduled round.
@@ -3786,7 +3897,6 @@ export class RunController {
 			{
 				...(own.tree !== undefined ? { start: own.tree } : {}),
 				...(now !== undefined ? { now: now.state } : {}),
-				...(own.rereviewedAt !== undefined ? { rereviewedAt: own.rereviewedAt } : {}),
 			},
 			coverage,
 		);
@@ -3891,7 +4001,11 @@ export class RunController {
 			// A review-accepted answer is bound to its submission and cited bytes, never to a tree: it goes straight to
 			// the receipt re-read below.
 			if (row.origin === "review" && !answer) {
+				const reviewed = rowWitness(row);
 				const tree = await currentTree();
+				// A settlement or review during the read may have replaced what this row stood on; that newer judgment
+				// is not demoted by a decision taken from the old row.
+				if (rowWitness(row) !== reviewed) continue;
 				// Without a current reading the gate cannot have an honest verified label; leave the row to it rather
 				// than guessing that an unread tree matches.
 				const moved = tree !== undefined && row.reviewTree !== tree;
@@ -3908,6 +4022,7 @@ export class RunController {
 				if (!moved || row.restoredFrom === undefined) continue;
 			}
 			let location: AcceptedLocation;
+			const located = rowWitness(row);
 			if (answer && row.state === "reviewable") {
 				// A submission with no recorded anchor was never judgeable; it stays as it is. One whose anchor moved is
 				// no longer the submission a reviewer would judge.
@@ -3920,6 +4035,9 @@ export class RunController {
 				location = await this.#acceptedLocation(own, planned, isolated, row);
 			}
 			if (location.ok) continue;
+			// The location read awaited: a newer attempt may have settled this row meanwhile. Its judgment stands; only
+			// the row this read actually checked can be revoked.
+			if (rowWitness(row) !== located) continue;
 			const held = row.state === "accepted" ? "수용된 결과가 현재 위치에서 확인되지 않았습니다" : "제출된 결과의 근거가 현재와 다릅니다";
 			row.state = "unmet";
 			row.origin = "attempt";
@@ -4317,7 +4435,8 @@ export function summarizeRun(run: RunRecord): string {
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
-	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept.
+	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept and
+	// from every uncapped run.
 	const rounds =
 		run.turns === undefined
 			? ""

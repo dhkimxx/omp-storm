@@ -57,6 +57,9 @@ try {
 					first.jobs?.some(job => job.name === "first" && job.status === "passed") === true &&
 					first.jobs.some(job => job.name === "retry" && job.status === "failed" && job.exitCode === 7) &&
 					starts().join(",") === "first,retry", JSON.stringify(first.jobs));
+				// The team config's `rounds: 0` is an explicit limit: one round, recorded and reported as the round limit.
+				suite.check("the config's rounds limit ends the run at its round limit", first.endReason === "round-limit" && first.maxRounds === 1 && first.turns === 1,
+					`${first.status}/${first.endReason} turns=${first.turns} maxRounds=${first.maxRounds}`);
 				const card = closeoutOf(original.frames, first.runId);
 				suite.check("the stopped run leaves one whole closeout card with its status pointer", card !== undefined &&
 					card.details?.kind === "closeout" && card.details.runId === first.runId && card.text.includes(CLOSEOUT_DETAIL) &&

@@ -20,6 +20,7 @@ import {
 	currentInputVersion,
 	declaredInputFingerprint,
 	declaredInputs,
+	ledgerInputSatisfaction,
 	recordedInputsMatch,
 	requirementConflict,
 	resultInputs,
@@ -194,7 +195,7 @@ describe("logical upstream identity and strength", () => {
 		expect(attemptInputsCurrent(renamed, ["a-result"], before)).toBe(true);
 	});
 
-	test("order and duplicate weaker edges are equivalent; added, removed, swapped or re-levelled inputs change", () => {
+	test("order and duplicate edges are equivalent; a weakened edge is not a change", () => {
 		const base = planWith("a", "b", [{ lane: "b", need: "result" }]);
 		const before = declaredInputs(base, laneOf(base, "a"));
 		const reversed = planWith("a", "b", [{ lane: "c", need: "integrated" }, { lane: "b", need: "result" }]);
@@ -205,16 +206,101 @@ describe("logical upstream identity and strength", () => {
 		expect(sameDeclaredInputs(before, declaredInputs(duplicate, laneOf(duplicate, "a")))).toBe(true);
 		expect([...changedInputRequirements(base, duplicate)]).toEqual([]);
 
+		// Integrated → result asks less of the same content, so neither a predicate nor a row has to say anything.
+		const integrated = planWith("a", "b", [{ lane: "b", need: "integrated" }]);
+		const captured = declaredInputs(integrated, laneOf(integrated, "a"));
+		expect([...changedInputRequirements(integrated, base)]).toEqual([]);
+		expect(attemptInputsCurrent(base, ["a-result"], captured)).toBe(true);
+		expect([...changedInputRequirements(integrated, base, () => false)]).toEqual([]);
+		expect(attemptInputsCurrent(base, ["a-result"], captured, () => false)).toBe(true);
+	});
+
+	test("an added, removed or swapped producer id is a change whatever the predicate says", () => {
+		const base = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const before = declaredInputs(base, laneOf(base, "a"));
 		const swapped = planWith("a", "b", [{ lane: "c", need: "result" }]);
 		const added = planWith("a", "b", [{ lane: "b", need: "result" }, { lane: "c", need: "result" }]);
 		const removed = planWith("a", "b", []);
-		const weaker = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
-		for (const next of [swapped, added, removed, weaker]) {
-			expect([...changedInputRequirements(base, next)]).toEqual(["a-result"]);
-			expect(attemptInputsCurrent(next, ["a-result"], before)).toBe(false);
+		for (const next of [swapped, added, removed]) {
+			expect([...changedInputRequirements(base, next, () => true)]).toEqual(["a-result"]);
+			expect(attemptInputsCurrent(next, ["a-result"], before, () => true)).toBe(false);
 		}
 		expect(resultInputs(swapped, "z-result")).toBeUndefined();
-		expect(attemptInputsCurrent(swapped, ["z-result"], before)).toBe(false);
+		expect(attemptInputsCurrent(swapped, ["z-result"], before, () => true)).toBe(false);
+	});
+
+	test("result → integrated keeps the consumer when the accepted producer is integrated", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const next = planWith("a", "b", [{ lane: "b", need: "integrated" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+			{ id: "d-result", state: "accepted", contentVersion: "vd", consumed: [{ id: "a-result", version: "va" }] },
+		];
+		const satisfied = ledgerInputSatisfaction(rows, id => id === "b-result");
+		expect(satisfied("b-result", "reviewable")).toBe(true);
+		expect(satisfied("b-result", "result")).toBe(true);
+		expect(satisfied("b-result", "integrated")).toBe(true);
+		// Integration still requires acceptance: a reviewable submission cannot satisfy the level alone.
+		expect(ledgerInputSatisfaction([{ id: "b-result", state: "reviewable" }], () => true)("b-result", "integrated")).toBe(false);
+		expect([...changedInputRequirements(previous, next, satisfied)]).toEqual([]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous, satisfied)]).toEqual([]);
+		const captured = declaredInputs(previous, laneOf(previous, "a"));
+		expect(attemptInputsCurrent(next, ["a-result"], captured, satisfied)).toBe(true);
+	});
+
+	test("result → integrated reopens the consumer when the accepted producer is not integrated", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const next = planWith("a", "b", [{ lane: "b", need: "integrated" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+			{ id: "d-result", state: "accepted", contentVersion: "vd", consumed: [{ id: "a-result", version: "va" }] },
+		];
+		const unintegrated = ledgerInputSatisfaction(rows, () => false);
+		expect(unintegrated("b-result", "integrated")).toBe(false);
+		expect([...changedInputRequirements(previous, next, unintegrated)]).toEqual(["a-result"]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous, unintegrated)].sort()).toEqual(["a-result", "d-result"]);
+		const captured = declaredInputs(previous, laneOf(previous, "a"));
+		expect(attemptInputsCurrent(next, ["a-result"], captured, unintegrated)).toBe(false);
+	});
+
+	test("reviewable → result needs acceptance: an accepted producer keeps the consumer, a reviewable one reopens it", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
+		const next = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "reviewable", contentVersion: "vb" },
+			{ id: "a-result", state: "reviewable", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+		];
+		const reviewOnly = ledgerInputSatisfaction(rows, () => false);
+		expect(reviewOnly("b-result", "reviewable")).toBe(true);
+		expect(reviewOnly("b-result", "result")).toBe(false);
+		expect([...changedInputRequirements(previous, next, reviewOnly)]).toEqual(["a-result"]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous, reviewOnly)]).toEqual(["a-result"]);
+
+		const accepted = rows.map(row => (row.id === "b-result" ? { ...row, state: "accepted" as const } : row));
+		const satisfied = ledgerInputSatisfaction(accepted, () => false);
+		expect(satisfied("b-result", "result")).toBe(true);
+		expect([...changedInputRequirements(previous, next, satisfied)]).toEqual([]);
+		expect([...staleRequirementIdsForPlan(accepted, next, previous, satisfied)]).toEqual([]);
+		const captured = declaredInputs(previous, laneOf(previous, "a"));
+		expect(attemptInputsCurrent(next, ["a-result"], captured, satisfied)).toBe(true);
+	});
+
+	test("without a predicate a stronger need stays a change and a missing id satisfies nothing", () => {
+		const previous = planWith("a", "b", [{ lane: "b", need: "result" }]);
+		const next = planWith("a", "b", [{ lane: "b", need: "integrated" }]);
+		const rows: RunResult[] = [
+			{ id: "b-result", state: "accepted", contentVersion: "vb" },
+			{ id: "a-result", state: "accepted", contentVersion: "va", consumed: [{ id: "b-result", version: "vb" }] },
+		];
+		expect([...changedInputRequirements(previous, next)]).toEqual(["a-result"]);
+		expect([...staleRequirementIdsForPlan(rows, next, previous)]).toEqual(["a-result"]);
+		const captured = declaredInputs(previous, laneOf(previous, "a"));
+		expect(attemptInputsCurrent(next, ["a-result"], captured)).toBe(false);
+		const satisfied = ledgerInputSatisfaction(rows, () => true);
+		expect(satisfied("absent-result", "reviewable")).toBe(false);
+		expect(satisfied("absent-result", "integrated")).toBe(false);
 	});
 
 	test("the recorded producer-id snapshot compares as an unordered identity set; versions are not its half", () => {
@@ -248,7 +334,7 @@ describe("logical upstream identity and strength", () => {
 		expect([...staleRequirementIdsForPlan(rows, renamed, previous)]).toEqual([]);
 	});
 
-	test("a different edge level or a weaker current producer state reopens even with the same content version", () => {
+	test("a strengthened edge or a weaker current producer state reopens even with the same content version", () => {
 		const previous = planWith("a", "b", [{ lane: "b", need: "reviewable" }]);
 		const next = planWith("a", "b", [{ lane: "b", need: "result" }]);
 		const rows: RunResult[] = [

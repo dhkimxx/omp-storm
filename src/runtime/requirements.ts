@@ -47,13 +47,41 @@ export function inputSnapshot(plan: RunPlan | undefined, lane: PlanLane, rows: r
 /**
  * One logical requirement input: the producer result id and the strongest edge level the plan declares to it. The
  * predecessor lane name is deliberately absent. Moving the same result id to another lane is a rename, while a
- * different result id or level is a changed input even under the same lane name.
+ * different result id is a changed input even under the same lane name; a stronger level is one only until the
+ * producer already satisfies it.
  */
 export interface DeclaredInput {
 	/** Producer result id, the only stable upstream identity a plan has. */
 	id: string;
 	/** Strongest declared edge to this id: `reviewable` < `result` < `integrated`. */
 	need: LaneNeed;
+}
+
+/**
+ * Whether a producer result id satisfies a declared edge level now, from facts the caller has verified. `reviewable`
+ * and `result` can be read from the ledger row's state; `integrated` needs the controller's tree fact, which a row
+ * does not carry.
+ */
+export type InputSatisfaction = (id: string, need: LaneNeed) => boolean;
+
+/**
+ * Builds the `satisfies now` predicate for a plan comparison. The row-state halves mirror `dependencyShortfall` in
+ * `lanes.ts`: a `reviewable` edge accepts an accepted or reviewable submission while a `result` edge needs acceptance.
+ * Integration is not a row fact — the caller supplies its verified tree answer, and that answer is what makes an
+ * accepted producer enough for an `integrated` edge. Location and receipt liveness of an accepted row stay with the
+ * controller's own revalidation passes; this predicate never overrides a row that no longer has evidence.
+ */
+export function ledgerInputSatisfaction(
+	rows: readonly RunResult[] | undefined,
+	integrated: (id: string) => boolean,
+): InputSatisfaction {
+	const byId = new Map((rows ?? []).map(row => [row.id, row]));
+	return (id, need) => {
+		const row = byId.get(id);
+		if (row === undefined) return false;
+		if (need === "integrated") return row.state === "accepted" && integrated(id);
+		return row.state === "accepted" || (need === "reviewable" && row.state === "reviewable");
+	};
 }
 
 /** Strength order for two edges that reach the same producer result; the stricter edge subsumes the weaker one. */
@@ -86,11 +114,27 @@ export function declaredInputs(plan: RunPlan | undefined, lane: PlanLane): Decla
 	return canonicalInputs(inputs);
 }
 
-/** Whether two declarations are equivalent: same logical results at the same strength, regardless of order or lanes. */
-export function sameDeclaredInputs(left: readonly DeclaredInput[], right: readonly DeclaredInput[]): boolean {
-	const a = canonicalInputs(left);
-	const b = canonicalInputs(right);
-	return a.length === b.length && a.every((input, index) => input.id === b[index]?.id && input.need === b[index]?.need);
+/**
+ * Whether two declarations are equivalent: the same logical result ids, and no level that got stronger unless the
+ * producer satisfies the new level now. `left` is the earlier declaration and `right` the later one. A weaker or equal
+ * new level never asks for more of the same consumed content, so it is not a change. Without a `satisfied` fact a
+ * stronger level is a change, which keeps the conservative answer for callers that cannot verify the producer's current
+ * state. Added, removed or swapped ids are a change whatever the predicate says.
+ */
+export function sameDeclaredInputs(
+	left: readonly DeclaredInput[],
+	right: readonly DeclaredInput[],
+	satisfied?: InputSatisfaction,
+): boolean {
+	const before = new Map(canonicalInputs(left).map(input => [input.id, input.need]));
+	const after = canonicalInputs(right);
+	if (before.size !== after.length) return false;
+	for (const input of after) {
+		const old = before.get(input.id);
+		if (old === undefined) return false;
+		if (INPUT_STRENGTH[input.need] > INPUT_STRENGTH[old] && !(satisfied?.(input.id, input.need) ?? false)) return false;
+	}
+	return true;
 }
 
 /** Exact, order-independent fingerprint for an attempt snapshot; never includes a lane name. */
@@ -109,10 +153,16 @@ export function resultInputs(plan: RunPlan | undefined, resultId: string): Decla
 
 /**
  * Requirement ids whose logical upstream inputs differ between two plans. Requirements are located by id in both
- * plans, so renaming a producer or consumer lane (with the edges following the same result ids and levels) is not a
- * change. A new id has no earlier evidence and is absent; a removed id is left to the ledger's orphan handling.
+ * plans, so renaming a producer or consumer lane (with the edges following the same result ids) is not a change. A
+ * level that got weaker is not a change, and a level that got stronger is one only while `satisfied` cannot confirm
+ * the producer meets it. A new id has no earlier evidence and is absent; a removed id is left to the ledger's orphan
+ * handling.
  */
-export function changedInputRequirements(previous: RunPlan | undefined, next: RunPlan): Set<string> {
+export function changedInputRequirements(
+	previous: RunPlan | undefined,
+	next: RunPlan,
+	satisfied?: InputSatisfaction,
+): Set<string> {
 	const changed = new Set<string>();
 	if (previous === undefined) return changed;
 	const before = new Map<string, DeclaredInput[]>();
@@ -123,7 +173,7 @@ export function changedInputRequirements(previous: RunPlan | undefined, next: Ru
 		for (const result of lane.results ?? []) {
 			const old = before.get(result.id);
 			if (old === undefined) continue;
-			if (!sameDeclaredInputs(old, declaredInputs(next, lane))) changed.add(result.id);
+			if (!sameDeclaredInputs(old, declaredInputs(next, lane), satisfied)) changed.add(result.id);
 		}
 	}
 	return changed;
@@ -148,19 +198,21 @@ export function recordedInputsMatch(
 
 /**
  * Whether an in-flight attempt's captured declaration still equals what the current plan declares for every result it
- * can produce. Result ids locate the lane, so a pure lane rename preserves the attempt; a swapped, added, removed or
- * re-levelled input makes its late result unusable.
+ * can produce. Result ids locate the lane, so a pure lane rename preserves the attempt; a swapped, added or removed
+ * input makes its late result unusable. A level that got weaker keeps it; a level that got stronger keeps it only when
+ * `satisfied` confirms the producer meets the new level now.
  */
 export function attemptInputsCurrent(
 	plan: RunPlan | undefined,
 	produced: readonly string[],
 	captured: readonly DeclaredInput[] | undefined,
+	satisfied?: InputSatisfaction,
 ): boolean {
 	// A run without a plan has no declaration to compare against; the existing version snapshot remains the guard.
 	if (plan === undefined || produced.length === 0) return true;
 	for (const id of produced) {
 		const current = resultInputs(plan, id);
-		if (current === undefined || !sameDeclaredInputs(current, captured ?? [])) return false;
+		if (current === undefined || !sameDeclaredInputs(captured ?? [], current, satisfied)) return false;
 	}
 	return true;
 }
@@ -212,18 +264,20 @@ export function hasStaleInputs(row: RunResult | undefined, rows: readonly RunRes
  *
  * The plan half compares the recorded producer ids with the logical inputs declared for the lane that currently owns
  * the requirement, and checks each declared level against the producer's current state. Passing `previous` adds the
- * exact plan transition: a requirement whose producer set or level changed is invalid even while its version snapshot
- * still names the same content. Once seeded, the version fixpoint makes the answer transitive, so a consumer of an
- * invalid requirement is reopened in the same pass without waiting for a row write. Rows whose id left the plan have
- * no current declaration and are left to orphan handling; no row is written here.
+ * exact plan transition: a requirement whose producer set changed, or whose level got stronger beyond what `satisfied`
+ * can confirm, is invalid even while its version snapshot still names the same content. Once seeded, the version
+ * fixpoint makes the answer transitive, so a consumer of an invalid requirement is reopened in the same pass without
+ * waiting for a row write. Rows whose id left the plan have no current declaration and are left to orphan handling; no
+ * row is written here.
  */
 export function staleRequirementIdsForPlan(
 	rows: readonly RunResult[],
 	plan: RunPlan | undefined,
 	previous?: RunPlan,
+	satisfied?: InputSatisfaction,
 ): Set<string> {
 	const byId = new Map(rows.map(row => [row.id, row]));
-	const bad = plan === undefined || previous === undefined ? new Set<string>() : changedInputRequirements(previous, plan);
+	const bad = plan === undefined || previous === undefined ? new Set<string>() : changedInputRequirements(previous, plan, satisfied);
 	if (plan !== undefined) {
 		for (const row of rows) {
 			if (row.scope === "excluded-by-user") continue;

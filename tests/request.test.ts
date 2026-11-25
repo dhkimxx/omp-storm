@@ -150,11 +150,11 @@ describe("route: prompt", () => {
 	test("the brief names every role with its models and worker range, the budget and the switches", async () => {
 		const config: StormConfig = { ...structuredClone(base), budget: { perRunUsd: 5, warnAtUsd: 4, onExceed: "stop" }, disabledRoles: ["quick"], docs: false, rounds: 5 };
 		const brief = teamBrief(await fakeHost({ config }).host.loadState());
-		for (const part of ["explorer: a/x, b/z; workers", "implementer: a/i; workers 1-3", "reviewer: b/r", "$5.00", "stop", "quick", "docs off", "cleanup off", "rounds 5"]) expect(brief).toContain(part);
+		for (const part of ["explorer: a/x, b/z; workers", "implementer: a/i; workers 1-3", "reviewer: b/r", "$5.00", "stop", "quick", "docs off", "cleanup off", "rounds 5 extra"]) expect(brief).toContain(part);
 		expect(brief).not.toContain("NOT approved");
 		expect(brief).not.toContain("parallelism");
 		expect(teamBrief(await fakeHost({ approved: false }).host.loadState())).toContain("NOT approved");
-		expect(teamBrief(await fakeHost().host.loadState())).toContain("rounds 3");
+		expect(teamBrief(await fakeHost().host.loadState())).toContain("rounds no cap");
 	});
 
 	test("the prompt carries the brief and the request, fenced, and stays compact", async () => {

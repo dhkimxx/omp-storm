@@ -432,8 +432,8 @@ async function main(): Promise<void> {
 
 		check("a classified run opens no dialog", dialogs === 0, `dialogs=${dialogs}`);
 		check(
-			"the run record keeps the whole request and the round bound",
-			run.request === request && run.task.length <= 200 && run.maxRounds === 4,
+			"the run record keeps the whole request and, for a team without a rounds limit, no round cap",
+			run.request === request && run.task.length <= 200 && run.maxRounds === undefined,
 			`request=${run.request === request} task=${run.task.length} maxRounds=${run.maxRounds}`,
 		);
 		check("the accepted answers close the run after one round", run.endReason === "verified" && run.status === "done" && run.turns === 1 && run.results?.every(row => row.state === "accepted") === true, `${run.endReason} ${run.status} turns=${run.turns}`);
@@ -524,7 +524,7 @@ async function main(): Promise<void> {
 		try {
 			await session(cancelAll, async (rpc, files) => {
 				const run = await runOf(rpc, files, startRun(steps));
-				const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+				const roundTag = `<storm-run id="${run.runId}" round="2">`;
 				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
 				const director = mains(llm.all());
 				const roundAt = director.findIndex(entry => newestUser(entry).startsWith(roundTag));
@@ -535,7 +535,7 @@ async function main(): Promise<void> {
 				);
 				const roundCall = String(JSON.stringify(director[roundAt]?.decision.args));
 				check(
-					"the round message starts round 2 of 4",
+					"the round message starts round 2, with no maximum",
 					stormMessages.some(user => user.startsWith(roundTag)) && roundAt >= 0 && director[roundAt]?.decision.tool === "task" && roundCall.includes("storm-reviewer"),
 					`${director[roundAt]?.decision.tool} ${roundCall.slice(0, 120)}`,
 				);
@@ -581,7 +581,7 @@ async function main(): Promise<void> {
 				);
 				check("the bash change is not a tool change", (implementer?.changes ?? 0) === 0, `changes=${implementer?.changes}`);
 				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
-				const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+				const roundTag = `<storm-run id="${run.runId}" round="2">`;
 				check("the changed tree brings a second round", stormMessages.filter(user => user.startsWith(roundTag)).length === 1 && stormMessages.length === 2, `storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`);
 				check("round 2's verdict passes on the changed tree", reviewer?.lastVerdict?.correct === true && reviewer?.lastVerdict?.tree !== undefined, JSON.stringify(reviewer?.lastVerdict));
 				check("the run ends verified after two rounds", run.status === "done" && run.endReason === "verified" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
@@ -607,7 +607,7 @@ async function main(): Promise<void> {
 				const quick = run.agents?.find(agent => agent.role === "quick");
 				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
 				check("the quick worker's change is counted", quick?.changes === 1 && existsSync(changed), `changes=${quick?.changes} file=${existsSync(changed)}`);
-				check("no round followed: the quick role needs no reviewer", stormMessages.length === 1 && !stormMessages.some(user => user.includes('round="2/4"')), `storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`);
+				check("no round followed: the quick role needs no reviewer", stormMessages.length === 1 && !stormMessages.some(user => user.includes('round="2"')), `storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`);
 				check("the run ends unreviewed after one round", run.status === "ended" && run.endReason === "unreviewed" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
 				const lines = files.index().filter(line => line.runId === run.runId);
 				check("the index line agrees, once", lines.length === 1 && lines[0]?.status === "ended" && lines[0]?.endReason === "unreviewed" && lines[0]?.turns === 1, JSON.stringify(lines));
@@ -643,7 +643,7 @@ async function main(): Promise<void> {
 				`tools=${childCalls.join(",")} head=${head.slice(0, 8)} before=${before.slice(0, 8)} dirty=${JSON.stringify(dirty)}`,
 			);
 			const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
-			const roundTag = `<storm-run id="${run.runId}" round="2/4">`;
+			const roundTag = `<storm-run id="${run.runId}" round="2">`;
 			check(
 				"the commit hides neither the change nor the round",
 				(implementer?.changes ?? 0) === 0 && stormMessages.filter(user => user.startsWith(roundTag)).length === 1 && stormMessages.length === 2,
@@ -675,18 +675,19 @@ async function main(): Promise<void> {
 			// `task` returns when the spawn is queued: each director change waits for the reviewer's result so it lands
 			// after the verdict, with no other agent active after it.
 			{ bash: change, afterResult: "Rev0" },
-			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3/4"' },
+			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3"' },
 			{ bash: change, afterResult: "Again0" },
 		];
 		try {
 			await session(cancelAll, async (rpc, files) => {
 				const run = await runOf(rpc, files, startRun(steps));
 				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
-				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}/4">`)).length;
+				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}">`)).length;
 				const reviewers = run.agents?.filter(agent => agent.role === "reviewer") ?? [];
 				check(
-					"the change after the verdict brings one re-review, and no fourth round",
-					stormMessages.length === 3 && round(2) === 1 && round(3) === 1 && round(4) === 0,
+					// Round 3 only re-reviews a tree the outside writer moved: quiet, so round 4 is the one more chance it gets.
+					"re-reviewing an outside writer's tree is a quiet round: one more round, then no fifth",
+					stormMessages.length === 4 && round(2) === 1 && round(3) === 1 && round(4) === 1 && round(5) === 0,
 					`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")} agents=${JSON.stringify(run.agents?.map(agent => [agent.id, agent.lastActivityAt, agent.lastVerdict?.at]))}`,
 				);
 				check("both reviews pass", reviewers.length === 2 && reviewers.every(agent => agent.lastVerdict?.correct === true), JSON.stringify(reviewers.map(agent => agent.lastVerdict)));
@@ -698,13 +699,13 @@ async function main(): Promise<void> {
 				);
 				check(
 					"the second verdict cannot verify a later change",
-					run.status === "stopped" && run.endReason === "no-progress" && run.turns === 3,
+					run.status === "stopped" && run.endReason === "no-progress" && run.turns === 4,
 					`${run.status} ${run.endReason} turns=${run.turns}`,
 				);
 				const lines = files.index().filter(line => line.runId === run.runId);
 				check(
 					"the index line agrees, once",
-					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 3,
+					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 4,
 					JSON.stringify(lines),
 				);
 				check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
@@ -714,7 +715,7 @@ async function main(): Promise<void> {
 		}
 	});
 
-	await suite.step("a team change after the re-review is sent back again", async () => {
+	await suite.step("a team change after a re-review of an outside change is sent back again", async () => {
 		const reviewed = join(env.project, REVIEW_FILE);
 		const llm = new LlmCursor(env);
 		const change = `printf '%s\\n' storm-director-change >> ${REVIEW_FILE}`;
@@ -726,16 +727,16 @@ async function main(): Promise<void> {
 			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-BASH ${REVIEW_FILE}` },
 			{ task: ["storm-reviewer"], as: "Rev", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
 			{ bash: change, afterResult: "Rev0" },
-			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3/4"' },
-			// An agent changes the file after the re-review's verdict: a team change, so no one-shot excuse applies.
+			{ task: ["storm-reviewer"], as: "Again", say: "E2E-CHILD-VERDICT correct", after: 'round="3"' },
+			// An agent changes the file after the re-review's verdict: a team change, not an outside writer's tree.
 			{ task: ["storm-implementer"], as: "Fix", say: `E2E-CHILD-BASH ${REVIEW_FILE}`, afterResult: "Again0" },
-			{ task: ["storm-reviewer"], as: "Final", say: "E2E-CHILD-VERDICT correct", after: 'round="4/4"' },
+			{ task: ["storm-reviewer"], as: "Final", say: "E2E-CHILD-VERDICT correct", after: 'round="4"' },
 		];
 		try {
 			await session(cancelAll, async (rpc, files) => {
 				const run = await runOf(rpc, files, startRun(steps));
 				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
-				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}/4">`)).length;
+				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}">`)).length;
 				const reviewers = run.agents?.filter(agent => agent.role === "reviewer") ?? [];
 				const fix = run.agents?.find(agent => agent.id === "Fix0");
 				const last = reviewers.find(agent => agent.id === "Final0");
@@ -769,6 +770,62 @@ async function main(): Promise<void> {
 		}
 	});
 
+	await suite.step("a team without a rounds limit keeps sending rounds past four while each one moves", async () => {
+		const reviewed = join(env.project, REVIEW_FILE);
+		const llm = new LlmCursor(env);
+		// Each review is followed by a team change, so every round moves and the run needs a fifth round to verify.
+		const steps: Step[] = [
+			plan([
+				{ name: "impl", kind: "code", results: [changeResult("long-change", REVIEW_FILE, "storm-child-bash", "each implementer appends its change to the reviewed file")] },
+				{ name: "review", kind: "review" },
+			]),
+			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-BASH ${REVIEW_FILE}` },
+			{ task: ["storm-reviewer"], as: "RevA", say: "E2E-CHILD-VERDICT correct", after: 'round="2"' },
+			{ task: ["storm-implementer"], as: "FixA", say: `E2E-CHILD-BASH ${REVIEW_FILE}`, afterResult: "RevA0" },
+			{ task: ["storm-reviewer"], as: "RevB", say: "E2E-CHILD-VERDICT correct", after: 'round="3"' },
+			{ task: ["storm-implementer"], as: "FixB", say: `E2E-CHILD-BASH ${REVIEW_FILE}`, afterResult: "RevB0" },
+			{ task: ["storm-reviewer"], as: "RevC", say: "E2E-CHILD-VERDICT correct", after: 'round="4"' },
+			{ task: ["storm-implementer"], as: "FixC", say: `E2E-CHILD-BASH ${REVIEW_FILE}`, afterResult: "RevC0" },
+			{ task: ["storm-reviewer"], as: "Final", say: "E2E-CHILD-VERDICT correct", after: 'round="5"' },
+		];
+		try {
+			await session(cancelAll, async (rpc, files) => {
+				const run = await runOf(rpc, files, startRun(steps));
+				const stormMessages = [...new Set(mains(llm.all()).map(newestUser))].filter(user => user.startsWith("<storm-run"));
+				const round = (n: number) => stormMessages.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}">`)).length;
+				check(
+					"rounds 2 to 5 were each sent once, with no maximum in the tag",
+					stormMessages.length === 5 && [2, 3, 4, 5].every(n => round(n) === 1) && round(6) === 0 && !stormMessages.some(user => /round="\d+\/\d+"/.test(user)),
+					`storm=${stormMessages.map(user => user.slice(0, 60)).join(" | ")}`,
+				);
+				const reviewers = run.agents?.filter(agent => agent.role === "reviewer") ?? [];
+				const lastFix = run.agents?.find(agent => agent.id === "FixC0");
+				const last = reviewers.find(agent => agent.id === "Final0");
+				check(
+					"the last verdict follows the last team change",
+					reviewers.length === 4 && reviewers.every(agent => agent.lastVerdict?.correct === true) && last !== undefined && lastFix !== undefined && (last.lastVerdict?.at ?? 0) > (lastFix.lastActivityAt ?? 0),
+					`reviewers=${JSON.stringify(reviewers.map(agent => [agent.id, agent.lastVerdict]))} fix=${lastFix?.lastActivityAt}`,
+				);
+				const content = readFileSync(reviewed, "utf8");
+				check("all four team changes are in the tree", content.split("storm-child-bash").length - 1 === 4, `content=${JSON.stringify(content)}`);
+				check(
+					"the run ends verified after five rounds with no round cap recorded",
+					run.status === "done" && run.endReason === "verified" && run.turns === 5 && run.maxRounds === undefined,
+					`${run.status} ${run.endReason} turns=${run.turns} maxRounds=${run.maxRounds}`,
+				);
+				const lines = files.index().filter(line => line.runId === run.runId);
+				check(
+					"the index line agrees, once",
+					lines.length === 1 && lines[0]?.status === "done" && lines[0]?.endReason === "verified" && lines[0]?.turns === 5,
+					JSON.stringify(lines),
+				);
+				check("the run left no git index lock and git status works", gitUsable(), "index.lock or git status failed");
+			});
+		} finally {
+			writeFileSync(reviewed, REVIEW_TEXT);
+		}
+	});
+
 	await suite.step("a run that makes no progress is stopped", async () => {
 		const changed = join(env.project, "e2e-stalled.txt");
 		const llm = new LlmCursor(env);
@@ -789,19 +846,20 @@ async function main(): Promise<void> {
 				const run = await runOf(rpc, files, startRun(steps));
 				const users = [...new Set(mains(llm.all()).map(newestUser))];
 				const stormMessages = users.filter(user => user.startsWith("<storm-run"));
-				const third = users.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="3/4">`));
+				const round = (n: number) => users.filter(user => user.startsWith(`<storm-run id="${run.runId}" round="${n}">`)).length;
+				// One quiet round may be a slow repair and gets another round; the second quiet round in a row ends the run.
 				check(
-					"round 2 was sent, and no third round followed",
-					stormMessages.length === 2 && stormMessages.some(user => user.startsWith(`<storm-run id="${run.runId}" round="2/4">`)) && third.length === 0,
+					"the first quiet round brings round 3, and no fourth round followed",
+					stormMessages.length === 3 && round(2) === 1 && round(3) === 1 && round(4) === 0,
 					`storm=${stormMessages.map(user => user.slice(0, 50)).join(" | ")}`,
 				);
 				const implementer = run.agents?.find(agent => agent.role === "implementer");
 				check("round 1's change is counted", implementer?.changes === 1 && existsSync(changed), `changes=${implementer?.changes} file=${existsSync(changed)}`);
-				check("the run stops with no progress", run.status === "stopped" && run.endReason === "no-progress" && run.turns === 2, `${run.status} ${run.endReason} turns=${run.turns}`);
+				check("the run stops with no progress after two quiet rounds", run.status === "stopped" && run.endReason === "no-progress" && run.turns === 3, `${run.status} ${run.endReason} turns=${run.turns}`);
 				const lines = files.index().filter(line => line.runId === run.runId);
 				check(
 					"the index line agrees, once",
-					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 2,
+					lines.length === 1 && lines[0]?.status === "stopped" && lines[0]?.endReason === "no-progress" && lines[0]?.turns === 3,
 					JSON.stringify(lines),
 				);
 			});

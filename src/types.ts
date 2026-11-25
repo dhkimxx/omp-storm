@@ -935,7 +935,7 @@ export interface RunRecord {
 	cleanup?: CleanupResult;
 	/** Main-session turns that settled during the run. */
 	turns?: number;
-	/** Most rounds the run may take, fixed at its start. */
+	/** Most rounds the run may take, fixed at its start; written only for a run with an explicit request or config cap. */
 	maxRounds?: number;
 	endReason?: RunEndReason;
 	/** The director's bounded, evidence-based briefing for this run; not approval or verification evidence. */

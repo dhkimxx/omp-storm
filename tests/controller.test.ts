@@ -145,11 +145,14 @@ describe("live status line", () => {
 		const agents = [writer()];
 		const h = session({ agents, tree: () => treeAt(), live: (_ctx, run) => calls.push(run) });
 		const runId = await h.start();
-		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 0, maxRounds: 4 });
+		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 0 });
+		// A team without a rounds field runs uncapped: no maximum is reported anywhere.
+		expect(calls.at(-1) && "maxRounds" in calls.at(-1)!).toBe(false);
 		await h.turn();
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
-		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 1, maxRounds: 4 });
+		expect(calls.at(-1)).toMatchObject({ runId, status: "running", turns: 1 });
+		expect(calls.at(-1) && "maxRounds" in calls.at(-1)!).toBe(false);
 		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
 		expect(calls.filter(run => run === undefined)).toHaveLength(1);
@@ -235,6 +238,10 @@ describe("live status line", () => {
 		await h.turn();
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
+		// The first quiet round buys one directed round; the second ends the run.
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 3);
 		await h.turn();
 		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress" });
 		expect(h.summaries()).toBe(1);
@@ -1144,7 +1151,7 @@ describe("lease, drain and required checks", () => {
 		expect(await runIds(h.sessionDir)).toEqual([]);
 	});
 
-	test("a no-change round with an open planned lane continues once, then ends no-progress", async () => {
+	test("a no-change round with an open planned lane continues, gets one directed round, then ends no-progress", async () => {
 		const agents: AgentEntry[] = [];
 		const h = session({ agents });
 		const result = await h.controller.startWithPlan(h.ctx, ask("probe"), plan);
@@ -1154,9 +1161,16 @@ describe("lease, drain and required checks", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 1);
-		expect(h.sent[0]).toContain('round="2/4"');
+		expect(h.sent[0]?.split("\n")[0]).toContain('round="2">');
 		await h.turn();
-		expect(await readRun(h.sessionDir, result.runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		// The first round without progress continues, and its message is longer by the change-approach directive.
+		expect(h.controller.directing()).toBe(true);
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="3">');
+		expect(h.sent[1]!.split("\n").length).toBe(h.sent[0]!.split("\n").length + 1);
+		await h.turn();
+		expect(await readRun(h.sessionDir, result.runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
 	});
 
 	test("stopping with a running owned worker keeps scope, lease and record until it settles", async () => {
@@ -1222,7 +1236,7 @@ describe("lease, drain and required checks", () => {
 		await h.controller.onAgentEnd({}, h.ctx);
 		h.timers.fire();
 		await until(() => h.sent.length === 1);
-		expect(h.sent[0]).toContain('round="2/4"');
+		expect(h.sent[0]?.split("\n")[0]).toContain('round="2">');
 		await h.controller.finish("shutdown");
 	});
 
@@ -1425,7 +1439,7 @@ describe("round loop", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
-		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
+		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2">`);
 
 		agents.push(verdict(T0 + 1, true, F0));
 		await h.turn();
@@ -1433,16 +1447,84 @@ describe("round loop", () => {
 		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "done", endReason: "verified", turns: 2 });
 	});
 
-	test("an incorrect verdict and a round that changes and reviews nothing ends no-progress", async () => {
+	test("an incorrect verdict and two rounds in a row that change and review nothing end no-progress", async () => {
 		const h = session({ agents: [writer(), verdict(T0 + 1, false)] });
 		const runId = await h.start();
 		await h.turn();
 		expect(h.sent).toHaveLength(1);
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
-		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2"');
 		await h.turn();
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		// One quiet round continues, with the directive to change approach.
+		expect(h.controller.directing()).toBe(true);
+		h.timers.fire();
+		await until(() => h.sent.length === 3);
+		expect(h.sent[2]?.split("\n")[0]).toContain('round="3"');
+		expect(h.sent[2]!.split("\n").length).toBe(h.sent[1]!.split("\n").length + 1);
+		await h.turn();
+		expect(h.sent).toHaveLength(3);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
+	});
+
+	test("progress between quiet rounds resets the count, so a later single quiet round does not end the run", async () => {
+		const agents = [writer(), verdict(T0 + 1, false)];
+		const h = session({ agents });
+		const runId = await h.start();
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		// Round 2 quiet: round 3 carries the directive.
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 3);
+		// Round 3 changes a file: progress, so round 4 is plain again.
+		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 2 }));
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 4);
+		expect(h.sent[3]!.split("\n").length).toBe(h.sent[1]!.split("\n").length);
+		// Round 4 quiet: the first in a row again, so the run continues.
+		await h.turn();
+		expect(h.controller.directing()).toBe(true);
+		h.timers.fire();
+		await until(() => h.sent.length === 5);
+		await h.turn();
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 5 });
+	});
+
+	test("an uncapped team keeps sending rounds past four while each round shows progress, then verifies", async () => {
+		const agents = [writer()];
+		const h = session({ agents, tree: () => treeAt() });
+		const runId = await h.start();
+		for (let round = 2; round <= 6; round++) {
+			await h.turn();
+			h.timers.fire();
+			await until(() => h.sent.length === round);
+			expect(h.sent[round - 1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="${round}">`);
+			expect(h.sent[round - 1]).not.toContain("last round");
+			agents.push(writer({ id: `Impl${round}`, lastChangeAt: T0 + round }));
+		}
+		agents.push(verdict(T0 + 100, true, F0));
+		await h.turn();
+		expect(h.sent).toHaveLength(6);
+		const run = await readRun(h.sessionDir, runId);
+		expect(run).toMatchObject({ status: "done", endReason: "verified", turns: 6 });
+		expect(run && "maxRounds" in run).toBe(false);
+	});
+
+	test("the request's rounds limit of 2 ends on the round limit after two rounds on an uncapped team", async () => {
+		const agents = [writer()];
+		const h = session({ agents });
+		const runId = await h.start({ task: "t", rounds: 2 });
+		await h.turn();
+		h.timers.fire();
+		await until(() => h.sent.length === 2);
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/2"');
+		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 2 }));
+		await h.turn();
+		expect(h.sent).toHaveLength(2);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "round-limit", turns: 2, maxRounds: 2 });
 	});
 
 	test("config extra rounds: progress every round but no verdict ends on the round limit after two rounds", async () => {
@@ -1510,7 +1592,7 @@ describe("round loop", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 		expect(h.timers.pending()).toBe(0);
-		expect(h.sent[1]?.split("\n")[0]).toContain('round="2/4"');
+		expect(h.sent[1]?.split("\n")[0]).toContain('round="2"');
 
 		// The next round's delay is pending; the turn that starts clears it.
 		agents.push(writer({ id: "Impl2", lastChangeAt: T0 + 3 }));
@@ -1529,7 +1611,7 @@ describe("round loop", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
-		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
+		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2">`);
 		await h.controller.finish("shutdown");
 	});
 
@@ -1565,7 +1647,7 @@ describe("round loop", () => {
 		const h = session({
 			agents: [writer()],
 			send: async text => {
-				if (text.includes('round="2/4"')) throw new Error("session closed");
+				if (text.includes('round="2"')) throw new Error("session closed");
 			},
 		});
 		const runId = await h.start();
@@ -1582,7 +1664,7 @@ describe("round loop", () => {
 		const h = session({
 			agents: [writer()],
 			send: async text => {
-				if (text.includes('round="2/4"')) await send.promise;
+				if (text.includes('round="2"')) await send.promise;
 			},
 		});
 		const runId = await h.start();
@@ -1607,7 +1689,7 @@ describe("round loop", () => {
 			agents,
 			tree: () => treeAt(),
 			send: async text => {
-				if (text.includes('round="2/4"')) await pending.promise;
+				if (text.includes('round="2"')) await pending.promise;
 			},
 		});
 		const runId = await h.start();
@@ -1717,7 +1799,7 @@ describe("changes seen through the work tree", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
-		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2/4">`);
+		expect(h.sent[1]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="2">`);
 
 		agents.push(verdict(T0 + 1, true, "d1:f0"));
 		await h.turn();
@@ -1744,7 +1826,7 @@ describe("changes seen through the work tree", () => {
 		await h.controller.finish("shutdown");
 	});
 
-	test("a tree that changes after every verdict gets one re-review, then stops no-progress", async () => {
+	test("an outside writer that moves the tree after every re-review ends no-progress, not a third re-review", async () => {
 		let now = T0;
 		let tree = treeOf("d0", "f0");
 		const agents: AgentEntry[] = [implementer];
@@ -1773,14 +1855,27 @@ describe("changes seen through the work tree", () => {
 		expect(h.sent).toHaveLength(2);
 		h.timers.fire();
 		await until(() => h.sent.length === 3);
-		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3/4">`);
+		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3">`);
 
-		// After the one asked-for tree review, another moved tree is exhausted proof, not a pass.
+		// Round 3 re-reviewed d2 and the tree moved again with no team activity: only the reviewer's count grew, which
+		// is no progress. The run continues once, with the directive to change approach.
 		agents.push(review(T0 + 200, "d2:f0"));
 		tree = treeOf("d3", "f0");
+		now = T0 + 300;
 		await h.turn();
 		expect(h.sent).toHaveLength(3);
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
+		h.timers.fire();
+		await until(() => h.sent.length === 4);
+		expect(h.sent[3]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="4">`);
+		expect(h.sent[3]!.split("\n").length).toBe(h.sent[2]!.split("\n").length + 1);
+
+		// The second re-review in a row is followed by another outside move: the run ends instead of a third re-review.
+		agents.push(review(T0 + 400, "d3:f0"));
+		tree = treeOf("d4", "f0");
+		await h.turn();
+		expect(h.sent).toHaveLength(4);
+		expect(h.timers.pending()).toBe(0);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 4 });
 	});
 
 	test("a team change after the re-review's verdict is not excused and gets another round", async () => {
@@ -1805,7 +1900,7 @@ describe("changes seen through the work tree", () => {
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
 
-		// Round 2: the tree moves with no other agent active, so this is the one tree-only re-review.
+		// Round 2: the tree moves with no other agent active, so round 3 is a tree-only re-review.
 		agents.push(review(T0 + 10, "d1:f0"));
 		tree = treeOf("d2", "f0");
 		now = T0 + 100;
@@ -1823,11 +1918,13 @@ describe("changes seen through the work tree", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 4);
-		expect(h.sent[3]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="4/4">`);
+		expect(h.sent[3]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="4">`);
+		// Team activity is progress: the round carries no change-approach directive.
+		expect(h.sent[3]!.split("\n").length).toBe(h.sent[2]!.split("\n").length);
 		await h.controller.finish("shutdown");
 	});
 
-	test("a tree that changes while no agent does anything ends no-progress", async () => {
+	test("a tree that changes while no agent does anything ends no-progress after two quiet rounds", async () => {
 		let tree = treeOf("d0", "f0");
 		const h = session({ tree: () => reading(tree) });
 		const runId = await h.start();
@@ -1837,8 +1934,12 @@ describe("changes seen through the work tree", () => {
 		await until(() => h.sent.length === 2);
 		tree = treeOf("d2", "f0");
 		await h.turn();
-		expect(h.sent).toHaveLength(2);
-		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 2 });
+		h.timers.fire();
+		await until(() => h.sent.length === 3);
+		tree = treeOf("d3", "f0");
+		await h.turn();
+		expect(h.sent).toHaveLength(3);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "stopped", endReason: "no-progress", turns: 3 });
 	});
 
 	test("a tree read that fails after a known start counts as a change", async () => {
@@ -1873,7 +1974,7 @@ describe("changes seen through the work tree", () => {
 		expect(h.timers.delays()).toEqual([ROUND_DELAY_MS]);
 		h.timers.fire();
 		await until(() => h.sent.length === 3);
-		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3/4">`);
+		expect(h.sent[2]?.split("\n")[0]).toBe(`<storm-run id="${runId}" round="3">`);
 
 		agents.push(verdict(T0 + 2, true, "d2:f0", { id: "Rev2" }));
 		await h.turn();
@@ -2067,7 +2168,7 @@ describe("interrupted waits", () => {
 		const h = session({
 			agents: [writer()],
 			send: async text => {
-				if (!text.includes('round="2/4"')) return;
+				if (!text.includes('round="2"')) return;
 				const error = new Error("Prompt dropped before provider dispatch.");
 				error.name = "PromptDroppedError";
 				throw error;
@@ -2106,7 +2207,7 @@ describe("run failures behind a timer", () => {
 		const h = session({
 			agents: [writer()],
 			send: async text => {
-				if (text.includes('round="2/4"')) throw new Error("session closed");
+				if (text.includes('round="2"')) throw new Error("session closed");
 			},
 		});
 		await h.start();
@@ -2947,11 +3048,15 @@ describe("declared results", () => {
 		expect(row?.reason).toBeTruthy();
 		expect(await Bun.file(path.join(root, REPORT)).text()).toBe(REPORT_TEXT);
 
-		// The first round cannot close quietly; the next round has no progress to report and stops honestly.
+		// The first round cannot close quietly; the next two rounds have no progress to report and the run stops honestly.
 		await h.turn();
 		expect(h.controller.directing()).toBe(true);
 		h.timers.fire();
 		await until(() => h.sent.length === 2);
+		await h.turn();
+		expect(h.controller.directing()).toBe(true);
+		h.timers.fire();
+		await until(() => h.sent.length === 3);
 		await h.turn();
 		const run = await readRun(h.sessionDir, runId);
 		expect(run).toMatchObject({ status: "stopped", endReason: "no-progress" });

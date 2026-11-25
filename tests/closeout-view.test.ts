@@ -206,6 +206,16 @@ describe("closeout frame", () => {
 		expect(frameOf(renderCloseout(F2, true).markdown, renderCloseout(F2, true).info).render(60).length).toBeLessThanOrEqual(30);
 	});
 
+	test("an uncapped run's round count has no maximum and the card stays within 60 columns", () => {
+		const open = brief({ official: { ...F2.official, label: "완료 아님 · 변경 없음 · 7라운드" } });
+		const { markdown, info } = renderCloseout(open, true);
+		const rows = frameOf(markdown, info).render(60);
+		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+		const text = stripTerminalSequences(rows.join("\n"));
+		expect(text).toContain("7라운드");
+		expect(text).not.toMatch(/\d\/\d라운드/);
+	});
+
 	test("ASCII preset and light theme keep the width and use theme tokens, not hard-coded colors", async () => {
 		restorePreset = getSymbolPresetOverride() ?? "unicode";
 		restoreTheme = getCurrentThemeName() ?? "dark";

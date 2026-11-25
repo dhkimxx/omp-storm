@@ -58,6 +58,7 @@ import {
 	reserveWorkerSlot,
 	SPAWN_DECISION_MS,
 	usableRole,
+	type WorkerSlot,
 	workerSlot,
 } from "./policy/spawn.ts";
 import { supervisorToolBlock } from "./policy/supervisor.ts";
@@ -169,6 +170,8 @@ interface AgentAuthority {
 
 /** Workers admitted by this process's Storm runs (same native id across follow-ups), scoped by artifact tree. */
 const agentAuthorities = new Map<string, AgentAuthority>();
+/** Which spawn decision reserved a worker slot: a late refusal releases only the slot its own decision holds. */
+const slotOwners = new WeakMap<WorkerSlot, symbol>();
 
 /** Follow-up tool calls that created the worker's slot; a failed delivery releases only that new slot, never one a
  * work-bearing note to an already running worker reused. */
@@ -1246,6 +1249,13 @@ export default function storm(pi: ExtensionAPI): void {
 		// The admitted run is fixed for this spawn: a later start in the same tree must not receive its record.
 		const captured = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
 		const capturedRunId = captured?.runId;
+		// A refusal frees only what this decision's own placement and reservations made. The lanes and the placement
+		// identity are read now, before anything awaits: the current run or a newer call may own the same name later.
+		const lanesAtEntry = runs.runLanes();
+		const capturedLanes = lanesAtEntry !== undefined && lanesAtEntry.runId === capturedRunId ? lanesAtEntry : undefined;
+		const placement = event.spawnKey === undefined ? undefined : capturedLanes?.placementOf(event.spawnKey);
+		const decisionToken = Symbol("spawn-decision");
+		let ownAuthority: AgentAuthority | undefined;
 		// A separate native child has no Storm session: only the run its parent admitted can route it. There is no
 		// unscoped ledger lookup here, so a same-id worker of another session is never consulted. If its artifact tree
 		// still has a live managed run, even a non-Storm name is an unattributed nested spawn and fails closed.
@@ -1377,6 +1387,9 @@ export default function storm(pi: ExtensionAPI): void {
 						...(record.lane === undefined ? {} : { lane: record.lane }),
 						now,
 					});
+					// Re-reserving a key refreshes the one slot rather than making another, so the latest decision owns it.
+					const slot = workerSlot(current.runId, record.spawnKey);
+					if (slot !== undefined) slotOwners.set(slot, decisionToken);
 				}
 				if (current !== undefined) {
 					const config = state.config.status === "ok" ? state.config.config : undefined;
@@ -1423,6 +1436,7 @@ export default function storm(pi: ExtensionAPI): void {
 						});
 						if (!authority.ok) return ledgerBlock(authority.reason, current, now);
 						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority.authority);
+						ownAuthority = authority.authority;
 						// Persist before returning: a pooled/rebound child has no access to this thread's map. A failure
 						// here blocks the spawn rather than allowing an unverifiable writer.
 						try {
@@ -1484,10 +1498,12 @@ export default function storm(pi: ExtensionAPI): void {
 			// A refused spawn must not keep its lane/write/capacity reservation or its enforced authority: another
 			// worker may start.
 			if (decision !== undefined && "block" in decision && event.spawnKey !== undefined) {
-				runs.runLanes()?.cancel(event.spawnKey);
+				capturedLanes?.cancel(event.spawnKey, placement);
 				const run = getLedgerRun(capturedRunId);
-				if (run !== undefined) releaseWorkerSlot(run.runId, event.spawnKey);
-				agentAuthorities.delete(authorityKey(artifacts, event.spawnKey));
+				const slot = run === undefined ? undefined : workerSlot(run.runId, event.spawnKey);
+				if (run !== undefined && slot !== undefined && slotOwners.get(slot) === decisionToken) releaseWorkerSlot(run.runId, event.spawnKey);
+				const authorityId = authorityKey(artifacts, event.spawnKey);
+				if (ownAuthority !== undefined && agentAuthorities.get(authorityId) === ownAuthority) agentAuthorities.delete(authorityId);
 			}
 			return decision;
 		});
@@ -1993,7 +2009,7 @@ export default function storm(pi: ExtensionAPI): void {
 				...(authorityPolicy === undefined ? {} : { policy: authorityPolicy }),
 				...(authorityPolicy?.kind === "paths" ? { canonicalFiles: authorityPolicy.paths } : {}),
 				auto: autoOn,
-				// A quiet progress note passes the gate but reserves nothing; a work note holds its lane until the turn starts.
+				// A quiet progress note meets the same conflict gate for an idle recipient but reserves nothing; a work note holds its lane until the turn starts.
 				...(progress ? { progress: true } : {}),
 				...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 				...(plan === undefined ? {} : { plan }),

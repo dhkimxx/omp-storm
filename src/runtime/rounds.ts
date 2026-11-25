@@ -7,7 +7,6 @@ import type { AgentEntry, RunEndReason, RunStatus, StormConfig } from "../types.
 import { reviewEvidenceOf, type ReviewEvidence } from "./review.ts";
 import type { TreeState } from "./tree.ts";
 
-export const DEFAULT_EXTRA_ROUNDS = 3;
 export const MAX_EXTRA_ROUNDS = 10;
 /** How long Storm waits before looking again while the session is held. */
 export const HOLD_MS = 5_000;
@@ -243,12 +242,13 @@ export type Gate =
 			changes: number;
 			reviews: number;
 			requests: number;
-			/** Set when the only reason for `stale-review` is a tree that moved since the verdict. */
+			/**
+			 * Set when the latest verdict is stale only because the tree moved with no team activity after it. Kept on a
+			 * results gate too, so the round rules can tell an outside writer's churn from the team's progress.
+			 */
 			by?: "tree";
 			/** Set when a tree that could not be read is why the proof is missing. */
 			unread?: true;
-			/** The one tree-only re-review was already used: another round cannot prove this tree. */
-			exhausted?: true;
 			/** Why check evidence is not proof; set with `cause: "coverage"`. */
 			evidence?: CoverageEvidence;
 			/** The first unfinished lane; set with `cause: "lanes"`. */
@@ -283,7 +283,6 @@ type UnverifiedCause = Unverified["cause"];
 type UnverifiedExtra = {
 	by?: "tree";
 	unread?: true;
-	exhausted?: true;
 	evidence?: CoverageEvidence;
 	lane?: string;
 	result?: string;
@@ -418,8 +417,8 @@ function resultWitness(row: CoverageResult, remedy: ResultRemedy): string {
 /**
  * Keeps ordinary closes honest about declared results. An open result is the concrete obligation, so it displaces an
  * ordinary review/check/lane cause and names the repair that can clear it; the run still cannot pass until the review
- * and checks bind to the current tree on a later decision. A P0 review finding, or a tree whose one re-review is
- * already spent, stays first because no repair can be proven without addressing it. A no-change/unreviewed/no-reviewer
+ * and checks bind to the current tree on a later decision. A P0 review finding stays first because no repair can be
+ * proven without addressing it. A no-change/unreviewed/no-reviewer
  * close is replaced by the open requirement so a quiet end cannot erase it, and a passed gate is not allowed to pass
  * over a requirement the controller could not accept. A reviewable row on a passed gate means the controller has not
  * yet bound the reviewer's proof; the next decision must do that first.
@@ -430,13 +429,14 @@ function resultWitness(row: CoverageResult, remedy: ResultRemedy): string {
 function withResults(gate: Gate, coverage: CoverageInput | undefined): Gate {
 	const open = openResult(coverage?.results, coverage?.reviewer);
 	if (open === undefined) return gate;
-	if (gate.state === "unverified" && (gate.cause === "p0" || gate.exhausted === true)) return gate;
+	if (gate.state === "unverified" && gate.cause === "p0") return gate;
 	const remedy = nextRemedy(open, coverage?.reviewer);
 	const counts = gate.state === "unverified" ? { changes: gate.changes, reviews: gate.reviews, requests: gate.requests } : { changes: 0, reviews: 0, requests: 0 };
 	return {
 		state: "unverified",
 		cause: "results",
 		...counts,
+		...(gate.state === "unverified" && gate.by !== undefined ? { by: gate.by } : {}),
 		result: open.id,
 		resultState: open.state,
 		...(open.lane === undefined ? {} : { resultLane: open.lane }),
@@ -461,7 +461,7 @@ function withResults(gate: Gate, coverage: CoverageInput | undefined): Gate {
 function outputSettled(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
-	tree: { start?: TreeState; now?: TreeState; rereviewedAt?: number } | undefined,
+	tree: { start?: TreeState; now?: TreeState } | undefined,
 	coverage: CoverageInput | undefined,
 ): boolean {
 	if (coverage === undefined) return false;
@@ -484,7 +484,7 @@ function outputSettled(
 export function reviewGate(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
-	tree?: { start?: TreeState; now?: TreeState; rereviewedAt?: number },
+	tree?: { start?: TreeState; now?: TreeState },
 	coverage?: CoverageInput,
 ): Gate {
 	const gate = gateCore(agents, config, tree, coverage);
@@ -495,7 +495,7 @@ export function reviewGate(
 function gateCore(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
-	tree?: { start?: TreeState; now?: TreeState; rereviewedAt?: number },
+	tree?: { start?: TreeState; now?: TreeState },
 	coverage?: CoverageInput,
 ): Gate {
 	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick");
@@ -518,7 +518,6 @@ function gateCore(
 		const gate: Unverified = { state: "unverified", cause, changes, reviews, requests };
 		if (extra.by !== undefined) gate.by = extra.by;
 		if (extra.unread) gate.unread = true;
-		if (extra.exhausted) gate.exhausted = true;
 		if (extra.evidence !== undefined) gate.evidence = extra.evidence;
 		if (extra.lane !== undefined) gate.lane = extra.lane;
 		if (extra.result !== undefined) gate.result = extra.result;
@@ -569,12 +568,9 @@ function gateCore(
 	if (chosen.verdict.tree === undefined) return unverified("unbound");
 	if (chosen.verdict.tree !== treeNow) {
 		// Another agent moving after the verdict means the team may have changed files; only an outside change is
-		// tree-only, and that one buys one re-review round.
+		// tree-only. Whether re-reviewing it again is worth a round is the round rules' progress question.
 		const teamActive = agents.some(agent => agent.id !== chosen.author.id && agent.lastActivityAt > chosen.verdict.at);
-		if (teamActive) return unverified("stale-review");
-		if (tree?.rereviewedAt === undefined) return unverified("stale-review", { by: "tree" });
-		// The one tree-only re-review was already used and the tree moved again: stop instead of re-reviewing forever.
-		return unverified("stale-review", { by: "tree", exhausted: true });
+		return unverified("stale-review", teamActive ? {} : { by: "tree" });
 	}
 	// The verdict must come with the structured review the ledger recorded, bound to the same tree. A legacy verdict
 	// without it is readable history, never current pass authority.
@@ -589,67 +585,110 @@ function gateCore(
 	return { state: "passed" };
 }
 
-/** Most rounds the run may take: the user's limit when stated, else the config's extra rounds on top of the first. */
-export function maxRounds(spec: { rounds?: number }, config: StormConfig): number {
+/**
+ * Most rounds the run may take, or `undefined` for no cap: the user's limit when stated, else the config's explicit
+ * extra rounds on top of the first. A team that never set `rounds` runs until its gate, budget, time limit or the
+ * no-progress rule ends it.
+ */
+export function maxRounds(spec: { rounds?: number }, config: StormConfig): number | undefined {
 	const asked = spec.rounds;
 	if (typeof asked === "number" && Number.isInteger(asked)) return Math.max(1, asked);
 	const extra = config.rounds;
 	const valid = typeof extra === "number" && Number.isInteger(extra) && extra >= 0 && extra <= MAX_EXTRA_ROUNDS;
-	return 1 + (valid ? extra : DEFAULT_EXTRA_ROUNDS);
+	return valid ? 1 + extra : undefined;
+}
+
+/** Rounds in a row without progress that end a run: the first gets a directive to change approach, the second ends it. */
+export const NO_PROGRESS_ROUNDS = 2;
+
+/** What the team had done when Storm sent its last round message: what the next round is expected to move. */
+export interface RoundProgress {
+	changes: number;
+	reviews: number;
+	requests: number;
+	/** The open requirement's witness at that send, kept across a round that had none. */
+	result?: string;
+	/** That round asked only to re-review a tree an outside writer had moved. */
+	tree?: true;
 }
 
 export type RoundDecision =
 	| { action: "end"; reason: RunEndReason }
-	| { action: "continue"; gate: Unverified; round: number; maxRounds: number };
+	| {
+			action: "continue";
+			gate: Unverified;
+			round: number;
+			/** Absent for an uncapped run. */
+			maxRounds?: number;
+			/** Rounds in a row, the one that just ended included, that moved nothing; 0 after any progress. */
+			stalled: number;
+	  };
+
+/**
+ * Whether the round that just ended moved anything since Storm's last round message. Without that message there is
+ * no baseline, so the round counts as progress.
+ */
+function roundProgressed(gate: Unverified, since: RoundProgress | undefined): boolean {
+	if (since === undefined) return true;
+	// Re-reviewing a tree that an outside writer moved again changes nothing the team owns. The new verdict raises the
+	// review count, so counting it would let a writer that touches tracked files every round keep the run alive forever.
+	if (since.tree === true && gate.by === "tree") return false;
+	// A results gate compares the requirement's own witness: a new attempt with the same state, prerequisites and
+	// content is not progress even when its request count grew. A changed state, producer input or content is.
+	// Request counts never extend a contracted result; a new repair must change the requirement or its inputs.
+	const contracted = gate.cause === "results";
+	const witnessed = contracted && since.result !== undefined && gate.resultProgress !== undefined;
+	// A result first seen after a round that had no requirement witness is a new obligation to act on, not a
+	// count-only repeat. With the controller storing the witness, only that transition misses it once.
+	const firstContractRound = contracted && (since.result === undefined || gate.resultProgress === undefined);
+	const activityProgressed = contracted
+		? since.changes !== gate.changes || since.reviews !== gate.reviews
+		: since.changes !== gate.changes || since.reviews !== gate.reviews || since.requests !== gate.requests;
+	const witnessProgressed = witnessed && since.result !== gate.resultProgress;
+	return activityProgressed || witnessProgressed || firstContractRound;
+}
 
 /** The one decision after a round, in the order the contract fixes: interruption first, then the gate, then limits. */
 export function decideRound(input: {
 	gate: Gate;
 	/** Rounds finished so far, the one that just ended included. */
 	turns: number;
-	maxRounds: number;
+	/** Absent for an uncapped run: only an explicit request or config limit makes `round-limit` possible. */
+	maxRounds?: number | undefined;
 	aborted: boolean;
 	/** The run has passed its team budget. */
 	overBudget: boolean;
 	elapsedMs: number;
 	minutes?: number;
 	/** The team's activity when Storm sent its last round message; absent before the first one. */
-	progressSince?: { changes: number; reviews: number; requests: number; result?: string };
+	progressSince?: RoundProgress;
+	/** Rounds in a row without progress before the one that just ended, as the last continue decision counted them. */
+	stalled?: number;
 }): RoundDecision {
 	if (input.aborted) return { action: "end", reason: "interrupted" };
 	const gate = input.gate;
 	if (gate.state === "none") return { action: "end", reason: gate.why === "quick-only" ? "unreviewed" : gate.why };
 	if (gate.state === "passed") return { action: "end", reason: "verified" };
 	if (input.overBudget) return { action: "end", reason: "budget" };
-	// The one tree-only re-review is spent and the tree moved again. Another round cannot bind a verdict to it, so the
-	// honest end is no-progress (stopped), not verified and not another re-review.
-	if (gate.exhausted) return { action: "end", reason: "no-progress" };
 	// An explicit round or time limit reached before the remedy is reported as that limit, not as a new reason.
-	if (input.turns >= input.maxRounds) return { action: "end", reason: "round-limit" };
+	if (input.maxRounds !== undefined && input.turns >= input.maxRounds) return { action: "end", reason: "round-limit" };
 	if (input.minutes !== undefined && input.elapsedMs >= input.minutes * 60_000) return { action: "end", reason: "time-limit" };
 	// A known external blocker gets no new model round: only a user/config change can clear it. Host retry exhaustion
-	// gets one directed round to replan onto a different approved route (never the same work), then repeated identical
+	// gets a directed round to replan onto a different approved route (never the same work), then repeated identical
 	// evidence stops below. This is not a new Storm retry: the host's configured retry/fallback already failed.
 	if (gate.cause === "results" && gate.resultRemedy === "blocked") {
 		return { action: "end", reason: "no-progress" };
 	}
-	const since = input.progressSince;
-	if (since) {
-		// A results gate compares the requirement's own witness: a new attempt with the same state, prerequisites and
-		// content is not progress even when its request count grew. A changed state, producer input or content is.
-		// Request counts never extend a contracted result; a new repair must change the requirement or its inputs.
-		const contracted = gate.cause === "results";
-		const witnessed = contracted && since.result !== undefined && gate.resultProgress !== undefined;
-		// A result first seen after a round that had no requirement witness is a new obligation to act on, not a
-		// count-only repeat. With the controller storing the witness, only that transition misses it once.
-		const firstContractRound = contracted && (since.result === undefined || gate.resultProgress === undefined);
-		const activityProgressed = contracted
-			? since.changes !== gate.changes || since.reviews !== gate.reviews
-			: since.changes !== gate.changes || since.reviews !== gate.reviews || since.requests !== gate.requests;
-		const witnessProgressed = contracted && witnessed && since.result !== gate.resultProgress;
-		if (!activityProgressed && !witnessProgressed && !firstContractRound) return { action: "end", reason: "no-progress" };
-	}
-	return { action: "continue", gate, round: input.turns + 1, maxRounds: input.maxRounds };
+	// One quiet round may be a slow repair, so it buys one directed round; a second in a row is a loop.
+	const stalled = roundProgressed(gate, input.progressSince) ? 0 : (input.stalled ?? 0) + 1;
+	if (stalled >= NO_PROGRESS_ROUNDS) return { action: "end", reason: "no-progress" };
+	return {
+		action: "continue",
+		gate,
+		round: input.turns + 1,
+		...(input.maxRounds === undefined ? {} : { maxRounds: input.maxRounds }),
+		stalled,
+	};
 }
 
 /** The cause sentence of each unverified gate; the instruction depends on the cause in `buildRoundMessage`. */
@@ -807,24 +846,32 @@ export function buildRoundMessage(input: {
 	runId: string;
 	/** The round this message starts (2 for the first one Storm sends). */
 	round: number;
-	maxRounds: number;
+	/** Absent for an uncapped run, which names no maximum. */
+	maxRounds?: number | undefined;
 	gate: Unverified;
 	/** The reviewer agent's name, e.g. `storm-reviewer`. */
 	reviewer?: string | undefined;
+	/** Rounds in a row that moved nothing (`RoundDecision.stalled`); any above 0 asks for a different approach. */
+	stalled?: number;
 }): string {
 	const why = input.gate.unread ? "The work tree could not be read, so Storm cannot bind a verdict to it." : CAUSE[input.gate.cause];
 	const details: string[] = [];
 	if (input.gate.cause === "coverage" && input.gate.evidence !== undefined) details.push(CHECK_PROBLEM[input.gate.evidence]);
 	if (input.gate.cause === "lanes" && input.gate.lane !== undefined) details.push(`Unfinished lane: \`${input.gate.lane}\`.`);
 	if (input.gate.cause === "results" && (input.gate.result !== undefined || input.gate.resultState !== undefined)) details.push(resultDetail(input.gate));
-	if (input.gate.exhausted) details.push("The one tree-only re-review was already used; no further round can prove this tree.");
+	const capped = input.maxRounds !== undefined;
 	const lines = [
-		`<storm-run id="${input.runId}" round="${input.round}/${input.maxRounds}">`,
+		`<storm-run id="${input.runId}" round="${input.round}${capped ? `/${input.maxRounds}` : ""}">`,
 		`Storm checked the run when you stopped: it is not done. ${why}`,
 		...details,
 		roundInstruction(input.gate, input.reviewer),
 	];
-	if (input.round === input.maxRounds) lines.push("This is the last round.");
+	if ((input.stalled ?? 0) > 0) {
+		lines.push(
+			"Nothing changed since the last round: no new change, review or result evidence. Take a different approach or state the blocker; do not repeat the same work. Another round without progress ends the run.",
+		);
+	}
+	if (capped && input.round === input.maxRounds) lines.push("This is the last round.");
 	lines.push("</storm-run>");
 	return lines.join("\n");
 }

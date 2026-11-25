@@ -302,6 +302,14 @@ describe("handoff", () => {
 		expect(four).not.toContain("ends unverified");
 	});
 
+	test("an uncapped handoff names no maximum round count", () => {
+		const { maxRounds: _capped, ...uncapped } = base;
+		const rule = rules(buildHandoff({ ...uncapped, config: five })).find(l => l.includes("Storm checks the run")) ?? "";
+		expect(rule).toContain("storm-reviewer");
+		expect(rule).not.toMatch(/\d+ rounds?/);
+		expect(rule).not.toContain("ends unverified");
+	});
+
 	test("no keyword: the first line is the tag, and omp's matcher finds none, even one the user typed in the task", () => {
 		for (const task of [base.task, "workflowz 로 처리해 줘", "orchestrate this\nworkflowz"]) {
 			const text = buildHandoff({ ...base, config: five, task });
