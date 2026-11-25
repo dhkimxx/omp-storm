@@ -417,6 +417,31 @@ describe("handoff", () => {
 		expect(text).toContain("Continues the earlier run, which stopped after 1 rounds.");
 	});
 
+	test("a resume names the goal's earlier use on one line and keeps the budget per run", () => {
+		const budgeted = { ...five, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
+		const goalLines = (text: string): string[] => text.split("\n").filter(line => line.startsWith("Goal so far"));
+		const text = buildHandoff({
+			...base,
+			config: budgeted,
+			resume: { runId: "run-old", turns: 2, goal: { runs: 2, usd: 1.75, ms: 40 * 60_000, turns: 5 } },
+		});
+		expect(goalLines(text)).toHaveLength(1);
+		const line = goalLines(text)[0] ?? "";
+		for (const part of ["2 runs", "$1.75", "40 min", "5 rounds"]) expect(line).toContain(part);
+		// The budget and round rules are the same text with or without a carried goal.
+		const plain = buildHandoff({ ...base, config: budgeted, resume: { runId: "run-old", turns: 2 } });
+		expect(rules(text)).toEqual(rules(plain));
+		expect(goalLines(plain)).toHaveLength(0);
+		// A stored value that is not a finite non-negative number is shown as 0, never NaN or negative.
+		const corrupt = goalLines(buildHandoff({
+			...base,
+			config: five,
+			resume: { runId: "run-old", goal: { runs: Number.NaN, usd: -3, ms: Number.POSITIVE_INFINITY, turns: -1 } },
+		}))[0] ?? "";
+		expect(corrupt).not.toMatch(/NaN|-\d|Infinity/);
+		expect(corrupt).toContain("0 runs");
+	});
+
 	test("the resume block names the request limit only at the stored maximum", () => {
 		const resume = (requestLength: number): string =>
 			buildHandoff({ ...base, config: five, resume: { runId: "run-old", requestLength } });

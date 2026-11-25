@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
 import {
 	choose, CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutOf, linkPlugin, LlmCursor, modelsYml, persistedStormRecords, prepare, PROFILE_CONFIG, Rpc, StormFiles, stormRecords,
-	Suite, startFakeLlm, TEAM_PROVIDERS,
+	Suite, startFakeLlm, TEAM_PROVIDERS, until,
 } from "./harness.ts";
 
 const env = prepare("storm-e2e-checkpoint", 18569);
@@ -60,7 +60,8 @@ try {
 				// The team config's `rounds: 0` is an explicit limit: one round, recorded and reported as the round limit.
 				suite.check("the config's rounds limit ends the run at its round limit", first.endReason === "round-limit" && first.maxRounds === 1 && first.turns === 1,
 					`${first.status}/${first.endReason} turns=${first.turns} maxRounds=${first.maxRounds}`);
-				const card = closeoutOf(original.frames, first.runId);
+				// The index line that ends `finishedRun` is written before the settled-run message reaches the host; wait for it.
+				const card = await until(() => closeoutOf(original.frames, first.runId), 30_000, "the stopped run's closeout").catch(() => undefined);
 				suite.check("the stopped run leaves one whole closeout card with its status pointer", card !== undefined &&
 					card.details?.kind === "closeout" && card.details.runId === first.runId && card.text.includes(CLOSEOUT_DETAIL) &&
 					stormRecords(original.frames).filter(record => record.text.includes(CLOSEOUT_HEADING)).length === 1,

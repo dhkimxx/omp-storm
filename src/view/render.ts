@@ -3,9 +3,11 @@ import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
+import { goalTotals } from "../runtime/goal.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
+import { GOAL_LABEL, goalText } from "./closeout.ts";
 import { resultProgress, resultRowText, type ResultProgress } from "./results.ts";
 import type {
 	BudgetConfig,
@@ -486,6 +488,12 @@ function resultLine(progress: ResultProgress, options: { prefix?: string; detail
 	};
 }
 
+/** What the whole goal has used, only for a run that continues one; a record without a goal has no such line. */
+function goalLine(run: RunRecord, now: number): string | undefined {
+	const text = goalText(goalTotals(run, now));
+	return text === undefined ? undefined : `- ${GOAL_LABEL}: ${text}`;
+}
+
 /** The round/agents/minutes part of the run details; spend has its own authoritative line and meter. */
 function runProgressParts(run: RunRecord, now: number): string[] {
 	const parts = [runRoundText(run)];
@@ -582,6 +590,9 @@ export function renderStatus(
 				],
 			});
 		}
+		// The model already reads the goal's earlier use in its resume handoff; the status line is for the user.
+		const goal = model ? undefined : goalLine(run, now);
+		if (goal !== undefined) styled([{ text: goal, tone: "muted" }]);
 		if (run.plan) {
 			for (const line of isolationLaneLines(run.plan, run)) styled([{ text: line }], undefined, "status.warning");
 			const note = isolationNote(run.plan);
@@ -596,7 +607,7 @@ export function renderStatus(
 		if (!run) return;
 		out.push("");
 		heading("마지막 실행", undefined, "status.info");
-		const lines = model ? modelLastRunLines(run, view.lastHandoff) : lastRunLines(run, true);
+		const lines = model ? modelLastRunLines(run, view.lastHandoff) : lastRunLines(run, true, now);
 		const index = out.length;
 		out.push(...lines);
 		if (info) {
@@ -1008,7 +1019,7 @@ export function resumeRunLine(run: RunRecord): string {
 	return `- 이어 갈 실행: ${head} · ${end} · ${rounds} · ${isoText(run.endedAt ?? run.updatedAt ?? run.startedAt)}`;
 }
 
-function lastRunLines(run: RunRecord, details: boolean): string[] {
+function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 	const counts = new Map<SpawnRecord["outcome"], number>();
 	for (const s of run.spawns) counts.set(s.outcome, (counts.get(s.outcome) ?? 0) + 1);
 	const spawns = counts.size
@@ -1023,6 +1034,8 @@ function lastRunLines(run: RunRecord, details: boolean): string[] {
 	const outcome = resultLine(progress, { detailed: details });
 	if (outcome !== undefined) out.push(outcome.text);
 	if (details) for (const row of progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
+	const goal = details ? goalLine(run, now) : undefined;
+	if (goal !== undefined) out.push(goal);
 	out.push(`- 스폰: ${spawns}`);
 	// An exception lane row already names the refusal of that exact spawn; only another block adds a reason here.
 	const isolated = isolationRowSpawns(run.plan, run);

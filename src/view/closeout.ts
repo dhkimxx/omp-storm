@@ -6,6 +6,7 @@
  * frame heading carries it. On the TUI the persisted `details` are validated again before they may restyle anything,
  * and they can only restyle text the plain content already says — never add a word, a control or a button.
  */
+import { formatUsd } from "../policy/spawn.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
 
 /** Schema version of a closeout record's `details`; anything else is drawn as the plain frame. */
@@ -14,6 +15,8 @@ export const CLOSEOUT_DETAILS_VERSION = 1;
 export const CLOSEOUT_STATUS_COMMAND = "/storm status";
 /** Displayed only on a card whose actions were registered, and honest when the card is replayed later. */
 export const CLOSEOUT_CHOICE_HINT = "이 카드 직후에만 번호로 선택 · 고르지 않으면 시작하지 않습니다";
+/** The label of a whole goal's totals, shared by the card and the status view so both name it alike. */
+export const GOAL_LABEL = "목표 누적";
 
 /** Card bounds: a closeout is a few lines that also fit a 60-column terminal, not a report. */
 const REQUEST_MAX = 120;
@@ -67,17 +70,33 @@ function clean(value: string | undefined, max: number): string {
 	return points.length > max ? `${points.slice(0, Math.max(1, max - 1)).join("")}…` : text;
 }
 
-/** `42분`, `1시간 5분`, `1분 미만`; undefined when either end is missing or unreadable. */
-export function closeoutDuration(startedAt: string, endedAt: string | undefined): string | undefined {
-	if (endedAt === undefined) return undefined;
-	const ms = Date.parse(endedAt) - Date.parse(startedAt);
-	if (!Number.isFinite(ms) || ms < 0) return undefined;
+/** `42분`, `1시간 5분`, `1분 미만` for a span of milliseconds. */
+function spanText(ms: number): string {
 	const minutes = Math.floor(ms / 60_000);
 	if (minutes < 1) return "1분 미만";
 	if (minutes < 60) return `${minutes}분`;
 	const hours = Math.floor(minutes / 60);
 	const rest = minutes % 60;
 	return rest === 0 ? `${hours}시간` : `${hours}시간 ${rest}분`;
+}
+
+/** `42분`, `1시간 5분`, `1분 미만`; undefined when either end is missing or unreadable. */
+export function closeoutDuration(startedAt: string, endedAt: string | undefined): string | undefined {
+	if (endedAt === undefined) return undefined;
+	const ms = Date.parse(endedAt) - Date.parse(startedAt);
+	if (!Number.isFinite(ms) || ms < 0) return undefined;
+	return spanText(ms);
+}
+
+/**
+ * What a whole goal has used so far, as the one text every surface shares: runs, spend, time, rounds. The values come
+ * from a stored record, so anything not a finite non-negative number means there is nothing honest to show.
+ */
+export function goalText(goal: NonNullable<CloseoutBrief["goal"]> | undefined): string | undefined {
+	if (goal === undefined) return undefined;
+	const { runs, usd, ms, turns } = goal;
+	if (![runs, usd, ms, turns].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)) return undefined;
+	return `실행 ${Math.floor(runs)}회 · ${formatUsd(usd)} · ${spanText(ms)} · ${Math.floor(turns)}라운드`;
 }
 
 /** The official tail after the status label: counts only, all from code. */
@@ -179,6 +198,10 @@ export function renderCloseout(brief: CloseoutBrief, showChoices: boolean): { ma
 
 	const proof = clean(brief.proof, ITEM_MAX);
 	if (proof !== "") out.item([{ text: "근거: ", tone: "muted" }, { text: proof }]);
+
+	// The run's own duration and rounds stay in the lines above; this is what the whole goal has used.
+	const goal = goalText(brief.goal);
+	if (goal !== undefined) out.item([{ text: `${GOAL_LABEL}: `, tone: "muted" }, { text: goal }]);
 
 	for (const action of brief.userActions.slice(0, USER_ACTION_MAX)) {
 		const text = clean(action, ITEM_MAX);

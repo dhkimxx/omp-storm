@@ -25,11 +25,11 @@ import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
 import { priorityLabel } from "../../src/view/render.ts";
 import { CLOSEOUT_NEXT_MAX } from "../../src/runtime/closeout.ts";
-import { CLOSEOUT_CHOICE_HINT } from "../../src/view/closeout.ts";
+import { CLOSEOUT_CHOICE_HINT, GOAL_LABEL, goalText } from "../../src/view/closeout.ts";
 import { STATUS_LABEL } from "../../src/runtime/rounds.ts";
 import {
 	CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutBody, focused, isOneLineCloseout, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, numberedOffers, offeredDirections, persistedStormRecords,
-	price, PROFILE_CONFIG, prepare, Rpc, runNext, sessionFileIn, type Step, type StormRecord, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui,
+	price, PROFILE_CONFIG, prepare, Rpc, RESUME_NEXT, runNext, sessionFileIn, type Step, type StormRecord, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui,
 	until, userNext, cancelAll,
 } from "./harness.ts";
 import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
@@ -86,6 +86,8 @@ const ASK_FORM = '<form data-storm-decision="e2e-tui-ask-v1" data-storm-reason="
 const ASK_ANSWER = "resume-ok";
 /** The file the 60-column card scenario's implementer writes and no reviewer ever judges. */
 const CARD_FILE = "e2e-card.txt";
+/** The file the goal step's implementer appends to, once per run of the goal. */
+const GOAL_FILE = "e2e-goal.txt";
 /** The official label of a done run, as the settled record and the status view print it. */
 const STATUS_DONE = STATUS_LABEL.done;
 /** The incomplete run whose card offered a related follow-up; later unrelated handoffs must not carry its facts. */
@@ -934,6 +936,93 @@ async function main(): Promise<void> {
 			await again.close();
 		}
 	}, 360_000);
+
+	await suite.step("a numbered resume carries the goal's totals onto its card, and a direction picked after it starts a new goal", async () => {
+		if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+		const resume = ownedSession;
+		const files = new StormFiles(env, resume.id);
+		requireApprovedTeam(files, "the goal totals across a numbered resume");
+		const changed = join(env.project, GOAL_FILE);
+		const marker = "E2E-GNXT";
+		const chosen = `${marker} E2E-STEPS ${JSON.stringify([{ storm: { action: "plan", plan: { lanes: [{ name: "g", kind: "review" }] } } }, { task: ["storm-reviewer"], say: "E2E-CHILD-VERDICT correct" }])}`;
+		if (chosen.length > CLOSEOUT_NEXT_MAX) throw new Error(`the chosen direction exceeds the brief bound: ${chosen.length} > ${CLOSEOUT_NEXT_MAX}`);
+		// The change is never reviewed, so each run of the goal stops at its round limit with a whole card that offers the
+		// recorded resume and the director's new direction. A resume replays the same request, so its card offers both again.
+		const brief = {
+			result: "E2E-GOAL-RESULT: the change was written; no reviewer judged it.",
+			verification: "E2E-GOAL-EVIDENCE: only the child's own write was observed.",
+			remaining: "E2E-GOAL-REMAINING: the change still needs one review.",
+			next: [RESUME_NEXT, runNext(chosen)],
+		};
+		const steps: Step[] = [
+			{ storm: { action: "plan", plan: { lanes: [{ name: "impl", kind: "code", results: [{ id: "goal-change", kind: "change", criterion: `the implementer wrote ${GOAL_FILE}`, path: GOAL_FILE, contains: "storm child change" }] }] } } },
+			{ task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-WRITE ${GOAL_FILE}` },
+			{ storm: { action: "brief", brief } },
+		];
+		/** The newest whole card painted since `from`, once `ready` holds for it. */
+		const cardSince = (tui: Tui, from: number, ready: (tail: string) => boolean, what: string): Promise<string> =>
+			tui.seen(from, text => {
+				const at = text.lastIndexOf(CLOSEOUT_HEADING);
+				const tail = at < 0 ? "" : text.slice(at);
+				return tail.includes(CLOSEOUT_DETAIL) && ready(tail) ? tail : undefined;
+			}, what, 60_000);
+		/** The number of the first offer on `card` that `pick` accepts. */
+		const numberOf = (card: string, pick: (offer: string) => boolean): string | undefined => {
+			const rows = screenRows(card);
+			const offers = numberedOffers(rows.slice(0, rows.findIndex(row => row.includes(CLOSEOUT_DETAIL)) + 1));
+			return offers.find(pick)?.match(/[1-9]/)?.[0];
+		};
+		const savedText = (runId: string): string => {
+			const sessionFile = sessionFileIn(resume.dir, resume.id);
+			return (sessionFile === undefined ? [] : persistedStormRecords(sessionFile)).filter(record => record.details?.runId === runId).map(record => record.text).join("\n");
+		};
+		const span = (run: RunRecord): number => Date.parse(run.endedAt ?? "") - Date.parse(run.startedAt);
+		const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], resume: resume.id, sessionDir: resume.dir });
+		try {
+			await readyForSubmission(tui);
+			const before = files.runIds();
+			const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run", rounds: 2 })} E2E-STEPS ${b64(steps)}`);
+			const fresh = await files.finishedRun(before, 150_000);
+			const freshCard = await cardSince(tui, started, tail => tail.includes("E2E-GOAL-RESULT"), "the fresh run's whole card");
+			check(
+				"a fresh run has no goal and its card draws no goal line",
+				fresh.status === "stopped" && fresh.endReason === "round-limit" && fresh.goal === undefined && !freshCard.includes(GOAL_LABEL),
+				`${fresh.status}/${fresh.endReason} goal=${JSON.stringify(fresh.goal ?? null)} ${screenRows(freshCard).join("\n")}`,
+			);
+			const resumeNumber = numberOf(freshCard, offer => !offer.includes(marker));
+			if (resumeNumber === undefined) throw new Error(`the fresh card offers no resume: ${screenRows(freshCard).join(" | ")}`);
+			const withFresh = files.runIds();
+			const picked = await tui.submit(resumeNumber);
+			const resumed = await files.finishedRun(withFresh, 150_000);
+			const expected = goalText({ runs: 2, usd: fresh.costUsd + resumed.costUsd, ms: span(fresh) + span(resumed), turns: (fresh.turns ?? 0) + (resumed.turns ?? 0) });
+			check(
+				"the numbered resume carries the fresh run's cost, time and rounds",
+				resumed.resumeOf === fresh.runId && resumed.followUpOf === undefined && resumed.goal?.firstRunId === fresh.runId && resumed.goal.runs === 1 &&
+					resumed.goal.usd === fresh.costUsd && resumed.goal.ms === span(fresh) && resumed.goal.turns === fresh.turns,
+				`resumeOf=${resumed.resumeOf} goal=${JSON.stringify(resumed.goal ?? null)} fresh=${fresh.costUsd}/${span(fresh)}/${fresh.turns}`,
+			);
+			const resumedCard = await cardSince(tui, picked, tail => tail.includes("E2E-GOAL-RESULT") && tail.includes(GOAL_LABEL), "the resumed run's card with its goal line");
+			check(
+				"the resumed run's painted card and its saved record show both runs' totals",
+				expected !== undefined && resumedCard.includes(`${GOAL_LABEL}: ${expected}`) && savedText(resumed.runId).includes(`${GOAL_LABEL}: ${expected}`),
+				`expected=${expected} ${screenRows(resumedCard).join("\n")}`,
+			);
+			const directionNumber = numberOf(resumedCard, offer => offer.includes(marker));
+			if (directionNumber === undefined) throw new Error(`the resumed card offers no direction: ${screenRows(resumedCard).join(" | ")}`);
+			const withResumed = files.runIds();
+			await tui.submit(directionNumber);
+			const followUp = await files.finishedRun(withResumed, 120_000);
+			const saved = await until(() => savedText(followUp.runId) || undefined, 20_000, "the follow-up's settled record").catch(() => "");
+			check(
+				"a direction picked after the resume is a new goal: no carry, no goal line",
+				followUp.followUpOf === resumed.runId && followUp.resumeOf === undefined && followUp.goal === undefined && saved !== "" && !saved.includes(GOAL_LABEL),
+				`followUpOf=${followUp.followUpOf} resumeOf=${followUp.resumeOf} goal=${JSON.stringify(followUp.goal ?? null)} saved=${saved.slice(0, 400)}`,
+			);
+		} finally {
+			await tui.close();
+			rmSync(changed, { force: true });
+		}
+	}, 420_000);
 
 	await suite.step(
 		"a native ask pauses the run and its answer resumes it",

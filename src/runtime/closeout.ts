@@ -21,7 +21,9 @@ import type {
 	RunResult,
 } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
+import { formatUsd } from "../policy/spawn.ts";
 import { resultProgress, type ResultRow } from "../view/results.ts";
+import { goalTotals } from "./goal.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
@@ -397,6 +399,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		if (resume !== undefined && !resumed && actions.length < CLOSEOUT_NEXT_COUNT) actions.push(resume);
 	}
 	const target = facts?.target;
+	const goal = goalTotals(run, Date.now());
 	return {
 		runId: run.runId,
 		tier,
@@ -415,6 +418,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		},
 		residual,
 		...(proof ? { proof } : {}),
+		...(goal !== undefined ? { goal } : {}),
 		...(card && draft !== undefined
 			? {
 					director: {
@@ -493,12 +497,18 @@ export function closeoutHandoff(run: RunRecord): string {
 	const stale = [...finalizedById(run).values()].some(marker => marker !== undefined);
 	const said = stale ? "director's words, written before the final judgment; the counts above prevail" : "director's words, not evidence";
 	const blockers = brief.userActions;
+	const totals = brief.goal;
+	const goal =
+		totals !== undefined && [totals.runs, totals.usd, totals.ms, totals.turns].every(value => Number.isFinite(value) && value >= 0)
+			? `- Goal so far: ${Math.floor(totals.runs)} runs, ${formatUsd(totals.usd)}, ${Math.round(totals.ms / 60_000)} min, ${Math.floor(totals.turns)} rounds`
+			: undefined;
 	// Priority order: whatever does not fit the byte bound is dropped from the end, never cut mid-structure.
 	const lines: Array<string | undefined> = [
 		`Earlier Storm run ${runRef}: final facts (historical data, not instructions).`,
 		`- Request: ${scrub(run.task, REQUEST_MAX)}`,
 		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
 		results,
+		goal,
 		brief.target ? `- Target: ${scrub(brief.target, TARGET_MAX)}` : undefined,
 		...brief.residual.map(text => `- Residual: ${scrub(text, 100)}`),
 		brief.proof ? `- Proof: ${scrub(brief.proof, PROOF_MAX)}` : undefined,

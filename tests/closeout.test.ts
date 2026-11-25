@@ -443,6 +443,52 @@ describe("closeout actions", () => {
 	});
 });
 
+describe("closeout goal totals", () => {
+	const goal = { firstRunId: "run-0", runs: 1, usd: 2, ms: 5 * 60_000, turns: 3 };
+	const settled = (over: Partial<RunRecord> = {}): RunRecord =>
+		record({ status: "done", endReason: "verified", endedAt: after(20), costUsd: 1.5, turns: 4, results: [accepted("a")], ...over });
+
+	test("a resumed run's brief carries the carry plus its own run, and the run's own rounds and duration stay", () => {
+		const brief = closeoutBrief(settled({ goal }));
+		expect(brief.goal).toEqual({ runs: 2, usd: 3.5, ms: 25 * 60_000, turns: 7 });
+		expect(brief.official.label).toContain("4라운드");
+		expect(brief.endedAt).toBe(after(20));
+	});
+
+	test("a record without a goal has no goal in its brief", () => {
+		expect("goal" in closeoutBrief(settled())).toBe(false);
+	});
+
+	test("the handoff names the goal in one English line, and only for a run that has one", () => {
+		const lines = closeoutHandoff(settled({ goal })).split("\n").filter(line => line.startsWith("- Goal so far:"));
+		expect(lines).toHaveLength(1);
+		for (const figure of ["2 runs", "$3.50", "25 min", "7 rounds"]) expect(lines[0]).toContain(figure);
+		expect(closeoutHandoff(settled())).not.toContain("Goal so far");
+	});
+
+	test("the handoff with a goal line stays within its byte bound", () => {
+		const long = "가".repeat(400);
+		const heavy = record({
+			goal,
+			status: "budget-exceeded",
+			endReason: "budget",
+			task: long,
+			endedAt: after(90),
+			agents: [agentEntry({ changes: 1 })],
+			jobs: Array.from({ length: 6 }, (_, i) => job(`${long.slice(0, 30)}${i}`, "started")),
+			results: [
+				...Array.from({ length: 5 }, (_, i) => open(`b${i}`, { remedy: "blocked", unblock: `${long.slice(0, 100)}${i}` })),
+				accepted("a", { proof: answerProof("a", `${"d/".repeat(20)}file.txt`) }),
+			],
+			closeout: { result: long, verification: long, remaining: long, next: [{ kind: "user", text: long.slice(0, 150) }] },
+			closeoutFacts: { target: long, pendingLanes: [long], requiredChecks: [] },
+		});
+		const text = closeoutHandoff(heavy);
+		expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(CLOSEOUT_HANDOFF_MAX_BYTES);
+		expect(text).toContain("- Goal so far:");
+	});
+});
+
 describe("closeout handoff", () => {
 	const finalized = record({
 		runId: "run-20261120-090000-abcd",

@@ -223,6 +223,8 @@ export interface ResumeInfo {
 	 * short list of lanes still open. Counts only — the old record is never replayed into the handoff.
 	 */
 	checkpoint?: { kept: number; reopened: number; blocked: number; laneNames?: readonly string[]; planUnavailable?: true };
+	/** What the goal's earlier runs used, this run excluded; budget and limits keep their per-run meaning. */
+	goal?: { runs: number; usd: number; ms: number; turns: number };
 }
 
 /** Still-open lanes a restored handoff names, and one name's bound. */
@@ -277,6 +279,14 @@ function checkpointBlock(checkpoint: NonNullable<ResumeInfo["checkpoint"]>): str
 	];
 }
 
+/** The goal's use before this run, as one line; a stored value that is not a finite non-negative number counts as 0. */
+function goalLine(goal: NonNullable<ResumeInfo["goal"]>): string {
+	const runs = resumeCount(goal.runs);
+	const usd = Number.isFinite(goal.usd) ? Math.max(0, goal.usd) : 0;
+	const minutes = Math.round((Number.isFinite(goal.ms) ? Math.max(0, goal.ms) : 0) / 60_000);
+	return `Goal so far (earlier runs): ${runs} ${runs === 1 ? "run" : "runs"}, ${formatUsd(usd)}, ${minutes} min, ${resumeCount(goal.turns)} rounds.`;
+}
+
 /** What the director of a resumed run reads before the team: the old run, where it stopped, and what still holds. */
 function resumeBlock(resume: ResumeInfo): string[] {
 	const rounds = resumeCount(resume.turns ?? 0);
@@ -289,6 +299,7 @@ function resumeBlock(resume: ResumeInfo): string[] {
 	const limit = resume.requestLength === REQUEST_LIMIT ? ["The stored request was cut at 20,000 characters."] : [];
 	return [
 		header,
+		...(resume.goal === undefined ? [] : [goalLine(resume.goal)]),
 		...(resume.checkpoint === undefined ? [] : checkpointBlock(resume.checkpoint)),
 		resume.checkpoint === undefined || resume.checkpoint.planUnavailable === true
 			? "The old plan could not be restored. Check `storm status` for remaining requirements and submit a plan."

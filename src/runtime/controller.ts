@@ -123,6 +123,7 @@ import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerRevi
 import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
 import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
+import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
@@ -912,6 +913,8 @@ export class RunController {
 			});
 			if (plan !== undefined) plan = stripExcludedPlan(plan, priorExcluded);
 			else if (restoredPlan !== undefined) plan = stripExcludedPlan(restoredPlan, priorExcluded);
+			// A resume continues its parent's goal; a follow-up and a fresh run start their own. Fixed here, never updated.
+			const goal = continued === undefined ? undefined : carryGoal(continued);
 			const resume =
 				continued === undefined
 					? undefined
@@ -921,6 +924,7 @@ export class RunController {
 							...(continued.turns !== undefined ? { turns: continued.turns } : {}),
 							...(continued.request !== undefined ? { requestLength: continued.request.length } : {}),
 							...(requested.resumeNote !== undefined ? { said: requested.resumeNote } : {}),
+							...(goal !== undefined ? { goal } : {}),
 						};
 
 			if (auto) {
@@ -965,6 +969,7 @@ export class RunController {
 				task: task.slice(0, TASK_CHARS),
 				request: task.slice(0, REQUEST_LIMIT),
 				...(requested.resumeOf !== undefined ? { resumeOf: requested.resumeOf } : {}),
+				...(goal !== undefined ? { goal } : {}),
 				...(followUp !== undefined ? { followUpOf: followUp.runId } : {}),
 				costUsd: 0,
 				costByModel: {},
@@ -1548,17 +1553,18 @@ export class RunController {
 	/** Rehydrate one validated plan; a prior record locates claims, only current evidence accepts them. */
 	async #restoreCheckpoint(own: OwnRun, previous: RunRecord, plan: RunPlan | undefined): Promise<void> {
 		this.#syncResults(own);
-		const oldRows = new Map<string, RunResult | null>();
-		if (Array.isArray(previous.results) && previous.results.length <= 400) {
+		// The record that held these rows was read within RUN_RECORD_MAX_BYTES, which bounds them; a count cap here would
+		// drop unmet requirements unseen. A repeated id is one requirement: its first row is the one imported.
+		const oldRows = new Map<string, RunResult>();
+		if (Array.isArray(previous.results)) {
 			for (const old of previous.results) {
-				if (old !== null && typeof old === "object" && typeof old.id === "string") {
-					oldRows.set(old.id, oldRows.has(old.id) ? null : old);
+				if (old !== null && typeof old === "object" && typeof old.id === "string" && !oldRows.has(old.id)) {
+					oldRows.set(old.id, old);
 				}
 			}
 		}
 		const rows = new Map(own.record.results?.map(row => [row.id, row]));
 		for (const old of oldRows.values()) {
-			if (old === null) continue;
 			if (old.scope === "excluded-by-user") {
 				const existing = rows.get(old.id);
 				if (existing !== undefined) {
@@ -1589,8 +1595,13 @@ export class RunController {
 			if (rows.has(old.id)) continue;
 			const contract = normalizeCheckpointContract(old.contract);
 			if (contract === undefined || old.id !== contract.id || old.identity !== resultContractIdentity(contract)) continue;
+			// The old row's unmet reason is why the requirement is still open; it stays next to the orphan reason.
+			const prior = typeof old.reason === "string" && old.state !== "accepted"
+				? compactResultReason(old.reason.startsWith(ORPHAN_RESULT_REASON) ? old.reason.slice(ORPHAN_RESULT_REASON.length) : old.reason)
+				: "";
 			const row: RunResult = {
-				id: contract.id, identity: old.identity, contract, state: "pending", origin: "plan", reason: ORPHAN_RESULT_REASON,
+				id: contract.id, identity: old.identity, contract, state: "pending", origin: "plan",
+				reason: prior === "" ? ORPHAN_RESULT_REASON : compactResultReason(`${ORPHAN_RESULT_REASON} ${prior}`),
 			};
 			(own.record.results ??= []).push(row);
 			rows.set(row.id, row);

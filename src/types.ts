@@ -891,6 +891,8 @@ export interface RunRecord {
 	resumeOf?: string;
 	/** Target-checked context source for a new scoped follow-up, not a continuation. */
 	followUpOf?: string;
+	/** The goal this run continues and what its earlier runs already used. Written once at start, never updated. */
+	goal?: { firstRunId: string; runs: number; usd: number; ms: number; turns: number };
 	/** List-price spend of every assistant message in this process while the run was active. */
 	costUsd: number;
 	/** Spend by "provider/model". */
@@ -974,6 +976,8 @@ export interface CloseoutBrief {
 	readonly director?: { readonly result: string; readonly remaining?: string; readonly stale: boolean };
 	readonly userActions: readonly string[];
 	readonly actions: readonly CloseoutAction[];
+	/** The whole goal's use when this run continues an earlier one, this run included. */
+	readonly goal?: { runs: number; usd: number; ms: number; turns: number };
 }
 
 export interface RunJob {

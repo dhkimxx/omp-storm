@@ -17,12 +17,14 @@ import {
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
 import { noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
+import { activeMs } from "../src/runtime/goal.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
 import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
 import { HOLD_MS, ROUND_DELAY_MS, treeFingerprint } from "../src/runtime/rounds.ts";
 import { lastRun, readRun, runIds, runsDir, writeRun } from "../src/runtime/run.ts";
 import { trustedResume, resumePointerFile, noteResumePointer } from "../src/runtime/resume.ts";
 import { readRunIndex } from "../src/runtime/run-index.ts";
+import { resultContractIdentity } from "../src/runtime/result-evidence.ts";
 import { readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { RunPhase } from "../src/view/appearance.ts";
@@ -33,6 +35,7 @@ import type {
 	CloseoutRecordStyle,
 	RunPlan,
 	RunRecord,
+	RunResult,
 	RunSpec,
 	ShadowInfo,
 	SpawnBlockCode,
@@ -744,6 +747,102 @@ describe("run start", () => {
 		expect((await readRun(h.sessionDir, runId))?.followUpOf).toBeUndefined();
 		expect(h.sent[0]).not.toContain("Earlier Storm run");
 		await h.controller.finish("no-changes");
+	});
+
+	test("a resume carries the goal's earlier use, a resume of that resume sums both, and the first run names the goal", async () => {
+		const old = runRecord({
+			runId: "run-20261119-090000-goa0",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			endedAt: "2026-11-19T09:30:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			turns: 3,
+			costUsd: 1.5,
+			request: "reach the goal",
+		});
+		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const middle = await h.start({ task: "reach the goal", resumeOf: old.runId });
+		expect((await readRun(h.sessionDir, middle))?.goal).toEqual({ firstRunId: old.runId, runs: 1, usd: 1.5, ms: 30 * 60_000, turns: 3 });
+		expect((h.sent[0] ?? "").split("\n").filter(line => line.startsWith("Goal so far"))).toHaveLength(1);
+		recordCost(middle, "a/i", 0.25);
+		await h.controller.finish("interrupted");
+		const middleRecord = await readRun(h.sessionDir, middle);
+		if (middleRecord === undefined) throw new Error("the resumed run's record is missing");
+		expect(middleRecord.costUsd).toBeCloseTo(0.25);
+
+		const next = await h.start({ task: "reach the goal", resumeOf: middle });
+		const goal = (await readRun(h.sessionDir, next))?.goal;
+		expect(goal).toMatchObject({
+			firstRunId: old.runId,
+			runs: 2,
+			ms: 30 * 60_000 + activeMs(middleRecord),
+			turns: 3 + (middleRecord.turns ?? 0),
+		});
+		expect(goal?.usd).toBeCloseTo(1.75);
+		await h.controller.finish("no-changes");
+	});
+
+	test("a fresh run and a follow-up start a goal of their own and carry nothing", async () => {
+		const h = session();
+		const fresh = await h.start({ task: "a fresh request" });
+		expect((await readRun(h.sessionDir, fresh))?.goal).toBeUndefined();
+		expect(h.sent[0]).not.toContain("Goal so far");
+		await h.controller.finish("no-changes");
+
+		const source = runRecord({
+			runId: "run-20261119-090000-goa1",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			endedAt: "2026-11-19T09:40:00.000Z",
+			status: "ended",
+			endReason: "no-progress",
+			turns: 4,
+			costUsd: 2,
+			request: "the earlier request",
+		});
+		await writeRun(h.sessionDir, source);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, source);
+		const followUp = await h.start({ task: "a new scope", followUpOf: source.runId });
+		const record = await readRun(h.sessionDir, followUp);
+		expect(record?.followUpOf).toBe(source.runId);
+		expect(record?.goal).toBeUndefined();
+		expect(h.sent.at(-1)).not.toContain("Goal so far");
+		await h.controller.finish("no-changes");
+	});
+
+	test("a resume imports every old row however many there are, keeps the first of a repeated id, and an orphan keeps its old reason", async () => {
+		const row = (index: number, reason: string): RunResult => {
+			const contract = { id: `req-${index}`, kind: "answer" as const, criterion: `report finding ${index}` };
+			return { id: contract.id, state: "unmet", identity: resultContractIdentity(contract), contract, reason };
+		};
+		const rows = Array.from({ length: 600 }, (_, index) => row(index, `check exited ${index}`));
+		rows.push(row(0, "a later copy"));
+		const old = runRecord({
+			runId: "run-20261119-090000-many",
+			startedAt: "2026-11-19T09:00:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			request: "many requirements",
+			results: rows,
+		});
+		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const runId = await h.start({ task: "many requirements", resumeOf: old.runId });
+		const stored = (await readRun(h.sessionDir, runId))?.results ?? [];
+		expect(stored).toHaveLength(600);
+		expect(new Set(stored.map(result => result.id)).size).toBe(600);
+		// No plan carries them: every row is an open orphan without a lane.
+		expect(stored.every(result => result.state === "pending" && result.lane === undefined)).toBe(true);
+		for (const index of [0, 399, 400, 599]) {
+			const reason = stored.find(result => result.id === `req-${index}`)?.reason ?? "";
+			expect(reason.endsWith(`check exited ${index}`)).toBe(true);
+			expect(reason).not.toBe(`check exited ${index}`);
+			expect(reason.length).toBeLessThanOrEqual(100);
+		}
+		expect(stored.some(result => result.reason?.includes("a later copy"))).toBe(false);
+		await h.controller.finish("interrupted");
 	});
 
 	test("a team that may not run starts nothing: no config, invalid, unapproved, another hash, an unapproved shadow", async () => {

@@ -17,6 +17,7 @@ import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
 import { FALLBACK, QUOTA_CHOICE } from "../../src/request/route.ts";
 import type { PlanLaneResult, RunRecord } from "../../src/types.ts";
+import { GOAL_LABEL, goalText } from "../../src/view/closeout.ts";
 import {
 	type Answer,
 	approveTeam,
@@ -67,6 +68,16 @@ const LABEL = {
 	keepModel: "지금 모델 유지",
 	autoOff: "자동 위임 끄기",
 } as const;
+
+/** A settled run's own active time, from its record's two ends; what a resume carries for it. */
+function ownMs(run: RunRecord): number {
+	return Date.parse(run.endedAt ?? "") - Date.parse(run.startedAt);
+}
+
+/** A goal's totals summed here from the runs' own records, independently of the carry Storm wrote. */
+function summed(runs: readonly RunRecord[]): { runs: number; usd: number; ms: number; turns: number } {
+	return runs.reduce((sum, run) => ({ runs: sum.runs + 1, usd: sum.usd + run.costUsd, ms: sum.ms + ownMs(run), turns: sum.turns + (run.turns ?? 0) }), { runs: 0, usd: 0, ms: 0, turns: 0 });
+}
 
 /** The disclosure the first team approval panel must carry. */
 const AUTO_DISCLOSURE = "승인하면 이 세션의 자동 위임이 켜집니다";
@@ -944,6 +955,11 @@ async function main(): Promise<void> {
 					status.slice(0, 1200),
 				);
 				check("neither settling nor the status view asked the model anything", quiet.all().length === 0, JSON.stringify(quiet.all().map(entry => [entry.who, entry.lastUser.slice(0, 80)])));
+				check(
+					"a fresh run carries no goal and draws no goal line on its card or in the status view",
+					run.goal === undefined && card !== undefined && !card.text.includes(GOAL_LABEL) && status !== "" && !status.includes(GOAL_LABEL),
+					`goal=${JSON.stringify(run.goal ?? null)} status=${status.slice(0, 600)}`,
+				);
 				return run;
 			});
 			if (origin === undefined) throw new Error("the old run's session was not captured");
@@ -955,8 +971,15 @@ async function main(): Promise<void> {
 				`${old.status} ${old.endReason} limits=${JSON.stringify(old.limits)} maxRounds=${old.maxRounds}`,
 			);
 
+			/** The settled run's card and the user's status view read right after it, from this session's frames. */
+			const settledViews = async (rpc: Rpc, run: RunRecord, from: number): Promise<{ card: string; status: string }> => {
+				const card = closeoutOf(rpc.frames, run.runId, from)?.text ?? "";
+				const statusFrom = rpc.frames.length;
+				await rpc.prompt("/storm status");
+				return { card, status: stormRecords(rpc.frames, statusFrom).at(-1)?.text ?? "" };
+			};
 			const first = new LlmCursor(env);
-			const resumed = await session(cancelAll, async (rpc, files) => {
+			const { run: resumed, views: resumedViews } = await session(cancelAll, async (rpc, files) => {
 				await rpc.prompt("/storm");
 				const menu = rpc.dialogs.at(-1)?.options ?? [];
 				check(
@@ -965,9 +988,11 @@ async function main(): Promise<void> {
 					`menu=${JSON.stringify(menu)} without=${JSON.stringify(hubWithoutResume)}`,
 				);
 				const before = files.runIds();
+				const from = rpc.frames.length;
 				rpc.answer = choose(LABEL.resume);
 				await rpc.prompt("/storm");
-				return files.finishedRun(before, 150_000);
+				const run = await files.finishedRun(before, 150_000);
+				return { run, views: await settledViews(rpc, run, from) };
 			}, { resume: stopped.id, sessionDir: stopped.dir, setup: "off" });
 			const handoff = mains(first.all()).map(newestUser).find(user => user.startsWith(`<storm-run id="${resumed.runId}"`)) ?? "";
 			check(
@@ -977,13 +1002,28 @@ async function main(): Promise<void> {
 			);
 			check("the resumed run carries the old limits", resumed.limits?.rounds === 2 && resumed.maxRounds === 2, `limits=${JSON.stringify(resumed.limits)} maxRounds=${resumed.maxRounds}`);
 			check("the handoff names the old run", handoff.includes(old.runId), handoff.slice(0, 240));
+			const oldUse = summed([old]);
+			check(
+				"the resumed run carries the stopped run's cost, time and rounds as its goal",
+				resumed.goal?.firstRunId === old.runId && resumed.goal.runs === 1 && resumed.goal.usd === oldUse.usd && resumed.goal.ms === oldUse.ms &&
+					resumed.goal.turns === oldUse.turns && oldUse.ms > 0 && oldUse.turns === 2,
+				`goal=${JSON.stringify(resumed.goal ?? null)} expected=${JSON.stringify(oldUse)}`,
+			);
+			check("the resume handoff tells the director what the goal used before", handoff.includes("Goal so far (earlier runs): 1 run,"), handoff.slice(0, 600));
+			const resumedGoal = goalText(summed([old, resumed]));
+			check(
+				"the resumed run's card and the status view show the goal totals, both runs counted",
+				resumedGoal !== undefined && resumedViews.card.includes(`${GOAL_LABEL}: ${resumedGoal}`) && resumedViews.status.includes(`- ${GOAL_LABEL}: ${resumedGoal}`),
+				`expected=${resumedGoal} card=${resumedViews.card.slice(0, 900)} status=${resumedViews.status.slice(0, 900)}`,
+			);
 
 			const second = new LlmCursor(env);
-			const again = await session(cancelAll, async (rpc, files) => {
+			const { run: again, views: againViews } = await session(cancelAll, async (rpc, files) => {
 				const dialogs = rpc.dialogs.length;
+				const from = rpc.frames.length;
 				const run = await runOf(rpc, files, route({ action: "resume" }, "continue the run that stopped"));
 				check("a classified resume opens no dialog", rpc.dialogs.length === dialogs, JSON.stringify(rpc.dialogs));
-				return run;
+				return { run, views: await settledViews(rpc, run, from) };
 			}, { resume: stopped.id, sessionDir: stopped.dir, setup: "off" });
 			const nextHandoff = mains(second.all()).map(newestUser).find(user => user.startsWith(`<storm-run id="${again.runId}"`)) ?? "";
 			check(
@@ -992,6 +1032,19 @@ async function main(): Promise<void> {
 				`resumeOf=${again.resumeOf} old=${resumed.runId} request=${again.request === resumed.request} limits=${JSON.stringify(again.limits)}`,
 			);
 			check("its handoff names the run it continues", nextHandoff.includes(resumed.runId), nextHandoff.slice(0, 240));
+			const bothUse = summed([old, resumed]);
+			check(
+				"a resume of the resume sums both earlier runs and keeps the goal's first run",
+				again.goal?.firstRunId === old.runId && again.goal.runs === 2 && again.goal.usd === bothUse.usd && again.goal.ms === bothUse.ms && again.goal.turns === bothUse.turns,
+				`goal=${JSON.stringify(again.goal ?? null)} expected=${JSON.stringify(bothUse)}`,
+			);
+			check("its handoff counts both earlier runs", nextHandoff.includes("Goal so far (earlier runs): 2 runs,"), nextHandoff.slice(0, 600));
+			const againGoal = goalText(summed([old, resumed, again]));
+			check(
+				"its card and the status view show all three runs' totals",
+				againGoal !== undefined && againViews.card.includes(`${GOAL_LABEL}: ${againGoal}`) && againViews.status.includes(`- ${GOAL_LABEL}: ${againGoal}`),
+				`expected=${againGoal} card=${againViews.card.slice(0, 900)} status=${againViews.status.slice(0, 900)}`,
+			);
 		} finally {
 			rmSync(limited, { force: true });
 		}

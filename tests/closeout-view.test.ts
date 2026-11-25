@@ -181,6 +181,50 @@ describe("closeout text", () => {
 	});
 });
 
+describe("goal totals on the card", () => {
+	const GOAL = { runs: 3, usd: 7.25, ms: 95 * 60_000, turns: 41 };
+	const withGoal = brief({ goal: GOAL });
+
+	test("a card with a goal adds exactly one item and keeps the run's own duration; without one it is unchanged", () => {
+		const plain = renderCloseout(brief(), true).markdown.split("\n");
+		const goal = renderCloseout(withGoal, true).markdown.split("\n");
+		const added = goal.filter(line => !plain.includes(line));
+		expect(goal).toHaveLength(plain.length + 1);
+		expect(added).toHaveLength(1);
+		for (const figure of ["3", "$7.25", "41"]) expect(added[0]).toContain(figure);
+		expect(added[0]).toContain("1시간 35분");
+		expect(goal.filter(line => !added.includes(line))).toEqual(plain);
+		expect(goal.join("\n")).toContain("42분");
+	});
+
+	test("a one-line closeout never shows the goal", () => {
+		const line = brief({ tier: "line", endedAt: "2026-11-25T09:03:00Z" });
+		expect(renderCloseout({ ...line, goal: GOAL }, true)).toEqual(renderCloseout(line, true));
+	});
+
+	test("an unreadable goal is not drawn", () => {
+		const bad = { runs: Number.NaN, usd: -1, ms: Number.POSITIVE_INFINITY, turns: 1 };
+		expect(renderCloseout(brief({ goal: bad }), true)).toEqual(renderCloseout(brief(), true));
+	});
+
+	test("the card fits 60 columns and survives the persisted-details round trip", () => {
+		const { markdown, info } = renderCloseout({ ...F2, goal: { runs: 12, usd: 123.456, ms: 5_000 * 60_000, turns: 480 } }, true);
+		for (const row of frameOf(markdown, info).render(60)) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+		const details = closeoutDetails(markdown, style(info));
+		expect(details).toBeDefined();
+		expect(readCloseoutRecord(content(markdown), JSON.parse(JSON.stringify(details)))).toEqual({ title: TITLE, markdown, info });
+	});
+
+	test("a card persisted before the goal item existed still draws as a closeout", () => {
+		const old = renderCloseout(brief(), true);
+		expect(readCloseoutRecord(content(old.markdown), JSON.parse(JSON.stringify(closeoutDetails(old.markdown, style(old.info)))))).toEqual({
+			title: TITLE,
+			markdown: old.markdown,
+			info: old.info,
+		});
+	});
+});
+
 describe("closeout frame", () => {
 	let restoreTheme: string | undefined;
 	let restorePreset: Parameters<typeof setSymbolPreset>[0] | undefined;

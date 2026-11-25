@@ -17,6 +17,7 @@ import {
 	trustedResume,
 } from "../src/runtime/resume.ts";
 import { maxRounds } from "../src/runtime/rounds.ts";
+import { carryGoal } from "../src/runtime/goal.ts";
 import type { RunRecord } from "../src/types.ts";
 import { runRecord, teamOf } from "./fixtures.ts";
 
@@ -253,6 +254,38 @@ describe("resume candidate selection", () => {
 		expect(stored.entries.length).toBe(RESUME_POINTERS_MAX);
 		expect(stored.entries.some(entry => entry.runId === interrupted.runId)).toBe(true);
 		expect((await findResumeCandidate(sessionDir, target))?.runId).toBe(interrupted.runId);
+	});
+});
+
+describe("resume goal carry", () => {
+	test("a start-failed resume never supersedes its parent, so the next resume counts the parent's use once", async () => {
+		const parent = run({ costUsd: 2, turns: 3, endedAt: "2026-11-20T10:30:00.000Z" });
+		await writeRun(sessionDir, parent);
+		await noteResumePointer(sessionDir, target, parent);
+		const failed = run({
+			runId: "run-20261120-110000-fail",
+			startedAt: "2026-11-20T11:00:00.000Z",
+			endedAt: "2026-11-20T11:00:01.000Z",
+			endReason: "start-failed",
+			resumeOf: parent.runId,
+			goal: carryGoal(parent),
+		});
+		await writeRun(sessionDir, failed);
+		await noteResumePointer(sessionDir, target, failed);
+
+		const candidate = await findResumeCandidate(sessionDir, target);
+		expect(candidate?.runId).toBe(parent.runId);
+		// The failed attempt's carry is never the base of the next one: the parent is carried again, once.
+		expect(carryGoal(candidate!)).toEqual({ firstRunId: parent.runId, runs: 1, usd: 2, ms: 30 * 60_000, turns: 3 });
+
+		// Only a continuation that got its handoff supersedes the parent and becomes the base of the next carry.
+		const started = { ...failed, runId: "run-20261120-120000-next", startedAt: "2026-11-20T12:00:00.000Z",
+			endedAt: "2026-11-20T12:10:00.000Z", endReason: "interrupted" as const, costUsd: 1, turns: 2 };
+		await writeRun(sessionDir, started);
+		await noteResumePointer(sessionDir, target, started);
+		const next = await findResumeCandidate(sessionDir, target);
+		expect(next?.runId).toBe(started.runId);
+		expect(carryGoal(next!)).toEqual({ firstRunId: parent.runId, runs: 2, usd: 3, ms: 40 * 60_000, turns: 5 });
 	});
 });
 

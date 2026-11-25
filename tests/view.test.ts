@@ -383,6 +383,45 @@ describe("status", () => {
 		expect(md).not.toContain("dir-test-");
 	});
 
+	describe("goal totals", () => {
+		const goal = { firstRunId: "run-0", runs: 2, usd: 7.25, ms: 30 * 60_000, turns: 37 };
+		const lines = (md: string): string[] => md.split("\n");
+		/** The lines the report gained when the record(s) gained a goal. */
+		const gained = (plain: StatusView, carried: StatusView): string[] => {
+			const before = lines(renderStatus(plain, NOW));
+			const after = lines(renderStatus(carried, NOW));
+			expect(after).toHaveLength(before.length + 1);
+			return after.filter(line => !before.includes(line));
+		};
+		const running = runRecord({ configHash: hash, status: "running", costUsd: 1.25, turns: 3, startedAt: "2026-11-20T09:18:00Z" });
+		const settled = runRecord({ configHash: hash, status: "done", costUsd: 0.5, turns: 2, endedAt: "2026-11-20T09:10:00Z" });
+
+		test("the running run shows what the whole goal has used, counting this run and its time so far", () => {
+			const [line] = gained(view({ run: running }), view({ run: { ...running, goal } }));
+			// 3 runs, $7.25 + $1.25, 30 + 12 minutes, 37 + 3 rounds.
+			for (const figure of ["3", "$8.50", "42분", "40"]) expect(line).toContain(figure);
+		});
+
+		test("the last run shows its goal totals with its own recorded time", () => {
+			const [line] = gained(view({ lastRun: settled }), view({ lastRun: { ...settled, goal } }));
+			// 3 runs, $7.25 + $0.50, 30 + 10 minutes, 37 + 2 rounds.
+			for (const figure of ["3", "$7.75", "40분", "39"]) expect(line).toContain(figure);
+		});
+
+		test("the rich status keeps every style index inside the report", () => {
+			const info: InfoLine[] = [];
+			const md = renderStatus(view({ run: { ...running, goal }, lastRun: { ...settled, goal } }), NOW, "user", info);
+			for (const entry of info) expect(entry.index).toBeLessThan(lines(md).length);
+		});
+
+		test("a record without a goal, and the model's report, show no goal line", () => {
+			const plain = view({ run: running, lastRun: settled });
+			expect(lines(renderStatus(plain, NOW)).some(line => line.includes("$7.25") || line.includes("$8.50"))).toBe(false);
+			const carried = view({ run: { ...running, goal }, lastRun: { ...settled, goal } });
+			expect(renderStatus(carried, NOW, "model")).toBe(renderStatus(plain, NOW, "model"));
+		});
+	});
+
 	test("quota and usage sections exist only when they were read", () => {
 		const bare = renderStatus(view(), NOW);
 		const read = renderStatus(view({ quota: [{ provider: "prov-q", state: "limited", usedFraction: 0.42, resetsAt: null }], dataAsOf: NOW - 3_600_000 }), NOW);
