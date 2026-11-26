@@ -91,7 +91,3 @@ OMP 터미널의 실행 중 입력창에서 바로 요청할 수 있습니다.
 | `/storm <요청>` | 자동 위임과 관계없이 명시적으로 요청 보내기 |
 
 [자세한 사용법·문제 해결](docs/usage.md) · [설계·개발](docs/design.md) · [변경 기록](CHANGELOG.md)
-
----
-
-<sub>OMP Storm은 [OMP](https://github.com/can1357/oh-my-pi) 위에서 돌아갑니다. 배너의 모델 로고는 [Lobe Icons](https://github.com/lobehub/lobe-icons)(MIT)에서 가져왔으며, 각 로고의 권리는 해당 회사에 있고 Storm이 그 모델로 검증되었거나 보증받았다는 뜻이 아닙니다. 라이선스는 [MIT](LICENSE)입니다.</sub>
