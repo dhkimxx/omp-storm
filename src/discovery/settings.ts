@@ -8,6 +8,18 @@ import type { Exec, ExplicitSettings } from "../types.ts";
 
 type Rec = Record<string, unknown>;
 
+/**
+ * Two internal modules of the host that only the motion switch needs (`tui.motion`'s presets and the settings
+ * registry). They are imported dynamically so a later omp that moves one costs the lane view its motion setting (motion
+ * stays on, omp's default) and not the whole extension its load. Everything else in this file is static: a failure there
+ * would degrade Storm's core, which a quiet fallback should not hide.
+ */
+type MotionPresets = typeof import("@oh-my-pi/pi-coding-agent/config/motion-presets");
+type Registry = typeof import("@oh-my-pi/pi-coding-agent/config/registry");
+const presets: MotionPresets | undefined = await import("@oh-my-pi/pi-coding-agent/config/motion-presets").catch(() => undefined);
+const registry: Registry | undefined = await import("@oh-my-pi/pi-coding-agent/config/registry").catch(() => undefined);
+const lookup = (id: string): ReturnType<Registry["lookup"]> | undefined => registry?.lookup(id);
+
 function isRec(value: unknown): value is Rec {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -108,4 +120,50 @@ export async function readExplicitSettings(exec: Exec, ompBin: string): Promise<
 	} catch {
 		return { modelRoles: {} };
 	}
+}
+
+/** The settings instance the current extension scope sees (the active session's), or undefined in a bare host. */
+export function scopedSettings(): Settings | undefined {
+	try {
+		return findScopedSettings();
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether omp's decorative motion may run: `tui.motion` is `full` and `display.shimmer` is not `disabled`. This is the
+ * switch Storm's animated pictures (the lane view, the radar) obey, the same one omp's own shimmer obeys. A settings
+ * instance that cannot be read means motion on: omp's default, never a Storm-invented "off".
+ */
+export function motionEffectsEnabled(settings: Settings | undefined): boolean {
+	if (settings === undefined) return true;
+	try {
+		const mode = lookup("tui.motion")?.get(settings);
+		const preset = typeof mode === "string" ? presets?.MOTION_PRESETS[mode as keyof MotionPresets["MOTION_PRESETS"]] : undefined;
+		if (preset !== undefined && !preset.effects) return false;
+		return lookup("display.shimmer")?.get(settings) !== "disabled";
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * Calls `onChange` after `tui.motion` or `display.shimmer` changed in `settings` (omp coalesces a burst into one call per
+ * microtask). Returns the unsubscribe; a no-op when there is no instance or the settings do not exist in this host.
+ */
+export function onMotionChange(settings: Settings | undefined, onChange: () => void): () => void {
+	if (settings === undefined) return () => {};
+	const stops: Array<() => void> = [];
+	try {
+		for (const id of ["tui.motion", "display.shimmer"]) {
+			const setting = lookup(id);
+			if (setting !== undefined) stops.push(setting.listen(settings, onChange));
+		}
+	} catch {
+		// A host without the setting keeps the widget's current pace; nothing to follow.
+	}
+	return () => {
+		for (const stop of stops.splice(0)) stop();
+	};
 }

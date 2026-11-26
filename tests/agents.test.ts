@@ -1,7 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
-import { stripTerminalSequences, visibleWidth } from "@oh-my-pi/pi-tui";
-import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
 import { agentRows, duration, renderAgentReport, renderAgentRows, tokens } from "../src/report/agents.ts";
 import { roleTitle } from "../src/roles.ts";
 import { bindLedgerChild, resetLedger, startLedgerRun } from "../src/runtime/ledger.ts";
@@ -23,11 +21,10 @@ import {
 	resetAgents,
 } from "../src/runtime/agents.ts";
 import type { AgentEntry, InfoLine } from "../src/types.ts";
-import { RichFrame } from "../src/view/info.ts";
+import { visibleWidth } from "../src/tui/kit.ts";
+import { infoFrame } from "../src/ui/info-node.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
-
-// The rich frame draws with omp's theme.
-ensureThemeSync();
+import { mountMessage } from "./tui-host.ts";
 
 const T0 = Date.parse("2026-11-20T09:00:00Z");
 const MIN = 60_000;
@@ -337,10 +334,13 @@ describe("renderAgentReport", () => {
 		);
 		expect(renderAgentRows(rows, NOW).split("\n").some(line => visibleWidth(line) > 60)).toBe(true);
 		const { md, info } = report(rows);
-		const frame = new RichFrame("서브에이전트", md, info).render(60);
+		const view = mountMessage(() => infoFrame("서브에이전트", md, info), { customType: "storm-report", content: md }, { columns: 60, rows: 60, theme: "plain" });
+		const frame = view.screen();
+		view.dispose();
+		expect(frame.length).toBeGreaterThan(0);
 		expect(frame.every(row => visibleWidth(row) <= 60)).toBe(true);
 		// Read the content back across wrapped rows: no frame border, no padding, no break position assumed.
-		const flat = frame.map(row => stripTerminalSequences(row)).join("").replace(/[\s\u2500-\u257f]/g, "");
+		const flat = frame.join("").replace(/[\s\u2500-\u257f]/g, "");
 		for (const shown of [
 			"0-Implementer-with-a-rather-long-generated-handle",
 			"openrouter/anthropic/claude-sonnet-5-5-preview",

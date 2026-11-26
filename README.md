@@ -4,6 +4,8 @@
 
 ## 빠른 시작
 
+OMP 19.2 이상이 필요합니다. 19.0·19.1에서는 0.24.0을 쓰세요(`release/omp-19.0`). 0.25 이상을 더 오래된 OMP에 설치하면 `/storm`이 이 안내만 보여 줍니다.
+
 ```sh
 omp plugin install github:dhkimxx/omp-storm
 ```

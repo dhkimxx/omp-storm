@@ -1,13 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { type Component, stripTerminalSequences, theme, visibleWidth } from "@oh-my-pi/pi-tui";
-import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
-import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-tui/html-form/parse";
-import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
-import { ModelPickerComponent } from "@oh-my-pi/pi-tui/overlays/model-picker";
-import { ensureThemeSync, getSymbolPresetOverride, setSymbolPreset } from "@oh-my-pi/pi-tui/theme/theme";
+import type { ExtensionAPI, ExtensionContext, ExtensionUiFactory } from "@oh-my-pi/pi-coding-agent";
+import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
+import { defaultFormData } from "@oh-my-pi/pi-coding-agent/tools/html-form/data";
+import { type HtmlForm, parseHtmlForm } from "@oh-my-pi/pi-coding-agent/tools/html-form/parse";
+import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation } from "../src/approval/auto.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { configPath, serializeConfig } from "../src/config/store.ts";
@@ -15,17 +14,19 @@ import { approveAndSave, type FlowEnv, hubFlow, resetFlow, setupFlow } from "../
 import { APPROVE } from "../src/proposals/present.ts";
 import { ROLES } from "../src/roles.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
-import { RichFrame } from "../src/view/info.ts";
 import { FIELD } from "../src/setup/form.ts";
 import { loadProjectState } from "../src/state.ts";
+import { FULL_VIEW } from "../src/ui/common.ts";
+import { offeredRowLabels } from "../src/ui/rows-select.ts";
+import { forceWindowing, windowingAvailable } from "../src/ui/window.ts";
 import type { InfoLine, UiContext, UiPort } from "../src/types.ts";
-import { createUiPort, registerReportRenderer } from "../src/ui.ts";
+import { createUiPort } from "../src/ui.ts";
 import { renderCloseout } from "../src/view/closeout.ts";
 import { renderStatus } from "../src/view/render.ts";
+import { LiveStatus, liveWidgetRows } from "../src/view/live.ts";
+import { runRecord } from "./fixtures.ts";
 import { makeProject, TEAM, type TestProject } from "./support.ts";
-
-// Storm's frames are omp components; they draw with omp's theme.
-ensureThemeSync();
+import { mountOverlay, mountWidget, type OverlayView, type TuiView } from "./tui-host.ts";
 
 const PICK_BY_ROLE = "역할별로 고르기";
 
@@ -37,77 +38,25 @@ interface FormAnswer {
 interface FakeHost {
 	pi: ExtensionAPI;
 	ctx: ExtensionContext;
-	/** Options of every selector omp was asked to open, with the panel rows above it at that moment. */
-	selects: Array<{ options: string[]; panel: readonly string[] | undefined; panelNative: NativeNode | null | undefined }>;
+	/** Options of every selector omp was asked to open, with the text of the panel above it at that moment. */
+	selects: Array<{ options: string[]; panel: string | undefined }>;
 	/** omp's own notifications. */
 	notified: string[];
 	/** Messages put in the transcript. */
 	sent: Array<{ message: { content?: unknown; display?: boolean; excludeFromContext?: boolean }; options: { triggerTurn?: boolean } | undefined }>;
-	/** Overlays opened (each is closed at once). */
+	/** Overlays opened (each is driven by `driveOverlay`, or closed with Esc). */
 	overlays: number;
+	/** What each overlay drew first. */
+	opened: string[];
 	/** Whether a panel widget is still set. */
 	panelSet(): boolean;
 }
 
-/** The describe inputs our components read; the terminal-specific fields are inert here. */
-function describeContext(cols: number) {
-	return { cols, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
-}
-
-/** Visit visible native nodes, following component children through their own describe. */
-function walkNative(node: NativeNode, visit: (node: NativeNode) => void): void {
-	if (node.p?.hidden) return;
-	visit(node);
-	for (const child of node.c ?? []) {
-		if ("k" in child) walkNative(child, visit);
-		else {
-			const described = child.describe?.(describeContext(80));
-			if (described) walkNative(described, visit);
-		}
-	}
-}
-
-function nativeSpans(root: NativeNode | null | undefined): Array<{ t: string; s: string | undefined }> {
-	const out: Array<{ t: string; s: string | undefined }> = [];
-	if (!root) return out;
-	walkNative(root, node => {
-		if (node.k === "text") for (const run of node.p?.spans ?? []) out.push({ t: run.t, s: run.s });
-	});
-	return out;
-}
-
-function nativeTexts(root: NativeNode | null | undefined): string[] {
-	const out: string[] = [];
-	if (!root) return out;
-	walkNative(root, node => {
-		if (node.k === "text" && node.p?.text !== undefined) out.push(node.p.text);
-		if (node.k === "md" && node.p?.text !== undefined) out.push(node.p.text);
-	});
-	for (const run of nativeSpans(root)) out.push(run.t);
-	return out;
-}
-
-function nativeMds(root: NativeNode | null | undefined): string[] {
-	const out: string[] = [];
-	if (!root) return out;
-	walkNative(root, node => {
-		if (node.k === "md" && node.p?.text !== undefined) out.push(node.p.text);
-	});
-	return out;
-}
-
-function nativeProgress(root: NativeNode | null | undefined): Array<{ value: number | null; tone: string | undefined }> {
-	const out: Array<{ value: number | null; tone: string | undefined }> = [];
-	if (!root) return out;
-	walkNative(root, node => {
-		if (node.k === "progress") out.push({ value: node.p?.value ?? null, tone: node.p?.tone });
-	});
-	return out;
-}
-
 /**
- * The parts of omp's extension API and context `createUiPort` touches. `answers` are given to selectors in order; a
- * function gets the offered options. `formDialog: undefined` is a host without a form surface.
+ * The parts of omp's extension API and context `createUiPort` touches, with the host's real drawing: a widget set with
+ * `setWidget` and an overlay opened with `custom` are mounted on pi-tui's test terminal at `rows` x `columns`. `answers`
+ * are given to selectors in order; a function gets the offered options. `formDialog: undefined` is a host without a form
+ * surface.
  */
 function fakeHost(opts: {
 	mode: ExtensionContext["mode"];
@@ -116,17 +65,21 @@ function fakeHost(opts: {
 	columns?: number;
 	answers?: Array<string | undefined | ((options: string[]) => string | undefined)>;
 	formDialog?: (html: string) => Promise<FormAnswer | undefined>;
-	models?: Array<Record<string, unknown>>;
-	driveOverlay?: (view: Component, rows: readonly string[]) => void;
+	theme?: Theme;
+	native?: boolean;
+	/** Drives an opened overlay; without it Esc closes it. */
+	driveOverlay?: (view: OverlayView<never>) => void | Promise<void>;
 }): FakeHost {
 	const answers = [...(opts.answers ?? [])];
-	const tui = { terminal: { rows: opts.rows ?? 50, columns: opts.columns ?? 100 }, requestRender() {} };
-	let widget: Component | undefined;
+	const size = { columns: opts.columns ?? 100, rows: opts.rows ?? 50 };
+	const mount = { ...size, ...(opts.theme === undefined ? {} : { theme: opts.theme }), ...(opts.native === undefined ? {} : { native: opts.native }) };
+	let widget: TuiView | undefined;
 	const host: FakeHost = {
 		selects: [],
 		notified: [],
 		sent: [],
 		overlays: 0,
+		opened: [],
 		panelSet: () => widget !== undefined,
 		pi: {
 			sendMessage(message: FakeHost["sent"][number]["message"], options?: { triggerTurn?: boolean }) {
@@ -136,15 +89,9 @@ function fakeHost(opts: {
 		ctx: {
 			mode: opts.mode,
 			hasUI: opts.hasUI,
-			modelRegistry: {
-				getError: () => undefined,
-				getAvailable: (kind: string) => opts.models?.filter(model => model.kind === kind) ?? [],
-			},
 			ui: {
 				async select(_title: string, options: string[]) {
-					const panel = widget?.render(tui.terminal.columns);
-					const panelNative = widget?.describe?.(describeContext(tui.terminal.columns));
-					host.selects.push({ options: [...options], panel, panelNative });
+					host.selects.push({ options: [...options], panel: widget?.text() });
 					if (!answers.length) throw new Error("no scripted answer");
 					const answer = answers.shift();
 					return typeof answer === "function" ? answer(options) : answer;
@@ -152,17 +99,19 @@ function fakeHost(opts: {
 				notify(message: string) {
 					host.notified.push(message);
 				},
-				setWidget(_key: string, factory: ((t: typeof tui) => Component) | undefined) {
-					widget = factory?.(tui);
+				setWidget(_key: string, content: ExtensionUiFactory | undefined) {
+					widget?.dispose();
+					widget = content === undefined ? undefined : mountWidget(content, mount);
 				},
-				async custom<T>(factory: (t: typeof tui, theme: unknown, keys: unknown, done: (result: T) => void) => Component): Promise<T> {
+				async custom<T>(factory: never): Promise<T> {
 					host.overlays++;
-					const { promise, resolve } = Promise.withResolvers<T>();
-					const view = factory(tui, undefined, undefined, resolve);
-					const rows = view.render(tui.terminal.columns);
-					if (opts.driveOverlay) opts.driveOverlay(view, rows);
-					else view.handleInput?.("q");
-					return promise;
+					const view = await mountOverlay<T>(factory, mount);
+					host.opened.push(view.text());
+					if (opts.driveOverlay) await opts.driveOverlay(view as unknown as OverlayView<never>);
+					else view.press("escape");
+					const result = await view.result;
+					view.dispose();
+					return result;
 				},
 				...(opts.formDialog ? { formDialog: opts.formDialog } : {}),
 			},
@@ -173,6 +122,9 @@ function fakeHost(opts: {
 
 const CONTEXT = { title: "title", markdown: "one\n\ntwo" };
 const TALL = { title: "title", markdown: Array.from({ length: 80 }, (_, i) => `- line-${i}`).join("\n") };
+
+/** Lets a painter's deferred report reach the view that reads it. */
+const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
 
 describe("form surface per host", () => {
 	const answer = async (): Promise<FormAnswer> => ({ data: { a: 1 } });
@@ -199,415 +151,93 @@ describe("form surface per host", () => {
 });
 
 describe("TUI", () => {
-	/** A catalog row as omp hands it to the registry: real ladders so the native thinking slider is live. */
-	const chatModel = (provider: string, id: string, efforts: readonly string[]) => ({
-		provider,
-		id,
-		name: `${id} display`,
-		kind: "chat",
-		reasoning: efforts.length > 0,
-		input: ["text"],
-		contextWindow: 200_000,
-		...(efforts.length > 0 ? { thinking: { efforts, defaultLevel: efforts[0] } } : {}),
-		supportsTools: true,
-		cost: { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 },
-		identity: { class: id.split("-")[0] },
-		int: 50,
-		tps: 70,
-	});
-	const INSIDE = chatModel("example", "inside", ["low", "medium", "high"]);
-	const OUTSIDE = chatModel("example", "outside", ["minimal", "low", "high"]);
-	const XHIGH = chatModel("example", "wide", ["low", "medium", "high", "xhigh"]);
-	const FROZEN = chatModel("example", "frozen", []);
-	const WILD = chatModel("example", "wild", ["low", "turbo"]);
-
-	test("the native picker exposes available chat models without switching the host session", async () => {
-		for (const key of ["\r", "\x1b"]) {
-			const host = fakeHost({
-				mode: "tui",
-				hasUI: true,
-				models: [OUTSIDE, { ...OUTSIDE, id: "no-tools", name: "No tools", supportsTools: false }],
-				driveOverlay(view, rows) {
-					expect(view).toBeInstanceOf(ModelPickerComponent);
-					const rendered = rows.join("\n");
-					expect(rendered).toContain("탐색 · 주 모델");
-					expect(rendered).toContain(OUTSIDE.name);
-					expect(rendered).not.toContain("No tools");
-					view.handleInput?.(key);
-				},
-			});
-			const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델");
-			if (key === "\r") {
-				expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside", efforts: ["minimal", "low", "high"] }) });
-				expect(result).not.toHaveProperty("effort");
-			} else {
-				expect(result).toBeUndefined();
-			}
-			expect(host.overlays).toBe(1);
-			expect(host.selects).toEqual([]);
-			expect(host.sent).toEqual([]);
-		}
-	});
-
-	test("opens on the slot's effort first and updates it in place at 60 columns", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			columns: 60,
-			models: [XHIGH, OUTSIDE, FROZEN],
-			driveOverlay(view, rows) {
-				const status = stripTerminalSequences(rows[1] ?? "");
-				expect(status).toContain("thinking XHigh · 이 역할에만 · 세션 유지 · Auto=기본값");
-				const footer = stripTerminalSequences(rows.at(-2) ?? "");
-				expect(footer).toContain("effort");
-				expect(footer).toContain("공급자");
-				expect(footer).toContain("취소");
-				for (const line of rows) expect(visibleWidth(line)).toBeLessThanOrEqual(60);
-				// XHigh → High: the selected level is what changes first in the status row.
-				view.handleInput?.("\x1b[D");
-				expect(stripTerminalSequences(view.render(60)[1] ?? "")).toContain("thinking High · 이 역할에만 · 세션 유지 · Auto=기본값");
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/wide", effort: "xhigh" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/wide" }), effort: "xhigh" });
-		expect(host.overlays).toBe(1);
-		expect(host.selects).toEqual([]);
-	});
-
-	test("the native sheet seeds the slot model and level, and keeps a refusal on screen", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, OUTSIDE],
-			driveOverlay(view) {
-				const opened = view.describe?.(describeContext(100));
-				expect(opened?.k).toBe("picker");
-				if (opened?.k !== "picker") return;
-				expect(opened.p?.title).toBe("Storm 모델 선택 · 탐색 · 주 모델");
-				expect(opened.p?.subtitle).toContain("Auto=기본값");
-				expect(opened.p?.level?.value).toBe("high");
-				expect(opened.p?.level?.steps.map(step => step.id)).toEqual(["auto", "off", "low", "medium", "high"]);
-
-				// High → Medium → Low → Off: the native sheet stays open with the reason and the alternatives.
-				for (let step = 0; step < 3; step++) view.handleInput?.("\x1b[D");
-				const offSheet = view.describe?.(describeContext(100));
-				expect(offSheet?.k === "picker" ? offSheet.p?.level?.value : undefined).toBe("off");
-				view.handleInput?.("\r");
-				const refused = view.describe?.(describeContext(100));
-				expect(refused?.k === "picker" ? refused.p?.subtitle : undefined).toContain("Off는 Storm effort가 아닙니다");
-				expect(refused?.k === "picker" ? refused.p?.subtitle : undefined).toContain("지원: low, medium, high");
-				expect(refused?.k === "picker" ? refused.p?.level?.value : undefined).toBe("off");
-
-				// The same sheet closes on a supported step.
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "low" });
-
-		// Without picker support the card fallback still says what the keys do and what Auto means.
-		const cardHost = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE],
-			driveOverlay(view) {
-				const cx = { ...describeContext(100), supports: () => false };
-				const card = view.describe?.(cx);
-				expect(card?.k).toBe("card");
-				expect(nativeTexts(card).join("\n")).not.toContain("\u001b");
-				const shown = stripTerminalSequences(nativeTexts(card).join("\n"));
-				expect(shown).toContain("thinking High");
-				expect(shown).toContain("Auto=기본값");
-				expect(shown).toContain("effort");
-				// The card has no level widget, so its status must follow the slider after a step.
-				view.handleInput?.("\x1b[D");
-				const stepped = view.describe?.(cx);
-				expect(stripTerminalSequences(nativeTexts(stepped).join("\n"))).toContain("thinking Med");
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-			},
-		});
-		expect(await createUiPort(cardHost.pi, cardHost.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toMatchObject({
-			effort: "high",
-		});
-	});
-
-	test("a native close action cancels without a pick", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE],
-			driveOverlay(view) {
-				view.handleNativeEvent?.({ type: "action", key: "", act: "close", mods: [] });
-			},
-		});
-		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
-		expect(host.sent).toEqual([]);
-	});
-
-	test("same model plus untouched keeps its valid effort, or stays bare when it has none", async () => {
-		const keep = async (current: { selector: string; effort?: "high" | "max" }) => {
-			const host = fakeHost({
-				mode: "tui",
-				hasUI: true,
-				models: [INSIDE, OUTSIDE],
-				driveOverlay(view, rows) {
-					expect(stripTerminalSequences(rows.join("\n"))).toContain(current.effort === "high" ? "thinking High" : "thinking Auto");
-					view.handleInput?.("\r");
-				},
-			});
-			return { host, result: await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", current) };
-		};
-		const withEffort = await keep({ selector: "example/inside", effort: "high" });
-		expect(withEffort.result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "high" });
-		const bare = await keep({ selector: "example/inside" });
-		expect(bare.result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }) });
-		expect(bare.result).not.toHaveProperty("effort");
-		// An effort the slot's model no longer supports is not carried silently; the model default shows instead.
-		const stale = await keep({ selector: "example/inside", effort: "max" });
-		expect(stale.result).not.toHaveProperty("effort");
-	});
-
-	test("cancelling after moving the slider applies nothing and leaves no session artifact", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, OUTSIDE],
-			driveOverlay(view) {
-				// High → Medium, then Esc: the pending effort is not a pick and no onKeepThinking path exists.
-				view.handleInput?.("\x1b[D");
-				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("thinking Med");
-				view.handleInput?.("\x1b");
-			},
-		});
-		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
-		expect(host.overlays).toBe(1);
-		expect(host.selects).toEqual([]);
-		expect(host.sent).toEqual([]);
-	});
-
-	test("steps a supported effort on the same model and picks model plus effort in one overlay", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, OUTSIDE],
-			driveOverlay(view, rows) {
-				// High → Medium on the current slot's own ladder.
-				view.handleInput?.("\x1b[D");
-				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("thinking Med");
-				expect(rows.length).toBeGreaterThan(0);
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }), effort: "medium" });
-		expect(host.overlays).toBe(1);
-		expect(host.selects).toEqual([]);
-	});
-
-	test("a fresh pick follows Auto → Off (refused) → Low → High without leaving the overlay", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE],
-			driveOverlay(view, rows) {
-				const status = () => stripTerminalSequences(view.render(100)[1] ?? "");
-				expect(stripTerminalSequences(rows[1] ?? "")).toContain("thinking Auto");
-				view.handleInput?.("\x1b[C");
-				expect(status()).toContain("thinking Off");
-				view.handleInput?.("\r");
-				expect(status()).toContain("Off는 Storm effort가 아닙니다");
-				view.handleInput?.("\x1b[C");
-				expect(status()).toContain("thinking Low");
-				view.handleInput?.("\x1b[C");
-				expect(status()).toContain("thinking Med");
-				view.handleInput?.("\x1b[C");
-				expect(status()).toContain("thinking High");
-				view.handleInput?.("\r");
-			},
-		});
-		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델")).toMatchObject({
-			effort: "high",
-		});
-	});
-
-	test("an untouched new model starts at its own default instead of the slot's effort", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, OUTSIDE],
-			driveOverlay(view) {
-				view.handleInput?.("outside");
-				const shown = stripTerminalSequences(view.render(100).join("\n"));
-				expect(shown).toContain("outside display");
-				expect(shown).toContain("thinking Auto");
-				expect(shown).not.toContain("thinking High");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside" }) });
-		expect(result).not.toHaveProperty("effort");
-	});
-
-	test("a carried slider step lands on the new model's exact supported effort, not the slot's", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, OUTSIDE],
-			driveOverlay(view) {
-				// High → Medium on the slot's ladder, then a model whose ladder has no medium.
-				view.handleInput?.("\x1b[D");
-				view.handleInput?.("outside");
-				const shown = stripTerminalSequences(view.render(100).join("\n"));
-				expect(shown).toContain("thinking Low");
-				expect(shown).not.toContain("thinking Med");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/outside" }), effort: "low" });
-	});
-
-	test("Auto means the model default, explained on screen and stored as a bare pick", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE],
-			driveOverlay(view) {
-				// High → Medium → Low → Off → Auto.
-				for (let step = 0; step < 4; step++) view.handleInput?.("\x1b[D");
-				const shown = stripTerminalSequences(view.render(100).join("\n"));
-				expect(shown).toContain("thinking Auto");
-				expect(shown).toContain("Auto=기본값");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/inside" }) });
-		expect(result).not.toHaveProperty("effort");
-	});
-
-	test("Off and an unknown ladder entry keep the picker open with the supported efforts listed", async () => {
-		const off = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE],
-			driveOverlay(view) {
-				// High → Medium → Low → Off; Off is not a Storm effort.
-				for (let step = 0; step < 3; step++) view.handleInput?.("\x1b[D");
-				view.handleInput?.("\r");
-				const refused = stripTerminalSequences(view.render(100).join("\n"));
-				expect(refused).toContain("Off는 Storm effort가 아닙니다");
-				expect(refused).toContain("지원: low, medium, high");
-				// Off → Low, then pick the supported effort.
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-			},
-		});
-		expect(await createUiPort(off.pi, off.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toMatchObject({
-			effort: "low",
-		});
-
-		const unknown = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [WILD],
-			driveOverlay(view) {
-				// Low → Turbo: the catalog declares it, Storm has no such effort.
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-				const refused = stripTerminalSequences(view.render(100).join("\n"));
-				expect(refused).toContain("turbo는 이 모델에서 지원되지 않습니다");
-				expect(refused).toContain("지원: low");
-				view.handleInput?.("\x1b[D");
-				view.handleInput?.("\r");
-			},
-		});
-		expect(await createUiPort(unknown.pi, unknown.ctx).pickModel!("탐색 · 주 모델", { selector: "example/wild", effort: "low" })).toMatchObject({
-			effort: "low",
-		});
-	});
-
-	test("a model with no effort control picks bare and keeps the frozen reason visible", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			models: [INSIDE, FROZEN],
-			driveOverlay(view) {
-				view.handleInput?.("frozen");
-				const shown = stripTerminalSequences(view.render(100).join("\n"));
-				expect(shown).toContain("frozen display");
-				expect(shown).toContain("no thinking");
-				view.handleInput?.("\x1b[C");
-				view.handleInput?.("\r");
-			},
-		});
-		const result = await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" });
-		expect(result).toMatchObject({ model: expect.objectContaining({ selector: "example/frozen", efforts: [] }) });
-		expect(result).not.toHaveProperty("effort");
-	});
-
-	test("an empty catalog still draws and Esc cancels without a pick", async () => {
-		const host = fakeHost({
-			mode: "tui",
-			hasUI: true,
-			columns: 60,
-			models: [],
-			driveOverlay(view, rows) {
-				expect(stripTerminalSequences(rows.join("\n"))).toContain("No models available");
-				view.handleInput?.("\x1b");
-			},
-		});
-		expect(await createUiPort(host.pi, host.ctx).pickModel!("탐색 · 주 모델", { selector: "example/inside", effort: "high" })).toBeUndefined();
-		expect(host.sent).toEqual([]);
-	});
-
 	test("a choice's context is a panel above the selector that leaves nothing behind", async () => {
 		const host = fakeHost({ mode: "tui", hasUI: true, answers: ["b"] });
 		const ui = createUiPort(host.pi, host.ctx);
 		expect(await ui.select("pick", ["a", "b"], CONTEXT)).toBe("b");
 		expect(host.selects).toHaveLength(1);
 		expect(host.selects[0]?.options).toEqual(["a", "b"]);
-		expect(host.selects[0]?.panel?.join("\n")).toContain("two");
+		expect(host.selects[0]?.panel).toContain("two");
 		expect(host.panelSet()).toBe(false);
 		expect(host.sent).toEqual([]);
 	});
 
+	test("the terminal looks load: a host whose paint module moved would fall back to the transcript", () => {
+		expect(windowingAvailable()).toBe(true);
+	});
+
 	test("a long report's scrollbar stays in one column as the thumb moves", async () => {
 		const lines = Array.from({ length: 50 }, (_, i) => `- 기록 ${i}: ${"비용 ".repeat(i % 6)}`);
-		const thumb = theme.bold(theme.fg("accent", "|"));
-		const track = theme.fg("dim", "|");
 		const host = fakeHost({
 			mode: "tui",
 			hasUI: true,
 			rows: 24,
-			driveOverlay(view, top) {
-				view.handleInput?.("\x1b[F"); // End
-				const bottom = view.render(100);
-				for (const frame of [top, bottom]) {
-					const rail = frame.slice(0, -1);
-					expect(rail.every(row => stripTerminalSequences(row).endsWith("|") && visibleWidth(row) === 100)).toBe(true);
-					expect(rail.some(row => row.endsWith(thumb))).toBe(true);
-					expect(rail.some(row => row.endsWith(track))).toBe(true);
-				}
-				expect(top.findIndex(row => row.endsWith(thumb))).toBe(0);
-				expect(bottom.findIndex(row => row.endsWith(thumb))).toBeGreaterThan(0);
-				expect(stripTerminalSequences(bottom.join("\n"))).toContain("기록 49");
-				view.handleInput?.("q");
+			columns: 100,
+			async driveOverlay(view) {
+				const body = (): string[] => view.screen().filter(row => row.length > 0);
+				const bar = (rows: string[]): string[] => rows.slice(0, -1).map(row => [...row].at(-1)!);
+				const top = body();
+				// Body rows share one bar column: a thumb and a track, never a shifted frame.
+				expect(top.length).toBeLessThanOrEqual(Math.floor(24 * 0.85));
+				expect(bar(top).every(glyph => glyph === "┃" || glyph === "│")).toBe(true);
+				expect(bar(top).includes("┃")).toBe(true);
+				expect(bar(top).includes("│")).toBe(true);
+				expect(bar(top).indexOf("┃")).toBe(0);
+				view.press("end");
+				const bottom = body();
+				expect(bar(bottom).every(glyph => glyph === "┃" || glyph === "│")).toBe(true);
+				expect(bar(bottom).indexOf("┃")).toBeGreaterThan(0);
+				expect(bottom.join("\n")).toContain("기록 49");
+				expect(top.join("\n")).not.toContain("기록 49");
+				view.press("q");
 			},
 		});
-		await createUiPort(host.pi, host.ctx).report("스크롤 검증", lines.join("\n"), [
-			{ index: 0, spans: [{ text: "• 기록 0", tone: "accent" }] },
-		]);
+		await createUiPort(host.pi, host.ctx).report("스크롤 검증", lines.join("\n"), [{ index: 0, spans: [{ text: "• 기록 0", tone: "accent" }] }]);
 	});
 
-	test("real status tabs show and scroll the selected section in both renderers at 60 columns", async () => {
-		const info: InfoLine[] = [];
-		const markdown = renderStatus(
+	test("paging, lines, Home and End move the window and never past its ends", async () => {
+		const lines = Array.from({ length: 60 }, (_, i) => `- 행 ${String(i).padStart(2, "0")}`);
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 20,
+			columns: 80,
+			async driveOverlay(view) {
+				// The first content row shown: the frame's top edge counts as row 0 until it scrolls away.
+				const first = (): number => Number(/행 (\d\d)/.exec(view.text())![1]) + (view.text().startsWith("╭") ? -1 : 0) + 1;
+				const page = Math.floor(20 * 0.85) - 1 - 1; // the viewport minus the hint row, minus one row of overlap
+				const before = first();
+				view.press("down");
+				expect(first()).toBe(before + 1);
+				view.press("up");
+				expect(first()).toBe(before);
+				view.press("up");
+				expect(first()).toBe(before);
+				view.press("shift+down");
+				expect(first()).toBe(before + 5);
+				view.press("pageDown");
+				expect(first()).toBe(before + 5 + page);
+				view.press("pageUp");
+				expect(first()).toBe(before + 5);
+				view.press("end");
+				expect(view.text()).toContain("행 59");
+				const last = first();
+				view.press("pageDown");
+				expect(first()).toBe(last);
+				// Page up from the very end moves by one page, however far End asked for.
+				view.press("pageUp");
+				expect(first()).toBe(last - page);
+				view.press("home");
+				expect(view.text()).toContain("행 00");
+				view.press("enter");
+			},
+		});
+		await createUiPort(host.pi, host.ctx).report("긴 보고서", lines.join("\n"));
+		expect(host.overlays).toBe(1);
+	});
+
+	const statusMarkdown = (info: InfoLine[]): string =>
+		renderStatus(
 			{
 				config: { status: "ok", config: TEAM, path: "/repo/.omp/storm/config.json", hash: configHash(TEAM), warnings: [] },
 				approval: undefined,
@@ -619,89 +249,63 @@ describe("TUI", () => {
 			"user",
 			info,
 		);
-		// The centered overlay occupies 90% of the terminal's 60 columns.
-		const width = 54;
-		const cx = describeContext(width);
+
+	test("real status tabs show and scroll the selected section at 60 columns", async () => {
+		const info: InfoLine[] = [];
+		const markdown = statusMarkdown(info);
+		const labels = [
+			{ id: "overview", label: "1 개요" },
+			{ id: "team", label: "2 팀" },
+			{ id: "runtime", label: "3 런타임" },
+			{ id: "storage", label: "4 저장 공간" },
+		] as const;
 		const host = fakeHost({
 			mode: "tui",
 			hasUI: true,
 			rows: 24,
-			columns: width,
-			driveOverlay(view, top) {
-				const labels = [
-					{ id: "overview", label: "1 개요", icon: "status.info" },
-					{ id: "team", label: "2 팀", icon: "status.enabled" },
-					{ id: "runtime", label: "3 런타임", icon: "status.running" },
-					{ id: "storage", label: "4 저장 공간", icon: "context.content" },
-				] as const;
-				const tabLabel = (id: string): string => {
-					const tab = labels.find(tab => tab.id === id)!;
-					return `${theme.symbol(tab.icon)}${tab.label}`;
+			columns: 60,
+			async driveOverlay(view) {
+				const screen = (): string[] => view.screen().filter(row => row.length > 0);
+				const fits = (): void => {
+					const rows = screen();
+					expect(rows.length).toBeLessThanOrEqual(Math.floor(24 * 0.85));
+					expect(rows.every(row => Bun.stringWidth(row) <= 60)).toBe(true);
 				};
-				const tabRow = stripTerminalSequences(top[0]!);
-				for (const tab of labels) expect(tabRow).toContain(tabLabel(tab.id));
-				expect(stripTerminalSequences(top.at(-1)!)).toContain("←→·Tab");
-				const selected = (id: string, shown: string, absent: string) => {
-					const rows = view.render(width);
-					expect(rows.length).toBeLessThanOrEqual(20);
-					expect(rows.every(row => visibleWidth(row) <= width)).toBe(true);
-					expect(rows[0]).toContain(theme.bold(theme.bg("selectedBg", theme.fg("text", ` ${tabLabel(id)} `))));
-					for (const tab of labels) {
-						if (tab.id !== id) expect(rows[0]).toContain(theme.fg("muted", ` ${tabLabel(tab.id)} `));
-					}
-					const ansi = stripTerminalSequences(rows.join("\n"));
-					const tree = view.describe?.(cx);
-					expect(tree?.c?.[0]).toMatchObject({ k: "tabs", p: { active: id } });
-					const native = nativeTexts(tree).join("\n");
-					for (const output of [ansi, native]) {
-						expect(output).toContain(shown);
-						expect(output).not.toContain(absent);
-					}
-					return tree;
+				// One strip on the first row with every tab, and the key hint last.
+				for (const tab of labels) expect(screen()[0]).toContain(tab.label);
+				expect(screen().at(-1)).toContain("←→·Tab");
+				const shows = (shown: string, absent: string): void => {
+					fits();
+					expect(view.text()).toContain(shown);
+					expect(view.text()).not.toContain(absent);
 				};
-				const overview = selected("overview", "/storm에서 팀 승인", "팀 설정");
-				expect(top.join("\n")).toContain(theme.fg("accent", theme.bold(STORM_MARK)));
-				expect(top.join("\n")).toContain(theme.fg("warning", theme.bold("- 다음: ")));
-				expect(nativeSpans(overview)).toContainEqual({ t: STORM_MARK, s: "accent strong" });
-				expect(nativeSpans(overview)).toContainEqual({ t: "- 다음: ", s: "warning strong" });
-
-				view.handleInput?.("\x1b[C"); // Right
-				const team = selected("team", "역할별 모델", "status-provider");
-				expect(nativeSpans(team)).toContainEqual({ t: theme.symbol("status.enabled"), s: "accent" });
-				expect(nativeSpans(team)).toContainEqual({ t: "팀 설정", s: "customMessageText strong" });
-				expect(stripTerminalSequences(view.render(width).join("\n"))).toContain(theme.symbol("status.enabled"));
-				view.handleInput?.("\x1b[F"); // End
-				const tail = view.render(width);
-				expect(stripTerminalSequences(tail.join("\n"))).toContain("필수 검사");
-				expect(tail.slice(1, -1).every(row => stripTerminalSequences(row).endsWith("|") && visibleWidth(row) === width)).toBe(true);
-				const teamBody = () => view.describe?.(cx)?.c?.find(child => "k" in child && child.key === "body-team");
-				expect(teamBody()).toMatchObject({ key: "body-team", p: { max: { h: "18lines" } }, scroll: { by: "end", n: 1 } });
-
-				view.handleInput?.("3");
-				const runtime = selected("runtime", "status-provider", "status-store");
-				// These runtime slices straddle Storage in the Markdown but share a single tab.
-				expect(nativeTexts(runtime)).toContain("하드 예산 상한");
-				expect(stripTerminalSequences(view.render(width).join("\n"))).toContain("하드 예산 상한");
-				expect(teamBody()).toMatchObject({ key: "body-team", p: { hidden: true }, scroll: { by: "end", n: 1 } });
-				view.handleInput?.("\t");
-				selected("storage", "status-store", "status-provider");
-				view.handleInput?.("\x1b[Z"); // Shift+Tab
-				selected("runtime", "status-provider", "status-store");
-
-				view.handleInput?.("2");
-				expect(view.render(width)).toEqual(tail);
-				expect(teamBody()).toMatchObject({ key: "body-team", scroll: { by: "end", n: 1 } });
-				view.handleInput?.("\x1b[H"); // Home
-				selected("team", "팀 설정", "status-provider");
-				view.handleInput?.("\x1b[D"); // Left
-				selected("overview", STORM_MARK, "status-provider");
-				view.handleInput?.("4");
-				selected("storage", "status-store", "status-provider");
-				view.handleNativeEvent?.({ type: "select", key: "tabs", item: "team" });
-				selected("team", "팀 설정", "status-provider");
-				view.handleInput?.("1");
-				selected("overview", STORM_MARK, "status-provider");
-				view.handleInput?.("\x1b"); // Esc
+				shows("/storm에서 팀 승인", "팀 설정");
+				expect(view.text()).toContain(STORM_MARK);
+				view.press("right");
+				shows("역할별 모델", "status-provider");
+				view.press("end");
+				expect(view.text()).toContain("필수 검사");
+				fits();
+				view.press("3");
+				// The runtime slices straddle Storage in the Markdown but share one tab.
+				shows("status-provider", "status-store");
+				expect(view.text()).toContain("하드 예산 상한");
+				view.press("tab");
+				shows("status-store", "status-provider");
+				view.press("shift+tab");
+				shows("status-provider", "status-store");
+				// A tab keeps its own place: Team is still at its end.
+				view.press("2");
+				expect(view.text()).toContain("필수 검사");
+				view.press("home");
+				shows("팀 설정", "status-provider");
+				view.press("left");
+				shows(STORM_MARK, "status-provider");
+				view.press("4");
+				shows("status-store", "status-provider");
+				view.press("1");
+				shows(STORM_MARK, "status-provider");
+				view.press("escape");
 			},
 		});
 		// A different title still produces tabs: only the annotations opt a report in.
@@ -709,9 +313,42 @@ describe("TUI", () => {
 		expect(host.sent).toEqual([]);
 	});
 
+	test("a native host gets a capped scroller per tab: max height, a scroll request, the other tabs hidden", async () => {
+		const info: InfoLine[] = [];
+		const markdown = statusMarkdown(info);
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			columns: 60,
+			native: true,
+			async driveOverlay(view) {
+				const [sheet] = view.root.children();
+				const bodies = sheet!.children().filter(node => node.key()?.startsWith("body-"));
+				const body = (id: string) => bodies.find(node => node.key() === `body-${id}`)!;
+				expect(bodies.map(node => node.key())).toEqual(["body-overview", "body-team", "body-runtime", "body-storage"]);
+				expect(body("overview").props().hidden).toBe(false);
+				expect(body("team").props().hidden).toBe(true);
+				expect(body("team").props().max).toEqual({ h: `${Math.floor(24 * 0.85) - 2}lines` });
+				view.press("2");
+				view.press("end");
+				expect(body("team").props().hidden).toBe(false);
+				expect(body("overview").props().hidden).toBe(true);
+				expect(body("team").scroll()).toMatchObject({ by: "end" });
+				// Another tab's scroller keeps the request it had.
+				view.press("3");
+				expect(body("team").scroll()).toMatchObject({ by: "end" });
+				expect(body("runtime").scroll()).toBeUndefined();
+				view.press("escape");
+			},
+		});
+		await createUiPort(host.pi, host.ctx).report("프로젝트 진단", markdown, info);
+	});
+
 	test("the ASCII preset keeps the 60-column tabs icon-led on one row", async () => {
-		const previous = getSymbolPresetOverride();
-		await setSymbolPreset("ascii");
+		const ascii = loadThemeSync("dark", { symbolPreset: "ascii" });
+		const previous = currentTheme();
+		setCurrentTheme(ascii as ReturnType<typeof currentTheme>);
 		try {
 			const info: InfoLine[] = [];
 			const markdown = renderStatus(
@@ -725,35 +362,25 @@ describe("TUI", () => {
 				"user",
 				info,
 			);
-			const width = 54;
-			const cx = describeContext(width);
 			const host = fakeHost({
 				mode: "tui",
 				hasUI: true,
 				rows: 24,
-				columns: width,
-				driveOverlay(view, top) {
-					const tabs = ["[i]1 개요", "[x]2 팀", "[~]3 런타임", "#4 저장 공간"];
-					const row = stripTerminalSequences(top[0]!);
-					for (const label of tabs) expect(row).toContain(label);
-					expect(stripTerminalSequences(top[1]!)).not.toContain("4 저장 공간");
-					expect(visibleWidth(top[0]!)).toBe(width);
-					expect(view.describe?.(cx)?.c?.[0]).toMatchObject({
-						k: "tabs",
-						p: { active: "overview", items: tabs.map(label => ({ label })) },
-					});
-					view.handleInput?.("2");
-					const team = view.describe?.(cx);
-					expect(nativeSpans(team)).toContainEqual({ t: "[x]", s: "accent" });
-					expect(nativeSpans(team)).toContainEqual({ t: "팀 설정", s: "customMessageText strong" });
-					expect(stripTerminalSequences(view.render(width)[0]!)).toContain("[x]2 팀");
-					view.handleInput?.("q");
+				columns: 60,
+				theme: ascii,
+				async driveOverlay(view) {
+					const rows = view.screen().filter(row => row.length > 0);
+					for (const label of ["[i]1 개요", "[x]2 팀", "[~]3 런타임", "#4 저장 공간"]) expect(rows[0]).toContain(label);
+					expect(rows[1]).not.toContain("4 저장 공간");
+					view.press("2");
+					expect(view.screen().filter(row => row.length > 0)[0]).toContain("[x]2 팀");
+					view.press("escape");
 				},
 			});
 			await createUiPort(host.pi, host.ctx).report("Storm 현황", markdown, info);
 			expect(host.sent).toEqual([]);
 		} finally {
-			await setSymbolPreset(previous ?? "unicode");
+			setCurrentTheme(previous);
 		}
 	});
 
@@ -763,13 +390,65 @@ describe("TUI", () => {
 		expect(await ui.select("pick", ["a", "b"], TALL)).toBe("a");
 		expect(host.selects.map(s => s.options.length)).toEqual([3, 3]);
 		expect(host.selects[0]?.options.slice(0, 2)).toEqual(["a", "b"]);
+		expect(host.selects[0]?.options.at(-1)).toBe(FULL_VIEW);
 		expect(host.overlays).toBe(1);
-		// The cut panel fits the rows the selector leaves and shows the head, not the tail.
+		// The cut panel fits the rows the selector leaves, shows the head, not the tail, and says what is left out.
 		const panel = host.selects[0]!.panel!;
-		expect(panel.length).toBeLessThanOrEqual(30);
-		expect(panel.join("\n")).toContain("line-0");
-		expect(panel.join("\n")).not.toContain("line-79");
+		expect(panel.split("\n").length).toBeLessThanOrEqual(30 - 2 - 11);
+		expect(panel).toContain("line-0");
+		expect(panel).not.toContain("line-79");
+		expect(panel).toContain(FULL_VIEW);
+		// The frame still closes under the cut.
+		expect(panel).toContain("╰");
 		expect(host.panelSet()).toBe(false);
+		// The overlay it opened is the whole content, from the top.
+		expect(host.opened[0]).toContain("line-0");
+	});
+
+	test("the panel follows the terminal it is shown in: the same context fits a taller one", async () => {
+		const host = fakeHost({ mode: "tui", hasUI: true, rows: 120, answers: ["a"] });
+		await createUiPort(host.pi, host.ctx).select("pick", ["a", "b"], TALL);
+		expect(host.selects[0]?.options).toEqual(["a", "b"]);
+		expect(host.selects[0]?.panel).toContain("line-79");
+		expect(host.overlays).toBe(0);
+	});
+
+	test("a lane view on screen takes its rows from the panel: the panel head stays, the cut grows, consent waits", async () => {
+		const panelRows = async (withLaneView: boolean): Promise<{ rows: number; offered: string[] }> => {
+			const live = new LiveStatus({ now: () => Date.now(), laneView: () => true });
+			let mounted: TuiView | undefined;
+			if (withLaneView) {
+				const liveCtx = {
+					mode: "tui",
+					hasUI: true,
+					agent: { kind: "main", id: "main", name: "main" },
+					ui: {
+						setStatus() {},
+						setWidget(_key: string, content: ExtensionUiFactory | undefined) {
+							mounted?.dispose();
+							mounted = content === undefined ? undefined : mountWidget(content, { columns: 100, rows: 30 });
+						},
+					},
+				} as unknown as ExtensionContext;
+				live.show(liveCtx, runRecord({ runId: "run-dock", status: "running" }), "working");
+				mounted?.text();
+				expect(liveWidgetRows()).toBeGreaterThan(0);
+			}
+			try {
+				const host = fakeHost({ mode: "tui", hasUI: true, rows: 30, answers: [options => options.at(-1), "a"] });
+				await createUiPort(host.pi, host.ctx).select("pick", ["a", "b"], { ...TALL, consent: ["a"] });
+				return { rows: host.selects[0]!.panel!.split("\n").length, offered: host.selects[0]!.options };
+			} finally {
+				live.clear();
+				mounted?.dispose();
+			}
+		};
+		const alone = await panelRows(false);
+		const docked = await panelRows(true);
+		expect(liveWidgetRows()).toBe(0);
+		expect(docked.rows).toBeLessThan(alone.rows);
+		expect(docked.offered).not.toContain("a");
+		expect(docked.offered).toContain(FULL_VIEW);
 	});
 
 	test("notices are omp's notifications and reports are overlays: nothing enters the transcript", async () => {
@@ -795,33 +474,75 @@ describe("rich rows", () => {
 		const rows = [...ROWS, { value: "explorer:2", label: "탐색 · 폴백", description: "b/z · low" }];
 		expect(await ui.selectRows?.("고르기", rows, CONTEXT)).toBe("explorer:0");
 		expect(host.selects).toHaveLength(1);
-		expect(host.selects[0]!.options).toEqual([
-			"탐색 · 폴백 — b/z · low",
-			"탐색 · 주 모델 — a/x · low",
-			"탐색 · 폴백 — b/z · low (2)",
-		]);
+		expect(host.selects[0]!.options).toEqual(offeredRowLabels(rows).labels);
+		expect(new Set(host.selects[0]!.options).size).toBe(3);
 		expect(host.sent).toHaveLength(1);
 		expect(String(host.sent[0]!.message.content)).toContain("two");
 		expect(host.panelSet()).toBe(false);
 	});
 
-	test("the TUI rows overlay chooses by value and Esc cancels", async () => {
-		for (const key of ["\r", "\x1b"]) {
+	test("the TUI rows overlay chooses by value, Enter on the focused row and Esc cancels", async () => {
+		for (const key of ["enter", "escape", "down+enter"]) {
 			const host = fakeHost({
 				mode: "tui",
 				hasUI: true,
 				rows: 24,
-				driveOverlay(view, lines) {
-					const text = stripTerminalSequences(lines.join("\n"));
-					expect(text).toContain("a/x · low");
-					expect(text).toContain("b/z · low");
-					view.handleInput?.(key);
+				async driveOverlay(view) {
+					expect(view.text()).toContain("a/x · low");
+					expect(view.text()).toContain("b/z · low");
+					for (const press of key.split("+")) view.press(press);
 				},
 			});
 			const ui = createUiPort(host.pi, host.ctx);
-			expect(await ui.selectRows?.("고르기", ROWS)).toBe(key === "\r" ? "explorer:1" : undefined);
+			expect(await ui.selectRows?.("고르기", ROWS)).toBe(key === "enter" ? "explorer:1" : key === "escape" ? undefined : "explorer:0");
 			expect(host.sent).toEqual([]);
 		}
+	});
+
+	test("the cursor wraps, Home and End jump, and the focused row is the marked one", async () => {
+		const rows = Array.from({ length: 5 }, (_, i) => ({ value: `v${i}`, label: `항목 ${i}`, description: `설명 ${i}` }));
+		const marked = (view: TuiView): string => view.screen().find(row => row.includes("❯"))!;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 24,
+			async driveOverlay(view) {
+				expect(marked(view)).toContain("항목 0");
+				view.press("up");
+				expect(marked(view)).toContain("항목 4");
+				view.press("down");
+				expect(marked(view)).toContain("항목 0");
+				view.press("end");
+				expect(marked(view)).toContain("항목 4");
+				view.press("home");
+				expect(marked(view)).toContain("항목 0");
+				view.press("pageDown");
+				expect(marked(view)).not.toContain("항목 0");
+				view.press("enter");
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", rows)).toBe("v4");
+	});
+
+	test("a list taller than the terminal keeps the focused row in view", async () => {
+		const rows = Array.from({ length: 40 }, (_, i) => ({ value: `v${i}`, label: `항목 ${String(i).padStart(2, "0")}`, description: `설명 ${i}` }));
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 16,
+			async driveOverlay(view) {
+				expect(view.text()).toContain("항목 00");
+				expect(view.text()).not.toContain("항목 39");
+				expect(view.screen().filter(row => row.length > 0).length).toBeLessThanOrEqual(Math.floor(16 * 0.85));
+				view.press("end");
+				expect(view.text()).toContain("항목 39");
+				expect(view.screen().find(row => row.includes("❯"))).toContain("항목 39");
+				for (let i = 0; i < 20; i++) view.press("up");
+				expect(view.screen().find(row => row.includes("❯"))).toContain("항목 19");
+				view.press("enter");
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", rows)).toBe("v19");
 	});
 
 	test("a narrow terminal wraps the focused row's complete detail instead of dropping it", async () => {
@@ -830,16 +551,14 @@ describe("rich rows", () => {
 			hasUI: true,
 			rows: 16,
 			columns: 30,
-			driveOverlay(view, lines) {
-				const text = stripTerminalSequences(lines.join("\n"));
-				expect(text).toContain("example/");
-				expect(text).toContain("xhigh");
-				view.handleInput?.("\x1b");
+			async driveOverlay(view) {
+				expect(view.text()).toContain("example/");
+				expect(view.text()).toContain("xhigh");
+				view.press("escape");
 			},
 		});
-		const ui = createUiPort(host.pi, host.ctx);
 		const rows = [{ value: "explorer:0", label: "탐색 · 주 모델", description: "example/very-long-model · xhigh" }];
-		expect(await ui.selectRows?.("고르기", rows)).toBeUndefined();
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", rows)).toBeUndefined();
 	});
 
 	test("a compact context sits once above the same rows", async () => {
@@ -847,15 +566,48 @@ describe("rich rows", () => {
 			mode: "tui",
 			hasUI: true,
 			rows: 30,
-			driveOverlay(view, lines) {
-				const text = stripTerminalSequences(lines.join("\n"));
-				expect(text).toContain("two");
-				expect(text).toContain("a/x · low");
-				view.handleInput?.("\x1b");
+			async driveOverlay(view) {
+				expect(view.text()).toContain("two");
+				expect(view.text()).toContain("a/x · low");
+				expect(view.text().split("two")).toHaveLength(2);
+				// It fits, so there is no row that opens it whole.
+				expect(view.text()).not.toContain(FULL_VIEW);
+				view.press("escape");
 			},
 		});
-		const ui = createUiPort(host.pi, host.ctx);
-		expect(await ui.selectRows?.("고르기", ROWS, CONTEXT)).toBeUndefined();
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", ROWS, CONTEXT)).toBeUndefined();
+		expect(host.sent).toEqual([]);
+	});
+
+	test("a cut context adds the full-view row, opens the whole content, then the list comes back", async () => {
+		let opened = 0;
+		const host = fakeHost({
+			mode: "tui",
+			hasUI: true,
+			rows: 30,
+			async driveOverlay(view) {
+				opened++;
+				if (opened === 1) {
+					await settle();
+					expect(view.text()).toContain("line-0");
+					expect(view.text()).not.toContain("line-79");
+					expect(view.text()).toContain(FULL_VIEW);
+					view.press("end");
+					view.press("enter");
+				} else if (opened === 2) {
+					// The whole content, linear, from the top.
+					expect(view.text()).toContain("line-0");
+					view.press("end");
+					expect(view.text()).toContain("line-79");
+					view.press("q");
+				} else {
+					expect(view.text()).not.toContain("line-79");
+					view.press("enter");
+				}
+			},
+		});
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", ROWS, TALL)).toBe("explorer:1");
+		expect(host.overlays).toBe(3);
 		expect(host.sent).toEqual([]);
 	});
 });
@@ -884,65 +636,51 @@ describe("rich metadata", () => {
 		},
 	];
 
-	test("ANSI and native show the same visible content with theme tones and a static meter", async () => {
-		let rendered = "";
-		let native: NativeNode | null | undefined;
+	test("the report overlay shows the annotated lines with theme tones and a static meter", async () => {
+		let visible = "";
+		let styled = "";
 		const host = fakeHost({
 			mode: "tui",
 			hasUI: true,
 			rows: 40,
-			driveOverlay(view, rows) {
-				rendered = rows.join("\n");
-				native = view.describe?.(describeContext(100));
-				expect(native?.c?.[0]).toMatchObject({ k: "col", key: "body" });
-				view.handleInput?.("q");
+			async driveOverlay(view) {
+				visible = view.text();
+				styled = view.rows().join("\n");
+				view.press("q");
 			},
 		});
 		await createUiPort(host.pi, host.ctx).report("Storm 현황", MARKDOWN, INFO);
-		const visible = stripTerminalSequences(rendered);
 		expect(visible).toContain("대기 중: 3개");
 		expect(visible).toContain("$0.42");
 		expect(visible).toContain("Storm 현황");
 		expect(visible).not.toContain("Storm · Storm 현황");
 		expect(visible).not.toContain("1 개요");
 		expect(visible).toContain("일반 문단");
-		expect(rendered).toContain(theme.fg("accent", "대기 중: "));
-		expect(rendered).toContain(theme.fg("warning", "3개"));
-		expect(rendered).toContain(theme.fg("success", "$0.42"));
+		// Tones are the theme's colours, not text.
+		expect(styled).toContain("\x1b[");
+		expect(styled).not.toContain("\x1b]");
 		// A static track, never shimmered text.
-		expect(visible).toContain("█");
-		expect(visible).toContain("░");
-		expect(native).not.toBeNull();
-		expect(native).not.toBeUndefined();
-		const spans = nativeSpans(native);
-		expect(spans).toContainEqual({ t: "$0.42", s: "success" });
-		expect(spans).toContainEqual({ t: "3개", s: "warning" });
-		expect(spans.every(run => !run.t.includes("\x1b"))).toBe(true);
-		expect(nativeProgress(native)).toEqual([{ value: 0.42, tone: "success" }]);
-		expect(nativeTexts(native).join("\n")).toContain("$0.42");
-		// Unannotated prose still goes through the existing Markdown path.
-		expect(nativeMds(native)).toContain("일반 문단 **강조**");
+		expect(visible).toMatch(/[█▓▒░━]/u);
 	});
 
-	test("an untrusted icon key is dropped from both renderers, not drawn or echoed", async () => {
+	test("an untrusted icon key is dropped, not drawn or echoed", async () => {
 		const info: InfoLine[] = [{ index: 0, icon: "status.evil\u001b[31m" as NonNullable<InfoLine["icon"]>, spans: [{ text: "본문" }] }];
 		let rendered = "";
-		let native: NativeNode | null | undefined;
+		let styled = "";
 		const host = fakeHost({
 			mode: "tui",
 			hasUI: true,
 			rows: 30,
-			driveOverlay(view, rows) {
-				rendered = rows.join("\n");
-				native = view.describe?.(describeContext(100));
-				view.handleInput?.("q");
+			async driveOverlay(view) {
+				rendered = view.text();
+				styled = view.rows().join("\n");
+				view.press("q");
 			},
 		});
 		await createUiPort(host.pi, host.ctx).report("제목", "본문", info);
-		expect(stripTerminalSequences(rendered)).toContain("본문");
+		expect(rendered).toContain("본문");
 		expect(rendered).not.toContain("evil");
-		expect(nativeTexts(native).join("\n")).toContain("본문");
-		expect(nativeSpans(native).every(run => !run.t.includes("evil") && !run.t.includes("\x1b"))).toBe(true);
+		expect(styled).not.toContain("evil");
 	});
 
 	test("a cut rich panel withholds consent until the full rich report was shown", async () => {
@@ -956,38 +694,31 @@ describe("rich metadata", () => {
 			// Even if approval context is mistakenly annotated, the full view must be linear.
 			return { index, spans, ...(index === 0 ? { section: "overview" } : index === lines.length - 1 ? { section: "team" } : {}) };
 		});
-		let reportNative: NativeNode | null | undefined;
 		const host = fakeHost({
 			mode: "tui",
 			hasUI: true,
 			rows: 30,
 			answers: [options => options[0], APPROVE],
-			driveOverlay(view, top) {
-				reportNative = view.describe?.(describeContext(100));
-				expect(reportNative?.c?.[0]).toMatchObject({ k: "col", key: "body" });
-				view.handleInput?.("2");
-				view.handleInput?.("\t");
-				expect(view.render(100)).toEqual(top);
-				view.handleInput?.("\x1b[F");
-				expect(stripTerminalSequences(view.render(100).join("\n"))).toContain("마지막 줄");
-				view.handleInput?.("q");
+			async driveOverlay(view) {
+				// No tab strip: the approval's whole content is one linear page, so the second tab key and Tab change nothing.
+				const top = view.text();
+				view.press("2");
+				view.press("tab");
+				expect(view.text()).toBe(top);
+				view.press("end");
+				expect(view.text()).toContain("마지막 줄");
+				view.press("q");
 			},
 		});
 		const ui = createUiPort(host.pi, host.ctx);
 		expect(await ui.select("승인할까요", [APPROVE, "취소"], { title: "승인", markdown, info, consent: [APPROVE] })).toBe(APPROVE);
 		const [first, second] = host.selects;
 		expect(first!.options).not.toContain(APPROVE);
-		const panel = first!.panel!.join("\n");
-		expect(panel).toContain(theme.fg("accent", "승인 요약"));
-		expect(panel).not.toContain("마지막 줄");
-		const clipped = nativeTexts(first!.panelNative).join("\n");
-		expect(clipped).toContain("승인 요약");
-		expect(clipped).not.toContain("마지막 줄");
+		expect(first!.panel).toContain("승인 요약");
+		expect(first!.panel).not.toContain("마지막 줄");
 		expect(second!.options).toContain(APPROVE);
 		expect(second!.options).toHaveLength(3);
 		expect(host.overlays).toBe(1);
-		const full = nativeTexts(reportNative).join("\n");
-		expect(full).toContain("마지막 줄");
 	});
 });
 
@@ -1061,17 +792,6 @@ describe("closeout records", () => {
 	const { markdown, info } = renderCloseout(BRIEF, true);
 	const style = { kind: "closeout", runId: "run-7", info } as const;
 
-	/** The renderer Storm registers for its transcript type, as omp would call it. */
-	function renderer() {
-		let draw: ((message: Record<string, unknown>) => Component | undefined) | undefined;
-		registerReportRenderer({
-			registerMessageRenderer(_type: string, fn: (message: Record<string, unknown>) => Component | undefined) {
-				draw = fn;
-			},
-		} as unknown as ExtensionAPI);
-		return (message: Record<string, unknown>) => draw!({ role: "custom", customType: "storm-report", display: true, timestamp: 0, ...message })!;
-	}
-
 	for (const mode of ["tui", "rpc"] as const) {
 		test(`${mode}: the record keeps its plain text, carries validated details, and never enters the model's context`, () => {
 			const host = fakeHost({ mode, hasUI: true });
@@ -1100,86 +820,42 @@ describe("closeout records", () => {
 			expect(message.excludeFromContext).toBe(true);
 		}
 	});
+});
 
-	test("a short settled run draws one inline fact, not a second frame under the answer", () => {
-		const { markdown: body, info: spans } = renderCloseout({
-			...BRIEF, tier: "line", official: { ...BRIEF.official, label: "완료", tone: "success", accepted: 1, inScope: 1,
-				open: { ...BRIEF.official.open, unsettled: 0 } },
-		}, false);
+describe("a host whose terminal looks cannot load", () => {
+	// A later omp may move the module the looks come from; Storm must still load and decide nothing unseen.
+	beforeEach(() => forceWindowing(false));
+	afterEach(() => forceWindowing(undefined));
+
+	test("a report goes to the transcript", async () => {
 		const host = fakeHost({ mode: "tui", hasUI: true });
-		createUiPort(host.pi, host.ctx).record(TITLE, body, { ...style, info: spans });
-		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
-		const rows = component.render(60).map(stripTerminalSequences);
-		expect(rows).toHaveLength(1);
-		expect(rows[0]).toContain("Storm · 완료 · 수용 1/1");
-		expect(rows[0]).not.toMatch(/[│╭╰]/u);
-		expect(component.describe?.(describeContext(60))).toMatchObject({ k: "text" });
+		await createUiPort(host.pi, host.ctx).report("보고서", "본문");
+		expect(host.overlays).toBe(0);
+		expect(host.sent).toHaveLength(1);
+		expect(String(host.sent[0]!.message.content)).toContain("본문");
 	});
 
-	test("a settled fact too long for the row with Storm's mark drops the mark instead of wrapping, and keeps it where it fits", () => {
-		const { markdown: body, info: spans } = renderCloseout({
-			...BRIEF, tier: "line", official: { ...BRIEF.official, label: "완료 · 필수 결과 이행 · 1/4라운드", tone: "success", accepted: 2, inScope: 2,
-				open: { ...BRIEF.official.open, unsettled: 0 } },
-		}, false);
-		const host = fakeHost({ mode: "tui", hasUI: true });
-		createUiPort(host.pi, host.ctx).record(TITLE, body, { ...style, info: spans });
-		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
-		const fact = stripTerminalSequences(component.render(200)[0]!);
-		expect(fact).toContain("Storm · ");
-		// Exactly as wide as the line with the mark needs: at 60 columns the mark would push the last word to a second row.
-		const tight = Bun.stringWidth(fact) - 1;
-		const rows = component.render(tight).map(stripTerminalSequences);
-		expect(rows).toHaveLength(1);
-		expect(rows[0]).not.toContain("Storm");
-		expect(rows[0]).toContain("수용 2/2");
-		expect(Bun.stringWidth(rows[0]!)).toBeLessThanOrEqual(tight);
-		expect(rows[0]).not.toMatch(/[│╭╰]/u);
-		// A width no single row can hold still wraps, keeping the whole fact and the mark.
-		expect(component.render(20).length).toBeGreaterThan(1);
+	test("an approval's context is held in the transcript before consent is offered", async () => {
+		const host = fakeHost({ mode: "tui", hasUI: true, answers: [options => options[0], APPROVE] });
+		const context = { title: "승인", markdown: "### 승인\n\n- 대상: 전부", consent: [APPROVE] };
+		expect(await createUiPort(host.pi, host.ctx).select("승인할까요", [APPROVE, "취소"], context)).toBe(APPROVE);
+		expect(host.selects[0]!.options).not.toContain(APPROVE);
+		expect(host.selects[0]!.options[0]).toBe(FULL_VIEW);
+		expect(host.selects[1]!.options).toContain(APPROVE);
+		expect(host.overlays).toBe(0);
+		expect(String(host.sent[0]!.message.content)).toContain("대상: 전부");
+		expect(host.panelSet()).toBe(false);
 	});
 
-	test("a closeout draws its title once as the frame heading, styled from details, with a native card free of ANSI", () => {
-		const host = fakeHost({ mode: "tui", hasUI: true });
-		createUiPort(host.pi, host.ctx).record(TITLE, markdown, style);
-		const component = renderer()(JSON.parse(JSON.stringify(host.sent[0]!.message)));
-		for (const width of [60, 100]) {
-			const rows = component.render(width);
-			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
-			const visible = stripTerminalSequences(rows.join("\n"));
-			expect(visible.split(TITLE)).toHaveLength(2);
-			expect(visible).not.toContain("###");
-			expect(visible).toContain("수용 1/3");
-		}
-		const wide = component.render(100).join("\n");
-		expect(stripTerminalSequences(wide)).toContain("수용 1/3 · 판정 전 종료 2");
-		expect(stripTerminalSequences(wide)).toContain("감독 설명(최종 판정 전 작성): 핵심 경로를 고쳤습니다.");
-		expect(wide).toContain(theme.fg("warning", theme.bold("완료 아님 · 라운드 한도")));
-		const native = component.describe?.(describeContext(60));
-		expect(native).toMatchObject({ k: "card" });
-		const spans = nativeSpans(native);
-		expect(spans).toContainEqual({ t: "완료 아님 · 라운드 한도", s: "warning strong" });
-		expect(spans.every(run => !run.t.includes("\x1b"))).toBe(true);
-		expect(nativeMds(native)).toEqual([]);
-	});
-
-	test("older records and malformed details keep the existing plain frame with their raw content", () => {
-		const draw = renderer();
-		const content = `### ${TITLE}\n\n${markdown}`;
-		const cases: unknown[] = [
-			undefined,
-			{ v: 2, kind: "closeout", runId: "run-7", info },
-			{ v: 1, kind: "closeout", runId: "run-7", info: "nope" },
-			{ v: 1, kind: "closeout", runId: "run-7", info: [{ ...info[0]!, spans: [{ text: "\x1b[2J가짜" }] }, ...info.slice(1)] },
-			{ v: 1, kind: "closeout", runId: "run-7", info: [{ ...info[0]!, meter: { fraction: 1, tone: "success" } }, ...info.slice(1)] },
+	test("rows are one plain select that carries the detail", async () => {
+		const host = fakeHost({ mode: "tui", hasUI: true, answers: [options => options[1]] });
+		const rows = [
+			{ value: "a", label: "하나", description: "설명 1" },
+			{ value: "b", label: "둘", description: "설명 2" },
 		];
-		for (const details of cases) {
-			const component = draw({ content, ...(details === undefined ? {} : { details }) });
-			expect(component).not.toBeInstanceOf(RichFrame);
-			const visible = stripTerminalSequences(component.render(100).join("\n"));
-			expect(visible).toContain("Storm");
-			expect(visible).toContain("결제 API 재시도 정책 정리");
-			expect(visible).not.toContain("가짜");
-		}
+		expect(await createUiPort(host.pi, host.ctx).selectRows?.("고르기", rows)).toBe("b");
+		expect(host.selects[0]!.options).toEqual(offeredRowLabels(rows).labels);
+		expect(host.overlays).toBe(0);
 	});
 });
 
@@ -1301,8 +977,8 @@ describe("accepting on a small terminal", () => {
 		const host = fakeHost({ mode: "tui", hasUI: true, rows: 30, answers: [undefined] });
 		await createUiPort(host.pi, host.ctx).select(dialog.title, dialog.options, dialog.context);
 		const panel = host.selects[0]!.panel!;
-		expect(panel.length).toBeLessThanOrEqual(30 - dialog.options.length);
-		expect(panel.join("\n")).toContain("승인하면 이 세션의 자동 위임이 켜집니다");
+		expect(panel.split("\n").length).toBeLessThanOrEqual(30 - dialog.options.length);
+		expect(panel).toContain("승인하면 이 세션의 자동 위임이 켜집니다");
 		expect(dialog.context.markdown).toContain("실행이 끝나면 정리");
 		expect(dialog.context.markdown).toContain("/repo/.omp/agents/shadow-file.md");
 		// One brand heading, after the first-approval default and the shadow warning; the narrow consent is unchanged.

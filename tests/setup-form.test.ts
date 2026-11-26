@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { defaultFormData } from "@oh-my-pi/pi-tui/html-form/data";
-import { type ChoiceField, type FormField, type HtmlForm, parseHtmlForm, spansText, type TextField } from "@oh-my-pi/pi-tui/html-form/parse";
+import { defaultFormData } from "@oh-my-pi/pi-coding-agent/tools/html-form/data";
+import { type ChoiceField, type FormField, type HtmlForm, parseHtmlForm, spansText, type TextField } from "@oh-my-pi/pi-coding-agent/tools/html-form/parse";
 import { validateConfig } from "../src/config/schema.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { BROWSE, commonSettingsForm, effortForm, FIELD, interviewRoles, MODEL_DEFAULT, NONE, pickedEntry, readRoleChoices, recommendationNotes, type RoleAnswers, roleForm, type SetupFormInput, type SetupResult, setupConfig } from "../src/setup/form.ts";

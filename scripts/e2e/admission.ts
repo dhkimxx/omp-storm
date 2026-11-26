@@ -93,7 +93,8 @@ function hostSettings(isolation: { enabled: boolean; apply?: boolean } = { enabl
 		"  maxConcurrency: 12",
 		// The host parks an idle subagent after this TTL (default 7 min). A kept-alive subagent still homed on a
 		// worker thread when stdin closes is released through a cross-thread dispose the host does not keep its
-		// event loop alive for (OMP 19.0.1 and 19.1.1): the loop drains, `omp launch` exits 1 and the isolated
+		// event loop alive for (seen on OMP 19.0.1 and 19.1.1; this suite is green on 19.2.1 with the park in place, the
+		// failure itself was not measured there): the loop drains, `omp launch` exits 1 and the isolated
 		// worktree it owns is never released. Parked while the client is still connected, its EOF release only
 		// runs the main-thread isolation capture and cleanup. `closeSession` waits for that park.
 		`  agentIdleTtlMs: ${IDLE_TTL_MS}`,

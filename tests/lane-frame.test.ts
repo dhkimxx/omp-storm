@@ -3,7 +3,7 @@
  * codes it writes, and what it costs.
  */
 import { describe, expect, test } from "bun:test";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { LANE_MIN_COLUMNS, type LaneFrameOptions, laneFrame, laneLiveliness } from "../src/view/lane/frame.ts";
 import { liveliness } from "../src/view/lane/effects.ts";
 import type { LaneSnapshot, LaneSpan, LaneState, LaneTrack } from "../src/view/lane/model.ts";

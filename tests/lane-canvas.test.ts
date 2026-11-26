@@ -3,7 +3,7 @@
  * never split, and the two colour modes write what their name says.
  */
 import { describe, expect, test } from "bun:test";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { Canvas, charWidth, textWidth } from "../src/view/lane/canvas.ts";
 import { lookOf, oklch } from "../src/view/lane/colour.ts";
 

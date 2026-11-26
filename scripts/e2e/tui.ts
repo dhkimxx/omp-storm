@@ -10,6 +10,22 @@
  *
  * Usage: npm run e2e:tui   (env: see harness.ts)
  *
+ * omp 19.2 paints by diff, so what is "on the screen" is read from the harness's emulated screen (`tui.screen()`,
+ * `tui.history()`, `selector()`, `statusLine(tui)`), and "what was painted since this key" from `tui.text(from)`.
+ * `E2E_ONLY=<part of a scenario name>` runs one scenario alone: scenarios after the setup ones approve the team over
+ * RPC first (`ensureApprovedTeam`), so each can be tried and judged on its own.
+ *
+ * Which scenario judges which Storm surface (the surface slices of the 19.2 port), so a failure points at its owner:
+ *   setup (3 scenarios) ........ selection dialogs and context panel (C), model picker (D), omp's own forms
+ *   a plain request ............ live widget and footer (A)
+ *   a short clean run .......... the one-fact record (B)
+ *   an incomplete run, numbered resume ... the closeout card (B), its numbered choices
+ *   a native ask ............... omp's own ask form, live widget (A)
+ *   a run sent back ............ live widget (A), `/storm status` overlay (C)
+ *   two lane view scenarios .... the lane view (A)
+ *   narrow motion off, under 60, ASCII ... live widget single line (A), `/storm` hub and status overlay (C)
+ *   Escape flow, shutdown ...... omp's ask form, footer (A), closeout card (B)
+ *
  * The driver is closed-loop: every key is followed by a wait for the repaint it must cause, and every check by a
  * wait for the state it asserts, so a slow machine only makes the run longer. Storm's files and the model request
  * log are what is asserted; the screen is read to know what has the focus. Directive payloads are typed as base64,
@@ -176,7 +192,7 @@ interface LiveScreen {
 	viewport: string[];
 }
 function liveScreen(tui: Tui): LiveScreen | undefined {
-	const { viewport } = replayScreen(tui.raw, tui.columns, tui.rows);
+	const { viewport } = tui.screen();
 	const labels = Object.values(RUN_APPEARANCE).map(appearance => appearance.label);
 	const status = viewport.findLastIndex(row => row.startsWith(`${STORM_MARK} · `) && labels.some(label => row.includes(label)));
 	if (status < 0) return undefined;
@@ -207,128 +223,6 @@ function cardRows(text: string): string[] {
 	const rows = text.split("\n");
 	const end = rows.findIndex(row => row.includes(CLOSEOUT_DETAIL));
 	return rows.slice(0, end < 0 ? rows.length : end + 1).filter(row => row.trim() !== "");
-}
-
-/**
- * The terminal screen a pty log paints, as rows of text: `scrollback` (rows scrolled off the top) then `viewport`.
- * `Tui.text` is only the byte stream with escapes removed, where one painted row can appear many times, wrapped
- * rows look like separate rows and cursor moves are lost; a visual claim (one row, no frame, nothing around it)
- * needs the rows a person actually sees. This replays the cursor moves, line edits and scrolling omp's renderer
- * uses (CUP/CUU/CUD/CUF/CUB/CHA, EL, ED, IL, DL, SU, DECSC/DECRC, CR/LF, auto-wrap) and ignores colours and modes.
- */
-function replayScreen(raw: string, cols: number, rows: number): { scrollback: string[]; viewport: string[] } {
-	const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-	const blank = (): string[] => Array.from({ length: cols }, () => " ");
-	const grid: string[][] = Array.from({ length: rows }, blank);
-	const scrollback: string[][] = [];
-	let row = 0;
-	let col = 0;
-	let saved: [number, number] = [0, 0];
-	const scrollUp = (): void => {
-		scrollback.push(grid.shift() ?? blank());
-		grid.push(blank());
-	};
-	const lineFeed = (): void => {
-		if (row === rows - 1) scrollUp();
-		else row++;
-	};
-	const put = (grapheme: string): void => {
-		const width = Bun.stringWidth(grapheme);
-		if (width === 0) return;
-		if (col + width > cols) {
-			col = 0;
-			lineFeed();
-		}
-		grid[row]![col] = grapheme;
-		for (let at = 1; at < width; at++) grid[row]![col + at] = "";
-		col += width;
-	};
-	const clamp = (value: number, max: number): number => Math.min(max, Math.max(0, value));
-	let at = 0;
-	while (at < raw.length) {
-		const char = raw[at]!;
-		if (char === "\x1b") {
-			const kind = raw[at + 1];
-			if (kind === "[") {
-				const csi = /^\x1b\[([0-9;?<>=:]*)([ -/]*[@-~])/.exec(raw.slice(at, at + 64));
-				if (csi === null) {
-					at++;
-					continue;
-				}
-				at += csi[0].length;
-				const args = csi[1]!.replace(/^[?<>=]/, "").split(";").map(part => (part === "" ? 0 : Number(part)));
-				const count = Math.max(1, args[0] ?? 0);
-				switch (csi[2]) {
-					case "H":
-					case "f":
-						row = clamp((args[0] || 1) - 1, rows - 1);
-						col = clamp((args[1] || 1) - 1, cols - 1);
-						break;
-					case "A": row = clamp(row - count, rows - 1); break;
-					case "B": row = clamp(row + count, rows - 1); break;
-					case "C": col = clamp(col + count, cols - 1); break;
-					case "D": col = clamp(col - count, cols - 1); break;
-					case "G": col = clamp((args[0] || 1) - 1, cols - 1); break;
-					case "K": {
-						const mode = args[0] ?? 0;
-						for (let cell = mode === 0 ? col : 0; cell < (mode === 1 ? col + 1 : cols); cell++) grid[row]![cell] = " ";
-						break;
-					}
-					case "J": {
-						const mode = args[0] ?? 0;
-						for (let line = 0; line < rows; line++) {
-							if (mode >= 2 || (mode === 0 && line > row) || (mode === 1 && line < row)) grid[line] = blank();
-						}
-						if (mode === 0) for (let cell = col; cell < cols; cell++) grid[row]![cell] = " ";
-						if (mode === 1) for (let cell = 0; cell <= col; cell++) grid[row]![cell] = " ";
-						break;
-					}
-					case "L":
-						for (let n = 0; n < count; n++) {
-							grid.splice(rows - 1, 1);
-							grid.splice(row, 0, blank());
-						}
-						break;
-					case "M":
-						for (let n = 0; n < count; n++) {
-							grid.splice(row, 1);
-							grid.push(blank());
-						}
-						break;
-					case "S":
-						for (let n = 0; n < count; n++) scrollUp();
-						break;
-					default:
-						break;
-				}
-				continue;
-			}
-			if (kind === "]" || kind === "_" || kind === "P") {
-				const bell = raw.indexOf("\x07", at);
-				const terminator = raw.indexOf("\x1b\\", at + 2);
-				const ends = [bell < 0 ? Number.POSITIVE_INFINITY : bell + 1, terminator < 0 ? Number.POSITIVE_INFINITY : terminator + 2];
-				const end = Math.min(...ends);
-				at = Number.isFinite(end) ? end : raw.length;
-				continue;
-			}
-			if (kind === "7") saved = [row, col];
-			if (kind === "8") [row, col] = saved;
-			at += 2;
-			continue;
-		}
-		if (char === "\r") col = 0;
-		else if (char === "\n") lineFeed();
-		if (char < " ") {
-			at++;
-			continue;
-		}
-		const stop = raw.slice(at).search(/[\x00-\x1f]/);
-		const text = stop < 0 ? raw.slice(at) : raw.slice(at, at + stop);
-		for (const { segment } of graphemes.segment(text)) put(segment);
-		at += text.length;
-	}
-	const rowText = (cells: string[]): string => cells.join("").replace(/\s+$/, "");
-	return { scrollback: scrollback.map(rowText), viewport: grid.map(rowText) };
 }
 
 /**
@@ -391,9 +285,12 @@ async function answer(tui: Tui, from: number, label: string): Promise<number> {
 	throw new Error(`the dialog never offered ${label}`);
 }
 
-/** The selected native effort is in the picker header, not in a later Ask form. */
+/**
+ * The effort the picker has selected, from its status row (`thinking Off · 이 역할에만 …`). The steps row under it
+ * (`effort Auto  [Off]  Low  High`) lists every step and would match first-to-last, so only `thinking` counts.
+ */
 const pickerLevel = (text: string): string | undefined =>
-	[...text.matchAll(/\b(?:thinking|effort)[: ]+\s*(Auto|Off|Min|Low|Med|High|XHigh|Max)\b/gi)].at(-1)?.[1]?.toLowerCase();
+	[...text.matchAll(/\bthinking\s+(Auto|Off|Min|Low|Med|High|XHigh|Max)\b/gi)].at(-1)?.[1]?.toLowerCase();
 
 async function stepEffort(tui: Tui, level: string): Promise<void> {
 	await tui.press(KEY.right, painted => pickerLevel(painted) === level, `the picker to show effort ${level}`, 10_000);
@@ -463,6 +360,15 @@ function requireApprovedTeam(files: StormFiles, name: string): void {
 }
 
 /**
+ * Whether this session's team carries a required check. The sent-back scenario sets one, and a run with a code lane
+ * that never ran it ends `no-changes` instead of `verified`: the narrow and ASCII runs prove their end state against
+ * the team they actually have, so each also stands on its own (`E2E_ONLY`) and in the full order.
+ */
+const certifies = (files: StormFiles): boolean => (files.config().requiredChecks?.length ?? 0) === 0;
+const endsAsExpected = (run: RunRecord, files: StormFiles): boolean =>
+	certifies(files) ? run.status === "done" && run.endReason === "verified" : run.endReason === "no-changes";
+
+/**
  * The narrow, motion-off run in one terminal appearance; the light variant proves no theme assumption. At 60 columns
  * and 18 rows or more the lane view is drawn (still, with motion off); below either the old single line with its radar
  * is, so `columns` and `rows` choose which of the two is proven.
@@ -476,8 +382,8 @@ async function narrowMotionOff(background: "dark" | "light", columns = LANE_MIN_
 	const named = (name: string): string => `${background}, ${columns}x${rows}: ${name}`;
 	try {
 		await readyForSubmission(tui);
-		await tui.seen(0, () => (idleFooter(statusLine(tui.raw)) ? true : undefined), named("narrow idle footer"), 30_000);
-		const idle = statusLine(tui.raw);
+		await tui.seen(0, () => (idleFooter(statusLine(tui)) ? true : undefined), named("narrow idle footer"), 30_000);
+		const idle = statusLine(tui);
 		check(named("the narrow footer uses the shared mark and an idle state"), idleFooter(idle), idle ?? "no status line");
 		check(named("the narrow footer fits the terminal"), Bun.stringWidth(idle ?? "") <= columns, `${Bun.stringWidth(idle ?? "")} > ${columns}: ${idle}`);
 		const before = files.runIds();
@@ -530,9 +436,9 @@ async function narrowMotionOff(background: "dark" | "light", columns = LANE_MIN_
 			check(named("motion off leaves the radar still"), first !== undefined && second === first && radarFrames(tui.text(started), "workers").size === 1, `${first} → ${second}`);
 		}
 		const run = await files.finishedRun(before, 120_000);
-		check(named("the narrow run accepts its answer but does not certify the unrun code check"),
-			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes", `${run.status} ${run.endReason}`);
-		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+		check(named(`the narrow run accepts its answer and ${certifies(files) ? "verifies it" : "does not certify the unrun code check"}`),
+			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && endsAsExpected(run, files), `${run.status} ${run.endReason}`);
+		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 30_000);
 		if (background === "dark" && columns === LANE_MIN_COLUMNS && rows === 30) {
 			const hub = await tui.submit("/storm");
 			const full = await pickMenuRow(tui, hub, "Storm 메뉴", "전체 현황");
@@ -569,6 +475,8 @@ async function asciiDashboard(): Promise<void> {
 	 */
 	async function asciiWideWorkerChips(): Promise<void> {
 		const wideColumns = 120;
+		// A per-run budget (the sent-back scenario sets one) shows spend over the budget; without one, the spend alone.
+		const spend = files.config().budget === undefined ? /\$0\.\d+/ : /\$0\.\d+\/\$0\.\d+/;
 		const wide = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns: wideColumns, rows: 30, resume: resume.id, sessionDir: resume.dir });
 		try {
 			await readyForSubmission(wide);
@@ -577,7 +485,7 @@ async function asciiDashboard(): Promise<void> {
 			const started = await wide.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 			const chips = await wide.seen(started, text => {
 				const row = metricsRow(text, "ascii");
-				return row && /\bAG\s*1\/1\b/.test(row) && /\$0\.\d+\/\$0\.\d+\b/.test(row) ? row : undefined;
+				return row && /\bAG\s*1\/1\b/.test(row) && spend.test(row) ? row : undefined;
 			}, "the 120-column ASCII row with an active worker and spend", 20_000);
 			const parts = chips.split(" - ");
 			const result = parts[0]!;
@@ -591,7 +499,7 @@ async function asciiDashboard(): Promise<void> {
 					/(?:(?:대기|진행 중|미충족|검토 가능) · )?이행 \d\/1$/.test(result.slice(resultPrefix.length)) &&
 					loop === "loop 1라운드" &&
 					workers === "AG 1/1" &&
-					cost !== undefined && /^\$0\.\d+\/\$0\.\d+$/.test(cost) &&
+					cost !== undefined && new RegExp(`^${spend.source}$`).test(cost) &&
 					elapsed !== undefined && /^t: \d+분$/.test(elapsed),
 				chips,
 			);
@@ -636,8 +544,8 @@ async function asciiDashboard(): Promise<void> {
 		);
 		check("the measured ASCII rows fit the actual terminal", [displayed.state, displayed.chips].every(line => Bun.stringWidth(line) <= columns), displayed.chips);
 		const run = await files.finishedRun(before, 30_000);
-		check("the ASCII view run retains its answer without claiming the code check",
-			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes");
+		check("the ASCII view run retains its answer and does not claim an unrun code check",
+			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && endsAsExpected(run, files), `${run.status} ${run.endReason}`);
 		const status = await tui.submit("/storm status");
 		await tui.shows(OVERLAY_HINT, status);
 		const storage = await tui.press("4", text => text.includes("Storm 세션 데이터") || text.includes("저장 공간"), "the ASCII status storage tab");
@@ -652,6 +560,31 @@ async function asciiDashboard(): Promise<void> {
 		writeFileSync(profile, original);
 	}
 }
+
+/**
+ * A scenario that needs the approved team the setup scenarios build. Run whole, the team is already there. Run alone
+ * (`E2E_ONLY`) or after a failed setup, the team is approved through RPC on the same native session first, so one
+ * scenario can be tried, and one failed screen does not take every later scenario down with it. The two setup
+ * scenarios that edit models through the picker are not covered: they are the only ones that need each other.
+ */
+async function ensureApprovedTeam(): Promise<void> {
+	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+	const files = new StormFiles(env, ownedSession.id);
+	if (existsSync(files.configFile) && files.approvals().length > 0) return;
+	const rpc = new Rpc(env, cancelAll, { model: "fake/general-b", resume: ownedSession.id, sessionDir: ownedSession.dir });
+	try {
+		await rpc.ready();
+		await approveTeam(rpc, "on");
+	} finally {
+		await rpc.close();
+	}
+}
+
+const scenario = (name: string, body: () => Promise<void>, timeoutMs?: number): Promise<void> =>
+	suite.step(name, async () => {
+		await ensureApprovedTeam();
+		await body();
+	}, timeoutMs);
 
 async function main(): Promise<void> {
 	const outside = { id: OUTSIDE, cost: price(2, 8), context: 110_000, efforts: ["low", "high"] } as const;
@@ -713,10 +646,10 @@ async function main(): Promise<void> {
 					!Object.hasOwn(files.config(), "parallelism") && !tui.text(team).includes("병렬도"),
 					tui.text(team).slice(-400));
 				tui.send(KEY.enter);
-				await suite.eventually("the calm idle footer names the approved team", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line");
-				const calm = statusLine(tui.raw);
+				await suite.eventually("the calm idle footer names the approved team", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line");
+				const calm = statusLine(tui);
 				await Bun.sleep(500);
-				check("the idle footer stays still", statusLine(tui.raw) === calm, `${calm} → ${statusLine(tui.raw)}`);
+				check("the idle footer stays still", statusLine(tui) === calm, `${calm} → ${statusLine(tui)}`);
 				check("no model request during setup", llm.all().filter(entry => entry.who !== "side").length === 0, `requests=${llm.all().length}`);
 			});
 		},
@@ -823,7 +756,7 @@ async function main(): Promise<void> {
 		}, `fake/${OUTSIDE}`, ["--thinking", "low"]);
 	}, 180_000);
 
-	await suite.step(
+	await scenario(
 		"a plain request delivers a verified answer without file changes",
 		async () => {
 			const llm = new LlmCursor(env);
@@ -834,13 +767,13 @@ async function main(): Promise<void> {
 				check("one turn, ended with accepted evidence", run.turns === 1 && run.endReason === "verified" && run.status === "done", `turns=${run.turns} ${run.endReason} ${run.status}`);
 				check("its subagent ran on the approved model", run.spawns.length === 1 && run.spawns[0]?.outcome === "routed" && run.agents?.length === 1, JSON.stringify(run.spawns.map(spawn => spawn.outcome)));
 				check("it ended once", files.index().filter(line => line.runId === run.runId).length === 1);
-				await suite.eventually("the footer returns to its idle state after the run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+				await suite.eventually("the footer returns to its idle state after the run", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 30_000);
 			});
 		},
 		240_000,
 	);
 
-	await suite.step("a short clean automatic run leaves one factual line and registers no numbered choice", async () => {
+	await scenario("a short clean automatic run leaves one factual line and registers no numbered choice", async () => {
 		const llm = new LlmCursor(env);
 		const columns = 60;
 		const viewRows = 40;
@@ -865,7 +798,7 @@ async function main(): Promise<void> {
 				{ storm: { action: "brief", brief } },
 			];
 			const before = files.runIds();
-			const started = await tui.submit(`E2E-STEPS ${b64(steps)}`);
+			await tui.submit(`E2E-STEPS ${b64(steps)}`);
 			const run = await files.finishedRun(before, 60_000);
 			// The saved record is the source of the proof line: the resumed session also repaints earlier runs' records,
 			// and an earlier short clean run has its own one-line fact, so this run's row is found by this run's saved fact.
@@ -881,10 +814,7 @@ async function main(): Promise<void> {
 			// At 60 columns the fact fills the row and Storm's mark yields; wider, the row begins `Storm · `. Either is the same one row.
 			const PROOF = /(?:^|\s)완료 · 필수 결과 이행 · /u;
 			const ours = (row: string): boolean => fact !== "" && PROOF.test(row) && row.includes(fact);
-			const view = (): string[] => {
-				const painted = replayScreen(tui.raw.slice(started), columns, viewRows);
-				return [...painted.scrollback, ...painted.viewport];
-			};
+			const view = (): string[] => tui.history();
 			await until(() => (view().some(ours) && idleFooter(view().findLast(row => row.includes(STORM_MARK) && row.includes("대기"))?.trim()) ? true : undefined), 20_000, "the settled record and the idle footer on the screen");
 			const screen = view();
 			const at = screen.findIndex(ours);
@@ -928,7 +858,7 @@ async function main(): Promise<void> {
 		}, "fake/general-b", [], { columns, rows: viewRows });
 	}, 180_000);
 
-	await suite.step("an incomplete run keeps the whole card at 60 columns, and its first direction starts one related follow-up", async () => {
+	await scenario("an incomplete run keeps the whole card at 60 columns, and its first direction starts one related follow-up", async () => {
 		if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
 		const resume = ownedSession;
 		const files = new StormFiles(env, resume.id);
@@ -1037,7 +967,7 @@ async function main(): Promise<void> {
 		}
 	}, 360_000);
 
-	await suite.step("a numbered resume carries the goal's totals onto its card, and a direction picked after it starts a new goal", async () => {
+	await scenario("a numbered resume carries the goal's totals onto its card, and a direction picked after it starts a new goal", async () => {
 		if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
 		const resume = ownedSession;
 		const files = new StormFiles(env, resume.id);
@@ -1124,7 +1054,7 @@ async function main(): Promise<void> {
 		}
 	}, 420_000);
 
-	await suite.step(
+	await scenario(
 		"a native ask pauses the run and its answer resumes it",
 		async () => {
 			const llm = new LlmCursor(env);
@@ -1209,13 +1139,13 @@ async function main(): Promise<void> {
 					unrelated.slice(0, 800),
 				);
 				check("the answered run verifies its result after one round", run.endReason === "verified" && run.turns === 1, `${run.status} ${run.endReason} turns=${run.turns}`);
-				await suite.eventually("the footer returns after the answered run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+				await suite.eventually("the footer returns after the answered run", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 30_000);
 			});
 		},
 		180_000,
 	);
 
-	await suite.step(
+	await scenario(
 		"a run is sent back until its changes are reviewed",
 		async () => {
 			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
@@ -1288,8 +1218,8 @@ async function main(): Promise<void> {
 					);
 					await suite.eventually(
 						"the status line returns to idle after the run",
-						() => idleFooter(statusLine(tui.raw)),
-						() => statusLine(tui.raw) ?? "no status line",
+						() => idleFooter(statusLine(tui)),
+						() => statusLine(tui) ?? "no status line",
 						60_000,
 					);
 					const roundTag = `<storm-run id="${run.runId}" round="2">`;
@@ -1329,7 +1259,7 @@ async function main(): Promise<void> {
 					const overview = await tui.press("\x1b[D", text => text.includes("마지막 실행"), "Left to return to the overview");
 					check("overview takes no focus away from the report", tui.text(overview).includes(run.runId));
 					tui.send(KEY.enter);
-					await suite.eventually("the footer returns to idle after the status report", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
+					await suite.eventually("the footer returns to idle after the status report", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 30_000);
 				});
 			} finally {
 				rmSync(changed, { force: true });
@@ -1338,7 +1268,7 @@ async function main(): Promise<void> {
 		300_000,
 	);
 
-	await suite.step(
+	await scenario(
 		"the lane view follows a real run with several lanes: fixed height, a usable editor, lane states, the switch",
 		async () => {
 			const [origin, api, ui] = ["origin", "api-verify", "ui-preview"] as const;
@@ -1462,7 +1392,7 @@ async function main(): Promise<void> {
 					check("the retry reads on the view as unmet then running again", inOrder(laneSequence(painted, api), ["running", "unmet", "running", "accepted"]), laneSequence(painted, api).join(" > "));
 					check("the widget never moved during the run, through the switch, typing and the retry", new Set(statuses).size === 1, `status rows: ${[...new Set(statuses)].join(", ")}`);
 					check("the run ended accepted for every in-scope result", finished.results?.every(row => row.state === "accepted" || row.scope === "excluded-by-user") === true, JSON.stringify(finished.results?.map(row => [row.id, row.state])));
-					await suite.eventually("the footer returns to idle after the run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 60_000);
+					await suite.eventually("the footer returns to idle after the run", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 60_000);
 					check("the lane view is gone after the run", liveScreen(tui) === undefined || !liveScreen(tui)!.lanes);
 				})(laneTui, new StormFiles(env, owned.id));
 			} finally {
@@ -1472,7 +1402,7 @@ async function main(): Promise<void> {
 		420_000,
 	);
 
-	await suite.step(
+	await scenario(
 		"the lane view shows the review of submitted answers: submitted, then reviewing on the lanes judged",
 		async () => {
 			const seedText = "Storm lane view review fixture transcript.";
@@ -1527,7 +1457,7 @@ async function main(): Promise<void> {
 		240_000,
 	);
 
-	await suite.step(
+	await scenario(
 		"a narrow terminal with motion off keeps the live status still in both backgrounds",
 		async () => {
 			await narrowMotionOff("dark");
@@ -1536,7 +1466,7 @@ async function main(): Promise<void> {
 		300_000,
 	);
 
-	await suite.step(
+	await scenario(
 		"a terminal under 60 columns or 18 rows keeps the single line with its radar",
 		async () => {
 			await narrowMotionOff("dark", LANE_MIN_COLUMNS - 1, 30);
@@ -1545,9 +1475,9 @@ async function main(): Promise<void> {
 		300_000,
 	);
 
-	await suite.step("the OMP ASCII preset keeps the live chips and status usable", asciiDashboard, 90_000);
+	await scenario("the OMP ASCII preset keeps the live chips and status usable", asciiDashboard, 90_000);
 
-	await suite.step("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
+	await scenario("the host's Escape flow cancels a waiting ask and restores the resumable footer", async () => {
 		await session(async (tui, files) => {
 			const before = files.runIds();
 			// The fresh card is for substantive work; it must not pick a different older unfinished run.
@@ -1566,7 +1496,7 @@ async function main(): Promise<void> {
 			check("Escape interrupts the waiting run", run.status === "stopped" && run.endReason === "interrupted", `${run.status} ${run.endReason}`);
 			await tui.seen(
 				cancelled,
-				() => (statusLine(tui.raw.slice(cancelled))?.startsWith(`${STORM_MARK} · ${RESUME.label}`) ? true : undefined),
+				() => (statusLine(tui)?.startsWith(`${STORM_MARK} · ${RESUME.label}`) ? true : undefined),
 				"the resumable footer after cancelling",
 				30_000,
 			);
@@ -1603,7 +1533,7 @@ async function main(): Promise<void> {
 		});
 	}, 210_000);
 
-	await suite.step(
+	await scenario(
 		"shutdown while an ask waits ends the run and leaves it resumable",
 		async () => {
 			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
@@ -1641,10 +1571,10 @@ async function main(): Promise<void> {
 				await suite.eventually(
 					"the shutdown run is offered as resumable in the shared footer",
 					() => {
-						const line = statusLine(next.raw);
+						const line = statusLine(next);
 						return line !== undefined && line.includes(STORM_MARK) && line.includes(RESUME.label);
 					},
-					() => statusLine(next.raw) ?? "no status line",
+					() => statusLine(next) ?? "no status line",
 					30_000,
 				);
 			});

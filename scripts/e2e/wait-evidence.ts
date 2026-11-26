@@ -4,7 +4,7 @@
  * local fake LLM. No paid model calls and nothing under the real user profile is read or written.
  *
  * A wait call consumes completed background jobs, and a host may return as soon as one child settles while another is
- * still running (19.1.1); the other then arrives through the normal `async-result` path. This exercise therefore does
+ * still running (seen on 19.1.1; the exercise passes on 19.2.1 either way); the other then arrives through the normal `async-result` path. This exercise therefore does
  * not require co-delivery: at least one child must be a genuine wait-consumed, source-citing result that no later
  * async-result re-delivered, and every other answer child must be accounted for by a wait or async delivery on its
  * exact host `job:<jobId>:<spawnKey>`, with both official obligations accepted there.

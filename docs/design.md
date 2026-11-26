@@ -98,9 +98,34 @@
 - **움직임은 OMP의 모션 설정을 따른다.** 끄면 색은 그대로인 정지 그림이다. 틱은 85ms(SSH에서는 120ms)이고, 사용자 응답을
   기다리거나 라운드 사이에서는 느려지거나 멈춘다. 레인은 한 번 받은 색을 계획이 바뀌어도 유지한다.
 
+- **선택창이 열려 있어도 레인 뷰는 입력창 아래에 남는다.** OMP의 하단 영역이 넘치면 위쪽부터 잘리므로, 승인 선택창 위에
+  붙는 맥락 패널이 양보한다. 패널은 터미널 줄 수에서 선택창과 레인 뷰가 쓰는 줄을 뺀 만큼만 보이고(24줄 터미널에서
+  실행 중이면 머리 몇 줄), 잘렸다는 안내 줄이 붙는다. 패널이 잘린 동안에는 승인하는 선택지를 내놓지 않고 「전체 내용 보기」를
+  먼저 열게 한다. 승인 대상을 보지 못한 채 승인하는 일은 없다. `/storm` 메뉴와 모델 선택창은 오버레이라 레인 뷰를 덮는다.
+
 코드: [레인 뷰 렌더러](../src/view/lane/frame.ts), [타임라인](../src/view/lane/timeline.ts),
 [효과 설계표](../src/view/lane/effects/README.md), [위젯](../src/view/live.ts). 그림은
 `bun scripts/lane-preview.ts`로 시나리오를 돌려 본다.
+
+## 화면 계층과 호스트 결합
+
+Storm의 화면은 OMP 19.2의 UI 라이브러리(`@oh-my-pi/pi-tui`) 위에 있다. 라이브러리를 직접 부르는 파일은 `src/tui/kit.ts`
+하나이고, 나머지는 `kit.ts`에서 가져온다. `src/entry.ts`가 OMP가 불러오는 파일이다. 먼저 `kit.ts`를 불러 보고, 라이브러리에 19.2의 이름이 없어
+(19.2보다 오래된 호스트) 실패하면 `/storm` 하나만 등록해 "OMP 19.2 이상이 필요합니다"라고 알린다. 불러지면 `extension.ts`를 불러온다.
+
+호스트 내부 모듈에 기대는 곳은 OMP가 올라갈 때 가장 먼저 의심할 자리다. 불러오기가 실패했을 때 무엇이 남는지와 함께 적는다.
+
+| 가져오는 곳 | 쓰는 파일 | 실패하면 |
+|---|---|---|
+| `@oh-my-pi/pi-tui` 루트 (`jsx`, `signal`, `computed`, `batch`, `nativeRendering`) | `tui/kit.ts` | 불러오기가 실패한다. `entry.ts`가 실패를 잡아 `/storm` 안내만 남긴다. 이름이 바뀐 새 호스트에서도 같은 안내가 나가므로, 안내 문구가 "이 OMP 버전용이 아님"을 말하는지 그때 다시 본다 |
+| `@oh-my-pi/pi-tui/text/{sanitize,width}`, `theme/runtime` | `tui/kit.ts` | 불러오기 실패. 화면 전체가 의존한다 |
+| `@oh-my-pi/pi-tui/term/paint` (동적) | `tui/kit.ts`의 `registerRolePainters`, `ui/window.ts` | 화면은 계속 뜬다. 스크롤·잘림·행 목록 그리기가 꺼지고 모든 화면이 대화 기록이나 OMP 기본 `select`로 물러난다. 승인 맥락은 보지 못한 채 결정되지 않도록 잘림으로 취급한다 |
+| `@oh-my-pi/pi-coding-agent/config/{registry,motion-presets}` (동적) | `discovery/settings.ts` | 모션 설정을 읽지 못해 움직임을 켠 채로 둔다. 나머지는 그대로다 |
+| `@oh-my-pi/pi-coding-agent/config/settings`, `task/settings` | `discovery/settings.ts` | 불러오기 실패. 격리·동시 실행 한도 읽기에 쓰는 것이라 조용히 물러나지 않는다 |
+| `@oh-my-pi/pi-utils` (`sanitizeText`, `getStatsDbPath`) | `ui/info-node.ts`, `history/stats.ts` | 불러오기 실패 |
+
+`jsx`를 직접 쓰는 `@jsxImportSource`는 쓰지 않는다. 호스트가 확장에 주는 라이브러리는 번들된 사본이라 JSX 변환이 넣는 import를
+바꿔 주지 않고, 쓰면 불러오기가 "Cannot find package"로 끝난다. 로드 확인은 `bun test`가 아니라 실제 `omp -e`로 한다.
 
 ## 개발
 

@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { stripTerminalSequences, visibleWidth } from "@oh-my-pi/pi-tui";
-import { ensureThemeSync } from "@oh-my-pi/pi-tui/theme/theme";
 import { recommend } from "../src/recommend/recommend.ts";
 import { renderModelCheck } from "../src/report/models.ts";
 import { compareTrial } from "../src/report/trials.ts";
 import { roleTitle } from "../src/roles.ts";
 import type { AnalysisContext, InfoLine, ModelInfo, StormConfig, TrialConfig, UsageRow, UsageSnapshot } from "../src/types.ts";
-import { infoSymbol, RichFrame } from "../src/view/info.ts";
+import { activeTheme, visibleWidth } from "../src/tui/kit.ts";
+import { infoFrame, infoSymbol } from "../src/ui/info-node.ts";
 import { teamOf } from "./fixtures.ts";
+import { mountMessage } from "./tui-host.ts";
 import { COST, model, NOW, row as usageRow, setup, type SetupOptions } from "./rank-fixture.ts";
 
 /** A context whose `recommend` is the real ranker over the fixture catalog. */
@@ -25,9 +25,6 @@ function ctxOf(catalog: ModelInfo[], opts: SetupOptions = {}): AnalysisContext {
 		detection: () => ({ providers: [], tools: { task: true, eval: true }, warnings: [] }),
 	};
 }
-
-// The rich frame draws with omp's theme.
-ensureThemeSync();
 
 const team = (roles: Record<string, string>, priority: StormConfig["priority"] = "balanced"): StormConfig => teamOf(roles, { priority });
 
@@ -210,22 +207,22 @@ describe("renderModelCheck rich annotations", () => {
 	test("at 60 columns the Korean headings and standings wrap inside the frame, with their standing symbols", () => {
 		const ctx = ctxOf(catalog);
 		const { md, info } = annotated(ctx, team({ implementer: "pa/c-pro-1", explorer: "pa/f-flash-1", reviewer: "pz/gone-pro-1" }));
-		const rows = new RichFrame("Storm 모델 점검", md, info).render(60);
-		expect(rows.every((row) => visibleWidth(row) <= 60)).toBe(true);
-		const plain = rows.map((row) => stripTerminalSequences(row));
-		expect(plain.some((row) => row.includes("###"))).toBe(false);
+		const view = mountMessage(() => infoFrame("Storm 모델 점검", md, info), { customType: "storm-report", content: md }, { columns: 60, rows: 80, theme: "plain" });
+		const plain = view.screen();
+		view.dispose();
+		expect(plain.every(row => visibleWidth(row) <= 60)).toBe(true);
+		expect(plain.some(row => row.includes("###"))).toBe(false);
 		for (const [role, symbol] of [
 			["implementer", "status.warning"],
 			["explorer", "status.success"],
 		] as const) {
-			const row = plain.find((line) => line.includes(`${roleTitle(role)} · `));
+			const row = plain.find(line => line.includes(`${roleTitle(role)} · `));
 			expect(row).toBeDefined();
 			// The standing symbol leads the heading row, before the Korean role title.
-			const glyph = infoSymbol(symbol);
-			if (glyph !== undefined) {
-				expect(row!.indexOf(glyph)).toBeGreaterThanOrEqual(0);
-				expect(row!.indexOf(glyph)).toBeLessThan(row!.indexOf(roleTitle(role)));
-			}
+			const glyph = infoSymbol(activeTheme(), symbol);
+			expect(glyph).toBeDefined();
+			expect(row!.indexOf(glyph!)).toBeGreaterThanOrEqual(0);
+			expect(row!.indexOf(glyph!)).toBeLessThan(row!.indexOf(roleTitle(role)));
 		}
 		expect(plain.join("\n")).toContain("추천 순위 1위");
 	});

@@ -9,7 +9,6 @@
  * - Nothing is approved unless the user picked the approve option in a dialog.
  */
 
-import type { SymbolKey } from "@oh-my-pi/pi-tui";
 import type { CloseoutDraft } from "./runtime/closeout.ts";
 import type { ResultProof } from "./runtime/checkpoint-import.ts";
 import type { ReviewEvidence } from "./runtime/review.ts";
@@ -71,8 +70,8 @@ export interface InfoLine {
 	spans: readonly InfoSpan[];
 	/** Optional determinate meter; the spans always include the authoritative numeric value. */
 	meter?: { fraction: number; tone: InfoTone };
-	/** An OMP theme symbol led in by the renderer; unknown keys are dropped at render. */
-	icon?: SymbolKey;
+	/** An OMP theme symbol key (`status.success`) led in by the renderer; unknown keys are dropped at render. */
+	icon?: string;
 	/** Starts a status section on this line; unmarked lines belong to the preceding section (initially overview). */
 	section?: "overview" | "team" | "runtime" | "storage";
 	/** Emphasizes the existing text without changing the Markdown or adding another row. */

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { containsMagicKeyword } from "@oh-my-pi/pi-tui/prompt/magic-keywords";
+import { containsMagicKeyword } from "@oh-my-pi/pi-coding-agent/session/magic-keywords";
 import { readJsonl, serialized, writeTextAtomic } from "../src/fsutil.ts";
 import { ROLES, STORM_VERSION } from "../src/roles.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";

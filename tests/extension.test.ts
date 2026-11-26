@@ -7,9 +7,9 @@ import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test, vi
 import { mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
-import type { CompactOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { CompactOptions, ExtensionAPI, ExtensionContext, ExtensionUiFactory, ExtensionUiHost } from "@oh-my-pi/pi-coding-agent";
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ensureThemeSync, setMotionEffects, theme as activeTheme } from "@oh-my-pi/pi-tui";
+import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
@@ -37,6 +37,7 @@ import type { CloseoutAction, RunRecord, RunSpec, StormConfig, TrialConfig } fro
 import { until } from "./fake-session.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
 import { git, gitRepo, makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { extensionTheme } from "./tui-host.ts";
 
 /** The fresh-plan contract the tool boundary requires; these tests exercise admission, not result evidence. */
 const changeFor = (id: string) => [{ id, kind: "change" as const, criterion: "the lane delivered its requested change" }];
@@ -914,6 +915,12 @@ describe("a run through the hooks", () => {
 		expect(omp.statuses.at(-1)).toBe(idle);
 	});
 
+	test("a project with no Storm config and no automatic consent gets no footer at all", async () => {
+		const omp = fakeOmp(project);
+		await omp.emit("session_start", {}, omp.ctx(MAIN));
+		expect(omp.statuses.at(-1)).toBeUndefined();
+	});
+
 	test("an idle TUI footer carries the shared mark and theme tones; RPC stays plain, and a live widget is not duplicated", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
@@ -936,10 +943,10 @@ describe("a run through the hooks", () => {
 				setWidget: (key: string, content: unknown) => {
 					if (content === undefined) return;
 					widgetKeys.push(key);
-					// LiveStatus installs a component factory; the fake host only needs to build the component.
-					(content as (tui: unknown, theme: unknown) => unknown)(
-						{ requestComponentRender: () => undefined, requestRender: () => undefined },
-						{ fg: (_tone: string, text: string) => text },
+					// LiveStatus installs a widget factory; the fake host only needs to build what it returns.
+					(content as ExtensionUiFactory)(
+						{ requestRender: () => undefined, size: () => ({ columns: 120, rows: 40 }), suspend: run => run() },
+						extensionTheme(currentTheme()),
 					);
 				},
 			},
@@ -957,12 +964,6 @@ describe("a run through the hooks", () => {
 		await omp.emit("agent_start", {}, tui);
 		await omp.emit("agent_end", {}, tui);
 		await until(() => themed.at(-1)?.startsWith("\x1b[") === true);
-	});
-
-	test("a project with no Storm config and no automatic consent gets no footer at all", async () => {
-		const omp = fakeOmp(project);
-		await omp.emit("session_start", {}, omp.ctx(MAIN));
-		expect(omp.statuses.at(-1)).toBeUndefined();
 	});
 
 	test("a session switch drops a pending ask wait with the run it belonged to", async () => {
@@ -3424,35 +3425,7 @@ describe("native ask decisions", () => {
 	});
 });
 
-describe("the lane view switch", () => {
-	/** A TUI host whose widget slot is kept, so a test can render what the run draws below the editor. */
-	function liveTui(main: ExtensionContext, terminalRows = 40) {
-		ensureThemeSync();
-		const widgets = new Map<string, { render(width: number): readonly string[]; dispose?(): void }>();
-		const tui = { terminal: { rows: terminalRows }, requestComponentRender: () => undefined, requestRender: () => undefined };
-		const ctx = {
-			...main,
-			mode: "tui",
-			ui: {
-				...(main.ui as unknown as Record<string, unknown>),
-				theme: activeTheme,
-				setWidget: (key: string, content: unknown) => {
-					if (content === undefined) {
-						widgets.get(key)?.dispose?.();
-						widgets.delete(key);
-						return;
-					}
-					widgets.set(key, (content as (tui: unknown, theme: unknown) => never)(tui, activeTheme));
-				},
-			},
-		} as unknown as ExtensionContext;
-		return { ctx, draw: (columns = 100) => (widgets.get("storm-live")?.render(columns) ?? []).map(row => Bun.stripANSI(row)) };
-	}
-	const RADAR = /\[[\u2801-\u28ff]{18}\]$/;
-	const noticesAbout = (omp: ReturnType<typeof fakeOmp>) => omp.notices.map(notice => notice.level);
-
-	afterEach(() => setMotionEffects(true));
-
+describe("the lane view switch (command)", () => {
 	test("/storm view is offered next to auto, described in Korean, and nothing else changed", () => {
 		const omp = fakeOmp(project);
 		const all = omp.completions("") ?? [];
@@ -3463,6 +3436,34 @@ describe("the lane view switch", () => {
 		expect(view?.description).toMatch(/[가-힣]/);
 		expect(omp.completions("vi")?.map(entry => entry.value)).toEqual(["view"]);
 	});
+});
+
+describe("the lane view switch", () => {
+	/** A TUI host whose widget slot is kept, so a test can render what the run draws below the editor. */
+	function liveTui(main: ExtensionContext, terminalRows = 40) {
+		const widgets = new Map<string, { render(width: number): readonly string[]; dispose?(): void }>();
+		const host: ExtensionUiHost = { requestRender: () => undefined, size: () => ({ columns: 120, rows: terminalRows }), suspend: run => run() };
+		const ctx = {
+			...main,
+			mode: "tui",
+			ui: {
+				...(main.ui as unknown as Record<string, unknown>),
+				theme: extensionTheme(currentTheme()),
+				setWidget: (key: string, content: unknown) => {
+					if (content === undefined) {
+						widgets.get(key)?.dispose?.();
+						widgets.delete(key);
+						return;
+					}
+					const rows = (content as ExtensionUiFactory)(host, extensionTheme(currentTheme()));
+					widgets.set(key, rows as { render(width: number): readonly string[]; dispose?(): void });
+				},
+			},
+		} as unknown as ExtensionContext;
+		return { ctx, draw: (columns = 100) => (widgets.get("storm-live")?.render(columns) ?? []).map(row => Bun.stripANSI(row)) };
+	}
+	const RADAR = /\[[\u2801-\u28ff]{18}\]$/;
+	const noticesAbout = (omp: ReturnType<typeof fakeOmp>) => omp.notices.map(notice => notice.level);
 
 	test("the lane view is on by default; /storm view turns it off and on again during a run, at a fixed height", async () => {
 		await approve(TEAM);

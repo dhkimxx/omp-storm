@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { stripTerminalSequences, theme, visibleWidth } from "@oh-my-pi/pi-tui";
-import type { NativeNode } from "@oh-my-pi/pi-tui/native/node";
-import { ensureThemeSync, getCurrentThemeName, getSymbolPresetOverride, setSymbolPreset, setTheme } from "@oh-my-pi/pi-tui/theme/theme";
+import { describe, expect, test } from "bun:test";
+import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
+import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
+import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
+import type { ExtensionAPI, MessageRenderer } from "@oh-my-pi/pi-coding-agent";
+import { symbolOf, visibleWidth, type UiNode } from "../src/tui/kit.ts";
+import { infoFrame, infoSymbol } from "../src/ui/info-node.ts";
+import { registerReportRenderer } from "../src/ui.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine } from "../src/types.ts";
 import { CLOSEOUT_CHOICE_HINT, CLOSEOUT_STATUS_COMMAND, closeoutDetails, closeoutDuration, readCloseoutRecord, renderCloseout } from "../src/view/closeout.ts";
-import { RichFrame } from "../src/view/info.ts";
-
-ensureThemeSync();
+import { mountMessage, type TuiView } from "./tui-host.ts";
 
 const TITLE = "Storm 실행 결과";
 const NONE_OPEN = { unsettled: 0, revoked: 0, blocked: 0, retry: 0, reviewable: 0, pending: 0, unmet: 0 } as const;
@@ -67,24 +69,60 @@ const WORST = brief({
 const style = (info: readonly InfoLine[], runId = "run-1"): CloseoutRecordStyle => ({ kind: "closeout", runId, info });
 const content = (markdown: string): string => `### ${TITLE}\n\n${markdown}`;
 
-function describeContext(cols: number) {
-	return { cols, dark: true, reduceMotion: true, supports: () => true, feature: () => false };
+const renderers = new Map<string, MessageRenderer>();
+registerReportRenderer({
+	registerMessageRenderer: (type: string, renderer: MessageRenderer) => renderers.set(type, renderer),
+} as unknown as ExtensionAPI);
+const reportRenderer = (): MessageRenderer => renderers.get("storm-report")!;
+
+interface DrawOptions {
+	readonly columns?: number;
+	readonly rows?: number;
+	readonly theme?: Theme | "plain";
+	readonly native?: boolean;
 }
 
-function nativeTexts(root: NativeNode): string[] {
+/** The closeout record as the transcript stores it, drawn by Storm's registered renderer on the test terminal. */
+function drawCloseout(markdown: string, info: readonly InfoLine[], options: DrawOptions = {}): TuiView {
+	const details = closeoutDetails(markdown, style(info));
+	expect(details).toBeDefined();
+	return mountMessage(
+		reportRenderer(),
+		{ customType: "storm-report", content: content(markdown), details },
+		{ columns: 80, rows: 160, theme: "plain", ...options },
+	);
+}
+
+/** Every `text` span and `md` run under a node, in order. */
+function nodeTexts(root: UiNode): string[] {
 	const out: string[] = [];
-	const walk = (node: NativeNode): void => {
-		if (node.k === "text") for (const run of node.p?.spans ?? []) out.push(run.t);
-		if (node.k === "md") out.push(`MD:${String(node.p?.text ?? "")}`);
-		for (const child of node.c ?? []) if ("k" in child) walk(child);
+	const walk = (node: UiNode): void => {
+		const props = node.props() as { spans?: ReadonlyArray<{ t: string }>; text?: unknown };
+		if (node.kind === "text") for (const run of props.spans ?? []) out.push(run.t);
+		if (node.kind === "md") out.push(`MD:${String(props.text ?? "")}`);
+		for (const child of node.children()) walk(child);
 	};
 	walk(root);
 	return out;
 }
 
-function frameOf(markdown: string, info: readonly InfoLine[]): RichFrame {
-	return new RichFrame(TITLE, markdown, info, "🌀");
+/**
+ * Runs `body` with `theme` as the host's active theme. Storm reads glyphs through the active theme (as it must, to
+ * follow a switch), while `mountMessage` paints with the theme it is given: a test that mounts a non-default theme
+ * makes both the same, as they are in omp.
+ */
+function withActiveTheme<T>(theme: Theme, body: () => T): T {
+	const before = currentTheme();
+	setCurrentTheme(theme as ReturnType<typeof currentTheme>);
+	try {
+		return body();
+	} finally {
+		setCurrentTheme(before);
+	}
 }
+
+/** The card's text read back across wrapped rows: no border, no padding, no break position assumed. */
+const flatten = (rows: readonly string[]): string => rows.join("").replace(/[\s\u2500-\u257f+|-]/g, "");
 
 describe("closeout text", () => {
 	test("a line brief is one factual line with no title, choices or prose", () => {
@@ -209,7 +247,9 @@ describe("goal totals on the card", () => {
 
 	test("the card fits 60 columns and survives the persisted-details round trip", () => {
 		const { markdown, info } = renderCloseout({ ...F2, goal: { runs: 12, usd: 123.456, ms: 5_000 * 60_000, turns: 480 } }, true);
-		for (const row of frameOf(markdown, info).render(60)) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+		const view = drawCloseout(markdown, info, { columns: 60 });
+		for (const row of view.screen()) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+		view.dispose();
 		const details = closeoutDetails(markdown, style(info));
 		expect(details).toBeDefined();
 		expect(readCloseoutRecord(content(markdown), JSON.parse(JSON.stringify(details)))).toEqual({ title: TITLE, markdown, info });
@@ -226,63 +266,257 @@ describe("goal totals on the card", () => {
 });
 
 describe("closeout frame", () => {
-	let restoreTheme: string | undefined;
-	let restorePreset: Parameters<typeof setSymbolPreset>[0] | undefined;
-	afterEach(async () => {
-		if (restoreTheme !== undefined) await setTheme(restoreTheme);
-		if (restorePreset !== undefined) await setSymbolPreset(restorePreset);
-		restoreTheme = undefined;
-		restorePreset = undefined;
-	});
+	/** The rows the card takes at `columns`, and the text it shows with the frame and padding removed. */
+	function cardAt(markdown: string, info: readonly InfoLine[], columns: number, options: DrawOptions = {}) {
+		const view = drawCloseout(markdown, info, { columns, ...options });
+		const rows = view.screen();
+		view.dispose();
+		return { rows, text: rows.join("\n") };
+	}
 
 	test("the worst-case Korean card fits 60, 80 and 120 columns on every row, with the title once", () => {
 		const { markdown, info } = renderCloseout(WORST, true);
 		for (const width of [60, 80, 120]) {
-			const rows = frameOf(markdown, info).render(width);
+			const { rows, text } = cardAt(markdown, info, width);
 			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
-			const visible = stripTerminalSequences(rows.join("\n"));
-			expect(visible.split(TITLE)).toHaveLength(2);
-			expect(visible).not.toContain("###");
+			expect(text.split(TITLE)).toHaveLength(2);
+			expect(text).not.toContain("###");
 		}
 		// Every field is bounded, so even this worst case is a finite card (about 100 rows at 60 columns), never a wall
 		// that grows with the run. Typical cards are a handful of rows.
-		expect(frameOf(markdown, info).render(60).length).toBeLessThanOrEqual(120);
-		expect(frameOf(renderCloseout(F2, true).markdown, renderCloseout(F2, true).info).render(60).length).toBeLessThanOrEqual(30);
+		expect(cardAt(markdown, info, 60).rows.length).toBeLessThanOrEqual(120);
+		const typical = renderCloseout(F2, true);
+		expect(cardAt(typical.markdown, typical.info, 60).rows.length).toBeLessThanOrEqual(30);
+	});
+
+	test("the whole worst-case card survives the wrapping: every field's text is still there", () => {
+		const { markdown, info } = renderCloseout(WORST, true);
+		const { rows } = cardAt(markdown, info, 60);
+		const flat = flatten(rows);
+		// A field is bounded to its own maximum; the longest prefix of it that every field keeps is on screen.
+		expect(flat).toContain(KOREAN.slice(0, 40));
+		expect(flat).toContain("상세:/stormstatus");
 	});
 
 	test("an uncapped run's round count has no maximum and the card stays within 60 columns", () => {
 		const open = brief({ official: { ...F2.official, label: "완료 아님 · 변경 없음 · 7라운드" } });
 		const { markdown, info } = renderCloseout(open, true);
-		const rows = frameOf(markdown, info).render(60);
+		const { rows, text } = cardAt(markdown, info, 60);
 		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
-		const text = stripTerminalSequences(rows.join("\n"));
 		expect(text).toContain("7라운드");
 		expect(text).not.toMatch(/\d\/\d라운드/);
 	});
 
-	test("ASCII preset and light theme keep the width and use theme tokens, not hard-coded colors", async () => {
-		restorePreset = getSymbolPresetOverride() ?? "unicode";
-		restoreTheme = getCurrentThemeName() ?? "dark";
+	test("the frame carries Storm's mark and the title in its head, once, and no heading mark-up", () => {
 		const { markdown, info } = renderCloseout(F2, true);
-		await setSymbolPreset("ascii");
-		for (const name of ["dark", "light"]) {
-			expect((await setTheme(name)).success).toBe(true);
-			const rows = frameOf(markdown, info).render(60);
-			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
-			const joined = rows.join("\n");
-			expect(joined).toContain(theme.fg("warning", theme.bold("완료 아님 · 라운드 한도 · 3/3라운드")));
-			expect(stripTerminalSequences(joined)).toContain("1. 추천");
-		}
+		const { rows } = cardAt(markdown, info, 80);
+		expect(rows[0]).toContain("🌀");
+		expect(rows[0]).toContain(TITLE);
+		expect(rows.slice(1).some(row => row.includes(TITLE))).toBe(false);
+		// The first body row is the request line, not a repeated title or a blank.
+		expect(rows[1]).toContain("요청:");
 	});
 
-	test("the native card carries the same text as semantic spans, never ANSI and never Markdown", () => {
+	for (const name of ["dark", "light"]) {
+		test(`ASCII preset on the ${name} theme keeps the width and paints with theme tokens, not hard-coded colours`, () => {
+			const theme = loadThemeSync(name, { symbolPreset: "ascii" });
+			const { markdown, info } = renderCloseout(F2, true);
+			withActiveTheme(theme, () => {
+				const view = drawCloseout(markdown, info, { columns: 60, theme });
+				for (const row of view.screen()) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+				const painted = view.rows().join("\n");
+				// The official line is the title-emphasised line: warning tone, bold, exactly as the theme draws those tokens.
+				expect(painted).toContain(theme.style("warning strong", "완료 아님 · 라운드 한도 · 3/3라운드"));
+				// A run with no tone takes the custom message's body colour; its muted label keeps its own.
+				expect(painted).toContain(theme.style("customMessageText", "실험 10개를 돌려 가장 좋은 설정을 고르기"));
+				expect(view.text()).toContain("1. 추천");
+				// The warning symbol is the preset's ASCII glyph, and the frame's border is the preset's too.
+				const glyph = infoSymbol(theme, "status.warning");
+				expect(glyph).toBe(symbolOf(theme, "status.warning"));
+				expect(view.screen().some(row => row.includes(`${glyph} 완료 아님`))).toBe(true);
+				expect(view.text()).not.toMatch(/[╭╮╰╯│─]/);
+				view.dispose();
+			});
+		});
+	}
+
+	test("a theme switch repaints the icons of the lines that are already on screen", () => {
 		const { markdown, info } = renderCloseout(F2, true);
-		const native = frameOf(markdown, info).describe(describeContext(60));
-		const texts = nativeTexts(native);
+		const unicode = loadThemeSync("dark", { symbolPreset: "unicode" });
+		const ascii = loadThemeSync("dark", { symbolPreset: "ascii" });
+		withActiveTheme(unicode, () => {
+			const view = drawCloseout(markdown, info, { columns: 80, theme: unicode });
+			expect(view.text()).toContain(`${infoSymbol(unicode, "status.warning")} 완료 아님`);
+			setCurrentTheme(ascii as ReturnType<typeof currentTheme>);
+			view.tick(0);
+			expect(view.text()).toContain(`${infoSymbol(ascii, "status.warning")} 완료 아님`);
+			view.dispose();
+		});
+	});
+
+	test("the nodes carry the text as semantic spans, never ANSI and never Markdown", () => {
+		const { markdown, info } = renderCloseout(F2, true);
+		const view = drawCloseout(markdown, info, { columns: 60, native: true });
+		const texts = nodeTexts(view.root);
+		view.dispose();
 		expect(texts.some(text => text.startsWith("MD:"))).toBe(false);
 		expect(texts.every(text => !text.includes("\x1b"))).toBe(true);
 		const joined = texts.join("");
 		for (const piece of ["수용 1/10", "최종 판정 전 작성", "추천", CLOSEOUT_STATUS_COMMAND]) expect(joined).toContain(piece);
+	});
+
+	test("a card whose details are tampered or missing draws the plain frame, never a half-styled one", () => {
+		const { markdown } = renderCloseout(F2, true);
+		const view = mountMessage(
+			reportRenderer(),
+			{ customType: "storm-report", content: content(markdown), details: { v: 1, kind: "closeout", runId: "run-1", info: [] } },
+			{ columns: 80, rows: 60, theme: "plain" },
+		);
+		const text = view.text();
+		view.dispose();
+		expect(text).toContain("🌀 Storm");
+		expect(text).toContain("수용 1/10");
+		expect(text).toContain(TITLE);
+	});
+});
+
+describe("one fact", () => {
+	const line = () => renderCloseout(brief({ tier: "line", endedAt: "2026-11-25T09:03:00Z", official: { ...brief().official, accepted: 1, inScope: 1 } }), true);
+
+	test("a line brief is one row led by Storm's name, with no frame and no title", () => {
+		const { markdown, info } = line();
+		const view = mountMessage(
+			reportRenderer(),
+			{ customType: "storm-report", content: `### ${TITLE}\n\n${markdown}`, details: closeoutDetails(markdown, style(info)) },
+			{ columns: 80, rows: 8, theme: "plain" },
+		);
+		const rows = view.screen();
+		view.dispose();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toContain("Storm · ");
+		expect(rows[0]).toContain("완료 · 검증됨 · 수용 1/1 · 3분");
+		expect(rows[0]).not.toContain(TITLE);
+		expect(rows[0]).not.toMatch(/[╭╮╰╯│─]/);
+	});
+
+	test("on a narrow terminal the fact wraps whole: no word is lost and no row passes the width", () => {
+		const { markdown, info } = line();
+		const view = mountMessage(
+			reportRenderer(),
+			{ customType: "storm-report", content: `### ${TITLE}\n\n${markdown}`, details: closeoutDetails(markdown, style(info)) },
+			{ columns: 24, rows: 12, theme: "plain" },
+		);
+		const rows = view.screen();
+		view.dispose();
+		expect(rows.length).toBeGreaterThan(1);
+		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(24);
+		const flat = flatten(rows);
+		for (const word of ["Storm", "완료", "검증됨", "수용1/1", "3분"]) expect(flat).toContain(word);
+	});
+
+	test("a fact too long for 60 columns with the lead loses the lead and stays one row; a short one keeps it", () => {
+		const draw = (text: string, columns: number): string[] => {
+			const info: InfoLine[] = [{ index: 0, icon: "status.success", spans: [{ text, tone: "success" }] }];
+			const view = drawCloseout(text, info, { columns, rows: 12, theme: "plain" });
+			const rows = view.screen();
+			view.dispose();
+			return rows;
+		};
+		const long = "완료 · 필수 결과 이행 · 1라운드 · 수용 2/2 · 1분 미만";
+		const narrow = draw(long, 60);
+		expect(narrow).toHaveLength(1);
+		expect(narrow[0]).toContain("1분 미만");
+		expect(narrow[0]).not.toContain("Storm");
+		const wide = draw(long, 120);
+		expect(wide).toHaveLength(1);
+		expect(wide[0]).not.toContain("Storm");
+		const short = draw("완료 · 검증됨 · 수용 1/1 · 3분", 60);
+		expect(short).toHaveLength(1);
+		expect(short[0]).toContain("Storm · ");
+	});
+
+	test("the status icon follows the line's tone and the mark is muted", () => {
+		const { markdown, info } = line();
+		const theme = loadThemeSync("dark");
+		const view = mountMessage(
+			reportRenderer(),
+			{ customType: "storm-report", content: `### ${TITLE}\n\n${markdown}`, details: closeoutDetails(markdown, style(info)) },
+			{ columns: 80, rows: 8, theme },
+		);
+		const painted = view.rows().join("\n");
+		view.dispose();
+		const glyph = infoSymbol(theme, "status.success")!;
+		expect(painted).toContain(theme.style("success", glyph));
+		expect(painted).toContain(theme.style("muted strong", "Storm · "));
+	});
+});
+
+describe("frame body", () => {
+	const draw = (markdown: string, info: readonly InfoLine[], columns: number, options: DrawOptions = {}) => {
+		const view = mountMessage(() => infoFrame("Storm · 점검", markdown, info, "🌀"), { customType: "storm-report", content: markdown }, { columns, rows: 40, theme: "plain", ...options });
+		const rows = view.screen();
+		view.dispose();
+		return rows;
+	};
+
+	test("a meter is drawn directly under its own line, as one bar with its share beside it", () => {
+		const markdown = ["## 진행", "예산 사용 40%", "다음은 검증입니다."].join("\n");
+		const info: InfoLine[] = [{ index: 1, spans: [{ text: "예산 사용 40%", tone: "success" }], meter: { fraction: 0.4, tone: "success" } }];
+		for (const columns of [40, 60, 120]) {
+			const rows = draw(markdown, info, columns);
+			const line = rows.findIndex(row => row.includes("예산 사용 40%"));
+			expect(line).toBeGreaterThan(0);
+			const bar = rows[line + 1]!;
+			expect(bar).toMatch(/█+░*\s40%/);
+			const cells = (bar.match(/[█░]/g) ?? []).length;
+			expect(cells).toBeGreaterThanOrEqual(4);
+			expect(cells).toBeLessThanOrEqual(24);
+			expect(bar.match(/█/g)?.length).toBe(Math.round(0.4 * cells));
+			// The prose around the annotated line stays Markdown: the heading drops its marker, the sentence is intact.
+			expect(rows.join("\n")).not.toContain("##");
+			expect(rows.join("\n")).toContain("다음은 검증입니다.");
+			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(columns);
+		}
+	});
+
+	test("an unbroken token longer than the card wraps instead of running past the border or being cut", () => {
+		const token = "x".repeat(90);
+		const rows = draw(`${token}\n끝`, [{ index: 0, spans: [{ text: token, tone: "accent" }] }], 40);
+		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+		expect(flatten(rows)).toContain(token);
+	});
+
+	test("a standing symbol leads its line and a frame without annotations is just the Markdown", () => {
+		const markdown = "- 하나\n- 둘";
+		const plain = draw(markdown, [], 60);
+		expect(plain[0]).toContain("Storm · 점검");
+		expect(plain.join("\n")).toContain("하나");
+		expect(plain.join("\n")).toContain("둘");
+	});
+
+	test("a record without closeout details keeps its own text in a frame headed by Storm's mark", () => {
+		const view = mountMessage(reportRenderer(), { customType: "storm-report", content: "### 알림\n\n본문 첫 줄\n\n- 항목" }, { columns: 60, rows: 12, theme: "plain" });
+		const rows = view.screen();
+		view.dispose();
+		expect(rows[0]).toContain("🌀 Storm");
+		const text = rows.join("\n");
+		expect(text).toContain("알림");
+		expect(text).toContain("본문 첫 줄");
+		for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(60);
+	});
+
+	test("the title line moves into the frame's head instead of drawing its hashes", () => {
+		const view = mountMessage(reportRenderer(), { customType: "storm-report", content: "### 알림\n\n본문 첫 줄\n\n- 항목" }, { columns: 60, rows: 12, theme: "plain" });
+		const rows = view.screen();
+		view.dispose();
+		expect(rows[0]).toContain("Storm · 알림");
+		expect(rows.some(row => row.includes("###"))).toBe(false);
+		expect(rows[1]).toContain("본문 첫 줄");
+		const named = mountMessage(reportRenderer(), { customType: "storm-report", content: "### Storm 팀 제안\n\n승인하면" }, { columns: 60, rows: 8, theme: "plain" });
+		const namedRows = named.screen();
+		named.dispose();
+		expect(namedRows[0]).toContain("Storm 팀 제안");
+		expect(namedRows[0]).not.toContain("Storm · Storm");
 	});
 });
 

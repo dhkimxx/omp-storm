@@ -19,6 +19,7 @@ import type { Effort, RunSummary, RunRecord, StormConfig } from "../../src/types
 import { STORM_MARK } from "../../src/view/appearance.ts";
 import { CLOSEOUT_CHOICE_HINT, CLOSEOUT_STATUS_COMMAND } from "../../src/view/closeout.ts";
 import type { LlmEntry, ScriptedTask, Step } from "./fake-llm.ts";
+import { Screen } from "./screen.ts";
 
 export type { LlmEntry, ScriptedTask, Step };
 /** A line of omp's RPC output; only the fields the drivers read are named. */
@@ -742,25 +743,48 @@ export function focused(text: string): string | undefined {
 }
 
 /**
- * The most recent Storm row written after erase-to-end-of-line (`EL`). OMP draws both absolute cursor-addressed
- * and sequential rows, so it need not emit a cursor address immediately before `EL`. Ignore report headings:
- * opening a report doesn't restore the footer.
+ * Storm's status row as the screen shows it now: the lowest row of the visible screen that begins with Storm's mark
+ * (`≋ STORM`, `~ STORM` in an ASCII preset). Idle it is the footer, in a run the live widget's first row. Read from the
+ * screen because omp 19.2 paints by diff: the row is written when it changes and not again, so no later byte
+ * stream holds it. Report headings (`≋ STORM · 대기 · v0.25.0` at the top of a report) are not the footer.
  */
-export function statusLine(raw: string): string | undefined {
-	const writes = raw.matchAll(/\x1b\[K((?:\x1b\[[0-9:;]*m|[^\x1b\r\n])*)/g);
-	let status: string | undefined;
-	for (const write of writes) {
-		const line = (write[1] ?? "").replace(ANSI, "").trim();
-		if (line.startsWith("storm") || (line.startsWith(STORM_MARK) && !/ · v\d+\.\d+\.\d+/.test(line))) status = line;
-	}
-	return status;
+export function statusLine(tui: Pick<Tui, "screen">): string | undefined {
+	return tui
+		.screen()
+		.viewport.map(row => row.trim())
+		.findLast(row => (row.startsWith("storm") || row.startsWith(STORM_MARK) || row.startsWith(STORM_MARK_ASCII)) && !/ · v\d+\.\d+\.\d+/.test(row));
+}
+
+const STORM_MARK_ASCII = "~ STORM";
+
+/** A selector box found on a screen: its title row and its options, top to bottom, the focus marker removed. */
+export interface SelectorBox {
+	title: string;
+	options: string[];
+}
+
+/**
+ * omp's selector on `viewport`: a box (`╭─ title ──╮` … `╰──╯`) whose last row before the bottom edge is the key hint
+ * (`↑/↓ navigate  ⏎ select  ⎋ cancel`). The lowest such box is the one that takes keys. `accept` can refuse a title.
+ */
+export function selectorOn(viewport: readonly string[], accept: (title: string) => boolean = () => true): SelectorBox | undefined {
+	const hint = viewport.findLastIndex(row => row.includes(SELECTOR_HINT) && row.includes(SELECTOR_HINT_END));
+	if (hint < 0) return undefined;
+	const top = viewport.slice(0, hint).findLastIndex(row => row.startsWith("╭─"));
+	if (top < 0) return undefined;
+	const title = (/^╭─\s*(.*?)\s*─+╮?\s*$/u.exec(viewport[top]!)?.[1] ?? "").trim();
+	if (!accept(title)) return undefined;
+	const options = rows(viewport.slice(top + 1, hint).join("\n"))
+		.map(row => row.replace(FOCUS, "").trim())
+		.filter(Boolean);
+	return options.length > 0 ? { title, options } : undefined;
 }
 
 /** The interactive TUI on a pty. Answers the terminal queries (DA1, OSC 11) the TUI waits for before it renders. */
 export class Tui {
 	raw = "";
-	readonly columns: number;
-	readonly rows: number;
+	columns: number;
+	rows: number;
 	/** The background this PTY reports over OSC 11; omp maps it to its light or dark theme. */
 	readonly background: "dark" | "light";
 	readonly #proc: Subprocess;
@@ -769,6 +793,8 @@ export class Tui {
 	readonly sessionDir: string;
 	#sessionId: string | undefined;
 	readonly #agentDir: string;
+	/** The terminal as a person sees it now, kept up to date with every chunk the host writes. */
+	#screen: Screen;
 
 	constructor(env: E2eEnv, options: SessionOptions) {
 		const tag = `tui-${String(++launches).padStart(3, "0")}`;
@@ -779,6 +805,7 @@ export class Tui {
 		this.columns = options.columns ?? 160;
 		this.rows = options.rows ?? 50;
 		this.background = options.background ?? "dark";
+		this.#screen = new Screen(this.columns, this.rows);
 		const decoder = new TextDecoder();
 		const args = [env.omp, ...sessionArgs(env, options, this.sessionDir)];
 		appendFileSync(join(env.logs, "launches.log"), `${tag} ${args.slice(1).join(" ")}\n`);
@@ -791,6 +818,7 @@ export class Tui {
 				data: (terminal, data) => {
 					const text = decoder.decode(data, { stream: true });
 					this.raw += text;
+					this.#screen.write(text);
 					appendFileSync(this.#log, text);
 					if (text.includes("\x1b[c")) terminal.write("\x1b[?62;22c");
 					if (text.includes("\x1b]11;?")) terminal.write(`\x1b]11;${this.background === "light" ? "rgb:ffff/ffff/ffff" : "rgb:1e1e/1e1e/1e1e"}\x1b\\`);
@@ -800,9 +828,41 @@ export class Tui {
 		open.add(this);
 	}
 
+	/**
+	 * Resizes the pty. The host answers the signal with a full repaint, which the emulator must see from a blank grid, so
+	 * the screen starts over at the new size (what scrolled off before is not kept).
+	 */
+	resize(columns: number, rows: number): void {
+		this.columns = columns;
+		this.rows = rows;
+		this.#screen = new Screen(columns, rows);
+		this.#proc.terminal?.resize(columns, rows);
+	}
+
 	/** What was printed after raw offset `from`, without escape sequences: the rows the TUI repainted since. */
 	text(from = 0): string {
-		return this.raw.slice(from).replace(ANSI, "").replace(/\r/g, "\n");
+		// OMP also rings the bell (BEL) when it wants attention (a finished turn, an ask); it is not a painted cell.
+		return this.raw.slice(from).replace(ANSI, "").replace(/\x07/g, "").replace(/\r/g, "\n");
+	}
+
+	/**
+	 * The terminal as a person sees it now: `viewport` is the screen, `scrollback` the rows that scrolled off its top.
+	 * omp 19.2 paints by diff, so a row that did not change is never written again: whatever must be judged as "on the
+	 * screen" (the composer, an open dialog, a form's focus, a live widget) is read here, not from `text()`.
+	 * `text(from)` stays the answer to "what was painted since".
+	 */
+	screen(): { viewport: string[]; scrollback: string[] } {
+		return { viewport: this.#screen.viewport(), scrollback: this.#screen.scrollback() };
+	}
+
+	/** Every row a person could read by scrolling: the scrollback, then the screen. */
+	history(): string[] {
+		return this.#screen.all();
+	}
+
+	/** The visible screen as one text, empty rows at the bottom cut. */
+	screenText(): string {
+		return this.#screen.text();
 	}
 
 	/** Waits until what was printed after raw offset `from` satisfies `probe`, and returns what it gave. */
@@ -852,20 +912,13 @@ export class Tui {
 	}
 
 	/**
-	 * The interactive terminal is ready when its composer row is drawn. That row is a box bottom (`╰─`, `+-` in an
-	 * ASCII preset) and appears at every width and theme; the model name deliberately disappears at 60 columns.
-	 * The next typed command still has to prove itself on screen: every caller waits for the actual dialog or report.
+	 * The interactive terminal is ready when the composer is on the screen: a row that begins with its box bottom
+	 * (`╰─`, `+-` in an ASCII preset). It is read from the screen, not the byte stream: omp paints by diff, so the
+	 * row is written once, with the key hint behind it, and never alone. The next typed command still has to prove
+	 * itself on screen: every caller waits for the actual dialog or report.
 	 */
 	async ready(): Promise<void> {
-		await this.seen(
-			0,
-			text => (text.split("\n").some(line => {
-				const row = line.trim();
-				return row === "╰─" || row === "+-";
-			}) ? true : undefined),
-			"the interactive composer",
-			90_000,
-		);
+		await until(() => (this.#screen.viewport().some(row => row.startsWith("╰─") || row.startsWith("+-")) ? true : undefined), 90_000, "the interactive composer");
 		this.#sessionId = await this.#identifySession();
 	}
 
@@ -887,36 +940,62 @@ export class Tui {
 		return mark;
 	}
 
-	/** Types a line into the composer, waits until the composer shows it, and submits it; returns the raw offset at the Enter. */
+	/** The composer's text as drawn now: its box row (`╰─ …`) and the continuation rows indented under it. */
+	composerText(): string {
+		const viewport = this.#screen.viewport();
+		const at = viewport.findLastIndex(row => row.startsWith("╰─") || row.startsWith("+-"));
+		if (at < 0) return "";
+		const rows = [viewport[at]!.slice(2)];
+		for (let next = at + 1; next < viewport.length && viewport[next]!.startsWith("   "); next++) rows.push(viewport[next]!);
+		return rows.join("").replace(/\s+/g, "");
+	}
+
+	/**
+	 * Types a line into the composer, waits until the composer shows it, and submits it; returns the raw offset at the
+	 * Enter. A long line arrives as a paste, and omp 19.2 may take an Enter that follows a paste at once as part of it,
+	 * so the line is let settle first, and an Enter that left the line in the composer is sent once more.
+	 */
 	async submit(line: string): Promise<number> {
 		const squash = (text: string): string => text.replace(/[\s│╭╮╰╯─]/g, "");
 		// A long line wraps, so its end is what to look for.
 		const end = squash(line).slice(-12);
 		await this.press(line, text => squash(text).includes(end), `the composer to show ${line.slice(0, 30)}`);
 		if (this.text().includes(SIGN_IN)) throw new Error("the provider sign-in picker is open: refusing to press Enter");
-		return this.send(KEY.enter);
+		// A long line is a paste: let it settle (nothing written for a moment; a live widget keeps painting, so bounded).
+		let quiet = this.raw.length;
+		let since = Date.now();
+		const give = Date.now() + (line.length > 200 ? 1_500 : 0);
+		while (Date.now() - since < 250 && Date.now() < give) {
+			await Bun.sleep(50);
+			if (this.raw.length !== quiet) {
+				quiet = this.raw.length;
+				since = Date.now();
+			}
+		}
+		const mark = this.send(KEY.enter);
+		// The line left the composer, or Enter was taken as part of the paste: then once more.
+		if (line.length > 200) {
+			const left = (): boolean => !this.composerText().includes(end);
+			const deadline = Date.now() + 3_000;
+			while (!left() && Date.now() < deadline) await Bun.sleep(50);
+			if (!left()) this.send(KEY.enter);
+		}
+		return mark;
 	}
 
 	/**
-	 * The options of the selector opened after raw offset `from`, top to bottom, once its rows are drawn down to the
-	 * key hints (the TUI repaints changed rows only, so the box's bottom edge may not come again). The first option
-	 * has the focus, and a selector that is drawn takes keys.
+	 * The options of omp's selector on the screen, top to bottom, once its box is drawn down to the key hints. The
+	 * first option has the focus, and a selector that is drawn takes keys. Only a selector whose title was painted
+	 * after raw offset `from` counts, so the dialog a key just closed is never mistaken for the next one.
 	 */
 	selector(from: number, timeoutMs = 90_000): Promise<string[]> {
-		return this.seen(
-			from,
-			text => {
-				const hint = text.indexOf(SELECTOR_HINT);
-				const top = text.lastIndexOf("╭─", hint);
-				if (hint < 0 || top < 0 || !text.slice(hint).includes(SELECTOR_HINT_END)) return undefined;
-				const options = rows(text.slice(top, text.lastIndexOf("\n", hint)))
-					.slice(1)
-					.map(row => row.replace(FOCUS, "").trim())
-					.filter(Boolean);
-				return options.length ? options : undefined;
+		return until(
+			() => {
+				const painted = this.text(from);
+				return selectorOn(this.#screen.viewport(), title => painted.includes(title))?.options;
 			},
-			"a selector",
 			timeoutMs,
+			"a selector",
 		);
 	}
 

@@ -1,32 +1,33 @@
 /**
- * Storm's live instrument below the editor. On a roomy ANSI terminal it is the lane view: a status row, then the
- * director's trunk and one line per plan lane, at a height fixed for the run. Everywhere else it is the single status
- * line with its radar (compact terminals get a static row). Tern clocks its own sheen, and still pictures or OMP motion
- * settings stop the only local repaint timer immediately.
+ * Storm's live instrument below the editor. On a roomy terminal it is the lane view: a status row, then the director's
+ * trunk and one line per plan lane, at a height fixed for the run. Everywhere else it is the single status line with
+ * its radar (compact terminals get a static row). A native (Tern) host gets a node tree instead, with the radar as a
+ * host-clocked `shimmer`; the only Storm-owned repaint timer exists in the terminal drawing, and omp's motion setting or
+ * a still picture stops it at once.
+ *
+ * The host builds a widget lazily and once (`ui/dock/widgets.tsx`), so the state of a run does not live in the factory:
+ * `LiveRunWidget` is created by `LiveStatus.show` and the factory only binds a view of it to the host that mounts it.
  */
-import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionContext, ExtensionRender, ExtensionRows, ExtensionTheme, ExtensionUiHost } from "@oh-my-pi/pi-coding-agent";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { motionEffectsEnabled, onMotionChange, scopedSettings } from "../discovery/settings.ts";
 import {
-	type Component,
-	type DescribeContext,
-	Ellipsis,
-	type NativeNode,
-	type ShimmerPalette,
-	col,
-	describeShimmer,
-	getThemeEpoch,
-	isNativeRendering,
-	motionEffectsEnabled,
-	onMotionEffectsChange,
-	onNativeRenderingChange,
-	row,
-	shimmerEnabled,
+	activeTheme,
+	depthOf,
+	h,
+	isDark,
+	type JSXNode,
+	nativeRendering,
+	presetOf,
+	signal,
 	span,
-	text,
-	truncateToWidth,
+	type Span,
+	symbolOf,
 	type Theme,
-	type TUI,
+	truncate,
+	type UiNode,
 	visibleWidth,
-} from "@oh-my-pi/pi-tui";
+} from "../tui/kit.ts";
 import type { RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
 import { LANE_MIN_COLUMNS, laneFrame, laneLiveliness } from "./lane/frame.ts";
@@ -56,6 +57,21 @@ const LANE_MAX_STEP_MS = 500;
 const LANE_MIN_HEIGHT = 6;
 const LANE_MAX_HEIGHT = 12;
 
+/**
+ * Rows each live widget drew at its last paint, kept until the widget stops (the dock drops and remounts a widget
+ * whenever another one comes or goes, so a mount that is gone for a moment still holds its rows). The dock
+ * bottom-aligns and loses the top rows of whatever overflows it, so a panel shown above the editor while the widget is
+ * on screen budgets its height without them.
+ */
+const drawnRows = new Map<object, number>();
+
+/** Rows the live widget takes below the editor right now (0 when none is mounted). */
+export function liveWidgetRows(): number {
+	let total = 0;
+	for (const rows of drawnRows.values()) total += rows;
+	return total;
+}
+
 /** The lane view's fixed height for a terminal of `terminalRows` rows: a third of it, between 6 and 12 rows. */
 export function laneHeight(terminalRows: number): number {
 	return Math.min(LANE_MAX_HEIGHT, Math.max(LANE_MIN_HEIGHT, Math.floor(terminalRows / 3)));
@@ -65,13 +81,16 @@ function laneTickMs(): number {
 	const env = process.env;
 	return (env.SSH_CONNECTION ?? "") !== "" || (env.SSH_TTY ?? "") !== "" ? LANE_SSH_TICK_MS : LANE_TICK_MS;
 }
+
 /** The ASCII preset keeps Storm's identity without a glyph the terminal cannot render. */
 const ASCII_MARK = "~ STORM";
+
+/** Theme colour keys of the radar's three tiers; the head of the field is always bold. */
 const RADAR_PALETTES = {
-	working: { low: "dim", mid: "accent", high: "mdLink", bold: true },
-	workers: { low: "dim", mid: "borderAccent", high: "mdLink", bold: true },
-	verifying: { low: "dim", mid: "borderAccent", high: "success", bold: true },
-} as const satisfies Record<"working" | "workers" | "verifying", ShimmerPalette>;
+	working: { low: "dim", mid: "accent", high: "mdLink" },
+	workers: { low: "dim", mid: "borderAccent", high: "mdLink" },
+	verifying: { low: "dim", mid: "borderAccent", high: "success" },
+} as const satisfies Record<"working" | "workers" | "verifying", { low: string; mid: string; high: string }>;
 
 // Single-cell braille gives the instrument a direction and texture without emoji presentation or ambiguous-width blocks.
 const RADAR = {
@@ -93,6 +112,8 @@ const RADAR_ASCII = {
 	stopping: "|/|/|/|/|/|/|/|/|/",
 } as const satisfies Record<RunPhase, string>;
 
+const strong = (theme: Theme, text: string): string => theme.style("strong", text);
+
 function radarFrame(phase: RunPhase, frame: number, theme: Theme, track: string): string {
 	if (!(phase in RADAR_PALETTES)) return theme.fg(RUN_APPEARANCE[phase].tone, track);
 	const motion = phase as keyof typeof RADAR_PALETTES;
@@ -109,7 +130,7 @@ function radarFrame(phase: RunPhase, frame: number, theme: Theme, track: string)
 	const left = Math.max(0, head - 3);
 	const right = Math.min(length, head + (motion === "verifying" ? 3 : 2));
 	return (left ? theme.fg(low, field.slice(0, left)) : "") +
-		theme.fg(mid, field.slice(left, head)) + theme.bold(theme.fg(high, field[head]!)) +
+		theme.fg(mid, field.slice(left, head)) + strong(theme, theme.fg(high, field[head]!)) +
 		theme.fg(mid, field.slice(head + 1, right)) +
 		(right < length ? theme.fg(low, field.slice(right)) : "");
 }
@@ -117,8 +138,6 @@ function radarFrame(phase: RunPhase, frame: number, theme: Theme, track: string)
 interface RadarLayout {
 	columns: number;
 	theme: Theme;
-	epoch: number;
-	preset: "unicode" | "nerd" | "ascii";
 	prefix: string;
 	metrics: string;
 	track: string;
@@ -132,15 +151,12 @@ interface FittedChip {
 	formIndex: number;
 }
 
-/** The text-span shape native `text` nodes take; kept concrete here instead of publishing an opaque helper type. */
-interface Span {
-	t: string;
-	s?: string;
-}
+const isAscii = (theme: Theme): boolean => presetOf(theme) === "ascii";
+const sepOf = (theme: Theme): string => symbolOf(theme, "sep.dot");
 
 /** The wind marker's ASCII form exists only in this widget; the footer keeps its own branding. */
 function markFor(theme: Theme): string {
-	return theme.getSymbolPreset() === "ascii" ? ASCII_MARK : STORM_MARK;
+	return isAscii(theme) ? ASCII_MARK : STORM_MARK;
 }
 
 /** A true interactive TUI session: RPC, print and subagent sessions keep the plain status line. */
@@ -150,7 +166,7 @@ export function isLiveTui(ctx: ExtensionContext): boolean {
 
 /** The visible icon prefix; ASCII's cost glyph is itself "$", so the value's own dollar is the whole mark. */
 function chipIcon(chip: LiveMetricChip, theme: Theme): string {
-	const icon = theme.symbol(chip.icon);
+	const icon = symbolOf(theme, chip.icon);
 	return chip.key === "cost" && icon === "$" ? "" : icon;
 }
 
@@ -200,7 +216,7 @@ function compareDetail(a: ChipFitQuality, b: ChipFitQuality): number {
  * chip set, so no chip is ever clipped to make room.
  */
 function fitChips(chips: readonly LiveMetricChip[], available: number, theme: Theme): FittedChip[] {
-	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
+	const sepWidth = visibleWidth(sepOf(theme));
 	let best: FittedChip[] = [];
 	let bestQuality = chipFitQuality([]);
 	const visit = (index: number, used: number, chosen: FittedChip[]): void => {
@@ -237,7 +253,7 @@ interface LiveLine {
  * `phase word + more chips`, and finally truncate the phase word itself. Phase is never dropped for a chip.
  */
 function chooseLine(facts: LiveMetricFacts, columns: number, theme: Theme): LiveLine | undefined {
-	const sepWidth = visibleWidth(theme.symbol("sep.dot"));
+	const sepWidth = visibleWidth(sepOf(theme));
 	const phaseWidth = visibleWidth(facts.phase.label);
 	const fullWidth = visibleWidth(markFor(theme)) + sepWidth + phaseWidth;
 	const candidates: LiveLine[] = [];
@@ -272,29 +288,28 @@ function ansiChip(entry: FittedChip, theme: Theme): string {
 	const prefix = icon === "" ? "" : theme.fg("dim", `${icon} `);
 	if (chip.key === "time") return `${prefix}${theme.fg("dim", form.value)}`;
 	const state = chip.state === undefined ? "" : ` ${theme.fg(chip.tone, LIVE_STATE_LABEL[chip.state])}`;
-	return `${prefix}${theme.bold(theme.fg(chip.tone, form.value))}${form.suffix === undefined ? "" : theme.fg("dim", form.suffix)}${state}`;
+	return `${prefix}${strong(theme, theme.fg(chip.tone, form.value))}${form.suffix === undefined ? "" : theme.fg("dim", form.suffix)}${state}`;
 }
 
 /** One whole ANSI row of chips; separators exist only between included chips. */
 function ansiMetrics(chips: readonly LiveMetricChip[], columns: number, theme: Theme): string {
-	const lead = theme.getSymbolPreset() === "ascii" ? "> " : "› ";
+	const lead = isAscii(theme) ? "> " : "› ";
 	const fitted = fitChips(chips, columns - visibleWidth(lead), theme);
 	if (fitted.length === 0) return "";
-	const sep = theme.fg("dim", theme.symbol("sep.dot"));
+	const sep = theme.fg("dim", sepOf(theme));
 	return `${theme.fg("dim", lead)}${fitted.map(entry => ansiChip(entry, theme)).join(sep)}`;
 }
 
 function singleRow(facts: LiveMetricFacts, columns: number, theme: Theme): readonly string[] {
 	const chosen = chooseLine(facts, columns, theme);
 	if (chosen === undefined) {
-		const ellipsis = theme.getSymbolPreset() === "ascii" ? Ellipsis.Ascii : Ellipsis.Unicode;
-		return [truncateToWidth(theme.fg(facts.phase.tone, facts.phase.label), columns, ellipsis)];
+		return [truncate(theme.fg(facts.phase.tone, facts.phase.label), columns, isAscii(theme) ? "..." : "…")];
 	}
 	const header = chosen.fullHeader
-		? `${theme.bold(theme.fg("accent", markFor(theme)))}${theme.fg("dim", theme.symbol("sep.dot"))}${theme.fg(facts.phase.tone, facts.phase.label)}`
+		? `${strong(theme, theme.fg("accent", markFor(theme)))}${theme.fg("dim", sepOf(theme))}${theme.fg(facts.phase.tone, facts.phase.label)}`
 		: theme.fg(facts.phase.tone, facts.phase.label);
 	if (chosen.chips.length === 0) return [header];
-	const sep = theme.fg("dim", theme.symbol("sep.dot"));
+	const sep = theme.fg("dim", sepOf(theme));
 	return [`${header}${sep}${chosen.chips.map(entry => ansiChip(entry, theme)).join(sep)}`];
 }
 
@@ -314,8 +329,9 @@ function chipSpans(entry: FittedChip, theme: Theme): Span[] {
 }
 
 /** A whole chip text node with its full accessible sentence; the layout only includes forms that fit. */
-function nativeChip(entry: FittedChip, theme: Theme): NativeNode {
-	return text(chipSpans(entry, theme), {
+function nativeChip(entry: FittedChip, theme: Theme): UiNode {
+	return h("text", {
+		spans: chipSpans(entry, theme),
 		wrap: "none",
 		truncate: "end",
 		shrink: 0,
@@ -324,22 +340,23 @@ function nativeChip(entry: FittedChip, theme: Theme): NativeNode {
 	});
 }
 
-function nativeMetricsRow(chips: readonly LiveMetricChip[], columns: number, theme: Theme): NativeNode {
-	const lead = theme.getSymbolPreset() === "ascii" ? "> " : "› ";
+function nativeMetricsRow(chips: readonly LiveMetricChip[], columns: number, theme: Theme): UiNode {
+	const lead = isAscii(theme) ? "> " : "› ";
 	const fitted = fitChips(chips, columns - visibleWidth(lead), theme);
-	const children: NativeNode[] = [text([span(lead, "dim")], { wrap: "none", shrink: 0 })];
+	const children: UiNode[] = [h("text", { spans: [span(lead, "dim")], wrap: "none", shrink: 0 })];
 	for (const entry of fitted) {
-		if (children.length > 1) children.push(text([span(theme.symbol("sep.dot"), "dim")], { wrap: "none", shrink: 0 }));
+		if (children.length > 1) children.push(h("text", { spans: [span(sepOf(theme), "dim")], wrap: "none", shrink: 0 }));
 		children.push(nativeChip(entry, theme));
 	}
-	return row(children, { align: "baseline", gap: "none", role: "omp.storm.live.metrics" });
+	return h("row", { align: "baseline", gap: "none", role: "omp.storm.live.metrics" }, ...children);
 }
 
 /** A narrow native host gets the same compact line as ANSI, with one overall accessible sentence. */
-function nativeCompactLine(facts: LiveMetricFacts, columns: number, theme: Theme): NativeNode {
+function nativeCompactLine(facts: LiveMetricFacts, columns: number, theme: Theme): UiNode {
 	const chosen = chooseLine(facts, columns, theme);
 	if (chosen === undefined) {
-		return text([span(facts.phase.label, facts.phase.tone)], {
+		return h("text", {
+			spans: [span(facts.phase.label, facts.phase.tone)],
 			wrap: "none",
 			truncate: "end",
 			shrink: 0,
@@ -348,26 +365,26 @@ function nativeCompactLine(facts: LiveMetricFacts, columns: number, theme: Theme
 		});
 	}
 	const spans: Span[] = chosen.fullHeader
-		? [span(markFor(theme), "accent"), span(theme.symbol("sep.dot"), "dim"), span(facts.phase.label, facts.phase.tone)]
+		? [span(markFor(theme), "accent"), span(sepOf(theme), "dim"), span(facts.phase.label, facts.phase.tone)]
 		: [span(facts.phase.label, facts.phase.tone)];
-	for (const entry of chosen.chips) {
-		spans.push(span(theme.symbol("sep.dot"), "dim"), ...chipSpans(entry, theme));
-	}
-	const header = chosen.fullHeader ? `${markFor(theme)}${theme.symbol("sep.dot")}${facts.phase.label}` : facts.phase.label;
+	for (const entry of chosen.chips) spans.push(span(sepOf(theme), "dim"), ...chipSpans(entry, theme));
+	const header = chosen.fullHeader ? `${markFor(theme)}${sepOf(theme)}${facts.phase.label}` : facts.phase.label;
 	const aria = chosen.chips.length === 0 ? header : `${header}: ${chosen.chips.map(entry => entry.chip.aria).join(" · ")}`;
-	return text(spans, { wrap: "none", truncate: "end", shrink: 0, role: "omp.storm.live", aria });
+	return h("text", { spans, wrap: "none", truncate: "end", shrink: 0, role: "omp.storm.live", aria });
 }
 
 /**
- * One session's live widget. `show` installs it once per active run and then updates the component in place;
- * `clear` removes it. `beginSession` invalidates an older session's asynchronous status refresh so a late
- * `syncSession` cannot install a widget for a run the user already switched away from.
+ * One session's live widget. `show` installs it once per active run and then updates it in place; `clear` removes it.
+ * `beginSession` invalidates an older session's asynchronous status refresh so a late `syncSession` cannot install a
+ * widget for a run the user already switched away from.
  */
 export class LiveStatus {
 	readonly #now: () => number;
 	readonly #laneView: (ctx: ExtensionContext) => boolean;
 	#ui: ExtensionContext["ui"] | undefined;
 	#widget: LiveRunWidget | undefined;
+	/** Whether the host holds a widget built from `#widget`, and in which drawing (terminal rows or native nodes). */
+	#installed: "rows" | "native" | undefined;
 	#statusCleared = false;
 	#epoch = 0;
 
@@ -395,30 +412,40 @@ export class LiveStatus {
 
 	/**
 	 * Shows `run` in the editor widget when this host can draw one. The phase is view-only evidence from the
-	 * controller and defaults to `working`, so existing callers keep the old behavior. Returns false for every
-	 * other host, whose caller keeps the plain `setStatus` text. Updates reuse the installed component and
-	 * request only its redraw.
+	 * controller and defaults to `working`. Returns false for every other host, whose caller keeps the plain
+	 * `setStatus` text. Updates reuse the one widget and only ask it to repaint.
 	 */
 	show(ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working"): boolean {
 		if (!isLiveTui(ctx)) return false;
 		const ui = ctx.ui;
 		if (this.#ui !== undefined && this.#ui !== ui) {
-			// The host was replaced: stop the old component without asking the new one to clear it.
+			// The host was replaced: stop the old widget without asking the new host to clear it.
 			this.#widget?.stop();
 			this.#widget = undefined;
-			this.#statusCleared = false;
-		}
-		if (this.#widget?.disposed === true) {
-			// The host removed or replaced the widget underneath us (its dispose ran): install again below.
-			this.#widget = undefined;
+			this.#installed = undefined;
 			this.#statusCleared = false;
 		}
 		const now = this.#now();
 		const laneView = this.#laneView(ctx);
-		if (this.#widget === undefined) {
-			if (!this.#install(ui, run, now, phase, laneView)) return false;
-		} else {
-			this.#widget.update(run, now, phase, laneView);
+		const fresh = this.#widget === undefined;
+		const widget = (this.#widget ??= new LiveRunWidget(run, now, phase, {
+			clock: this.#now,
+			laneView,
+			settings: scopedSettings(),
+			onDropped: () => {
+				// The host removed or replaced the widget underneath us: the next `show` installs it again.
+				this.#installed = undefined;
+				this.#statusCleared = false;
+			},
+		}));
+		if (!fresh) widget.update(run, now, phase, laneView);
+		const drawing = nativeRendering() ? "native" : "rows";
+		if (this.#installed !== drawing && !this.#install(ui, widget, drawing)) {
+			if (fresh) {
+				widget.stop();
+				this.#widget = undefined;
+			}
+			return false;
 		}
 		this.#ui = ui;
 		// The run's label moved into the widget: the status line must not keep a second live copy.
@@ -435,65 +462,46 @@ export class LiveStatus {
 		const ui = this.#ui;
 		this.#widget = undefined;
 		this.#ui = undefined;
+		this.#installed = undefined;
 		this.#statusCleared = false;
 		widget?.stop();
 		if (ui === undefined) return;
 		try {
 			ui.setWidget(LIVE_WIDGET_KEY, undefined);
 		} catch {
-			// The host is going away or no longer accepts widgets; the component's timer is already stopped.
+			// The host is going away or no longer accepts widgets; the widget's timer is already stopped.
 		}
 	}
 
-	#install(ui: ExtensionContext["ui"], run: RunRecord, now: number, phase: RunPhase, laneView: boolean): boolean {
-		let created: LiveRunWidget | undefined;
+	#install(ui: ExtensionContext["ui"], widget: LiveRunWidget, drawing: "rows" | "native"): boolean {
 		try {
-			ui.setWidget(
-				LIVE_WIDGET_KEY,
-				(tui, hostTheme) => {
-					const widget = new LiveRunWidget(tui, () => ui.theme ?? hostTheme, run, now, phase, {
-						clock: this.#now,
-						laneView,
-						onDisposed: () => {
-							if (this.#widget !== widget) return;
-							this.#widget = undefined;
-							this.#statusCleared = false;
-						},
-					});
-					created = widget;
-					return widget;
-				},
-				{ placement: "belowEditor" },
-			);
+			ui.setWidget(LIVE_WIDGET_KEY, (host, theme) => widget.attach(host, theme), { placement: "belowEditor" });
 		} catch {
 			// Without a widget the caller falls back to the plain status line.
 			return false;
 		}
-		this.#widget = created;
-		return created !== undefined;
+		this.#installed = drawing;
+		return true;
 	}
 }
 
-/** `requestComponentRender` is the scoped request older and newer TUI hosts all answer; plain render is the fallback. */
-type ComponentTui = Omit<TUI, "requestComponentRender" | "terminal"> & {
-	requestComponentRender?: (component: Component) => void;
-	/** Absent in hosts that cannot say how tall the terminal is; the lane view then stays off. */
-	terminal?: Pick<TUI["terminal"], "rows">;
-};
+/** What the host mounted: its handle, the theme it handed over, and the theme that was active then. */
+interface Mount {
+	readonly ui: ExtensionUiHost;
+	readonly theme: Theme;
+	readonly mountedActive: Theme;
+}
 
-/** The ANSI row of the status line in lane mode, shaped for one width, theme and set of facts. */
+/** The ANSI row of the status line in lane mode, shaped for one width and theme. */
 interface StatusRow {
 	columns: number;
 	theme: Theme;
-	epoch: number;
-	preset: "unicode" | "nerd" | "ascii";
 	row: string;
 }
 
 /**
- * The widget Storm mounts below the editor for one run. Two ANSI drawings share it: the lane view (status row, trunk
- * and lanes) and the single status line with its radar; native rendering describes the line and the host clocks its
- * sheen.
+ * The state of one run's live widget, and what it draws. Two terminal drawings share it: the lane view (status row,
+ * trunk and lanes) and the single status line with its radar; a native host gets nodes and clocks the radar itself.
  *
  * The lane view's height is decided once, the first time its conditions hold, and never changes while the widget is
  * mounted: omp's below-editor area only grows, so a height that shrank would leave blank rows and one that grew
@@ -501,64 +509,101 @@ interface StatusRow {
  * stop holding (the switch is turned off, the window gets narrow, short or ASCII) it draws the single line at the top
  * of those rows and leaves the rest blank.
  */
-class LiveRunWidget implements Component {
-	#tui: ComponentTui;
-	#theme: () => Theme;
+class LiveRunWidget {
+	#mount: { mount: Mount; token: object } | undefined;
 	#phase: RunPhase;
 	/** Shaped only when the controller supplies a new snapshot, not during animation ticks. */
 	#facts: LiveMetricFacts;
-	#onDisposed: (() => void) | undefined;
-	#offMotion: () => void;
-	#offNative: () => void;
+	readonly #onDropped: (() => void) | undefined;
+	readonly #clock: () => number;
+	readonly #settings: Settings | undefined;
+	readonly #offMotion: () => void;
+	/** omp's motion switch (`tui.motion`, `display.shimmer`), kept current by its change notification. */
+	#motion: boolean;
+	#stopped = false;
 	#timer: NodeJS.Timeout | undefined;
-	#disposed = false;
+	#timerPeriod = 0;
 	#columns = 0;
 	#frame = 0;
 	#layout: RadarLayout | undefined;
-	#native: { theme: Theme; key: string; node: NativeNode } | undefined;
-	readonly #clock: () => number;
+	#status: StatusRow | undefined;
 	#laneView: boolean;
 	#runId: string;
 	#timeline = new LaneTimeline();
 	/** Rows reserved for the lane view; undefined until its conditions first hold. */
 	#height: number | undefined;
-	#status: StatusRow | undefined;
-	#timerPeriod = 0;
 	/** Animation time: advances only while the timer runs, so a restart continues the motion instead of jumping. */
 	#animTime = 0;
 	#animAt: number | undefined;
+	/** Bumped when the native tree has to be built again (a native host's nodes read it). */
+	readonly #revision = signal(0);
 
 	constructor(
-		tui: TUI,
-		theme: () => Theme,
 		run: RunRecord,
 		now: number,
 		phase: RunPhase,
-		options: { onDisposed?: () => void; clock?: () => number; laneView?: boolean } = {},
+		options: { onDropped?: () => void; clock?: () => number; laneView?: boolean; settings?: Settings | undefined } = {},
 	) {
-		this.#tui = tui;
-		this.#theme = theme;
 		this.#phase = phase;
 		this.#facts = liveMetricFacts(run, phase, now);
-		this.#onDisposed = options.onDisposed;
+		this.#onDropped = options.onDropped;
 		this.#clock = options.clock ?? Date.now;
 		this.#laneView = options.laneView ?? true;
+		this.#settings = options.settings;
 		this.#runId = run.runId;
 		this.#timeline.observe(run, phase, now);
-		this.#offMotion = onMotionEffectsChange(() => this.#settingsChanged());
-		this.#offNative = onNativeRenderingChange(() => this.#settingsChanged());
-	}
-
-	get disposed(): boolean {
-		return this.#disposed;
+		this.#motion = motionEffectsEnabled(this.#settings);
+		this.#offMotion = onMotionChange(this.#settings, () => this.#motionChanged());
 	}
 
 	/**
-	 * The controller's live record, phase or the lane view switch changed: repaint, but keep the one installed
-	 * component. The timeline sees every update, even one that changes no chip, because lanes move without them.
+	 * The host mounts the widget: terminal hosts get rows, a native host gets nodes. The factory may run again if the
+	 * host rebuilds its dock; the newest mount is the one that draws.
+	 */
+	attach(ui: ExtensionUiHost, theme: ExtensionTheme): ExtensionRender {
+		if (this.#stopped) return { render: () => [] };
+		const mount: Mount = { ui, theme, mountedActive: activeTheme() };
+		const token = {};
+		// A rebuilt dock mounts afresh: the old mount's timer must not outlive it (the next render starts a new one).
+		this.#stopTimer();
+		this.#mount = { mount, token };
+		if (nativeRendering()) {
+			const node = h("col", { gap: "none" }, () => this.#nativeNode(mount));
+			node.onDispose(() => this.#detach(token));
+			return node;
+		}
+		const rows: ExtensionRows = {
+			render: width => this.#render(token, mount, width),
+			dispose: () => this.#detach(token),
+		};
+		return rows;
+	}
+
+	/** The host dropped a mount. Only the current one counts: an older one was replaced by a rebuild. */
+	#detach(token: object): void {
+		if (this.#mount?.token !== token) return;
+		this.#mount = undefined;
+		this.#stopTimer();
+		if (!this.#stopped) this.#onDropped?.();
+	}
+
+	/** Stopped for good: the run ended, the session switched or the host was replaced. Idempotent. */
+	stop(): void {
+		if (this.#stopped) return;
+		this.#stopped = true;
+		this.#mount = undefined;
+		drawnRows.delete(this);
+		this.#stopTimer();
+		this.#offMotion();
+		this.#invalidate();
+	}
+
+	/**
+	 * The controller's live record, phase or the lane view switch changed: repaint, but keep the one widget. The
+	 * timeline sees every update, even one that changes no chip, because lanes move without them.
 	 */
 	update(run: RunRecord, now: number, phase: RunPhase, laneView: boolean = this.#laneView): void {
-		if (this.#disposed) return;
+		if (this.#stopped) return;
 		if (run.runId !== this.#runId) {
 			// One timeline belongs to one run.
 			this.#runId = run.runId;
@@ -573,32 +618,51 @@ class LiveRunWidget implements Component {
 		if (this.#phase !== phase) this.#frame = 0;
 		this.#facts = facts;
 		this.#phase = phase;
-		this.invalidate();
+		this.#invalidate();
 		this.#syncTimer();
 		this.#requestRender();
 	}
 
-	/** Whether the lane view is what this widget draws at the width it was last given. */
-	#laneShown(): boolean {
-		return this.#columns > 0 && this.#laneEligible(this.#columns, this.#theme());
+	/** The theme to draw with: the one the host handed over, unless the user switched themes since. */
+	#themeOf(mount: Mount): Theme {
+		const active = activeTheme();
+		return active === mount.mountedActive ? mount.theme : active;
 	}
 
-	/** The lane view's conditions: ANSI rendering, room in both directions, a glyph preset with Braille, switch on. */
-	#laneEligible(columns: number, theme: Theme): boolean {
-		if (!this.#laneView || isNativeRendering()) return false;
-		if (columns < LANE_MIN_COLUMNS || theme.getSymbolPreset() === "ascii") return false;
-		const rows = this.#tui.terminal?.rows;
+	/** The terminal's height as the host reports it; undefined when it cannot say. */
+	#terminalRows(ui: ExtensionUiHost): number | undefined {
+		const rows = ui.size().rows;
+		return Number.isFinite(rows) && rows > 0 ? rows : undefined;
+	}
+
+	/** Whether the lane view is what this widget draws at the width it was last given. */
+	#laneShown(): boolean {
+		const current = this.#mount;
+		if (current === undefined || this.#columns === 0) return false;
+		return this.#laneEligible(this.#columns, this.#themeOf(current.mount), this.#terminalRows(current.mount.ui));
+	}
+
+	/** The lane view's conditions: terminal drawing, room in both directions, a glyph preset with Braille, switch on. */
+	#laneEligible(columns: number, theme: Theme, rows: number | undefined): boolean {
+		if (!this.#laneView || nativeRendering()) return false;
+		if (columns < LANE_MIN_COLUMNS || isAscii(theme)) return false;
 		return rows !== undefined && rows >= LANE_MIN_ROWS;
 	}
 
-	render(width: number): readonly string[] {
-		if (this.#disposed) return [];
+	#render(token: object, mount: Mount, width: number): readonly string[] {
+		if (this.#stopped || this.#mount?.token !== token) return [];
 		const columns = Math.max(0, Math.floor(width));
 		this.#columns = columns;
-		const theme = this.#theme();
-		const lane = columns > 0 && this.#laneEligible(columns, theme);
-		if (lane && this.#height === undefined) this.#height = laneHeight(this.#tui.terminal?.rows ?? LANE_MIN_ROWS);
-		if (lane) return this.#laneRows(columns, theme);
+		const theme = this.#themeOf(mount);
+		const terminalRows = this.#terminalRows(mount.ui);
+		const lane = columns > 0 && this.#laneEligible(columns, theme, terminalRows);
+		if (lane && this.#height === undefined) this.#height = laneHeight(terminalRows ?? LANE_MIN_ROWS);
+		const rows = lane ? this.#laneRows(columns, theme) : this.#singleRows(columns, theme);
+		drawnRows.set(this, rows.length);
+		return rows;
+	}
+
+	#singleRows(columns: number, theme: Theme): readonly string[] {
 		this.#syncTimer();
 		if (columns === 0) return this.#padded([]);
 		return this.#padded(this.#lineRows(columns, theme));
@@ -623,32 +687,27 @@ class LiveRunWidget implements Component {
 			this.#animAt = now;
 		}
 		const frame = laneFrame(snapshot, columns, this.#animTime, {
-			motion: this.#motionOn(),
+			motion: this.#motion,
 			maxRows: height - 1,
-			colour: theme.getColorMode() === "truecolor" ? "truecolor" : "256",
-			dark: !theme.isLight,
+			colour: depthOf(theme) === "truecolor" ? "truecolor" : "256",
+			dark: isDark(theme),
 		});
 		return this.#padded([this.#statusRow(columns, theme), ...frame]);
 	}
 
 	/** Row 0 of the lane view: mark, phase and chips, without the radar (the trunk carries the motion). */
 	#statusRow(columns: number, theme: Theme): string {
-		const epoch = getThemeEpoch();
-		const preset = theme.getSymbolPreset();
 		const cached = this.#status;
-		if (cached?.columns === columns && cached.theme === theme && cached.epoch === epoch && cached.preset === preset) return cached.row;
+		if (cached?.columns === columns && cached.theme === theme) return cached.row;
 		const row = singleRow(this.#facts, columns, theme)[0] ?? "";
-		this.#status = { columns, theme, epoch, preset, row };
+		this.#status = { columns, theme, row };
 		return row;
 	}
 
 	/** The single status line with its radar, exactly as before the lane view existed. */
 	#lineRows(columns: number, theme: Theme): readonly string[] {
-		const epoch = getThemeEpoch();
-		const preset = theme.getSymbolPreset();
-		const layout = this.#layout?.columns === columns && this.#layout.theme === theme &&
-			this.#layout.epoch === epoch && this.#layout.preset === preset
-			? this.#layout : (this.#layout = this.#buildLayout(columns, theme, epoch, preset));
+		const layout = this.#layout?.columns === columns && this.#layout.theme === theme
+			? this.#layout : (this.#layout = this.#buildLayout(columns, theme));
 		if (!this.#ticking()) return layout.still;
 		return (layout.frames[this.#frame] ??= [
 			`${layout.prefix}${radarFrame(this.#phase, this.#frame, theme, layout.track)}${theme.fg("dim", "]")}`,
@@ -656,85 +715,63 @@ class LiveRunWidget implements Component {
 		]);
 	}
 
-	#buildLayout(columns: number, theme: Theme, epoch: number, preset: "unicode" | "nerd" | "ascii"): RadarLayout {
-		const ascii = preset === "ascii";
-		const track = ascii ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
-		const header = `${theme.bold(theme.fg("accent", markFor(theme)))}${theme.fg("dim", theme.symbol("sep.dot"))}${theme.fg(this.#facts.phase.tone, this.#facts.phase.label)}`;
+	#buildLayout(columns: number, theme: Theme): RadarLayout {
+		const track = isAscii(theme) ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
+		const header = `${strong(theme, theme.fg("accent", markFor(theme)))}${theme.fg("dim", sepOf(theme))}${theme.fg(this.#facts.phase.tone, this.#facts.phase.label)}`;
 		if (columns < RADAR_COLUMNS) {
-			return { columns, theme, epoch, preset, prefix: "", metrics: "", track, still: singleRow(this.#facts, columns, theme), frames: [] };
+			return { columns, theme, prefix: "", metrics: "", track, still: singleRow(this.#facts, columns, theme), frames: [] };
 		}
-		const headerWidth = visibleWidth(markFor(theme)) + visibleWidth(theme.symbol("sep.dot")) + visibleWidth(this.#facts.phase.label);
+		const headerWidth = visibleWidth(markFor(theme)) + visibleWidth(sepOf(theme)) + visibleWidth(this.#facts.phase.label);
 		const prefix = `${header}${" ".repeat(Math.max(1, columns - headerWidth - visibleWidth(track) - 2))}${theme.fg("dim", "[")}`;
 		const metrics = ansiMetrics(this.#facts.chips, columns, theme);
 		const still = [`${prefix}${theme.fg(this.#facts.phase.tone, track)}${theme.fg("dim", "]")}`, metrics];
-		return { columns, theme, epoch, preset, prefix, metrics, track, still, frames: [] };
+		return { columns, theme, prefix, metrics, track, still, frames: [] };
 	}
 
-	describe(cx?: DescribeContext): NativeNode | null {
-		if (this.#disposed) return null;
-		this.#stopTimer(); // Tern paints its own sheen.
-		const columns = Math.max(0, Math.floor(cx?.cols ?? RADAR_COLUMNS));
+	/**
+	 * What a native host draws: the compact line under 52 columns, otherwise the header with the radar and the chips.
+	 * The radar is a `shimmer` the host clocks itself (it honours the host's reduced motion), so no Storm timer runs.
+	 * Reads the revision, the theme and the terminal width, so it is built again when any of them changes.
+	 */
+	#nativeNode(mount: Mount): JSXNode {
+		this.#revision();
+		const theme = this.#themeOf(mount);
+		const columns = Math.max(0, Math.floor(mount.ui.size().columns));
 		const wide = columns >= RADAR_COLUMNS;
-		const shimmer = wide && this.#animated() && cx?.reduceMotion !== true && (cx?.supports("shimmer") ?? true);
-		const theme = this.#theme();
-		const epoch = getThemeEpoch();
-		const preset = theme.getSymbolPreset();
-		const key = `${wide}|${shimmer}|${columns}|${epoch}|${preset}`;
-		const cached = this.#native;
-		if (cached !== undefined && cached.theme === theme && cached.key === key) return cached.node;
-		const ascii = preset === "ascii";
-		const track = ascii ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
-		let described: NativeNode;
-		if (wide) {
-			const header = text([
-				span(markFor(theme), "accent"),
-				span(theme.symbol("sep.dot"), "dim"),
-				span(this.#facts.phase.label, this.#facts.phase.tone),
-			], { wrap: "none", truncate: "end", shrink: 0 });
-			const field = shimmer
-				? describeShimmer([{ text: track, palette: RADAR_PALETTES[this.#phase as keyof typeof RADAR_PALETTES] }], "storm-radar")
-				: text([span(track, this.#facts.phase.tone)], { wrap: "none", shrink: 0 });
-			described = col([
-				row([
-					header,
-					text(" ", { grow: 1, min: { w: "0ch" } }),
-					text([span("[", "dim")], { shrink: 0 }), field, text([span("]", "dim")], { shrink: 0 }),
-				], { align: "baseline", gap: "none" }),
-				nativeMetricsRow(this.#facts.chips, columns, theme),
-			], { gap: "none" });
-		} else {
-			described = nativeCompactLine(this.#facts, columns, theme);
-		}
-		this.#native = { theme, key, node: described };
-		return described;
-	}
-
-	dispose(): void {
-		this.stop();
-	}
-
-	/** Idempotent: the host may dispose the component, and `LiveStatus.clear()` may have stopped it already. */
-	stop(): void {
-		if (this.#disposed) return;
-		this.#disposed = true;
-		this.#stopTimer();
-		this.#offMotion();
-		this.#offNative();
-		this.invalidate();
-		this.#onDisposed?.();
-	}
-
-	/** OMP's motion setting, the gate both drawings share. */
-	#motionOn(): boolean {
-		return !this.#disposed && motionEffectsEnabled() && shimmerEnabled();
+		if (!wide) return nativeCompactLine(this.#facts, columns, theme);
+		const track = isAscii(theme) ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
+		const tone = this.#facts.phase.tone;
+		const header = h("text", {
+			spans: [span(markFor(theme), "accent"), span(sepOf(theme), "dim"), span(this.#facts.phase.label, tone)],
+			wrap: "none",
+			truncate: "end",
+			shrink: 0,
+		});
+		const field = this.#animated()
+			? h("shimmer", { text: track, palette: RADAR_PALETTES[this.#phase as keyof typeof RADAR_PALETTES] })
+			: h("text", { spans: [span(track, tone)], wrap: "none", shrink: 0 });
+		return h(
+			"col",
+			{ gap: "none" },
+			h(
+				"row",
+				{ align: "baseline", gap: "none" },
+				header,
+				h("text", { text: " ", grow: 1, min: { w: "0ch" } }),
+				h("text", { spans: [span("[", "dim")], shrink: 0 }),
+				field,
+				h("text", { spans: [span("]", "dim")], shrink: 0 }),
+			),
+			nativeMetricsRow(this.#facts.chips, columns, theme),
+		);
 	}
 
 	#animated(): boolean {
-		return this.#motionOn() && RUN_APPEARANCE[this.#phase].motion;
+		return this.#motion && RUN_APPEARANCE[this.#phase].motion;
 	}
 
 	#ticking(): boolean {
-		return this.#columns >= RADAR_COLUMNS && this.#animated() && !isNativeRendering();
+		return this.#columns >= RADAR_COLUMNS && this.#animated() && !nativeRendering();
 	}
 
 	/**
@@ -742,16 +779,16 @@ class LiveRunWidget implements Component {
 	 * liveliness: full pace, a slow pulse, or none; the radar follows its phase.
 	 */
 	#period(snapshot?: LaneSnapshot): number | undefined {
-		if (this.#disposed || this.#columns === 0) return undefined;
+		if (this.#stopped || this.#mount === undefined || this.#columns === 0) return undefined;
 		if (this.#laneShown()) {
-			if (!this.#motionOn()) return undefined;
+			if (!this.#motion) return undefined;
 			const liveliness = laneLiveliness(snapshot ?? this.#timeline.snapshot(this.#clock()));
 			return liveliness === "still" ? undefined : liveliness === "slow" ? LANE_SLOW_TICK_MS : laneTickMs();
 		}
 		return this.#ticking() ? RADAR_TICK_MS : undefined;
 	}
 
-	/** One scoped repaint timer, only while something on screen moves. */
+	/** One repaint timer, only while something on screen moves. */
 	#syncTimer(snapshot?: LaneSnapshot): void {
 		const period = this.#period(snapshot);
 		if (period === undefined) {
@@ -789,23 +826,23 @@ class LiveRunWidget implements Component {
 		this.#animAt = undefined;
 	}
 
-	#settingsChanged(): void {
-		if (this.#disposed) return;
-		this.invalidate();
+	/** `tui.motion` or `display.shimmer` changed: the picture, the timer and a native radar follow at once. */
+	#motionChanged(): void {
+		if (this.#stopped) return;
+		this.#motion = motionEffectsEnabled(this.#settings);
+		this.#invalidate();
 		this.#syncTimer();
 		this.#requestRender();
 	}
 
 	#requestRender(): void {
-		if (this.#disposed) return;
-		const request = this.#tui.requestComponentRender;
-		if (request !== undefined) request.call(this.#tui, this);
-		else this.#tui.requestRender();
+		if (this.#stopped) return;
+		this.#revision.set(this.#revision.peek() + 1);
+		this.#mount?.mount.ui.requestRender();
 	}
 
-	invalidate(): void {
+	#invalidate(): void {
 		this.#layout = undefined;
 		this.#status = undefined;
-		this.#native = undefined;
 	}
 }

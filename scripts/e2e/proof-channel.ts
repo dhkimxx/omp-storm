@@ -307,7 +307,7 @@ async function main(): Promise<void> {
 						results.every(result => typeof result.outputPath === "string" && result.outputPath !== ""),
 						JSON.stringify(results.map(result => [result.id, result.outputPath])),
 					);
-					// Baseline 19.0.1: a sync child's temp .md is removed before tool_result for non-isolated runs; the
+					// Baseline 19.0.1, and the check below passes on 19.2.1: a sync child's temp .md is removed before tool_result for non-isolated runs; the
 					// isolated child keeps its output and patch. A caller must not treat every outputPath as durable.
 					check(
 						"only the isolated sync child's reported artifacts are readable at tool-result time",
