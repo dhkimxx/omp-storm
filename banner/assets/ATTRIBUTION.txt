@@ -1,0 +1,12 @@
+Brand icon artwork from Lobe Icons by LobeHub.
+Source: https://github.com/lobehub/lobe-icons
+Commit: 05260484d9f4de68f90cc87a634ae68fa4043efd
+License: MIT; see LICENSE-lobe-icons.txt.
+Logos and brand names identify their respective owners. This artwork does not imply endorsement.
+
+openai: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/openai.svg
+claude: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/claude-color.svg
+gemini: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/gemini-color.svg
+grok: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/grok.svg
+deepseek: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/deepseek-color.svg
+qwen: https://github.com/lobehub/lobe-icons/blob/05260484d9f4de68f90cc87a634ae68fa4043efd/packages/static-svg/icons/qwen-color.svg

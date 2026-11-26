@@ -1,0 +1,16 @@
+{
+  "name": "omp-storm-cyclone",
+  "version": "2.0.0",
+  "private": true,
+  "description": "OMP STORM CYCLONE with directed handoffs and a sweeping title gradient",
+  "scripts": {
+    "preview": "node render.cjs --preview",
+    "render": "node render.cjs",
+    "gif": "node encode-gif.cjs",
+    "webp": "sh encode-webp.sh"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "0.1.100",
+    "sharp": "0.35.5"
+  }
+}
