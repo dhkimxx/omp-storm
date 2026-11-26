@@ -5,6 +5,7 @@
   "description": "OMP Storm: plan, delegate, and verify coding, research, and operational work in omp",
   "type": "module",
   "author": "dhkimxx",
+  "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/dhkimxx/omp-storm.git" },
   "keywords": ["omp-plugin", "oh-my-pi", "omp", "multi-agent", "orchestration"],
   "files": ["src", "agents", "priors", "README.md"],
