@@ -1,12 +1,17 @@
 /**
- * Layout of the "storm" variant: a run snapshot in, geometry out (strands, marks, labels). No colour, no drawing and no
+ * Layout of the lane view: a lane snapshot in, geometry out (strands, marks, labels). No colour, no drawing and no
  * animation time live here.
  *
  * Time axis: the picture covers the smallest step of LADDER_S that is at least 8% longer than the run so far, mapped
  * linearly onto the graph area, so the head ("now") sits between about 65% and 92% of its width.
  *
+ * Rows: the trunk, then the shown lanes ordered by start time, then a summary row when lanes are folded. The height is
+ * `maxRows` at most. When the lanes do not fit, `FOLD_RANK` and `foldsBefore` decide which ones go into the summary:
+ * finished lanes first, then lanes that have not started, then (only when that is still not enough) lanes that wait for
+ * a decision. Lanes that are working stay visible. Every lane keeps its index, so its hue and its marks do not move
+ * when others fold.
+ *
  * Routing (the "rake"):
- * - Rows are the trunk, then the shown lanes ordered by start time, then a summary row when lanes are folded.
  * - Lanes whose starts lie within GROUP_DOTS dots of the first start of a group share one stem: a vertical line that
  *   drops from the trunk at the group's first start. Every lane peels off to the right on its own row with a small
  *   quarter arc; the stem keeps going down past it to the next lane of the group. Peeling always goes right, so a
@@ -20,7 +25,9 @@
  * - A dependency link is a vertical dotted strand at the moment the wait ended (or now, while it still lasts), from the
  *   prerequisite's row to the waiting lane's row. It is faint, so it crosses without gaps.
  */
-import type { Lane, LaneState, Phase, Role, RunSnapshot } from "../model.ts";
+import type { RunPhase } from "../appearance.ts";
+import type { LaneSnapshot, LaneState, LaneTrack } from "./model.ts";
+import { textWidth } from "./canvas.ts";
 import type { Label, Mark, PathPoint, Scene, Strand } from "./scene.ts";
 
 const LADDER_S = [30, 45, 60, 90, 120, 180, 300, 480, 720, 1200, 1800, 2700, 3600, 5400, 7200, 10800, 14400, 21600, 28800, 43200, 86400];
@@ -36,12 +43,14 @@ const JOIN_GAP = 2;
 /** Spacing of the nodes on a job lane, in dots. */
 const JOB_STEP = 10;
 
-const ROLE_WORD: Record<Role, string> = { explorer: "탐색", implementer: "구현", reviewer: "검토", quick: "빠른", architect: "설계" };
-const STATE_WORD: Record<LaneState, string> = {
+/** What the trunk row is called. */
+export const TRUNK_LABEL = "감독";
+/** The word a lane row ends with for each state. */
+export const STATE_WORD: Record<LaneState, string> = {
 	reserved: "예약", waiting: "선행 대기", running: "작업 중", quiet: "조용", submitted: "제출", reviewing: "검토 중",
 	accepted: "승인", unmet: "미충족", blocked: "막힘", excluded: "제외", idle: "유휴",
 };
-const PHASE_WORDS: Record<Phase, readonly string[]> = {
+const PHASE_WORDS: Record<RunPhase, readonly string[]> = {
 	working: ["진행 중"],
 	workers: ["워커 작업 중", "워커 작업"],
 	"waiting-user": ["응답 대기"],
@@ -49,32 +58,28 @@ const PHASE_WORDS: Record<Phase, readonly string[]> = {
 	"between-rounds": ["다음 라운드 대기", "다음 라운드", "다음 대기"],
 	stopping: ["종료 정리 중", "종료 중"],
 };
+/**
+ * How early a lane in this state folds into the summary row when the lanes do not fit: higher folds first.
+ * Finished lanes (6), then lanes that have not started (5 reserved, 4 waiting), then lanes whose worker is idle or whose
+ * result waits for a verdict (2), then lanes that need a person's eye (1), and last the lanes that are working (0).
+ */
+const FOLD_RANK: Record<LaneState, number> = {
+	accepted: 6, excluded: 6, reserved: 5, waiting: 4, submitted: 2, idle: 2, blocked: 1, unmet: 1, running: 0, quiet: 0, reviewing: 0,
+};
+const FINISHED_RANK = 6;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Text helpers (display width, not string length)
 // ---------------------------------------------------------------------------------------------------------------
 
-function charWidth(code: number): number {
-	if (code === 0 || (code >= 0x300 && code <= 0x36f) || code === 0x200d || (code >= 0xfe00 && code <= 0xfe0f)) return 0;
-	return (code >= 0x1100 && code <= 0x115f) || (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xac00 && code <= 0xd7a3) ||
-		(code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe30 && code <= 0xfe6f) || (code >= 0xff00 && code <= 0xff60) ||
-		(code >= 0xffe0 && code <= 0xffe6) || (code >= 0x1f300 && code <= 0x1faff) || (code >= 0x20000 && code <= 0x3fffd)
-		? 2 : 1;
-}
-
-function cells(text: string): number {
-	let width = 0;
-	for (const char of text) width += charWidth(char.codePointAt(0)!);
-	return width;
-}
-
-/** Cuts `text` to `width` display columns, ending in an ellipsis when something was cut. */
+/** Cuts `text` to `width` display cells, ending in an ellipsis when something was cut. */
 function clip(text: string, width: number): string {
-	if (cells(text) <= width) return text;
+	if (width <= 0) return "";
+	if (textWidth(text) <= width) return text;
 	let out = "";
 	let used = 0;
 	for (const char of text) {
-		const w = charWidth(char.codePointAt(0)!);
+		const w = textWidth(char);
 		if (used + w > width - 1) break;
 		out += char;
 		used += w;
@@ -82,8 +87,9 @@ function clip(text: string, width: number): string {
 	return `${out}…`;
 }
 
+/** Pads with spaces to `width` display cells (and never cuts). */
 function padEnd(text: string, width: number): string {
-	return text + " ".repeat(Math.max(0, width - cells(text)));
+	return text + " ".repeat(Math.max(0, width - textWidth(text)));
 }
 
 function fmtSpan(ms: number): string {
@@ -106,7 +112,7 @@ function niceSpan(now: number): number {
 	return Math.ceil((now * 1.08) / 86_400_000) * 86_400_000;
 }
 
-function lastState(lane: Lane): LaneState {
+function lastState(lane: LaneTrack): LaneState {
 	return lane.spans[lane.spans.length - 1]!.state;
 }
 
@@ -114,14 +120,28 @@ function isTerminal(state: LaneState): boolean {
 	return state === "accepted" || state === "blocked" || state === "excluded";
 }
 
-function foldRank(lane: Lane): number {
-	const state = lastState(lane);
-	return state === "accepted" || state === "excluded" ? 3 : state === "blocked" ? 2 : 0;
+function phaseWord(phase: RunPhase, width: number): string {
+	const words = PHASE_WORDS[phase];
+	return words.find((w) => textWidth(w) <= width) ?? clip(words[words.length - 1]!, width);
 }
 
-function phaseWord(phase: Phase, width: number): string {
-	const words = PHASE_WORDS[phase];
-	return words.find((w) => cells(w) <= width) ?? clip(words[words.length - 1]!, width);
+/**
+ * The lanes to fold, given the lanes that could be shown and the rows there are for them. `keep` lanes stay; the rest
+ * go into the summary row. Finished lanes fold in the order they finished, every other kind folds latest-planned first,
+ * so the lanes that stay are the ones that matter now and, among equals, the ones that come first in the plan.
+ */
+function chooseFolded(lanes: readonly LaneTrack[], candidates: readonly number[], keep: number): Set<number> {
+	const rank = new Map<number, number>();
+	const key = new Map<number, number>();
+	for (const i of candidates) {
+		const lane = lanes[i]!;
+		const last = lane.spans[lane.spans.length - 1]!;
+		const r = FOLD_RANK[last.state];
+		rank.set(i, r);
+		key.set(i, r === FINISHED_RANK ? last.from : -i);
+	}
+	const order = [...candidates].sort((a, b) => rank.get(b)! - rank.get(a)! || key.get(a)! - key.get(b)! || a - b);
+	return new Set(order.slice(0, candidates.length - keep));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -198,9 +218,10 @@ interface Placed {
 	group: number;
 }
 
-export function layout(snapshot: RunSnapshot, cols: number, maxRows: number): Scene {
+export function layout(snapshot: LaneSnapshot, cols: number, maxRows: number): Scene {
+	cols = Math.max(0, Math.floor(cols));
 	// --- Areas --------------------------------------------------------------------------------------------------
-	let rw = cols >= 100 ? 16 : cols >= 80 ? 12 : 9;
+	let rw = cols >= 100 ? 18 : cols >= 80 ? 14 : 11;
 	let lw = clamp(Math.round(cols * 0.22), 16, 22);
 	if (cols - lw - rw - 2 < 8) {
 		lw = Math.max(4, Math.min(lw, cols - rw - 10));
@@ -213,37 +234,38 @@ export function layout(snapshot: RunSnapshot, cols: number, maxRows: number): Sc
 	const wd = x1 - x0 + 1;
 
 	const lanes = snapshot.lanes;
-	const now = snapshot.now;
+	const now = Number.isFinite(snapshot.now) ? Math.max(0, snapshot.now) : 0;
 	const span = niceSpan(now);
 	const X = (ms: number): number => x0 + clamp(Math.round((ms / span) * (wd - 1)), 0, wd - 1);
 	const msAt = (x: number): number => ((x - x0) / (wd - 1)) * span;
 	const headX = X(now);
 
 	const lastPhase = snapshot.phases[snapshot.phases.length - 1];
-	const phase: Phase = lastPhase?.phase ?? "working";
+	const phase: RunPhase = lastPhase?.phase ?? "working";
 	const phaseAge = lastPhase === undefined ? 0 : Math.max(0, now - lastPhase.from);
 
-	// --- Rows: shown lanes in start order, finished lanes fold first ----------------------------------------------
+	// --- Rows: shown lanes in start order, the rest folded ----------------------------------------------------------
+	// A lane without spans has no history to draw: it is neither shown nor folded.
+	const startOf = (i: number): number => Math.min(lanes[i]!.spans[0]!.from, now);
+	const candidates: number[] = [];
+	lanes.forEach((lane, i) => { if (lane.spans.length > 0) candidates.push(i); });
 	const room = Math.max(0, maxRows - 1);
-	let shown = lanes.map((_, i) => i);
+	let shown = candidates;
 	let folded: number[] = [];
-	if (lanes.length > room) {
-		const keep = Math.max(0, room - 1);
-		const order = lanes.map((lane, i) => ({ i, rank: foldRank(lane) })).sort((a, b) => b.rank - a.rank || a.i - b.i);
-		const foldSet = new Set(order.slice(0, lanes.length - keep).map((o) => o.i));
-		shown = shown.filter((i) => !foldSet.has(i));
-		folded = lanes.map((_, i) => i).filter((i) => foldSet.has(i));
-	}
 	if (room === 0) {
 		shown = [];
-		folded = [];
+	} else if (candidates.length > room) {
+		const foldSet = chooseFolded(lanes, candidates, room - 1);
+		shown = candidates.filter((i) => !foldSet.has(i));
+		folded = candidates.filter((i) => foldSet.has(i));
 	}
-	const startOf = (i: number): number => lanes[i]!.spans[0]!.from;
-	shown.sort((a, b) => startOf(a) - startOf(b) || a - b);
+	shown = [...shown].sort((a, b) => startOf(a) - startOf(b) || a - b);
 	const rowOf: number[] = lanes.map(() => -1);
 	shown.forEach((laneIndex, r) => { rowOf[laneIndex] = r + 1; });
-	const rows = 1 + shown.length + (folded.length > 0 ? 1 : 0);
+	const rows = maxRows < 1 ? 0 : 1 + shown.length + (folded.length > 0 ? 1 : 0);
 	const yOf = (row: number): number => 4 * row + LANE_Y_OFFSET;
+	const indexOfName = new Map<string, number>();
+	lanes.forEach((lane, i) => { if (!indexOfName.has(lane.name)) indexOfName.set(lane.name, i); });
 
 	const strands: Strand[] = [];
 	const marks: Mark[] = [];
@@ -327,7 +349,9 @@ export function layout(snapshot: RunSnapshot, cols: number, maxRows: number): Sc
 		const { row, y, xs, start } = here;
 		const lastSpan = lane.spans[lane.spans.length - 1]!;
 		const terminal = isTerminal(lastSpan.state);
-		const real = terminal ? lane.spans.slice(0, -1) : lane.spans;
+		const earlier = terminal ? lane.spans.slice(0, -1) : lane.spans;
+		// A lane that was first seen already finished has no earlier span: its own end state stands for the stretch.
+		const real = earlier.length > 0 ? earlier : [{ from: start, to: lastSpan.from, state: lastSpan.state }];
 		const join = joins.get(laneIndex);
 		const xEnd = join !== undefined ? join.xl : terminal ? clamp(X(lastSpan.from), xs, headX) : headX;
 		const cap = terminal ? lastSpan.from : now;
@@ -393,7 +417,7 @@ export function layout(snapshot: RunSnapshot, cols: number, maxRows: number): Sc
 			const when = s.to ?? now;
 			const lx = clamp(X(when), xs, headX);
 			for (const dep of lane.dependsOn) {
-				const depIndex = lanes.findIndex((l) => l.name === dep);
+				const depIndex = indexOfName.get(dep) ?? -1;
 				const depRow = depIndex < 0 ? -1 : rowOf[depIndex]!;
 				if (depRow < 0 || depIndex === laneIndex) continue;
 				const yDep = yOf(depRow);
@@ -409,38 +433,43 @@ export function layout(snapshot: RunSnapshot, cols: number, maxRows: number): Sc
 	snapshot.rounds.forEach((offset, i) => marks.push({ kind: "round", lane: -1, cx: X(offset) >> 1, cy: 0, at: offset, round: i + 1 }));
 	// Accepted lanes without a row still join the trunk, at their accept time.
 	lanes.forEach((lane, i) => {
-		const last = lane.spans[lane.spans.length - 1]!;
-		if (rowOf[i]! < 0 && last.state === "accepted") marks.push({ kind: "accept", lane: i, cx: X(last.from) >> 1, cy: 0, at: last.from });
+		const last = lane.spans[lane.spans.length - 1];
+		if (last !== undefined && rowOf[i]! < 0 && last.state === "accepted") marks.push({ kind: "accept", lane: i, cx: X(last.from) >> 1, cy: 0, at: last.from });
 	});
 	marks.push({ kind: "trunk-head", lane: -1, cx: headX >> 1, cy: 0, at: now });
 
-	// --- Labels ---------------------------------------------------------------------------------------------------
-	const nameW = Math.max(1, lw - 5);
-	const round = `R${snapshot.rounds.length}${snapshot.maxRounds !== undefined ? `/${snapshot.maxRounds}` : ""}`;
-	const trunkLeft = clip(`감독 ${round} ${snapshot.counts.accepted}/${snapshot.counts.inScope}`, lw);
-	labels.push({ side: "left", lane: -1, cx: 0, cy: 0, width: cells(trunkLeft), text: trunkLeft });
-	const word = phaseWord(phase, rw);
-	labels.push({ side: "right", lane: -1, cx: cols - rw, cy: 0, width: cells(word), text: word });
 
+	// --- Labels ---------------------------------------------------------------------------------------------------
+	labels.push({ side: "left", lane: -1, cx: 0, cy: 0, width: textWidth(TRUNK_LABEL), text: TRUNK_LABEL });
+	const word = phaseWord(phase, rw);
+	labels.push({ side: "right", lane: -1, cx: cols - rw, cy: 0, width: textWidth(word), text: word });
+
+	// The role word sits in a column of its own, so every lane's word starts at the same cell.
+	const roleW = clamp(Math.ceil(lw * 0.3), 4, 7);
 	for (const laneIndex of shown) {
 		const lane = lanes[laneIndex]!;
 		const row = rowOf[laneIndex]!;
-		const left = clip(`${padEnd(clip(lane.name, nameW), nameW)} ${ROLE_WORD[lane.role]}`, lw);
-		labels.push({ side: "left", lane: laneIndex, cx: 0, cy: row, width: cells(left), text: left });
-		const state = clip(STATE_WORD[lastState(lane)], rw);
-		labels.push({ side: "right", lane: laneIndex, cx: cols - rw, cy: row, width: cells(state), text: state });
+		const note = lane.label === "" ? "" : ` ${clip(lane.label, roleW)}`;
+		const primary = padEnd(clip(lane.name, note === "" ? lw : lw - 1 - roleW), note === "" ? 0 : lw - 1 - roleW);
+		const left = clip(primary + note, lw);
+		labels.push({ side: "left", lane: laneIndex, cx: 0, cy: row, width: textWidth(left), text: left, split: primary.length });
+		// State word, then the progress when the lane has several results; the word gives way before the progress does.
+		const progress = lane.progress !== undefined && lane.progress.total > 1 ? ` ${lane.progress.met}/${lane.progress.total}` : "";
+		const state = clip(STATE_WORD[lastState(lane)], rw - progress.length);
+		const right = clip(state + progress, rw);
+		labels.push({ side: "right", lane: laneIndex, cx: cols - rw, cy: row, width: textWidth(right), text: right, split: state.length });
 	}
 	if (folded.length > 0) {
 		const counts = new Map<LaneState, number>();
 		for (const i of folded) counts.set(lastState(lanes[i]!), (counts.get(lastState(lanes[i]!)) ?? 0) + 1);
 		const text = clip([...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2).map(([s, n]) => `${STATE_WORD[s]} ${n}`).join(" · "), rw);
 		const left = clip(`+${folded.length} 레인`, lw);
-		labels.push({ side: "left", lane: -1, cx: 0, cy: rows - 1, width: cells(left), text: left });
-		labels.push({ side: "right", lane: -1, cx: cols - rw, cy: rows - 1, width: cells(text), text });
+		labels.push({ side: "left", lane: -1, cx: 0, cy: rows - 1, width: textWidth(left), text: left });
+		labels.push({ side: "right", lane: -1, cx: cols - rw, cy: rows - 1, width: textWidth(text), text });
 	}
 	// The scale stays at the right end of the trunk when it does not run into the head.
 	const scale = fmtSpan(span);
-	const scaleW = cells(scale);
+	const scaleW = textWidth(scale);
 	if ((headX >> 1) + 3 < cx1 - scaleW) labels.push({ side: "scale", lane: -1, cx: cx1 - scaleW, cy: 0, width: scaleW, text: scale });
 
 	return {

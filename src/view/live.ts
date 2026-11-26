@@ -1,7 +1,8 @@
 /**
- * Storm's live instrument below the editor. The radar moves; the phase and counters do not. Compact
- * terminals get a static single row. Tern clocks its own sheen, and still phases or OMP motion settings
- * stop the only local repaint timer immediately.
+ * Storm's live instrument below the editor. On a roomy ANSI terminal it is the lane view: a status row, then the
+ * director's trunk and one line per plan lane, at a height fixed for the run. Everywhere else it is the single status
+ * line with its radar (compact terminals get a static row). Tern clocks its own sheen, and still pictures or OMP motion
+ * settings stop the only local repaint timer immediately.
  */
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
@@ -28,6 +29,9 @@ import {
 } from "@oh-my-pi/pi-tui";
 import type { RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
+import { LANE_MIN_COLUMNS, laneFrame, laneLiveliness } from "./lane/frame.ts";
+import type { LaneSnapshot } from "./lane/model.ts";
+import { LaneTimeline } from "./lane/timeline.ts";
 import {
 	type LiveMetricChip,
 	type LiveMetricFacts,
@@ -40,6 +44,27 @@ import {
 export const LIVE_WIDGET_KEY = "storm-live";
 const RADAR_TICK_MS = 85;
 const RADAR_COLUMNS = 52;
+/** The lane view needs this many terminal rows; below it the single line stays. */
+export const LANE_MIN_ROWS = 18;
+/** Lane frames repaint at the radar's pace, a little slower over SSH where the view's ~70 KB/s is felt. */
+const LANE_TICK_MS = 85;
+const LANE_SSH_TICK_MS = 120;
+/** About four frames a second: the picture only breathes (waiting for the user). */
+const LANE_SLOW_TICK_MS = 250;
+/** One animation step never exceeds this, so a stalled event loop does not make the picture leap. */
+const LANE_MAX_STEP_MS = 500;
+const LANE_MIN_HEIGHT = 6;
+const LANE_MAX_HEIGHT = 12;
+
+/** The lane view's fixed height for a terminal of `terminalRows` rows: a third of it, between 6 and 12 rows. */
+export function laneHeight(terminalRows: number): number {
+	return Math.min(LANE_MAX_HEIGHT, Math.max(LANE_MIN_HEIGHT, Math.floor(terminalRows / 3)));
+}
+
+function laneTickMs(): number {
+	const env = process.env;
+	return (env.SSH_CONNECTION ?? "") !== "" || (env.SSH_TTY ?? "") !== "" ? LANE_SSH_TICK_MS : LANE_TICK_MS;
+}
 /** The ASCII preset keeps Storm's identity without a glyph the terminal cannot render. */
 const ASCII_MARK = "~ STORM";
 const RADAR_PALETTES = {
@@ -340,13 +365,16 @@ function nativeCompactLine(facts: LiveMetricFacts, columns: number, theme: Theme
  */
 export class LiveStatus {
 	readonly #now: () => number;
+	readonly #laneView: (ctx: ExtensionContext) => boolean;
 	#ui: ExtensionContext["ui"] | undefined;
 	#widget: LiveRunWidget | undefined;
 	#statusCleared = false;
 	#epoch = 0;
 
-	constructor(options: { now?: () => number } = {}) {
+	/** `laneView` is the session's lane view switch, asked on every `show`; it defaults to on. */
+	constructor(options: { now?: () => number; laneView?: (ctx: ExtensionContext) => boolean } = {}) {
 		this.#now = options.now ?? Date.now;
+		this.#laneView = options.laneView ?? (() => true);
 	}
 
 	/** The current session generation; `syncSession` checks it again after every await. */
@@ -386,10 +414,11 @@ export class LiveStatus {
 			this.#statusCleared = false;
 		}
 		const now = this.#now();
+		const laneView = this.#laneView(ctx);
 		if (this.#widget === undefined) {
-			if (!this.#install(ui, run, now, phase)) return false;
+			if (!this.#install(ui, run, now, phase, laneView)) return false;
 		} else {
-			this.#widget.update(run, now, phase);
+			this.#widget.update(run, now, phase, laneView);
 		}
 		this.#ui = ui;
 		// The run's label moved into the widget: the status line must not keep a second live copy.
@@ -416,13 +445,15 @@ export class LiveStatus {
 		}
 	}
 
-	#install(ui: ExtensionContext["ui"], run: RunRecord, now: number, phase: RunPhase): boolean {
+	#install(ui: ExtensionContext["ui"], run: RunRecord, now: number, phase: RunPhase, laneView: boolean): boolean {
 		let created: LiveRunWidget | undefined;
 		try {
 			ui.setWidget(
 				LIVE_WIDGET_KEY,
 				(tui, hostTheme) => {
 					const widget = new LiveRunWidget(tui, () => ui.theme ?? hostTheme, run, now, phase, {
+						clock: this.#now,
+						laneView,
 						onDisposed: () => {
 							if (this.#widget !== widget) return;
 							this.#widget = undefined;
@@ -444,11 +475,32 @@ export class LiveStatus {
 }
 
 /** `requestComponentRender` is the scoped request older and newer TUI hosts all answer; plain render is the fallback. */
-type ComponentTui = Omit<TUI, "requestComponentRender"> & {
+type ComponentTui = Omit<TUI, "requestComponentRender" | "terminal"> & {
 	requestComponentRender?: (component: Component) => void;
+	/** Absent in hosts that cannot say how tall the terminal is; the lane view then stays off. */
+	terminal?: Pick<TUI["terminal"], "rows">;
 };
 
-/** A terminal-clocked radar or its equivalent native, host-clocked sheen. */
+/** The ANSI row of the status line in lane mode, shaped for one width, theme and set of facts. */
+interface StatusRow {
+	columns: number;
+	theme: Theme;
+	epoch: number;
+	preset: "unicode" | "nerd" | "ascii";
+	row: string;
+}
+
+/**
+ * The widget Storm mounts below the editor for one run. Two ANSI drawings share it: the lane view (status row, trunk
+ * and lanes) and the single status line with its radar; native rendering describes the line and the host clocks its
+ * sheen.
+ *
+ * The lane view's height is decided once, the first time its conditions hold, and never changes while the widget is
+ * mounted: omp's below-editor area only grows, so a height that shrank would leave blank rows and one that grew
+ * would push the editor up again. After that the widget always returns exactly that many rows. When the conditions
+ * stop holding (the switch is turned off, the window gets narrow, short or ASCII) it draws the single line at the top
+ * of those rows and leaves the rest blank.
+ */
 class LiveRunWidget implements Component {
 	#tui: ComponentTui;
 	#theme: () => Theme;
@@ -464,6 +516,17 @@ class LiveRunWidget implements Component {
 	#frame = 0;
 	#layout: RadarLayout | undefined;
 	#native: { theme: Theme; key: string; node: NativeNode } | undefined;
+	readonly #clock: () => number;
+	#laneView: boolean;
+	#runId: string;
+	#timeline = new LaneTimeline();
+	/** Rows reserved for the lane view; undefined until its conditions first hold. */
+	#height: number | undefined;
+	#status: StatusRow | undefined;
+	#timerPeriod = 0;
+	/** Animation time: advances only while the timer runs, so a restart continues the motion instead of jumping. */
+	#animTime = 0;
+	#animAt: number | undefined;
 
 	constructor(
 		tui: TUI,
@@ -471,13 +534,17 @@ class LiveRunWidget implements Component {
 		run: RunRecord,
 		now: number,
 		phase: RunPhase,
-		options: { onDisposed?: () => void } = {},
+		options: { onDisposed?: () => void; clock?: () => number; laneView?: boolean } = {},
 	) {
 		this.#tui = tui;
 		this.#theme = theme;
 		this.#phase = phase;
 		this.#facts = liveMetricFacts(run, phase, now);
 		this.#onDisposed = options.onDisposed;
+		this.#clock = options.clock ?? Date.now;
+		this.#laneView = options.laneView ?? true;
+		this.#runId = run.runId;
+		this.#timeline.observe(run, phase, now);
 		this.#offMotion = onMotionEffectsChange(() => this.#settingsChanged());
 		this.#offNative = onNativeRenderingChange(() => this.#settingsChanged());
 	}
@@ -486,11 +553,23 @@ class LiveRunWidget implements Component {
 		return this.#disposed;
 	}
 
-	/** The controller's live record or phase changed: repaint, but keep the one installed component. */
-	update(run: RunRecord, now: number, phase: RunPhase): void {
+	/**
+	 * The controller's live record, phase or the lane view switch changed: repaint, but keep the one installed
+	 * component. The timeline sees every update, even one that changes no chip, because lanes move without them.
+	 */
+	update(run: RunRecord, now: number, phase: RunPhase, laneView: boolean = this.#laneView): void {
 		if (this.#disposed) return;
+		if (run.runId !== this.#runId) {
+			// One timeline belongs to one run.
+			this.#runId = run.runId;
+			this.#timeline = new LaneTimeline();
+		}
+		this.#timeline.observe(run, phase, now);
+		const switched = laneView !== this.#laneView;
+		this.#laneView = laneView;
 		const facts = liveMetricFacts(run, phase, now);
-		if (this.#phase === phase && this.#facts.key === facts.key) return;
+		const unchanged = this.#phase === phase && this.#facts.key === facts.key;
+		if (unchanged && !switched && !this.#laneShown()) return;
 		if (this.#phase !== phase) this.#frame = 0;
 		this.#facts = facts;
 		this.#phase = phase;
@@ -499,13 +578,72 @@ class LiveRunWidget implements Component {
 		this.#requestRender();
 	}
 
+	/** Whether the lane view is what this widget draws at the width it was last given. */
+	#laneShown(): boolean {
+		return this.#columns > 0 && this.#laneEligible(this.#columns, this.#theme());
+	}
+
+	/** The lane view's conditions: ANSI rendering, room in both directions, a glyph preset with Braille, switch on. */
+	#laneEligible(columns: number, theme: Theme): boolean {
+		if (!this.#laneView || isNativeRendering()) return false;
+		if (columns < LANE_MIN_COLUMNS || theme.getSymbolPreset() === "ascii") return false;
+		const rows = this.#tui.terminal?.rows;
+		return rows !== undefined && rows >= LANE_MIN_ROWS;
+	}
+
 	render(width: number): readonly string[] {
 		if (this.#disposed) return [];
 		const columns = Math.max(0, Math.floor(width));
 		this.#columns = columns;
-		this.#syncTimer();
-		if (columns === 0) return [];
 		const theme = this.#theme();
+		const lane = columns > 0 && this.#laneEligible(columns, theme);
+		if (lane && this.#height === undefined) this.#height = laneHeight(this.#tui.terminal?.rows ?? LANE_MIN_ROWS);
+		if (lane) return this.#laneRows(columns, theme);
+		this.#syncTimer();
+		if (columns === 0) return this.#padded([]);
+		return this.#padded(this.#lineRows(columns, theme));
+	}
+
+	/** Once the lane view's height is decided every render returns exactly that many rows, blank where nothing is drawn. */
+	#padded(rows: readonly string[]): readonly string[] {
+		const height = this.#height;
+		if (height === undefined) return rows;
+		if (rows.length >= height) return rows.slice(0, height);
+		return [...rows, ...Array.from({ length: height - rows.length }, () => "")];
+	}
+
+	/** The status row, then the trunk and the lanes, padded to the height fixed for the run. */
+	#laneRows(columns: number, theme: Theme): readonly string[] {
+		const height = this.#height!;
+		const now = this.#clock();
+		const snapshot = this.#timeline.snapshot(now);
+		this.#syncTimer(snapshot);
+		if (this.#timer !== undefined) {
+			if (this.#animAt !== undefined) this.#animTime += Math.min(LANE_MAX_STEP_MS, Math.max(0, now - this.#animAt));
+			this.#animAt = now;
+		}
+		const frame = laneFrame(snapshot, columns, this.#animTime, {
+			motion: this.#motionOn(),
+			maxRows: height - 1,
+			colour: theme.getColorMode() === "truecolor" ? "truecolor" : "256",
+			dark: !theme.isLight,
+		});
+		return this.#padded([this.#statusRow(columns, theme), ...frame]);
+	}
+
+	/** Row 0 of the lane view: mark, phase and chips, without the radar (the trunk carries the motion). */
+	#statusRow(columns: number, theme: Theme): string {
+		const epoch = getThemeEpoch();
+		const preset = theme.getSymbolPreset();
+		const cached = this.#status;
+		if (cached?.columns === columns && cached.theme === theme && cached.epoch === epoch && cached.preset === preset) return cached.row;
+		const row = singleRow(this.#facts, columns, theme)[0] ?? "";
+		this.#status = { columns, theme, epoch, preset, row };
+		return row;
+	}
+
+	/** The single status line with its radar, exactly as before the lane view existed. */
+	#lineRows(columns: number, theme: Theme): readonly string[] {
 		const epoch = getThemeEpoch();
 		const preset = theme.getSymbolPreset();
 		const layout = this.#layout?.columns === columns && this.#layout.theme === theme &&
@@ -586,40 +724,69 @@ class LiveRunWidget implements Component {
 		this.#onDisposed?.();
 	}
 
+	/** OMP's motion setting, the gate both drawings share. */
+	#motionOn(): boolean {
+		return !this.#disposed && motionEffectsEnabled() && shimmerEnabled();
+	}
+
 	#animated(): boolean {
-		return !this.#disposed && RUN_APPEARANCE[this.#phase].motion && motionEffectsEnabled() && shimmerEnabled();
+		return this.#motionOn() && RUN_APPEARANCE[this.#phase].motion;
 	}
 
 	#ticking(): boolean {
 		return this.#columns >= RADAR_COLUMNS && this.#animated() && !isNativeRendering();
 	}
 
-	/** One scoped repaint timer, only when this terminal actually has room to show the radar. */
-	#syncTimer(): void {
-		if (!this.#ticking()) {
+	/**
+	 * The period of the one repaint timer, or undefined when nothing moves. The lane view follows its picture's
+	 * liveliness: full pace, a slow pulse, or none; the radar follows its phase.
+	 */
+	#period(snapshot?: LaneSnapshot): number | undefined {
+		if (this.#disposed || this.#columns === 0) return undefined;
+		if (this.#laneShown()) {
+			if (!this.#motionOn()) return undefined;
+			const liveliness = laneLiveliness(snapshot ?? this.#timeline.snapshot(this.#clock()));
+			return liveliness === "still" ? undefined : liveliness === "slow" ? LANE_SLOW_TICK_MS : laneTickMs();
+		}
+		return this.#ticking() ? RADAR_TICK_MS : undefined;
+	}
+
+	/** One scoped repaint timer, only while something on screen moves. */
+	#syncTimer(snapshot?: LaneSnapshot): void {
+		const period = this.#period(snapshot);
+		if (period === undefined) {
 			this.#stopTimer();
 			return;
 		}
-		if (this.#timer !== undefined) return;
+		if (this.#timer !== undefined && this.#timerPeriod === period) return;
+		if (this.#timer !== undefined) clearInterval(this.#timer);
 		const timer = setInterval(() => {
 			if (this.#timer !== timer) return;
-			if (!this.#ticking()) {
+			// In lane mode the render decides the pace (and whether to stop) from the frame's own snapshot.
+			if (this.#laneShown()) {
+				this.#requestRender();
+				return;
+			}
+			if (this.#period() === undefined) {
 				this.#stopTimer();
 			} else {
 				const length = RADAR[this.#phase].length;
-				const period = this.#phase === "verifying" ? 2 * (length - 1) : length;
-				this.#frame = (this.#frame + 1) % period;
+				const cycle = this.#phase === "verifying" ? 2 * (length - 1) : length;
+				this.#frame = (this.#frame + 1) % cycle;
 			}
 			this.#requestRender();
-		}, RADAR_TICK_MS);
+		}, period);
 		timer.unref?.();
 		this.#timer = timer;
+		this.#timerPeriod = period;
 	}
 
 	#stopTimer(): void {
 		if (this.#timer === undefined) return;
 		clearInterval(this.#timer);
 		this.#timer = undefined;
+		// The next restart continues from the animation time reached, not from the wall clock.
+		this.#animAt = undefined;
 	}
 
 	#settingsChanged(): void {
@@ -638,6 +805,7 @@ class LiveRunWidget implements Component {
 
 	invalidate(): void {
 		this.#layout = undefined;
+		this.#status = undefined;
 		this.#native = undefined;
 	}
 }

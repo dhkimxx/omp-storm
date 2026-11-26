@@ -1,5 +1,5 @@
 /**
- * Colour maths for the storm variant: OKLCH in, packed sRGB out, mixing in linear light.
+ * Colour maths for the lane view: OKLCH in, packed sRGB out, mixing in linear light.
  * No dependencies; every function is pure.
  */
 
@@ -103,19 +103,4 @@ const GOLDEN_ANGLE = 137.50776405003785;
 export function laneHue(index: number): number {
 	const h = (FIRST_HUE + index * GOLDEN_ANGLE) % 360;
 	return h < 0 ? h + 360 : h;
-}
-
-/** Lightness and chroma and hue of a colour, for choosing a tone and for tests. */
-export function toOklch(rgb: Rgb): { l: number; c: number; h: number } {
-	const r = TO_LINEAR[red(rgb)]!;
-	const g = TO_LINEAR[green(rgb)]!;
-	const b = TO_LINEAR[blue(rgb)]!;
-	const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
-	const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
-	const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
-	const L = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
-	const A = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
-	const B = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
-	const hue = (Math.atan2(B, A) * 180) / Math.PI;
-	return { l: L, c: Math.hypot(A, B), h: hue < 0 ? hue + 360 : hue };
 }

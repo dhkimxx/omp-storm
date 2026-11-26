@@ -23,12 +23,16 @@ import { ROLES, STORM_VERSION } from "../../src/roles.ts";
 import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
+import { LANE_MIN_COLUMNS } from "../../src/view/lane/frame.ts";
+import { STATE_WORD, TRUNK_LABEL } from "../../src/view/lane/layout.ts";
+import type { LaneState } from "../../src/view/lane/model.ts";
+import { LANE_MIN_ROWS, laneHeight } from "../../src/view/live.ts";
 import { priorityLabel } from "../../src/view/render.ts";
 import { CLOSEOUT_NEXT_MAX } from "../../src/runtime/closeout.ts";
 import { CLOSEOUT_CHOICE_HINT, GOAL_LABEL, goalText } from "../../src/view/closeout.ts";
 import { STATUS_LABEL } from "../../src/runtime/rounds.ts";
 import {
-	CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutBody, focused, isOneLineCloseout, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, numberedOffers, offeredDirections, persistedStormRecords,
+	approveTeam, CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutBody, focused, isOneLineCloseout, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, numberedOffers, offeredDirections, persistedStormRecords,
 	price, PROFILE_CONFIG, prepare, Rpc, RESUME_NEXT, runNext, sessionFileIn, type Step, type StormRecord, statusLine, StormFiles, Suite, startFakeLlm, TEAM_PROVIDERS, Tui,
 	until, userNext, cancelAll,
 } from "./harness.ts";
@@ -109,6 +113,76 @@ function radarFrames(text: string, phase: RunPhase): Set<string> {
 		const field = line.includes(head) ? line.match(RADAR_FIELD)?.[0] : undefined;
 		return field ? [field] : [];
 	}));
+}
+// The lane view (the default live view where the terminal is big enough): a status row, the director's trunk row,
+// one row per lane. Its rows are found by the trunk label and Braille, never by colour.
+const BRAILLE = /[\u2800-\u28ff]/u;
+/** Whether `row` is the director's trunk row of the lane view. */
+const isTrunkRow = (row: string): boolean => row.trimStart().startsWith(TRUNK_LABEL) && BRAILLE.test(row);
+/** The distinct trunk rows painted in `text`: the picture moves, so a live run shows more than one. */
+function trunkFrames(text: string): Set<string> {
+	return new Set(text.split("\n").map(row => row.trimEnd()).filter(isTrunkRow));
+}
+/** The states a lane's row showed, in order of appearance, without consecutive repeats. */
+function laneSequence(text: string, lane: string): LaneState[] {
+	const sequence: LaneState[] = [];
+	for (const row of text.split("\n")) {
+		const line = row.trim();
+		if (!line.startsWith(`${lane} `) || !BRAILLE.test(line)) continue;
+		const state = (Object.entries(STATE_WORD) as Array<[LaneState, string]>).find(([, word]) => line.endsWith(word) || new RegExp(`${word} \\d+/\\d+$`, "u").test(line))?.[0];
+		if (state !== undefined && sequence.at(-1) !== state) sequence.push(state);
+	}
+	return sequence;
+}
+/** Whether `wanted` appears in `sequence` in that order, other states allowed in between. */
+const inOrder = (sequence: readonly LaneState[], wanted: readonly LaneState[]): boolean => {
+	let at = 0;
+	for (const state of sequence) if (state === wanted[at]) at++;
+	return at === wanted.length;
+};
+
+/** The state word a lane's row ends with on the screen a person sees now, if the row is there. */
+function shownState(tui: Tui, lane: string): LaneState | undefined {
+	const row = liveScreen(tui)?.viewport.find(line => line.trim().startsWith(`${lane} `) && BRAILLE.test(line));
+	if (row === undefined) return undefined;
+	return (Object.entries(STATE_WORD) as Array<[LaneState, string]>).find(([, word]) => row.trimEnd().endsWith(word) || new RegExp(`${word} \\d+/\\d+$`, "u").test(row.trimEnd()))?.[0];
+}
+
+/**
+ * A session of its own with a team approved over RPC (as result-direction.ts does): its workers are addressable by
+ * lane name, which a follow-up to a lane's worker needs. The transcript carries `seedText`.
+ */
+async function seedOwnSession(seedText: string): Promise<{ id: string; dir: string }> {
+	const seed = new Rpc(env, cancelAll, { model: "fake/general-b" });
+	try {
+		await seed.ready();
+		await seed.turn(seedText);
+		await approveTeam(seed, "off");
+		await seed.identify();
+		return { id: seed.sessionId, dir: seed.sessionDir };
+	} finally {
+		await seed.close();
+	}
+}
+
+/** Where the live widget sits on the screen a person sees. */
+interface LiveScreen {
+	/** Viewport row of the status row (`≋ STORM · <phase> …`). */
+	status: number;
+	/** Whether the row under it is the trunk (the lane view) rather than the single line's second row or blank. */
+	lanes: boolean;
+	/** The viewport rows from the status row down, without trailing blank rows. */
+	rows: string[];
+	viewport: string[];
+}
+function liveScreen(tui: Tui): LiveScreen | undefined {
+	const { viewport } = replayScreen(tui.raw, tui.columns, tui.rows);
+	const labels = Object.values(RUN_APPEARANCE).map(appearance => appearance.label);
+	const status = viewport.findLastIndex(row => row.startsWith(`${STORM_MARK} · `) && labels.some(label => row.includes(label)));
+	if (status < 0) return undefined;
+	const rows = viewport.slice(status);
+	while (rows.length > 1 && rows.at(-1) === "") rows.pop();
+	return { status, lanes: isTrunkRow(viewport[status + 1] ?? ""), rows, viewport };
 }
 /** The last rendered row carrying a live phase header, without surrounding box edges or padding. */
 function phaseRow(text: string, phase: RunPhase): string | undefined {
@@ -388,14 +462,18 @@ function requireApprovedTeam(files: StormFiles, name: string): void {
 	}
 }
 
-/** The narrow, motion-off run in one terminal appearance; the light variant proves no theme assumption. */
-async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
+/**
+ * The narrow, motion-off run in one terminal appearance; the light variant proves no theme assumption. At 60 columns
+ * and 18 rows or more the lane view is drawn (still, with motion off); below either the old single line with its radar
+ * is, so `columns` and `rows` choose which of the two is proven.
+ */
+async function narrowMotionOff(background: "dark" | "light", columns = LANE_MIN_COLUMNS, rows = 30): Promise<void> {
 	if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
 	const files = new StormFiles(env, ownedSession.id);
 	requireApprovedTeam(files, `${background}: narrow motion-off`);
-	const columns = 60;
-	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows: 30, background, resume: ownedSession.id, sessionDir: ownedSession.dir });
-	const named = (name: string): string => `${background}: ${name}`;
+	const lanes = columns >= LANE_MIN_COLUMNS && rows >= LANE_MIN_ROWS;
+	const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "none"], columns, rows, background, resume: ownedSession.id, sessionDir: ownedSession.dir });
+	const named = (name: string): string => `${background}, ${columns}x${rows}: ${name}`;
 	try {
 		await readyForSubmission(tui);
 		await tui.seen(0, () => (idleFooter(statusLine(tui.raw)) ? true : undefined), named("narrow idle footer"), 30_000);
@@ -403,7 +481,7 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 		check(named("the narrow footer uses the shared mark and an idle state"), idleFooter(idle), idle ?? "no status line");
 		check(named("the narrow footer fits the terminal"), Bun.stringWidth(idle ?? "") <= columns, `${Bun.stringWidth(idle ?? "")} > ${columns}: ${idle}`);
 		const before = files.runIds();
-		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-DELAY 3000 ${readProbe}` }, { awaitChild: true }];
+		const steps: Step[] = [plan("impl", "code"), { task: ["storm-implementer"], as: "Impl", say: `E2E-CHILD-DELAY 6000 ${readProbe}` }, { awaitChild: true }];
 		const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 		await tui.seen(started, text => (phaseRow(text, "workers") !== undefined ? true : undefined), named("workers phase"), 30_000);
 		const active = await tui.seen(started, text => {
@@ -421,19 +499,41 @@ async function narrowMotionOff(background: "dark" | "light"): Promise<void> {
 				stableSince = Date.now();
 			}
 		}
-		check(
-			named("the phase, radar and active worker count fit at 60 columns"),
-			first !== undefined && RADAR_FIELD.test(first) && [first, active].every(line => Bun.stringWidth(line) <= columns),
-			`${first} / ${active}`,
-		);
-		await Bun.sleep(800);
-		const second = phaseRow(tui.text(started), "workers");
-		check(named("motion off leaves the radar still"), first !== undefined && second === first && radarFrames(tui.text(started), "workers").size === 1, `${first} → ${second}`);
+		if (lanes) {
+			// The status row loses its radar (the trunk carries the motion); every row of the view fits the terminal.
+			const live = liveScreen(tui);
+			check(
+				named("the status row and the lane view fit the terminal width"),
+				first !== undefined && !RADAR_FIELD.test(first) && live?.lanes === true && [first, active, ...(live?.rows ?? [])].every(line => Bun.stringWidth(line) <= columns),
+				`${first} / ${active} / ${live?.rows.join(" | ")}`,
+			);
+			// Motion off: the picture is repainted only when the run changes (the time axis moves with it), never on a
+			// timer. At the 85 ms tick, 800 ms would paint about nine different trunk rows.
+			const mark = tui.raw.length;
+			await Bun.sleep(800);
+			const second = phaseRow(tui.text(started), "workers");
+			const painted = trunkFrames(tui.text(mark));
+			const again = liveScreen(tui);
+			check(
+				named("motion off leaves the picture still: no timer repaints it"),
+				first !== undefined && second === first && painted.size <= 2 && live !== undefined && again?.status === live.status,
+				`${first === second}, ${painted.size} trunk rows in 800 ms, status row ${live?.status} → ${again?.status}`,
+			);
+		} else {
+			check(
+				named("the single line keeps its phase, radar and active worker count within the terminal"),
+				first !== undefined && RADAR_FIELD.test(first) && [first, active].every(line => Bun.stringWidth(line) <= columns) && trunkFrames(tui.text(started)).size === 0,
+				`${first} / ${active}`,
+			);
+			await Bun.sleep(800);
+			const second = phaseRow(tui.text(started), "workers");
+			check(named("motion off leaves the radar still"), first !== undefined && second === first && radarFrames(tui.text(started), "workers").size === 1, `${first} → ${second}`);
+		}
 		const run = await files.finishedRun(before, 120_000);
 		check(named("the narrow run accepts its answer but does not certify the unrun code check"),
 			run.results?.some(row => row.id === "impl-answer" && row.state === "accepted") === true && run.endReason === "no-changes", `${run.status} ${run.endReason}`);
 		await suite.eventually(named("the narrow footer returns to idle"), () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 30_000);
-		if (background === "dark") {
+		if (background === "dark" && columns === LANE_MIN_COLUMNS && rows === 30) {
 			const hub = await tui.submit("/storm");
 			const full = await pickMenuRow(tui, hub, "Storm 메뉴", "전체 현황");
 			check("the narrow hub reaches the dashboard without a second link above the menu", !tui.text(hub).includes("전체 현황은 /storm status"));
@@ -1054,7 +1154,11 @@ async function main(): Promise<void> {
 					askPanel.slice(-600),
 				);
 				check("the native ask offers Submit", askPanel.includes("Submit"), askPanel.slice(-600));
-				check("waiting for the user shows the radar without a moving field", radarFrames(shown, "waiting-user").size === 1);
+				check(
+					"waiting for the user shows the lane view under a status row that has no radar field",
+					trunkFrames(shown).size >= 1 && radarFrames(shown, "waiting-user").size === 0,
+					`trunk=${trunkFrames(shown).size} radar=${radarFrames(shown, "waiting-user").size}`,
+				);
 				const live = await until(() => files.runs().find(run => !before.has(run.runId) && run.status === "running"), 20_000, "the asked run to be active");
 				await tui.press(ASK_ANSWER, text => text.includes(ASK_ANSWER), "the ask control to show the answer");
 				/** The exact answer as the fake provider saw it, not merely text left in the form. */
@@ -1088,13 +1192,13 @@ async function main(): Promise<void> {
 				const frames = await tui.seen(
 					first,
 					text => {
-						const fields = radarFrames(text, "workers");
-						return fields.size >= 2 ? fields : undefined;
+						const rows = trunkFrames(text);
+						return rows.size >= 2 && phaseRow(text, "workers") !== undefined ? rows : undefined;
 					},
-					"the answered run to resume with at least two distinct worker radar frames",
+					"the answered run to resume with at least two distinct frames of the lane view's trunk",
 					15_000,
 				);
-				console.log(`     real worker radar: ${[...frames].slice(0, 2).join(" → ")}`);
+				console.log(`     real trunk frames: ${frames.size}`);
 				await until(answerArrived, 30_000, "the named answer to reach the director");
 				const run = await files.finishedRun(before, 150_000);
 				check("the answer resumed the same run", run.runId === live.runId && run.status !== "running", `${run.runId} vs ${live.runId} ${run.status}`);
@@ -1156,12 +1260,11 @@ async function main(): Promise<void> {
 					const before = files.runIds();
 					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
 					await suite.eventually(
-						"the live widget shows a radar and a fixed row with the round and budget",
+						"the live widget shows the lane view and a fixed row with the round and budget",
 						() => {
 							const painted = tui.text(started);
 							const numbers = metricsRow(painted);
-							return numbers !== undefined && numbers.includes("💲") && numbers.includes("0.01") &&
-								(["working", "workers", "verifying"] as const).some(phase => radarFrames(painted, phase).size !== 0);
+							return numbers !== undefined && numbers.includes("💲") && numbers.includes("0.01") && trunkFrames(painted).size !== 0;
 						},
 						() => "",
 						30_000,
@@ -1236,10 +1339,208 @@ async function main(): Promise<void> {
 	);
 
 	await suite.step(
+		"the lane view follows a real run with several lanes: fixed height, a usable editor, lane states, the switch",
+		async () => {
+			const [origin, api, ui] = ["origin", "api-verify", "ui-preview"] as const;
+			const view = { columns: 120, rows: 36 };
+			const height = laneHeight(view.rows);
+			const answerResult = (id: string, criterion: string): Record<string, unknown> => ({ id, kind: "answer", criterion, path: FACT_FILE, contains: FACT_LINE });
+			const retryRelease = "release-lane-view-retry";
+			const steps: Step[] = [
+				{
+					storm: {
+						action: "plan",
+						plan: {
+							lanes: [
+								{ name: origin, kind: "explore", role: "explorer", results: [answerResult("origin-count", "원본 행 수")] },
+								{ name: api, kind: "explore", role: "explorer", results: [answerResult("api-check", "API 검증")] },
+								{ name: ui, kind: "explore", role: "explorer", results: [answerResult("ui-preview", "UI 미리보기")] },
+							],
+						},
+					},
+				},
+				{ tasks: [{ name: origin, agent: "storm-explorer", task: "Report the original line from source", say: readProbe }] },
+				{ wait: true },
+				// No source citation and a long delay: the lane runs for a while, then settles genuinely unmet.
+				{ tasks: [{ name: api, agent: "storm-explorer", task: "Verify the API criterion from source", say: "E2E-CHILD-DELAY 15000 E2E-CHILD-CLAIM not verified yet" }] },
+				{ wait: true },
+				{
+					followUp: `agent://${api}`,
+					content: `Retry the failed API verification against source. ${readProbe}`,
+					after: 'action="retry"',
+					releaseFile: { name: retryRelease, receipt: "not verified yet" },
+				},
+				{ wait: true },
+			];
+			const owned = await seedOwnSession("Storm lane view fixture transcript.");
+			const laneTui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"], resume: owned.id, sessionDir: owned.dir, ...view });
+			try {
+				await laneTui.ready();
+				await laneTui.shows("Storm lane view fixture transcript.");
+				await (async (tui: Tui, files: StormFiles): Promise<void> => {
+					const before = files.runIds();
+					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+					const run = await until(
+						() => files.runs().find(candidate => !before.has(candidate.runId) && candidate.status === "running" && candidate.plan?.lanes.length === 3),
+						60_000,
+						"the run with three lanes to be bound",
+					);
+					await tui.seen(started, text => ([origin, api, ui].every(lane => laneSequence(text, lane).length > 0) ? true : undefined), "a lane view row for each of the three lanes", 30_000);
+					const statuses: number[] = [];
+					const sample = (): LiveScreen | undefined => {
+						const screen = liveScreen(tui);
+						if (screen !== undefined) statuses.push(screen.status);
+						return screen;
+					};
+					const first = await until(() => sample(), 20_000, "the live widget on the screen");
+					check("the lane view sits under the editor: status row, trunk, then one row per lane", first.lanes && [origin, api, ui].every(lane => first.rows.some(row => row.trim().startsWith(`${lane} `))), first.rows.join("\n"));
+					check(
+						"the view is the fixed height and every row fits the terminal",
+						first.rows.length <= height && first.viewport.every(row => Bun.stringWidth(row) <= view.columns) && first.viewport.length - first.status >= height,
+						`rows=${first.rows.length} height=${height} status=${first.status} screen=${first.viewport.length}`,
+					);
+					const lead = trunkFrames(tui.text(started));
+					await suite.eventually("the trunk moves: two distinct frames", () => trunkFrames(tui.text(started)).size >= Math.max(2, lead.size), () => `frames=${trunkFrames(tui.text(started)).size}`, 15_000);
+
+					// The editor stays usable while the view animates: typed text appears above the status row, and goes again.
+					const typed = "lane-view-typing";
+					tui.send(typed);
+					const above = await until(() => {
+						const screen = sample();
+						return screen !== undefined && screen.viewport.slice(0, screen.status).some(row => row.includes(typed)) ? screen : undefined;
+					}, 15_000, "the typed text in the editor above the live widget");
+					check("typing in the editor works and the widget did not move", above.status === first.status, `${above.status} vs ${first.status}`);
+					tui.send("\x7f".repeat(typed.length));
+					await until(() => {
+						const screen = sample();
+						return screen !== undefined && !screen.viewport.some(row => row.includes(typed)) ? true : undefined;
+					}, 15_000, "the typed text to be erased");
+
+					// The independent lane settles first; the API lane is the one running a long time.
+					await until(() => {
+						const current = files.run(run.runId);
+						return current?.results?.find(row => row.id === "origin-count")?.state === "accepted" ? true : undefined;
+					}, 60_000, "the origin result to be accepted");
+					// How late the picture shows what the record already says: what is painted after the record changed.
+					const acceptedAt = Date.now();
+					await until(() => (shownState(tui, origin) === "accepted" ? true : undefined), 20_000, "the origin lane to show accepted");
+					const acceptedLag = Date.now() - acceptedAt;
+					await tui.seen(started, text => (laneSequence(text, api).includes("running") ? true : undefined), "the api lane to show running", 20_000);
+
+					// `/storm view` turns the picture into the single line, in the same place, and back.
+					await tui.submit("/storm view");
+					const single = await until(() => {
+						const screen = sample();
+						return screen !== undefined && !screen.lanes && RADAR_FIELD.test(screen.rows[0] ?? "") ? screen : undefined;
+					}, 20_000, "the single line with its radar after /storm view");
+					check("the switch leaves the single line in the same row, with the rest of the height blank", single.status === first.status && single.rows.length <= 2, `${single.status} vs ${first.status}: ${single.rows.join(" | ")}`);
+					await tui.submit("/storm view");
+					const back = await until(() => {
+						const screen = sample();
+						return screen?.lanes === true ? screen : undefined;
+					}, 20_000, "the lane view back after the second /storm view");
+					check("switching it on again restores the picture without moving the widget", back.status === first.status && [origin, api, ui].every(lane => back.rows.some(row => row.trim().startsWith(`${lane} `))), `${back.status} vs ${first.status}`);
+
+					// The user's two inputs: the unstarted lane leaves the plan, the unmet one is retried.
+					await tui.submit("UI는 빼고 API만 계속해");
+					await tui.seen(started, text => (laneSequence(text, ui).includes("excluded") ? true : undefined), "the ui lane to show excluded", 30_000);
+					await until(() => (files.run(run.runId)?.results?.find(row => row.id === "api-check")?.state === "unmet" ? true : undefined), 60_000, "the api result to settle unmet");
+					const unmetAt = Date.now();
+					await until(() => (shownState(tui, api) === "unmet" ? true : undefined), 20_000, "the api lane to show unmet");
+					const unmetLag = Date.now() - unmetAt;
+					console.log(`     the view followed the record: accepted after ${acceptedLag} ms, unmet after ${unmetLag} ms`);
+					check("a change in the record reaches the view within the controller's 2 s refresh and a repaint", acceptedLag <= 4_000 && unmetLag <= 4_000, `${acceptedLag} ms, ${unmetLag} ms`);
+					sample();
+					await tui.submit("실패한 API 검증만 다시 해");
+					await until(() => (files.run(run.runId)?.adjustments?.some(entry => entry.kind === "retry" && entry.id === "api-check") ? true : undefined), 20_000, "the retry request");
+					writeFileSync(join(env.work, retryRelease), "");
+					await tui.seen(started, text => (inOrder(laneSequence(text, api), ["running", "unmet", "running", "accepted"]) ? true : undefined), "the api lane to run, fail, retry and be accepted on the view", 90_000);
+					sample();
+					const finished = await files.finishedRun(before, 120_000);
+					const painted = tui.text(started);
+					check("the independent lane went to accepted and the excluded lane ended excluded", laneSequence(painted, origin).at(-1) === "accepted" && laneSequence(painted, ui).at(-1) === "excluded", `${laneSequence(painted, origin)} / ${laneSequence(painted, ui)}`);
+					check("the retry reads on the view as unmet then running again", inOrder(laneSequence(painted, api), ["running", "unmet", "running", "accepted"]), laneSequence(painted, api).join(" > "));
+					check("the widget never moved during the run, through the switch, typing and the retry", new Set(statuses).size === 1, `status rows: ${[...new Set(statuses)].join(", ")}`);
+					check("the run ended accepted for every in-scope result", finished.results?.every(row => row.state === "accepted" || row.scope === "excluded-by-user") === true, JSON.stringify(finished.results?.map(row => [row.id, row.state])));
+					await suite.eventually("the footer returns to idle after the run", () => idleFooter(statusLine(tui.raw)), () => statusLine(tui.raw) ?? "no status line", 60_000);
+					check("the lane view is gone after the run", liveScreen(tui) === undefined || !liveScreen(tui)!.lanes);
+				})(laneTui, new StormFiles(env, owned.id));
+			} finally {
+				await laneTui.close();
+			}
+		},
+		420_000,
+	);
+
+	await suite.step(
+		"the lane view shows the review of submitted answers: submitted, then reviewing on the lanes judged",
+		async () => {
+			const seedText = "Storm lane view review fixture transcript.";
+			const owned = await seedOwnSession(seedText);
+			const source = "report.json";
+			writeFileSync(join(env.project, source), '{\n  "total": 42,\n  "source": "user owning this file"\n}\n');
+			const claim = `The ${source} source field says a user owns this file, so Storm must leave its figures untouched (${source}:3)`;
+			const answerResult = (id: string): Record<string, unknown> => ({ id, kind: "answer", criterion: `The answer explains ${id} from ${source}; an independent reviewer judges the prose.`, path: source });
+			const steps: Step[] = [
+				{
+					storm: {
+						action: "plan",
+						plan: {
+							lanes: [
+								{ name: "explain-a", kind: "explore", role: "explorer", goal: "Explain a", results: [answerResult("a-answer")] },
+								{ name: "explain-b", kind: "explore", role: "explorer", goal: "Explain b", results: [answerResult("b-answer")] },
+								// A review gate that declares no dependency is the director's batch review of every submitted answer.
+								{ name: "review", kind: "review", goal: "Judge the answers" },
+							],
+						},
+					},
+				},
+				{
+					tasks: [
+						{ name: "explain-a", agent: "storm-explorer", task: "Explain a", say: `E2E-CHILD-READ ${source} E2E-CHILD-CLAIM ${claim}` },
+						{ name: "explain-b", agent: "storm-explorer", task: "Explain b", say: `E2E-CHILD-READ ${source} E2E-CHILD-CLAIM ${claim}` },
+					],
+				},
+				// Held until Storm says answers wait for review; the delay keeps the review on the screen long enough to see.
+				{ task: ["storm-reviewer"], as: "Judge", say: "E2E-CHILD-DELAY 6000 E2E-CHILD-ANSWER-VERDICT-ALL correct", after: "waiting for review" },
+			];
+			const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"], resume: owned.id, sessionDir: owned.dir, columns: 120, rows: 36 });
+			try {
+				await tui.ready();
+				await tui.shows(seedText);
+				const files = new StormFiles(env, owned.id);
+				const before = files.runIds();
+				const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+				const run = await files.finishedRun(before, 120_000);
+				const painted = tui.text(started);
+				// The widget goes with the run, so the verdict that ends it may never be painted: the record says accepted, below.
+				const expected: LaneState[] = ["submitted", "reviewing"];
+				for (const lane of ["explain-a", "explain-b"]) {
+					check(`${lane} reads submitted, then reviewing on the view`, inOrder(laneSequence(painted, lane), expected), laneSequence(painted, lane).join(" > "));
+				}
+				check("the review gate's own lane runs while it judges", laneSequence(painted, "review").includes("running"), laneSequence(painted, "review").join(" > "));
+				check("the run verified both answers", run.endReason === "verified" && run.results?.every(row => row.state === "accepted") === true, `${run.status} ${run.endReason}`);
+			} finally {
+				await tui.close();
+			}
+		},
+		240_000,
+	);
+
+	await suite.step(
 		"a narrow terminal with motion off keeps the live status still in both backgrounds",
 		async () => {
 			await narrowMotionOff("dark");
 			await narrowMotionOff("light");
+		},
+		300_000,
+	);
+
+	await suite.step(
+		"a terminal under 60 columns or 18 rows keeps the single line with its radar",
+		async () => {
+			await narrowMotionOff("dark", LANE_MIN_COLUMNS - 1, 30);
+			await narrowMotionOff("light", 100, LANE_MIN_ROWS - 1);
 		},
 		300_000,
 	);

@@ -9,6 +9,7 @@ import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
 import type { CompactOptions, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ensureThemeSync, setMotionEffects, theme as activeTheme } from "@oh-my-pi/pi-tui";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
@@ -100,6 +101,7 @@ function fakeOmp(project: TestProject) {
 	const transcript: unknown[] = [];
 	let active = ["read", "write"];
 	let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+	let completions: ((prefix: string) => Array<{ value: string; label: string; description?: string }> | null) | undefined;
 	let tool: Tool | undefined;
 	/** What this fake session reports as context usage; tests set it before a turn. */
 	const usage: { current?: { tokens: number; contextWindow: number; percent: number } } = {};
@@ -142,8 +144,12 @@ function fakeOmp(project: TestProject) {
 		registerTool: (definition: Tool) => {
 			tool = definition;
 		},
-		registerCommand: (_name: string, definition: { handler: NonNullable<typeof command> }) => {
+		registerCommand: (
+			_name: string,
+			definition: { handler: NonNullable<typeof command>; getArgumentCompletions?: NonNullable<typeof completions> },
+		) => {
 			command = definition.handler;
+			completions = definition.getArgumentCompletions;
 		},
 		registerMessageRenderer: () => undefined,
 	};
@@ -224,6 +230,8 @@ function fakeOmp(project: TestProject) {
 		sessionId: () => mainSessionId,
 		activeTools: () => active,
 		emit,
+		/** What `/storm ` offers after the typed prefix. */
+		completions: (prefix: string) => completions?.(prefix) ?? null,
 		command: (args: string, on: ExtensionContext) => {
 			if (!command) throw new Error("the /storm command is not registered");
 			rememberSession(on);
@@ -3413,5 +3421,126 @@ describe("native ask decisions", () => {
 		// The oldest key is still present, so it is a repeat rather than a new authorization.
 		expect(verdict(await ask(omp, main, form("cap-0", "user-choice")))).toBe("ask-repeat");
 		await omp.emit("session_shutdown", {}, main);
+	});
+});
+
+describe("the lane view switch", () => {
+	/** A TUI host whose widget slot is kept, so a test can render what the run draws below the editor. */
+	function liveTui(main: ExtensionContext, terminalRows = 40) {
+		ensureThemeSync();
+		const widgets = new Map<string, { render(width: number): readonly string[]; dispose?(): void }>();
+		const tui = { terminal: { rows: terminalRows }, requestComponentRender: () => undefined, requestRender: () => undefined };
+		const ctx = {
+			...main,
+			mode: "tui",
+			ui: {
+				...(main.ui as unknown as Record<string, unknown>),
+				theme: activeTheme,
+				setWidget: (key: string, content: unknown) => {
+					if (content === undefined) {
+						widgets.get(key)?.dispose?.();
+						widgets.delete(key);
+						return;
+					}
+					widgets.set(key, (content as (tui: unknown, theme: unknown) => never)(tui, activeTheme));
+				},
+			},
+		} as unknown as ExtensionContext;
+		return { ctx, draw: (columns = 100) => (widgets.get("storm-live")?.render(columns) ?? []).map(row => Bun.stripANSI(row)) };
+	}
+	const RADAR = /\[[\u2801-\u28ff]{18}\]$/;
+	const noticesAbout = (omp: ReturnType<typeof fakeOmp>) => omp.notices.map(notice => notice.level);
+
+	afterEach(() => setMotionEffects(true));
+
+	test("/storm view is offered next to auto, described in Korean, and nothing else changed", () => {
+		const omp = fakeOmp(project);
+		const all = omp.completions("") ?? [];
+		const names = all.map(entry => entry.value);
+		expect(names).toContain("view");
+		expect(names).toContain("auto");
+		const view = all.find(entry => entry.value === "view");
+		expect(view?.description).toMatch(/[가-힣]/);
+		expect(omp.completions("vi")?.map(entry => entry.value)).toEqual(["view"]);
+	});
+
+	test("the lane view is on by default; /storm view turns it off and on again during a run, at a fixed height", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const host = liveTui(omp.ctx(MAIN));
+		await omp.emit("session_start", {}, host.ctx);
+		await omp.command("fix it", host.ctx);
+		const lane = host.draw();
+		expect(lane).toHaveLength(12);
+		expect(lane[0]).toStartWith(STORM_MARK);
+		expect(lane[0]).not.toMatch(RADAR);
+		expect(lane[1]!.trim()).not.toBe("");
+
+		await omp.command("view", host.ctx);
+		const line = host.draw();
+		// The single line again, in the same 12 rows: the editor does not move.
+		expect(line).toHaveLength(12);
+		expect(line[0]).toMatch(RADAR);
+		expect(line.slice(2).every(row => row === "")).toBe(true);
+		expect(omp.notices.at(-1)?.level).toBe("info");
+
+		await omp.command("view", host.ctx);
+		const back = host.draw();
+		expect(back).toHaveLength(12);
+		expect(back[0]).not.toMatch(RADAR);
+		expect(back[1]!.trim()).not.toBe("");
+		expect(noticesAbout(omp).includes("error")).toBe(false);
+		await omp.emit("agent_start", {}, host.ctx);
+		await omp.emit("agent_end", {}, host.ctx);
+	});
+
+	test("a view turned off before the run starts keeps the single line; turning it on mid-run shows the picture", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const host = liveTui(omp.ctx(MAIN));
+		await omp.emit("session_start", {}, host.ctx);
+		await omp.command("view", host.ctx);
+		await omp.command("fix it", host.ctx);
+		const line = host.draw();
+		expect(line.length).toBeLessThanOrEqual(2);
+		expect(line[0]).toMatch(RADAR);
+
+		await omp.command("view", host.ctx);
+		const lane = host.draw();
+		expect(lane).toHaveLength(12);
+		expect(lane[0]).not.toMatch(RADAR);
+		await omp.emit("agent_start", {}, host.ctx);
+		await omp.emit("agent_end", {}, host.ctx);
+	});
+
+	test("the switch is one session's own and is dropped at a conversation boundary: the view is on again", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const host = liveTui(omp.ctx(MAIN));
+		await omp.emit("session_start", {}, host.ctx);
+		await omp.command("view", host.ctx);
+		await omp.emit("session_switch", {}, host.ctx);
+		await omp.emit("session_start", {}, host.ctx);
+		await omp.command("fix it", host.ctx);
+		expect(host.draw()).toHaveLength(12);
+		await omp.emit("agent_start", {}, host.ctx);
+		await omp.emit("agent_end", {}, host.ctx);
+	});
+
+	test("a host without the terminal screen changes nothing and says so", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		const before = omp.notices.length + omp.transcript.length;
+		await omp.command("view", main);
+		// Said somewhere the user can read it (the notice or the transcript), once.
+		expect(omp.notices.length + omp.transcript.length).toBe(before + 1);
+		// The refused command left the switch alone: a TUI of the same session still has the view.
+		const host = liveTui(main);
+		await omp.command("fix it", host.ctx);
+		expect(host.draw()).toHaveLength(12);
+		await omp.emit("agent_start", {}, host.ctx);
+		await omp.emit("agent_end", {}, host.ctx);
 	});
 });

@@ -1,9 +1,10 @@
 /**
- * The geometry of the "storm" variant: what `layout` hands to the painter. Nothing here knows about colour, drawing or
- * animation time. Dot coordinates are on the full-width canvas (2 by 4 dots per cell); `at` is the run time in ms a
- * point or mark stands for, so an effect can ask how long ago something happened without knowing the layout.
+ * What `layout` hands to the painter. Dot coordinates are on the full-width canvas (2 by 4 dots per cell); `at` is the
+ * run time in ms a point or mark stands for, so an effect can ask how long ago something happened without knowing the
+ * layout.
  */
-import type { LaneState, Phase, RunSnapshot } from "../model.ts";
+import type { RunPhase } from "../appearance.ts";
+import type { LaneSnapshot, LaneState } from "./model.ts";
 
 /** Dot coordinates on the full-width canvas; `at` is the run time in ms this point stands for. */
 export interface PathPoint { x: number; y: number; at: number }
@@ -24,12 +25,25 @@ export interface Strand {
 export type MarkKind = "start" | "round" | "accept" | "unmet" | "blocked" | "excluded" | "review" | "job" | "head" | "trunk-head";
 /** A node or an event at a cell. `at` lets an effect know how long ago it happened. */
 export interface Mark { kind: MarkKind; lane: number; cx: number; cy: number; at: number; done?: boolean; round?: number }
-export interface Label { side: "left" | "right" | "scale"; lane: number; cx: number; cy: number; width: number; text: string }
+export interface Label {
+	side: "left" | "right" | "scale";
+	lane: number;
+	cx: number;
+	cy: number;
+	/** Display cells the text occupies. */
+	width: number;
+	text: string;
+	/**
+	 * On a lane's labels: `text.slice(0, split)` is the main part (the name, or the state word) and `text.slice(split)`
+	 * the secondary part (the role word after the name, or the progress after the state word). Absent elsewhere.
+	 */
+	split?: number;
+}
 export interface Scene {
-	snapshot: RunSnapshot;
+	snapshot: LaneSnapshot;
 	cols: number;
 	rows: number;
-	phase: Phase;
+	phase: RunPhase;
 	phaseAge: number;
 	/** Run time the picture covers. */
 	span: number;

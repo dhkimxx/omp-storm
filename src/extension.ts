@@ -139,6 +139,7 @@ const SHORTCUTS = [
 	{ value: "status", label: "status", description: "현황만 보기(메뉴 없음)" },
 	{ value: "models", label: "models", description: "모델 점검" },
 	{ value: "auto", label: "auto", description: "자동 위임 켜기/끄기(이 세션)" },
+	{ value: "view", label: "view", description: "레인 뷰 켜기/끄기(이 세션)" },
 	{ value: "setup", label: "setup", description: "팀 다시 설정" },
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
@@ -618,7 +619,18 @@ function idleStatusText(
 
 export default function storm(pi: ExtensionAPI): void {
 	const exec = execPort(pi);
-	const liveStatus = new LiveStatus();
+	/**
+	 * The native sessions whose lane view the user turned off with `/storm view`. The view is on by default; like the
+	 * automatic-delegation policy this is one session's own setting, dropped at every identity boundary, and unlike it
+	 * nothing is stored: it only chooses what the live widget draws.
+	 */
+	const laneViewOff = new Set<string>();
+	const liveStatus = new LiveStatus({
+		laneView: ctx => {
+			const id = mainSessionId(ctx);
+			return id === undefined || !laneViewOff.has(id);
+		},
+	});
 	/**
 	 * The run each open ask/tool-approval belongs to, captured when it opened. Its end event closes that run's key,
 	 * never one of whichever run this session directs by then.
@@ -2295,6 +2307,7 @@ export default function storm(pi: ExtensionAPI): void {
 		const id = mainSessionId(ctx);
 		if (id !== undefined) {
 			autos.delete(id);
+			laneViewOff.delete(id);
 			decisions.forget(id);
 		}
 		stateCache.clear();
@@ -2468,6 +2481,7 @@ export default function storm(pi: ExtensionAPI): void {
 		if (sessionId === undefined) {
 			// The host can no longer say whose state this is: leave no Storm surface from another conversation.
 			autos.clear();
+			laneViewOff.clear();
 			stateCache.clear();
 			liveStatus.clear();
 			await deactivateTool();
@@ -2520,6 +2534,7 @@ export default function storm(pi: ExtensionAPI): void {
 		const sessionId = mainSessionId(ctx);
 		if (sessionId === undefined) {
 			autos.clear();
+			laneViewOff.clear();
 			stateCache.clear();
 			liveStatus.clear();
 			await deactivateTool();
@@ -2527,6 +2542,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		sessionGeneration++;
 		autos.delete(sessionId);
+		laneViewOff.delete(sessionId);
 		decisions.forget(sessionId);
 		stateCache.clear();
 		const generation = sessionGeneration;
@@ -2600,6 +2616,18 @@ export default function storm(pi: ExtensionAPI): void {
 					return;
 				}
 				const env = flowEnv(ctx, startRun);
+				/** `/storm view`: this session's lane view on or off; a live run changes its picture at once. */
+				const toggleLaneView = (): void => {
+					if (!isLiveTui(ctx)) {
+						ui.notify("레인 뷰는 터미널 화면에서만 쓸 수 있어 아무것도 바꾸지 않습니다.", "warning");
+						return;
+					}
+					const nowOn = laneViewOff.delete(sessionId);
+					if (!nowOn) laneViewOff.add(sessionId);
+					const run = runs.active();
+					if (run) showRunStatus(ctx, run, runs.phase());
+					ui.notify(nowOn ? "레인 뷰를 켰습니다. 이 OMP 세션에서만 적용됩니다." : "레인 뷰를 껐습니다. 한 줄 현황으로 돌아갑니다. 이 OMP 세션에서만 적용됩니다.");
+				};
 				/** Bare /storm: the hub, or just the status where no dialog can be answered. */
 				const menu = async (): Promise<void> => {
 					if (!ctx.hasUI) await statusFlow(env, ui);
@@ -2609,6 +2637,7 @@ export default function storm(pi: ExtensionAPI): void {
 				else if (input === "status") await statusFlow(env, ui);
 				else if (input === "models") await modelsFlow(env, ui);
 				else if (input === "auto") await autoDelegationFlow(env, ui);
+				else if (input === "view") toggleLaneView();
 				else if (SHORTCUT_NAMES.includes(input)) {
 					if (!ctx.hasUI) ui.notify("승인 창을 띄울 수 없는 모드라 아무것도 바꾸지 않습니다. /storm 으로 현황은 볼 수 있습니다.", "warning");
 					else if (input === "setup") await setupFlow(env, ui);

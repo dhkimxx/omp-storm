@@ -1,7 +1,12 @@
 /**
- * Live radar layout, structured metric chips, animation isolation, and native and plain terminal motion preferences.
+ * Live widget: the single status line with its radar (layout, metric chips, animation isolation, native and plain
+ * terminal motion preferences) and the lane view above it (rows, height, timer, switch).
+ *
+ * `describe("the live run widget")` tests the single line on purpose: its `LiveStatus` has the lane view switched
+ * off, so a tall terminal in the test host cannot turn it into the lane view by accident. The lane view has its own
+ * `describe` below.
  */
-import { afterEach, describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, spyOn, test, vi } from "bun:test";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
 	type Component,
@@ -18,9 +23,10 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
-import { LIVE_WIDGET_KEY, LiveStatus } from "../src/view/live.ts";
+import * as frameModule from "../src/view/lane/frame.ts";
+import { LANE_MIN_ROWS, LIVE_WIDGET_KEY, LiveStatus } from "../src/view/live.ts";
 import type { RunRecord, RunResult } from "../src/types.ts";
-import { agentEntry, runRecord } from "./fixtures.ts";
+import { agentEntry, runRecord, spawnRecord } from "./fixtures.ts";
 
 ensureThemeSync();
 
@@ -45,25 +51,30 @@ type WidgetFactory = (tui: TUI) => Widget;
 interface WidgetHost {
 	ctx: ExtensionContext;
 	ui: { theme: typeof activeTheme };
+	/** The terminal the widget asks for its height; change `rows` to resize the window under a mounted widget. */
+	terminal: { rows: number };
 	installs: Array<{ key: string; placement: string | undefined }>;
 	statuses: Array<string | undefined>;
 	widgets: Map<string, Widget>;
 	requests: Component[];
 }
 
-/** The parts of a TUI host the widget touches: status writes, one widget slot, and component-render requests. */
-function widgetHost(): WidgetHost {
+/** The parts of a TUI host the widget touches: status writes, one widget slot, render requests, terminal height. */
+function widgetHost(rows = 40): WidgetHost {
 	const statuses: Array<string | undefined> = [];
 	const installs: Array<{ key: string; placement: string | undefined }> = [];
 	const widgets = new Map<string, Widget>();
 	const requests: Component[] = [];
+	const terminal = { rows };
 	const tui = {
+		terminal,
 		requestComponentRender(component: Component) {
 			requests.push(component);
 		},
 		requestRender() {},
 	};
 	const ui = {
+		// Read through the module binding: a preset change after the host exists is what the widget must see.
 		theme: activeTheme,
 		setStatus(_key: string, text: string | undefined) {
 			statuses.push(text);
@@ -82,6 +93,7 @@ function widgetHost(): WidgetHost {
 	return {
 		ctx: { mode: "tui", hasUI: true, agent: { kind: "main", id: "main", name: "main" }, ui } as unknown as ExtensionContext,
 		ui,
+		terminal,
 		installs,
 		statuses,
 		widgets,
@@ -145,15 +157,27 @@ const describeContext = {
 } as unknown as DescribeContext;
 
 const activeWidgets: LiveStatus[] = [];
+const realLaneFrame = frameModule.laneFrame;
+const SSH_VARIABLES = ["SSH_CONNECTION", "SSH_TTY"] as const;
+const savedEnv = new Map<string, string | undefined>(SSH_VARIABLES.map(name => [name, process.env[name]]));
 
+function restoreEnv(): void {
+	for (const [name, value] of savedEnv) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+}
+
+/** The single status line: the lane view is switched off, whatever the terminal's size. */
 function liveForTest(): LiveStatus {
-	const live = new LiveStatus({ now: () => NOW });
+	const live = new LiveStatus({ now: () => NOW, laneView: () => false });
 	activeWidgets.push(live);
 	return live;
 }
 
 afterEach(() => {
 	for (const live of activeWidgets.splice(0)) live.clear();
+	restoreEnv();
 	vi.useRealTimers();
 	setMotionEffects(true);
 	setShimmerMode("classic");
@@ -713,5 +737,516 @@ describe("the live run widget", () => {
 		expect(live.isCurrent(epoch)).toBe(false);
 		expect(live.isCurrent(next)).toBe(true);
 		expect(host.widgets.size).toBe(0);
+	});
+});
+
+// ---- The lane view ----------------------------------------------------------------------------------------------
+
+const LONG_LANE = "아주긴한글레인이름아주긴한글레인이름아주긴한글레인이름";
+const iso = (ms: number): string => new Date(ms).toISOString();
+/** The contract's height for a terminal of this many rows, written out again so a drifting constant is caught. */
+const heightFor = (rows: number): number => Math.min(12, Math.max(6, Math.floor(rows / 3)));
+
+/** A run with a plan: two workers running, a reviewer lane that waits for one of them, and a lane with a very long name. */
+function laneRun(over: Partial<RunRecord> = {}, now = NOW): RunRecord {
+	const worker = (id: string) => agentEntry({ id, state: "running", startedAt: now - 120_000, lastActivityAt: now - 1_000 });
+	return runRecord({
+		runId: "run-lane",
+		status: "running",
+		startedAt: iso(now - 180_000),
+		turns: 1,
+		maxRounds: 4,
+		plan: {
+			submittedAt: iso(now - 170_000),
+			workers: { implementer: 3, reviewer: 1 },
+			lanes: [
+				{ name: "Api", kind: "code", role: "implementer" },
+				{ name: "Ui", kind: "code", role: "implementer" },
+				{ name: LONG_LANE, kind: "code", role: "implementer" },
+				{ name: "Check", kind: "review", role: "reviewer", dependsOn: [{ lane: "Api", need: "reviewable" }] },
+			],
+		},
+		agents: [worker("Api"), worker("Ui"), worker("Long")],
+		spawns: [
+			spawnRecord({ spawnKey: "Api", lane: "Api" }),
+			spawnRecord({ spawnKey: "Ui", lane: "Ui" }),
+			spawnRecord({ spawnKey: "Long", lane: LONG_LANE }),
+		],
+		...over,
+	});
+}
+
+/** The same plan with every worker settled: the lanes idle and the picture has nothing running. */
+function settledRun(over: Partial<RunRecord> = {}): RunRecord {
+	const run = laneRun(over);
+	return { ...run, agents: (run.agents ?? []).map(agent => ({ ...agent, state: "idle" })) };
+}
+
+interface LaneSetup {
+	live: LiveStatus;
+	clock: { now: number };
+	host: WidgetHost;
+	component: () => Widget;
+	/** Shows the run through the status and returns nothing; the host's widget is `component()`. */
+	show: (run: RunRecord, phase?: RunPhase) => void;
+}
+
+/** A status with the lane view on (or following `switch`), on a host with a `rows` tall terminal and a movable clock. */
+function laneSetup(options: { rows?: number; switch?: () => boolean } = {}): LaneSetup {
+	const clock = { now: NOW };
+	const live = new LiveStatus({ now: () => clock.now, laneView: options.switch ?? (() => true) });
+	activeWidgets.push(live);
+	const host = widgetHost(options.rows ?? 40);
+	return {
+		live,
+		clock,
+		host,
+		component: () => host.widgets.get(LIVE_WIDGET_KEY)!,
+		show: (run, phase = "working") => void live.show(host.ctx, run, phase),
+	};
+}
+
+/** A waiting or between-rounds picture first lets its last events play out; this is the clock step that ends that. */
+const SETTLE_MS = 3_000;
+const RADAR_ROW = /\[[⠁-⣿]{18}\]$/;
+const blank = (rows: readonly string[]): boolean => rows.every(row => row === "");
+
+describe("the live run widget in lane mode", () => {
+	test("draws the status row without the radar, then the picture, at the height the terminal decides", () => {
+		vi.useFakeTimers();
+		for (const rows of [18, 21, 30, 40, 90]) {
+			for (const columns of [60, 61, 100, 200]) {
+				const lane = laneSetup({ rows });
+				lane.show(laneRun());
+				const drawn = lane.component().render(columns);
+				const text = plain(drawn);
+				expect(drawn).toHaveLength(heightFor(rows));
+				expect(drawn.every(row => visibleWidth(row) <= columns)).toBe(true);
+				expect(text[0]).toStartWith(STORM_MARK);
+				expect(text[0]).not.toMatch(RADAR_ROW);
+				expect(text[0]!.includes("[")).toBe(false);
+				// The trunk and at least one lane have something on them; nothing below the picture is invented.
+				expect(text[1]!.trim()).not.toBe("");
+				expect(text[2]!.trim()).not.toBe("");
+				lane.live.clear();
+			}
+		}
+	});
+
+	test("row 0 is today's status line: mark, phase and the same chips", () => {
+		const lane = laneSetup();
+		lane.show(RUN);
+		expect(plain(lane.component().render(120))[0]).toBe(`${liveHeader("working")} · ${COUNTERS}`);
+		// At the contract's smallest width the chips shrink exactly as they do in the single line.
+		const narrow = plain(lane.component().render(60))[0]!;
+		expect(visibleWidth(narrow)).toBeLessThanOrEqual(60);
+		expect(narrow).toStartWith(STORM_MARK);
+	});
+
+	test("the boundary values: 18 rows and 60 columns are lane mode, one less is the single line", () => {
+		const check = (rows: number, columns: number): readonly string[] => {
+			const lane = laneSetup({ rows });
+			lane.show(laneRun());
+			const drawn = lane.component().render(columns);
+			lane.live.clear();
+			return drawn;
+		};
+		expect(check(18, 60)).toHaveLength(6);
+		expect(check(17, 60).length).toBeLessThanOrEqual(2);
+		expect(check(18, 59).length).toBeLessThanOrEqual(2);
+		// The constants the widget exports are the same numbers.
+		expect([LANE_MIN_ROWS, frameModule.LANE_MIN_COLUMNS]).toEqual([18, 60]);
+	});
+
+	test("a short or narrow terminal, the ASCII preset or an unknown height keeps the single line with its radar, exactly", () => {
+		const lineOf = (host: WidgetHost, columns: number, phase: RunPhase = "working"): readonly string[] => {
+			const live = liveForTest();
+			live.show(host.ctx, RUN, phase);
+			return host.widgets.get(LIVE_WIDGET_KEY)!.render(columns);
+		};
+		const laneOf = (host: WidgetHost, columns: number): readonly string[] => {
+			const live = new LiveStatus({ now: () => NOW });
+			activeWidgets.push(live);
+			live.show(host.ctx, RUN, "working");
+			return host.widgets.get(LIVE_WIDGET_KEY)!.render(columns);
+		};
+		const sameAsLine = (rows: number, columns: number): void => {
+			const lineHost = widgetHost(rows);
+			const laneHost = widgetHost(rows);
+			const expected = lineOf(lineHost, columns);
+			const actual = laneOf(laneHost, columns);
+			expect(actual).toEqual(expected);
+			expect(actual.length).toBeLessThanOrEqual(2);
+		};
+		sameAsLine(17, 120);
+		sameAsLine(10, 120);
+		sameAsLine(40, 59);
+		sameAsLine(40, 52);
+		sameAsLine(40, 30);
+		// A host that cannot say how tall the terminal is gets the line too.
+		const unknown = widgetHost();
+		(unknown as unknown as { terminal: { rows: number | undefined } }).terminal.rows = undefined;
+		expect(laneOf(unknown, 120).length).toBeLessThanOrEqual(2);
+		expect(plain(laneOf(unknown, 120))[0]).toMatch(RADAR_ROW);
+
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		sameAsLine(40, 120);
+		expect(plain(laneOf(widgetHost(40), 120))[0]).toStartWith(ASCII_MARK);
+	});
+
+	test("native rendering keeps describing the line and runs no timer", () => {
+		vi.useFakeTimers();
+		setNativeRendering(true);
+		const lane = laneSetup();
+		lane.show(RUN);
+		const node = lane.component().describe?.(describeContext);
+		expect(node).not.toBeNull();
+		expect(flatText(node!)).toContain(RUN_APPEARANCE.working.label);
+		expect(vi.getTimerCount()).toBe(0);
+		// A host that still calls render keeps the single line.
+		expect(lane.component().render(120).length).toBeLessThanOrEqual(2);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("the height is fixed for the run: resizing, narrowing, the preset or the switch never change the row count", () => {
+		vi.useFakeTimers();
+		let on = true;
+		const lane = laneSetup({ rows: 40, switch: () => on });
+		lane.show(laneRun());
+		const counts = new Set<number>();
+		const draw = (columns: number): readonly string[] => {
+			const rows = lane.component().render(columns);
+			counts.add(rows.length);
+			expect(rows.every(row => visibleWidth(row) <= columns)).toBe(true);
+			return rows;
+		};
+		expect(draw(120)).toHaveLength(12);
+		// Shorter window, still tall enough: the picture, the same 12 rows.
+		lane.host.terminal.rows = 24;
+		expect(plain(draw(120))[1]!.trim()).not.toBe("");
+		// Too short for lane mode: the single line at the top of the same 12 rows, the rest blank.
+		lane.host.terminal.rows = 12;
+		const short = draw(120);
+		expect(plain(short)[0]).toMatch(RADAR_ROW);
+		expect(plain(short)[1]).toStartWith("›");
+		expect(blank(short.slice(2))).toBe(true);
+		lane.host.terminal.rows = 40;
+		// Narrow: the compact line, padded.
+		const narrow = draw(50);
+		expect(plain(narrow)[0]).toStartWith(STORM_MARK);
+		expect(blank(narrow.slice(1))).toBe(true);
+		draw(0);
+		expect(draw(0).every(row => row === "")).toBe(true);
+		// The switch off mid-run, then on again.
+		on = false;
+		lane.show(laneRun());
+		const off = draw(120);
+		expect(plain(off)[0]).toMatch(RADAR_ROW);
+		expect(blank(off.slice(2))).toBe(true);
+		on = true;
+		lane.show(laneRun());
+		expect(plain(draw(120))[0]).not.toMatch(RADAR_ROW);
+		// The ASCII preset mid-run: the line without braille, the height unchanged.
+		expect(setNativeSymbolPreset("ascii")).toBe(true);
+		lane.host.ui.theme = activeTheme;
+		const ascii = draw(120);
+		expect(plain(ascii)[0]).toStartWith(ASCII_MARK);
+		expect(plain(ascii).join("\n")).not.toMatch(/[⠁-⣿]/);
+		expect(blank(ascii.slice(2))).toBe(true);
+		setNativeSymbolPreset(undefined);
+		lane.host.ui.theme = activeTheme;
+		draw(100);
+		expect([...counts]).toEqual([12]);
+	});
+
+	test("a run that starts in the single line decides its height once, the first time the view fits", () => {
+		const lane = laneSetup({ rows: 40 });
+		lane.show(laneRun());
+		const narrow = lane.component().render(50);
+		expect(narrow.length).toBeLessThanOrEqual(2);
+		const wide = lane.component().render(120);
+		expect(wide).toHaveLength(12);
+		expect(lane.component().render(50)).toHaveLength(12);
+		lane.host.terminal.rows = 90;
+		expect(lane.component().render(120)).toHaveLength(12);
+	});
+
+	test("one row of the picture is never wider than the terminal, with wide characters, in both colour modes", () => {
+		for (const columns of [60, 63, 80, 117]) {
+			const lane = laneSetup({ rows: 60 });
+			lane.show(laneRun());
+			const rows = lane.component().render(columns);
+			expect(rows).toHaveLength(12);
+			expect(rows.every(row => visibleWidth(row) <= columns)).toBe(true);
+			lane.live.clear();
+		}
+	});
+
+	test("the animation ticks at 85 ms, 120 ms over SSH, and about four frames a second while it only breathes", () => {
+		vi.useFakeTimers();
+		delete process.env.SSH_CONNECTION;
+		delete process.env.SSH_TTY;
+		const ticks = (phase: RunPhase, ms: number, env?: string): number => {
+			if (env !== undefined) process.env[env] = "1";
+			const lane = laneSetup();
+			lane.show(laneRun(), phase);
+			if (phase === "waiting-user") lane.clock.now += SETTLE_MS;
+			lane.component().render(120);
+			expect(vi.getTimerCount()).toBe(1);
+			const before = lane.host.requests.length;
+			vi.advanceTimersByTime(ms);
+			const seen = lane.host.requests.length - before;
+			lane.live.clear();
+			expect(vi.getTimerCount()).toBe(0);
+			if (env !== undefined) delete process.env[env];
+			return seen;
+		};
+		expect(ticks("working", 1_020)).toBe(12);
+		expect(ticks("working", 1_020, "SSH_CONNECTION")).toBe(8);
+		expect(ticks("working", 1_020, "SSH_TTY")).toBe(8);
+		const slow = ticks("waiting-user", 1_000);
+		expect(slow).toBeGreaterThanOrEqual(3);
+		expect(slow).toBeLessThanOrEqual(5);
+	});
+
+	test("a picture that does not move has no timer; an update that makes it lively starts one, and never a second", () => {
+		vi.useFakeTimers();
+		const lane = laneSetup();
+		lane.show(settledRun(), "between-rounds");
+		lane.component().render(120);
+		expect(vi.getTimerCount()).toBe(0);
+		const quiet = lane.host.requests.length;
+		vi.advanceTimersByTime(5_000);
+		expect(lane.host.requests.length).toBe(quiet);
+
+		lane.show(laneRun(), "working");
+		expect(vi.getTimerCount()).toBe(1);
+		lane.component().render(120);
+		lane.show(laneRun({ turns: 2 }), "working");
+		lane.component().render(120);
+		expect(vi.getTimerCount()).toBe(1);
+
+		// Waiting for the user slows it down but keeps the one timer.
+		lane.show(laneRun(), "waiting-user");
+		// The events of the moment before the wait play out at full pace first.
+		expect(vi.getTimerCount()).toBe(1);
+		lane.clock.now += SETTLE_MS;
+		lane.component().render(120);
+		expect(vi.getTimerCount()).toBe(1);
+		const slowFrom = lane.host.requests.length;
+		vi.advanceTimersByTime(1_000);
+		expect(lane.host.requests.length - slowFrom).toBeLessThanOrEqual(6);
+
+		// And back to the full pace.
+		lane.show(laneRun(), "working");
+		lane.component().render(120);
+		const fullFrom = lane.host.requests.length;
+		vi.advanceTimersByTime(1_000);
+		expect(lane.host.requests.length - fullFrom).toBeGreaterThanOrEqual(10);
+
+		lane.show(settledRun(), "between-rounds");
+		expect(vi.getTimerCount()).toBe(1);
+		lane.clock.now += SETTLE_MS;
+		lane.component().render(120);
+		expect(vi.getTimerCount()).toBe(0);
+		const stopped = lane.host.requests.length;
+		vi.advanceTimersByTime(5_000);
+		expect(lane.host.requests.length).toBe(stopped);
+	});
+
+	test("with motion off there is no timer and the picture is still, with its colours", () => {
+		vi.useFakeTimers();
+		setMotionEffects(false);
+		const lane = laneSetup();
+		lane.show(laneRun());
+		const first = lane.component().render(120);
+		expect(vi.getTimerCount()).toBe(0);
+		const requests = lane.host.requests.length;
+		vi.advanceTimersByTime(5_000);
+		expect(lane.host.requests.length).toBe(requests);
+		expect(lane.component().render(120)).toEqual(first);
+		expect(first.some(row => row.includes("\x1b["))).toBe(true);
+		expect(vi.getTimerCount()).toBe(0);
+
+		// Motion back on: the timer comes back without another update.
+		setMotionEffects(true);
+		expect(vi.getTimerCount()).toBe(1);
+		setMotionEffects(false);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	test("no timer survives dispose, a replaced host, the end of the run or a switch to the single line's still phases", () => {
+		vi.useFakeTimers();
+		const lane = laneSetup();
+		lane.show(laneRun());
+		const first = lane.component();
+		first.render(120);
+		expect(vi.getTimerCount()).toBe(1);
+		first.dispose?.();
+		expect(vi.getTimerCount()).toBe(0);
+		expect(first.render(120)).toEqual([]);
+		const requests = lane.host.requests.length;
+		vi.advanceTimersByTime(2_000);
+		expect(lane.host.requests.length).toBe(requests);
+
+		// The host removed the widget: the next show installs a fresh one, with one timer.
+		lane.show(laneRun());
+		const second = lane.component();
+		expect(second).not.toBe(first);
+		second.render(120);
+		expect(vi.getTimerCount()).toBe(1);
+
+		const replacement = widgetHost();
+		lane.live.show(replacement.ctx, laneRun(), "working");
+		expect(vi.getTimerCount()).toBe(0);
+		const third = replacement.widgets.get(LIVE_WIDGET_KEY)!;
+		third.render(120);
+		expect(vi.getTimerCount()).toBe(1);
+		const before = lane.host.requests.length + replacement.requests.length;
+		lane.live.clear();
+		expect(vi.getTimerCount()).toBe(0);
+		vi.advanceTimersByTime(2_000);
+		expect(lane.host.requests.length + replacement.requests.length).toBe(before);
+		expect(replacement.widgets.size).toBe(0);
+	});
+
+	test("animation time continues where it stopped when the timer restarts; it never jumps by the idle gap", () => {
+		vi.useFakeTimers();
+		const lane = laneSetup();
+		const times: number[] = [];
+		const spy = spyOn(frameModule, "laneFrame").mockImplementation((snapshot, cols, t, options) => {
+			times.push(t);
+			return realLaneFrame(snapshot, cols, t, options);
+		});
+		try {
+			lane.show(laneRun());
+			const component = lane.component();
+			component.render(120);
+			for (const step of [85, 85, 85]) {
+				lane.clock.now += step;
+				vi.advanceTimersByTime(step);
+				component.render(120);
+			}
+			const reached = times.at(-1)!;
+			expect(times[0]).toBe(0);
+			expect(reached).toBe(255);
+
+			// Everything settles: a still picture, no timer, the clock runs on for ten minutes.
+			lane.show(settledRun(), "between-rounds");
+			lane.clock.now += SETTLE_MS;
+			component.render(120);
+			expect(vi.getTimerCount()).toBe(0);
+			expect(times.at(-1)).toBe(reached);
+			lane.clock.now += 600_000;
+			component.render(120);
+			lane.show(laneRun({}, lane.clock.now), "working");
+			expect(vi.getTimerCount()).toBe(1);
+			times.length = 0;
+			component.render(120);
+			expect(times.at(-1)).toBe(reached);
+			lane.clock.now += 85;
+			vi.advanceTimersByTime(85);
+			component.render(120);
+			expect(times.at(-1)).toBe(reached + 85);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("a stalled event loop moves the animation by a bounded step, not by the whole stall", () => {
+		vi.useFakeTimers();
+		const lane = laneSetup();
+		const times: number[] = [];
+		const spy = spyOn(frameModule, "laneFrame").mockImplementation((snapshot, cols, t, options) => {
+			times.push(t);
+			return realLaneFrame(snapshot, cols, t, options);
+		});
+		try {
+			lane.show(laneRun());
+			lane.component().render(120);
+			lane.clock.now += 30_000;
+			lane.component().render(120);
+			expect(times.at(-1)!).toBeLessThanOrEqual(1_000);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	test("the switch changes the drawing at once, in both directions, and repaints", () => {
+		vi.useFakeTimers();
+		let on = true;
+		const lane = laneSetup({ switch: () => on });
+		lane.show(laneRun());
+		expect(plain(lane.component().render(120))[0]).not.toMatch(RADAR_ROW);
+		const requests = lane.host.requests.length;
+
+		on = false;
+		lane.show(laneRun());
+		expect(lane.host.requests.length).toBeGreaterThan(requests);
+		const line = lane.component().render(120);
+		expect(plain(line)[0]).toStartWith(liveHeader("working"));
+		expect(plain(line)[0]).toMatch(RADAR_ROW);
+		expect(line).toHaveLength(12);
+		expect(vi.getTimerCount()).toBe(1);
+
+		on = true;
+		lane.show(laneRun());
+		const again = lane.component().render(120);
+		expect(plain(again)[0]).not.toMatch(RADAR_ROW);
+		expect(plain(again)[1]!.trim()).not.toBe("");
+		expect(vi.getTimerCount()).toBe(1);
+	});
+
+	test("turning the view on mid-run draws the lanes from what the timeline recorded, as if it had been on all along", () => {
+		setMotionEffects(false);
+		/** The record at a moment: both workers run, then `Api` settles and `Ui` keeps going. */
+		const recordAt = (moment: number): RunRecord => {
+			const run = laneRun({}, moment);
+			if (moment === NOW) return run;
+			return { ...run, agents: (run.agents ?? []).map(agent => (agent.id === "Api" ? { ...agent, state: "idle" } : agent)) };
+		};
+		const play = (on: () => boolean, turnOn: () => void): readonly string[] => {
+			const lane = laneSetup({ switch: on });
+			lane.show(recordAt(NOW));
+			lane.component().render(120);
+			lane.clock.now = NOW + 40_000;
+			lane.show(recordAt(lane.clock.now));
+			lane.clock.now = NOW + 80_000;
+			turnOn();
+			lane.show(recordAt(lane.clock.now));
+			return lane.component().render(120);
+		};
+		let late = false;
+		const mid = play(() => late, () => {
+			late = true;
+		});
+		const always = play(() => true, () => undefined);
+		expect(mid).toHaveLength(12);
+		expect(plain(mid).join("\n")).toContain("Api");
+		expect(mid).toEqual(always);
+	});
+
+	test("a new run gets a new timeline: nothing of the earlier run's history reaches its picture", () => {
+		setMotionEffects(false);
+		const second = (): RunRecord =>
+			laneRun({
+				runId: "run-second",
+				startedAt: iso(NOW - 10_000),
+				plan: { submittedAt: iso(NOW - 9_000), workers: { implementer: 1 }, lanes: [{ name: "Zed", kind: "code", role: "implementer" }] },
+				agents: [agentEntry({ id: "Zed", state: "running", startedAt: NOW - 5_000, lastActivityAt: NOW - 500 })],
+				spawns: [spawnRecord({ spawnKey: "Zed", lane: "Zed" })],
+			});
+		const reused = laneSetup();
+		reused.show(laneRun());
+		reused.component().render(120);
+		reused.clock.now += 20_000;
+		reused.show(second());
+		const fresh = laneSetup();
+		fresh.clock.now = reused.clock.now;
+		fresh.show(second());
+		const rows = reused.component().render(120);
+		expect(plain(rows).join("\n")).toContain("Zed");
+		expect(plain(rows).join("\n")).not.toContain("Api");
+		expect(rows).toEqual(fresh.component().render(120));
 	});
 });

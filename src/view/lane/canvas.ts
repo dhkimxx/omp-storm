@@ -6,15 +6,15 @@
  * 1 is the full colour, and above 1 the colour is pushed toward white on a dark terminal (toward a deep tone on a light
  * one, where white would vanish).
  *
- * Output has three modes, chosen by `FrameOptions.colour`:
+ * Output has two modes:
  * - "truecolor": `38;2;r;g;b`, written only where the colour changes along the row. Blank cells keep the current colour
  *   (nothing is written for a space), and a colour within a few units of the current one is not rewritten. That is what
  *   keeps a frame cheap over SSH.
  * - "256": the nearest xterm 256-colour index; runs of the same index share one code.
- * - "tones" (or absent): the colour is mapped to one of the 13 tones and written through `options.paint`.
+ *
+ * Every row is exactly `cw` cells wide. Text is measured in display cells, so a Korean syllable takes two.
  */
-import type { FrameOptions, Tone } from "../model.ts";
-import { blue, green, grey, type Look, mix, type Rgb, red, toOklch } from "./colour.ts";
+import { blue, green, grey, type Look, mix, type Rgb, red } from "./colour.ts";
 
 /** Shapes the energy-to-blend curve: perceived brightness against linear-light mixing (gentler on a light terminal). */
 const ENERGY_CURVE_DARK = 1.8;
@@ -40,12 +40,23 @@ const EMPTY = 0;
 const TEXT = 1;
 const CONTINUATION = 2;
 
-function charWidth(code: number): number {
-	if (code === 0 || (code >= 0x300 && code <= 0x36f) || code === 0x200d || (code >= 0xfe00 && code <= 0xfe0f)) return 0;
+/**
+ * Display cells of one code point: 0 for control, combining and joiner characters (a name can never smuggle an escape
+ * sequence into a row), 2 for East Asian wide and emoji ranges, otherwise 1.
+ */
+export function charWidth(code: number): number {
+	if (code < 0x20 || (code >= 0x7f && code < 0xa0) || (code >= 0x300 && code <= 0x36f) || code === 0x200d || (code >= 0xfe00 && code <= 0xfe0f)) return 0;
 	return (code >= 0x1100 && code <= 0x115f) || (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xac00 && code <= 0xd7a3) ||
 		(code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe30 && code <= 0xfe6f) || (code >= 0xff00 && code <= 0xff60) ||
 		(code >= 0xffe0 && code <= 0xffe6) || (code >= 0x1f300 && code <= 0x1faff) || (code >= 0x20000 && code <= 0x3fffd)
 		? 2 : 1;
+}
+
+/** Display cells of a text (see `charWidth`). */
+export function textWidth(text: string): number {
+	let width = 0;
+	for (const char of text) width += charWidth(char.codePointAt(0)!);
+	return width;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -81,29 +92,6 @@ function xterm256(rgb: Rgb): number {
 	if (indexCache.size > 20000) indexCache.clear();
 	indexCache.set(rgb, index);
 	return index;
-}
-
-/**
- * The tone nearest to a colour and its energy. Hue picks the tone (the plain palette has one tone per hue family:
- * red error, amber warning, green success, then blue, purple, pink, orange and teal roles); energy picks dim, normal
- * or bold. White-hot cells use `bright`.
- */
-function toneOf(colour: Rgb, energy: number): { tone: Tone; bold: boolean } {
-	if (energy < 0.22) return { tone: "dim", bold: false };
-	const { c, h } = toOklch(colour);
-	if (energy > 1.3 && c < 0.06) return { tone: "bright", bold: true };
-	const bold = energy > 0.85;
-	if (c < 0.04) return { tone: energy < 0.5 ? "muted" : "fg", bold };
-	let tone: Tone;
-	if (h < 10 || h >= 335) tone = "role5";
-	else if (h < 40) tone = "error";
-	else if (h < 70) tone = "role3";
-	else if (h < 115) tone = "warning";
-	else if (h < 165) tone = "success";
-	else if (h < 215) tone = "role4";
-	else if (h < 280) tone = "role1";
-	else tone = "role2";
-	return { tone, bold };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -146,9 +134,11 @@ export class Canvas {
 		if (!(energy >= MIN_ENERGY)) return;
 		const dx = Math.floor(x);
 		const dy = Math.floor(y);
-		const cx = dx >> 1;
-		const cy = dy >> 2;
-		if (dx < 0 || dy < 0 || cx >= this.cw || cy >= this.ch) return;
+		// Not `>>`: it wraps at 2^32 and turns NaN and Infinity into cell 0. These comparisons are false for NaN.
+		if (!(dx >= 0) || !(dy >= 0)) return;
+		const cx = Math.floor(dx / 2);
+		const cy = Math.floor(dy / 4);
+		if (cx >= this.cw || cy >= this.ch) return;
 		const i = cy * this.cw + cx;
 		if (this.#kind[i] !== EMPTY) return;
 		const lit = this.#mask[i]!;
@@ -160,10 +150,15 @@ export class Canvas {
 		}
 	}
 
-	/** Puts ordinary text on the cells starting at cell (cx, cy), replacing dots there. Returns the cells used. */
+	/**
+	 * Puts ordinary text on the cells starting at cell (cx, cy), replacing dots there. Returns the display cells the text
+	 * occupies. A wide character (a Korean syllable) takes two cells and is never split: if it would not fit before the
+	 * right edge, drawing stops there; a wide character that starts left of the canvas is skipped whole. Control and
+	 * combining characters take no cell and are dropped. Overwriting one half of an earlier wide character clears both.
+	 */
 	text(cx: number, cy: number, text: string, colour: Rgb, energy: number = 1, bold: boolean = false): number {
 		const row = Math.floor(cy);
-		if (row < 0 || row >= this.ch) return 0;
+		if (!(row >= 0 && row < this.ch) || !Number.isFinite(cx)) return 0;
 		const e = energy > MAX_ENERGY ? MAX_ENERGY : energy;
 		let at = Math.floor(cx);
 		let used = 0;
@@ -189,6 +184,16 @@ export class Canvas {
 		return used;
 	}
 
+	/** Empties the canvas so it can be drawn on again; cheaper than allocating a new one for every frame. */
+	clear(): void {
+		this.#kind.fill(EMPTY);
+		this.#mask.fill(0);
+		this.#energy.fill(0);
+		this.#wide.fill(0);
+		this.#bold.fill(0);
+		this.#glyph.fill("");
+	}
+
 	/** Pulls every cell's colour toward grey by `amount` 0..1 (the freeze). */
 	drain(amount: number): void {
 		if (!(amount > 0)) return;
@@ -200,11 +205,10 @@ export class Canvas {
 		}
 	}
 
-	/** One string per row, `cw` cells wide, coloured for `options`. */
-	rows(options: FrameOptions): string[] {
-		const mode = options.colour ?? "tones";
+	/** One string per row, exactly `cw` cells wide, each one self-contained (it opens with its own colour and closes with a reset). */
+	rows(colour: "truecolor" | "256"): string[] {
 		const out: string[] = [];
-		for (let cy = 0; cy < this.ch; cy++) out.push(mode === "tones" ? this.#toneRow(cy, options) : this.#ansiRow(cy, mode === "256"));
+		for (let cy = 0; cy < this.ch; cy++) out.push(this.#ansiRow(cy, colour === "256"));
 		return out;
 	}
 
@@ -284,38 +288,5 @@ export class Canvas {
 			out += glyph;
 		}
 		return current >= 0 || currentRgb >= 0 || bold ? out + RESET : out;
-	}
-
-	#toneRow(cy: number, options: FrameOptions): string {
-		let out = "";
-		let run = "";
-		let runTone: Tone | undefined;
-		let runBold = false;
-		const flush = (): void => {
-			if (run === "") return;
-			out += runTone === undefined ? run : options.paint(runTone, run, runBold);
-			run = "";
-		};
-		const base = cy * this.cw;
-		for (let cx = 0; cx < this.cw; cx++) {
-			const i = base + cx;
-			const kind = this.#kind[i]!;
-			if (kind === CONTINUATION) continue;
-			const glyph = this.#glyphAt(i);
-			if (glyph === " ") {
-				run += " ";
-				continue;
-			}
-			const { tone, bold } = toneOf(this.#colour[i]!, this.#energy[i]!);
-			if (tone !== runTone || bold !== runBold) {
-				// Spaces waiting in `run` belong to the run that is closing.
-				flush();
-				runTone = tone;
-				runBold = bold;
-			}
-			run += glyph;
-		}
-		flush();
-		return out;
 	}
 }
