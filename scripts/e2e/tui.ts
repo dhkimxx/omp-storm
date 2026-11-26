@@ -31,7 +31,7 @@
  * log are what is asserted; the screen is read to know what has the focus. Directive payloads are typed as base64,
  * so no key of them means anything to the composer.
  */
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
@@ -1659,6 +1659,73 @@ async function main(): Promise<void> {
 		},
 		180_000,
 	);
+	// A refused `task` call is the one tool result omp 19.2's own view cannot draw when it is a plain block (`details: {}`):
+	// the block's first paint threw inside a listener (a logged warning), and the next thing that read the block outside
+	// a listener (expanding the output, another refusal, resuming the session file) killed omp. The lane-write refusal
+	// below waits its 1.5 s first, so the block is painted pending before the refusal arrives: the state a real model leaves.
+	await scenario(
+		"a refused task call leaves a transcript omp can keep drawing: expanding it, a second refusal and a resume do not kill omp",
+		async () => {
+			if (ownedSession === undefined) throw new Error("the TUI fixture session was not created");
+			const llm = new LlmCursor(env);
+			const logDir = join(env.agentDir, "..", "logs");
+			/** What omp's own log holds that a healthy session never writes: a rejected listener or an uncaught exception. */
+			const hostFaults = (): string[] =>
+				(existsSync(logDir) ? readdirSync(logDir) : []).flatMap(name =>
+					readFileSync(join(logDir, name), "utf8").split("\n").filter(line => /AgentSession listener rejected|Uncaught exception|"reason":"uncaught_exception"/.test(line)),
+				);
+			const faultsBefore = hostFaults().length;
+			const died = (tui: Tui): boolean => /\[(Uncaught Exception|Fatal Error)\]/.test(tui.screenText());
+			/** Presses Ctrl+O and waits for omp to say the expansion changed, or for its crash screen. */
+			const expand = async (tui: Tui, label: string): Promise<boolean> => {
+				const from = tui.send("\x0f");
+				const answered = await until(() => (/Tool output expansion: (enabled|disabled)/.test(tui.text(from)) ? true : died(tui) ? false : undefined), 15_000, `omp to answer Ctrl+O (${label})`).catch(() => false);
+				return answered && !died(tui);
+			};
+			const file = FACT_FILE;
+			const result = (id: string) => [{ id, kind: "change", criterion: `${id} is written`, path: file, contains: id }];
+			const holder = { name: "W0", kind: "run", role: "quick", files: [file], goal: "hold the shared file", results: result("w-write") };
+			const overlap = { name: "X0", kind: "code", role: "quick", files: [file], goal: "overlap the holder", results: result("x-write") };
+			const steps: Step[] = [
+				{ storm: { action: "plan", plan: { lanes: [holder, overlap], workers: { quick: 3 } } } },
+				{ task: ["storm-quick"], as: "W", say: "E2E-CHILD-DELAY 50000" },
+				{ task: ["storm-quick"], as: "X", say: "E2E-REFUSED-CHILD" },
+				{ task: ["storm-quick"], as: "Y", say: "E2E-REFUSED-CHILD" },
+			];
+			// The second call names no planned lane, so Storm refuses it with a different code: both count.
+			const refusalsTold = (): number => mains(llm.all()).filter(entry => entry.lastTool.startsWith("[storm:lane")).length;
+			await session(async (tui, files) => {
+				const before = files.runIds();
+				await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+				const told = await until(() => mains(llm.all()).find(entry => entry.lastTool.includes("[storm:lane-write]")), 60_000, "the refusal to reach the director");
+				check("the director is still told why the call was refused, in the refusal's own words", told.lastTool.includes("[storm:lane-write]"), told.lastTool.slice(0, 200));
+				await Bun.sleep(3_000);
+				check("the refused call's first paint did not make omp reject a listener", hostFaults().length === faultsBefore && !died(tui), hostFaults().slice(faultsBefore).join("\n").slice(0, 400));
+				const live = await until(() => files.runs().find(run => !before.has(run.runId) && run.status === "running"), 20_000, "the run to be active");
+				check("the refused item started no worker, and the run kept the one it had admitted", llm.of("child").every(entry => !entry.lastUser.includes("E2E-REFUSED-CHILD")) && live.status === "running");
+
+				check("expanding the transcript output after a refused call leaves omp running", await expand(tui, "first"), tui.screenText().slice(-300));
+				check("the user can read why the call was refused", tui.history().some(row => row.includes("[storm:lane-write]")), tui.history().slice(-12).join("\n"));
+				// The second refused call is the next task call after a block that was painted pending: it follows the first at once.
+				await until(() => (refusalsTold() >= 2 ? true : undefined), 60_000, "the second refusal to reach the director");
+				await Bun.sleep(2_000);
+				check("a second refused call leaves omp running, and so does collapsing the output again", !died(tui) && (await expand(tui, "second")), tui.screenText().slice(-300));
+				check("omp's log holds no rejected listener or uncaught exception after both refusals", hostFaults().length === faultsBefore, hostFaults().slice(faultsBefore).join("\n").slice(0, 600));
+			});
+			// The refusal is in the session file now: resuming it draws every block again, outside any listener.
+			const reopened = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"], resume: ownedSession.id, sessionDir: ownedSession.dir });
+			try {
+				const opened = await readyForSubmission(reopened).then(() => true, () => false);
+				check("the session file with refused calls opens again", opened && !died(reopened), reopened.screenText().slice(-300));
+				check("expanding the resumed transcript leaves omp running", opened && (await expand(reopened, "after resume")), reopened.screenText().slice(-300));
+				check("the resumed session's log holds no rejected listener or uncaught exception", hostFaults().length === faultsBefore, hostFaults().slice(faultsBefore).join("\n").slice(0, 600));
+			} finally {
+				await reopened.close();
+			}
+		},
+		240_000,
+	);
+
 }
 
 let code = 1;

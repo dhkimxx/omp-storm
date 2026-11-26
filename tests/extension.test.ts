@@ -20,7 +20,7 @@ import { APPROVE } from "../src/proposals/present.ts";
 import { listAgents, resetAgents } from "../src/runtime/agents.ts";
 import * as closeoutModule from "../src/runtime/closeout.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
-import { RunController } from "../src/runtime/controller.ts";
+import { RunController, runSpawns } from "../src/runtime/controller.ts";
 import { activeLedgerRun, bindLedgerChild, resetLedger } from "../src/runtime/ledger.ts";
 import { processKey } from "../src/runtime/janitor.ts";
 import { ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
@@ -34,6 +34,7 @@ import { loadProjectState } from "../src/state.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
 import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions } from "../src/worker-admission.ts";
 import type { CloseoutAction, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
+import { refusedCodeOf } from "../src/runtime/task-refusal.ts";
 import { until } from "./fake-session.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
 import { git, gitRepo, makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
@@ -258,12 +259,12 @@ const spawnOf = (agent: string, spawnKey: string, patterns: string[] = []) => ({
 const assistant = (provider: string, model: string, input: number, usd: number) => ({
 	message: { role: "assistant", provider, model, usage: { input, cacheRead: 0, cacheWrite: 0, cost: { total: usd } } },
 });
-/** The `[storm:<code>]` a hook answered with, "pass" when it let the call through, or the routed models. */
+/** The `[storm:<code>]` a hook answered with (a refused `task` call carries its code in its input), "pass" when it let the call through, or the routed models. */
 function verdict(answer: unknown): string {
 	if (answer === undefined) return "pass";
 	if (typeof answer !== "object" || answer === null) return "?";
 	if ("block" in answer && "reason" in answer) return /^\[storm:([a-z-]+)\] /.exec(String(answer.reason))?.[1] ?? "block without a code";
-	if ("input" in answer) return "pass";
+	if ("input" in answer) return refusedCodeOf(answer.input) ?? "pass";
 	return "model" in answer && Array.isArray(answer.model) ? `route:${answer.model.join(",")}` : "?";
 }
 
@@ -468,6 +469,184 @@ describe("a run through the hooks", () => {
 		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", task: "Stray", isolated: true } }, main))).toBe("isolation");
 		// Three task calls, one host capability read: the per-run cache holds across shared and selective spawns.
 		expect(settings.calls()).toBe(1);
+	});
+
+	test("a refused task call is not a block: it runs into omp's own rejection and its result becomes Storm's reason", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		const planned = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
+		expect(planned.outcome).toBe("ok");
+
+		// A block ends a call with `details: {}`, which omp 19.2's task view cannot draw; a refused task call carries the field
+		// omp's task tool rejects first, keeps everything the director sent, and is told apart by the code in the marker.
+		const sent = { agent: "storm-explorer", name: "scout", task: "Look around" };
+		const answer = await omp.emit("tool_call", { toolName: "task", toolCallId: "refused-1", input: sent }, main);
+		expect(answer).not.toHaveProperty("block");
+		expect(verdict(answer)).toBe("lane");
+		const revised = (answer as { input: Record<string, unknown> }).input;
+		expect(revised).toMatchObject(sent);
+		expect(refusedCodeOf(revised)).toBe("lane");
+
+		// The host ran the revised call and omp rejected it; Storm's reason replaces the rejection and the record stays drawable.
+		const hostResult = { toolName: "task", toolCallId: "refused-1", isError: true, input: revised, content: [{ type: "text", text: "The task tool uses `outputSchema`" }], details: { projectAgentsDir: null, results: [], totalDurationMs: 0 } };
+		const settled = (await omp.emit("tool_result", hostResult, main)) as { content: Array<{ text: string }>; details: { results: unknown[] }; isError: boolean };
+		expect(settled.isError).toBe(true);
+		expect(settled.content[0]?.text).toMatch(/^\[storm:lane\] /);
+		expect(Array.isArray(settled.details.results)).toBe(true);
+		// The reason is delivered once: a second result for the same call id is the host's own.
+		expect(await omp.emit("tool_result", hostResult, main)).toBeUndefined();
+
+		// A refusal of any other tool stays the plain block its view draws.
+		const readBlock = await omp.emit("tool_call", { toolName: "write", toolCallId: "refused-2", input: { path: "agent://all", content: "resume" } }, main);
+		expect(readBlock).toMatchObject({ block: true });
+
+		// A call without a host id cannot be matched to its result: it is blocked as before, never half-refused.
+		expect(await omp.emit("tool_call", { toolName: "task", input: sent }, main)).toMatchObject({ block: true });
+
+		// If omp ever ran the refused call, its real result stays and the user is told the refusal did not hold.
+		await omp.emit("tool_call", { toolName: "task", toolCallId: "refused-3", input: sent }, main);
+		const ran = await omp.emit("tool_result", { ...hostResult, toolCallId: "refused-3", isError: false, content: [{ type: "text", text: "started" }] }, main);
+		expect(ran).toBeUndefined();
+		expect(omp.notices.some(notice => notice.level === "error")).toBe(true);
+	});
+
+	test("a refused task call the host runs anyway starts no worker, for a single task, a mixed batch and a nameless item", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(
+			await omp.tool(
+				{
+					action: "plan",
+					plan: {
+						lanes: [
+							{ name: "E0", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("e0-answer") },
+							{ name: "C0", kind: "code", role: "implementer", files: ["c.txt"], results: changeFor("c0-change"), dependsOn: [{ lane: "E0", need: "result" }] },
+							{ name: "C1", kind: "code", role: "implementer", files: ["d.txt"], results: changeFor("c1-change"), dependsOn: [{ lane: "E0", need: "result" }] },
+						],
+						workers: { implementer: 2, explorer: 2 },
+					},
+				},
+				main,
+			),
+		).toBe("ok");
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		const item = (name: string, agent = "storm-implementer") => ({ agent, name, task: `work ${name}` });
+		// One worker of the run is admitted, so the run's marker is live for the child-side check below.
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "ok-1", input: item("E0", "storm-explorer") }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "E0"), main))).toMatch(/^route:/);
+		await child.emit("before_agent_start", { systemPrompt: [] }, child.ctx(sub("E0", "storm-explorer")));
+		const spawnKeys = () => runSpawns(runId).map(spawn => spawn.spawnKey);
+		expect(spawnKeys()).toEqual(["E0"]);
+
+		const refusals: Array<{ call: string; input: Record<string, unknown>; spawns: Array<[string, string]>; code: string }> = [
+			// A consumer whose prerequisite is not ready: the spawn hook alone would admit it as its planned lane.
+			{ call: "r-dependency", input: item("C0"), spawns: [["storm-implementer", "C0"]], code: "lane-dependency" },
+			// One bad item refuses the whole batch, the good item with it.
+			{ call: "r-batch", input: { context: "c", tasks: [item("C0"), item("C1"), item("stray")] }, spawns: [["storm-implementer", "C0"], ["storm-implementer", "C1"]], code: "lane" },
+			// No handle: omp names the spawn after the call, and a lane of the agent's role is the only candidate.
+			{ call: "r-nameless", input: { agent: "storm-explorer", task: "work" }, spawns: [["storm-explorer", "r-nameless:0"]], code: "lane-busy" },
+		];
+		for (const refusal of refusals) {
+			const answer = await omp.emit("tool_call", { toolName: "task", toolCallId: refusal.call, input: refusal.input }, main);
+			expect(answer).not.toHaveProperty("block");
+			expect(verdict(answer)).toBe(refusal.code);
+			// omp ran the call anyway: every spawn it asks for is refused with Storm's reason, nothing is routed or reserved.
+			for (const [agent, key] of refusal.spawns) {
+				const spawn = await omp.emit("before_subagent_spawn", spawnOf(agent, key), main);
+				expect(spawn).toMatchObject({ block: true });
+				expect(verdict(spawn)).toBe(refusal.code);
+			}
+			// The host's own result for the call (omp reports the blocked spawn) is replaced by the same reason, and the hold ends.
+			const settled = (await omp.emit("tool_result", { toolName: "task", toolCallId: refusal.call, isError: true, input: (answer as { input: unknown }).input, content: [], details: {} }, main)) as { content: Array<{ text: string }> };
+			expect(settled.content[0]?.text).toMatch(new RegExp(`^\\[storm:${refusal.code}\\] `));
+		}
+		// Nothing of the refused calls reached the run: no spawn row, no worker, no result moved.
+		expect(spawnKeys()).toEqual(["E0"]);
+		const pending = async () => (await readRun(project.sessionDir, runId))?.results?.every(result => result.state === "pending");
+		expect(await pending()).toBe(true);
+		expect(listAgents({ runId, scope: project.sessionDir }).map(agent => agent.id)).toEqual(["E0"]);
+
+		// If the host ran the call and a worker started without an admission, the child side still denies it everything
+		// but reads: the run's marker is live (E0 was admitted), and a child with no record of its own is not unmanaged then.
+		const ghost = child.ctx(sub("C0"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, ghost);
+		expect(verdict(await child.emit("tool_call", { toolName: "read", input: { path: "README.md" } }, ghost))).toBe("pass");
+		for (const call of [
+			{ toolName: "write", input: { path: "c.txt", content: "x" } },
+			{ toolName: "edit", input: { path: "c.txt", edits: [] } },
+			{ toolName: "bash", input: { command: "touch c.txt" } },
+		]) expect(verdict(await child.emit("tool_call", call, ghost))).toBe("authority");
+		expect(verdict(await child.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", task: "nested" } }, ghost))).toBe("lane-nested");
+		expect(spawnKeys()).toEqual(["E0"]);
+		expect(listAgents({ runId, scope: project.sessionDir }).map(agent => agent.id)).toEqual(["E0"]);
+		expect(await pending()).toBe(true);
+
+		// The hold ended with the refused calls: a spawn is judged by the plan again, not refused for a call that is gone.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "E1"), main))).not.toMatch(/^lane/);
+	});
+
+	test("a call refused after its lane was placed leaves a placement the hold keeps from admitting a worker", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(
+			await omp.tool(
+				{
+					action: "plan",
+					plan: {
+						lanes: [
+							{ name: "W0", kind: "run", role: "implementer", files: ["shared.txt"], goal: "Write the shared file", results: changeFor("w0-change") },
+							{ name: "X0", kind: "code", role: "implementer", files: ["shared.txt"], goal: "Conflict with the writer", results: changeFor("x0-change") },
+						],
+						workers: { implementer: 2 },
+					},
+				},
+				main,
+			),
+		).toBe("ok");
+		const call = (id: string, name: string) => omp.emit("tool_call", { toolName: "task", toolCallId: id, input: { agent: "storm-implementer", name, task: `work ${name}` } }, main);
+		expect(verdict(await call("w", "W0"))).toBe("pass");
+		// X0 waits for the writer; the writer's call fails and the conversation changes while it waits, after X0 was placed.
+		const waiting = call("x", "X0");
+		await new Promise(resolve => setTimeout(resolve, 200));
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "w", isError: true }, main);
+		omp.setSessionId("session-switched");
+		expect(verdict(await waiting)).toBe("session");
+		omp.setSessionId(project.sessionId);
+		// The placement of X0 is still there, and without the hold the host's spawn would be admitted as that lane.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "X0"), main))).toBe("session");
+		await omp.emit("tool_result", { toolName: "task", toolCallId: "x", isError: true, input: {}, content: [], details: {} }, main);
+		// The failed call's result frees what it placed: the lane can be dispatched again.
+		expect(verdict(await call("x2", "X0"))).toBe("pass");
+	});
+
+	test("a refused task call that never settles stops holding spawns after its window, and a cancelled one at once", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(await omp.tool({ action: "plan", plan: { lanes: [fixLane] } }, main)).toBe("ok");
+		const refuse = (call: string) => omp.emit("tool_call", { toolName: "task", toolCallId: call, input: { agent: "storm-explorer", name: "scout", task: "x" } }, main);
+		const spawn = async () => verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "fix"), main));
+		await refuse("c1");
+		expect(await spawn()).toBe("lane");
+		// The host cancelled the call: its end clears the hold.
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "c1", isError: true }, main);
+		expect(await spawn()).toBe("route:a/i");
+		// Any other verdict than the refusal's own proves the hold is gone (the plan's one implementer is taken now).
+
+		// A call the host never settles holds spawns only for its window.
+		setSystemTime(new Date("2030-01-01T00:00:00Z"));
+		await refuse("c2");
+		expect(await spawn()).toBe("lane");
+		setSystemTime(new Date("2030-01-01T00:02:00Z"));
+		expect(await spawn()).not.toBe("lane");
 	});
 
 	test("closing the fake host releases its real lease even with an unfinished child session", async () => {

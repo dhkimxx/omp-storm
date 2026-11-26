@@ -3,8 +3,9 @@
  * the fake LLM), the step runner, the RPC and pty drivers, and readers of what Storm writes.
  *
  * Env: OMP_BIN (default node_modules/.bin/omp), E2E_PORT, E2E_PROFILE (default storm-e2e), E2E_WORK (default
- * <tmp>/storm-e2e[-tui]), E2E_ONLY (run only scenarios whose name contains this text; a step marked `always` still
- * runs), E2E_KEEP=1 keeps the work dir after a green run (it is always kept after a failure).
+ * <tmp>/storm-e2e[-tui]), E2E_PLUGIN_ROOT (the plugin checkout omp loads; default this one: point it at an unpacked
+ * earlier commit to watch a check fail on it), E2E_ONLY (run only scenarios whose name contains this text; a step
+ * marked `always` still runs), E2E_KEEP=1 keeps the work dir after a green run (it is always kept after a failure).
  * omp runs with HOME inside the work dir, so nothing under the real ~/.omp is read or written.
  */
 import type { BunFile, Subprocess } from "bun";
@@ -303,7 +304,8 @@ export const PROFILE_CONFIG = "setupVersion: 3\n";
 
 /** Installs Storm into the profile the way a user does, so every session (subagents included) loads it as a plugin. */
 export function linkPlugin(env: E2eEnv): void {
-	const link = Bun.spawnSync([env.omp, "--profile", env.profile, "plugin", "link", ROOT], { cwd: env.project, env: env.childEnv });
+	// `E2E_PLUGIN_ROOT` links another checkout of the plugin (an earlier commit, to see a check fail on it) instead of this one.
+	const link = Bun.spawnSync([env.omp, "--profile", env.profile, "plugin", "link", process.env.E2E_PLUGIN_ROOT ?? ROOT], { cwd: env.project, env: env.childEnv });
 	if (link.exitCode !== 0) throw new Error(`omp plugin link failed (${link.exitCode}): ${link.stdout.toString()}${link.stderr.toString()}`);
 }
 

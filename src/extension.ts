@@ -8,7 +8,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState, type ToolCallEvent, type ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
@@ -80,6 +80,7 @@ import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
+import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
 import { noteLaneAgentStart, replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
@@ -148,6 +149,8 @@ const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.val
  * How long a single fresh task/follow-up may wait for a conflicting shared writer to settle before the admission is
  * refused. It is a wait, not a queue: a long-running writer still leaves the call blocked, and no reservation leaks.
  */
+/** Said when omp ran a `task` call that Storm had refused; the refusal did not hold. */
+const REFUSAL_NOT_HELD = "Storm이 거절한 task 호출을 OMP가 실행했습니다. Storm은 그 호출이 끝나기 전까지 워커 스폰을 막았으므로 새 워커는 쓰기 권한을 받지 못했어야 하지만, 결과가 오류가 아니니 레인과 워커 상태를 /storm status로 확인하세요.";
 const WRITE_WAIT_MS = 1_500;
 const WRITE_WAIT_STEP_MS = 50;
 
@@ -1071,6 +1074,7 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 	pi.on("tool_execution_end", (event, ctx) => {
 		if (event.toolName === "ask") closeWait(ctx, "ask", event.toolCallId);
+		if (event.toolName === "task") refusedCalls.forget(event.toolCallId);
 		// A call a hook blocked, or one the host cancelled, ends here with isError and no `tool_result`. A regular failed
 		// delivery also ends here and then reports its result; the release is exact and idempotent either way.
 		if (!event.isError || ctx.agent.kind !== "main") return;
@@ -1262,6 +1266,12 @@ export default function storm(pi: ExtensionAPI): void {
 		// team config or approval cannot be read; subagent sessions are not fenced by this session's policy.
 		if (ctx.agent.kind === "main" && auto?.enabled === true && runs.runId() === undefined) {
 			return { block: true, reason: autoRefusal(auto?.problem, AUTO_SPAWN_REASON) };
+		}
+		// A call Storm refused may still have been run by the host: the spawn event names no call, so while one is
+		// unsettled none starts (task-refusal.ts). Nothing is reserved or recorded for it.
+		if (ctx.agent.kind === "main") {
+			const refused = refusedCalls.unsettled();
+			if (refused !== undefined) return { block: true, reason: refused };
 		}
 		const limit = deadline(SPAWN_DECISION_MS);
 		let timedOut = false;
@@ -1613,12 +1623,21 @@ export default function storm(pi: ExtensionAPI): void {
 		touchRun(ledger.runId);
 	};
 
+	/** `task` calls Storm refused, by the host's call id, until their result is settled; one per session's extension. */
+	const refusedCalls = new RefusedCalls();
 	/**
 	 * Frees exactly what one failed, blocked or cancelled director call reserved, by the host's own call id: its
 	 * follow-up reactivation slot, its unspawned lane placements and its unstarted follow-up admission, plus any spawn
 	 * handles the call names. Work that already started (a running agent, an admitted worker) is never released, and
 	 * running it twice is harmless: the second call finds nothing of this call id left.
 	 */
+	const taskHandles = (input: unknown): string[] => {
+		const echoed = input as { name?: unknown; tasks?: unknown } | undefined;
+		const items = Array.isArray(echoed?.tasks) ? echoed.tasks : [echoed];
+		return items.flatMap(item =>
+			typeof item === "object" && item !== null && "name" in item && typeof item.name === "string" ? [item.name] : [],
+		);
+	};
 	const releaseFailedCall = (runId: string, callId: string, handles: readonly string[] = []): void => {
 		const scope = getLedgerRun(runId)?.sessionDir;
 		const running = new Set(scope === undefined ? [] : listAgents({ runId, scope }).filter(agent => agent.state === "running").map(agent => agent.id));
@@ -1708,7 +1727,7 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	// Director mode: blocking the call instead of swapping the tool list keeps the main session's prompt cache intact.
-	pi.on("tool_call", async (event, ctx) => {
+	const guardToolCall = async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
 			const boundRunId = ledger?.runId;
@@ -2106,6 +2125,16 @@ export default function storm(pi: ExtensionAPI): void {
 			}
 		}
 		return undefined;
+	};
+	// A refused `task` call is not blocked: a block ends the call with `details: {}`, which omp's task view cannot draw
+	// (see task-refusal.ts). The call runs into omp's own rejection of a stale field and `tool_result` swaps in Storm's
+	// reason. Every other tool keeps the plain block: its view draws that result.
+	pi.on("tool_call", async (event, ctx) => {
+		const verdict = await guardToolCall(event, ctx);
+		if (verdict?.block !== true || event.toolName !== "task" || typeof event.toolCallId !== "string") return verdict;
+		const reason = verdict.reason ?? "";
+		refusedCalls.remember(event.toolCallId, reason);
+		return { input: refusedTaskInput(event.input, reason) };
 	});
 
 	/**
@@ -2143,6 +2172,19 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		// A call Storm refused ran into omp's own rejection (task-refusal.ts): its result becomes Storm's reason. The call
+		// spawned nothing and was never admitted, so only what its call id reserved is freed; no delivery is observed.
+		const refusal = event.toolName === "task" ? refusedCalls.take(event.toolCallId) : undefined;
+		if (refusal !== undefined) {
+			if (!event.isError) {
+				// The host ran a call Storm refused: omp stopped rejecting the marker. Its real result stays, and the user is told.
+				if (ctx.hasUI) ctx.ui.notify(REFUSAL_NOT_HELD, "error");
+				return undefined;
+			}
+			const runId = ctx.agent.kind === "main" ? runs.runId() : undefined;
+			if (runId !== undefined) releaseFailedCall(runId, event.toolCallId, taskHandles(event.input));
+			return refusedTaskResult(refusal);
+		}
 		if (ctx.agent.kind === "sub") {
 			// The parent admitted this id before the spawn returned: no cwd or repo match is trusted here, and an
 			// unbound child writes nothing into any ledger.
@@ -2165,12 +2207,7 @@ export default function storm(pi: ExtensionAPI): void {
 		// A failed delivery frees what its call id reserved (the task's named handles too: the echoed input can lag the
 		// placement). A delivered call only forgets its follow-up slot bookkeeping; the reused slot stays with the worker.
 		if (event.isError) {
-			const input = event.input as { name?: unknown; tasks?: unknown } | undefined;
-			const items = event.toolName !== "task" ? [] : Array.isArray(input?.tasks) ? input.tasks : [input];
-			const handles = items.flatMap(item =>
-				typeof item === "object" && item !== null && "name" in item && typeof item.name === "string" ? [item.name] : [],
-			);
-			releaseFailedCall(runId, event.toolCallId, handles);
+			releaseFailedCall(runId, event.toolCallId, event.toolName === "task" ? taskHandles(event.input) : []);
 		} else {
 			followCapacityCalls.delete(`${runId}\0${event.toolCallId}`);
 		}
@@ -2315,6 +2352,7 @@ export default function storm(pi: ExtensionAPI): void {
 		liveStatus.beginSession();
 		openWaits.clear();
 		resetCloseoutChoices(ctx);
+		refusedCalls.clear();
 	};
 	/**
 	 * Every host transition that replaces the conversation (new, resume, fork, branch, context clear) shares this:

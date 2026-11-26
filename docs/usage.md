@@ -92,6 +92,7 @@ Storm은 팀, 대상별 승인, 자동 위임 선택과 실행 기록을 OMP 프
 | 동시 상한으로 대기 | 해당 역할의 워커가 끝나는지 봅니다. 전체 동시 상한은 OMP `task.maxConcurrency`에서 조정합니다. |
 | 검토 가능·미충족·차단 | `/storm status`에서 해당 결과의 근거와 해소 조건을 확인합니다. 실행 종료 자체를 검증 통과로 보지 않습니다. |
 | `/storm <요청>`을 분류하지 못함 | `작업으로 실행`을 선택하거나 대화가 너무 길다면 새 세션에서 필요한 배경만 다시 전달합니다. |
+| OMP 19.2.1이 `Spread syntax requires ...iterable not be null or undefined`로 종료되거나, 다시 열 때 같은 오류가 남 | OMP가 거절된 `task` 호출의 기록을 그리지 못하는 문제입니다. 이 버전의 Storm은 새 거절을 그릴 수 있는 모양으로 남깁니다. 이전 버전이 이미 세션 파일에 남긴 기록은 OMP가 열지 못하니, 먼저 `find ~/.omp -name '*<세션 id>*.jsonl'`로 파일을 찾아(id는 종료 화면의 `Recovery` 줄에 있습니다) `sed -i.bak '/"toolName":"task"/s/"details":{}/"details":{"projectAgentsDir":null,"results":[],"totalDurationMs":0}/' <세션 파일>`을 실행한 뒤 `omp --resume <세션 id>`로 엽니다. 원본은 `.bak`으로 남습니다. |
 | OMP의 계획·목표·반복·vibe 모드가 켜져 실행할 수 없음 | 해당 모드를 끝낸 뒤 Storm에 맡깁니다. |
 
 ## 업데이트와 제거
