@@ -1,9 +1,9 @@
 /**
  * Storm's live instrument below the editor. On a roomy terminal it is the lane view: a status row, then the director's
- * trunk and one line per plan lane, at a height fixed for the run. Everywhere else it is the single status line with
- * its radar (compact terminals get a static row). A native (Tern) host gets a node tree instead, with the radar as a
- * host-clocked `shimmer`; the only Storm-owned repaint timer exists in the terminal drawing, and omp's motion setting or
- * a still picture stops it at once.
+ * trunk and one line per plan lane, as tall as what it draws (capped by `laneHeight`). Everywhere else it is the
+ * single status line with its radar (compact terminals get a static row). A native (Tern) host gets a node tree
+ * instead, with the radar as a host-clocked `shimmer`; the only Storm-owned repaint timer exists in the terminal
+ * drawing, and omp's motion setting or a still picture stops it at once.
  *
  * The host builds a widget lazily and once (`ui/dock/widgets.tsx`), so the state of a run does not live in the factory:
  * `LiveRunWidget` is created by `LiveStatus.show` and the factory only binds a view of it to the host that mounts it.
@@ -54,6 +54,7 @@ const LANE_SSH_TICK_MS = 120;
 const LANE_SLOW_TICK_MS = 250;
 /** One animation step never exceeds this, so a stalled event loop does not make the picture leap. */
 const LANE_MAX_STEP_MS = 500;
+/** The cap on the lane view's rows (status row included): a third of the terminal, between these two. */
 const LANE_MIN_HEIGHT = 6;
 const LANE_MAX_HEIGHT = 12;
 
@@ -72,7 +73,10 @@ export function liveWidgetRows(): number {
 	return total;
 }
 
-/** The lane view's fixed height for a terminal of `terminalRows` rows: a third of it, between 6 and 12 rows. */
+/**
+ * The most rows the lane view may take on a terminal of `terminalRows` rows: a third of it, between 6 and 12. It is a
+ * cap, not a size: the view draws only the rows it needs and folds the lanes that do not fit into one summary row.
+ */
 export function laneHeight(terminalRows: number): number {
 	return Math.min(LANE_MAX_HEIGHT, Math.max(LANE_MIN_HEIGHT, Math.floor(terminalRows / 3)));
 }
@@ -503,11 +507,12 @@ interface StatusRow {
  * The state of one run's live widget, and what it draws. Two terminal drawings share it: the lane view (status row,
  * trunk and lanes) and the single status line with its radar; a native host gets nodes and clocks the radar itself.
  *
- * The lane view's height is decided once, the first time its conditions hold, and never changes while the widget is
- * mounted: omp's below-editor area only grows, so a height that shrank would leave blank rows and one that grew
- * would push the editor up again. After that the widget always returns exactly that many rows. When the conditions
- * stop holding (the switch is turned off, the window gets narrow, short or ASCII) it draws the single line at the top
- * of those rows and leaves the rest blank.
+ * The widget returns exactly the rows it draws, so nothing blank ever sits under the last lane. The count follows the
+ * content (a replan adds or drops a lane), the cap (`laneHeight` of the terminal as it is now) and which drawing
+ * applies (the single line when the switch is off or the window is narrow, short or ASCII). omp 19.2's dock keeps
+ * itself at the bottom of the screen and follows such a change: the editor moves by the difference, and a shortfall of
+ * transcript shows above the editor, never under this widget. The count changes only on those discrete events, never
+ * while animating or typing.
  */
 class LiveRunWidget {
 	#mount: { mount: Mount; token: object } | undefined;
@@ -530,8 +535,6 @@ class LiveRunWidget {
 	#laneView: boolean;
 	#runId: string;
 	#timeline = new LaneTimeline();
-	/** Rows reserved for the lane view; undefined until its conditions first hold. */
-	#height: number | undefined;
 	/** Animation time: advances only while the timer runs, so a restart continues the motion instead of jumping. */
 	#animTime = 0;
 	#animAt: number | undefined;
@@ -656,29 +659,19 @@ class LiveRunWidget {
 		const theme = this.#themeOf(mount);
 		const terminalRows = this.#terminalRows(mount.ui);
 		const lane = columns > 0 && this.#laneEligible(columns, theme, terminalRows);
-		if (lane && this.#height === undefined) this.#height = laneHeight(terminalRows ?? LANE_MIN_ROWS);
-		const rows = lane ? this.#laneRows(columns, theme) : this.#singleRows(columns, theme);
+		const rows = lane ? this.#laneRows(columns, theme, laneHeight(terminalRows ?? LANE_MIN_ROWS)) : this.#singleRows(columns, theme);
 		drawnRows.set(this, rows.length);
 		return rows;
 	}
 
 	#singleRows(columns: number, theme: Theme): readonly string[] {
 		this.#syncTimer();
-		if (columns === 0) return this.#padded([]);
-		return this.#padded(this.#lineRows(columns, theme));
+		if (columns === 0) return [];
+		return this.#lineRows(columns, theme);
 	}
 
-	/** Once the lane view's height is decided every render returns exactly that many rows, blank where nothing is drawn. */
-	#padded(rows: readonly string[]): readonly string[] {
-		const height = this.#height;
-		if (height === undefined) return rows;
-		if (rows.length >= height) return rows.slice(0, height);
-		return [...rows, ...Array.from({ length: height - rows.length }, () => "")];
-	}
-
-	/** The status row, then the trunk and the lanes, padded to the height fixed for the run. */
-	#laneRows(columns: number, theme: Theme): readonly string[] {
-		const height = this.#height!;
+	/** The status row, then the trunk and the lanes: as many rows as the picture needs, at most `height`. */
+	#laneRows(columns: number, theme: Theme, height: number): readonly string[] {
 		const now = this.#clock();
 		const snapshot = this.#timeline.snapshot(now);
 		this.#syncTimer(snapshot);
@@ -692,7 +685,7 @@ class LiveRunWidget {
 			colour: depthOf(theme) === "truecolor" ? "truecolor" : "256",
 			dark: isDark(theme),
 		});
-		return this.#padded([this.#statusRow(columns, theme), ...frame]);
+		return [this.#statusRow(columns, theme), ...frame];
 	}
 
 	/** Row 0 of the lane view: mark, phase and chips, without the radar (the trunk carries the motion). */

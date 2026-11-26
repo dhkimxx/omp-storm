@@ -3465,29 +3465,30 @@ describe("the lane view switch", () => {
 	const RADAR = /\[[\u2801-\u28ff]{18}\]$/;
 	const noticesAbout = (omp: ReturnType<typeof fakeOmp>) => omp.notices.map(notice => notice.level);
 
-	test("the lane view is on by default; /storm view turns it off and on again during a run, at a fixed height", async () => {
+	test("the lane view is on by default; /storm view turns it off and on again during a run, each drawing exactly as tall as it is", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const host = liveTui(omp.ctx(MAIN));
 		await omp.emit("session_start", {}, host.ctx);
 		await omp.command("fix it", host.ctx);
 		const lane = host.draw();
-		expect(lane).toHaveLength(12);
+		// Nothing is padded: a run without a plan yet draws the status row and the trunk, no more.
+		expect(lane).toHaveLength(2);
 		expect(lane[0]).toStartWith(STORM_MARK);
 		expect(lane[0]).not.toMatch(RADAR);
 		expect(lane[1]!.trim()).not.toBe("");
 
 		await omp.command("view", host.ctx);
 		const line = host.draw();
-		// The single line again, in the same 12 rows: the editor does not move.
-		expect(line).toHaveLength(12);
+		// The single line again: its own two rows, none blank.
+		expect(line).toHaveLength(2);
 		expect(line[0]).toMatch(RADAR);
-		expect(line.slice(2).every(row => row === "")).toBe(true);
+		expect(line.every(row => row.trim() !== "")).toBe(true);
 		expect(omp.notices.at(-1)?.level).toBe("info");
 
 		await omp.command("view", host.ctx);
 		const back = host.draw();
-		expect(back).toHaveLength(12);
+		expect(back).toHaveLength(2);
 		expect(back[0]).not.toMatch(RADAR);
 		expect(back[1]!.trim()).not.toBe("");
 		expect(noticesAbout(omp).includes("error")).toBe(false);
@@ -3508,8 +3509,8 @@ describe("the lane view switch", () => {
 
 		await omp.command("view", host.ctx);
 		const lane = host.draw();
-		expect(lane).toHaveLength(12);
 		expect(lane[0]).not.toMatch(RADAR);
+		expect(lane.every(row => row.trim() !== "")).toBe(true);
 		await omp.emit("agent_start", {}, host.ctx);
 		await omp.emit("agent_end", {}, host.ctx);
 	});
@@ -3523,7 +3524,7 @@ describe("the lane view switch", () => {
 		await omp.emit("session_switch", {}, host.ctx);
 		await omp.emit("session_start", {}, host.ctx);
 		await omp.command("fix it", host.ctx);
-		expect(host.draw()).toHaveLength(12);
+		expect(host.draw()[0]).not.toMatch(RADAR);
 		await omp.emit("agent_start", {}, host.ctx);
 		await omp.emit("agent_end", {}, host.ctx);
 	});
@@ -3540,7 +3541,7 @@ describe("the lane view switch", () => {
 		// The refused command left the switch alone: a TUI of the same session still has the view.
 		const host = liveTui(main);
 		await omp.command("fix it", host.ctx);
-		expect(host.draw()).toHaveLength(12);
+		expect(host.draw()[0]).not.toMatch(RADAR);
 		await omp.emit("agent_start", {}, host.ctx);
 		await omp.emit("agent_end", {}, host.ctx);
 	});

@@ -413,7 +413,8 @@ describe("TUI", () => {
 		expect(host.overlays).toBe(0);
 	});
 
-	test("a lane view on screen takes its rows from the panel: the panel head stays, the cut grows, consent waits", async () => {
+	test("a lane view on screen takes its rows from the panel, exactly the rows it draws: the panel head stays, the cut grows, consent waits", async () => {
+		let widgetRows = 0;
 		const panelRows = async (withLaneView: boolean): Promise<{ rows: number; offered: string[] }> => {
 			const live = new LiveStatus({ now: () => Date.now(), laneView: () => true });
 			let mounted: TuiView | undefined;
@@ -430,9 +431,14 @@ describe("TUI", () => {
 						},
 					},
 				} as unknown as ExtensionContext;
-				live.show(liveCtx, runRecord({ runId: "run-dock", status: "running" }), "working");
+				const lanes = ["Api", "Ui", "Check"].map(name => ({ name, kind: "code" as const, role: "implementer" }));
+				const plan = { submittedAt: new Date(0).toISOString(), workers: { implementer: 3 }, lanes };
+				live.show(liveCtx, runRecord({ runId: "run-dock", status: "running", plan }), "working");
 				mounted?.text();
-				expect(liveWidgetRows()).toBeGreaterThan(0);
+				// The status row, the trunk and three lanes: what the widget draws is what it reports, with no padding.
+				widgetRows = mounted!.screen().length;
+				expect(widgetRows).toBe(5);
+				expect(liveWidgetRows()).toBe(widgetRows);
 			}
 			try {
 				const host = fakeHost({ mode: "tui", hasUI: true, rows: 30, answers: [options => options.at(-1), "a"] });
@@ -446,7 +452,7 @@ describe("TUI", () => {
 		const alone = await panelRows(false);
 		const docked = await panelRows(true);
 		expect(liveWidgetRows()).toBe(0);
-		expect(docked.rows).toBeLessThan(alone.rows);
+		expect(docked.rows).toBe(alone.rows - widgetRows);
 		expect(docked.offered).not.toContain("a");
 		expect(docked.offered).toContain(FULL_VIEW);
 	});

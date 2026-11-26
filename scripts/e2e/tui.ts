@@ -22,7 +22,7 @@
  *   an incomplete run, numbered resume ... the closeout card (B), its numbered choices
  *   a native ask ............... omp's own ask form, live widget (A)
  *   a run sent back ............ live widget (A), `/storm status` overlay (C)
- *   two lane view scenarios .... the lane view (A)
+ *   three lane view scenarios ... the lane view (A): its own height, no blank row under it, folding past the cap
  *   narrow motion off, under 60, ASCII ... live widget single line (A), `/storm` hub and status overlay (C)
  *   Escape flow, shutdown ...... omp's ask form, footer (A), closeout card (B)
  *
@@ -190,6 +190,8 @@ interface LiveScreen {
 	/** The viewport rows from the status row down, without trailing blank rows. */
 	rows: string[];
 	viewport: string[];
+	/** Blank screen rows under the widget's last drawn row; the dock sits at the bottom, so any is a padded widget. */
+	blankUnder: number;
 }
 function liveScreen(tui: Tui): LiveScreen | undefined {
 	const { viewport } = tui.screen();
@@ -198,7 +200,7 @@ function liveScreen(tui: Tui): LiveScreen | undefined {
 	if (status < 0) return undefined;
 	const rows = viewport.slice(status);
 	while (rows.length > 1 && rows.at(-1) === "") rows.pop();
-	return { status, lanes: isTrunkRow(viewport[status + 1] ?? ""), rows, viewport };
+	return { status, lanes: isTrunkRow(viewport[status + 1] ?? ""), rows, viewport, blankUnder: viewport.length - status - rows.length };
 }
 /** The last rendered row carrying a live phase header, without surrounding box edges or padding. */
 function phaseRow(text: string, phase: RunPhase): string | undefined {
@@ -1269,11 +1271,12 @@ async function main(): Promise<void> {
 	);
 
 	await scenario(
-		"the lane view follows a real run with several lanes: fixed height, a usable editor, lane states, the switch",
+		"the lane view follows a real run with several lanes: as tall as it draws, a usable editor, lane states, the switch",
 		async () => {
 			const [origin, api, ui] = ["origin", "api-verify", "ui-preview"] as const;
 			const view = { columns: 120, rows: 36 };
-			const height = laneHeight(view.rows);
+			// The status row, the trunk and one row per lane: three lanes, well under the cap.
+			const drawn = 2 + 3;
 			const answerResult = (id: string, criterion: string): Record<string, unknown> => ({ id, kind: "answer", criterion, path: FACT_FILE, contains: FACT_LINE });
 			const retryRelease = "release-lane-view-retry";
 			const steps: Step[] = [
@@ -1316,18 +1319,24 @@ async function main(): Promise<void> {
 						"the run with three lanes to be bound",
 					);
 					await tui.seen(started, text => ([origin, api, ui].every(lane => laneSequence(text, lane).length > 0) ? true : undefined), "a lane view row for each of the three lanes", 30_000);
-					const statuses: number[] = [];
+					// Every sample of the lane view: where its status row sits, how many rows it draws, how many blanks are under it.
+					const seen: Array<{ status: number; rows: number; blankUnder: number }> = [];
 					const sample = (): LiveScreen | undefined => {
 						const screen = liveScreen(tui);
-						if (screen !== undefined) statuses.push(screen.status);
+						if (screen?.lanes) seen.push({ status: screen.status, rows: screen.rows.length, blankUnder: screen.blankUnder });
 						return screen;
 					};
 					const first = await until(() => sample(), 20_000, "the live widget on the screen");
 					check("the lane view sits under the editor: status row, trunk, then one row per lane", first.lanes && [origin, api, ui].every(lane => first.rows.some(row => row.trim().startsWith(`${lane} `))), first.rows.join("\n"));
 					check(
-						"the view is the fixed height and every row fits the terminal",
-						first.rows.length <= height && first.viewport.every(row => Bun.stringWidth(row) <= view.columns) && first.viewport.length - first.status >= height,
-						`rows=${first.rows.length} height=${height} status=${first.status} screen=${first.viewport.length}`,
+						"the view is as tall as what it draws, within the cap, and every row fits the terminal",
+						first.rows.length === drawn && first.rows.length <= laneHeight(view.rows) && first.viewport.every(row => Bun.stringWidth(row) <= view.columns),
+						`rows=${first.rows.length} drawn=${drawn} cap=${laneHeight(view.rows)} status=${first.status} screen=${first.viewport.length}`,
+					);
+					check(
+						"no blank row under the last lane: the last lane is the bottom row of the screen",
+						first.blankUnder === 0 && (first.viewport.at(-1) ?? "").trim() !== "",
+						`blank rows under the view: ${first.blankUnder}\n${first.viewport.slice(first.status).join("\n")}`,
 					);
 					const lead = trunkFrames(tui.text(started));
 					await suite.eventually("the trunk moves: two distinct frames", () => trunkFrames(tui.text(started)).size >= Math.max(2, lead.size), () => `frames=${trunkFrames(tui.text(started)).size}`, 15_000);
@@ -1363,13 +1372,17 @@ async function main(): Promise<void> {
 						const screen = sample();
 						return screen !== undefined && !screen.lanes && RADAR_FIELD.test(screen.rows[0] ?? "") ? screen : undefined;
 					}, 20_000, "the single line with its radar after /storm view");
-					check("the switch leaves the single line in the same row, with the rest of the height blank", single.status === first.status && single.rows.length <= 2, `${single.status} vs ${first.status}: ${single.rows.join(" | ")}`);
+					check(
+						"the switch leaves the single line as tall as it is, at the bottom, with nothing blank under it",
+						single.rows.length === 2 && single.blankUnder === 0 && single.status === single.viewport.length - 2,
+						`${single.status} of ${single.viewport.length}, ${single.blankUnder} blank under: ${single.rows.join(" | ")}`,
+					);
 					await tui.submit("/storm view");
 					const back = await until(() => {
 						const screen = sample();
 						return screen?.lanes === true ? screen : undefined;
 					}, 20_000, "the lane view back after the second /storm view");
-					check("switching it on again restores the picture without moving the widget", back.status === first.status && [origin, api, ui].every(lane => back.rows.some(row => row.trim().startsWith(`${lane} `))), `${back.status} vs ${first.status}`);
+					check("switching it on again restores the picture at its own size", back.status === first.status && back.blankUnder === 0 && [origin, api, ui].every(lane => back.rows.some(row => row.trim().startsWith(`${lane} `))), `${back.status} vs ${first.status}`);
 
 					// The user's two inputs: the unstarted lane leaves the plan, the unmet one is retried.
 					await tui.submit("UI는 빼고 API만 계속해");
@@ -1390,7 +1403,15 @@ async function main(): Promise<void> {
 					const painted = tui.text(started);
 					check("the independent lane went to accepted and the excluded lane ended excluded", laneSequence(painted, origin).at(-1) === "accepted" && laneSequence(painted, ui).at(-1) === "excluded", `${laneSequence(painted, origin)} / ${laneSequence(painted, ui)}`);
 					check("the retry reads on the view as unmet then running again", inOrder(laneSequence(painted, api), ["running", "unmet", "running", "accepted"]), laneSequence(painted, api).join(" > "));
-					check("the widget never moved during the run, through the switch, typing and the retry", new Set(statuses).size === 1, `status rows: ${[...new Set(statuses)].join(", ")}`);
+					// The excluded lane leaves the plan, so the picture loses a row then: its status row moves by exactly that and no
+					// other time (typing, the switch and the retry never moved it), and nothing blank is ever under it.
+					const sizes = new Map<number, Set<number>>();
+					for (const entry of seen) sizes.set(entry.rows, (sizes.get(entry.rows) ?? new Set<number>()).add(entry.status));
+					check(
+						"the picture moves only when its row count does, and never has a blank row under it",
+						seen.length > 0 && seen.every(entry => entry.blankUnder === 0) && [...sizes.values()].every(statuses => statuses.size === 1),
+						JSON.stringify([...sizes].map(([rows, statuses]) => [rows, [...statuses]])),
+					);
 					check("the run ended accepted for every in-scope result", finished.results?.every(row => row.state === "accepted" || row.scope === "excluded-by-user") === true, JSON.stringify(finished.results?.map(row => [row.id, row.state])));
 					await suite.eventually("the footer returns to idle after the run", () => idleFooter(statusLine(tui)), () => statusLine(tui) ?? "no status line", 60_000);
 					check("the lane view is gone after the run", liveScreen(tui) === undefined || !liveScreen(tui)!.lanes);
@@ -1455,6 +1476,63 @@ async function main(): Promise<void> {
 			}
 		},
 		240_000,
+	);
+
+	await scenario(
+		"the lane view is as tall as its lanes and no taller: nothing blank under it at 120x50 and 80x24, past the cap it folds",
+		async () => {
+			const owned = await seedOwnSession("Storm lane view fit fixture transcript.");
+			const answerResult = (id: string): Record<string, unknown> => ({ id, kind: "answer", criterion: `report ${id}`, path: FACT_FILE, contains: FACT_LINE });
+			// `started` lanes get a worker that is held for a while; the rest stay planned, so the view has every lane to draw.
+			const fit = async (columns: number, rows: number, laneCount: number): Promise<void> => {
+				const named = (name: string): string => `${columns}x${rows}, ${laneCount} lanes: ${name}`;
+				// Lane names are unique per call: a worker name from an earlier run of this session may not be reused.
+				const names = Array.from({ length: laneCount }, (_, at) => `fit${columns}-${at + 1}`);
+				const steps: Step[] = [
+					{ storm: { action: "plan", plan: { lanes: names.map(name => ({ name, kind: "explore", role: "explorer", results: [answerResult(`${name}-r`)] })) } } },
+					{ tasks: names.slice(0, 2).map(name => ({ name, agent: "storm-explorer", task: `Report ${name} from source`, say: `E2E-CHILD-DELAY 8000 ${readProbe}` })) },
+					{ wait: true },
+				];
+				const tui = new Tui(env, { model: "fake/general-b", flags: ["--motion", "full"], resume: owned.id, sessionDir: owned.dir, columns, rows });
+				try {
+					await tui.ready();
+					await tui.shows("Storm lane view fit fixture transcript.");
+					const files = new StormFiles(env, owned.id);
+					const before = files.runIds();
+					const started = await tui.submit(`/storm E2E-ROUTE ${b64({ action: "run" })} E2E-STEPS ${b64(steps)}`);
+					await until(() => files.runs().find(candidate => !before.has(candidate.runId) && candidate.status === "running" && candidate.plan?.lanes.length === laneCount), 60_000, named("the run to be bound"));
+					await tui.seen(started, text => (laneSequence(text, names[0]!).length > 0 ? true : undefined), named("the first lane's row"), 30_000);
+					await Bun.sleep(1_000);
+					const screen = await until(() => liveScreen(tui), 20_000, named("the live widget on the screen"));
+					const cap = laneHeight(rows);
+					const expected = Math.min(cap, 2 + laneCount);
+					check(named(`the view is ${expected} rows: its own size, never past the cap of ${cap}`), screen.lanes && screen.rows.length === expected, `${screen.rows.length} rows\n${screen.rows.join("\n")}`);
+					check(named("no blank row under the view: its last row is the bottom row of the screen"), screen.blankUnder === 0 && (screen.viewport.at(-1) ?? "").trim() !== "", `${screen.blankUnder} blank rows under\n${screen.viewport.slice(-expected - 2).join("\n")}`);
+					check(named("the status row and the director's trunk are on the screen and every row fits the width"), screen.rows[0]!.startsWith(STORM_MARK) && isTrunkRow(screen.rows[1] ?? "") && screen.rows.every(row => Bun.stringWidth(row) <= columns), screen.rows.join("\n"));
+					if (2 + laneCount <= cap) {
+						check(named("every lane has its row"), names.every(name => screen.rows.some(row => row.trim().startsWith(`${name} `))), screen.rows.join("\n"));
+					} else {
+						check(named("lanes past the cap are folded into one summary row"), (screen.rows.at(-1) ?? "").trim().startsWith("+") && screen.rows.slice(2, -1).every(row => names.some(name => row.trim().startsWith(`${name} `))), screen.rows.join("\n"));
+					}
+					// The editor is usable with the view that size: typed text shows above the status row, and the view stays put.
+					const typed = "fit-typing";
+					tui.send(typed);
+					const above = await until(() => {
+						const live = liveScreen(tui);
+						return live !== undefined && live.viewport.slice(0, live.status).some(row => row.includes(typed)) ? live : undefined;
+					}, 15_000, named("the typed text in the editor above the view"));
+					check(named("typing did not move the view"), above.status === screen.status && above.blankUnder === 0, `${above.status} vs ${screen.status}`);
+					tui.send("\x7f".repeat(typed.length));
+					await until(() => (liveScreen(tui)?.viewport.some(row => row.includes(typed)) ? undefined : true), 15_000, named("the typed text to be erased"));
+					await files.finishedRun(before, 120_000);
+				} finally {
+					await tui.close();
+				}
+			};
+			await fit(120, 50, 2);
+			await fit(80, 24, 15);
+		},
+		300_000,
 	);
 
 	await scenario(

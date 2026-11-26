@@ -21,7 +21,7 @@ import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { signal } from "../src/tui/kit.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
 import * as frameModule from "../src/view/lane/frame.ts";
-import { LANE_MIN_ROWS, LIVE_WIDGET_KEY, LiveStatus } from "../src/view/live.ts";
+import { LANE_MIN_ROWS, laneHeight, LIVE_WIDGET_KEY, LiveStatus, liveWidgetRows } from "../src/view/live.ts";
 import type { RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord, spawnRecord } from "./fixtures.ts";
 import { extensionTheme, mountWidget } from "./tui-host.ts";
@@ -888,8 +888,20 @@ describe("the live run widget", () => {
 
 const LONG_LANE = "아주긴한글레인이름아주긴한글레인이름아주긴한글레인이름";
 const iso = (ms: number): string => new Date(ms).toISOString();
-/** The contract's height for a terminal of this many rows, written out again so a drifting constant is caught. */
+/** The cap on the view's rows for a terminal of this many rows, written out again so a drifting constant is caught. */
 const heightFor = (rows: number): number => Math.min(12, Math.max(6, Math.floor(rows / 3)));
+/** What `laneRun()` draws: the status row, the trunk and one row for each of its four lanes. */
+const LANE_RUN_ROWS = 6;
+/** A plan of `count` lanes that have not started, so every one has a row to draw (or to fold). */
+const manyLanes = (count: number): RunRecord => {
+	const run = laneRun();
+	return {
+		...run,
+		plan: { ...run.plan!, lanes: Array.from({ length: count }, (_, at) => ({ name: `Lane${at}`, kind: "code" as const, role: "implementer" })) },
+		agents: [],
+		spawns: [],
+	};
+};
 
 /** A run with a plan: two workers running, a reviewer lane that waits for one of them, and a lane with a very long name. */
 function laneRun(over: Partial<RunRecord> = {}, now = NOW): RunRecord {
@@ -956,10 +968,9 @@ function laneSetup(options: { rows?: number; switch?: () => boolean; settings?: 
 /** A waiting or between-rounds picture first lets its last events play out; this is the clock step that ends that. */
 const SETTLE_MS = 3_000;
 const RADAR_ROW = /\[[⠁-⣿]{18}\]$/;
-const blank = (rows: readonly string[]): boolean => rows.every(row => row === "");
 
 describe("the live run widget in lane mode", () => {
-	test("draws the status row without the radar, then the picture, at the height the terminal decides", () => {
+	test("draws the status row without the radar, then only the rows the picture needs, never past the cap", () => {
 		vi.useFakeTimers();
 		for (const rows of [18, 21, 30, 40, 90]) {
 			for (const columns of [60, 61, 100, 200]) {
@@ -967,8 +978,11 @@ describe("the live run widget in lane mode", () => {
 				lane.show(laneRun());
 				const drawn = lane.component().render(columns);
 				const text = plain(drawn);
-				expect(drawn).toHaveLength(heightFor(rows));
+				// Four lanes need six rows; the cap of the smallest lane terminal is six, so the cap never cuts this plan.
+				expect(drawn).toHaveLength(Math.min(LANE_RUN_ROWS, heightFor(rows)));
 				expect(drawn.every(row => visibleWidth(row) <= columns)).toBe(true);
+				// No blank row anywhere, least of all under the last lane.
+				expect(text.every(row => row.trim() !== "")).toBe(true);
 				expect(text[0]).toStartWith(STORM_MARK);
 				expect(text[0]).not.toMatch(RADAR_ROW);
 				expect(text[0]!.includes("[")).toBe(false);
@@ -978,6 +992,41 @@ describe("the live run widget in lane mode", () => {
 				lane.live.clear();
 			}
 		}
+	});
+
+	test("more lanes than the cap allows fold into one summary row and the view stays at the cap", () => {
+		for (const rows of [18, 24, 36, 50, 90]) {
+			const lane = laneSetup({ rows });
+			lane.show(manyLanes(30));
+			const drawn = plain(lane.component().render(120));
+			expect(drawn).toHaveLength(heightFor(rows));
+			expect(drawn).toHaveLength(laneHeight(rows));
+			expect(drawn.every(row => row.trim() !== "")).toBe(true);
+			expect(drawn[0]).toStartWith(STORM_MARK);
+			lane.live.clear();
+		}
+		// A plan that just fits is not folded: the cap is reached by the rows it needs, not by padding.
+		const fits = laneSetup({ rows: 36 });
+		fits.show(manyLanes(laneHeight(36) - 2));
+		expect(plain(fits.component().render(120))).toHaveLength(laneHeight(36));
+		fits.live.clear();
+	});
+
+	test("the view is as tall as its plan: a lane more or fewer is a row more or fewer, with nothing blank under it", () => {
+		const lane = laneSetup({ rows: 50 });
+		const heights: number[] = [];
+		for (const count of [1, 3, 8, 2, 5]) {
+			lane.show(manyLanes(count));
+			const drawn = plain(lane.component().render(120));
+			heights.push(drawn.length);
+			expect(drawn.at(-1)!.trim()).not.toBe("");
+			expect(drawn.every(row => row.trim() !== "")).toBe(true);
+			// What the context panel subtracts from its budget is what the host really gives this widget.
+			expect(liveWidgetRows()).toBe(drawn.length);
+		}
+		expect(heights).toEqual([3, 5, 10, 4, 7]);
+		lane.live.clear();
+		expect(liveWidgetRows()).toBe(0);
 	});
 
 	test("row 0 is today's status line: mark, phase and the same chips", () => {
@@ -1056,65 +1105,79 @@ describe("the live run widget in lane mode", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	test("the height is fixed for the run: resizing, narrowing, the preset or the switch never change the row count", () => {
+	test("the row count follows the drawing: resizing, narrowing, the preset or the switch change it, and it is never padded", () => {
 		vi.useFakeTimers();
 		let on = true;
 		const lane = laneSetup({ rows: 40, switch: () => on });
 		lane.show(laneRun());
-		const counts = new Set<number>();
 		const draw = (columns: number): readonly string[] => {
 			const rows = lane.component().render(columns);
-			counts.add(rows.length);
 			expect(rows.every(row => visibleWidth(row) <= columns)).toBe(true);
+			// Whatever the drawing, no row is blank, and the widget reports exactly the rows it returned.
+			expect(rows.every(row => row !== "")).toBe(true);
+			expect(liveWidgetRows()).toBe(rows.length);
 			return rows;
 		};
-		expect(draw(120)).toHaveLength(12);
-		// Shorter window, still tall enough: the picture, the same 12 rows.
+		expect(draw(120)).toHaveLength(LANE_RUN_ROWS);
+		// Shorter window, still tall enough: the picture, the same rows.
 		lane.host.terminal.rows = 24;
 		expect(plain(draw(120))[1]!.trim()).not.toBe("");
-		// Too short for lane mode: the single line at the top of the same 12 rows, the rest blank.
+		expect(draw(120)).toHaveLength(LANE_RUN_ROWS);
+		// Too short for lane mode: the two rows of the single line, nothing under them.
 		lane.host.terminal.rows = 12;
 		const short = draw(120);
+		expect(short).toHaveLength(2);
 		expect(plain(short)[0]).toMatch(RADAR_ROW);
 		expect(plain(short)[1]).toStartWith("›");
-		expect(blank(short.slice(2))).toBe(true);
 		lane.host.terminal.rows = 40;
-		// Narrow: the compact line, padded.
+		expect(draw(120)).toHaveLength(LANE_RUN_ROWS);
+		// Narrow: the compact line alone.
 		const narrow = draw(50);
+		expect(narrow).toHaveLength(1);
 		expect(plain(narrow)[0]).toStartWith(STORM_MARK);
-		expect(blank(narrow.slice(1))).toBe(true);
-		draw(0);
-		expect(draw(0).every(row => row === "")).toBe(true);
+		expect(draw(0)).toEqual([]);
+		expect(liveWidgetRows()).toBe(0);
 		// The switch off mid-run, then on again.
 		on = false;
 		lane.show(laneRun());
 		const off = draw(120);
+		expect(off).toHaveLength(2);
 		expect(plain(off)[0]).toMatch(RADAR_ROW);
-		expect(blank(off.slice(2))).toBe(true);
 		on = true;
 		lane.show(laneRun());
 		expect(plain(draw(120))[0]).not.toMatch(RADAR_ROW);
-		// The ASCII preset mid-run: the line without braille, the height unchanged.
+		expect(draw(120)).toHaveLength(LANE_RUN_ROWS);
+		// The ASCII preset mid-run: the line without braille, two rows.
 		useAscii();
 		const ascii = draw(120);
+		expect(ascii).toHaveLength(2);
 		expect(plain(ascii)[0]).toStartWith(ASCII_MARK);
 		expect(plain(ascii).join("\n")).not.toMatch(/[⠁-⣿]/);
-		expect(blank(ascii.slice(2))).toBe(true);
 		setCurrentTheme(defaultTheme as ReturnType<typeof loadThemeSync>);
-		draw(100);
-		expect([...counts]).toEqual([12]);
+		expect(draw(100)).toHaveLength(LANE_RUN_ROWS);
 	});
 
-	test("a run that starts in the single line decides its height once, the first time the view fits", () => {
+	test("the count does not move while the picture animates, only when the plan, the cap or the drawing does", () => {
+		vi.useFakeTimers();
+		const lane = laneSetup({ rows: 40 });
+		lane.show(laneRun());
+		const counts = new Set<number>();
+		for (let step = 0; step < 40; step++) {
+			lane.clock.now += 400;
+			counts.add(lane.component().render(120).length);
+		}
+		expect([...counts]).toEqual([LANE_RUN_ROWS]);
+	});
+
+	test("a run that starts in the single line grows into the view when it fits, and shrinks back when it does not", () => {
 		const lane = laneSetup({ rows: 40 });
 		lane.show(laneRun());
 		const narrow = lane.component().render(50);
 		expect(narrow.length).toBeLessThanOrEqual(2);
-		const wide = lane.component().render(120);
-		expect(wide).toHaveLength(12);
-		expect(lane.component().render(50)).toHaveLength(12);
+		expect(lane.component().render(120)).toHaveLength(LANE_RUN_ROWS);
+		expect(lane.component().render(50).length).toBeLessThanOrEqual(2);
 		lane.host.terminal.rows = 90;
-		expect(lane.component().render(120)).toHaveLength(12);
+		expect(lane.component().render(120)).toHaveLength(LANE_RUN_ROWS);
 	});
 
 	test("one row of the picture is never wider than the terminal, with wide characters, in both colour modes", () => {
@@ -1122,7 +1185,7 @@ describe("the live run widget in lane mode", () => {
 			const lane = laneSetup({ rows: 60 });
 			lane.show(laneRun());
 			const rows = lane.component().render(columns);
-			expect(rows).toHaveLength(12);
+			expect(rows).toHaveLength(LANE_RUN_ROWS);
 			expect(rows.every(row => visibleWidth(row) <= columns)).toBe(true);
 			lane.live.clear();
 		}
@@ -1340,7 +1403,7 @@ describe("the live run widget in lane mode", () => {
 		const line = lane.component().render(120);
 		expect(plain(line)[0]).toStartWith(liveHeader("working"));
 		expect(plain(line)[0]).toMatch(RADAR_ROW);
-		expect(line).toHaveLength(12);
+		expect(line).toHaveLength(2);
 		expect(vi.getTimerCount()).toBe(1);
 
 		on = true;
@@ -1375,7 +1438,7 @@ describe("the live run widget in lane mode", () => {
 			late = true;
 		});
 		const always = play(() => true, () => undefined);
-		expect(mid).toHaveLength(12);
+		expect(mid).toHaveLength(LANE_RUN_ROWS);
 		expect(plain(mid).join("\n")).toContain("Api");
 		expect(mid).toEqual(always);
 	});
@@ -1469,10 +1532,11 @@ describe("the live run widget mounted in the host's terminal", () => {
 		const tall = host.view().screen();
 		expect(tall.filter(row => row.trim() !== "").length).toBeGreaterThan(2);
 		host.view().resize(100, 12);
-		// Too short for the lane view now: the single line at the top, the rows below blank.
+		// Too short for the lane view now: the single line alone, nothing blank under it.
 		const short = host.view().screen();
 		expect(short[0]).toMatch(RADAR_ROW);
-		expect(short.slice(2).every(row => row.trim() === "")).toBe(true);
+		expect(short.length).toBeLessThanOrEqual(2);
+		expect(short.every(row => row.trim() !== "")).toBe(true);
 		host.view().resize(100, 40);
 		expect(host.view().screen()[0]).not.toMatch(RADAR_ROW);
 	});
