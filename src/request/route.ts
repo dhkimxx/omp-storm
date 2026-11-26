@@ -183,7 +183,7 @@ async function execute(routed: Routed, deps: RouteDeps, text: string): Promise<v
  */
 async function confirmed(routed: Routed, ui: UiPort): Promise<Routed | undefined> {
 	if (routed.action === "change" && routed.change.action === "quota") {
-		const choice = await ui.select(`Provider ${routed.change.provider} 를 쿼터 소진으로 표시할까요? 승인된 다른 Provider 모델을 먼저 쓰게 됩니다.`, [
+		const choice = await ui.select(`${routed.change.provider} Provider를 쿼터 소진으로 표시할까요? 승인된 다른 Provider 모델을 먼저 쓰게 됩니다.`, [
 			QUOTA_CHOICE.mark,
 			QUOTA_CHOICE.cancel,
 		]);

@@ -2,7 +2,7 @@
  * Probe extension for `scripts/e2e/proof-channel.ts`: records the native host events a trusted parent runtime can
  * see, plus the process-global AgentRegistry facts that correlate them, as JSONL. Test support only.
  */
-import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { threadId } from "node:worker_threads";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
 
@@ -16,9 +16,18 @@ interface ProbeAgent {
 	parentId?: string;
 	depth?: number;
 }
+interface ProbeJob {
+	id?: string;
+	type?: string;
+	status?: string;
+	agentId?: string;
+	startTime?: number;
+	endTime?: number;
+}
 interface ProbeContext {
 	agent?: ProbeAgent;
 	sessionManager?: { getHeader?: () => unknown };
+	getAsyncJobSnapshot?: () => { running?: ProbeJob[]; recent?: ProbeJob[] } | null | undefined;
 }
 interface ProbeEvent {
 	[key: string]: unknown;
@@ -114,6 +123,18 @@ function registrySnapshot(): unknown[] {
 	}
 }
 
+/** The parent session's own async job rows right now, as the extension API shows them (running and the newest settled). */
+function jobSnapshot(ctx: ProbeContext): unknown {
+	try {
+		const snapshot = ctx.getAsyncJobSnapshot?.();
+		if (snapshot === null || snapshot === undefined) return undefined;
+		const pick = (job: ProbeJob) => ({ id: job.id, type: job.type, status: job.status, agentId: job.agentId, startTime: job.startTime, endTime: job.endTime });
+		return { running: (snapshot.running ?? []).map(pick), recent: (snapshot.recent ?? []).map(pick) };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
 function log(event: Record<string, unknown>): void {
 	appendFileSync(LOG, `${JSON.stringify({ at: Date.now(), threadId, ...event })}\n`);
 }
@@ -156,6 +177,7 @@ export default function probe(pi: {
 			input: event.toolName === "task" || event.toolName === "write" ? event.input : undefined,
 			content: textOf(event.content).slice(0, 4_000),
 			details: summarizeDetails(event.details),
+			jobs: jobSnapshot(ctx),
 			registry: registrySnapshot(),
 		});
 	});
@@ -168,13 +190,14 @@ export default function probe(pi: {
 			customType: message.customType,
 			content: textOf(message.content).slice(0, 8_000),
 			details: message.details,
+			jobs: jobSnapshot(ctx),
 			registry: registrySnapshot(),
 		});
 	});
 	pi.on("agent_start", (_event, ctx) => {
 		log({ type: "agent_start", agent: ctx.agent });
 	});
-	pi.on("agent_end", (event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		log({
 			type: "agent_end",
 			agent: ctx.agent,
@@ -182,5 +205,14 @@ export default function probe(pi: {
 			awaitingAsyncWork: event.awaitingAsyncWork,
 			registry: registrySnapshot(),
 		});
+		// A probe can hold a subagent's end-of-turn work (as a slow extension handler such as Storm's own does): the turn
+		// is over for the model, and whatever the parent writes meanwhile lands while it is being finished.
+		const hold = Number(process.env.PROOF_CHILD_END_DELAY_MS ?? 0);
+		if (ctx.agent?.kind !== "sub" || !(hold > 0)) return;
+		const marker = process.env.PROOF_CHILD_END_MARKER;
+		if (marker !== undefined && marker !== "") writeFileSync(marker, String(Date.now()));
+		log({ type: "child_end_hold_begin", agent: ctx.agent, holdMs: hold });
+		await new Promise(resolve => setTimeout(resolve, hold));
+		log({ type: "child_end_hold_end", agent: ctx.agent });
 	});
 }

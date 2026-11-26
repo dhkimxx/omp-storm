@@ -23,6 +23,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
+import { withJosa } from "../josa.ts";
 import { MAX_RESULT_CONTAINS, MAX_RESULT_CRITERION, RESULT_ID_RE } from "../plan/validate.ts";
 import type { LaneResultKind, PlanLaneResult, RunResult, RunResultState } from "../types.ts";
 import {
@@ -144,8 +145,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 /** One short, bounded field with no control characters and no surrounding whitespace. */
 function labelProblem(value: unknown, max: number, what: string): string | undefined {
-	if (typeof value !== "string" || value === "") return `${what}이(가) 비어 있습니다.`;
-	if (value.length > max) return `${what}이(가) ${max}자를 넘습니다.`;
+	if (typeof value !== "string" || value === "") return `${withJosa(what, "이/가")} 비어 있습니다.`;
+	if (value.length > max) return `${withJosa(what, "이/가")} ${max}자를 넘습니다.`;
 	if (value.trim() !== value) return `${what} 앞뒤에 공백이 있습니다.`;
 	if (UNSAFE_LINE.test(value)) return `${what}에 제어 문자가 있습니다.`;
 	return undefined;
@@ -616,11 +617,11 @@ async function verifyPatchInParent(
 		if (file.hunks.length === 0) return fail("unverifiable", "패치에 내용 변경이 없습니다.");
 		const state = await readWorkspace(parent, target, limits, budget);
 		if (state.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘었습니다.");
-		if (state.kind === "absent") return fail("not-integrated", `${target}이(가) 부모에 없습니다.`);
+		if (state.kind === "absent") return fail("not-integrated", `${target} 파일이 부모에 없습니다.`);
 		if (state.kind !== "file" || state.truncated) return fail("unverifiable", `${target} 내용을 정확히 읽을 수 없습니다.`);
 		if (whole !== undefined) {
 			if (whole.previousDigest !== undefined && state.digest === whole.previousDigest) {
-				return fail("reverted", `${target}이(가) 이전 내용으로 되돌려졌습니다.`);
+				return fail("reverted", `${target} 파일이 이전 내용으로 되돌려졌습니다.`);
 			}
 			if (state.digest !== whole.digest) return fail("not-integrated", `${target} 전체 내용이 승인된 post 지문과 다릅니다.`);
 		} else {
@@ -635,7 +636,7 @@ async function verifyPatchInParent(
 	}
 	if (wholeFiles !== undefined) {
 		for (const path of wholeFiles.keys()) {
-			if (!seen.has(path)) return fail("invalid-evidence", `승인된 post 지문 경로 ${path}이(가) 패치에 없습니다.`);
+			if (!seen.has(path)) return fail("invalid-evidence", `승인된 post 지문의 ${path} 경로가 패치에 없습니다.`);
 		}
 	}
 	if (declaredPath !== undefined) {
@@ -949,10 +950,10 @@ async function locateIntegratedParent(
 	for (const file of files) {
 		const state = await readWorkspace(parent, file.path, limits, budget);
 		if (state.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘어 부모 내용을 확인하지 못했습니다.");
-		if (state.kind === "absent") return fail("not-integrated", `${file.path}이(가) 부모에 없습니다.`);
+		if (state.kind === "absent") return fail("not-integrated", `${file.path} 파일이 부모에 없습니다.`);
 		if (state.kind !== "file" || state.truncated) return fail("unverifiable", `${file.path} 내용을 정확히 읽을 수 없습니다.`);
 		if (file.previousDigest !== undefined && state.digest === file.previousDigest) {
-			return fail("reverted", `${file.path}이(가) 이전 내용으로 되돌려졌습니다.`);
+			return fail("reverted", `${file.path} 파일이 이전 내용으로 되돌려졌습니다.`);
 		}
 		if (state.digest !== file.digest) return fail("not-integrated", `${file.path} 내용이 S1이 승인한 결과와 다릅니다.`);
 		verified.push({ path: file.path, digest: state.digest });
@@ -990,7 +991,7 @@ async function locateIntegratedArtifact(
 		if (member.digest !== accepted.digest) return fail("artifact-changed", "보존 산출물 내용이 S1 관찰과 다릅니다.");
 		const state = await readWorkspace(parent, accepted.result.path, limits, budget);
 		if (state.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘었습니다.");
-		if (state.kind === "absent") return fail("not-integrated", `${accepted.result.path}이(가) 부모에 없습니다.`);
+		if (state.kind === "absent") return fail("not-integrated", `${accepted.result.path} 경로가 부모에 없습니다.`);
 		if (state.kind !== "file" || state.truncated) return fail("unverifiable", `${accepted.result.path} 내용을 정확히 읽을 수 없습니다.`);
 		if (state.digest !== accepted.digest) return fail("not-integrated", `${accepted.result.path} 내용이 채택된 산출물과 다릅니다.`);
 		return locationOf(accepted, "integrated", parent, "parent-file", accepted.result.path, state.digest, [
@@ -1014,7 +1015,7 @@ async function locateIntegratedArtifact(
 	if (path.basename(artifact.path) !== accepted.result.path) return fail("invalid-evidence", "단일 파일 산출물의 이름이 요구 경로와 다릅니다.");
 	const state = await readWorkspace(parent, accepted.result.path, limits, budget);
 	if (state.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘었습니다.");
-	if (state.kind === "absent") return fail("not-integrated", `${accepted.result.path}이(가) 부모에 없습니다.`);
+	if (state.kind === "absent") return fail("not-integrated", `${accepted.result.path} 파일이 부모에 없습니다.`);
 	if (state.kind !== "file" || state.truncated) return fail("unverifiable", `${accepted.result.path} 내용을 정확히 읽을 수 없습니다.`);
 	if (state.digest !== sourceDigest) return fail("not-integrated", `${accepted.result.path} 내용이 보존 산출물과 다릅니다.`);
 	return locationOf(accepted, "integrated", parent, "parent-file", accepted.result.path, state.digest, [

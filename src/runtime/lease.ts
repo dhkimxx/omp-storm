@@ -39,6 +39,7 @@ import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { withJosa } from "../josa.ts";
 
 const SCHEMA = "storm.lease/v2";
 /** Owner records are small; anything larger is not one of ours and must not be parsed. */
@@ -220,9 +221,9 @@ function cleanToken(value: unknown): value is string {
 }
 
 function cleanIdentity(value: unknown, field: string): string {
-	if (typeof value !== "string") throw new Error(`${field}가 문자열이 아닙니다. 실행을 시작하지 않았습니다.`);
+	if (typeof value !== "string") throw new Error(`${withJosa(field, "이/가")} 문자열이 아닙니다. 실행을 시작하지 않았습니다.`);
 	if (value.trim() === "" || value.length > MAX_IDENTITY || /[\u0000-\u001f\u007f]/.test(value)) {
-		throw new Error(`${field}가 올바르지 않습니다. 실행을 시작하지 않았습니다.`);
+		throw new Error(`${withJosa(field, "이/가")} 올바르지 않습니다. 실행을 시작하지 않았습니다.`);
 	}
 	return value;
 }
@@ -586,12 +587,12 @@ function sessionContentionReason(lockPath: string): string {
 }
 
 function readerConflictReason(writer: LeaseRecord, reader: LeaseRecord): string {
-	return `읽기 실행(${reader.runId})이 같은 worktree(${writer.root})를 읽고 있습니다. 쓰기 실행(${writer.runId})은 그 읽기가 끝난 뒤에만 시작할 수 있습니다.`;
+	return `읽기 실행(${reader.runId})이 같은 worktree 경로(${writer.root})를 읽고 있습니다. 쓰기 실행(${writer.runId})은 그 읽기가 끝난 뒤에만 시작할 수 있습니다.`;
 }
 
 function writerConflictReason(other: LeaseRecord, pathText: string | undefined): string {
 	const scope = pathText === undefined ? "이 worktree 전체" : `경로 ${pathText}`;
-	return `다른 Storm 실행(${other.runId}, 세션 ${other.sessionId})이 ${scope}를 쓰고 있습니다. 그 실행이 끝난 뒤 다시 시작하세요.`;
+	return `다른 Storm 실행(${other.runId}, 세션 ${other.sessionId})이 ${withJosa(scope, "을/를")} 쓰고 있습니다. 그 실행이 끝난 뒤 다시 시작하세요.`;
 }
 
 function leaseReleaseError(lockPath: string, detail: string): Error {

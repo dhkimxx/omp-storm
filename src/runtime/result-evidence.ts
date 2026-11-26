@@ -26,6 +26,7 @@ import { constants as fsConstants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
+import { withJosa } from "../josa.ts";
 import { MAX_RESULT_ID, MAX_RESULT_PATH, parseLaneResults } from "../plan/validate.ts";
 import type { ApprovalRecord, ConfigLoad, LaneResultKind, PlanLaneResult, StormConfig } from "../types.ts";
 import { checkGate, type CheckEvidence, type CheckReport, type CheckStatus } from "./checks.ts";
@@ -280,8 +281,8 @@ export function resolveResultLimits(overrides: Partial<ResultEvidenceLimits> | u
 }
 
 function labelProblem(value: unknown, max: number, what: string): string | undefined {
-	if (typeof value !== "string" || value === "") return `${what}이(가) 비어 있습니다.`;
-	if (value.length > max) return `${what}이(가) ${max}자를 넘습니다.`;
+	if (typeof value !== "string" || value === "") return `${withJosa(what, "이/가")} 비어 있습니다.`;
+	if (value.length > max) return `${withJosa(what, "이/가")} ${max}자를 넘습니다.`;
 	if (value.trim() !== value) return `${what} 앞뒤에 공백이 있습니다.`;
 	if (UNSAFE_LINE.test(value)) return `${what}에 제어 문자가 있습니다.`;
 	return undefined;
@@ -1455,7 +1456,7 @@ export async function verifyAnswerReceipt(input: {
 		return { ok: false, reason: "작업 트리를 확인할 수 없습니다." };
 	}
 	const state = await readContained(root, cited, limits, { remaining: limits.totalBytes });
-	if (state.kind === "absent") return { ok: false, reason: `답변 출처 ${cited}이(가) 삭제되었습니다.` };
+	if (state.kind === "absent") return { ok: false, reason: `답변 출처 ${cited} 파일이 삭제되었습니다.` };
 	if (state.kind !== "file") return { ok: false, reason: `답변 출처를 일반 파일로 읽을 수 없습니다(${unsafeDetail(state) ?? state.kind}).` };
 	if (state.digest !== citation.digest) return { ok: false, reason: `답변 출처 ${cited}의 내용이 답변 당시와 다릅니다.` };
 	return { ok: true };

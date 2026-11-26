@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { withJosa } from "../josa.ts";
 import { BUILTIN_AGENT_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
-import { scopesOverlap, type LanePolicy } from "../policy/capability.ts";
+import { scopesOverlap, type LanePolicy, WHY_AUTO_WRITER, WHY_UNDECLARED_WRITER } from "../policy/capability.ts";
 import { activeAgents, releaseWorkerSlot, reservedWorkers, reserveWorkerSlot } from "../policy/spawn.ts";
 import type {
 	AgentEntry,
@@ -220,7 +221,7 @@ export function plannedTaskLanes(input: unknown, plan: RunPlan, config: StormCon
 				return {
 					ok: false,
 					code: "lane",
-					reason: `${name}: 레인 역할 '${named.role}'과 task 역할 '${role ?? "알 수 없음"}(${agent})'이 다릅니다.`,
+					reason: `${name}: 레인은 '${named.role}' 역할이고 task는 '${role ?? "알 수 없음"}(${agent})' 역할이라 서로 다릅니다.`,
 				};
 			}
 			if (used.has(named.name)) return { ok: false, code: "lane", reason: `${name}: 같은 배치에서 이미 사용한 레인입니다.` };
@@ -282,8 +283,8 @@ function withIsolation(item: Record<string, unknown>, desired: boolean | undefin
 function isolationCapabilityReason(agent: string, enabled: boolean | undefined): string {
 	const state = enabled === false ? "꺼져 있습니다(task.isolation.enabled=false)" : "상태를 확인하지 못했습니다";
 	return `${agent}: 이 작업은 부모 트리와 분리된 격리 실행이 필요한데 omp 격리가 ${state}. ` +
-		"`omp config set task.isolation.enabled true`로 켜고 `omp config list --json`으로 확인한 뒤 다시 스폰하세요. " +
-		"격리가 필요 없다면 계획의 isolationReason을 빼고 공유 레인으로 다시 계획하거나, 호스트가 격리를 지원하지 않으면 파일 범위를 나눈 순차 공유 레인으로 실행하세요.";
+		"격리를 켜는 것은 사용자의 omp 설정(`omp config set task.isolation.enabled true`, 확인은 `omp config list --json`)입니다. " +
+		"지금 쓸 수 없으면 계획의 isolationReason을 빼고 공유 레인으로 다시 계획하세요. 공유 쓰기 레인은 한 번에 하나씩 시작합니다.";
 }
 
 function isolationApplyReason(agent: string, lane: string, apply: boolean | undefined): string {
@@ -321,15 +322,100 @@ function located(need: LaneNeed, result: LaneResultReadiness): boolean {
 	return result.integrated || result.retained !== undefined;
 }
 
-/** Whether one prerequisite lane's current ledger facts satisfy the edge; a missing row is never satisfied. */
-function dependencyShortfall(need: LaneNeed, state: LaneReadiness): string | undefined {
-	// A lane that is still working may change the result the consumer would read. Its prior row is not final input.
-	if (state.running) return "해당 레인의 워커가 아직 실행 중이라 현재 결과가 확정되지 않았습니다";
-	const open = state.results.filter(result =>
+/** The prerequisite's result rows this edge is still waiting for. */
+function openResults(need: LaneNeed, state: LaneReadiness): LaneResultReadiness[] {
+	return state.results.filter(result =>
 		need === "reviewable"
 			? result.state !== "reviewable" && result.state !== "accepted"
 			: result.state !== "accepted" || !located(need, result),
 	);
+}
+
+/** The citation form an answer is read by: said where an unmet answer is refused and where the director is told. */
+const ANSWER_CITATION_FORM = "읽기 전용 답은 프로젝트 안 파일의 path:line 인용이 있어야 합니다(local://, #L은 읽지 않음).";
+
+/** Tag of the line the director reads when a delivery changed the ledger. */
+export const LEDGER_NOTICE_TAG = "[storm:결과]";
+
+/** One result a delivery left short of acceptance, as the ledger holds it now. */
+export interface LedgerNoticeRow {
+	id: string;
+	kind: LaneResultKind;
+	state: RunResult["state"];
+	reason?: string;
+}
+
+/** What the notice calls a waiting lane whose prerequisites all hold; it does not say the lane can start. */
+export const LEDGER_READY_LEAD = "선행이 충족된 대기 레인";
+
+const NOTICE_ROWS = 3;
+const NOTICE_REASON_CHARS = 140;
+
+/**
+ * What the director needs to read when a worker's delivery was evaluated: what Storm decided if that was not
+ * acceptance (each result, its state, the ledger's reason, and for an answer the citation form that is read) and which
+ * waiting lanes now have every prerequisite met (the spawn guard still decides whether they start). Nothing when the delivery was accepted and nothing waits on it. Facts only:
+ * starting anything stays the director's call and the spawn guard's.
+ */
+export function ledgerNotice(input: { lane: string; open: readonly LedgerNoticeRow[]; startable: readonly string[] }): string | undefined {
+	const parts: string[] = [];
+	if (input.open.length > 0) {
+		const shown = input.open.slice(0, NOTICE_ROWS).map(row => {
+			const why = row.reason === undefined || row.reason.trim() === ""
+				? ""
+				: `: ${row.reason.replace(/\s+/gu, " ").trim().replace(/[.。]+$/u, "").slice(0, NOTICE_REASON_CHARS)}`;
+			return `${row.id}(${STATE_LABEL[row.state]}${why})`;
+		});
+		const more = input.open.length > NOTICE_ROWS ? ` 외 ${input.open.length - NOTICE_ROWS}건` : "";
+		parts.push(`'${input.lane}' 레인의 결과를 수용하지 않았습니다: ${shown.join(", ")}${more}.`);
+		if (input.open.some(row => row.kind === "answer" && row.state === "unmet")) parts.push(ANSWER_CITATION_FORM);
+	}
+	if (input.startable.length > 0) {
+		const names = input.startable.slice(0, 6).join(", ") + (input.startable.length > 6 ? ` 외 ${input.startable.length - 6}개` : "");
+		// Prerequisites are one of the spawn guard's checks: role caps, parallelism, budget, writer order and isolation can
+		// still refuse, so this names lanes that wait on nothing more, not lanes that will start.
+		parts.push(`${LEDGER_READY_LEAD}: ${names}. 시작 여부는 스폰 검사가 정합니다.`);
+	}
+	return parts.length === 0 ? undefined : `${LEDGER_NOTICE_TAG} ${parts.join(" ")}`;
+}
+
+/**
+ * What the director can do next for the state a prerequisite is in, one short sentence per distinct state. Waiting
+ * only helps a worker that is still running or a result not yet judged; a finished, judged-unmet or reviewable result
+ * does not change by itself, so it says what would change it. Pure advice: the guard still decides at the spawn.
+ */
+function shortfallAdvice(need: LaneNeed, state: LaneReadiness): string {
+	if (state.running) return "그 워커가 끝난 뒤 같은 호출을 다시 보내세요.";
+	const open = openResults(need, state);
+	if (state.results.length === 0) {
+		return need === "integrated" ? "그 결과가 부모 트리에 반영된 뒤 다시 보내세요." : "그 워커의 결과를 받은 뒤 다시 보내세요.";
+	}
+	const follow = state.handle === undefined ? "후속 지시" : `\`write agent://${state.handle}\` 명령`;
+	const notes = new Set<string>();
+	for (const result of open) {
+		if (result.state === "pending") notes.add("아직 판정되지 않았으니 결과가 반영된 뒤 다시 보내세요.");
+		else if (result.state === "unmet") {
+			notes.add(
+				result.kind === "answer"
+					? `${ANSWER_CITATION_FORM} 그 워커에게 ${withJosa(follow, "으로/로")} 인용을 요청하세요.`
+					: `미충족은 기다려도 바뀌지 않습니다. 사유를 보고 그 워커에게 ${withJosa(follow, "으로/로")} 보완을 요청하세요.`,
+			);
+		} else if (result.state === "reviewable") {
+			notes.add(
+				need === "result"
+					? "검토 가능은 아직 수용이 아니며 승인된 리뷰어의 판정이 있어야 합니다. 제출만 필요하면 이 선행의 need를 reviewable로 바꿔 다시 계획하세요."
+					: "검토 가능은 아직 수용이 아니며 승인된 리뷰어의 판정이 있어야 합니다.",
+			);
+		} else notes.add("수용된 결과가 현재 트리에서 확인된 뒤 다시 보내세요.");
+	}
+	return notes.size === 0 ? "그 결과가 충족된 뒤 다시 보내세요." : [...notes].slice(0, 2).join(" ");
+}
+
+/** Whether one prerequisite lane's current ledger facts satisfy the edge; a missing row is never satisfied. */
+function dependencyShortfall(need: LaneNeed, state: LaneReadiness): string | undefined {
+	// A lane that is still working may change the result the consumer would read. Its prior row is not final input.
+	if (state.running) return "해당 레인의 워커가 아직 실행 중이라 현재 결과가 확정되지 않았습니다";
+	const open = openResults(need, state);
 	if (state.results.length === 0) {
 		// A legacy lane declared no results: only an admitted, settled worker is evidence. An `integrated` edge on a
 		// shared lane additionally needs the parent tree to carry it; an empty answer cannot be integrated.
@@ -340,7 +426,7 @@ function dependencyShortfall(need: LaneNeed, state: LaneReadiness): string | und
 		return open
 			.slice(0, 3)
 			.map(result => {
-				const why = result.reason === undefined ? "" : `: ${result.reason}`;
+				const why = result.reason === undefined ? "" : `: ${result.reason.replace(/[.。]+$/u, "")}`;
 				const marker = result.state !== "accepted"
 					? ""
 					: need === "integrated"
@@ -369,7 +455,8 @@ export function dependencyBlock(lane: PlanLane, readiness: LaneReadinessView | u
 		}
 		const shortfall = dependencyShortfall(dependency.need, state);
 		if (shortfall === undefined) continue;
-		return `레인 '${lane.name}'은 선행 '${dependency.lane}'의 ${NEED_LABEL[dependency.need]}을 기다립니다: ${shortfall}. 해당 선행 레인이 끝난 뒤 다시 스폰하세요. 선행을 대신 실행하거나 같은 이름으로 결과를 주장하지 마세요.`;
+		// A fixed noun sits between each inserted value and its particle, so the sentence is grammatical whatever is inserted.
+		return `'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL[dependency.need]} 조건이 충족되지 않았습니다: ${shortfall}. ${shortfallAdvice(dependency.need, state)} 선행을 대신 실행하거나 같은 이름으로 결과를 주장하지 마세요.`;
 	}
 	return undefined;
 }
@@ -414,7 +501,8 @@ type WriteScope =
 	| { kind: "read" }
 	| { kind: "private" }
 	| { kind: "paths"; paths: string[] }
-	| { kind: "unknown" };
+	/** `why` is the short cause of an exclusive writer, shown in the refusal; absent when nothing narrowed it. */
+	| { kind: "unknown"; why?: string };
 
 /** Roles that do not change files: the lane may only read, whatever tools the host happens to offer. */
 const READ_ONLY_ROLES: Readonly<Record<string, true>> = { explorer: true, reviewer: true, architect: true };
@@ -440,17 +528,18 @@ function writeScope(
 	if (policy !== undefined) {
 		if (policy.kind === "read") return { kind: "read" };
 		if (policy.kind === "private") return { kind: "private" };
-		if (policy.kind === "unknown" || policy.kind === "blocked" || auto) return { kind: "unknown" };
+		if (policy.kind === "unknown") return { kind: "unknown", why: policy.reason };
+		if (policy.kind === "blocked" || auto) return { kind: "unknown", why: WHY_AUTO_WRITER };
 		return { kind: "paths", paths: [...new Set(canonicalFiles ?? policy.paths ?? lane?.files ?? [])].sort() };
 	}
 	if (lane !== undefined && (lane.files?.length ?? 0) > 0) {
-		return auto ? { kind: "unknown" } : { kind: "paths", paths: normalizeFiles(lane) };
+		return auto ? { kind: "unknown", why: WHY_AUTO_WRITER } : { kind: "paths", paths: normalizeFiles(lane) };
 	}
 	const laneRole = lane?.role ?? role;
 	const changes = lane !== undefined && ((lane.results ?? []).some(result => result.kind !== "answer") || WRITING_KINDS[lane.kind] === true);
-	if (changes || (laneRole !== undefined && WRITING_ROLES[laneRole] === true)) return { kind: "unknown" };
+	if (changes || (laneRole !== undefined && WRITING_ROLES[laneRole] === true)) return { kind: "unknown", why: WHY_UNDECLARED_WRITER };
 	if (laneRole !== undefined && READ_ONLY_ROLES[laneRole] === true) return { kind: "read" };
-	return { kind: "unknown" };
+	return { kind: "unknown", why: WHY_UNDECLARED_WRITER };
 }
 
 /** Two shared writes collide when their path scopes overlap by directory prefix; an unknown scope can touch anything. */
@@ -461,15 +550,48 @@ function scopesConflict(a: WriteScope, b: WriteScope): boolean {
 	return scopesOverlap(a.paths, b.paths);
 }
 
-function scopeText(scope: WriteScope): string {
-	if (scope.kind === "paths") return `파일 ${scope.paths.join(", ")}`;
-	if (scope.kind === "unknown") return "쓰기 범위가 선언되지 않은 공유 작업";
-	return "읽기 전용 작업";
+/**
+ * Why two shared writes may not start together, and the one next step that works for this refusal. A lane that declared
+ * files is told so: for an exclusive writer (a `bash`/`eval` tool, automatic delegation) the files do not narrow what it
+ * can touch, so splitting them changes nothing and the text must not ask for it. Isolation is never recommended here:
+ * it exists only where omp has it on, and the plan reply says when it does not. `other` is a noun phrase that ends in a
+ * fixed Korean noun (레인, 작업), so the particles after it hold whatever name is inserted before it.
+ */
+function conflictText(
+	lane: PlanLane | undefined,
+	agent: string,
+	scope: WriteScope,
+	other: string,
+	otherScope: WriteScope,
+	sameCall = false,
+): string {
+	const who = lane === undefined ? `${agent} 직접 작업` : `'${lane.name}' 레인`;
+	const declared = (lane?.files?.length ?? 0) > 0;
+	// Both phrases end in a fixed Korean noun, but the particle is still picked from the text so a reworded phrase stays right.
+	const topic = withJosa(who, "은/는");
+	const withOther = withJosa(other, "과/와");
+	let head: string;
+	if (scope.kind === "unknown") {
+		const why = scope.why ?? WHY_UNDECLARED_WRITER;
+		head = declared
+			? `${topic} 파일 목록을 선언했지만 쓰기 범위를 좁힐 수 없는 공유 작업입니다(${why}). ${withOther} 함께 시작하지 않았습니다. 파일 목록을 나눠도 같습니다.`
+			: `${topic} 쓰기 범위를 좁힐 수 없는 공유 작업입니다(${why}). ${withOther} 함께 시작하지 않았습니다.${otherScope.kind === "paths" && why === WHY_UNDECLARED_WRITER ? " 파일 목록을 선언하면 겹치지 않는 한 함께 시작합니다." : ""}`;
+	} else if (otherScope.kind === "unknown") {
+		head = `${topic} 파일 ${scope.kind === "paths" ? scope.paths.join(", ") : ""}만 쓰지만 ${withJosa(other, "은/는")} 쓰기 범위를 좁힐 수 없는 공유 작업이라(${otherScope.why ?? WHY_UNDECLARED_WRITER}) 함께 시작하지 않았습니다.`;
+	} else {
+		const mine = scope.kind === "paths" ? scope.paths.join(", ") : "";
+		const theirs = otherScope.kind === "paths" ? otherScope.paths.join(", ") : "";
+		head = `${topic} ${withOther} 쓰는 파일이 겹쳐 함께 시작하지 않았습니다(${mine} / ${theirs}).`;
+	}
+	const next = sameCall
+		? "이 호출에는 쓰기 작업을 하나만 담고 나머지는 끝난 뒤 보내세요. 읽기 전용 레인은 함께 보내도 됩니다."
+		: `${withJosa(other, "이/가")} 끝난 뒤 같은 호출을 다시 보내세요.`;
+	return `${head} ${next}`;
 }
 
-function conflictText(lane: PlanLane | undefined, agent: string, scope: WriteScope, other: string, otherScope: WriteScope): string {
-	const who = lane === undefined ? `${agent} 직접 작업` : `레인 '${lane.name}'`;
-	return `${who}의 ${scopeText(scope)}이(가) ${other}의 ${scopeText(otherScope)}와 겹칩니다. 한 번에 시작하지 않았습니다. 겹치는 작업을 순서대로 나눠 제출하거나 쓰기 범위를 분리하세요.`;
+/** The earlier writer a refusal names, as a noun phrase: a reservation may be placed but not yet running. */
+function earlierWriter(lane: string | undefined): string {
+	return lane === undefined ? "먼저 시작한 공유 작업" : `먼저 시작한 '${lane}' 레인`;
 }
 
 interface WriteReservation {
@@ -772,7 +894,7 @@ export class RunLanes {
 				for (const [key, reservation] of this.#writes) {
 					if (key === ownKey || reservation.agentId === spawn.spawnKey) continue;
 					if (!scopesConflict(scope, reservation.scope)) continue;
-					const other = reservation.lane === undefined ? "진행 중인 공유 작업" : `레인 '${reservation.lane}'`;
+					const other = earlierWriter(reservation.lane);
 					const reason = conflictText(lane, spawn.agent, scope, other, reservation.scope);
 					this.#releaseSpawn(spawn.spawnKey, assignment.lane);
 					return { ok: false, code: "lane-write", reason };
@@ -815,7 +937,7 @@ export class RunLanes {
 				ok: false,
 				code: "lane-busy",
 				retry: false,
-				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `write agent://${handle} 로`} 후속 지시를 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
+				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `\`write agent://${handle}\` 명령으로`} 후속 지시를 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 			};
 		}
 		for (let i = 0; i < scopes.length; i++) {
@@ -828,7 +950,7 @@ export class RunLanes {
 					ok: false,
 					code: "lane-write",
 					retry: false,
-					reason: conflictText(a.lane, a.agent, a.scope, `같은 배치의 다른 항목(${b.lane?.name ?? b.agent})`, b.scope),
+					reason: conflictText(a.lane, a.agent, a.scope, b.lane === undefined ? `같은 호출의 ${b.agent} 직접 작업` : `같은 호출의 '${b.lane.name}' 레인`, b.scope, true),
 				};
 			}
 		}
@@ -837,7 +959,7 @@ export class RunLanes {
 			if (scope.kind !== "paths" && scope.kind !== "unknown") continue;
 			for (const reservation of this.#writes.values()) {
 				if (!scopesConflict(scope, reservation.scope)) continue;
-				const other = reservation.lane === undefined ? "진행 중인 공유 작업" : `레인 '${reservation.lane}'`;
+				const other = earlierWriter(reservation.lane);
 				return { ok: false, code: "lane-write", retry: true, reason: conflictText(entry.lane, entry.agent, scope, other, reservation.scope) };
 			}
 		}
@@ -1080,7 +1202,7 @@ export class RunLanes {
 			return {
 				ok: false,
 				code: "lane-job",
-				reason: `'${lane.name}' 레인은 정형 작업(job: ${lane.job})이라 호스트 러너가 실행합니다. AI 서브에이전트에 후속 작업을 보내지 말고 job 실행 결과나 별도 워커 레인을 쓰세요.`,
+				reason: `'${lane.name}' 레인은 정형 작업이라 호스트 러너가 실행합니다(job: ${lane.job}). AI 서브에이전트에 후속 작업을 보내지 말고 job 실행 결과나 별도 워커 레인을 쓰세요.`,
 			};
 		}
 		if (lane !== undefined) {
@@ -1135,11 +1257,11 @@ export class RunLanes {
 			if (!running) {
 				for (const reservation of this.#writes.values()) {
 					if (reservation.agentId === input.agentId || !scopesConflict(scope, reservation.scope)) continue;
-					const other = reservation.lane === undefined ? "진행 중인 공유 작업" : `레인 '${reservation.lane}'`;
+					const other = earlierWriter(reservation.lane);
 					return {
 						ok: false,
 						code: "lane-write",
-						reason: `${conflictText(lane, input.agent, scope, other, reservation.scope)} 이 진행 메모는 대기 중인 워커의 새 턴을 시작시키므로 보내지 않았습니다. 앞선 쓰기 작업이 끝난 뒤 같은 메모를 다시 보내세요.`,
+						reason: `${conflictText(lane, input.agent, scope, other, reservation.scope)} 이 진행 메모는 대기 중인 워커의 새 턴을 시작시키므로 보내지 않았습니다.`,
 					};
 				}
 			}
@@ -1154,7 +1276,7 @@ export class RunLanes {
 				return {
 					ok: false,
 					code: "lane-busy",
-					reason: `레인 '${lane.name}'에 이미 예약된 ${current.agentId === undefined ? "독립 작업" : "후속 작업"}이 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 그 작업이 시작·종료된 뒤 같은 write를 다시 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
+					reason: `레인 '${lane.name}'에 이미 예약된 ${withJosa(current.agentId === undefined ? "독립 작업" : "후속 작업", "이/가")} 있어 ${input.agent} 후속 작업을 보내지 않았습니다. 그 작업이 시작·종료된 뒤 같은 write를 다시 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 				};
 			}
 		}
@@ -1179,7 +1301,7 @@ export class RunLanes {
 		for (const reservation of this.#writes.values()) {
 			if (reservation.agentId === input.agentId) continue;
 			if (!scopesConflict(scope, reservation.scope)) continue;
-			const other = reservation.lane === undefined ? "진행 중인 공유 작업" : `레인 '${reservation.lane}'`;
+			const other = earlierWriter(reservation.lane);
 			return { ok: false, reason: conflictText(lane, input.agent, scope, other, reservation.scope), code: "lane-write" };
 		}
 		const key = lane !== undefined ? `lane:${lane.name}` : `spawn:${input.agentId}`;

@@ -284,7 +284,7 @@ export function resolveAdjustTarget(
 	if (exact) {
 		const hit = candidates.filter(candidate => candidate.id === phrase);
 		if (hit.length === 1) return { ok: true, target: targetOf(hit[0]!) };
-		return { ok: false, reason: `결과 id '${safeLabel(phrase, 64)}'를 이 실행의 계획에서 찾지 못했습니다. ${suggestions(candidates)}` };
+		return { ok: false, reason: `'${safeLabel(phrase, 64)}' 결과 id를 이 실행의 계획에서 찾지 못했습니다. ${suggestions(candidates)}` };
 	}
 	if (phrase === "") return { ok: false, reason: notFound(kind, candidates) };
 	const lowered = phrase.toLowerCase();
@@ -341,7 +341,7 @@ export function excludeProblem(input: ExcludeGuardInput): string | undefined {
 	if (row.state !== "pending" || row.attemptId !== undefined || row.contentVersion !== undefined ||
 		row.proof !== undefined || (row.consumed?.length ?? 0) > 0 || row.restoredFrom !== undefined ||
 		(row.origin !== undefined && row.origin !== "plan")) {
-		return `결과 '${safeLabel(resultId, 40)}'는 이미 ${row.state === "pending" ? "대기" : row.state === "unmet" ? "미충족" : row.state === "reviewable" ? "검토 가능" : "이행"} 상태이거나 시도·근거가 있어 제외할 수 없습니다. 쓰기나 실행을 되돌리지 않습니다.`;
+		return `'${safeLabel(resultId, 40)}' 결과는이미 ${row.state === "pending" ? "대기" : row.state === "unmet" ? "미충족" : row.state === "reviewable" ? "검토 가능" : "이행"} 상태이거나 시도·근거가 있어 제외할 수 없습니다. 쓰기나 실행을 되돌리지 않습니다.`;
 	}
 	const consumers = rows
 		.filter(candidate => candidate.id !== row.id && (candidate.consumed ?? []).some(input => input.id === resultId))
@@ -388,16 +388,16 @@ export function retryProblem(input: RetryGuardInput): string | undefined {
 	const row = rows.find(candidate => candidate.id === resultId);
 	if (row === undefined) return `결과 '${safeLabel(resultId, 40)}'의 기록을 찾지 못해 재시도하지 않았습니다.`;
 	if (input.laneBusy) return `'${safeLabel(lane.name, 40)}' 레인의 시도가 이미 진행 중입니다(자동 재시도 포함). 끝난 뒤 결과를 확인하세요.`;
-	if (row.state === "accepted") return `결과 '${safeLabel(resultId, 40)}'는 이미 이행되어 재시도할 필요가 없습니다.`;
-	if (row.state === "reviewable") return `결과 '${safeLabel(resultId, 40)}'는 검토 제출 상태입니다. 재시도 대신 승인된 리뷰가 필요합니다.`;
+	if (row.state === "accepted") return `'${safeLabel(resultId, 40)}' 결과는이미 이행되어 재시도할 필요가 없습니다.`;
+	if (row.state === "reviewable") return `'${safeLabel(resultId, 40)}' 결과는검토 제출 상태입니다. 재시도 대신 승인된 리뷰가 필요합니다.`;
 	if (row.state === "pending") {
 		return row.attemptId === undefined
-			? `결과 '${safeLabel(resultId, 40)}'는 아직 호스트가 확정한 실패 시도가 없어 재시도 대상이 아닙니다.`
-			: `결과 '${safeLabel(resultId, 40)}'는 시도가 아직 끝나지 않았거나 새 시도가 시작되었습니다. 끝난 뒤 다시 요청하세요.`;
+			? `'${safeLabel(resultId, 40)}' 결과는아직 호스트가 확정한 실패 시도가 없어 재시도 대상이 아닙니다.`
+			: `'${safeLabel(resultId, 40)}' 결과는시도가 아직 끝나지 않았거나 새 시도가 시작되었습니다. 끝난 뒤 다시 요청하세요.`;
 	}
-	if (row.attemptId === undefined) return `결과 '${safeLabel(resultId, 40)}'는 호스트가 확정한 시도가 없어 한 번 재시도할 근거가 없습니다.`;
-	if (row.remedy === "retry") return `결과 '${safeLabel(resultId, 40)}'는 호스트 기본 재시도·대체 경로가 이미 소진되었습니다. 같은 경로를 다시 예약하지 않습니다. 다른 승인 레인으로 계획하세요.`;
-	if (row.remedy === "blocked") return `결과 '${safeLabel(resultId, 40)}'는 외부 차단 상태입니다. 먼저 차단 조건을 해소해야 하며 재시도로 우회하지 않습니다.`;
+	if (row.attemptId === undefined) return `'${safeLabel(resultId, 40)}' 결과는호스트가 확정한 시도가 없어 한 번 재시도할 근거가 없습니다.`;
+	if (row.remedy === "retry") return `'${safeLabel(resultId, 40)}' 결과는호스트 기본 재시도·대체 경로가 이미 소진되었습니다. 같은 경로를 다시 예약하지 않습니다. 다른 승인 레인으로 계획하세요.`;
+	if (row.remedy === "blocked") return `'${safeLabel(resultId, 40)}' 결과는외부 차단 상태입니다. 먼저 차단 조건을 해소해야 하며 재시도로 우회하지 않습니다.`;
 	if (!input.inputsAvailable) return `결과 '${safeLabel(resultId, 40)}'의 선행 입력이 아직 준비되지 않았습니다. 누락된 입력을 먼저 만들고 같은 결과를 다시 판단하세요.`;
 	if (!input.inputsMatch) return `결과 '${safeLabel(resultId, 40)}'의 선행 입력 버전이 바뀌었습니다. 같은 입력으로 재시도할 수 없으니 현재 계획으로 다시 판단하세요.`;
 	return undefined;
@@ -422,7 +422,7 @@ export function excludedPlanConflict(rows: readonly RunResult[] | undefined, pla
 	for (const lane of plan.lanes) {
 		for (const result of lane.results ?? []) {
 			if (excluded.some(row => row.id === result.id)) {
-				return `사용자가 범위에서 제외한 결과 '${safeLabel(result.id, 40)}'를 다시 계획할 수 없습니다. 제외는 이 실행에서 유지됩니다.`;
+				return `사용자가 범위에서 제외한 '${safeLabel(result.id, 40)}' 결과를 다시 계획할 수 없습니다. 제외는 이 실행에서 유지됩니다.`;
 			}
 		}
 	}

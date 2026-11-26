@@ -96,6 +96,11 @@ export function readOnlyIntent(lane: PlanLane): boolean {
 	return lane.kind !== "code" && lane.kind !== "run";
 }
 
+/** Why a shared writer's scope cannot be narrowed; short enough to sit in parentheses of a refusal or a plan line. */
+export const WHY_AUTO_WRITER = "자동 위임";
+export const WHY_EXEC_WRITER = "임의 실행 도구가 있음";
+export const WHY_UNDECLARED_WRITER = "파일 목록이 없음";
+
 export type LanePolicy =
 	| { kind: "read"; reason: string }
 	| { kind: "private"; reason: string }
@@ -129,18 +134,18 @@ export function lanePolicy(input: LanePolicyInput): LanePolicy {
 		if (!capability.readOnly) {
 			return {
 				kind: "blocked",
-				reason: `'${lane.name}'은 쓰기 의도가 없는 레인인데 이 에이전트의 실제 도구에 쓰기/실행 능력이 있습니다(${tools === undefined ? "도구 목록 없음=호스트 기본 전체" : tools.join(", ")}). 역할 이름으로 읽기 전용을 가정하지 않으며, 읽기 전용 정의나 승인된 센드박스가 필요합니다.`,
+				reason: `'${lane.name}' 레인은 쓰기 의도가 없는데 이 에이전트의 실제 도구에 쓰기/실행 능력이 있습니다(${tools === undefined ? "도구 목록 없음=호스트 기본 전체" : tools.join(", ")}). 역할 이름으로 읽기 전용을 가정하지 않으며, 읽기 전용 정의나 승인된 센드박스가 필요합니다.`,
 			};
 		}
 		return { kind: "read", reason: "실제 도구가 읽기 전용인 레인" };
 	}
 	const capability = toolCapability(tools);
 	if (capability.readOnly) {
-		return { kind: "blocked", reason: `'${lane.name}'은 쓰기 결과를 요구하지만 이 에이전트의 도구는 읽기 전용입니다` };
+		return { kind: "blocked", reason: `'${lane.name}' 레인은 쓰기 결과를 요구하지만 이 에이전트의 도구는 읽기 전용입니다` };
 	}
-	if (input.auto) return { kind: "unknown", reason: "자동 배정의 공유 쓰기는 전역 순차" };
-	if (capability.exec) return { kind: "unknown", reason: "임의 실행 도구가 있어 쓰기 범위를 좁힐 수 없습니다" };
-	if ((lane.files?.length ?? 0) === 0) return { kind: "unknown", reason: "쓰기 범위가 선언되지 않았습니다" };
+	if (input.auto) return { kind: "unknown", reason: WHY_AUTO_WRITER };
+	if (capability.exec) return { kind: "unknown", reason: WHY_EXEC_WRITER };
+	if ((lane.files?.length ?? 0) === 0) return { kind: "unknown", reason: WHY_UNDECLARED_WRITER };
 	return { kind: "paths", paths: [...new Set(lane.files ?? [])].sort(), reason: "경로 지정 도구만 있는 수동 공유 쓰기" };
 }
 

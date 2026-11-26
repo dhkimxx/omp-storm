@@ -39,7 +39,7 @@ import type {
 	StormConfig,
 	UiPort,
 } from "../types.ts";
-import { attemptUsable, type AttemptReport } from "./attempt-report.ts";
+import { ATTEMPT_REF, attemptUsable, type AttemptReport } from "./attempt-report.ts";
 import {
 	excludeProblem,
 	excludedPlanConflict,
@@ -80,7 +80,7 @@ import {
 	normalizeCheckpointPlan,
 	revalidateCheckpointProof,
 } from "./checkpoint-import.ts";
-import { dependencyBlock, laneRouteFingerprint, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { dependencyBlock, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
 import {
 	attemptInputsCurrent,
 	changedInputRequirements,
@@ -103,6 +103,7 @@ import {
 	decideRound,
 	END_STATUS,
 	endLabel,
+	stopWords,
 	HOLD_MS,
 	lastWriterChangeAt,
 	maxRounds,
@@ -125,7 +126,7 @@ import { locateResult, projectAcceptedResult } from "./result-location.ts";
 import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
-import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, trustedResume, type ResumeTarget } from "./resume.ts";
+import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
@@ -158,6 +159,17 @@ const DRAIN_MAX_MS = 30_000;
  * and be refused for a result that is being written in the same tick.
  */
 const ADMISSION_SETTLE_WAIT_MS = 1_000;
+/** What the director reads about the ledger in one request: a few lines, never a dump. */
+const NOTICE_MAX_CHARS = 900;
+
+/**
+ * The fence a lane goes back to when a prepared dispatch is dropped: the newest attempt that is still real, whether it
+ * is open or already settled (in any outcome). A dropped dispatch never ran, so it must not lower the fence below an
+ * attempt that did.
+ */
+export function fenceAfterDiscard(settledEpoch: number | undefined, openEpochs: readonly number[]): number {
+	return Math.max(0, settledEpoch ?? 0, ...openEpochs);
+}
 
 /** Asks the owning session to rewrite the run's record soon (spawns, spend) and to re-check its live phase at once. */
 export function touchRun(runId: string): void {
@@ -213,6 +225,19 @@ const TASK_CHARS = 200;
 /** A follow-up reference that is not this session's own finished run on this target; nothing of it was read in. */
 const FOLLOW_UP_DECLINED =
 	"이전 실행을 이 세션과 이 작업 트리의 끝난 실행으로 확인하지 못해 후속 작업으로 시작하지 않았습니다. 요청을 새로 입력해 시작하세요.";
+
+/** Refusals of a director's continuation; each says what the user can do, since the director cannot. */
+const NO_CONTINUABLE_RUN =
+	"이어 갈 중단된 실행이 없습니다. 이 세션과 이 작업 트리에서 시작해 끝나지 않은 실행만 이어 갑니다. 새 작업이면 계획을 plan으로 제출하세요.";
+const CONTINUE_PLAN_REFUSED =
+	"중단된 실행의 계획이 지금 승인된 팀 범위에 맞지 않아 이어 가지 않았습니다. 사용자가 /storm 의 이어 가기를 고르면 결과는 이어받고 계획은 새로 세웁니다. 팀 범위 변경도 사용자가 /storm 에서 합니다.";
+const CONTINUE_NO_LANES = "중단된 실행의 범위에 남은 레인이 없어 이어 가지 않았습니다. 새 작업이면 계획을 plan으로 제출하세요.";
+/** A continued run whose place in the lineage could not be written starts nothing, so two runs never claim one parent. */
+export const RESUME_POINTER_FAILED =
+	"이어 가는 실행의 계보를 기록하지 못해 시작하지 않았습니다. 세션 저장소의 쓰기 권한과 여유 공간을 확인한 뒤 다시 이어 가세요.";
+/** The run stopped at or after this turn began: the user has not spoken since, so a limit or a stop of theirs stands. */
+export const CONTINUE_SAME_TURN =
+	"중단된 실행이 이번 사용자 요청과 같은 턴이거나 그 뒤에 멈춘 것이라 이어 가지 않았습니다. 멈춘 뒤에 사용자가 이어 가라고 말해야 이어 갑니다. 사용자에게 멈춘 이유를 알리고 어떻게 할지 물어 보세요.";
 
 /** Whether a turn ended because it was interrupted: omp closes it with an assistant message marked aborted. */
 export function turnAborted(messages: readonly unknown[] | undefined): boolean {
@@ -275,6 +300,15 @@ interface PreparedAttempt {
 	declaredInputs: readonly DeclaredInput[];
 	/** Captured immediately before the attempt; absent for a legacy lane with no declared results. */
 	baseline?: ResultBaseline;
+	/** The user's one-shot retry this attempt consumed, so an attempt that never ran can give it back. */
+	retryTaken?: RetryTaken;
+}
+
+/** What taking a retry grant changed, enough to undo it: the grant, the row's earlier reason and the stamped entry. */
+interface RetryTaken {
+	grant: RetryGrant;
+	reason?: string;
+	entry?: RunAdjustment;
 }
 
 /** The last settled attempt of a lane, kept bounded for a later re-evaluation whose check evidence was not ready yet. */
@@ -389,8 +423,6 @@ const RESULT_FALLBACK_REASON: Record<"unmet" | "reviewable", string> = {
 	unmet: "요구 결과가 충족되지 않았습니다.",
 	reviewable: "제출물이 있어 자연어 판단이 필요합니다.",
 };
-/** A host attempt reference is a short token, never a path or model text; an unsafe one is omitted. */
-const ATTEMPT_REF = /^[A-Za-z0-9:._-]{1,64}$/u;
 const PROOF_DIGEST = /^[a-f0-9]{64}$/u;
 
 function jobDigest(job: NonNullable<StormConfig["jobs"]>[number]): string {
@@ -535,6 +567,21 @@ interface OwnRun {
 	laneAttempt: Map<string, number>;
 	/** The latest settled attempt per lane, for a bounded re-evaluation once approved check evidence exists. */
 	settled: Map<string, SettledAttempt>;
+	/**
+	 * The highest attempt epoch of each lane that settled in any outcome. `settled` keeps only the last success, so a
+	 * newer attempt that failed, was cancelled or went stale is visible here alone; the lane's fence never drops
+	 * below it, or the older success's evidence would count as current again.
+	 */
+	settledEpoch: Map<string, number>;
+	/**
+	 * What the director has not yet been told about the ledger (see `ledgerNotice`), oldest first; taken once by
+	 * `takeNotices`. Memory only: a notice is a reading aid for the next director request, never state to restore.
+	 */
+	notices: string[];
+	/** Dispatches whose evaluation was already reported: one attempt is reported once, however many ways it arrives. */
+	noticed: Set<string>;
+	/** Waiting lanes the director was told can start and that have not started or stopped being startable since. */
+	startableTold: Set<string>;
 	/** Revalidated lanes owe no new worker attempt unless their results are reopened. */
 	restoredLanes: Set<string>;
 	/** The answer submission each answer row currently stands on; see `AnswerSubject`. */
@@ -772,12 +819,26 @@ export class RunController {
 		return this.#start(ctx, spec, newRunId(this.deps.now()), plan, configHash);
 	}
 
+	/**
+	 * Continues the interrupted run the `/storm` menu would resume, inside the turn that is already running, the way
+	 * `startWithPlan` opens an automatic run: no handoff, no dialog, the in-flight turn is the first round. It is the
+	 * same start with the same checks: the candidate is `findResumeCandidate`'s, the pointer must still vouch for it,
+	 * the checkpoint is proven again before an accepted result is carried, the goal is carried and `resumeOf` records
+	 * the lineage. Its plan is the old one re-validated against the approved team (`normalizeCheckpointPlan`, the
+	 * `validatePlan` the `plan` action uses): a plan outside those bounds starts nothing. The caller has already
+	 * decided that this is the user's turn and that delegation is automatic.
+	 */
+	async continueInTurn(ctx: ExtensionContext, said: string | undefined, turnStartedAt: number): Promise<RunRequestResult> {
+		return this.#start(ctx, { task: "" }, newRunId(this.deps.now()), undefined, undefined, { said, turnStartedAt });
+	}
+
 	async #start(
 		ctx: ExtensionContext,
 		spec: RunSpec,
 		runId: string,
 		plan?: RunPlan,
 		configHash?: string,
+		continuing?: { said: string | undefined; turnStartedAt: number },
 	): Promise<RunRequestResult> {
 		// A queued run is not in the way of its own start: `onAgentEnd` takes it off the queue first.
 		const reason = this.refusal();
@@ -785,7 +846,7 @@ export class RunController {
 		const generation = this.#generation;
 		this.#starting = true;
 		try {
-			return await this.#begin(ctx, spec, runId, plan, configHash, generation);
+			return await this.#begin(ctx, spec, runId, plan, configHash, generation, continuing);
 		} finally {
 			this.#starting = false;
 		}
@@ -807,14 +868,17 @@ export class RunController {
 
 	async #begin(
 		ctx: ExtensionContext,
-		requested: RunSpec,
+		asked: RunSpec,
 		runId: string,
 		plan: RunPlan | undefined,
 		configHash: string | undefined,
 		generation: number,
+		continuing?: { said: string | undefined; turnStartedAt: number },
 	): Promise<RunRequestResult> {
-		// Only an automatic probe starts inside a turn that is already running; a manual start waits for its handoff.
-		const auto = plan !== undefined;
+		// Only an automatic probe starts inside a turn that is already running; a manual start waits for its handoff. A
+		// continuation by the director is one: it is told the carried state in the answer to its call, not by a handoff.
+		const auto = plan !== undefined || continuing !== undefined;
+		let requested = asked;
 		const gone = (): Refusal => refuse("세션이 바뀌어 Storm 실행을 시작하지 않았습니다.");
 		const state = await this.deps.loadState(ctx);
 		if (this.#generation !== generation) return gone();
@@ -835,6 +899,21 @@ export class RunController {
 		const target: ResumeTarget = { repoId: state.repo.repoId, root };
 		const busy = refuse("이 세션에서 다른 Storm 실행이 진행 중입니다.");
 		if (activeLedgerRun(sessionDir)) return busy;
+		if (continuing !== undefined) {
+			// The candidate is the menu's own: the newest trusted unfinished run of this session and target.
+			const candidate = await findResumeCandidate(sessionDir, target).catch(() => undefined);
+			if (this.#generation !== generation) return gone();
+			if (candidate === undefined) return refuse(NO_CONTINUABLE_RUN);
+			// The user must have spoken after the run stopped. Both times are recorded facts: the run's own end (a run found
+			// dead has the time of its last sign of life) and the moment the user's message began this turn. The same
+			// millisecond counts as after: no turn begins and runs a run to its stop within one. A record that gives no time
+			// cannot be shown to precede the turn.
+			const stoppedAt = Date.parse(candidate.endedAt ?? candidate.updatedAt ?? candidate.startedAt);
+			if (!Number.isFinite(stoppedAt) || continuing.turnStartedAt < stoppedAt) return refuse(CONTINUE_SAME_TURN);
+			const built = resumeSpec(candidate, continuing.said);
+			if (!built.ok) return refuse(built.error);
+			requested = built.spec;
+		}
 		// The host may mutate its session manager in place instead of emitting a switch: every await below must also
 		// prove that the context still names this same native session.
 		const stale = (): boolean => this.#generation !== generation || closeoutSessionId(ctx) !== sessionId;
@@ -875,13 +954,14 @@ export class RunController {
 			const startTree = await this.#treeAt(root);
 			if (stale()) return gone();
 			// A resumed run starts a new record; what it continues is an old record of this same session and target.
-			// An automatic probe has no handoff to put it in, so it does not read the old record.
-			const continued = !auto && requested.resumeOf !== undefined ? await readRun(sessionDir, requested.resumeOf) : undefined;
+			// An automatic probe has no handoff to put it in, so it does not read the old record; only a continuation does.
+			const continued = (!auto || continuing !== undefined) && requested.resumeOf !== undefined ? await readRun(sessionDir, requested.resumeOf) : undefined;
 			if (stale()) return gone();
 			if (requested.resumeOf !== undefined && continued === undefined) return refuse("이전 실행을 읽을 수 없어 안전하게 이어갈 수 없습니다.");
 			if (continued !== undefined && !(await trustedResume(sessionDir, target, continued))) {
 				return refuse("이 세션과 이 작업 트리에서 시작한 실행만 이어갈 수 있습니다.");
 			}
+			if (continuing !== undefined && !resumableRun(continued)) return refuse(NO_CONTINUABLE_RUN);
 			// A fresh direction picked from a settled card may name its source for background only. The source must be a
 			// finished record of this session's own store that this machine started on this same target; a stale or
 			// foreign reference is declined rather than read into the handoff. Nothing of it is restored: no plan, row,
@@ -898,6 +978,9 @@ export class RunController {
 				followUp = source;
 			}
 			const restoredPlan = continued?.plan === undefined ? undefined : normalizeCheckpointPlan(gate.config, continued.plan);
+			// A director's continuation puts the old plan in force before its first spawn, so that plan must be one the
+			// approved team could be given today: the same bounds a submitted plan is held to. Otherwise nothing starts.
+			if (continuing !== undefined && restoredPlan === undefined) return refuse(CONTINUE_PLAN_REFUSED);
 			if (restoredPlan !== undefined && planNeedsWrite(restoredPlan)) {
 				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
 				if (!upgraded.ok) return refuse(upgraded.reason);
@@ -913,6 +996,7 @@ export class RunController {
 			});
 			if (plan !== undefined) plan = stripExcludedPlan(plan, priorExcluded);
 			else if (restoredPlan !== undefined) plan = stripExcludedPlan(restoredPlan, priorExcluded);
+			if (continuing !== undefined && plan === undefined) return refuse(CONTINUE_NO_LANES);
 			// A resume continues its parent's goal; a follow-up and a fresh run start their own. Fixed here, never updated.
 			const goal = continued === undefined ? undefined : carryGoal(continued);
 			const resume =
@@ -998,6 +1082,10 @@ export class RunController {
 				retryAcks: new Set(),
 				laneAttempt: new Map(),
 				settled: new Map(),
+				settledEpoch: new Map(),
+				notices: [],
+				noticed: new Set(),
+				startableTold: new Set(),
 				restoredLanes: new Set(),
 				settling: new Set(),
 				abort: new AbortController(),
@@ -1085,7 +1173,15 @@ export class RunController {
 					return gone();
 				}
 				// In this session's own profile store, keyed by its native id and bound to the exact target.
-				await noteResumePointer(own.sessionDir, target, record).catch(() => undefined);
+				// A run that continues another is recorded as its successor here, and only this entry stops the next
+				// continuation from taking the same parent again. Without it the lineage forks (two runs claim one parent, the
+				// spend and accepted results of this one fall out of the goal), so a continued run that cannot be recorded
+				// does not go on. A fresh run only loses its own resumability, which was always best effort.
+				const pointed = await noteResumePointer(own.sessionDir, target, record).then(() => true, () => false);
+				if (!pointed && record.resumeOf !== undefined) {
+					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
+					return refuse(RESUME_POINTER_FAILED);
+				}
 				if (stale() || this.#own !== own) {
 					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 					return gone();
@@ -1106,6 +1202,13 @@ export class RunController {
 					ui.notify(`실행 계약을 보내지 못했습니다: ${errorText(error)}`, "error");
 					this.#stopSoon(own, "start-failed", ctx);
 				});
+			}
+			if (continuing !== undefined && continued !== undefined) {
+				const rows = own.record.results ?? [];
+				const kept = rows.filter(row => row.restoredFrom !== undefined && row.state === "accepted").length;
+				const blocked = rows.filter(row => row.remedy === "blocked").length;
+				const open = (plan?.lanes ?? []).filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name);
+				return { ok: true, runId, continued: { from: continued.runId, ended: stopWords(continued.endReason), kept, reopened: rows.length - kept - blocked, blocked, open: open.slice(0, 12) } };
 			}
 			return { ok: true, runId };
 		} finally {
@@ -1197,12 +1300,17 @@ export class RunController {
 	 * lanes a plan's edges name are inspected.
 	 */
 	async laneReadiness(plan: RunPlan, needed: ReadonlySet<string>): Promise<Map<string, LaneReadiness>> {
-		const view = new Map<string, LaneReadiness>();
 		const own = this.#own;
-		if (own === undefined) return view;
+		if (own === undefined) return new Map<string, LaneReadiness>();
 		// A native delivery can land just before the consumer's call. Wait only for the prerequisites this admission
 		// actually reads, and never past a bounded window: a running producer still blocks.
 		await this.#awaitSettlements(own, needed, ADMISSION_SETTLE_WAIT_MS);
+		return this.#readLaneReadiness(own, plan, needed);
+	}
+
+	/** The same read as `laneReadiness` without waiting for settlements: what the ledger holds at this moment. */
+	async #readLaneReadiness(own: OwnRun, plan: RunPlan, needed: ReadonlySet<string>): Promise<Map<string, LaneReadiness>> {
+		const view = new Map<string, LaneReadiness>();
 		this.#syncResults(own);
 		// A consumer reads answers only at their recorded cited bytes: an edited or deleted source reopens that answer
 		// (and, transitively, what already consumed it) in the record before any readiness is reported.
@@ -1249,6 +1357,9 @@ export class RunController {
 						: "보존된 산출물의 근거가 현재 계약과 다릅니다.";
 				}
 				const citation = (row?.proof?.item ?? (row !== undefined && result.kind === "answer" ? this.#answerReceipt(own, row) : undefined))?.citation;
+				// The ledger's own reason travels with a result that is not usable (unmet, reviewable): a consumer's refusal
+				// can then say why, instead of only naming the state. A reason found while re-locating wins.
+				const reason = retainedReason ?? (state === "unmet" || state === "reviewable" ? row?.reason : undefined);
 				results.push({
 					id: result.id,
 					kind: result.kind,
@@ -1258,7 +1369,7 @@ export class RunController {
 					...(result.path === undefined ? {} : { path: result.path }),
 					...(citation === undefined ? {} : { citation: { path: citation.path, ...(citation.line === undefined ? {} : { line: citation.line }) } }),
 					...(retained === undefined ? {} : { retained }),
-					...(retainedReason === undefined ? {} : { reason: retainedReason }),
+					...(reason === undefined ? {} : { reason }),
 				});
 			}
 			const settled = coverage.get(name) === true;
@@ -1436,10 +1547,11 @@ export class RunController {
 			return { ok: false, reason: "기준선을 만드는 동안 계획이 바뀌어 작업을 시작하지 않았습니다. 새 계획 아래에서 다시 스폰하세요." };
 		}
 		const retry = own.retry;
+		let retryTaken: RetryTaken | undefined;
 		if (retry !== undefined && retry.lane === lane.name) {
 			if (this.#retryMatches(own, retry)) {
 				delete own.retry;
-				this.#markRetryTaken(own, retry);
+				retryTaken = this.#markRetryTaken(own, retry);
 				this.#scheduleFlush(own);
 			} else {
 				delete own.retry;
@@ -1467,8 +1579,41 @@ export class RunController {
 			declaredInputs: declared,
 			...(lane.files === undefined ? {} : { laneFiles: lane.files }),
 			baseline: capture.baseline,
+			...(retryTaken === undefined ? {} : { retryTaken }),
 		});
 		return { ok: true };
+	}
+
+	/**
+	 * Drops one prepared dispatch whose follow-up write never reached the worker, so nothing will ever settle it. The
+	 * lane stops reading as running for it, and the fence it raised goes back to the newest attempt that is still real:
+	 * an earlier open dispatch settles normally, and an earlier settled one is not made stale by a turn that never ran.
+	 * A dispatch that is unknown, already settled or from another run is ignored.
+	 */
+	async discardAttempt(input: { runId: string; dispatch: string }): Promise<void> {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== input.runId) return;
+		const prepared = own.attempts.get(input.dispatch);
+		if (prepared === undefined) return;
+		own.attempts.delete(input.dispatch);
+		// A write that never reached the worker did not use the user's retry. The grant goes first, before the fence
+		// decision below can return: several writes of one director message each open a dispatch and the grant sits on
+		// the first, which need not be the newest, so a failed write that is not the lane's newest still holds it. If a
+		// newer dispatch of the lane remains, that is the attempt which will run (or be discarded next), and it carries the
+		// grant on; otherwise nothing will run for it and it is owed to the user again, with the row no longer claiming
+		// a retry is running.
+		if (prepared.retryTaken !== undefined) {
+			const later = [...own.attempts.values()]
+				.filter(other => other.lane === prepared.lane && other.epoch > prepared.epoch)
+				.sort((a, b) => b.epoch - a.epoch)[0];
+			if (later !== undefined && later.retryTaken === undefined) later.retryTaken = prepared.retryTaken;
+			else this.#giveRetryBack(own, prepared.retryTaken);
+		}
+		if (own.laneAttempt.get(prepared.lane) !== prepared.epoch) return;
+		const open = [...own.attempts.values()].filter(other => other.lane === prepared.lane).map(other => other.epoch);
+		const newest = fenceAfterDiscard(own.settledEpoch.get(prepared.lane), open);
+		if (newest === 0) own.laneAttempt.delete(prepared.lane);
+		else own.laneAttempt.set(prepared.lane, newest);
 	}
 
 	/**
@@ -1482,7 +1627,16 @@ export class RunController {
 		const prepared = own.attempts.get(input.dispatch);
 		if (prepared === undefined) return;
 		own.attempts.delete(input.dispatch);
+		// A lane's dispatches settle newest-last: every older open dispatch of the lane (a follow-up joined an open turn,
+		// or a retry replaced an agent that never delivered) can only be a superseded one. Its settlement would be
+		// ignored below; left open it would keep the lane reading as running and, at the end of the run, rewrite rows
+		// that this newer attempt already judged.
+		for (const [key, older] of own.attempts) {
+			if (older.lane === prepared.lane && older.epoch < prepared.epoch) own.attempts.delete(key);
+		}
 		own.settling.add(prepared.lane);
+		// Set once this delivery passed both fences: only then did it decide anything the director could be told.
+		let decided = false;
 		try {
 			// A newer attempt of this lane already started: its settlement governs the requirement. The older attempt
 			// must not reinstate a success (or a failure) even when the host delivers it late.
@@ -1490,7 +1644,12 @@ export class RunController {
 			const satisfied = await this.#settledInputSatisfaction(own, prepared);
 			// The integration read awaited: a newer attempt or another owner may have taken over meanwhile.
 			if (this.#own !== own || prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+			own.settledEpoch.set(prepared.lane, Math.max(own.settledEpoch.get(prepared.lane) ?? 0, prepared.epoch));
+			decided = true;
 			const report = input.report;
+			// The collector refused this delivery as the earlier turn's repeat and only closes the dispatch: the rows keep the
+			// verdict, the attempt id and the reason the earlier turn gave, whatever state they are in.
+			if (report.captureError === "attempt-replayed" && report.attemptId === undefined) return;
 			const exact =
 				attemptUsable(report) &&
 				report.runId === input.runId &&
@@ -1546,8 +1705,80 @@ export class RunController {
 			this.#scheduleFlush(own);
 		} finally {
 			own.settling.delete(prepared.lane);
+			// Queued before the settlement is reported done, so whoever awaited it (a `wait` result, a pushed delivery)
+			// finds the notice when it comes to deliver it. Never lets a failed read hide or break the settlement.
+			if (decided) await this.#noteLedgerChange(own, prepared, input.dispatch).catch(() => undefined);
 			this.#wakeSettlementWaiters();
 		}
+	}
+
+	/**
+	 * Queues what the director should read about one evaluated delivery, once per attempt: the results Storm did not
+	 * accept (state, the ledger's reason; `ledgerNotice` adds the answer citation form) and the waiting lanes whose
+	 * prerequisites now all hold. An accepted delivery nothing waits on adds nothing. The readiness it reads is the
+	 * ledger as it stands, with no waiting for other settlements; it changes no plan, spawns nothing and admits nothing,
+	 * and the spawn guard decides again at the spawn.
+	 */
+	async #noteLedgerChange(own: OwnRun, prepared: PreparedAttempt, dispatch: string): Promise<void> {
+		if (this.#own !== own || own.noticed.has(dispatch)) return;
+		own.noticed.add(dispatch);
+		// A newer attempt of the lane governs its results now; this one decided nothing the director still needs.
+		if (prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+		const startable = await this.#startableAfter(own, prepared.lane);
+		if (this.#own !== own) return;
+		const rows = own.record.results ?? [];
+		const open = prepared.results.flatMap((result): LedgerNoticeRow[] => {
+			const row = rows.find(candidate => candidate.id === result.id);
+			if (row === undefined || row.state === "accepted") return [];
+			return [{ id: result.id, kind: result.kind, state: row.state, ...(row.reason === undefined ? {} : { reason: row.reason }) }];
+		});
+		const text = ledgerNotice({ lane: prepared.lane, open, startable });
+		if (text !== undefined) own.notices.push(text);
+	}
+
+	/**
+	 * Waiting lanes that name `lane` as a prerequisite and whose every prerequisite now holds, by the same
+	 * `dependencyBlock` the spawn guard asks. A lane already started, restored or fully accepted does not wait. A lane is
+	 * named once until it stops being startable or starts.
+	 */
+	async #startableAfter(own: OwnRun, lane: string): Promise<string[]> {
+		const plan = own.record.plan;
+		if (plan === undefined) return [];
+		const rows = own.record.results ?? [];
+		const waiting = plan.lanes.filter(candidate => {
+			if (!(candidate.dependsOn ?? []).some(edge => edge.lane === lane)) return false;
+			if (own.restoredLanes.has(candidate.name) || own.lanes.agentForLane(candidate.name) !== undefined) return false;
+			if ([...own.attempts.values()].some(prepared => prepared.lane === candidate.name) || own.settled.has(candidate.name)) return false;
+			if (candidate.job !== undefined && own.record.jobs?.some(job => job.lane === candidate.name)) return false;
+			const results = candidate.results ?? [];
+			return results.length === 0 || results.some(result => rows.find(row => row.id === result.id)?.state !== "accepted");
+		});
+		if (waiting.length === 0) return [];
+		const needed = new Set(waiting.flatMap(candidate => (candidate.dependsOn ?? []).map(edge => edge.lane)));
+		const view = await this.#readLaneReadiness(own, plan, needed);
+		if (this.#own !== own) return [];
+		const startable: string[] = [];
+		for (const candidate of waiting) {
+			if (dependencyBlock(candidate, view) !== undefined) {
+				own.startableTold.delete(candidate.name);
+			} else if (!own.startableTold.has(candidate.name)) {
+				own.startableTold.add(candidate.name);
+				startable.push(candidate.name);
+			}
+		}
+		return startable;
+	}
+
+	/**
+	 * The notices queued since the last call, as one bounded text for the director's next request, or nothing. Taking
+	 * them empties the queue, so a notice is read once however it is delivered.
+	 */
+	takeNotices(): string | undefined {
+		const own = this.#own;
+		if (own === undefined || own.notices.length === 0) return undefined;
+		const taken = own.notices.splice(0, own.notices.length);
+		const text = taken.join("\n");
+		return text.length > NOTICE_MAX_CHARS ? `${text.slice(0, NOTICE_MAX_CHARS - 1)}…` : text;
 	}
 
 	/** Rehydrate one validated plan; a prior record locates claims, only current evidence accepts them. */
@@ -2410,7 +2641,7 @@ export class RunController {
 		const citation = item.citation;
 		if (row.state === "reviewable" && citation !== undefined) {
 			const anchor = `${citation.path}${citation.line === undefined ? "" : `:${citation.line}`}`;
-			row.reason = compactResultReason(`답변 원문과 출처 ${anchor}를 리뷰어에게 그대로 전달해 판정받으세요.`);
+			row.reason = compactResultReason(`답변 원문과 ${anchor} 출처를 리뷰어에게 그대로 전달해 판정받으세요.`);
 		}
 	}
 
@@ -2998,7 +3229,7 @@ export class RunController {
 		const row = own.record.results?.find(candidate => candidate.id === target.resultId);
 		if (row === undefined) return { ok: false, reason: `결과 '${target.resultId}'의 기록을 찾지 못해 제외하지 않았습니다.` };
 		if (row.scope === "excluded-by-user") {
-			return { ok: true, already: true, text: `결과 '${target.label}'(${target.resultId})는 이미 범위에서 제외되어 있습니다.` };
+			return { ok: true, already: true, text: `'${target.label}' 결과(${target.resultId})는 이미 범위에서 제외되어 있습니다.` };
 		}
 		const lane = plan.lanes.find(candidate => candidate.name === target.laneName);
 		if (lane === undefined) return { ok: false, reason: "대상 레인이 현재 계획에 없어 결과를 제외할 수 없습니다." };
@@ -3035,7 +3266,7 @@ export class RunController {
 		if (this.#own === own) this.#sendAdjustNudge(own, ctx, exclusionNudgeText(own.record.runId, target), "exclude");
 		return {
 			ok: true,
-			text: `결과 '${target.label}'(${target.resultId})를 이 실행의 범위에서 제외했습니다. 레인은 계획에서 빠졌고 다른 결과의 증거는 그대로입니다.`,
+			text: `'${target.label}' 결과(${target.resultId})를 이 실행의 범위에서 제외했습니다. 레인은 계획에서 빠졌고 다른 결과의 증거는 그대로입니다.`,
 		};
 	}
 
@@ -3046,7 +3277,7 @@ export class RunController {
 		const lane = plan.lanes.find(candidate => candidate.name === target.laneName);
 		if (lane === undefined) return { ok: false, reason: "대상 레인이 현재 계획에 없어 재시도할 수 없습니다." };
 		const row = own.record.results?.find(candidate => candidate.id === target.resultId);
-		if (row?.scope === "excluded-by-user") return { ok: false, reason: `결과 '${target.label}'은 사용자가 범위에서 제외해 재시도하지 않습니다.` };
+		if (row?.scope === "excluded-by-user") return { ok: false, reason: `'${target.label}' 결과는 사용자가 범위에서 제외해 재시도하지 않습니다.` };
 		const now = this.deps.now();
 		const normalized = request.target.normalize("NFC").trim();
 		const last = own.lastRetry;
@@ -3072,7 +3303,7 @@ export class RunController {
 		});
 		if (problem !== undefined) return { ok: false, reason: problem };
 		const baseAttempt = row?.attemptId;
-		if (baseAttempt === undefined) return { ok: false, reason: `결과 '${target.label}'은 호스트가 확정한 시도가 없어 재시도할 수 없습니다.` };
+		if (baseAttempt === undefined) return { ok: false, reason: `'${target.label}' 결과는 호스트가 확정한 시도가 없어 재시도할 수 없습니다.` };
 		const key = retryAdjustmentKey(lane.name, target.resultId, baseAttempt);
 		if (own.retryAcks.has(key)) {
 			return { ok: true, already: true, text: `결과 '${target.label}'(${target.resultId})의 같은 시도에 대한 재시도는 이미 접수했습니다.` };
@@ -3152,17 +3383,41 @@ export class RunController {
 	}
 
 	/** Marks the one-shot grant as consumed by a prepared attempt and stamps the durable acknowledgement. */
-	#markRetryTaken(own: OwnRun, grant: RetryGrant): void {
+	#markRetryTaken(own: OwnRun, grant: RetryGrant): RetryTaken {
+		const taken: RetryTaken = { grant };
 		const row = own.record.results?.find(candidate => candidate.id === grant.result);
-		if (row !== undefined) row.reason = compactResultReason("사용자 요청으로 같은 계약을 한 번 더 시도합니다.");
+		if (row !== undefined) {
+			if (row.reason !== undefined) taken.reason = row.reason;
+			row.reason = compactResultReason("사용자 요청으로 같은 계약을 한 번 더 시도합니다.");
+		}
 		const list = own.record.adjustments;
-		if (list === undefined) return;
+		if (list === undefined) return taken;
 		for (let index = list.length - 1; index >= 0; index -= 1) {
 			const entry = list[index];
 			if (entry?.kind !== "retry" || entry.id !== grant.result || entry.lane !== grant.lane || entry.takenAt !== undefined) continue;
 			entry.takenAt = iso(this.deps.now());
+			taken.entry = entry;
 			break;
 		}
+		return taken;
+	}
+
+	/**
+	 * Undoes `#markRetryTaken` for an attempt that never ran. The grant comes back only while it still names the same
+	 * row, contract and inputs and no other retry was asked for meanwhile; otherwise it stays spent, as a plan change
+	 * would have made it.
+	 */
+	#giveRetryBack(own: OwnRun, taken: RetryTaken): void {
+		const grant = taken.grant;
+		if (own.retry !== undefined || own.ending !== undefined || !this.#retryMatches(own, grant)) return;
+		const row = own.record.results?.find(candidate => candidate.id === grant.result);
+		if (row !== undefined) {
+			if (taken.reason === undefined) delete row.reason;
+			else row.reason = taken.reason;
+		}
+		if (taken.entry !== undefined && own.record.adjustments?.includes(taken.entry) === true) delete taken.entry.takenAt;
+		own.retry = grant;
+		this.#scheduleFlush(own);
 	}
 
 	/** Appends one bounded audit entry; this is an acknowledgement, never authority a later run can replay. */
@@ -4486,7 +4741,7 @@ export class RunController {
 		}
 		const stop = budget?.onExceed === "stop";
 		ui.notify(
-			`Storm 실행 예산 ${formatUsd(budget?.perRunUsd ?? 0)}을 넘었습니다(누계 ${formatUsd(run.costUsd)}). ${stop ? "실행을 중단합니다." : "새 스폰을 차단합니다."}`,
+			`Storm 실행 예산(${formatUsd(budget?.perRunUsd ?? 0)})을 넘었습니다(누계 ${formatUsd(run.costUsd)}). ${stop ? "실행을 중단합니다." : "새 스폰을 차단합니다."}`,
 			"warning",
 		);
 		if (!stop) return;

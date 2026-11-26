@@ -4,6 +4,7 @@ import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { goalTotals } from "../runtime/goal.ts";
+import { CONTINUATION_HEAD } from "../runtime/resume.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
@@ -604,10 +605,18 @@ export function renderStatus(
 	/** The last finished run is read after the active one and before the team setting. */
 	const lastRunSection = (): void => {
 		const run = view.lastRun;
-		if (!run) return;
+		if (!run) {
+			if (model && view.resumableRunId !== undefined) {
+				out.push("");
+				heading("이어 가기", undefined, "status.info");
+				out.push(resumeFactLine(view.resumableRunId, view.directorMayContinue === true, view.resumableEnded));
+			}
+			return;
+		}
 		out.push("");
 		heading("마지막 실행", undefined, "status.info");
 		const lines = model ? modelLastRunLines(run, view.lastHandoff) : lastRunLines(run, true, now);
+		if (model && view.resumableRunId !== undefined) lines.push(resumeFactLine(view.resumableRunId, view.directorMayContinue === true, view.resumableEnded));
 		const index = out.length;
 		out.push(...lines);
 		if (info) {
@@ -1011,7 +1020,10 @@ export function runStatusText(run: RunRecord, now: number): string {
 
 /** The head of the stored request (what resuming will send), why it stopped, its rounds and when. */
 export function resumeRunLine(run: RunRecord): string {
-	const request = visible((run.request ?? "").split(/\r?\n/)[0] ?? "").trim();
+	// A continued run's request starts with a generated heading; the row names what it is for: its first lanes.
+	const lines = (run.request ?? "").split(/\r?\n/);
+	const named = lines[0] === CONTINUATION_HEAD ? lines.slice(1).filter(line => line.startsWith("- ")).slice(0, 3).map(line => line.slice(2)).join(" · ") : (lines[0] ?? "");
+	const request = visible(named).trim();
 	const head = request.length > 80 ? `${request.slice(0, 80)}…` : request;
 	const turns = run.turns ?? 0;
 	const rounds = run.maxRounds === undefined ? `${turns}라운드` : `${turns}/${run.maxRounds}라운드`;
@@ -1028,7 +1040,9 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 				.map((o) => `${OUTCOME[o]} ${counts.get(o)}`)
 				.join(", ")
 		: "없음";
-	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`];
+	// A run the host cut off says so: neither the user nor the director may read it as the user pressing Esc.
+	const hostEnded = run.endReason === "host-ended" ? ` (${endLabel(run.endReason)})` : "";
+	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]}${hostEnded} · ${spendText(run.costUsd, run.budget)}`];
 	// The official result disposition leads a settled run; spawn receipts and plan shape follow it.
 	const progress = resultProgress(run);
 	const outcome = resultLine(progress, { detailed: details });
@@ -1126,6 +1140,19 @@ function settledDetailLines(run: RunRecord, progress: ResultProgress): string[] 
 		if (next.length) out.push(`- 제안한 다음 행동(${label}): ${next.join(" · ")}`);
 	}
 	return out;
+}
+
+/**
+ * One fact for the model status: who can continue an interrupted run, and what a new plan does not carry. Under
+ * automatic delegation the director continues it itself when the user asks the work to go on; otherwise only the user
+ * does. The fixed noun 실행 stands between the inserted id and its particle.
+ */
+export function resumeFactLine(runId: string, directorMayContinue: boolean, ended?: string): string {
+	// The reason sits inside the same parentheses as the id, so the fixed noun 실행 still stands before the particle.
+	const named = ended === undefined ? runId : `${runId}, 멈춘 이유: ${ended}`;
+	return directorMayContinue
+		? `- 이어 가기: 중단된 실행(${named})이 있습니다. 사용자가 멈춘 뒤에 작업을 이어 가라고 하면 storm continue로 결과와 목표 합계를 이어받아 이어 가고, storm plan은 이를 잇지 않는 새 실행을 엽니다.`
+		: `- 이어 가기: 중단된 실행(${named})은 자동 위임이 꺼져 있어 사용자가 /storm 에서 이어 가며, storm plan은 이전 결과와 목표 합계를 잇지 않는 새 실행을 엽니다.`;
 }
 
 /** The model's bound on a settled run's handoff: a synopsis, never the full draft, evidence or logs. */

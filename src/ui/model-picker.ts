@@ -81,7 +81,7 @@ export function refusalText(effort: string, supported: readonly string[]): strin
 	const list = supported.length > 0 ? supported.join(", ") : "없음";
 	return effort === OFF_STEP
 		? `Off는 Storm effort가 아닙니다 · 지원: ${list}`
-		: `${effort}는 이 모델에서 지원되지 않습니다 · 지원: ${list}`;
+		: `${effort} effort는 이 모델에서 지원되지 않습니다 · 지원: ${list}`;
 }
 
 /** Tool-capable chat models the registry offers, deduplicated by selector. */

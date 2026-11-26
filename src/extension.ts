@@ -8,9 +8,10 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState, type ToolCallEvent, type ToolCallEventResult } from "@oh-my-pi/pi-coding-agent";
+import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState, type ToolCallEvent, type ToolCallEventResult, type ToolResultEvent, type ToolResultEventResult } from "@oh-my-pi/pi-coding-agent";
 import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
+import { isRecord } from "./config/schema.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { liveIsolationSettings, liveTaskMaxConcurrency, readExplicitSettings } from "./discovery/settings.ts";
@@ -31,7 +32,7 @@ import { serialized } from "./fsutil.ts";
 import { execPort, ompBinary } from "./omp.ts";
 import { changesFiles, pathOf } from "./policy/director.ts";
 import { docPromptFor } from "./policy/docs.ts";
-import { deliveredFollowUp, followUpAgent, followUpProgress, followUpTarget } from "./policy/followup.ts";
+import { agentControlTarget, deliveredFollowUp, followUpAgent, followUpProgress, followUpTarget } from "./policy/followup.ts";
 import {
 	canonicalScope,
 	effectiveAgentTools,
@@ -78,7 +79,7 @@ import {
 } from "./runtime/agents.ts";
 import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
-import { AttemptCollector } from "./runtime/attempt-collector.ts";
+import { AttemptCollector, type AttemptHostJob } from "./runtime/attempt-collector.ts";
 import { noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
 import { noteLaneAgentStart, replanConflict, taskLaneProblem, type LaneReadinessView, type TaskIsolationHost } from "./runtime/lanes.ts";
@@ -152,6 +153,8 @@ const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.val
 /** Said when omp ran a `task` call that Storm had refused; the refusal did not hold. */
 const REFUSAL_NOT_HELD = "Storm이 거절한 task 호출을 OMP가 실행했습니다. Storm은 그 호출이 끝나기 전까지 워커 스폰을 막았으므로 새 워커는 쓰기 권한을 받지 못했어야 하지만, 결과가 오류가 아니니 레인과 워커 상태를 /storm status로 확인하세요.";
 const WRITE_WAIT_MS = 1_500;
+/** Most the director's next request waits for the evaluation of a delivery that just arrived, before it carries the notice. */
+const NOTICE_WAIT_MS = 1_500;
 const WRITE_WAIT_STEP_MS = 50;
 
 /** A bounded local pause; no host channel is polled. */
@@ -180,6 +183,10 @@ const slotOwners = new WeakMap<WorkerSlot, symbol>();
 /** Follow-up tool calls that created the worker's slot; a failed delivery releases only that new slot, never one a
  * work-bearing note to an already running worker reused. */
 const followCapacityCalls = new Map<string, { runId: string; agentId: string }>();
+/** The follow-up dispatches an admitted `write agent://<id>` opened, by run and call id: dropped if the write never lands. */
+const followDispatches = new Map<string, string>();
+/** What Storm's own generated user messages start with: a round message and an adjustment nudge. Never the user's words. */
+const STORM_MESSAGE_TAGS = ["<storm-run ", "<storm-adjust "] as const;
 
 /** OMP agent ids are unique inside one artifact tree, not across profiles or sessions. */
 function authorityKey(artifacts: string | undefined, agentId: string): string {
@@ -371,6 +378,20 @@ function artifactsOf(ctx: ExtensionContext): string | undefined {
 /** A subagent's run, only through the binding its parent recorded before the spawn was admitted. */
 function childLedger(ctx: ExtensionContext): LedgerRun | undefined {
 	return ledgerRunForChild(ctx.agent.id, ctx.agent.parentId, artifactsOf(ctx));
+}
+
+/**
+ * The parent session's own async job rows (running, and the newest settled ones omp still lists), as host facts for
+ * the attempt collector: a job's id, agent, status and start time tell one turn of a reused agent from another. An
+ * older host without the snapshot gives none.
+ */
+function hostJobs(ctx: ExtensionContext): readonly AttemptHostJob[] {
+	try {
+		const snapshot = ctx.getAsyncJobSnapshot?.();
+		return snapshot ? [...snapshot.running, ...snapshot.recent] : [];
+	} catch {
+		return [];
+	}
 }
 
 /** Count native workers outside Storm only with proof that they belong to this session's task scheduler. */
@@ -699,6 +720,13 @@ export default function storm(pi: ExtensionAPI): void {
 	 */
 	interface AutoEntry extends AutoStatus {
 		task: string | undefined;
+		/** When the user's message that is `task` began its turn; set and cleared with it. */
+		turnStartedAt?: number;
+		/**
+		 * The director's loop paused on background work (a `willContinue` end that awaits async work). A prompt that
+		 * arrives while paused is a new user message, not a continuation of the paused request.
+		 */
+		paused?: boolean;
 		settling?: Promise<void>;
 		epoch: number;
 	}
@@ -716,13 +744,14 @@ export default function storm(pi: ExtensionAPI): void {
 		return id === undefined ? undefined : autos.get(id);
 	};
 	/** What a tool host bound to `sessionId` reports, even after another conversation became live. */
-	const autoSnapshot = (sessionId: string): { enabled: boolean; blocked?: string; task?: string } => {
+	const autoSnapshot = (sessionId: string): { enabled: boolean; blocked?: string; task?: string; turnStartedAt?: number } => {
 		const entry = autos.get(sessionId);
 		if (entry === undefined) return { enabled: false };
 		return {
 			enabled: entry.enabled,
 			...(entry.problem !== undefined ? { blocked: entry.problem } : {}),
 			...(entry.task !== undefined ? { task: entry.task } : {}),
+			...(entry.task !== undefined && entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}),
 		};
 	};
 	const refreshAuto = async (ctx: ExtensionContext, load?: () => Promise<ProjectState>): Promise<void> => {
@@ -940,7 +969,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		return {
 			block: true,
-			reason: `[storm:ask-repeat] 이번 사용자 요청에서 이미 결정 '${checked.ask.key}'(${remembered.reason})을 물었습니다. 같은 승인을 다시 요청하지 말고, 이전 답이나 취소·타임아웃을 그대로 상태로 두고 범위 안 작업을 계속하거나 막힘을 보고하세요. 타임아웃·취소는 동의가 아닙니다.`,
+			reason: `[storm:ask-repeat] 이번 사용자 요청에서 이미 결정('${checked.ask.key}', ${remembered.reason})을 물었습니다. 같은 승인을 다시 요청하지 말고, 이전 답이나 취소·타임아웃을 그대로 상태로 두고 범위 안 작업을 계속하거나 막힘을 보고하세요. 타임아웃·취소는 동의가 아닙니다.`,
 		};
 	};
 
@@ -1016,6 +1045,7 @@ export default function storm(pi: ExtensionAPI): void {
 		port: {
 			prepare: input => runs.prepareAttempt(input),
 			settle: input => runs.settleAttempt(input),
+			discard: input => runs.discardAttempt(input),
 		},
 		registry: () => AgentRegistry.global(),
 	});
@@ -1104,6 +1134,7 @@ export default function storm(pi: ExtensionAPI): void {
 			activeRun: () => runs.active(),
 			activePhase: () => runs.phase(),
 			autoModeProblem: () => modeProblem(ctx),
+			autoEnabled: () => autoSnapshot(env.sessionId).enabled,
 			agents: () => {
 				const scope = agentScope(ctx);
 				return scope === undefined ? [] : listAgents({ ancestorId: ctx.agent.id, scope });
@@ -1169,6 +1200,32 @@ export default function storm(pi: ExtensionAPI): void {
 		const stale = "대화가 바뀌어 이 호출은 적용하지 않았습니다. 새 대화에서 다시 시도하세요.";
 		const flow = flowEnv(ctx);
 		const scope = agentScope(ctx);
+		/**
+		 * The one door of an automatic start, a first plan's and a continuation's alike: this tool call still belongs to the
+		 * conversation that made it, omp's public plan mode is not on, and only then does the controller's start run.
+		 */
+		const startAutomatic = async (start: () => Promise<RunRequestResult>): Promise<RunRequestResult> => {
+			if (!stillOwner()) return { ok: false, reason: stale };
+			// Public plan mode means the user is still planning; an automatic run may not start there.
+			const modes = ctx.sessionModes;
+			if (modes !== undefined) {
+				try {
+					if (modes.getState().plan.status === "active") {
+						return { ok: false, reason: "omp 계획 모드가 켜져 있어 자동 실행을 열지 않았습니다. 계획 모드를 끝낸 뒤 다시 요청하세요." };
+					}
+				} catch {
+					return { ok: false, reason: "omp 계획 모드를 확인하지 못해 자동 실행을 열지 않았습니다. 다시 요청하세요." };
+				}
+			}
+			const started = await start();
+			// The first accepted automatic plan is a live tool boundary: the run's heavy pre-work context was
+			// never preflight-compacted (and a sync subagent wait may never pause the agent loop). Start the one
+			// background checkpoint now; omp commits it at its next turn/idle boundary. The already-oversized
+			// first request cannot be prevented from here — the host classifies prompt size only after the
+			// prompt has arrived — so this restores every request after that boundary, not that first one.
+			if (started.ok) runs.startAutoCheckpoint();
+			return started;
+		};
 		/** Fresh state under the captured session; a stale call reads nothing and writes nothing. */
 		const loadState = async (): Promise<ProjectState> => {
 			if (!stillOwner()) throw new Error(stale);
@@ -1184,6 +1241,7 @@ export default function storm(pi: ExtensionAPI): void {
 				const run = runs.active();
 				return run?.resumeOf === undefined ? text : `${text}\n\n${checkpointWorkState(run).join("\n")}`;
 			},
+			isolationEnabled: () => liveIsolationSettings().isolationEnabled,
 			auto: () => autoSnapshot(sessionId),
 			runtime: {
 				requestRun: spec => (stillOwner() ? runs.request(spec) : { ok: false, reason: stale }),
@@ -1192,28 +1250,9 @@ export default function storm(pi: ExtensionAPI): void {
 				executeJobs: (lanes, signal) => runs.executeJobs(ctx, lanes, stillOwner, signal),
 				submitCloseout: draft => (stillOwner() ? runs.submitCloseout(ctx, draft) : { ok: false, reason: stale }),
 				runActive: () => stillOwner() && runs.runId() !== undefined,
-				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) => {
-					if (!stillOwner()) return { ok: false, reason: stale };
-					// Public plan mode means the user is still planning; an automatic run may not start there.
-					const modes = ctx.sessionModes;
-					if (modes !== undefined) {
-						try {
-							if (modes.getState().plan.status === "active") {
-								return { ok: false, reason: "omp 계획 모드가 켜져 있어 자동 실행을 열지 않았습니다. 계획 모드를 끝낸 뒤 다시 요청하세요." };
-							}
-						} catch {
-							return { ok: false, reason: "omp 계획 모드를 확인하지 못해 자동 실행을 열지 않았습니다. 다시 요청하세요." };
-						}
-					}
-					const started = await runs.startWithPlan(ctx, spec, plan, validatedHash);
-					// The first accepted automatic plan is a live tool boundary: the run's heavy pre-work context was
-					// never preflight-compacted (and a sync subagent wait may never pause the agent loop). Start the one
-					// background checkpoint now; omp commits it at its next turn/idle boundary. The already-oversized
-					// first request cannot be prevented from here — the host classifies prompt size only after the
-					// prompt has arrived — so this restores every request after that boundary, not that first one.
-					if (started.ok) runs.startAutoCheckpoint();
-					return started;
-				},
+				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) =>
+					startAutomatic(() => runs.startWithPlan(ctx, spec, plan, validatedHash)),
+				continueRun: (said, turnStartedAt) => startAutomatic(() => runs.continueInTurn(ctx, said, turnStartedAt)),
 				agents: () => (stillOwner() && scope !== undefined ? listAgents({ ancestorId: ctx.agent.id, scope }) : []),
 			},
 		};
@@ -1542,14 +1581,39 @@ export default function storm(pi: ExtensionAPI): void {
 		});
 	});
 
+	/**
+	 * Pushed deliveries (`async-result` messages) given to the collector, by what identifies the message. omp tells Storm
+	 * of a delivery through `message_end`, which it does not wait for before it builds the director's next request: that
+	 * request's `context` hook gives the delivery to the collector too when it comes first. Whichever comes first starts
+	 * the one evaluation; the other joins it, so a delivery is evaluated once and the notice it leaves is ready for the
+	 * request that carries the delivery.
+	 */
+	const observedDeliveries = new Map<string, Promise<void>>();
+	const OBSERVED_DELIVERIES_MAX = 128;
+	// A message without its own timestamp has no identity that tells two identical answers apart (the same worker may
+	// answer the same words again): it is never joined to an earlier evaluation, only evaluated when `message_end` says so.
+	const deliveryKey = (message: unknown): string | undefined =>
+		isRecord(message) && message.customType === "async-result" && typeof message.timestamp === "number"
+			? JSON.stringify([message.timestamp, message.content, message.details])
+			: undefined;
+	const observeDelivery = (ctx: ExtensionContext, runId: string, message: unknown): Promise<void> => {
+		const key = deliveryKey(message);
+		const known = key === undefined ? undefined : observedDeliveries.get(key);
+		if (known !== undefined) return known;
+		const observing = attempts.observeMessage({ runId, parentId: ctx.agent.id, message, observedAt: Date.now(), jobs: hostJobs(ctx) });
+		if (key !== undefined) {
+			observedDeliveries.set(key, observing);
+			if (observedDeliveries.size > OBSERVED_DELIVERIES_MAX) observedDeliveries.delete(observedDeliveries.keys().next().value as string);
+		}
+		return observing;
+	};
+
 	pi.on("message_end", async (event, ctx) => {
 		// A finished background task is a custom `async-result` message on the parent, not an assistant turn. Observe it
 		// before the usage guard, which has no usage to read for that message.
 		if (ctx.agent.kind === "main") {
 			const runId = runs.runId();
-			if (runId !== undefined) {
-				await attempts.observeMessage({ runId, parentId: ctx.agent.id, message: event.message, observedAt: Date.now() });
-			}
+			if (runId !== undefined) await observeDelivery(ctx, runId, event.message);
 		}
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
@@ -1665,7 +1729,9 @@ export default function storm(pi: ExtensionAPI): void {
 			if (event.reason === "prompt") {
 				const prompt = typeof event.prompt === "string" ? event.prompt : "";
 				const text = prompt.trimStart();
-				const runMessage = text.startsWith("<storm-run ");
+				// Storm's own messages (a round, an adjustment nudge) are generated: a prompt that starts with their tag is
+				// never the user's, whatever the run's state is when the turn begins.
+				const runMessage = STORM_MESSAGE_TAGS.some(tag => text.startsWith(tag));
 				if (!runMessage) {
 					// The host can start a new prompt while its detached terminal agent_end is still closing Storm's run.
 					// Wait for that decision and lease release before deciding if this is a new task or run context.
@@ -1673,15 +1739,28 @@ export default function storm(pi: ExtensionAPI): void {
 						await auto.settling.catch(() => undefined);
 						if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId || autos.get(sessionId) !== auto) return undefined;
 					}
+					// A message the user types while the director is paused on background work is a new request: the paused
+					// request ends here instead of being kept in place of the user's words. Background results that wake the
+					// director later are not prompts and continue the request they belong to (see `agent_end`).
+					const wasPaused = auto.paused === true;
+					auto.paused = false;
+					if (wasPaused && runs.runId() === undefined) {
+						auto.task = undefined;
+						delete auto.turnStartedAt;
+					}
 					if (text === "") {
 						// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
-						if (runs.runId() === undefined) auto.task = undefined;
+						if (runs.runId() === undefined) {
+							auto.task = undefined;
+							delete auto.turnStartedAt;
+						}
 						return undefined;
 					}
 					// The first ordinary prompt of a turn is its task. Later synthetic continuations, tool-loop
 					// reminders and steers must not replace it; a prompt while this session directs is run context.
 					if (runs.runId() === undefined && auto.task === undefined) {
 						auto.task = prompt;
+						auto.turnStartedAt = Date.now();
 						// The first prompt of a user turn starts its request; decisions never inherit from the last one.
 						decisions.nextRequest(sessionId, sessionGeneration);
 					}
@@ -1769,26 +1848,37 @@ export default function storm(pi: ExtensionAPI): void {
 					reason: "[storm:lane-nested] 중첩 task는 실행의 레인 배정과 쓰기 권한을 우회하므로 막았습니다. 감독이 계획한 레인으로 직접 스폰하고, 이 워커는 맡은 결과만 보고하세요.",
 				};
 			}
+			// The model and the effort of a role are the user's team setting, fixed when the worker was routed. omp lets an
+			// agent change itself or a direct child through these two paths: a managed worker never does, whatever its
+			// lane's authority. Ordinary messages and reads are not control paths and are not touched here.
+			if (managed && agentControlTarget(event.toolName, event.input) !== undefined) {
+				return {
+					block: true,
+					reason: "[storm:worker-control] 에이전트의 모델과 추론 강도는 사용자의 팀 설정이라 워커가 바꿀 수 없습니다. 지금 모델로 맡은 결과를 보고하고, 더 나은 모델이 필요하면 감독에게 알리세요.",
+				};
+			}
 			if (denied !== undefined) {
 				return { block: true, reason: `[storm:authority] ${denied} 승인된 레인 권한을 확인할 수 없어 쓰기·실행·중첩 호출을 허용하지 않았습니다.` };
 			}
 			if (authority !== undefined) {
 				const { policy, root, lane } = authority;
 				const who = lane === undefined ? ctx.agent.id : `'${lane}' 레인(${ctx.agent.id})`;
+				// The subject form: a fixed noun stands before the particle whatever the inserted id is.
+				const whoTopic = lane === undefined ? `${ctx.agent.id} 에이전트는` : `'${lane}' 레인(${ctx.agent.id})은`;
 				// An unplanned worker has no concrete lane: it may read, but it never gains shared write or exec
 				// powers merely because it lives in the same tree as an approved writer.
 				if (policy.kind === "blocked" || (policy.kind === "unknown" && lane === undefined)) {
 					if (!readOnlyTool(event.toolName)) {
 						return {
 							block: true,
-							reason: `[storm:lane] ${who}은 승인된 계획의 구체적인 레인에 속하지 않아 '${event.toolName}' 쓰기·실행 권한을 받지 못했습니다. 감독이 레인을 계획해야 합니다.`,
+							reason: `[storm:lane] ${whoTopic} 승인된 계획의 구체적인 레인에 속하지 않아 '${event.toolName}' 쓰기·실행 권한을 받지 못했습니다. 감독이 레인을 계획해야 합니다.`,
 						};
 					}
 				}
 				if (policy.kind === "read" && !readOnlyTool(event.toolName)) {
 					return {
 						block: true,
-						reason: `[storm:lane-capability] ${who}은 읽기 전용으로 승인되어 '${event.toolName}' 도구를 쓸 수 없습니다. 읽기·검색·검증 도구만 쓰고, 변경이 필요하면 감독에게 쓰기 레인을 요청하세요.`,
+						reason: `[storm:lane-capability] ${whoTopic} 읽기 전용으로 승인되어 '${event.toolName}' 도구를 쓸 수 없습니다. 읽기·검색·검증 도구만 쓰고, 변경이 필요하면 감독에게 쓰기 레인을 요청하세요.`,
 					};
 				}
 				if (policy.kind === "private" && pathWriteTool(event.toolName) && !readOnlyTool(event.toolName)) {
@@ -1809,7 +1899,7 @@ export default function storm(pi: ExtensionAPI): void {
 						if (!pathWriteTool(event.toolName)) {
 							return {
 								block: true,
-								reason: `[storm:lane-capability] ${who}은 승인된 경로 쓰기 도구만 쓸 수 있고 '${event.toolName}'은 임의 실행/알 수 없는 쓰기입니다. 감독이 실행 권한을 가진 레인으로 다시 배정해야 합니다.`,
+								reason: `[storm:lane-capability] ${whoTopic} 승인된 경로 쓰기 도구만 쓸 수 있고 '${event.toolName}' 도구는 임의 실행/알 수 없는 쓰기입니다. 감독이 실행 권한을 가진 레인으로 다시 배정해야 합니다.`,
 							};
 						}
 						const targets = toolWriteTargets(event.toolName, event.input);
@@ -1817,7 +1907,7 @@ export default function storm(pi: ExtensionAPI): void {
 						if (targets.length === 0 || outside.length > 0) {
 							return {
 								block: true,
-								reason: `[storm:lane-scope] ${who}의 쓰기 경로는 ${policy.paths.join(", ")}입니다. ${targets.length === 0 ? "대상 경로를 확인할 수 없는 쓰기" : `경로 이탈: ${outside.join(", ")}`}는 허용하지 않았습니다. 승인된 범위 안에서 쓰거나 감독에게 새 레인을 요청하세요.`,
+								reason: `[storm:lane-scope] ${who}의 쓰기 경로는 ${policy.paths.join(", ")}입니다. ${targets.length === 0 ? "대상 경로를 확인할 수 없는 쓰기는" : `경로 이탈(${outside.join(", ")})은`} 허용하지 않았습니다. 승인된 범위 안에서 쓰거나 감독에게 새 레인을 요청하세요.`,
 							};
 						}
 					}
@@ -2101,8 +2191,17 @@ export default function storm(pi: ExtensionAPI): void {
 				if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
 				return { block: true, reason: blockText({ code: "internal", reason: admitted.reason }) };
 			}
+			if (typeof event.toolCallId === "string") followDispatches.set(`${runId}\0${event.toolCallId}`, followAgent.id);
 		}
+		// A block after the admission means the write never lands: its dispatch must not stay open.
+		const dropFollowDispatch = (): void => {
+			if (typeof event.toolCallId !== "string" || followAgent === undefined) return;
+			if (followDispatches.delete(`${runId}\0${event.toolCallId}`)) {
+				void attempts.abandonFollowUp({ runId, spawnKey: followAgent.id, toolCallId: event.toolCallId });
+			}
+		};
 		if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+			dropFollowDispatch();
 			if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
 			return { block: true, reason: "[storm:session] 대화가 바뀌어 이 후속 지시를 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 		}
@@ -2110,6 +2209,7 @@ export default function storm(pi: ExtensionAPI): void {
 		if (followAgent !== undefined) {
 			const blockedByJob = runs.jobGate();
 			if (blockedByJob !== undefined) {
+				dropFollowDispatch();
 				if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
 				return { block: true, reason: blockedByJob };
 			}
@@ -2171,7 +2271,7 @@ export default function storm(pi: ExtensionAPI): void {
 		return { context };
 	});
 
-	pi.on("tool_result", async (event, ctx) => {
+	const onToolResult = async (event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined> => {
 		// A call Storm refused ran into omp's own rejection (task-refusal.ts): its result becomes Storm's reason. The call
 		// spawned nothing and was never admitted, so only what its call id reserved is freed; no delivery is observed.
 		const refusal = event.toolName === "task" ? refusedCalls.take(event.toolCallId) : undefined;
@@ -2206,6 +2306,12 @@ export default function storm(pi: ExtensionAPI): void {
 		if (!runId) return undefined;
 		// A failed delivery frees what its call id reserved (the task's named handles too: the echoed input can lag the
 		// placement). A delivered call only forgets its follow-up slot bookkeeping; the reused slot stays with the worker.
+		const followDispatch = followDispatches.get(`${runId}\0${event.toolCallId}`);
+		followDispatches.delete(`${runId}\0${event.toolCallId}`);
+		if (event.isError && followDispatch !== undefined) {
+			// The write that opened a follow-up dispatch failed: the worker was never asked, so nothing will settle it.
+			await attempts.abandonFollowUp({ runId, spawnKey: followDispatch, toolCallId: event.toolCallId });
+		}
 		if (event.isError) {
 			releaseFailedCall(runId, event.toolCallId, event.toolName === "task" ? taskHandles(event.input) : []);
 		} else {
@@ -2231,6 +2337,7 @@ export default function storm(pi: ExtensionAPI): void {
 				parentId: ctx.agent.id,
 				details: event.details,
 				observedAt: Date.now(),
+				jobs: hostJobs(ctx),
 			});
 		}
 		if (event.isError) return undefined;
@@ -2256,14 +2363,60 @@ export default function storm(pi: ExtensionAPI): void {
 		noteAgentFollowUp(agent.id, targetRun.sessionDir);
 		// The follow-up's next async job is already in this parent session's own snapshot. Its exact id (not a guessed
 		// name) is what lets the first delivery bind to this turn instead of looking stale.
-		const snapshot = ctx.getAsyncJobSnapshot?.();
-		if (snapshot) attempts.bindFollowUpJobs({ runId, spawnKey: agent.id, jobs: [...snapshot.running, ...snapshot.recent] });
+		attempts.bindFollowUpJobs({ runId, spawnKey: agent.id, jobs: hostJobs(ctx) });
 		return undefined;
+	};
+
+	// What a delivery changed in the ledger reaches the director in the place it reads the delivery. A result that
+	// comes back from `wait` (or a sync `task`) is read in this call's own result: omp appends `additionalContext` after
+	// it as a developer message in the history. A result that is pushed has no call to ride on; it is read through the
+	// `context` hook below. The notice is taken once, so whichever of the two comes first carries it and the other
+	// finds nothing. Storm starts nothing because of it.
+	pi.on("tool_result", async (event, ctx) => {
+		const result = await onToolResult(event, ctx);
+		if (ctx.agent.kind !== "main" || (event.toolName !== "wait" && event.toolName !== "task")) return result;
+		const notice = runs.takeNotices();
+		return notice === undefined ? result : { ...result, additionalContext: notice };
+	});
+
+	pi.on("context", async (event, ctx) => {
+		// A pushed delivery is read here, on the director's next request. omp builds that request without waiting for
+		// Storm's evaluation of the delivery, so a delivery still being evaluated is waited for, but never for long: a
+		// slow evaluation only means the notice comes with the request after. Only the director's requests: a child's
+		// request must neither read nor take the director's notice.
+		if (ctx.agent.kind !== "main") return undefined;
+		const runId = runs.runId();
+		if (runId === undefined) return undefined;
+		// The deliveries this request carries: the `async-result` messages after the director's last turn.
+		const arrived: Promise<void>[] = [];
+		for (let at = event.messages.length - 1; at >= 0; at--) {
+			const message = event.messages[at];
+			if (message === undefined || message.role === "assistant") break;
+			if (deliveryKey(message) !== undefined) arrived.push(observeDelivery(ctx, runId, message));
+		}
+		if (arrived.length > 0) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const limit = new Promise<void>(resolve => {
+				timer = setTimeout(resolve, NOTICE_WAIT_MS);
+				timer.unref?.();
+			});
+			await Promise.race([Promise.allSettled(arrived), limit]);
+			clearTimeout(timer);
+		}
+		const notice = runs.takeNotices();
+		if (notice === undefined) return undefined;
+		return { messages: [...event.messages, { role: "developer", content: [{ type: "text", text: notice }], attribution: "agent", timestamp: Date.now() }] };
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
 		// Every child turn, including a settled agent resumed by a follow-up (which has no before_agent_start).
 		if (ctx.agent.kind === "sub") noteChildTurnStart(ctx);
+		// A loop that starts with no prompt of its own (background results woke the paused director) is the paused
+		// request's continuation: it no longer counts as paused, so a steer inside it cannot replace the request.
+		else {
+			const woken = autoOf(ctx);
+			if (woken !== undefined) woken.paused = false;
+		}
 		runs.onAgentStart();
 	});
 
@@ -2304,10 +2457,20 @@ export default function storm(pi: ExtensionAPI): void {
 		const eventSessionId = mainSessionId(ctx);
 		const auto = !event.willContinue && eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
 		// Clear the ending request before yielding; a detached old handler must never clear a newer prompt's task.
-		if (auto !== undefined) auto.task = undefined;
+		if (auto !== undefined) {
+			auto.task = undefined;
+			delete auto.turnStartedAt;
+			auto.paused = false;
+		}
 		// Paused on async subagents: the moment to shed context before their results arrive. Both manual and automatic
 		// runs use the same background handoff, so the recorded ledger is identical.
-		if (event.awaitingAsyncWork) runs.startCheckpoint();
+		if (event.awaitingAsyncWork) {
+			// The user's request stays through the pause: background results wake this same loop, and that is the request's
+			// own continuation. A prompt typed meanwhile replaces it (`paused`, above).
+			const pausedAuto = eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
+			if (pausedAuto !== undefined) pausedAuto.paused = true;
+			runs.startCheckpoint();
+		}
 		// Ends the run when the session settles; a queued run starts detached from this handler.
 		const settlement = runs.onAgentEnd(event, ctx);
 		if (auto !== undefined && !event.awaitingAsyncWork) auto.settling = settlement;
@@ -2349,6 +2512,7 @@ export default function storm(pi: ExtensionAPI): void {
 		}
 		stateCache.clear();
 		attempts.stop();
+		followDispatches.clear();
 		liveStatus.beginSession();
 		openWaits.clear();
 		resetCloseoutChoices(ctx);

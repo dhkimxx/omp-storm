@@ -7,7 +7,22 @@ import type { CloseoutDraft } from "../runtime/closeout.ts";
 import type { ProjectState } from "../state.ts";
 import type { AgentEntry, RunPlan, RunSpec } from "../types.ts";
 
-export type RunRequestResult = { ok: true; runId: string } | { ok: false; reason: string };
+/** What a continued run carried over from the run it continues: counts of results, and the lanes still to do. */
+export interface ContinuedRun {
+	from: string;
+	/** Why the continued run stopped, in the words `/storm status` uses ("이유 기록 없음" for a record that names none). */
+	ended: string;
+	/** Accepted results proven again against the current bytes and carried. */
+	kept: number;
+	/** Results that are open again (never proven again, or never accepted). */
+	reopened: number;
+	/** Results the earlier run left blocked. */
+	blocked: number;
+	/** Lanes with work left, in plan order (bounded). */
+	open: readonly string[];
+}
+
+export type RunRequestResult = { ok: true; runId: string; continued?: ContinuedRun } | { ok: false; reason: string };
 
 /**
  * The personal automatic-delegation policy of the native main session that owns a tool call. Consent is read from
@@ -21,6 +36,8 @@ export interface AutoDelegationState {
 	blocked?: string;
 	/** The ordinary user prompt this turn started from: the task a first plan opens the run for. Absent on a revive, an empty prompt, or after the turn settled. */
 	task?: string;
+	/** With `task`: when the user's message that began this turn arrived (ms since the epoch), as the host recorded it. */
+	turnStartedAt?: number;
 }
 
 /** The tool's host: project reads and the run operations only. Config/approval writes stay with `/storm` flows. */
@@ -30,6 +47,11 @@ export interface StormToolHost {
 	now(): number;
 	/** The status report `/storm status` shows, as markdown; `quota` adds omp's provider quota (about a second). */
 	statusText(opts: { quota: boolean }): Promise<string>;
+	/**
+	 * Whether omp task isolation is on, when the host can prove it. The extension's host reads the live omp settings;
+	 * absent or undefined means unknown, which the plan reply never reports as off.
+	 */
+	isolationEnabled?(): boolean | undefined;
 	/** The main session's automatic-delegation policy; absent hosts behave as if it were never opted in. */
 	auto?(): AutoDelegationState;
 	runtime: {
@@ -60,6 +82,13 @@ export interface StormToolHost {
 		 * no handoff; the in-flight turn is the run's first round.
 		 */
 		startWithPlan?(spec: RunSpec, plan: RunPlan, validatedHash?: string): Promise<RunRequestResult>;
+		/**
+		 * Automatic delegation only: opens the run the `/storm` menu would resume (the same candidate and checks) inside
+		 * this turn, with its checkpoint restored and its plan in force. Nothing is started when there is no candidate or
+		 * the old plan no longer fits the approved team, or the run stopped at or after `turnStartedAt`: the user has to
+		 * have spoken after it stopped. `said` is the user's message of this turn.
+		 */
+		continueRun?(said: string | undefined, turnStartedAt: number): Promise<RunRequestResult>;
 		/** Subagents spawned under this session (any depth), from the agent ledger. */
 		agents(): AgentEntry[];
 	};

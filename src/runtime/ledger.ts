@@ -1,3 +1,4 @@
+import { withJosa } from "../josa.ts";
 import type { BudgetConfig, RunPlan } from "../types.ts";
 
 /** Spend and dispatch authority of one run, shared with its children inside this process. */
@@ -38,7 +39,7 @@ function childKey(id: string, parentId: string | undefined, artifactsDir: string
 
 function requireIdentity(value: unknown, field: string): string {
 	if (typeof value !== "string" || value.trim() === "" || value.includes("\u0000")) {
-		throw new Error(`Storm 실행의 ${field}가 올바르지 않습니다.`);
+		throw new Error(`Storm 실행의 ${withJosa(field, "이/가")} 올바르지 않습니다.`);
 	}
 	return value;
 }

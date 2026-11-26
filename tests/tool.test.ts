@@ -7,6 +7,7 @@ import { APPROVE } from "../src/proposals/present.ts";
 import { runChange } from "../src/request/actions.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
 import { CLOSEOUT_NEXT_MAX, CLOSEOUT_RESULT_MAX, CLOSEOUT_TEXT_MAX, type CloseoutDraft } from "../src/runtime/closeout.ts";
+import { CONTINUE_SAME_TURN } from "../src/runtime/controller.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { RunRequestResult, StormToolHost } from "../src/tool/host.ts";
 import { createStormTool, runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
@@ -73,9 +74,9 @@ const agentEntry = (over: Partial<AgentEntry> = {}): AgentEntry =>
 describe("tool definition", () => {
 	const tool = createStormTool(zod, () => fakeHost().host);
 
-	test("exposes run, plan, execute, brief, status and agents without adding team changes", () => {
+	test("exposes run, plan, execute, brief, status, agents and continue without adding team changes", () => {
 		expect(tool).toMatchObject({ name: "storm", label: "Storm", loadMode: "essential", defaultInactive: true });
-		for (const action of ["run", "plan", "execute", "brief", "status", "agents"]) expect(tool.parameters.safeParse({ action }).success).toBe(true);
+		for (const action of ["run", "plan", "execute", "brief", "status", "agents", "continue"]) expect(tool.parameters.safeParse({ action }).success).toBe(true);
 		const gone = ["models", "priority", "workers", "reselect", "quota", "trial", "budget", "settings", "propose", "delete-everything"];
 		for (const action of gone) expect(tool.parameters.safeParse({ action }).success).toBe(false);
 	});
@@ -692,5 +693,127 @@ describe("automatic delegation", () => {
 		expect(r.outcome).toBe("ok");
 		expect(f.plans).toHaveLength(1);
 		expect(starts).toEqual([]);
+	});
+});
+
+describe("continue: the director continues an interrupted run", () => {
+	const carried = { from: "run-20261126-073428-48cc", ended: "라운드 한도", kept: 2, reopened: 3, blocked: 1, open: ["Build", "Pin"] } as const;
+	const SPOKE_AT = 1_700_000_000_000;
+
+	function continueHost(
+		opts: { enabled?: boolean; task?: string; turnStartedAt?: number | null; active?: boolean; result?: RunRequestResult; withoutStart?: boolean } = {},
+	) {
+		const f = fakeHost();
+		const said: Array<string | undefined> = [];
+		const turns: number[] = [];
+		const starts: RunSpec[] = [];
+		// `null`: the host recorded no start time for the turn.
+		const startedAt = opts.turnStartedAt === undefined ? SPOKE_AT : (opts.turnStartedAt ?? undefined);
+		const host: StormToolHost = {
+			...f.host,
+			auto: () => ({
+				enabled: opts.enabled ?? true,
+				...(opts.task !== undefined ? { task: opts.task } : {}),
+				...(opts.task !== undefined && startedAt !== undefined ? { turnStartedAt: startedAt } : {}),
+			}),
+			runtime: {
+				...f.host.runtime,
+				runActive: () => opts.active ?? false,
+				startWithPlan: async (spec: RunSpec) => {
+					starts.push(spec);
+					return { ok: true, runId: "run-auto" };
+				},
+				...(opts.withoutStart === true
+					? {}
+					: {
+							continueRun: async (text: string | undefined, turnStartedAt: number) => {
+								said.push(text);
+								turns.push(turnStartedAt);
+								return opts.result ?? { ok: true, runId: "run-next", continued: carried };
+							},
+						}),
+			},
+		};
+		return { f, host, said, starts, turns };
+	}
+
+	test("the action is a write, so the host's approval applies to it as to a plan", () => {
+		const tool = createStormTool(zod, () => fakeHost().host);
+		expect((tool.approval as (args: unknown) => string)({ action: "continue" })).toBe("write");
+		expect((tool.approval as (args: unknown) => string)({ action: "status" })).toBe("read");
+		expect(tool.parameters.safeParse({ action: "continue" }).success).toBe(true);
+	});
+
+	test("automatic delegation, no run active, this turn's user prompt: it continues with that prompt and reports what was carried", async () => {
+		const { host, said, starts, turns } = continueHost({ task: "이어서 해줘" });
+		const r = await run({ host }, { action: "continue" });
+		expect(r.outcome).toBe("ok");
+		expect(said).toEqual(["이어서 해줘"]);
+		// A continuation is not a plan: it opens nothing through the plan's start.
+		expect(starts).toEqual([]);
+		expect(r.text).toContain("run-next");
+		expect(r.text).toContain(carried.from);
+		for (const lane of carried.open) expect(r.text).toContain(lane);
+		expect(r.text).toContain(`이어받은 결과 ${carried.kept}개`);
+		expect(r.text).toContain(`다시 할 결과 ${carried.reopened}개`);
+		expect(r.text).toContain(`막힌 결과 ${carried.blocked}개`);
+		expect(r.text.length).toBeLessThan(480);
+		// The director is told why the run stopped, in the words the user's status uses: a limit is not a crash.
+		expect(r.text).toContain(carried.ended);
+		// The start gets the time the user's message began this turn: that is what the stop is compared with.
+		expect(turns).toEqual([SPOKE_AT]);
+	});
+
+	test("a host that recorded no start time for the turn cannot show the user spoke after the stop: nothing starts", async () => {
+		const { host, said, turns } = continueHost({ task: "이어서 해줘", turnStartedAt: null });
+		const r = await run({ host }, { action: "continue" });
+		expect(r.outcome).toBe("rejected");
+		expect(said).toEqual([]);
+		expect(turns).toEqual([]);
+	});
+
+	test("the controller's refusal for a run that stopped in this turn is passed on as it is", async () => {
+		const { host } = continueHost({ task: "이어서 해줘", result: { ok: false, reason: CONTINUE_SAME_TURN } });
+		const r = await run({ host }, { action: "continue" });
+		expect(r).toEqual({ outcome: "rejected", text: CONTINUE_SAME_TURN });
+	});
+
+	test("delegation set to manual: nothing starts, and the answer says where the user can continue", async () => {
+		const { host, said } = continueHost({ enabled: false, task: "이어서 해줘" });
+		const r = await run({ host }, { action: "continue" });
+		expect(r.outcome).toBe("rejected");
+		expect(said).toEqual([]);
+		expect(r.text).toContain("/storm");
+		// A host that offers no automatic state at all behaves as manual.
+		const bare = fakeHost();
+		expect((await run(bare, { action: "continue" })).outcome).toBe("rejected");
+	});
+
+	test("an active run, or a turn that is not the user's own message, starts nothing", async () => {
+		const active = continueHost({ task: "이어서 해줘", active: true });
+		expect((await run({ host: active.host }, { action: "continue" })).outcome).toBe("rejected");
+		expect(active.said).toEqual([]);
+		for (const task of [undefined, "", "   \n"]) {
+			const noTurn = continueHost(task === undefined ? {} : { task });
+			const r = await run({ host: noTurn.host }, { action: "continue" });
+			expect(r.outcome).toBe("rejected");
+			expect(noTurn.said).toEqual([]);
+		}
+	});
+
+	test("the start's refusal comes back unchanged, and a host without a continue door refuses", async () => {
+		const refused = continueHost({ task: "계속", result: { ok: false, reason: "no candidate" } });
+		expect(await run({ host: refused.host }, { action: "continue" })).toEqual({ outcome: "rejected", text: "no candidate" });
+		expect(refused.said).toEqual(["계속"]);
+		const bare = continueHost({ task: "계속", withoutStart: true });
+		const r = await run({ host: bare.host }, { action: "continue" });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("/storm");
+	});
+
+	test("the tool description names the action and stays within its budget", () => {
+		const tool = createStormTool(zod, () => fakeHost().host);
+		expect(tool.description).toContain("continue");
+		expect(tool.description.length).toBeLessThanOrEqual(900);
 	});
 });

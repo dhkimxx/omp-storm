@@ -17,10 +17,10 @@ export function fallbackQuotaMark(fromModel: string, now: number): QuotaMark | u
 
 /** Notice for `retry_fallback_applied`; `provider` is the marked provider, absent when nothing was marked. */
 export function quotaNotice(from: string, to: string, provider?: string): string {
-	const switched = `omp 가 오류로 ${from} 에서 ${to} 로 모델을 바꿨습니다.`;
+	const switched = `omp 가 오류로 모델을 바꿨습니다(${from} → ${to}).`;
 	return provider === undefined
 		? switched
-		: `${switched} ${provider} 를 5시간 동안 쿼터 소진으로 표시해 승인된 다른 provider 모델을 먼저 씁니다.`;
+		: `${switched} ${provider} provider를 5시간 동안 쿼터 소진으로 표시해 승인된 다른 provider 모델을 먼저 씁니다.`;
 }
 
 /** Notice for `credential_disabled`: shown only, nothing is marked. */

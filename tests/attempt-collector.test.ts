@@ -1091,7 +1091,8 @@ describe("native wait deliveries", () => {
 			startedAt: 2_000,
 		});
 		// No bound new job id: a row that merely shares the agent id must not resurrect the old completion.
-		await h.collector.observeWaitResult(waitInput([waitRow({ id: "Impl", settledAtMs: 2_100 })], { observedAt: 2_200 }));
+		// (Its own start, settled minus duration, is 600: before this follow-up was admitted.)
+		await h.collector.observeWaitResult(waitInput([waitRow({ id: "Impl", settledAtMs: 2_100, durationMs: 1_500 })], { observedAt: 2_200 }));
 		expect(recorded.settlements).toHaveLength(1);
 		// The host's own new job id, bound to this turn, is the only row that may settle it.
 		h.collector.bindFollowUpJobs({ runId: "run-1", spawnKey: "Impl", jobs: [{ id: "Impl-2", agentId: "Impl", startTime: 2_001, status: "running" }] });
@@ -1186,6 +1187,109 @@ describe("same-agent follow-ups", () => {
 		});
 		expect(recorded.settlements).toHaveLength(1);
 		h.collector.stop();
+	});
+
+	describe("omp reuses the agent id as the follow-up's job id (the earlier job row was evicted)", () => {
+		const L = lane([{ id: "change", kind: "change", criterion: "a.ts changed", path: "a.ts" }]);
+		const job = (over: Record<string, unknown> = {}) => ({ id: "Impl", agentId: "Impl", startTime: 2_100, status: "running", ...over });
+		const waitRow = (over: Record<string, unknown> = {}) => ({
+			id: "Impl", type: "task", status: "completed", agentUrlId: "Impl", settledAtMs: 2_600, durationMs: 500, resultText: "second", ...over,
+		});
+		const waitOf = (jobs: readonly Record<string, unknown>[], observedAt = 2_700) => ({
+			runId: "run-1", parentId: "Main", observedAt, details: { op: "wait", jobs },
+		});
+
+		/** The first turn delivered as the bare job `Impl`, then a follow-up admitted at 2 000. */
+		async function afterFirstJob(recorded: Recorded, h: Harness): Promise<void> {
+			h.setNow(1_000);
+			await h.collector.admitSpawn({ runId: "run-1", parentId: "Main", spawnKey: "Impl", lane: L, artifactMode: "shared", startedAt: 1_000 });
+			h.setNow(1_100);
+			await h.collector.observeMessage({
+				runId: "run-1", parentId: "Main", observedAt: 1_100,
+				message: { customType: "async-result", content: "first", details: { jobs: [{ jobId: "Impl", agentId: "Impl", status: "completed" }] } },
+			});
+			expect(recorded.settlements.map(settlement => settlement.report.attemptId)).toEqual(["job:Impl:Impl"]);
+			h.setNow(2_000);
+			await h.collector.admitFollowUp({ runId: "run-1", parentId: "Main", spawnKey: "Impl", lane: L, artifactMode: "shared", toolCallId: "write_1", startedAt: 2_000 });
+		}
+
+		test("the job bound at the write settles by wait under an id that carries its start", async () => {
+			const recorded = recordingPort();
+			const h = harness(recorded.port);
+			await afterFirstJob(recorded, h);
+			h.collector.bindFollowUpJobs({ runId: "run-1", spawnKey: "Impl", jobs: [job()] });
+			await h.collector.observeWaitResult(waitOf([waitRow()]));
+			expect(recorded.settlements.map(settlement => settlement.report.attemptId)).toEqual(["job:Impl:Impl", "job:Impl.t2100:Impl"]);
+			expect(recorded.settlements[1]?.report).toMatchObject({ outcome: "success", capture: "observed" });
+			h.collector.stop();
+		});
+
+		test("pushed, it settles with or without the parent's rows, and a replay of the first job is refused", async () => {
+			for (const rows of [undefined, [job({ status: "completed" })]]) {
+				const recorded = recordingPort();
+				const h = harness(recorded.port);
+				await afterFirstJob(recorded, h);
+				h.collector.bindFollowUpJobs({ runId: "run-1", spawnKey: "Impl", jobs: [job()] });
+				// The first job's own row (before the write) cannot become the follow-up's result.
+				h.setNow(2_050);
+				await h.collector.observeMessage({
+					runId: "run-1", parentId: "Main", observedAt: 2_050,
+					message: { customType: "async-result", content: "first again", details: { jobs: [{ jobId: "Impl", agentId: "Impl", status: "completed" }] } },
+					jobs: [job({ startTime: 1_000, status: "completed" })],
+				});
+				expect(recorded.settlements).toHaveLength(1);
+				h.setNow(2_650);
+				await h.collector.observeMessage({
+					runId: "run-1", parentId: "Main", observedAt: 2_650,
+					message: { customType: "async-result", content: "second", details: { jobs: [{ jobId: "Impl", agentId: "Impl", status: "completed" }] } },
+					...(rows === undefined ? {} : { jobs: rows }),
+				});
+				expect(recorded.settlements.map(settlement => settlement.report.attemptId)).toEqual(["job:Impl:Impl", "job:Impl.t2100:Impl"]);
+				h.collector.stop();
+			}
+		});
+
+		test("not bound at the write, the delivery's own start proves it (a wait row's settled time minus its duration)", async () => {
+			const recorded = recordingPort();
+			const h = harness(recorded.port);
+			await afterFirstJob(recorded, h);
+			// The first job again: started at 1 000, before the write.
+			await h.collector.observeWaitResult(waitOf([waitRow({ settledAtMs: 1_900, durationMs: 900 })], 2_050));
+			expect(recorded.settlements).toHaveLength(1);
+			await h.collector.observeWaitResult(waitOf([waitRow()]));
+			expect(recorded.settlements.map(settlement => settlement.report.attemptId)).toEqual(["job:Impl:Impl", "job:Impl.t2100:Impl"]);
+			h.collector.stop();
+		});
+
+		test("a row without a duration or a pushed result without the parent's rows proves nothing, unbound", async () => {
+			const recorded = recordingPort();
+			const h = harness(recorded.port);
+			await afterFirstJob(recorded, h);
+			await h.collector.observeWaitResult(waitOf([{ ...waitRow(), durationMs: undefined }]));
+			h.setNow(2_650);
+			await h.collector.observeMessage({
+				runId: "run-1", parentId: "Main", observedAt: 2_650,
+				message: { customType: "async-result", content: "second", details: { jobs: [{ jobId: "Impl", agentId: "Impl", status: "completed" }] } },
+			});
+			expect(recorded.settlements).toHaveLength(1);
+			h.collector.stop();
+		});
+
+		test("a message that joined an open turn binds the running job and settles with its completion", async () => {
+			const recorded = recordingPort();
+			const h = harness(recorded.port);
+			h.setNow(1_000);
+			await h.collector.admitSpawn({ runId: "run-1", parentId: "Main", spawnKey: "Impl", lane: L, artifactMode: "shared", startedAt: 1_000 });
+			h.setNow(2_000);
+			await h.collector.admitFollowUp({ runId: "run-1", parentId: "Main", spawnKey: "Impl", lane: L, artifactMode: "shared", toolCallId: "write_1", startedAt: 2_000 });
+			// The only job of the agent is the first turn's, still running: it started before this write.
+			h.collector.bindFollowUpJobs({ runId: "run-1", spawnKey: "Impl", jobs: [job({ startTime: 1_010 })] });
+			h.setNow(3_000);
+			await h.collector.observeWaitResult(waitOf([waitRow({ settledAtMs: 3_000, durationMs: 1_990 })], 3_010));
+			expect(recorded.settlements.map(settlement => settlement.report.attemptId)).toEqual(["job:Impl:Impl"]);
+			expect(recorded.settlements[0]?.report).toMatchObject({ outcome: "success" });
+			h.collector.stop();
+		});
 	});
 
 	test("a retry fact is scoped to the follow-up turn and expired by settlement", async () => {

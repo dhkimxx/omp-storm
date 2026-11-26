@@ -21,6 +21,21 @@ import { isAbsolute } from "node:path";
 export const ATTEMPT_REPORT_SCHEMA = "storm.attempt-report/v1";
 export const UNKNOWN_HOST_VERSION = "unknown";
 
+/** A native id is at most this many characters (`nativeId`). */
+const NATIVE_ID_MAX_CHARS = 120;
+/** The longest `.t<start>` stamp: a safe integer has at most 16 digits. */
+const STAMP_MAX_CHARS = ".t".length + String(Number.MAX_SAFE_INTEGER).length;
+/**
+ * The longest attempt id Storm keeps: the widest id `asyncAttemptId` can build, `job:<job>.t<start>:<agent>` with two
+ * host ids of the longest length `nativeId` allows and the longest start stamp. A real run's ids are already 67
+ * characters (`job:` + `run-20261126-051651-7850-lane-3` twice), so a limit near 64 silently dropped them. Every place
+ * that validates an attempt reference uses this one, and `asyncAttemptId` never builds an id past it, so a stamped id
+ * can never be refused where its plain id fits (the replay guard would then take a real new turn for a replay).
+ */
+export const ATTEMPT_ID_MAX_CHARS = "job:".length + NATIVE_ID_MAX_CHARS + STAMP_MAX_CHARS + ":".length + NATIVE_ID_MAX_CHARS;
+/** A host attempt reference is a bounded token, never a path or model text; an unsafe one is omitted. */
+export const ATTEMPT_REF = new RegExp(`^[A-Za-z0-9:._-]{1,${ATTEMPT_ID_MAX_CHARS}}$`, "u");
+
 export const ATTEMPT_TEXT_MAX = 320;
 export const ATTEMPT_ARTIFACT_MAX = 8;
 export const ATTEMPT_OBSERVATION_MAX = 12;
@@ -144,6 +159,8 @@ export interface AsyncJobFact {
 	jobId?: unknown;
 	agentId?: unknown;
 	status?: unknown;
+	/** When the host started this job (epoch ms), when it said so; tells two turns that share a reused job id apart. */
+	startTime?: unknown;
 	schema?: {
 		status?: unknown;
 		error?: unknown;
@@ -269,7 +286,7 @@ export function attemptUsable(report: AttemptReport): boolean {
 
 /** Strict native id: 1-120 ASCII letters/digits/`.`/`_`/`-`. Anything else is rejected, never rewritten. */
 function nativeId(value: unknown): string | undefined {
-	return typeof value === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(value) ? value : undefined;
+	return typeof value === "string" && value.length <= NATIVE_ID_MAX_CHARS && /^[A-Za-z0-9._-]+$/.test(value) ? value : undefined;
 }
 
 /** Host-derived id for a synchronous child result; undefined when either component is malformed. */
@@ -279,11 +296,41 @@ export function syncAttemptId(toolCallId: string, resultId: string): string | un
 	return task === undefined || result === undefined ? undefined : `task:${task}:${result}`;
 }
 
-/** Host-derived id for a delivered background job; undefined when either component is malformed. */
-export function asyncAttemptId(jobId: string, agentId: string): string | undefined {
+/**
+ * Host-derived id for a delivered background job; undefined when a component is malformed or the id would not fit
+ * `ATTEMPT_ID_MAX_CHARS`. `startTime` stamps a job whose id omp reused: it hands a follow-up turn the agent id again
+ * once the earlier job's row was evicted, so one job id can name two turns and only the start tells them apart.
+ */
+export function asyncAttemptId(jobId: string, agentId: string, startTime?: number): string | undefined {
 	const job = nativeId(jobId);
 	const agent = nativeId(agentId);
-	return job === undefined || agent === undefined ? undefined : `job:${job}:${agent}`;
+	if (job === undefined || agent === undefined) return undefined;
+	if (startTime !== undefined && !(Number.isSafeInteger(startTime) && startTime >= 0)) return undefined;
+	const id = `job:${job}${startTime === undefined ? "" : `.t${startTime}`}:${agent}`;
+	return id.length > ATTEMPT_ID_MAX_CHARS ? undefined : id;
+}
+
+/**
+ * The attempt id of one delivered job for this subject. A job whose plain id this spawn already settled is either a
+ * replay of that job or a new turn that omp registered under the reused id. It is the new turn only when the job's
+ * start time proves it began after this dispatch was admitted, or is the very start of the job the dispatch was bound
+ * to; its id then carries the start. Without that proof the plain id is returned and the replay guard refuses it, so a
+ * stale delivery can never overwrite a newer result. `startTime` is a host fact (a job row's `startTime`, or a wait
+ * row's `settledAtMs - durationMs`), never model text.
+ */
+export function deliveredAttemptId(subject: AttemptSubject, jobId: unknown, agentId: unknown, startTime: unknown): string | undefined {
+	if (typeof jobId !== "string" || typeof agentId !== "string") return undefined;
+	const plain = asyncAttemptId(jobId, agentId);
+	if (plain === undefined) return undefined;
+	const prior = Array.isArray(subject.priorAttemptIds) ? subject.priorAttemptIds : [];
+	if (!prior.includes(plain)) return plain;
+	const start = finite(startTime);
+	if (start === undefined || !Number.isSafeInteger(start) || start < 0) return plain;
+	const stamped = asyncAttemptId(jobId, agentId, start);
+	if (stamped === undefined) return plain;
+	// The same wall-clock comparison as `#unboundDelivery` in the collector: exact, equal counts as later, and a clock
+	// that stepped backwards after the admission can only make a real new turn read as the earlier one (fail closed).
+	return start >= subject.startedAt || stamped === subject.expectedAttemptId ? stamped : plain;
 }
 
 /** A report for the case where no native envelope/result arrived. It never claims an attempt id or a success. */
@@ -377,7 +424,7 @@ export function asyncAttemptReport(subject: AttemptSubject, capture: AsyncResult
 		return invalid(subject, channel, observedAt, version, "identity-invalid");
 	}
 	if (agentId !== subject.spawnKey) return invalid(subject, channel, observedAt, version, "spawn-mismatch");
-	const attemptId = asyncAttemptId(jobId, agentId);
+	const attemptId = deliveredAttemptId(subject, jobId, agentId, capture.job.startTime);
 	if (attemptId === undefined) return invalid(subject, channel, observedAt, version, "identity-invalid");
 
 	const report = base(subject, attemptId, observedAt, version);

@@ -6,6 +6,8 @@ import { sha256Hex } from "../src/config/canonical.ts";
 import { lastRun, pruneRuns, readRun, RUN_RECORD_MAX_BYTES, runsDir, writeRun } from "../src/runtime/run.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import {
+	CONTINUATION_HEAD,
+	EARLIER_REQUEST_MARKER,
 	findResumeCandidate,
 	noteResumePointer,
 	protectedResumeRunIds,
@@ -18,7 +20,7 @@ import {
 } from "../src/runtime/resume.ts";
 import { maxRounds } from "../src/runtime/rounds.ts";
 import { carryGoal } from "../src/runtime/goal.ts";
-import type { RunRecord } from "../src/types.ts";
+import type { RunPlan, RunRecord } from "../src/types.ts";
 import { runRecord, teamOf } from "./fixtures.ts";
 
 let tmp: string;
@@ -394,5 +396,55 @@ describe("resume round limits", () => {
 	test("a run without an explicit limit resumes uncapped, even if its record shows an old default cap", () => {
 		expect(capOf(run())).toBeUndefined();
 		expect(capOf(run({ maxRounds: 4, turns: 4, endReason: "round-limit" }))).toBeUndefined();
+	});
+});
+
+describe("the task a continued run carries", () => {
+	const lane = (name: string, over: Record<string, unknown> = {}) => ({ name, kind: "explore", role: "explorer", results: [{ id: `${name}-r`, kind: "answer", criterion: `${name} reports` }], ...over });
+	const planned = (...lanes: unknown[]): RunPlan => ({ submittedAt: "2026-11-26T05:00:00.000Z", workers: {}, lanes: lanes as never });
+	const taskOf = (over: Partial<RunRecord>): string => {
+		const spec = resumeSpec(run(over) as RunRecord & { request: string });
+		if (!spec.ok) throw new Error(spec.error);
+		return spec.spec.task;
+	};
+	const workOf = (task: string): string => task.split(`\n${EARLIER_REQUEST_MARKER}\n`)[0] ?? "";
+
+	test("a plan states the work: each lane with its goal, else the first result it owes; the status question is only the marked earlier request", () => {
+		const task = taskOf({ request: "작업현황", plan: planned(lane("Pin", { goal: "pin the head total" }), lane("Build")) });
+		expect(task.startsWith(CONTINUATION_HEAD)).toBe(true);
+		expect(workOf(task)).toContain("- Pin: pin the head total");
+		expect(workOf(task)).toContain("- Build: Build reports");
+		expect(workOf(task)).not.toContain("작업현황");
+		expect(task.endsWith(`${EARLIER_REQUEST_MARKER}\n작업현황`)).toBe(true);
+	});
+
+	test("without a plan the request is the task, untouched", () => {
+		expect(taskOf({ request: "fix the login bug" })).toBe("fix the login bug");
+		expect(taskOf({ request: "fix the login bug", plan: planned() })).toBe("fix the login bug");
+	});
+
+	test("a continuation of a continuation keeps the original request, not the generated text around it", () => {
+		const first = taskOf({ request: "작업현황", plan: planned(lane("Pin")) });
+		const second = taskOf({ request: first, plan: planned(lane("Pin"), lane("Build")) });
+		expect(second.split(EARLIER_REQUEST_MARKER)).toHaveLength(2);
+		expect(second.endsWith(`${EARLIER_REQUEST_MARKER}\n작업현황`)).toBe(true);
+		expect(workOf(second)).toContain("- Build");
+		// A generated task that carries no earlier request leaves none to repeat.
+		const bare = taskOf({ request: CONTINUATION_HEAD, plan: planned(lane("Pin")) });
+		expect(bare).not.toContain(EARLIER_REQUEST_MARKER);
+	});
+
+	test("it is bounded however many lanes and however long the request, and a lane's text stays on one line", () => {
+		const many = Array.from({ length: 200 }, (_, index) => lane(`lane-${index}`, { goal: `goal\n${"x".repeat(500)}` }));
+		const task = taskOf({ request: "r".repeat(20_000), plan: planned(...many) });
+		expect(workOf(task).length).toBeLessThan(2_200);
+		expect(workOf(task)).toMatch(/- 외 \d+개/);
+		expect(workOf(task).split("\n").every(line => line === "" || line.startsWith("- ") || line === CONTINUATION_HEAD)).toBe(true);
+		expect(task.length).toBeLessThan(6_500);
+	});
+
+	test("the request's limits and the lineage still ride on the spec", () => {
+		const spec = resumeSpec(run({ request: "q", limits: { rounds: 3 }, plan: planned(lane("Pin")) }) as RunRecord & { request: string }, "계속");
+		expect(spec).toMatchObject({ ok: true, spec: { rounds: 3, resumeNote: "계속" } });
 	});
 });

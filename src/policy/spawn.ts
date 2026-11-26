@@ -100,7 +100,7 @@ function budgetBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 	if (!run?.budget || run.costUsd < run.budget.perRunUsd) return undefined;
 	return {
 		code: "budget",
-		reason: `실행 예산 ${formatUsd(run.budget.perRunUsd)}을 넘어(누계 ${formatUsd(run.costUsd)}) 새 스폰을 막았습니다. 이미 도는 서브에이전트의 결과로 마무리하세요.`,
+		reason: `실행 예산(${formatUsd(run.budget.perRunUsd)})을 넘어(누계 ${formatUsd(run.costUsd)}) 새 스폰을 막았습니다. 이미 도는 서브에이전트의 결과로 마무리하세요.`,
 	};
 }
 
@@ -306,7 +306,7 @@ function laneBindingBlock(runtime: SpawnRuntime, roleId: string, agent: string, 
 	if (spawnKey === undefined) {
 		return {
 			code: "unassigned-lane",
-			reason: `호스트가 스폰 키를 주지 않아 ${agent} 을(를) 계획 레인에 배정할 수 없습니다. task 항목마다 계획 레인 이름을 붙여 다시 스폰하세요.`,
+			reason: `호스트가 스폰 키를 주지 않아 ${agent} 에이전트를 계획 레인에 배정할 수 없습니다. task 항목마다 계획 레인 이름을 붙여 다시 스폰하세요.`,
 		};
 	}
 	return undefined;
@@ -363,7 +363,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 			builtinKey === undefined
 				? {
 						code: "unmapped-agent",
-						reason: `실행 중에는 계획 레인에 매핑된 에이전트만 스폰할 수 있습니다. ${event.agent} 은(는) 팀 역할에 매핑되지 않아 쓰기 권한과 결과 소유자를 정할 수 없습니다. 팀의 storm-* 에이전트를 쓰거나 plan으로 역할이 있는 레인을 지정하세요.`,
+						reason: `실행 중에는 계획 레인에 매핑된 에이전트만 스폰할 수 있습니다. ${event.agent} 에이전트는 팀 역할에 매핑되지 않아 쓰기 권한과 결과 소유자를 정할 수 없습니다. 팀의 storm-* 에이전트를 쓰거나 plan으로 역할이 있는 레인을 지정하세요.`,
 					}
 				: undefined;
 		const runBlock =
@@ -422,7 +422,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		if (config.disabledRoles?.includes(spec.id)) {
 			const suggest = (usable === undefined ? undefined : config.roles[usable]?.agent) ?? "storm-implementer";
 			return block(
-				{ code: "disabled-role", reason: `${spec.title} 역할(${event.agent})은 이 팀에서 쓰지 않습니다. 대신 ${suggest} 를 쓰세요.` },
+				{ code: "disabled-role", reason: `${spec.title} 역할(${event.agent})은 이 팀에서 쓰지 않습니다. 대신 ${suggest} 에이전트를 쓰세요.` },
 				{ role: spec.id },
 			);
 		}

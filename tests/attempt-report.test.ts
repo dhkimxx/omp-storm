@@ -2,9 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
 	asyncAttemptId,
 	asyncAttemptReport,
+	ATTEMPT_ID_MAX_CHARS,
 	ATTEMPT_OBSERVATION_MAX,
+	ATTEMPT_REF,
 	ATTEMPT_TEXT_MAX,
 	attemptUsable,
+	deliveredAttemptId,
 	type AsyncJobFact,
 	type AsyncResultCapture,
 	type AttemptSubject,
@@ -364,6 +367,89 @@ describe("async result report", () => {
 		expect(long.capture).toBe("invalid");
 		expect(long.captureError).toBe("identity-invalid");
 		expect(asyncAttemptId("bad id", "Follow")).toBeUndefined();
+	});
+});
+
+describe("a job id that omp reused for a later turn of the same child", () => {
+	const AGENT = "run-20261126-051651-7850-lane-3";
+	const first = asyncAttemptId(AGENT, AGENT) as string;
+	const later = (over: Partial<AttemptSubject> = {}): AttemptSubject => subject({ spawnKey: AGENT, startedAt: 2_000, priorAttemptIds: [first], ...over });
+
+	test("a real id is 67 characters; a reused job's id carries its start and still fits the limit", () => {
+		expect(first).toHaveLength(67);
+		expect(asyncAttemptId(AGENT, AGENT, 1_795_688_212_331)).toBe(`job:${AGENT}.t1795688212331:${AGENT}`);
+		expect(asyncAttemptId(AGENT, AGENT, 1_795_688_212_331)).toHaveLength(67 + ".t1795688212331".length);
+		expect(ATTEMPT_REF.test(first)).toBe(true);
+		expect(ATTEMPT_REF.test(asyncAttemptId(AGENT, AGENT, 1_795_688_212_331) as string)).toBe(true);
+	});
+
+	test("the limit holds the widest id the host ids allow, stamped or not; a start that is not a time names no attempt", () => {
+		const widestJob = "j".repeat(120);
+		const widestAgent = "a".repeat(120);
+		const stamped = asyncAttemptId(widestJob, widestAgent, 1_795_688_212_331);
+		expect(stamped).toHaveLength(4 + 120 + ".t1795688212331".length + 1 + 120);
+		expect(ATTEMPT_REF.test(stamped as string)).toBe(true);
+		expect(asyncAttemptId(widestJob, widestAgent)).toHaveLength(4 + 120 + 1 + 120);
+		// A start of the largest safe integer is the longest stamp there can be.
+		const longest = asyncAttemptId(widestJob, widestAgent, Number.MAX_SAFE_INTEGER);
+		expect(longest).toBeDefined();
+		expect(ATTEMPT_ID_MAX_CHARS).toBeGreaterThanOrEqual((longest as string).length);
+		expect(ATTEMPT_REF.test(longest as string)).toBe(true);
+		for (const start of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) expect(asyncAttemptId(AGENT, AGENT, start)).toBeUndefined();
+	});
+
+	test("a real new turn whose stamped id is long keeps its own id and is not mistaken for a replay", () => {
+		const job = "j".repeat(120);
+		const agent = "a".repeat(120);
+		const plain = asyncAttemptId(job, agent) as string;
+		const at = 1_795_688_212_331;
+		const turn = subject({ spawnKey: agent, startedAt: at - 400, priorAttemptIds: [plain] });
+		expect(deliveredAttemptId(turn, job, agent, at)).toBe(asyncAttemptId(job, agent, at));
+		expect(deliveredAttemptId(turn, job, agent, at)).not.toBe(plain);
+	});
+
+	test("an id this child never settled is the plain id, whatever its start", () => {
+		expect(deliveredAttemptId(later(), `${AGENT}-2`, AGENT, 2_500)).toBe(`job:${AGENT}-2:${AGENT}`);
+		expect(deliveredAttemptId(later(), `${AGENT}-2`, AGENT, undefined)).toBe(`job:${AGENT}-2:${AGENT}`);
+	});
+
+	test("a settled id is a new turn only when it provably started after the dispatch was admitted", () => {
+		expect(deliveredAttemptId(later(), AGENT, AGENT, 2_000)).toBe(`job:${AGENT}.t2000:${AGENT}`);
+		expect(deliveredAttemptId(later(), AGENT, AGENT, 2_500)).toBe(`job:${AGENT}.t2500:${AGENT}`);
+		// The earlier turn's replay, a delivery with no start, or a start that is not a number stays the plain id.
+		expect(deliveredAttemptId(later(), AGENT, AGENT, 1_100)).toBe(first);
+		expect(deliveredAttemptId(later(), AGENT, AGENT, undefined)).toBe(first);
+		expect(deliveredAttemptId(later(), AGENT, AGENT, "2500")).toBe(first);
+	});
+
+	test("the very job the dispatch was bound to is accepted even though it started before the admission (a joined turn)", () => {
+		const bound = asyncAttemptId(AGENT, AGENT, 1_500) as string;
+		expect(deliveredAttemptId(later({ expectedAttemptId: bound }), AGENT, AGENT, 1_500)).toBe(bound);
+		expect(deliveredAttemptId(later({ expectedAttemptId: bound }), AGENT, AGENT, 1_100)).toBe(first);
+	});
+
+	test("the report of a reused job's turn is usable, and the same job again is a replay, the first one is stale", () => {
+		const stamped = asyncAttemptId(AGENT, AGENT, 2_100) as string;
+		const subj = later({ expectedAttemptId: stamped });
+		const report = asyncAttemptReport(subj, asyncCapture({ observedAt: 2_500, job: job({ jobId: AGENT, agentId: AGENT, startTime: 2_100 }) }));
+		expect(report.attemptId).toBe(stamped);
+		expect(attemptUsable(report)).toBe(true);
+
+		const replay = asyncAttemptReport({ ...subj, priorAttemptIds: [first, stamped] }, asyncCapture({ observedAt: 2_600, job: job({ jobId: AGENT, agentId: AGENT, startTime: 2_100 }) }));
+		expect(replay.captureError).toBe("attempt-replayed");
+
+		const stale = asyncAttemptReport(subj, asyncCapture({ observedAt: 2_500, job: job({ jobId: AGENT, agentId: AGENT, startTime: 1_100 }) }));
+		expect(stale.captureError).toBe("attempt-replayed");
+		expect(attemptUsable(stale)).toBe(false);
+	});
+});
+
+describe("the attempt reference pattern", () => {
+	test("it holds every id Storm builds and refuses what is not a bounded token", () => {
+		expect(ATTEMPT_REF.test("job:run-20261126-051651-7850-lane-3:run-20261126-051651-7850-lane-3")).toBe(true);
+		expect(ATTEMPT_REF.test(`task:${"c".repeat(120)}:${"a".repeat(120)}`)).toBe(true);
+		expect(ATTEMPT_REF.test("a".repeat(ATTEMPT_ID_MAX_CHARS + 1))).toBe(false);
+		for (const unsafe of ["", "job:a b:c", "job:a/b:c", "job:a\nb:c", "job:\u00e9:c"]) expect(ATTEMPT_REF.test(unsafe)).toBe(false);
 	});
 });
 

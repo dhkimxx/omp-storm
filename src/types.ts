@@ -663,6 +663,12 @@ export interface StatusView {
 	lastRun?: RunRecord;
 	/** Bounded final facts, supplied only after the model status caller validates the run's native session and target. */
 	lastHandoff?: string;
+	/** An interrupted run of this session that the user can continue from `/storm`; set only on the model status. */
+	resumableRunId?: string;
+	/** With `resumableRunId`: why it stopped, in the words `/storm status` uses, so a stop is not mistaken for a crash. */
+	resumableEnded?: string;
+	/** With `resumableRunId`: automatic delegation is on, so the director's own `continue` can open it. */
+	directorMayContinue?: boolean;
 	trials?: TrialView[];
 	/** Active quota marks only. */
 	quotaMarks?: QuotaMark[];
@@ -724,6 +730,11 @@ export type RunEndReason =
 	| "time-limit"
 	/** The session closed. */
 	| "shutdown"
+	/**
+	 * The omp process ended while the run was going (a crash or a kill): found dead at a later start, so the run could not
+	 * record its own end. Unlike `interrupted` the user did not stop it. Records written before this value carry no reason.
+	 */
+	| "host-ended"
 	/** The run passed its budget. */
 	| "budget"
 	/** The handoff could not be sent. */
@@ -1247,7 +1258,7 @@ export interface AnalysisContext {
 
 // ── storm tool (implemented in src/tool) ────────────────────────────────────────────────────
 
-export type StormToolAction = "run" | "plan" | "execute" | "brief" | "status" | "agents";
+export type StormToolAction = "run" | "plan" | "execute" | "brief" | "status" | "agents" | "continue";
 
 /** A run plan as the director sends it; `validatePlan` checks it and resolves roles and workers. */
 export interface PlanRequest {

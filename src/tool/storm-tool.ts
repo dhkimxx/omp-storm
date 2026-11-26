@@ -3,9 +3,11 @@
  * force (refusing one past the approved bounds), `brief` stages the director's closeout for the current run,
  * `status` and `agents` report. Team changes are not here: the user makes them through `/storm`.
  */
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
+import { effectiveAgentTools, lanePolicy } from "../policy/capability.ts";
 import {
 	LANE_NEEDS,
 	MAX_LANES,
@@ -38,8 +40,8 @@ import {
 	parseCloseout,
 } from "../runtime/closeout.ts";
 import type { ProjectState } from "../state.ts";
-import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
-import type { StormToolHost } from "./host.ts";
+import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, ShadowInfo, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
+import type { ContinuedRun, StormToolHost } from "./host.ts";
 
 type Zod = ExtensionAPI["zod"];
 /** The parsed shape is checked against `StormToolInput` where the schema is built. */
@@ -56,12 +58,15 @@ export type StormToolInput = { action: StormToolAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
 };
 
-const ACTIONS = ["run", "plan", "execute", "brief", "status", "agents"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["run", "plan", "execute", "brief", "status", "agents", "continue"] as const satisfies readonly StormToolAction[];
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
 const LANE_NEED_IDS = LANE_NEEDS as unknown as [LaneNeed, ...LaneNeed[]];
 const NEXT_KINDS = ["resume", "run", "user"] as const satisfies readonly CloseoutNext["kind"][];
+
+/** The bundled agent definitions: the same files the start reads the worker's tools from. */
+const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../../agents/", import.meta.url));
 
 const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
 - run {task}: queue the request verbatim, then end the turn.
@@ -69,6 +74,7 @@ const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
 - execute {lanes}: planned job lanes, not AI workers; exit and an exact stdout marker prove execution only.
 - brief {brief}: stages result, verification, remaining? and 0-3 next, best first: resume, run {task} for new scope, user {text} for the user; never verifies or ends the run. Skip trivial.
 - status: team, approval, runs and approved job names.
+- continue: when status shows an interrupted run and the user asked to go on, not new work; plan's rules, results carried.
 - agents: existing workers and follow-up allowance.
 Team changes: /storm.`;
 
@@ -235,6 +241,54 @@ const BRIEF_NO_HOST =
 const BRIEF_STAGED =
 	"마무리 보고를 준비했습니다. 최종 판정과 실행 종료는 Storm 검증 게이트가 결정하고, 실행이 끝나면 Storm이 공식 결과를 먼저 보여줍니다. 짧고 깨끗하게 끝나면 한 줄 기록만 남으니 평소처럼 설명하고, 미해결·잔여 위험이 있거나 오래 걸린 실행은 카드에 이 보고의 결과와 남은 일이 실리므로 응답은 짧게 마치세요. 응답에 번호 목록을 다시 쓰지 말고, 검증 전에는 검증됐다고 말하지 마세요. 이후 라운드에서 결과가 바뀌면 새 보고로 다시 제출하세요.";
 
+/**
+ * The turn's user request, or the refusal that says there is none. Every automatic start (a first plan, a continuation)
+ * asks this one question: the prompt the host reported for this turn is the user's, and only it opens a run.
+ */
+function userTurnTask(host: StormToolHost, refusal: string): { task: string; startedAt: number | undefined } | StormToolReply {
+	const auto = host.auto?.();
+	const task = auto?.task;
+	return task === undefined || task.trim() === "" ? rejected(refusal) : { task, startedAt: auto?.turnStartedAt };
+}
+
+const CONTINUE_MANUAL =
+	"자동 위임이 꺼져 있어 이어 가기는 사용자만 합니다. 사용자가 /storm 에서 이어 가기를 고르면 중단된 실행을 이어 갑니다. 자동 위임을 켜는 것도 /storm 입니다.";
+const CONTINUE_ACTIVE = "이 세션에 이미 실행이 진행 중이라 이어 가지 않았습니다.";
+const CONTINUE_NO_TURN =
+	"이어 갈 근거가 되는 이번 사용자 요청을 찾지 못했습니다. 이어 가지 않았습니다. 사용자에게 이어 가라고 다시 말해 달라고 안내하세요.";
+const CONTINUE_NO_HOST = "이 호스트에서는 중단된 실행을 이어 갈 수 없습니다. 사용자가 /storm 에서 이어 가기를 고르게 안내하세요.";
+
+/** What a continued run carried over, in the words the director acts on. Facts and the next step, no plan dump. */
+function continuedText(runId: string, carried: ContinuedRun): string {
+	const parts = [`이어받은 결과 ${carried.kept}개(현재 근거로 다시 확인함)`, `다시 할 결과 ${carried.reopened}개`];
+	if (carried.blocked > 0) parts.push(`막힌 결과 ${carried.blocked}개`);
+	const open = carried.open.length === 0 ? "" : ` 남은 레인: ${carried.open.join(", ")}.`;
+	return (
+		`중단된 실행(${carried.from}, 멈춘 이유: ${carried.ended})을 이어 새 실행(${runId})을 열고 이전 계획을 적용했습니다. ${parts.join(", ")}.${open} ` +
+		"작업은 이 레인들의 목표이고, 방금 사용자의 말을 함께 반영하세요. 승인된 범위에서 워커를 스폰하거나 정형 레인을 실행하세요."
+	);
+}
+
+/**
+ * Continues the interrupted run when the user asked the work to go on. It starts a run exactly where a first plan
+ * starts one, under the same conditions: automatic delegation, no run active, this turn's own user prompt, and the
+ * host's start. The bounds a plan is held to apply to the old plan inside the start.
+ */
+async function continueRun(host: StormToolHost): Promise<StormToolReply> {
+	if (host.auto?.().enabled !== true) return rejected(CONTINUE_MANUAL);
+	if (host.runtime.runActive?.() !== false) return rejected(CONTINUE_ACTIVE);
+	const turn = userTurnTask(host, CONTINUE_NO_TURN);
+	if ("outcome" in turn) return turn;
+	// Without a recorded time for the user's message nothing can show that it came after the run stopped: refuse.
+	if (turn.startedAt === undefined) return rejected(CONTINUE_NO_TURN);
+	const start = host.runtime.continueRun;
+	if (start === undefined) return rejected(CONTINUE_NO_HOST);
+	const started = await start(turn.task, turn.startedAt);
+	if (!started.ok) return rejected(started.reason);
+	if (started.continued === undefined) return { outcome: "ok", text: `실행(${started.runId})을 열었습니다.` };
+	return { outcome: "ok", text: continuedText(started.runId, started.continued) };
+}
+
 interface Current {
 	state: ProjectState;
 	config: StormConfig;
@@ -271,6 +325,8 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput, 
 		}
 		case "plan":
 			return submitPlan(host, params.plan);
+		case "continue":
+			return continueRun(host);
 		case "execute": {
 			const lanes = params.lanes;
 			if (lanes === undefined || lanes.length === 0 || lanes.length > MAX_LANES || new Set(lanes).size !== lanes.length) {
@@ -295,6 +351,52 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput, 
 function isolationLine(plan: RunPlan): string | undefined {
 	const isolated = plan.lanes.flatMap((l) => (l.isolationReason === undefined ? [] : [`${l.name} — ${l.isolationReason}`]));
 	return isolated.length === 0 ? undefined : `- 격리(부모 트리 밖 보존): ${isolated.join(" · ")}`;
+}
+
+/**
+ * Shared writers the start will run one at a time, and why. It classifies each lane with the same `lanePolicy` the
+ * task guard uses (same agent definition, isolation and automatic flag), so what the plan says is what the start does.
+ * Two lanes are named when the classification makes one of them an exclusive writer and the plan does not already
+ * order them through `dependsOn`. Lanes that only overlap by path are left to the refusal, which names the paths.
+ */
+function writerOrderLine(config: StormConfig, plan: RunPlan, shadows: readonly ShadowInfo[], auto: boolean): string | undefined {
+	const after = new Map(plan.lanes.map(lane => [lane.name, (lane.dependsOn ?? []).map(dependency => dependency.lane)]));
+	const ordered = (from: string, to: string, seen = new Set<string>()): boolean => {
+		if (seen.has(from)) return false;
+		seen.add(from);
+		return (after.get(from) ?? []).some(next => next === to || ordered(next, to, seen));
+	};
+	const writers: { name: string; exclusive: boolean; why: string }[] = [];
+	for (const lane of plan.lanes) {
+		if (lane.job !== undefined) continue;
+		const agent = config.roles[lane.role]?.agent ?? ROLES.find(role => role.id === lane.role)?.agent;
+		if (agent === undefined) continue;
+		const policy = lanePolicy({
+			lane,
+			tools: effectiveAgentTools(agent, shadows, PLUGIN_AGENTS_DIR),
+			isolated: config.isolation === "isolated" || lane.isolationReason !== undefined,
+			auto,
+		});
+		if (policy.kind === "unknown") writers.push({ name: lane.name, exclusive: true, why: policy.reason });
+		else if (policy.kind === "paths") writers.push({ name: lane.name, exclusive: false, why: "" });
+	}
+	const serial = writers.filter(a =>
+		writers.some(b => b !== a && (a.exclusive || b.exclusive) && !ordered(a.name, b.name) && !ordered(b.name, a.name)),
+	);
+	const exclusive = serial.filter(writer => writer.exclusive);
+	if (exclusive.length === 0) return undefined;
+	const names = serial.map(writer => writer.name);
+	const shown = names.length > 4 ? `${names.slice(0, 4).join(", ")} 외 ${names.length - 4}개` : names.join(", ");
+	const whys = [...new Set(exclusive.map(writer => writer.why))].join("; ");
+	return `- 쓰기 순서: ${shown} 레인은 파일 목록과 무관하게 한 번에 하나씩 시작합니다(${whys}). 호출마다 쓰기 레인은 하나만 담고, 읽기 전용 레인은 함께 보내도 됩니다.`;
+}
+
+/** Isolated lanes cannot start while omp isolation is off; only a proven `false` is reported, never an unknown. */
+function isolationOffLine(plan: RunPlan, enabled: boolean | undefined): string | undefined {
+	if (enabled !== false) return undefined;
+	const names = plan.lanes.filter(lane => lane.isolationReason !== undefined).map(lane => lane.name);
+	if (names.length === 0) return undefined;
+	return `- 격리 불가: ${names.join(", ")} 레인은 omp 격리(task.isolation.enabled)가 꺼져 있어 시작할 수 없습니다. 켜는 것은 사용자의 설정이며, 지금은 isolationReason을 빼야 합니다.`;
 }
 
 /** The one plan line for prerequisites; a plan whose lanes declare none adds no line. */
@@ -366,13 +468,17 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(config, plan)];
 	if (check.warnings.length) body.push("경고:", ...check.warnings.map((w) => `- ${w}`));
 	const auto = host.auto?.();
+	const order = writerOrderLine(config, plan, cur.state.shadows, auto?.enabled === true);
+	if (order !== undefined) body.push(order);
+	const off = isolationOffLine(plan, host.isolationEnabled?.());
+	if (off !== undefined) body.push(off);
 	if (auto?.enabled === true && host.runtime.runActive?.() === false) {
 		// Automatic delegation: this turn's user request is the task, and the plan must be bound before the first spawn.
 		const start = host.runtime.startWithPlan;
 		if (start === undefined) return rejected("이 호스트에서는 자동 위임 실행을 열 수 없습니다. /storm auto를 끄거나 호스트를 업데이트하세요.");
-		const task = auto.task;
-		if (task === undefined || task.trim() === "") return rejected(AUTO_NO_TASK);
-		const spec = runSpec(task);
+		const turn = userTurnTask(host, AUTO_NO_TASK);
+		if ("outcome" in turn) return turn;
+		const spec = runSpec(turn.task);
 		if (!spec.ok) return rejected(spec.error);
 		const started = await start(spec.spec, plan, validatedHash);
 		if (!started.ok) return rejected(started.reason);

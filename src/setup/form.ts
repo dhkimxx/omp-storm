@@ -251,7 +251,7 @@ export function readRoleChoices(input: SetupFormInput, id: RoleId, browse: boole
 	const errors: string[] = [];
 	const min = whole(data, errors, FIELD.workersMin(id), `${title} ${LABEL.workersMin}`, 1, MAX_WORKERS);
 	const max = whole(data, errors, FIELD.workersMax(id), `${title} ${LABEL.workersMax}`, 1, MAX_WORKERS);
-	if (min > max) errors.push(`${title}: ${LABEL.workersMin}(${min})가 ${LABEL.workersMax}(${max})보다 큽니다`);
+	if (min > max) errors.push(`${title}: ${LABEL.workersMin} 값(${min})이 ${LABEL.workersMax} 값(${max})보다 큽니다`);
 	if (errors.length) return { errors };
 	const fallback = choice(data, FIELD.fallback(id), fallbacks.map(([value]) => value), defaults.fallback);
 	return { primary, ...(fallback !== NONE && (fallback !== primary || fallback === BROWSE) ? { fallback } : {}), workers: { min, max } };
@@ -371,7 +371,7 @@ export function setupConfig(input: SetupFormInput, answers: RoleAnswers, data: F
 		if (pick.fallback !== undefined) {
 			picked.push(pick.fallback);
 			if (providerOf(pick.fallback.selector) === providerOf(pick.primary.selector)) {
-				warnings.push(`${title}: 폴백 ${pick.fallback.selector} 은 주 모델과 같은 Provider입니다. 그 Provider의 쿼터가 소진되면 함께 막힙니다.`);
+				warnings.push(`${title}: 폴백 ${pick.fallback.selector} 모델은 주 모델과 같은 Provider입니다. 그 Provider의 쿼터가 소진되면 함께 막힙니다.`);
 			}
 			// The forms know one fallback; the ones the role has behind it stay, in their order and at their efforts.
 			for (const model of before?.models.slice(2) ?? []) {
@@ -403,7 +403,7 @@ export function setupConfig(input: SetupFormInput, answers: RoleAnswers, data: F
 	const warnAtUsd = amount(FIELD.budgetWarn, LABEL.budgetWarn);
 	if (perRunUsd === 0) delete config.budget;
 	else {
-		if (warnAtUsd > perRunUsd) errors.push(`${LABEL.budgetWarn}($${warnAtUsd})이 ${LABEL.budget}($${perRunUsd})보다 큽니다`);
+		if (warnAtUsd > perRunUsd) errors.push(`${LABEL.budgetWarn} 값($${warnAtUsd})이 ${LABEL.budget} 값($${perRunUsd})보다 큽니다`);
 		config.budget = {
 			perRunUsd,
 			...(warnAtUsd === 0 ? {} : { warnAtUsd }),

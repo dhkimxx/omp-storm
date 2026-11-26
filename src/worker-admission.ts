@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { sha256Hex } from "./config/canonical.ts";
 import { writeJsonAtomic } from "./fsutil.ts";
+import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
 import { assertSessionStoreSafe } from "./session-scope.ts";
 
@@ -81,14 +82,14 @@ export type WorkerAdmissionRead =
 
 function identity(value: unknown, what: string): string {
 	if (typeof value !== "string" || value.trim() === "" || CONTROL_CHARS.test(value) || value.length > MAX_ID) {
-		throw new Error(`${what}가 없거나 올바르지 않습니다`);
+		throw new Error(`${withJosa(what, "이/가")} 없거나 올바르지 않습니다`);
 	}
 	return value;
 }
 
 function requireAbsolute(value: unknown, what: string): string {
 	const raw = identity(value, what);
-	if (!path.isAbsolute(raw)) throw new Error(`${what}는 절대 경로여야 합니다`);
+	if (!path.isAbsolute(raw)) throw new Error(`${withJosa(what, "은/는")} 절대 경로여야 합니다`);
 	return raw;
 }
 

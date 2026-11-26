@@ -30,6 +30,7 @@ import { roleTitle } from "./roles.ts";
 import { closeoutHandoff } from "./runtime/closeout.ts";
 import { acquireSessionLease } from "./runtime/lease.ts";
 import { lastRun, runsDir } from "./runtime/run.ts";
+import { stopWords } from "./runtime/rounds.ts";
 import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
 import { formatStorage, readStorage, storageDetailLines } from "./runtime/janitor.ts";
 import { readRunIndex } from "./runtime/run-index.ts";
@@ -72,6 +73,8 @@ export interface FlowEnv extends ProjectEnv {
 	stillOwner: () => boolean;
 	/** Starts a run in this session; absent where the caller cannot start one. */
 	startRun?: (spec: RunSpec) => Promise<RunRequestResult>;
+	/** The user's opt-in to automatic delegation for this session: the director may then continue an interrupted run. */
+	autoEnabled?: () => boolean;
 }
 
 type OkState = ProjectState & { config: Extract<ConfigLoad, { status: "ok" }> };
@@ -530,7 +533,7 @@ export async function setupFlow(env: FlowEnv, ui: UiPort): Promise<void> {
 		form
 			? ""
 			: canPick
-				? `이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 「${EDIT_MODELS}」으로 모델만 바꿀 수 있습니다.`
+				? `이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 「${EDIT_MODELS}」 항목으로 모델만 바꿀 수 있습니다.`
 				: "이 환경에서는 역할별로 고르는 폼을 그릴 수 없습니다. 승인한 뒤 `/storm <요청>` 으로 바꾸세요.",
 	]
 		.filter(Boolean)
@@ -718,6 +721,17 @@ async function statusMarkdown(env: FlowEnv, opts: { quota: boolean }, info?: Inf
 			(await trustedResume(state.sessionDir, state.repo, last))
 		) {
 			view.lastHandoff = closeoutHandoff(last);
+		}
+		// A fact for the model status: whether the director can continue an interrupted run (automatic delegation) or
+		// the user does, and that a plan opens a new one. With no active run and a start available (the menu's, or the
+		// director's under automatic delegation), the same candidate the `/storm` menu would offer.
+		if (view.run === undefined && (env.startRun !== undefined || env.autoEnabled !== undefined)) {
+			const resumable = await findResumeCandidate(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root });
+			if (resumable !== undefined) {
+				view.resumableRunId = resumable.runId;
+				view.resumableEnded = stopWords(resumable.endReason);
+				view.directorMayContinue = env.autoEnabled?.() === true;
+			}
 		}
 	}
 	const body = renderStatus(view, env.now(), opts.quota ? "user" : "model", info);

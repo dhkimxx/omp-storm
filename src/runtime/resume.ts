@@ -140,7 +140,7 @@ function durableRun(item: { entry: ResumeEntry; run: RunRecord }): boolean {
 		entry.resumeOf !== undefined ||
 		(Array.isArray(lanes)
 			? lanes.length > 1 || lanes.some(lane => isRecord(lane) && lane.kind !== "explore")
-			: run.spawns.length > 0 || run.endReason === undefined) ||
+			: run.spawns.length > 0 || run.endReason === undefined || run.endReason === "host-ended") ||
 		(run.checkpoints?.length ?? 0) > 0 ||
 		(run.blockedEdits ?? 0) > 0 ||
 		(run.blockedFollowUps ?? 0) > 0
@@ -270,9 +270,71 @@ export async function resumeCandidate(
 	return (await trustedResume(sessionDir, target, run)) ? run : undefined;
 }
 
-/** A resume spec goes through `runSpec` like a typed request, so its limits are checked the same way. */
+/** What the task of a continued run says about one lane, and the whole task's bound. */
+const TASK_LANE_CHARS = 160;
+const TASK_CHARS = 1_800;
+
+const oneLine = (text: string, max: number): string => {
+	const flat = text.replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim();
+	return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
+/**
+ * The task a continued run carries. A run opened under automatic delegation records the user's chat message of that
+ * turn as its request, and that can be a question ("작업현황") or "go on": it names no work. What the run was for is in
+ * its plan, which the director wrote and the checkpoint carries, so a plan with lanes states the task: each lane with
+ * its goal, else the first result it owes. The earlier request follows, marked as the earlier request: for a run the
+ * user typed it is the user's own wording of the work (constraints included), for a chat turn it is only background,
+ * and the task never leads with it either way. A continuation of a continuation keeps the original request, not the
+ * generated text around it. Without a plan the request is all there is.
+ */
+export function continuationTask(run: RunRecord & { request: string }): string {
+	const lanes = Array.isArray(run.plan?.lanes) ? run.plan.lanes : [];
+	const lines: string[] = [];
+	let used = 0;
+	let omitted = 0;
+	for (const lane of lanes) {
+		if (!isRecord(lane) || typeof lane.name !== "string" || lane.name.trim() === "") continue;
+		const first = Array.isArray(lane.results) ? lane.results.find(result => isRecord(result) && typeof result.criterion === "string") : undefined;
+		const said = typeof lane.goal === "string" && lane.goal.trim() !== "" ? lane.goal : isRecord(first) ? String(first.criterion) : "";
+		const line = `- ${oneLine(lane.name, 80)}${said === "" ? "" : `: ${oneLine(said, TASK_LANE_CHARS)}`}`;
+		if (used + line.length > TASK_CHARS) {
+			omitted += 1;
+			continue;
+		}
+		lines.push(line);
+		used += line.length + 1;
+	}
+	if (lines.length === 0) return run.request;
+	const earlier = earlierRequestOf(run.request);
+	return [
+		CONTINUATION_HEAD,
+		...lines,
+		...(omitted > 0 ? [`- 외 ${omitted}개`] : []),
+		...(earlier === "" ? [] : ["", EARLIER_REQUEST_MARKER, earlier]),
+	].join("\n");
+}
+
+/** First line of a generated continuation task, and the line that introduces the earlier request inside it. */
+export const CONTINUATION_HEAD = "이전 실행의 계획 범위를 이어서 끝냅니다. 레인과 목표:";
+export const EARLIER_REQUEST_MARKER = "이전 요청(참고용 원문):";
+const EARLIER_REQUEST_CHARS = 4_000;
+
+/** The request as the user's turn or command wrote it: what follows the marker of a generated task, else the request. */
+function earlierRequestOf(request: string): string {
+	const at = request.startsWith(CONTINUATION_HEAD) ? request.indexOf(`\n${EARLIER_REQUEST_MARKER}\n`) : -1;
+	const original = at < 0 ? (request.startsWith(CONTINUATION_HEAD) ? "" : request) : request.slice(at + EARLIER_REQUEST_MARKER.length + 2);
+	const flat = original.trim();
+	return flat.length > EARLIER_REQUEST_CHARS ? `${flat.slice(0, EARLIER_REQUEST_CHARS - 1)}…` : flat;
+}
+
+/**
+ * A resume spec goes through `runSpec` like a typed request, so its limits are checked the same way. Its task is the
+ * work (`continuationTask`), whoever asks and however: the `/storm` menu, the closeout card and the director's own
+ * `continue` all start from this one function.
+ */
 export function resumeSpec(run: RunRecord & { request: string }, said?: string): SpecResult {
-	const result = runSpec(run.request, run.limits, run.runId);
+	const result = runSpec(continuationTask(run), run.limits, run.runId);
 	if (!result.ok) return result;
 	return { ok: true, spec: { ...result.spec, ...(said ? { resumeNote: said } : {}) } };
 }

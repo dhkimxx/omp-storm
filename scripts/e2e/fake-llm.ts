@@ -45,6 +45,10 @@
  *                           can be watched without duplicating its native job/result
  *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
  *                           observed deterministically while the child really runs
+ *   E2E-CHILD-FINAL-PAUSE <ms> <marker>
+ *                           when the child's request is the one that answers in text (its turn ends with this reply),
+ *                           create the file `<marker>` and hold the reply that long: a message the parent writes to
+ *                           the child meanwhile lands as the child's turn is ending
  *   E2E-CHILD-GATE <key>   mark this child as waiting and hold its first reply until a scripted wait releases it
  *   E2E-WAKE-GATE <key>    hold the first provider reply to a follow-up, including an already-used child
  *   E2E-CHILD-HOLD          hold the first reply until the parent's context has been compacted (a compaction request
@@ -56,7 +60,7 @@
  *
  * `GET /v1/models` answers the readiness probe. Env: FAKE_LLM_PORT, FAKE_LLM_LOG (both required).
  */
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isRecord } from "../../src/config/schema.ts";
 
@@ -117,7 +121,7 @@ export type Step = (
 	| { storm: Record<string, unknown> }
 	| { task: string[]; as?: string; say?: string; isolated?: boolean[] }
 	| { tasks: ScriptedTask[]; context?: string; awaitChildren?: string[] }
-	| { edit: string }
+	| { edit: string; content?: string }
 	| { bash: string }
 	| { followUp: string; content?: string }
 	| { read: string }
@@ -132,6 +136,16 @@ export type Step = (
 	reviewFor?: string;
 	/** After a host receipt, park an unmet `after` reply until the PTY driver signals release. */
 	releaseFile?: { name: string; receipt: string };
+	/**
+	 * Hold this step's call until the file exists (at most `HOLD_MAX_MS`), so a director write lands at a moment a probe
+	 * marks from the other side (a child's final pause, an extension's end-of-turn delay).
+	 */
+	holdUntilFile?: string;
+	/**
+	 * Sleep this long (at most `HOLD_MAX_MS`) before this step's call is issued, once its own conditions are met. It
+	 * lets a scenario outlast a host timer (omp evicts a consumed job row 30 s after delivery) while the turn stays open.
+	 */
+	pauseMs?: number;
 };
 interface ChatRequest {
 	model: string;
@@ -145,7 +159,7 @@ interface ChatRequest {
 type Decision = (
 	| { kind: "text"; text: string; awaitChild?: boolean }
 	| { kind: "tool"; name: string; args: Record<string, unknown> }
-) & { awaitChildren?: string[]; releaseChildren?: string[]; releaseFile?: string };
+) & { awaitChildren?: string[]; releaseChildren?: string[]; releaseFile?: string; pauseMs?: number; waitFile?: string };
 /** Who a request is from: the main session, a spawned child, Storm's router, a compaction, or omp's own auxiliary calls. */
 export type Who = "main" | "child" | "route" | "compaction" | "side";
 
@@ -156,6 +170,11 @@ export type Who = "main" | "child" | "route" | "compaction" | "side";
 export interface LlmEntry {
 	ts: number;
 	who: Who;
+	/**
+	 * The `[storm:…]` lines this request carries as their own message (a developer message a host hook attached after a
+	 * result; omp sends it as a user message to a provider without that role), in order, each cut to 1,200 chars.
+	 */
+	notes: string[];
 	model: string;
 	effort: string | null;
 	tools: string[];
@@ -530,7 +549,7 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 		return step.awaitChildren === undefined ? decision : { ...decision, awaitChildren: step.awaitChildren };
 	}
 	if ("read" in step) return readCall(tools, step.read);
-	if ("edit" in step) return writeCall(step.edit, "storm director check\n");
+	if ("edit" in step) return writeCall(step.edit, step.content ?? "storm director check\n");
 	if ("bash" in step) return bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, step.content ?? "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
@@ -563,7 +582,9 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 		if (forwarded === undefined) return { kind: "text", text: "waiting" };
 		return stepCall({ ...step, say: `${step.say ?? ""}\n${forwarded}` }, tools);
 	}
-	return stepCall(step, tools);
+	const call = stepCall(step, tools);
+	const paused = step.pauseMs === undefined ? call : { ...call, pauseMs: step.pauseMs };
+	return step.holdUntilFile === undefined ? paused : { ...paused, waitFile: step.holdUntilFile };
 }
 
 /**
@@ -686,6 +707,11 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 	const entry: LlmEntry = {
 		ts: Date.now(),
 		who,
+		notes: request.messages
+			.filter(message => message.role === "developer" || message.role === "user")
+			.map(message => textOf(message.content))
+			.filter(text => text.startsWith("[storm:"))
+			.map(text => text.slice(0, 1_200)),
 		model: request.model,
 		effort: request.reasoning_effort ?? request.reasoning?.effort ?? null,
 		tools: request.tools?.map(tool => tool.function.name) ?? [],
@@ -841,6 +867,15 @@ Bun.serve({
 			}
 		}
 		if (decision.kind === "tool" && decision.name === "task") seen.childrenAtTask = seen.children;
+		if (decision.waitFile !== undefined && !(await hold(() => existsSync(decision.waitFile as string)))) {
+			return gateError(`The marker file never appeared: ${decision.waitFile}`);
+		}
+		if (decision.pauseMs !== undefined) await Bun.sleep(Math.min(decision.pauseMs, HOLD_MAX_MS));
+		const finalPause = who === "child" && decision.kind === "text" ? /E2E-CHILD-FINAL-PAUSE[ \t]+(\d+)[ \t]+(\S+)/.exec(userText(request.messages)) : null;
+		if (finalPause?.[1] !== undefined && finalPause[2] !== undefined) {
+			writeFileSync(finalPause[2], String(Date.now()));
+			await Bun.sleep(Math.min(Number(finalPause[1]), HOLD_MAX_MS));
+		}
 		const delay = childDelayMs(who, request.messages);
 		if (delay > 0) await Bun.sleep(delay);
 		if (decision.kind === "text" && decision.awaitChild) await hold(() => seen.children > seen.childrenAtTask);

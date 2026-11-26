@@ -36,6 +36,7 @@ import {
 	resolveResultLimits,
 	resultContractIdentity,
 } from "./result-evidence.ts";
+import { ATTEMPT_ID_MAX_CHARS } from "./attempt-report.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
 
 /** The bounded proof one accepted row keeps: the S1 item and, for an isolated artifact, its host-bound source. */
@@ -48,7 +49,7 @@ const DIGEST = /^[0-9a-f]{64}$/u;
 const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const UNSAFE_PATH = /[<>:"|?*]/u;
 /** The same attempt-id bound the evidence modules use. */
-const MAX_ATTEMPT_CHARS = 256;
+const MAX_ATTEMPT_CHARS = ATTEMPT_ID_MAX_CHARS;
 /** One retained source absolute path; matches `prepareArtifact`. */
 const MAX_ARTIFACT_PATH = 4_096;
 /** Segments below the trusted artifacts dir: a bound, never a scan. */

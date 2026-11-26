@@ -4,6 +4,7 @@
  * never refuses a follow-up: omp compacts a subagent session itself. The rule covers every agent of the process
  * ledger, whichever run started it.
  */
+import { withJosa } from "../josa.ts";
 import { ROLE_AGENT_PREFIX, roleTitle } from "../roles.ts";
 import type { AgentEntry, Block } from "../types.ts";
 import { pathOf } from "./director.ts";
@@ -17,6 +18,20 @@ export function followUpTarget(toolName: string, input: unknown): string | undef
 	if (path === undefined || !path.startsWith(AGENT_URL)) return undefined;
 	const id = path.slice(AGENT_URL.length).split(/[?/]/, 1)[0];
 	return id || undefined;
+}
+
+/**
+ * Which control of an agent a `write` addresses: `agent://<id>/model` or `agent://<id>/effort` (any id, any case, with or
+ * without a query or a trailing slash). omp lets an agent switch itself or a direct child through these paths; an
+ * ordinary message (`agent://<id>`, `agent://parent`, `?progress`) is not one.
+ */
+export function agentControlTarget(toolName: string, input: unknown): "model" | "effort" | undefined {
+	if (toolName !== "write") return undefined;
+	const path = pathOf(input);
+	if (path === undefined || !path.startsWith(AGENT_URL)) return undefined;
+	const segments = path.slice(AGENT_URL.length).split("?", 1)[0]?.split("/") ?? [];
+	const control = segments[1]?.toLowerCase();
+	return control === "model" || control === "effort" ? control : undefined;
 }
 
 /** The ledger entry a follow-up target names; omp resolves recipient ids ignoring case when no exact one exists. */
@@ -35,10 +50,10 @@ export function followUpBlock(
 	const agent = id === undefined ? undefined : followUpAgent(agents, id);
 	if (!agent) return undefined;
 	if (agent.cleanedAt === undefined) return undefined;
-	const who = `${agent.id}(${agent.role === undefined ? agent.name : roleTitle(agent.role)})`;
+	const who = `${agent.id}(${agent.role === undefined ? agent.name : roleTitle(agent.role)}) 에이전트`;
 	const fresh = agent.role === undefined ? agent.name : `${ROLE_AGENT_PREFIX}${agent.role}`;
-	const next = `새 ${fresh} 를 띄워 agent://${agent.id} 의 결과를 읽고 이어 가게 하세요. 요약을 따로 넘길 필요는 없습니다.`;
-	return { code: "followup-cleaned", reason: `${who}는 정리로 omp 기록이 지워져 후속 지시를 받을 수 없습니다. ${next}` };
+	const next = `새 \`${fresh}\` 에이전트를 띄워 \`agent://${agent.id}\`의 결과를 읽고 이어 가게 하세요. 요약을 따로 넘길 필요는 없습니다.`;
+	return { code: "followup-cleaned", reason: `${withJosa(who, "은/는")} 정리로 omp 기록이 지워져 후속 지시를 받을 수 없습니다. ${next}` };
 }
 
 /**

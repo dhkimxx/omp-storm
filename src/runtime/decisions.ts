@@ -336,7 +336,7 @@ export function decisionAsk(args: unknown): DecisionAskCheck {
 			return {
 				ok: false,
 				code: "default",
-				detail: `'${key}'(${reason})은 범위 변경이나 되돌릴 수 없는 작업입니다. ${problem}; 타임아웃·취소가 승인으로 제출되지 않도록 기본 선택 없이 사용자가 직접 고르게 하세요.`,
+				detail: `결정('${key}', ${reason})은 범위 변경이나 되돌릴 수 없는 작업입니다. ${problem}; 타임아웃·취소가 승인으로 제출되지 않도록 기본 선택 없이 사용자가 직접 고르게 하세요.`,
 			};
 		}
 	}

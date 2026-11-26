@@ -4,6 +4,7 @@
  */
 import { usableRole } from "../policy/spawn.ts";
 import type { AgentEntry, RunEndReason, RunStatus, StormConfig } from "../types.ts";
+import { ATTEMPT_REF } from "./attempt-report.ts";
 import { reviewEvidenceOf, type ReviewEvidence } from "./review.ts";
 import type { TreeState } from "./tree.ts";
 
@@ -33,6 +34,7 @@ export const END_LABEL: Readonly<Record<RunEndReason, string>> = {
 	"no-progress": "진전 없음",
 	"time-limit": "시간 한도",
 	shutdown: "세션 종료",
+	"host-ended": "호스트가 실행 도중 종료",
 	budget: "실행 예산 초과",
 	"start-failed": "실행 계약 전송 실패",
 };
@@ -48,6 +50,7 @@ export const END_STATUS: Readonly<Record<RunEndReason, RunStatus>> = {
 	"no-progress": "stopped",
 	"time-limit": "stopped",
 	shutdown: "stopped",
+	"host-ended": "stopped",
 	budget: "stopped",
 	"start-failed": "stopped",
 };
@@ -55,6 +58,14 @@ export const END_STATUS: Readonly<Record<RunEndReason, RunStatus>> = {
 /** The label of a reason; records written by 0.10 carry reasons that no longer exist, shown as they are. */
 export function endLabel(reason: string): string {
 	return (END_LABEL as Readonly<Record<string, string | undefined>>)[reason] ?? reason;
+}
+
+/** What an interrupted run's stop is called when its record names no reason (written before reasons were kept). */
+export const NO_END_REASON = "이유 기록 없음";
+
+/** The stop of an interrupted run in the words `/storm status` uses; the director reads the same words. */
+export function stopWords(reason: string | undefined): string {
+	return reason === undefined ? NO_END_REASON : endLabel(reason);
 }
 
 /** Why a required check is not proof: no entry, not passed, older than the change, or another tree. */
@@ -715,7 +726,6 @@ const CHECK_PROBLEM: Record<CoverageEvidence, string> = {
 /** Model-facing detail is one bounded line: no control characters and no absolute host path. */
 const UNSAFE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/gu;
 const ABSOLUTE_PATH = /(^|[\s("'=])(?:~\/[^\s)"']*|[A-Za-z]:[\\/][^\s)"']*|\/(?:[^\s/)"']+\/)[^\s)"']*)/gu;
-const ATTEMPT_REF = /^[A-Za-z0-9:._-]{1,64}$/;
 const DETAIL_MAX = 160;
 
 function detail(value: unknown, max = DETAIL_MAX): string | undefined {

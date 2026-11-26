@@ -30,6 +30,7 @@ import {
 	asyncAttemptId,
 	asyncAttemptReport,
 	attemptUsable,
+	deliveredAttemptId,
 	missingAttemptReport,
 	retryAttemptOf,
 	syncAttemptId,
@@ -65,6 +66,8 @@ export interface AttemptSettlementPort {
 	prepare(input: AttemptPreparation): Promise<AttemptAdmission>;
 	/** Evaluate this exact host attempt against the lane contract and persist the result evidence. */
 	settle(input: AttemptSettlement): Promise<void>;
+	/** Drop a prepared dispatch whose follow-up write never reached the worker; no settlement will come for it. */
+	discard?(input: { runId: string; dispatch: string }): Promise<void>;
 }
 
 /** The subset of `AgentRegistryApi` the collector uses, so tests and host versions stay decoupled. */
@@ -162,8 +165,21 @@ interface TrackedAttempt {
 	startedAt: number;
 	priorAttemptIds: string[];
 	expectedAttemptId?: string;
+	/**
+	 * The job `expectedAttemptId` was derived from and when it started, when the host said so. A delivery that names
+	 * this job without a start of its own takes this one, so a reused job id keeps the identity it was bound with.
+	 */
+	expectedJobId?: string;
+	expectedStart?: number;
 	admissionPatch?: HostArtifactCapture | null;
 	toolCallId?: string;
+	/**
+	 * The dispatch this follow-up replaced in `#tracked`, so a write that never reached the worker can give it back.
+	 * The chain runs newest to oldest through every follow-up that has not settled and ends at the last settled
+	 * dispatch; a settlement cuts it. Several writes to one worker in one director message are all admitted before any
+	 * runs, and each failing one must take out exactly its own dispatch.
+	 */
+	previous?: TrackedAttempt;
 	/** A native terminal retry fact observed on this dispatch's own progress; cleared at settlement or expiry. */
 	retry?: { attempt: number; observedAt: number; toolCallId: string };
 	pending?: PendingAsync;
@@ -171,6 +187,20 @@ interface TrackedAttempt {
 	registry?: RegistryObservation;
 	/** Last usable patch this spawn produced; a follow-up's admission baseline when the registry cannot show one. */
 	lastPatch?: HostArtifactCapture;
+	/**
+	 * A follow-up to a worker this run never saw deliver: its history is unknown, so an unbound delivery must prove it
+	 * began after the admission even though no attempt of this run precedes it.
+	 *
+	 * The proof does not apply to a binding made at the write to a job that was already running (the message joined that
+	 * turn). Across runs that job can be a turn the earlier run started, and its answer settles this run's dispatch. That
+	 * is deliberate: omp folded the message into that turn, so its answer is the answer to the message, and refusing it
+	 * would leave the dispatch open for good.
+	 */
+	requiresStartProof?: boolean;
+	/** sha256 of the answer text this dispatch settled usable with. */
+	answerDigest?: string;
+	/** The digest of the answer the worker's last settled turn gave; a follow-up carries it from the dispatch before. */
+	priorAnswerDigest?: string;
 	settled: boolean;
 }
 
@@ -252,6 +282,8 @@ export interface AttemptWaitResultInput {
 	parentId: string;
 	details: unknown;
 	observedAt: number;
+	/** The parent's job rows at that moment; a tentative follow-up binding is looked at again with them. */
+	jobs?: readonly AttemptHostJob[];
 }
 
 export interface AttemptTaskResultInput {
@@ -265,12 +297,25 @@ export interface AttemptTaskResultInput {
 	observedAt: number;
 }
 
+/** One row of the parent session's own async job snapshot (`getAsyncJobSnapshot`); host facts only. */
+export interface AttemptHostJob {
+	id?: unknown;
+	agentId?: unknown;
+	startTime?: unknown;
+	status?: unknown;
+}
+
 export interface AttemptMessageInput {
 	runId: string;
 	parentId: string;
 	/** The host message; only a custom `async-result` envelope with `details.jobs` is read. */
 	message: unknown;
 	observedAt: number;
+	/**
+	 * The parent's job rows at delivery. A delivered job's row is still there (omp evicts it 30 s after delivery), and
+	 * its start time is what tells a follow-up turn from a replay when omp reused the job id.
+	 */
+	jobs?: readonly AttemptHostJob[];
 }
 
 /** One `tool_execution_update` for a task/write call; only `partialResult.details.progress[]` is read. */
@@ -286,15 +331,12 @@ export interface AttemptProgressInput {
 export interface AttemptFollowUpJobInput {
 	runId: string;
 	spawnKey: string;
-	jobs: readonly {
-		id?: unknown;
-		agentId?: unknown;
-		startTime?: unknown;
-		status?: unknown;
-	}[];
+	jobs: readonly AttemptHostJob[];
 }
 
 const HOST_VERSION = UNKNOWN_HOST_VERSION;
+
+const digestOf = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -799,20 +841,37 @@ export class AttemptCollector {
 	}
 
 	/**
-	 * Admission of a `write agent://<id>` turn. The pre-write baseline is the state before that turn. A child that
-	 * this run did not admit is left alone (no baseline, no settlement).
+	 * Admission of a `write agent://<id>` turn. The pre-write baseline is the state before that turn. A lane with no
+	 * declared results is left alone (no baseline, no settlement).
+	 *
+	 * The worker may belong to an earlier run of the same session (the next run reuses a live worker, or the collector
+	 * was stopped when the conversation was re-opened): this run has no attempt of it to follow. The turn is still this
+	 * run's work for the lane the extension bound it to, so it gets its own dispatch. Its history is whatever the
+	 * collector still knows of the worker's earlier jobs (to refuse their replays); with none, a delivery must prove by
+	 * its own start that it began after this admission. A host process that was restarted knows no worker of the
+	 * earlier process at all (the agent ledger and the run ledger live in memory), so no write reaches this method.
 	 */
 	async admitFollowUp(input: AttemptFollowUpInput): Promise<AttemptAdmission> {
 		const previous = this.#tracked.get(input.spawnKey);
 		const lane = input.lane !== undefined && input.lane.results !== undefined && input.lane.results.length > 0 ? input.lane : undefined;
 		if (lane === undefined) return { ok: true };
-		if (previous === undefined || previous.runId !== input.runId) return { ok: true };
 		this.start();
-		// A follow-up cannot start while the previous turn's patch is still pending; fail it closed first.
-		if (previous.pending !== undefined) await this.#settlePending(previous, true);
+		const sameRun = previous !== undefined && previous.runId === input.runId;
+		// A worker this run never tracked was bound to the lane only by its role (a helper left over from an earlier run).
+		// While the lane has an open dispatch of this run, or a worker of its own still running, that helper must not take
+		// the lane over: a dispatch opened for it would fence out the lane's own worker and its answer, which is the
+		// lane's result, would be dropped as older. The write goes through as plain help, with no dispatch to settle.
+		if (!sameRun && this.#laneHasOpenDispatch(input.runId, lane.name, input.spawnKey)) return { ok: true };
+		// A follow-up cannot start while the previous turn's patch is still pending; fail it closed first. Another run's
+		// pending delivery has nobody to settle into any more.
+		if (previous?.pending !== undefined) {
+			if (sameRun) await this.#settlePending(previous, true);
+			else this.#clearPending(previous);
+		}
 		const dispatch = this.#dispatch(input.spawnKey, input.startedAt);
 		const requiresPatch = input.artifactMode === "isolated" && lane.results?.some(result => result.kind === "artifact") === true;
-		const admissionPatch = requiresPatch ? await this.#admissionPatch(input.spawnKey, previous.lastPatch, false) : undefined;
+		const admissionPatch = requiresPatch ? await this.#admissionPatch(input.spawnKey, previous?.lastPatch, false) : undefined;
+		const priorDigest = previous?.answerDigest ?? previous?.priorAnswerDigest;
 		const tracked: TrackedAttempt = {
 			runId: input.runId,
 			lane: lane.name,
@@ -823,8 +882,11 @@ export class AttemptCollector {
 			artifactMode: input.artifactMode,
 			requiresPatch,
 			startedAt: input.startedAt,
-			priorAttemptIds: [...previous.priorAttemptIds],
+			priorAttemptIds: this.#knownAttempts(input.spawnKey, previous),
 			settled: false,
+			...(sameRun ? {} : { requiresStartProof: true }),
+			...(previous === undefined ? {} : { previous }),
+			...(priorDigest === undefined ? {} : { priorAnswerDigest: priorDigest }),
 			...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
 			...(admissionPatch === undefined ? {} : { admissionPatch }),
 		};
@@ -834,23 +896,89 @@ export class AttemptCollector {
 		return { ok: true };
 	}
 
+	/** Whether another worker of this run has an unsettled dispatch on `lane` (its first turn or a follow-up). */
+	#laneHasOpenDispatch(runId: string, lane: string, except: string): boolean {
+		for (const tracked of this.#tracked.values()) {
+			if (tracked.runId === runId && tracked.lane === lane && tracked.spawnKey !== except && !tracked.settled) return true;
+		}
+		return false;
+	}
+
 	/**
-	 * Binds the exact new async job of an accepted follow-up from the parent session's own job snapshot. Without this,
-	 * a same-agent follow-up's first delivery is stale by design (`priorAttemptIds` is non-empty).
+	 * The `write agent://<id>` of an admitted follow-up never woke the worker (Storm or the host refused it, or it
+	 * failed): its dispatch would stay open for the rest of the run and the lane would read as running. It is dropped,
+	 * and whatever it replaced is given back. The call id names the dispatch, wherever it stands in the chain of
+	 * unsettled follow-ups: the newest one hands the worker back to its predecessor, an older one (another write of the
+	 * same director message that was admitted after it) is cut out of the chain. A write whose job was bound did wake
+	 * the worker, so a late error report on it changes nothing; so does any other call's failure.
+	 */
+	async abandonFollowUp(input: { runId: string; spawnKey: string; toolCallId: string }): Promise<void> {
+		const head = this.#tracked.get(input.spawnKey);
+		if (head === undefined || head.runId !== input.runId) return;
+		let newer: TrackedAttempt | undefined;
+		let tracked: TrackedAttempt | undefined = head;
+		while (tracked !== undefined && !(tracked.followUp && !tracked.settled && tracked.toolCallId === input.toolCallId)) {
+			newer = tracked;
+			tracked = tracked.previous;
+		}
+		if (tracked === undefined || tracked.expectedAttemptId !== undefined) return;
+		this.#clearPending(tracked);
+		if (newer !== undefined) {
+			if (tracked.previous === undefined) delete newer.previous;
+			else newer.previous = tracked.previous;
+		} else if (tracked.previous === undefined) this.#tracked.delete(input.spawnKey);
+		else this.#tracked.set(input.spawnKey, tracked.previous);
+		try {
+			await this.#deps.port.discard?.({ runId: tracked.runId, dispatch: tracked.dispatch });
+		} catch {
+			// The collector never throws into an omp event handler; a dispatch left open is the old behavior.
+		}
+	}
+
+	/**
+	 * Binds the exact async job of an accepted follow-up from the parent session's own job snapshot. Without it a
+	 * same-agent follow-up's first delivery is unbound, and an unbound delivery needs its own proof (see
+	 * `#unboundDelivery`). The job is the one omp registered for the woken or revived worker (it started at or after
+	 * the admission), or the one still running when the message joined an open turn. When omp reused the agent id for
+	 * it, the attempt id carries the job's start time so it is not mistaken for the earlier turn's replay.
 	 */
 	bindFollowUpJobs(input: AttemptFollowUpJobInput): void {
 		const tracked = this.#tracked.get(input.spawnKey);
 		if (tracked === undefined || tracked.runId !== input.runId || tracked.settled || !tracked.followUp) return;
-		const candidates = input.jobs.filter(job => {
-			if (typeof job.agentId !== "string" || job.agentId !== input.spawnKey) return false;
+		this.#bindFrom(tracked, input.jobs);
+	}
+
+	/**
+	 * Picks the job a follow-up dispatch stands for out of the parent's job rows. A job of this worker that started at
+	 * or after the admission is the turn the message woke or revived; when the worker was still finishing its earlier
+	 * turn the rows hold that job too (still running, started before the write), and it is not this one. Only when no job
+	 * started after the admission is the one job still running the open turn the message joined: omp folds the message
+	 * into that turn, so its answer is the answer to the message. The binding is made once, at the write, and is not
+	 * looked at again at delivery. A host that instead queued the message to run as a new job after the open turn ended,
+	 * whose job is not yet in the rows at the write, is not covered: the open turn's answer settles the dispatch and the
+	 * queued turn's answer is then unbound. omp 19.2.1 was not seen to do that. A later job of the worker that no write of
+	 * this dispatch started (a quiet progress note can wake an idle worker) must never take the binding over: that dropped
+	 * the real answer. More than one candidate binds nothing.
+	 */
+	#bindFrom(tracked: TrackedAttempt, jobs: readonly AttemptHostJob[]): void {
+		const mine = jobs.filter(job => {
+			if (typeof job.agentId !== "string" || job.agentId !== tracked.spawnKey) return false;
 			if (typeof job.id !== "string" || job.id === "") return false;
-			if (typeof job.startTime !== "number" || !Number.isFinite(job.startTime)) return false;
-			return job.startTime >= tracked.startedAt;
+			return typeof job.startTime === "number" && Number.isFinite(job.startTime);
 		});
+		const fresh = mine.filter(job => (job.startTime as number) >= tracked.startedAt);
+		const open = mine.filter(job => job.status === "running");
+		const candidates = fresh.length > 0 ? fresh : open;
 		if (candidates.length !== 1) return;
 		const jobId = candidates[0]?.id;
-		const attemptId = typeof jobId === "string" ? asyncAttemptId(jobId, input.spawnKey) : undefined;
-		if (attemptId !== undefined) tracked.expectedAttemptId = attemptId;
+		const startTime = candidates[0]?.startTime;
+		if (typeof jobId !== "string" || typeof startTime !== "number") return;
+		const plain = asyncAttemptId(jobId, tracked.spawnKey);
+		const attemptId = plain !== undefined && tracked.priorAttemptIds.includes(plain) ? asyncAttemptId(jobId, tracked.spawnKey, startTime) : plain;
+		if (attemptId === undefined) return;
+		tracked.expectedAttemptId = attemptId;
+		tracked.expectedJobId = jobId;
+		tracked.expectedStart = startTime;
 	}
 
 	/**
@@ -956,8 +1084,12 @@ export class AttemptCollector {
 			if (agentId === undefined) continue;
 			const tracked = this.#tracked.get(agentId);
 			if (tracked === undefined || tracked.runId !== input.runId || tracked.settled) continue;
+			const row = input.jobs?.find(candidate => candidate.id === job.jobId && candidate.agentId === agentId);
+			// A delivered job is never running: when omp reused the job id, a running row is the *next* turn's, and its
+			// start says nothing about the turn being delivered.
+			const start = row?.status !== "running" && typeof row?.startTime === "number" && Number.isFinite(row.startTime) ? row.startTime : undefined;
 			// Only this job's own output, never the notice frame or a sibling job's answer.
-			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobOutput(envelope.content, jobs, index, agentId));
+			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobOutput(envelope.content, jobs, index, agentId), start);
 		}
 	}
 
@@ -989,18 +1121,26 @@ export class AttemptCollector {
 			// terminal settlement must not precede it. A pre-admission job (another turn or a reused child) is ignored.
 			const settledAt = typeof job.settledAtMs === "number" && Number.isFinite(job.settledAtMs) ? job.settledAtMs : undefined;
 			if (settledAt === undefined || settledAt < tracked.startedAt) continue;
-			const attemptId = asyncAttemptId(jobId, agentId);
+			// The row's own start: a settled job's duration runs from its start to `settledAtMs`.
+			const duration = typeof job.durationMs === "number" && Number.isFinite(job.durationMs) ? job.durationMs : undefined;
+			const evidence = duration === undefined ? undefined : settledAt - duration;
+			if (this.#unprovenRepeat(tracked, jobId, agentId, evidence, output?.text)) {
+				await this.#settleReplayed(tracked, "wait-result", input.observedAt);
+				continue;
+			}
+			const startTime = this.#deliveryStart(tracked, jobId, evidence);
+			const attemptId = deliveredAttemptId(this.#subject(tracked), jobId, agentId, startTime);
 			if (attemptId === undefined) continue;
 			// Once the host named the exact job, only that job can settle this dispatch.
 			if (tracked.expectedAttemptId !== undefined && tracked.expectedAttemptId !== attemptId) continue;
-			// A follow-up/reused child has attempt history: its wait row must be the exact job bound to this turn. A row
-			// that merely shares the agent id is the old turn's result and must not resurrect it.
-			if ((tracked.followUp || tracked.priorAttemptIds.length > 0) && tracked.expectedAttemptId === undefined) continue;
+			// A dispatch with attempt history needs proof that this row is its own turn, not the earlier turn's result.
+			if (tracked.expectedAttemptId === undefined && !this.#unboundDelivery(tracked, jobId, attemptId, evidence)) continue;
 			const structured = record(job.structured) ? job.structured : undefined;
 			const fact: AsyncJobFact = {
 				jobId,
 				agentId,
 				status,
+				...(startTime === undefined ? {} : { startTime }),
 				...(structured === undefined
 					? {}
 					: { schema: { status: structured.status, error: structured.error } }),
@@ -1020,6 +1160,68 @@ export class AttemptCollector {
 		await this.#observeRegistry(event);
 	}
 
+	/** The start that tells which turn a delivered job is: the delivery's own evidence, else the bound job's. */
+	#deliveryStart(tracked: TrackedAttempt, jobId: string, evidence: number | undefined): number | undefined {
+		if (evidence !== undefined) return evidence;
+		return tracked.expectedJobId === jobId ? tracked.expectedStart : undefined;
+	}
+
+	/**
+	 * A delivery under a job id this worker already settled, whose start the binding alone supplies, can be the earlier
+	 * turn delivered again as easily as the follow-up's own turn: nothing the host said tells them apart. When its
+	 * answer is also the very text the earlier turn gave, it is taken for the repeat and left unrecorded; a delivery
+	 * that brings its own start (a wait row's duration, the parent's job row) is never judged this way, so a worker that
+	 * really answers the same thing twice is still recorded. omp 19.2.1 always supplies the start, so this only
+	 * hardens the case where it does not.
+	 *
+	 * The digest is only the text of the worker's last answer that a dispatch *settled* usable. An answer that was
+	 * delivered but never settled (a delivery that arrived after its run ended, or one skipped for belonging to another
+	 * run) leaves no digest, so a redelivery of it is not recognised here; that needs a host that redelivers a consumed
+	 * job, which omp 19.2.1 was not seen to do. A refused repeat settles the dispatch (see `#settleReplayed`): the lane
+	 * stops reading as running and the earlier verdict stands.
+	 */
+	#unprovenRepeat(tracked: TrackedAttempt, jobId: string, agentId: unknown, evidence: number | undefined, text: string | undefined): boolean {
+		if (evidence !== undefined || tracked.expectedJobId !== jobId || tracked.priorAnswerDigest === undefined) return false;
+		const plain = typeof agentId === "string" ? asyncAttemptId(jobId, agentId) : undefined;
+		if (plain === undefined || !tracked.priorAttemptIds.includes(plain)) return false;
+		const own = hostText(text);
+		return own !== undefined && digestOf(own) === tracked.priorAnswerDigest;
+	}
+
+	/**
+	 * Closes a dispatch whose delivery was refused as the earlier turn's repeat. Left open it would hold the lane as
+	 * running for the rest of the run and, at the end, rewrite a row that was accepted. The report is a missing
+	 * `attempt-replayed` one: the controller keeps an accepted row of the same contract and never reads the text.
+	 */
+	async #settleReplayed(tracked: TrackedAttempt, channel: "async-result" | "wait-result", observedAt: number): Promise<void> {
+		await this.#settleReport(
+			tracked,
+			missingAttemptReport(this.#subject(tracked), { channel, observedAt, hostVersion: HOST_VERSION, reason: "attempt-replayed" }),
+			{},
+		);
+	}
+
+	/**
+	 * Whether a delivery may settle a dispatch the host never named a job for. A dispatch with no attempt history takes
+	 * its first delivery as before. One with history (a follow-up after a settled turn) needs proof that the job began
+	 * after the dispatch was admitted: that start is what makes the job this turn's and not the earlier one's replay.
+	 * On proof the dispatch is bound to the job, exactly as if the snapshot had named it at the write.
+	 */
+	#unboundDelivery(tracked: TrackedAttempt, jobId: string, attemptId: string, evidence: number | undefined): boolean {
+		if (tracked.priorAttemptIds.length === 0 && tracked.requiresStartProof !== true) return true;
+		// Clock assumption: a job's start (omp's `startTime`, or a wait row's `settledAtMs - durationMs`) and the dispatch's
+		// admission time (`startedAt`, Storm's `Date.now()` in the `tool_call` hook) come from one process's wall clock,
+		// and omp registers the job after the hook ran. Equal times count as later. The comparison is exact on purpose:
+		// a tolerance window would let the earlier turn's replay in. It also means that a wall clock stepping backwards
+		// between the hook and the job's registration makes a real new turn read as stale: the delivery is then left
+		// unrecorded and the lane keeps reading as running, which fails closed; a bound dispatch is not affected.
+		if (evidence === undefined || evidence < tracked.startedAt) return false;
+		tracked.expectedAttemptId = attemptId;
+		tracked.expectedJobId = jobId;
+		tracked.expectedStart = evidence;
+		return true;
+	}
+
 	async #prepare(tracked: TrackedAttempt): Promise<AttemptAdmission> {
 		try {
 			return await this.#deps.port.prepare({
@@ -1036,6 +1238,17 @@ export class AttemptCollector {
 		} catch {
 			return { ok: false, reason: "결과 기준선을 준비하지 못해 작업을 시작하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." };
 		}
+	}
+
+	/**
+	 * The attempt ids a follow-up's delivery must not be mistaken for. With the worker's earlier dispatch at hand those
+	 * are its settled ones; with none, the worker's first job (omp names it by the agent id) is assumed to have run, so
+	 * its replay is refused and a later turn under that reused id carries its own start in its id.
+	 */
+	#knownAttempts(spawnKey: string, previous: TrackedAttempt | undefined): string[] {
+		if (previous !== undefined) return [...previous.priorAttemptIds];
+		const first = asyncAttemptId(spawnKey, spawnKey);
+		return first === undefined ? [] : [first];
 	}
 
 	#dispatch(spawnKey: string, startedAt: number): string {
@@ -1110,11 +1323,30 @@ export class AttemptCollector {
 		return true;
 	}
 
-	async #observeAsyncJob(tracked: TrackedAttempt, job: Record<string, unknown>, observedAt: number, output: NativeJobOutput | undefined): Promise<void> {
+	async #observeAsyncJob(
+		tracked: TrackedAttempt,
+		job: Record<string, unknown>,
+		observedAt: number,
+		output: NativeJobOutput | undefined,
+		evidence: number | undefined,
+	): Promise<void> {
+		const jobId = typeof job.jobId === "string" ? job.jobId : undefined;
+		if (jobId !== undefined && this.#unprovenRepeat(tracked, jobId, job.agentId, evidence, output?.text)) {
+			await this.#settleReplayed(tracked, "async-result", observedAt);
+			return;
+		}
+		const startTime = jobId === undefined ? undefined : this.#deliveryStart(tracked, jobId, evidence);
+		if (tracked.expectedAttemptId === undefined && jobId !== undefined) {
+			const attemptId = deliveredAttemptId(this.#subject(tracked), jobId, job.agentId, startTime);
+			// With attempt history the replay guard refuses an unproven repeat; a dispatch with none (the worker is new to
+			// this collector) has only the start to go by.
+			if (attemptId !== undefined && !this.#unboundDelivery(tracked, jobId, attemptId, evidence) && tracked.requiresStartProof === true) return;
+		}
 		const fact: AsyncJobFact = {
 			jobId: job.jobId,
 			agentId: job.agentId,
 			status: job.status,
+			...(startTime === undefined ? {} : { startTime }),
 			schema: record(job.schema)
 				? { status: job.schema.status, error: job.schema.error }
 				: undefined,
@@ -1321,8 +1553,11 @@ export class AttemptCollector {
 		tracked.settled = true;
 		this.#clearPending(tracked);
 		delete tracked.retry;
+		delete tracked.previous;
 		if (attemptUsable(report) && report.attemptId !== undefined) {
 			if (!tracked.priorAttemptIds.includes(report.attemptId)) tracked.priorAttemptIds.push(report.attemptId);
+			const delivered = hostText(answer.text);
+			if (delivered !== undefined) tracked.answerDigest = digestOf(delivered);
 			const patch = report.artifacts.find(artifact => artifact.kind === "patch");
 			if (patch?.digest !== undefined) {
 				tracked.lastPatch = {

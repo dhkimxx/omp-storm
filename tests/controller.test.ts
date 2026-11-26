@@ -16,7 +16,7 @@ import {
 	resetCloseoutChoices,
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
-import { noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
+import { fenceAfterDiscard, noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { activeMs } from "../src/runtime/goal.ts";
 import { processKey, readTrustedRuns, recordTrustedRun } from "../src/runtime/janitor.ts";
 import { activeLedgerRun, getLedgerRun, recordCost, resetLedger } from "../src/runtime/ledger.ts";
@@ -3649,6 +3649,53 @@ describe("declared results", () => {
 		await until(() => h.controller.active()?.results?.find(item => item.id === "checked-change")?.state === "accepted");
 		const row = h.controller.active()?.results?.find(item => item.id === "checked-change");
 		expect(row).toMatchObject({ state: "accepted", lane: "write", attemptId: `job:job-8:${spawnKey}` });
+	});
+
+	test("a discarded follow-up gives the lane's fence back to the newest attempt that settled, even one that failed: the older evidence stays superseded", async () => {
+		const agents: AgentEntry[] = [];
+		const config: StormConfig = { ...SESSION_TEAM, requiredChecks: [{ name: "unit-result", argv: ["/bin/sh", "-c", "true"] }] };
+		const h = session({ agents, config, tree: () => treeAt() });
+		const runId = await h.start();
+		const target = "checked-result.txt";
+		const plan = planFor(
+			[{ name: "write", kind: "code", role: "implementer", files: [target], results: [{ id: "checked-change", kind: "change", criterion: "the checked change is present", check: "unit-result" }] }],
+			{ implementer: 1 },
+		);
+		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
+		const spawnKey = admit(h, plan, agents, "write");
+		const writer = agents.find(item => item.id === spawnKey);
+		if (writer === undefined) throw new Error("the lane was not admitted");
+		writer.changes = 1;
+		writer.lastChangeAt = T0;
+		const input = (dispatch: string, followUp: boolean, startedAt: number) => ({ runId, lane: "write", spawnKey, parentId: "main", dispatch, followUp, artifactMode: "shared" as const, startedAt });
+		const settle = (dispatch: string, startedAt: number, attemptId: string, outcome: "success" | "failure") =>
+			h.controller.settleAttempt({ runId, lane: "write", spawnKey, parentId: "main", dispatch, startedAt, observedAt: startedAt + 1, report: report({ runId, spawnKey, attemptId, outcome, observedAt: startedAt + 1 }), citations: [] });
+		const rowOf = () => h.controller.active()?.results?.find(item => item.id === "checked-change");
+		// D1 succeeds but waits for the approved check; the follow-up D2 settles as a failure; D3's write fails.
+		expect(await h.controller.prepareAttempt(input("g1", false, T0))).toEqual({ ok: true });
+		await writeFile(path.join(root, target), "checked\n");
+		await settle("g1", T0, `job:job-g1:${spawnKey}`, "success");
+		expect(rowOf()).toMatchObject({ state: "reviewable" });
+		expect(await h.controller.prepareAttempt(input("g2", true, T0 + 2))).toEqual({ ok: true });
+		await settle("g2", T0 + 2, `job:job-g2:${spawnKey}`, "failure");
+		expect(rowOf()).toMatchObject({ state: "unmet", attemptId: `job:job-g2:${spawnKey}` });
+		expect(await h.controller.prepareAttempt(input("g3", true, T0 + 4))).toEqual({ ok: true });
+		await h.controller.discardAttempt({ runId, dispatch: "g3" });
+		// The check runs for the tree as it is; D1's evidence is older than D2's failure and must not come back over it.
+		await h.turn();
+		h.timers.fire();
+		await h.turn();
+		expect(rowOf()).toMatchObject({ state: "unmet", attemptId: `job:job-g2:${spawnKey}` });
+	});
+
+	test("the fence a dropped dispatch leaves is the newest attempt that is real: open, or settled in any outcome", () => {
+		// D1 settled as a success (epoch 1), D2 settled as a failure (epoch 2), D3's write failed (epoch 3 dropped).
+		expect(fenceAfterDiscard(2, [])).toBe(2);
+		expect(fenceAfterDiscard(2, [1])).toBe(2);
+		// An older open dispatch of the lane keeps its own epoch when no newer one settled.
+		expect(fenceAfterDiscard(undefined, [1])).toBe(1);
+		expect(fenceAfterDiscard(1, [2])).toBe(2);
+		expect(fenceAfterDiscard(undefined, [])).toBe(0);
 	});
 
 	test("a replan cannot rewrite an obligation under the same id; the refused plan leaves the old contract in force", async () => {

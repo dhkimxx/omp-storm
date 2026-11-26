@@ -7,6 +7,7 @@
 import { tokens } from "../report/agents.ts";
 import { roleTitle } from "../roles.ts";
 import type { AgentEntry, AgentLiveState, LaneNeed, PlanLaneResult, RunRecord, RunResultState } from "../types.ts";
+import { ATTEMPT_ID_MAX_CHARS } from "./attempt-report.ts";
 import { reviewTotals } from "./review.ts";
 import { runRecordRef } from "./run.ts";
 
@@ -30,7 +31,6 @@ const MAX_DEPENDENCIES = 8;
 const MAX_RESULT_REASON = 100;
 /** One field of a result contract (criterion, path, contains, check); the stored contract keeps the whole text. */
 const MAX_CONTRACT_FIELD = 120;
-const MAX_ATTEMPT = 64;
 const MAX_EDGE_NAME = 60;
 /** Hard cap on the whole ledger; longer text points at the run record instead of replaying it. */
 const MAX_STATE_BYTES = 6_000;
@@ -179,7 +179,7 @@ function appendPlanState(out: string[], run: RunRecord, details = false): void {
 		out.push(`필수 결과 ${results.length}개 (요구 id는 재계획에도 유지):`);
 		for (const row of results.slice(0, MAX_RESULTS)) {
 			const lane = row.lane === undefined ? "미배정" : `레인 ${oneLine(row.lane, MAX_NAME)}`;
-			const attempt = row.attemptId === undefined ? "" : ` · 시도 ${oneLine(row.attemptId, MAX_ATTEMPT)}`;
+			const attempt = row.attemptId === undefined ? "" : ` · 시도 ${oneLine(row.attemptId, ATTEMPT_ID_MAX_CHARS)}`;
 			const reason = row.reason === undefined ? "" : ` · ${oneLine(row.reason, MAX_RESULT_REASON)}`;
 			out.push(`- ${oneLine(row.id, MAX_NAME)} = ${RESULT_STATE_LABEL[row.state]} · ${lane}${attempt}${reason}`);
 			if (details && row.lane === undefined && row.contract !== undefined) out.push(`  계약: ${contractText(row.contract)}`);

@@ -6,6 +6,7 @@
  */
 import type { InfoTone, RunRecord, RunResult, RunResultState } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
+import { ATTEMPT_REF } from "../runtime/attempt-report.ts";
 
 /** Bounds are part of the display contract: no surface may show a longer fragment than this. */
 const RESULT_ID_MAX = MAX_RESULT_ID;
@@ -37,8 +38,6 @@ const RESULT_REMEDIES: Readonly<Record<NonNullable<RunResult["remedy"]>, true>> 
 /** Control characters, Unicode line separators, and bidi controls: never allowed to reach a terminal line. */
 const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
 const UNSAFE_TEST = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/;
-/** A host attempt id is a short token; anything path-like is omitted rather than shown as evidence. */
-const HOST_REF = /^[A-Za-z0-9:._-]{1,64}$/;
 const ABSOLUTE_PATH = /^(?:\/|\\|[A-Za-z]:[\\/]|~)/;
 
 /** One bounded, single-line presentation value; control and bidi characters become spaces and runs collapse. */
@@ -85,6 +84,8 @@ export interface ResultRow {
 	/** The operator excluded this requirement; its state is unchanged and it never counts as in scope. */
 	readonly excluded: boolean;
 	readonly remedy?: NonNullable<RunResult["remedy"]>;
+	/** Finalization closed this row before any judgment: its `unmet` is a placeholder, not a verdict. */
+	readonly closedUnjudged: boolean;
 	readonly reason?: string;
 	readonly unblock?: string;
 	/** Safe host attempt reference, when one was observed. */
@@ -101,7 +102,10 @@ export interface ResultCounts {
 	/** In-scope state counts; these sum to `inScope`. */
 	readonly accepted: number;
 	readonly reviewable: number;
+	/** Judged unmet only; a row closed before any judgment is counted in `unjudged`. */
 	readonly unmet: number;
+	/** In-scope rows finalization closed before any judgment (state `unmet`, marker `unsettled`). */
+	readonly unjudged: number;
 	readonly running: number;
 	readonly pending: number;
 	/** In-scope rows whose trusted remedy is a structured blocker, and those whose retry route is exhausted. */
@@ -163,7 +167,7 @@ function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: Reado
 		typeof result.remedy === "string" && Object.hasOwn(RESULT_REMEDIES, result.remedy)
 			? (result.remedy as NonNullable<RunResult["remedy"]>)
 			: undefined;
-	const attempt = typeof result.attemptId === "string" && HOST_REF.test(result.attemptId) ? result.attemptId : undefined;
+	const attempt = typeof result.attemptId === "string" && ATTEMPT_REF.test(result.attemptId) ? result.attemptId : undefined;
 	const source = sourceRef(result);
 	const excluded = result.scope === RESULT_SCOPE_EXCLUDED;
 	const running = !excluded && (state === "pending" || state === "unmet") &&
@@ -177,6 +181,7 @@ function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: Reado
 		stateLabel: running ? "진행 중" : RESULT_STATE_LABEL[state],
 		running,
 		excluded,
+		closedUnjudged: !excluded && state === "unmet" && result.finalized === "unsettled",
 		...(remedy === undefined ? {} : { remedy }),
 		...(reason === undefined ? {} : { reason }),
 		...(unblock === undefined ? {} : { unblock }),
@@ -249,7 +254,7 @@ function firstByRank(rows: readonly ResultRow[]): ResultRow | undefined {
 
 function toneOf(counts: ResultCounts): InfoTone {
 	if (counts.inScope === 0) return "muted";
-	if (counts.blocked > 0 || counts.exhausted > 0 || counts.unmet > 0) return "warning";
+	if (counts.blocked > 0 || counts.exhausted > 0 || counts.unmet > 0 || counts.unjudged > 0) return "warning";
 	if (counts.reviewable > 0 || counts.pending > 0) return "accent";
 	if (counts.accepted === counts.inScope) return "success";
 	return "accent";
@@ -290,6 +295,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 	let accepted = 0;
 	let reviewable = 0;
 	let unmet = 0;
+	let unjudged = 0;
 	let running = 0;
 	let pending = 0;
 	let blocked = 0;
@@ -307,7 +313,10 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 				continue;
 			}
 			if (row.state === "reviewable") reviewable++;
-			else if (row.state === "unmet") unmet++;
+			else if (row.state === "unmet") {
+				if (row.closedUnjudged) unjudged++;
+				else unmet++;
+			}
 			else pending++;
 			if (row.remedy === "blocked") blocked++;
 			else if (row.remedy === "retry") exhausted++;
@@ -319,6 +328,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 		accepted,
 		reviewable,
 		unmet,
+		unjudged,
 		running,
 		pending,
 		blocked,
@@ -333,6 +343,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 		parts.push(`이행 ${counts.accepted}/${inScope}`);
 		if (counts.reviewable > 0) parts.push(`검토 가능 ${counts.reviewable}`);
 		if (counts.unmet > 0) parts.push(`미충족 ${counts.unmet}`);
+		if (counts.unjudged > 0) parts.push(`판정 전 종료 ${counts.unjudged}`);
 		if (counts.running > 0) parts.push(`진행 중 ${counts.running}`);
 		if (counts.pending > 0) parts.push(`대기 ${counts.pending}`);
 		if (counts.exhausted > 0) parts.push(`재시도 소진 ${counts.exhausted}`);
@@ -365,6 +376,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 				row.attempt,
 				row.source,
 				row.remedy,
+				row.closedUnjudged,
 			]),
 		]),
 	};

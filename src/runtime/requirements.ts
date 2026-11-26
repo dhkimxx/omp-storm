@@ -314,7 +314,7 @@ function conflict(known: readonly RequirementIdentity[], plan: RunPlan): string 
 	for (const lane of plan.lanes) {
 		for (const result of lane.results ?? []) {
 			if (seen.has(result.id)) {
-				return `결과 id '${result.id}'가 계획 안에서 중복되었습니다. 한 id는 하나의 필수 요구만 뜻합니다.`;
+				return `'${result.id}' 결과 id가 계획 안에서 중복되었습니다. 한 id는 하나의 필수 요구만 뜻합니다.`;
 			}
 			seen.add(result.id);
 			const identity = resultContractIdentity(result);

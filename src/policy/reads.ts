@@ -178,7 +178,7 @@ export function directorRead(input: { runId: string; path: unknown; cwd: string;
 		indexed: true,
 		block: {
 			code: "read-large",
-			reason: `${shown} 은(는) 이 실행의 서브에이전트(${named}${more})가 읽은 파일인데 ${target.lines}줄을 요청해 막았습니다(한 번에 ${MAX_RANGE_LINES}줄까지). 근거 위치만 좁혀 읽으세요(예: ${shown}:120-180). ${next}`,
+			reason: `${shown} 파일은 이 실행의 서브에이전트(${named}${more})가 읽었는데${target.lines}줄을 요청해 막았습니다(한 번에 ${MAX_RANGE_LINES}줄까지). 근거 위치만 좁혀 읽으세요(예: ${shown}:120-180). ${next}`,
 		},
 	};
 }

@@ -16,6 +16,7 @@ import { docPromptFor } from "../../src/policy/docs.ts";
 import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
 import { FALLBACK, QUOTA_CHOICE } from "../../src/request/route.ts";
+import { continuationTask } from "../../src/runtime/resume.ts";
 import type { PlanLaneResult, RunRecord } from "../../src/types.ts";
 import { GOAL_LABEL, goalText } from "../../src/view/closeout.ts";
 import {
@@ -996,9 +997,10 @@ async function main(): Promise<void> {
 			}, { resume: stopped.id, sessionDir: stopped.dir, setup: "off" });
 			const handoff = mains(first.all()).map(newestUser).find(user => user.startsWith(`<storm-run id="${resumed.runId}"`)) ?? "";
 			check(
-				"the resumed run records what it continues and the same request",
-				resumed.runId !== old.runId && resumed.resumeOf === old.runId && resumed.request !== undefined && resumed.request === old.request,
-				`resumeOf=${resumed.resumeOf} old=${old.runId} request=${resumed.request === old.request}`,
+				"the resumed run records what it continues and the task the continuation derives from the old run (its plan, then the earlier request)",
+				resumed.runId !== old.runId && resumed.resumeOf === old.runId && resumed.request !== undefined && old.request !== undefined &&
+					resumed.request === continuationTask({ ...old, request: old.request }) && resumed.request.includes(old.request),
+				`resumeOf=${resumed.resumeOf} old=${old.runId} request=${resumed.request?.slice(0, 120)}`,
 			);
 			check("the resumed run carries the old limits", resumed.limits?.rounds === 2 && resumed.maxRounds === 2, `limits=${JSON.stringify(resumed.limits)} maxRounds=${resumed.maxRounds}`);
 			check("the handoff names the old run", handoff.includes(old.runId), handoff.slice(0, 240));
@@ -1137,7 +1139,7 @@ async function main(): Promise<void> {
 		await session(cancelAll, async (rpc, files) => {
 			let frames = await rpc.turn('E2E-TOOL {"action":"status"}');
 			const offered = mains(llm.all())[0]?.stormTool;
-			check("run tool offers execute and brief but no team mutations", same(offered?.actions, ["run", "plan", "execute", "brief", "status", "agents"]), JSON.stringify(offered?.actions));
+			check("run tool offers execute and brief but no team mutations", same(offered?.actions, ["run", "plan", "execute", "brief", "status", "agents", "continue"]), JSON.stringify(offered?.actions));
 			check("its description stays within 900 chars", (offered?.descriptionChars ?? 0) > 0 && (offered?.descriptionChars ?? 0) <= 900, `chars=${offered?.descriptionChars}`);
 			check("status: ok", same(toolOutcomes(frames), [{ action: "status", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
 			frames = await rpc.turn('E2E-TOOL {"action":"agents"}');

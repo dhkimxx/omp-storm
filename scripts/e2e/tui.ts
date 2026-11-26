@@ -46,6 +46,7 @@ import { LANE_MIN_ROWS, laneHeight } from "../../src/view/live.ts";
 import { priorityLabel } from "../../src/view/render.ts";
 import { CLOSEOUT_NEXT_MAX } from "../../src/runtime/closeout.ts";
 import { CLOSEOUT_CHOICE_HINT, GOAL_LABEL, goalText } from "../../src/view/closeout.ts";
+import { continuationTask } from "../../src/runtime/resume.ts";
 import { STATUS_LABEL } from "../../src/runtime/rounds.ts";
 import {
 	approveTeam, CLOSEOUT_DETAIL, CLOSEOUT_HEADING, closeoutBody, focused, isOneLineCloseout, KEY, LlmCursor, type LlmEntry, linkPlugin, modelId, modelsYml, numberedOffers, offeredDirections, persistedStormRecords,
@@ -1605,7 +1606,7 @@ async function main(): Promise<void> {
 			);
 			check(
 				"the numbered resume continues the interrupted run's own request through the resume path",
-				resumed.resumeOf === run.runId && resumed.followUpOf === undefined && resumed.request === run.request && handoff.includes(run.runId) && resumeLlm.of("route").length === 0,
+				resumed.resumeOf === run.runId && resumed.followUpOf === undefined && resumed.request === continuationTask(run as RunRecord & { request: string }) && (run.request === undefined || resumed.request?.includes(run.request) === true) && handoff.includes(run.runId) && resumeLlm.of("route").length === 0,
 				`resumeOf=${resumed.resumeOf} followUpOf=${resumed.followUpOf} request=${resumed.request === run.request} handoff=${handoff.slice(0, 400)}`,
 			);
 		});

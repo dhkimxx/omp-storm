@@ -40,6 +40,16 @@ jobs:
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-auto" npm run e2e:auto
       - name: E2E (checkpoint across a native OMP restart)
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-checkpoint" node_modules/.bin/bun scripts/e2e/checkpoint-resume.ts
+      # A follow-up's result must reach the result ledger even though omp reuses the agent id as the job id (about 75 s:
+      # the script waits out omp's 30 s eviction of a consumed job row). The probe checks what omp reports at the write
+      # (about 100 s), so a changed omp job lifecycle fails here before it silently loses results.
+      - name: E2E (follow-up results reach the ledger)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-follow-up" node_modules/.bin/bun scripts/e2e/follow-up-ledger.ts
+      - name: E2E (omp job rows at a follow-up write)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-job-snapshot" node_modules/.bin/bun scripts/e2e/follow-up-job-snapshot.ts
+      # A run omp's host died in is found at the next start and the director continues it when the user says to go on.
+      - name: E2E (the director continues a run the host cut off)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-continue" node_modules/.bin/bun scripts/e2e/continue.ts
       # omp's goal and loop modes exist only in its TUI, which the harness drives on a pty.
       - name: Can this runner open a pty?
         id: pty

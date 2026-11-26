@@ -20,12 +20,13 @@ import { APPROVE } from "../src/proposals/present.ts";
 import { listAgents, resetAgents } from "../src/runtime/agents.ts";
 import * as closeoutModule from "../src/runtime/closeout.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
-import { RunController, runSpawns } from "../src/runtime/controller.ts";
+import { CONTINUE_SAME_TURN, RunController, runSpawns } from "../src/runtime/controller.ts";
 import { activeLedgerRun, bindLedgerChild, resetLedger } from "../src/runtime/ledger.ts";
 import { processKey } from "../src/runtime/janitor.ts";
-import { ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
+import { LEDGER_READY_LEAD } from "../src/runtime/lanes.ts";
+import { endLabel, ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
 import { lastRun, readRun, writeRun } from "../src/runtime/run.ts";
-import { noteResumePointer } from "../src/runtime/resume.ts";
+import { CONTINUATION_HEAD, EARLIER_REQUEST_MARKER, noteResumePointer } from "../src/runtime/resume.ts";
 import { readTrialStates } from "../src/runtime/state-files.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
 import { treeAgainst } from "../src/runtime/tree.ts";
@@ -33,7 +34,7 @@ import { sessionStoreDir } from "../src/session-scope.ts";
 import { loadProjectState } from "../src/state.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
 import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions } from "../src/worker-admission.ts";
-import type { CloseoutAction, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
+import type { CloseoutAction, RunPlan, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { refusedCodeOf } from "../src/runtime/task-refusal.ts";
 import { until } from "./fake-session.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
@@ -708,6 +709,49 @@ describe("a run through the hooks", () => {
 		} as ExtensionContext;
 		expect(verdict(await child.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", task: "own work" } }, stranger))).toBe("pass");
 	});
+
+	for (const mode of ["exclusive writer", "isolated worker"] as const) {
+		test(`a managed ${mode} cannot switch its own or a peer's model or effort: the control paths are refused, messages and reads are not`, async () => {
+			const isolated = mode === "isolated worker";
+			if (isolated) {
+				await pathOnlyImplementer();
+				await approveShadows(TEAM);
+				installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
+			} else {
+				await approve(TEAM);
+			}
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("manual task", main);
+			const lane = isolated
+				? { name: "probe", kind: "run", role: "implementer", isolationReason: "independent experiment", files: ["allowed.txt"], results: changeFor("probe-change") }
+				: { name: "probe", kind: "run", role: "implementer", files: ["shared.txt"], results: changeFor("probe-change") };
+			expect(await omp.tool({ action: "plan", plan: { lanes: [lane], workers: { implementer: 1 } } }, main)).toBe("ok");
+			expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "probe", task: "Work" } }, main))).not.toBe("internal");
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "probe"), main))).toMatch(/^route:/);
+			const worker = child.ctx(sub("probe"));
+			await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+			const control = ["agent://probe/model", "agent://probe/effort", "agent://parent/model", "agent://Main/effort", "agent://all/model", "agent://probe/Model", "agent://other/effort?x=1", "agent://probe/model/"];
+			for (const target of control) {
+				expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: target, content: "other-model" } }, worker)), target).toBe("worker-control");
+			}
+			// Ordinary messages and reads are not control paths: whatever else the gate says, it is not this refusal.
+			for (const target of ["agent://parent", "agent://probe", "agent://other?progress"]) {
+				const answer = verdict(await child.emit("tool_call", { toolName: "write", input: { path: target, content: "done" } }, worker));
+				expect(answer, target).not.toBe("worker-control");
+				if (!isolated) expect(answer, target).toBe("pass");
+			}
+			expect(verdict(await child.emit("tool_call", { toolName: "read", input: { path: "agent://probe/model" } }, worker))).not.toBe("worker-control");
+			// An unmanaged native subagent (no Storm run binding) is not gated.
+			const unrelatedArtifacts = path.join(project.tmp, "unrelated-artifacts-control");
+			await mkdir(unrelatedArtifacts, { recursive: true });
+			const strangerBase = child.ctx(sub("Stranger", "unrelated"));
+			const stranger = { ...strangerBase, sessionManager: { ...strangerBase.sessionManager, getArtifactsDir: () => unrelatedArtifacts } } as ExtensionContext;
+			expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: "agent://Stranger/model", content: "x" } }, stranger))).toBe("pass");
+			await omp.emit("session_shutdown", {}, main);
+		}, 15_000);
+	}
 
 	test("an overlapping shared-write batch is refused whole, and a work follow-up waits for the writer", async () => {
 		await approve(TEAM);
@@ -2051,6 +2095,26 @@ describe("the spawn hook", () => {
 		await omp.emit("session_shutdown", {}, main);
 	});
 
+	test("the plan reply reads the live omp isolation setting: an isolated lane is named only while isolation is off", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("task", main);
+		const plan = {
+			lanes: [{ name: "probe", kind: "run", isolationReason: "keep the experiment outside the tree", results: changeFor("probe-change") }],
+			workers: { implementer: 1 },
+		};
+		const planWith = (enabled: boolean) =>
+			withActiveSettings(Settings.isolated({ "task.isolation.enabled": enabled }), () => omp.toolReply({ action: "plan", plan }, main));
+		const off = await planWith(false);
+		const line = off.text.split("\n").find(candidate => candidate.startsWith("- 격리 불가"));
+		expect(line).toContain("probe");
+		expect(line).toContain("task.isolation.enabled");
+		const on = await planWith(true);
+		expect(on.text).not.toContain("격리 불가");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
 	test("the approval it checks is at most 2 s old: an edit after approval blocks spawns from then on", async () => {
 		setSystemTime(new Date(T0));
 		await approve(TEAM);
@@ -3055,6 +3119,261 @@ describe("native attempt evidence through the extension hooks", () => {
 		});
 		await omp.emit("session_shutdown", {}, main);
 	}, 15_000);
+	test("a follow-up whose job omp registered under the agent id again reaches the ledger, from the write's and the delivery's job rows", async () => {
+		await approve(TEAM);
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("read the total", main);
+		expect(await omp.tool({
+			action: "plan",
+			plan: {
+				lanes: [{
+					name: "look",
+					kind: "explore",
+					files: ["notes.md"],
+					results: [{ id: "total", kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }],
+				}],
+				workers: { explorer: 1 },
+			},
+		}, main)).toBe("ok");
+		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+		if (runId === undefined) throw new Error("no active run");
+		// The parent's own job rows, as omp shows them: only what a test sets.
+		const rows: { running: unknown[]; recent: unknown[] } = { running: [], recent: [] };
+		const parent = { ...main, getAsyncJobSnapshot: () => ({ running: rows.running, recent: rows.recent, delivery: {} }) } as unknown as ExtensionContext;
+		const delivery = (text: string) => ({
+			message: { customType: "async-result", content: text, details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } },
+		});
+
+		expect(verdict(await omp.emit("tool_call", {
+			toolName: "task",
+			toolCallId: "call_5",
+			input: { agent: "storm-explorer", name: "look", task: "Read notes.md" },
+		}, parent))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), parent))).toMatch(/^route:/);
+		const worker = child.ctx(sub("look", "storm-explorer"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		// The first turn's job is `look`; it delivers an answer with no citation.
+		const started = Date.now();
+		rows.recent = [{ id: "look", type: "task", status: "completed", agentId: "look", startTime: started - 500, endTime: started }];
+		await omp.emit("message_end", delivery("I could not find anything to cite."), parent);
+		await child.emit("agent_end", {}, worker);
+		await until(async () => (await readRun(project.sessionDir, runId))?.results?.some(row => row.id === "total" && row.state === "unmet") === true);
+		const first = (await readRun(project.sessionDir, runId))?.results?.find(row => row.id === "total")?.attemptId;
+		expect(first).toBe("job:look:look");
+
+		// Later, omp has evicted that row; the director writes a follow-up and omp wakes the worker under the same id.
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write_1", input: { path: "agent://look", content: "cite notes.md:1" } }, parent))).toBe("pass");
+		const woken = Date.now() + 50;
+		rows.recent = [];
+		rows.running = [{ id: "look", type: "task", status: "running", agentId: "look", startTime: woken }];
+		await omp.emit("tool_result", { toolName: "write", toolCallId: "write_1", isError: false, input: { path: "agent://look", content: "cite notes.md:1" }, content: [] }, parent);
+		await child.emit("agent_start", {}, worker);
+		rows.running = [];
+		rows.recent = [{ id: "look", type: "task", status: "completed", agentId: "look", startTime: woken, endTime: woken + 200 }];
+		await omp.emit("message_end", delivery("The total is 42 (notes.md:1)"), parent);
+		await child.emit("agent_end", {}, worker);
+
+		await until(async () => (await readRun(project.sessionDir, runId))?.results?.some(row => row.id === "total" && row.state === "accepted") === true);
+		const row = (await readRun(project.sessionDir, runId))?.results?.find(candidate => candidate.id === "total");
+		expect(row).toMatchObject({ state: "accepted", attemptId: `job:look.t${woken}:look`, origin: "attempt" });
+		// The lane is no longer running: nothing is left open for the end of the run to rewrite.
+		await omp.emit("session_shutdown", {}, parent);
+		const final = (await readRun(project.sessionDir, runId))?.results?.find(candidate => candidate.id === "total");
+		expect(final).toMatchObject({ state: "accepted" });
+		expect(final?.finalized).toBeUndefined();
+	}, 15_000);
+
+	for (const helperWrite of [false, true]) {
+		test(`a lane's own worker answers while a leftover helper of the same role is written to (${helperWrite ? "write to the helper" : "control: no write"}): the lane's cited answer is its result`, async () => {
+			await approve(TEAM);
+			await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("read the total", main);
+			expect(await omp.tool({
+				action: "plan",
+				plan: {
+					lanes: [{ name: "again", kind: "explore", role: "explorer", files: ["notes.md"], results: [{ id: "total-again", kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }] }],
+					workers: { explorer: 2 },
+				},
+			}, main)).toBe("ok");
+			const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+			if (runId === undefined) throw new Error("no active run");
+			// A helper left over from an earlier run: an idle explorer this run never spawned.
+			admitChild(runId, "old");
+			const helper = child.ctx(sub("old", "storm-explorer"));
+			await child.emit("before_agent_start", { systemPrompt: [] }, helper);
+			await child.emit("agent_end", {}, helper);
+			// The lane's own worker is spawned and working.
+			expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_again", input: { agent: "storm-explorer", name: "again", task: "Read notes.md" } }, main))).toBe("pass");
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "again"), main))).toMatch(/^route:/);
+			const own = child.ctx(sub("again", "storm-explorer"));
+			await child.emit("before_agent_start", { systemPrompt: [] }, own);
+			if (helperWrite) {
+				// The only explorer lane binds the helper by role; omp wakes it.
+				expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write_old", input: { path: "agent://old", content: "help out" } }, main))).toBe("pass");
+				await omp.emit("tool_result", { toolName: "write", toolCallId: "write_old", isError: false, input: { path: "agent://old", content: "help out" }, content: [] }, main);
+			}
+			await omp.emit("message_end", {
+				message: { customType: "async-result", content: "The total is 42 (notes.md:1)", details: { jobs: [{ jobId: "again", agentId: "again", status: "completed" }] } },
+			}, main);
+			await child.emit("agent_end", {}, own);
+			await until(async () => (await readRun(project.sessionDir, runId))?.results?.some(row => row.id === "total-again" && row.state === "accepted") === true);
+			expect((await readRun(project.sessionDir, runId))?.results?.find(row => row.id === "total-again")).toMatchObject({ state: "accepted", attemptId: "job:again:again" });
+			await omp.emit("session_shutdown", {}, main);
+		}, 15_000);
+	}
+
+	test("a follow-up write that fails leaves no open dispatch: the lane that needs the accepted answer is admitted", async () => {
+		await approve(TEAM);
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("read the total", main);
+		expect(await omp.tool({
+			action: "plan",
+			plan: {
+				lanes: [
+					{ name: "look", kind: "explore", role: "explorer", files: ["notes.md"], results: [{ id: "total", kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }] },
+					{ name: "use", kind: "explore", role: "explorer", goal: "use the total", dependsOn: [{ lane: "look", need: "result" }], results: answerFor("use-answer") },
+				],
+				workers: { explorer: 2 },
+			},
+		}, main)).toBe("ok");
+		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+		if (runId === undefined) throw new Error("no active run");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_6", input: { agent: "storm-explorer", name: "look", task: "Read notes.md" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub("look", "storm-explorer"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		await omp.emit("message_end", {
+			message: { customType: "async-result", content: "The total is 42 (notes.md:1)", details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } },
+		}, main);
+		await child.emit("agent_end", {}, worker);
+		await until(async () => (await readRun(project.sessionDir, runId))?.results?.some(row => row.id === "total" && row.state === "accepted") === true);
+
+		// The follow-up is admitted, then the host fails the write: the worker was never asked.
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write_f", input: { path: "agent://look", content: "again" } }, main))).toBe("pass");
+		await omp.emit("tool_result", { toolName: "write", toolCallId: "write_f", isError: true, input: { path: "agent://look", content: "again" }, content: [] }, main);
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_7", input: { agent: "storm-explorer", name: "use", task: "Use it" } }, main))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	}, 15_000);
+
+	for (const order of [["write_a", "write_b"], ["write_b", "write_a"]] as const) {
+		test(`two failing follow-up writes to one worker in one director message (results reported ${order.join(" then ")}) leave no open dispatch`, async () => {
+			await approve(TEAM);
+			await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("read the total", main);
+			expect(await omp.tool({
+				action: "plan",
+				plan: {
+					lanes: [
+						{ name: "look", kind: "explore", role: "explorer", files: ["notes.md"], results: [{ id: "total", kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }] },
+						{ name: "use", kind: "explore", role: "explorer", goal: "use the total", dependsOn: [{ lane: "look", need: "result" }], results: answerFor("use-answer") },
+					],
+					workers: { explorer: 2 },
+				},
+			}, main)).toBe("ok");
+			const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+			if (runId === undefined) throw new Error("no active run");
+			expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_6", input: { agent: "storm-explorer", name: "look", task: "Read notes.md" } }, main))).toBe("pass");
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), main))).toMatch(/^route:/);
+			const worker = child.ctx(sub("look", "storm-explorer"));
+			await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+			await omp.emit("message_end", {
+				message: { customType: "async-result", content: "The total is 42 (notes.md:1)", details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } },
+			}, main);
+			await child.emit("agent_end", {}, worker);
+			await until(async () => (await readRun(project.sessionDir, runId))?.results?.some(row => row.id === "total" && row.state === "accepted") === true);
+
+			// omp runs every call's tool_call hook before any call executes, so both writes are admitted, then both fail.
+			const write = (id: string) => ({ toolName: "write", toolCallId: id, input: { path: "agent://look", content: id } });
+			expect(verdict(await omp.emit("tool_call", write("write_a"), main))).toBe("pass");
+			expect(verdict(await omp.emit("tool_call", write("write_b"), main))).toBe("pass");
+			for (const id of order) await omp.emit("tool_result", { ...write(id), isError: true, content: [] }, main);
+			// The dependant is admitted: nothing of the lane is left running.
+			expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_7", input: { agent: "storm-explorer", name: "use", task: "Use it" } }, main))).toBe("pass");
+			// A later, real follow-up still opens its own dispatch, so its delivery is recorded as the lane's newest attempt.
+			const rows: { running: unknown[]; recent: unknown[] } = { running: [], recent: [] };
+			const parent = { ...main, getAsyncJobSnapshot: () => ({ running: rows.running, recent: rows.recent, delivery: {} }) } as unknown as ExtensionContext;
+			expect(verdict(await omp.emit("tool_call", write("write_c"), parent))).toBe("pass");
+			const woken = Date.now() + 50;
+			rows.running = [{ id: "look", type: "task", status: "running", agentId: "look", startTime: woken }];
+			await omp.emit("tool_result", { ...write("write_c"), isError: false, content: [] }, parent);
+			rows.running = [];
+			rows.recent = [{ id: "look", type: "task", status: "completed", agentId: "look", startTime: woken, endTime: woken + 200 }];
+			await omp.emit("message_end", {
+				message: { customType: "async-result", content: "The total is 42 (notes.md:1)", details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } },
+			}, parent);
+			await until(async () => (await readRun(project.sessionDir, runId))?.results?.find(row => row.id === "total")?.attemptId === `job:look.t${woken}:look`);
+			await omp.emit("session_shutdown", {}, parent);
+			const final = (await readRun(project.sessionDir, runId))?.results?.find(row => row.id === "total");
+			expect(final).toMatchObject({ state: "accepted" });
+			expect(final?.finalized).toBeUndefined();
+		}, 15_000);
+	}
+
+	test("a worker of the earlier run, written to by the next run in the same session, has its answer recorded in that run", async () => {
+		await approve(TEAM);
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const rows: { running: unknown[]; recent: unknown[] } = { running: [], recent: [] };
+		const parent = { ...main, getAsyncJobSnapshot: () => ({ running: rows.running, recent: rows.recent, delivery: {} }) } as unknown as ExtensionContext;
+		const delivery = (text: string) => ({
+			message: { customType: "async-result", content: text, details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } },
+		});
+		const lane = (name: string, result: string) => ({ name, kind: "explore", role: "explorer", files: ["notes.md"], results: [{ id: result, kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }] });
+		const plan = async (lanes: object[]): Promise<string> => {
+			expect(await omp.tool({ action: "plan", plan: { lanes, workers: { explorer: 1 } } }, parent)).toBe("ok");
+			const id = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+			if (id === undefined) throw new Error("no active run");
+			return id;
+		};
+
+		// Run A: the worker `look` answers and the run is over.
+		await omp.command("read the total", parent);
+		const first = await plan([lane("look", "total")]);
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_a", input: { agent: "storm-explorer", name: "look", task: "Read notes.md" } }, parent))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), parent))).toMatch(/^route:/);
+		const worker = child.ctx(sub("look", "storm-explorer"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		rows.recent = [{ id: "look", type: "task", status: "completed", agentId: "look", startTime: Date.now() - 500, endTime: Date.now() }];
+		await omp.emit("message_end", delivery("The total is 42 (notes.md:1)"), parent);
+		await child.emit("agent_end", {}, worker);
+		await until(async () => (await readRun(project.sessionDir, first))?.results?.some(row => row.id === "total" && row.state === "accepted") === true);
+		// The conversation is re-opened (the host's session switch): run A ends, the collector forgets its dispatches.
+		await omp.emit("session_switch", { reason: "resume" }, parent);
+
+		// Run B, same session: its director writes to the idle worker of run A, which the plan's one explorer lane covers.
+		await omp.command("read the total again", parent);
+		const second = await plan([lane("look-again", "total-again")]);
+		expect(second).not.toBe(first);
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write_b", input: { path: "agent://look", content: "cite notes.md:1 again" } }, parent))).toBe("pass");
+		const woken = Date.now() + 50;
+		rows.recent = [];
+		rows.running = [{ id: "look", type: "task", status: "running", agentId: "look", startTime: woken }];
+		await omp.emit("tool_result", { toolName: "write", toolCallId: "write_b", isError: false, input: { path: "agent://look", content: "cite notes.md:1 again" }, content: [] }, parent);
+		rows.running = [];
+		rows.recent = [{ id: "look", type: "task", status: "completed", agentId: "look", startTime: woken, endTime: woken + 200 }];
+		await omp.emit("message_end", delivery("Again: the total is 42 (notes.md:1)"), parent);
+		await child.emit("agent_end", {}, worker);
+		await until(async () => (await readRun(project.sessionDir, second))?.results?.find(row => row.id === "total-again")?.attemptId !== undefined);
+		const row = (await readRun(project.sessionDir, second))?.results?.find(candidate => candidate.id === "total-again");
+		expect(row).toMatchObject({ origin: "attempt" });
+		expect(row?.attemptId).toMatch(/^job:look/);
+		await omp.emit("session_shutdown", {}, parent);
+	}, 20_000);
+
 	test("a reviewable answer reaches only the approved reviewer's task as its scoped packet", async () => {
 		await approve(TEAM);
 		await writeFile(path.join(project.root, "notes.md"), "the total is 42\n");
@@ -3723,5 +4042,403 @@ describe("the lane view switch", () => {
 		expect(host.draw()[0]).not.toMatch(RADAR);
 		await omp.emit("agent_start", {}, host.ctx);
 		await omp.emit("agent_end", {}, host.ctx);
+	});
+});
+
+describe("the director reads what a delivery changed, in the place it reads the delivery", () => {
+	const lookLane = { name: "look", kind: "explore", role: "explorer", files: ["notes.md"], results: [{ id: "total", kind: "answer", criterion: "what the note holds", path: "notes.md", contains: "42" }] };
+	const useLane = { name: "use", kind: "explore", role: "explorer", goal: "use the total", dependsOn: [{ lane: "look", need: "result" }], results: answerFor("use-answer") };
+	const CITED_ANSWER = "The total is 42 (notes.md:1)";
+	const UNCITED_ANSWER = "I looked at the note and found the total.";
+	type ContextAnswer = { messages: Array<{ role: string; content: Array<{ type: string; text: string }> }> };
+
+	/** A run with the explorer lane `look` admitted and spawned, and `use` waiting on it. */
+	async function lookRun(lanes: object[] = [lookLane, useLane]) {
+		await approve(TEAM);
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("read the total", main);
+		expect(await omp.tool({ action: "plan", plan: { lanes, workers: { explorer: 2 } } }, main)).toBe("ok");
+		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
+		if (runId === undefined) throw new Error("no active run");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", toolCallId: "call_n1", input: { agent: "storm-explorer", name: "look", task: "Read notes.md" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub("look", "storm-explorer"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		const diskRow = async () => (await readRun(project.sessionDir, runId))?.results?.find(row => row.id === "total");
+		/** The record is flushed after the settlement: wait until it shows the state, then read the row. */
+		const rowOf = async (state?: string) => {
+			if (state !== undefined) await until(async () => (await diskRow())?.state === state);
+			return diskRow();
+		};
+		const pushed = async (text: string) => {
+			await omp.emit("message_end", { message: { customType: "async-result", content: text, details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] } } }, main);
+		};
+		const waited = async (text: string) => {
+			// The job completes after the worker's turn ended; `wait` then hands its result over.
+			await child.emit("agent_end", {}, worker);
+			const settledAtMs = Date.now() + 100;
+			return omp.emit("tool_result", {
+				toolName: "wait",
+				toolCallId: "call_wait",
+				isError: false,
+				input: {},
+				content: [],
+				details: { op: "wait", jobs: [{ id: "look", type: "task", status: "completed", agentUrlId: "look", settledAtMs, durationMs: 50, resultText: text }] },
+			}, main);
+		};
+		/** The next provider request's context: what the director would read beyond its history. */
+		const request = (on: ExtensionContext = main) => omp.emit("context", { messages: [{ role: "user", content: "go on", timestamp: 1 }] }, on) as Promise<ContextAnswer | undefined>;
+		/** Waits for the notice a pushed delivery left, taking it the way the next request does. */
+		const pushedNotice = async (): Promise<ContextAnswer> => {
+			let out: ContextAnswer | undefined;
+			await until(async () => {
+				out = await request();
+				return out !== undefined;
+			});
+			return out as ContextAnswer;
+		};
+		return { omp, child, main, worker, runId, rowOf, pushed, waited, request, pushedNotice };
+	}
+	const textOf = (answer: ContextAnswer): string => answer.messages.at(-1)?.content.map(part => part.text).join("") ?? "";
+
+	test("a pushed delivery Storm did not accept is on the director's next request: result, state, reason and the citation form", async () => {
+		const run = await lookRun();
+		const sentBefore = run.omp.sent.length;
+		await run.pushed(UNCITED_ANSWER);
+		await run.child.emit("agent_end", {}, run.worker);
+		const answer = await run.pushedNotice();
+		// The request's own messages are kept and the notice follows them, as a developer message.
+		expect(answer.messages).toHaveLength(2);
+		expect(answer.messages.at(-1)?.role).toBe("developer");
+		const text = textOf(answer);
+		expect(text).toContain("look");
+		expect(text).toContain("total");
+		expect(text).toContain("미충족");
+		expect(text).toContain((await run.rowOf("unmet"))!.reason!.replace(/[.。]+$/u, ""));
+		expect(text).toContain("path:line");
+		expect(text).not.toContain(LEDGER_READY_LEAD);
+		// Once: the following request carries nothing more, and nothing was started because of it.
+		expect(await run.request()).toBeUndefined();
+		expect(run.omp.sent).toHaveLength(sentBefore);
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a delivery returned by wait carries the notice on that call's result, and is not read twice", async () => {
+		const run = await lookRun();
+		const result = (await run.waited(CITED_ANSWER)) as { additionalContext?: string } | undefined;
+		expect(result?.additionalContext).toContain("use");
+		expect(result?.additionalContext).toContain(LEDGER_READY_LEAD);
+		expect(result?.additionalContext).not.toContain("수용하지 않았습니다");
+		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
+		// Taken: the next request has nothing left to add.
+		expect(await run.request()).toBeUndefined();
+		// And no worker was started for the lane it names.
+		expect(listAgents({ runId: run.runId, scope: project.sessionDir }).map(agent => agent.name)).not.toContain("use");
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a refused delivery by wait names the state and the citation form", async () => {
+		const run = await lookRun();
+		const result = (await run.waited(UNCITED_ANSWER)) as { additionalContext?: string } | undefined;
+		expect(result?.additionalContext).toContain("미충족");
+		expect(result?.additionalContext).toContain("path:line");
+		expect(result?.additionalContext).not.toContain(LEDGER_READY_LEAD);
+		expect(await run.request()).toBeUndefined();
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("accepted with nothing waiting on it adds nothing, by either way", async () => {
+		const run = await lookRun([lookLane]);
+		const result = (await run.waited(CITED_ANSWER)) as { additionalContext?: string } | undefined;
+		expect(result?.additionalContext).toBeUndefined();
+		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
+		expect(await run.request()).toBeUndefined();
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a request that carries a delivery Storm was not yet told of evaluates it first, once, so the notice is on that request", async () => {
+		const run = await lookRun();
+		await run.child.emit("agent_end", {}, run.worker);
+		const delivery = { role: "custom", customType: "async-result", content: UNCITED_ANSWER, details: { jobs: [{ jobId: "look", agentId: "look", status: "completed" }] }, timestamp: 5 };
+		// omp built the request before it told Storm of the message: the request's own hook gives it to the collector.
+		const answer = (await run.omp.emit("context", { messages: [{ role: "user", content: "go on", timestamp: 1 }, delivery] }, run.main)) as ContextAnswer | undefined;
+		expect(answer).toBeDefined();
+		expect(textOf(answer as ContextAnswer)).toContain("미충족");
+		expect(textOf(answer as ContextAnswer)).toContain("path:line");
+		// Then the host tells Storm of the same message: it is the same evaluation, not a second one.
+		await run.omp.emit("message_end", { message: delivery }, run.main);
+		expect(await run.request()).toBeUndefined();
+		await until(async () => (await run.rowOf())?.state === "unmet");
+		expect(await run.request()).toBeUndefined();
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a child's own request neither reads nor takes the director's notice", async () => {
+		const run = await lookRun();
+		await run.pushed(UNCITED_ANSWER);
+		await run.child.emit("agent_end", {}, run.worker);
+		await until(async () => (await run.rowOf())?.state === "unmet");
+		// Poll until the notice is queued, always from the child's side: it never sees it.
+		for (let i = 0; i < 20; i++) expect(await run.request(run.worker)).toBeUndefined();
+		expect(textOf(await run.pushedNotice())).toContain("미충족");
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+});
+
+describe("the director continues an interrupted run through the hooks", () => {
+	const lane = { name: "look", kind: "explore" as const, role: "explorer" as const, files: ["notes.md"], results: [{ id: "total", kind: "answer" as const, criterion: "what the note holds", path: "notes.md", contains: "42" }] };
+	const planOf = (): RunPlan => ({ submittedAt: new Date().toISOString(), workers: { explorer: 1 }, lanes: [lane] });
+
+	/** What the run of 2026-11-26 left: a run of this session and target the host cut off, with its plan and a request that is only a question. */
+	const cutOff = async (over: Partial<RunRecord> = {}): Promise<RunRecord> => {
+		const state = await loadProjectState(project.env);
+		const run = runRecord({
+			runId: "run-20261126-073428-48cc",
+			startedAt: "2026-11-26T07:34:28.000Z",
+			endedAt: "2026-11-26T08:28:31.000Z",
+			status: "stopped",
+			endReason: "host-ended",
+			task: "작업현황",
+			request: "작업현황",
+			plan: planOf(),
+			results: [{ id: "total", state: "pending", lane: "look", origin: "plan", identity: "x" } as never],
+			...over,
+		});
+		await writeRun(state.sessionDir, run);
+		await noteResumePointer(state.sessionDir, { repoId: state.repo.repoId, root: state.repo.root }, run);
+		return run;
+	};
+	const opened = async (prompt = "이어서 해줘") => {
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		if (prompt !== "") await omp.emit("before_agent_start", { reason: "prompt", prompt, systemPrompt: [] }, main);
+		return { omp, main };
+	};
+	const startedRuns = async (): Promise<string[]> => {
+		const dir = (await loadProjectState(project.env)).sessionDir;
+		const id = activeLedgerRun(dir)?.runId;
+		return id === undefined ? [] : [id];
+	};
+
+	test("under automatic delegation, in the user's turn, it opens a run that continues the interrupted one", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const run = await cutOff();
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		const { omp, main } = await opened("재개");
+		// The director can learn it: the status says a run can be continued, and by whom.
+		const status = await omp.toolReply({ action: "status" }, main);
+		expect(status.text).toContain(run.runId);
+		expect(status.text).toContain("storm continue");
+		const reply = await omp.toolReply({ action: "continue" }, main);
+		expect(reply.outcome).toBe("ok");
+		expect(reply.text).toContain(run.runId);
+		expect(reply.text).toContain("look");
+		const nextId = (await startedRuns())[0];
+		expect(nextId).toBeDefined();
+		expect(nextId).not.toBe(run.runId);
+		const next = await readRun(project.sessionDir, nextId as string);
+		expect(next).toMatchObject({ status: "running", resumeOf: run.runId, plan: { lanes: [{ name: "look" }] } });
+		expect(next?.goal).toMatchObject({ runs: 1 });
+		// The task is the interrupted run's work, not the question it was opened with.
+		expect(next?.request).toContain("look");
+		expect(next?.request?.startsWith(CONTINUATION_HEAD)).toBe(true);
+		expect(next?.request?.split(`\n${EARLIER_REQUEST_MARKER}\n`)[0]).not.toContain("작업현황");
+		// Inside the turn that is running: no handoff message and no dialog.
+		expect(omp.sent).toEqual([]);
+		expect(omp.selects).toEqual([]);
+		// A second continue in the same turn is refused: a run is active.
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		expect(await startedRuns()).toEqual([nextId as string]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a run that stopped at or after this turn began is not continued in it; once the user speaks again it is, and the stop is named", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+		// A limit the user set stopped it after this turn's message began (a stop inside the turn); the user has not spoken since.
+		const stoppedAt = Date.now() + 10 * 60_000;
+		const run = await cutOff({ endReason: "budget", endedAt: new Date(stoppedAt).toISOString() });
+		const { omp, main } = await opened("이어서 해줘");
+		const status = await omp.toolReply({ action: "status" }, main);
+		expect(status.text).toContain(endLabel("budget"));
+		const refused = await omp.toolReply({ action: "continue" }, main);
+		expect(refused).toEqual({ outcome: "rejected", text: CONTINUE_SAME_TURN });
+		expect(await startedRuns()).toEqual([]);
+		// The turn ends. The user's next message came later than the stop: now the same run continues.
+		await omp.emit("agent_end", { messages: [] }, main);
+		setSystemTime(new Date(stoppedAt + 60_000));
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "한도는 알지만 이어서 해줘", systemPrompt: [] }, main);
+		const reply = await omp.toolReply({ action: "continue" }, main);
+		expect(reply.outcome).toBe("ok");
+		expect(reply.text).toContain(run.runId);
+		expect(reply.text).toContain(endLabel("budget"));
+		expect(await startedRuns()).toHaveLength(1);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("Storm's own adjustment nudge is not the user's turn, even when it starts a turn with no run active", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		await cutOff();
+		const { omp, main } = await opened("");
+		const nudge = '<storm-adjust run="run-x" action="retry" result="total" lane="look">Retry once.</storm-adjust>';
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: nudge, systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).text).not.toContain("자동 위임 실행");
+		expect(await startedRuns()).toEqual([]);
+		await omp.emit("agent_end", { messages: [] }, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "이어서 해줘", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("ok");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	describe("what the user's turn is across a pause on background work", () => {
+		const paused = { messages: [], willContinue: true, awaitingAsyncWork: true };
+		const requestOf = async (): Promise<string | undefined> => {
+			const id = (await startedRuns())[0];
+			return id === undefined ? undefined : (await readRun(project.sessionDir, id))?.request;
+		};
+
+		test("results that wake the paused director continue the request they belong to", async () => {
+			await approve(TEAM);
+			await enableAuto();
+			const { omp, main } = await opened("첫 요청");
+			await omp.emit("agent_end", paused, main);
+			// The wake is no prompt: the request stays, and the director's plan opens the run for it.
+			await omp.emit("agent_start", {}, main);
+			expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).text).toContain("자동 위임 실행");
+			expect(await requestOf()).toBe("첫 요청");
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a message the user types while it is paused is the new request, not the paused one", async () => {
+			await approve(TEAM);
+			await enableAuto();
+			const { omp, main } = await opened("첫 요청");
+			await omp.emit("agent_end", paused, main);
+			await omp.emit("before_agent_start", { reason: "prompt", prompt: "두 번째 요청", systemPrompt: [] }, main);
+			await omp.emit("agent_start", {}, main);
+			expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).text).toContain("자동 위임 실행");
+			expect(await requestOf()).toBe("두 번째 요청");
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("without a pause a later prompt in the same turn does not replace the request", async () => {
+			await approve(TEAM);
+			await enableAuto();
+			const { omp, main } = await opened("첫 요청");
+			await omp.emit("before_agent_start", { reason: "prompt", prompt: "끼어든 말", systemPrompt: [] }, main);
+			expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).text).toContain("자동 위임 실행");
+			expect(await requestOf()).toBe("첫 요청");
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("the time of the turn moves with the new message: a stop between the two messages can be continued by the second", async () => {
+			await approve(TEAM);
+			await enableAuto();
+			await writeFile(path.join(project.root, "notes.md"), "total: 42\n");
+			const first = Date.now();
+			// Stopped after the first message and before the second (a limit hit while the director was paused).
+			await cutOff({ endReason: "time-limit", endedAt: new Date(first + 5 * 60_000).toISOString() });
+			const { omp, main } = await opened("첫 요청");
+			await omp.emit("agent_end", paused, main);
+			expect((await omp.toolReply({ action: "continue" }, main)).text).toContain(CONTINUE_SAME_TURN);
+			setSystemTime(new Date(first + 10 * 60_000));
+			await omp.emit("before_agent_start", { reason: "prompt", prompt: "그래도 이어서 해줘", systemPrompt: [] }, main);
+			expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("ok");
+			await omp.emit("session_shutdown", {}, main);
+		});
+	});
+
+	test("with delegation set to manual it starts nothing and says where the user can", async () => {
+		await approve(TEAM);
+		const run = await cutOff();
+		const { omp, main } = await opened("재개");
+		const status = await omp.toolReply({ action: "status" }, main);
+		expect(status.text).toContain(run.runId);
+		expect(status.text).not.toContain("storm continue");
+		const reply = await omp.toolReply({ action: "continue" }, main);
+		expect(reply.outcome).toBe("rejected");
+		expect(reply.text).toContain("/storm");
+		expect(await startedRuns()).toEqual([]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a turn the user's own message did not begin (a revive, an empty prompt) starts nothing", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		await cutOff();
+		const { omp, main } = await opened("");
+		await omp.emit("before_agent_start", { reason: "revive", prompt: "revived context", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "   ", systemPrompt: [] }, main);
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		expect(await startedRuns()).toEqual([]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("with no interrupted run, or only a finished one, it starts nothing and the director may plan instead", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const { omp, main } = await opened();
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		await cutOff({ status: "done", endReason: "verified" });
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		expect(await startedRuns()).toEqual([]);
+		// The ordinary way in still works in this very turn.
+		expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).text).toContain("자동 위임 실행");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a run of another session or another project is not continued", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const state = await loadProjectState(project.env);
+		// Written to this store but never recorded as started here: no pointer, so it is nobody's to continue.
+		await writeRun(state.sessionDir, runRecord({ runId: "run-20261126-010000-aaaa", status: "stopped", endReason: "host-ended", request: "x", plan: planOf() }));
+		// A pointer recorded for another worktree of this session.
+		const elsewhere = runRecord({ runId: "run-20261126-020000-bbbb", status: "stopped", endReason: "host-ended", request: "y", plan: planOf() });
+		await writeRun(state.sessionDir, elsewhere);
+		await noteResumePointer(state.sessionDir, { repoId: state.repo.repoId, root: path.join(project.tmp, "another-tree") }, elsewhere);
+		const { omp, main } = await opened();
+		expect((await omp.toolReply({ action: "continue" }, main)).outcome).toBe("rejected");
+		expect(await startedRuns()).toEqual([]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("while omp's plan mode is on, it starts nothing", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		await cutOff();
+		const { omp, main } = await opened();
+		const planning = { ...main, sessionModes: { getState: () => ({ plan: { status: "active" }, vibe: { status: "inactive" }, goal: { status: "inactive" }, loop: { status: "inactive" } }) } } as unknown as ExtensionContext;
+		const reply = await omp.toolReply({ action: "continue" }, planning);
+		expect(reply.outcome).toBe("rejected");
+		expect(await startedRuns()).toEqual([]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a plan the approved team no longer allows starts nothing", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const run = await cutOff();
+		// The approved team loses its explorer role (a valid team without it): the old plan's lane names a role that no plan
+		// could use today, so it is outside the bounds a submitted plan is held to.
+		await approve({ ...TEAM, roles: Object.fromEntries(Object.entries(TEAM.roles).filter(([id]) => id !== "explorer")) } as StormConfig);
+		await enableAuto();
+		const { omp, main } = await opened();
+		const reply = await omp.toolReply({ action: "continue" }, main);
+		expect(reply.outcome).toBe("rejected");
+		expect(reply.text).toContain("/storm");
+		expect(await startedRuns()).toEqual([]);
+		// The interrupted run is still the candidate for the user's own menu.
+		expect((await readRun(project.sessionDir, run.runId))?.status).toBe("stopped");
+		await omp.emit("session_shutdown", {}, main);
 	});
 });

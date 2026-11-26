@@ -253,7 +253,17 @@ export async function stopDeadRuns(input: DeadRunSweep): Promise<void> {
 		// Without a named process every record is probed: a live one stays, a dead one is closed. A record of the named
 		// process itself is stale (one run per session), so it is closed without a probe.
 		if (record.process !== undefined && record.process !== input.process && alive(record.process)) continue;
-		await writeRun(input.sessionDir, { ...record, status: "stopped", endedAt: record.updatedAt ?? record.startedAt });
+		// A record of another, dead process (or one whose process was never named) ended with its host: say so, so a crash
+		// is not read as the user stopping the run. The record stays exactly as resumable as a reasonless stop.
+		// Only a stale record of the very process that is ending is not the host's death. A record that names no process
+		// (older Storm, or a process the sweep was not told) is probed and closed here too, and its host is gone as well.
+		const hostEnded = !(record.process !== undefined && record.process === input.process);
+		await writeRun(input.sessionDir, {
+			...record,
+			status: "stopped",
+			endedAt: record.updatedAt ?? record.startedAt,
+			...(hostEnded && record.endReason === undefined ? { endReason: "host-ended" as const } : {}),
+		});
 	}
 }
 
