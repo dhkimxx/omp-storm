@@ -219,6 +219,8 @@ export interface LaneResultReadiness {
 	retained?: { ref: string; path: string; digest?: string; kind: "patch" | "file" | "directory" | "parent-file" | "parent-files" };
 	/** Why an otherwise observed result is not currently usable (for example a vanished retained artifact). */
 	reason?: string;
+	/** The producing lane runs in its own checkout; its changes never reach the parent in this version. */
+	isolated?: boolean;
 }
 
 /** What a consumer lane may use from one prerequisite lane. */
@@ -602,8 +604,22 @@ function openResults(need: LaneNeed, state: LaneReadiness): LaneResultReadiness[
 export const ANSWER_CITATION_FORM =
 	"읽기 전용 답은 프로젝트 안 파일의 path:line 인용이 있어야 합니다(path#L12, path#L12-L20, [텍스트](path#L12)도 같은 위치로 읽습니다. local://, agent://, URL은 읽지 않음).";
 
+/**
+ * The same rule in one short line, for a refusal that already carries the ledger's reason. The full alias list lives in
+ * the worker contract (`CITATION_ALIAS_FORMS`) and in `ANSWER_CITATION_FORM`; a refusal stays under the existing
+ * readability budget (`tests/dependency-words.test.ts`) while still saying which forms are read and which are not.
+ */
+export const ANSWER_CITATION_HINT =
+	"path:line 인용 필요(path#L12도 읽음; local://, agent://, URL 제외)";
+
 /** Tag of the line the director reads when a delivery changed the ledger. */
 export const LEDGER_NOTICE_TAG = "[storm:결과]";
+
+/**
+ * Row 5: an isolated producer's result will not change by waiting and a finished checkout must not be messaged. The one
+ * sentence is exported so the refusal and its test quote the same advice.
+ */
+export const ISOLATED_STALE_ADVICE = "새 격리 시도를 계획하고 끝난 체크아웃에 후속 지시를 보내지 마세요";
 
 /** One result a delivery left short of acceptance, as the ledger holds it now. */
 export interface LedgerNoticeRow {
@@ -676,9 +692,11 @@ function shortfallAdvice(need: LaneNeed, state: LaneReadiness): string {
 		if (result.state === "pending") notes.add("아직 판정되지 않았으니 결과가 반영된 뒤 다시 보내세요.");
 		else if (result.state === "unmet") {
 			notes.add(
-				result.kind === "answer"
-					? `${ANSWER_CITATION_FORM} 그 워커에게 ${withJosa(follow, "으로/로")} 인용을 요청하세요.`
-					: `미충족은 기다려도 바뀌지 않습니다. 사유를 보고 그 워커에게 ${withJosa(follow, "으로/로")} 보완을 요청하세요.`,
+				result.isolated === true
+					? `미충족은 기다려도 바뀌지 않습니다. 이 버전은 격리 작업을 부모 트리로 가져오지 않으므로 ${ISOLATED_STALE_ADVICE}.`
+					: result.kind === "answer"
+						? `${ANSWER_CITATION_HINT}. 그 워커에게 ${withJosa(follow, "으로/로")} 인용을 요청하세요.`
+						: `미충족은 기다려도 바뀌지 않습니다. 사유를 보고 그 워커에게 ${withJosa(follow, "으로/로")} 보완을 요청하세요.`,
 			);
 		} else if (result.state === "reviewable") {
 			notes.add(
@@ -686,6 +704,9 @@ function shortfallAdvice(need: LaneNeed, state: LaneReadiness): string {
 					? "검토 가능은 아직 수용이 아니며 승인된 리뷰어의 판정이 있어야 합니다. 제출만 필요하면 이 선행의 need를 reviewable로 바꿔 다시 계획하세요."
 					: "검토 가능은 아직 수용이 아니며 승인된 리뷰어의 판정이 있어야 합니다.",
 			);
+		} else if (result.isolated === true && need === "integrated") {
+			// Row 5: no version of this run can produce the integrated proof the edge asks for.
+			notes.add("이 버전은 격리 작업을 부모 트리에 통합하지 않으므로 이 조건은 기다려도 충족되지 않습니다. need를 result로 바꾸거나 통합 버전을 기다리세요.");
 		} else notes.add("수용된 결과가 현재 트리에서 확인된 뒤 다시 보내세요.");
 	}
 	return notes.size === 0 ? "그 결과가 충족된 뒤 다시 보내세요." : [...notes].slice(0, 2).join(" ");
@@ -793,7 +814,9 @@ export function dependencyStart(lane: PlanLane, readiness: LaneReadinessView | u
 			continue;
 		}
 		notes.push(
-			`'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL[dependency.need]} 조건이 충족되기 전에 시작했습니다(${shortfall}). 선행 결과가 수용되지 않은 입력으로 만든 결과라 이 레인의 결과는 수용되지 않습니다. 선행이 수용된 뒤 이 워커에게 후속 지시(write agent://<id>)를 보내 다시 하게 하세요.`,
+			open.some(result => result.isolated === true)
+				? `'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL[dependency.need]} 조건이 충족되기 전에 시작했습니다(${shortfall}). 이 버전은 격리 작업을 부모 트리로 가져오지 않으므로 선행이 저절로 충족되지 않습니다. ${ISOLATED_STALE_ADVICE}.`
+				: `'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL[dependency.need]} 조건이 충족되기 전에 시작했습니다(${shortfall}). 선행 결과가 수용되지 않은 입력으로 만든 결과라 이 레인의 결과는 수용되지 않습니다. 선행이 수용된 뒤 이 워커에게 후속 지시(write agent://<id>)를 보내 다시 하게 하세요.`,
 		);
 	}
 	return { ok: true, notes };
@@ -1973,6 +1996,15 @@ export class RunLanes {
 		for (const hold of this.#held.values()) if (hold.agentId === agentId && hold.started !== true) return true;
 		for (const reservation of this.#writes.values()) if (reservation.agentId === agentId && reservation.awaiting === true) return true;
 		return false;
+	}
+
+	/**
+	 * The agent an unplanned placement's handle was placed for, or undefined when the key is no placement of this run.
+	 * The spawn hook uses it before reserving anything: a spawn of another agent under this key is refused without
+	 * disturbing the placement it names (R4), so a reader cannot consume a writer's pending place.
+	 */
+	placementAgent(spawnKey: string): string | undefined {
+		return this.#assigned.get(spawnKey)?.agent;
 	}
 
 	/**

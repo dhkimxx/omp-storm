@@ -158,21 +158,26 @@ test("a fresh worker that shows idle with no request yet and was never seen runn
 
 test("a placement that was never admitted still lapses, and an unplanned child whose placement lapsed is checked again", () => {
 	const work = new RunLanes("unplanned-late");
-	// Plan-less manual work: the item's handle names the reservation, so a late spawn with that handle is the same placement.
-	expect(work.place({ agent: "storm-implementer", name: "solo", task: "s" }, undefined, team, { now: T0 }).ok).toBe(true);
+	// Plan-less manual work: the item's generated handle (D6) names the reservation, and omp's spawn key is that handle.
+	const solo = work.place({ agent: "storm-implementer", name: "solo", task: "s" }, undefined, team, { now: T0 });
+	expect(solo.ok).toBe(true);
+	const soloKey = idOf(solo);
+	expect(soloKey).not.toBe("solo");
 	// Another unknown-scope writer is refused inside the window and allowed once the never-admitted placement lapsed.
 	expect(refusedWrite(work.place({ agent: "storm-implementer", name: "other", task: "o" }, undefined, team, { now: T0 + 1_000 }))).toBe(true);
 	expect(work.place({ agent: "storm-implementer", name: "other", task: "o" }, undefined, team, { now: LATE }).ok).toBe(true);
 	// `solo` now starts late: its scope is checked against `other`, and the pair is refused as a conflict.
-	const late = at(LATE, () => work.admitChecked({ spawnKey: "solo", agent: "storm-implementer", outcome: "routed" }));
+	const late = at(LATE, () => work.admitChecked({ spawnKey: soloKey, agent: "storm-implementer", outcome: "routed" }));
 	expect(late.ok).toBe(false);
 });
 
 test("an unplanned child that starts late with no rival is reserved, so a later writer is refused", () => {
 	const work = new RunLanes("unplanned-reserved");
-	expect(work.place({ agent: "storm-implementer", name: "solo", task: "s" }, undefined, team, { now: T0 }).ok).toBe(true);
-	expect(at(LATE, () => work.admitChecked({ spawnKey: "solo", agent: "storm-implementer", outcome: "routed" })).ok).toBe(true);
-	const running = [agentEntry({ id: "solo", state: "running" })];
+	const solo = work.place({ agent: "storm-implementer", name: "solo", task: "s" }, undefined, team, { now: T0 });
+	expect(solo.ok).toBe(true);
+	const soloKey = idOf(solo);
+	expect(at(LATE, () => work.admitChecked({ spawnKey: soloKey, agent: "storm-implementer", outcome: "routed" })).ok).toBe(true);
+	const running = [agentEntry({ id: soloKey, state: "running" })];
 	expect(refusedWrite(work.place({ agent: "storm-implementer", name: "next", task: "n" }, undefined, team, { now: LATE + 1_000, agents: running }))).toBe(true);
 });
 

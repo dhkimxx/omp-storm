@@ -103,6 +103,13 @@ export interface ResultBaseline {
 /** Whether an artifact result is an ordinary shared output or a retained result of an isolated attempt. */
 export type ArtifactMode = "shared" | "isolated";
 
+/**
+ * Row 2 of the 0.29.0 table: a `change` result of an isolated attempt is never accepted or reviewable in this version.
+ * Storm does not bring isolated work into the target tree, so there is no parent-tree evidence to judge. The one
+ * sentence is exported because the controller, the views and the tests all quote it.
+ */
+export const ISOLATED_CHANGE_REASON = "이 버전은 격리 작업을 부모 트리로 가져오지 않습니다. change는 통합 전에는 수용할 수 없습니다.";
+
 export interface CaptureBaselineInput {
 	lane: string;
 	/** The raw `lane.results` value or an already parsed list. */
@@ -1515,7 +1522,12 @@ export async function evaluateSettledResults(input: EvaluateResultsInput): Promi
 	for (const result of parsed.results) {
 		if (input.signal?.aborted === true) return { ok: false, reason: "결과 평가가 취소되었습니다." };
 		let outcome: ItemOutcome;
-		if (result.kind === "change") {
+		if (result.kind === "change" && input.artifactMode === "isolated") {
+			// Row 2 of the 0.29.0 table: an isolated worker's change is never judged on the parent tree in this version.
+			// The parent may hold another writer's bytes (ISO P7-B) and Storm has no managed integration; the reason
+			// names that missing capability, never "the worker changed nothing".
+			outcome = { state: "unmet", reason: ISOLATED_CHANGE_REASON };
+		} else if (result.kind === "change") {
 			const entries = baselineEntries.get(result.id) ?? [];
 			if (result.path === undefined) {
 				const actual = [...new Set(entries.map(entry => entry.path))].sort();

@@ -10,6 +10,8 @@ import type { PlanView } from "./plan-view.ts";
 
 /** What a continued run carried over from the run it continues: counts of results, and the lanes still to do. */
 export interface ContinuedRun {
+	/** Which of R12's two continuations happened: the old plan and rows carried, or a handoff with nothing re-proved. */
+	mode: "carry" | "handoff";
 	from: string;
 	/** Why the continued run stopped, in the words `/storm status` uses ("이유 기록 없음" for a record that names none). */
 	ended: string;
@@ -86,9 +88,10 @@ export interface StormToolHost {
 		runActive?(): boolean;
 		/**
 		 * Automatic delegation only: opens a run for this turn's user request with `plan` already in force. It sends
-		 * no handoff; the in-flight turn is the run's first round.
+		 * no handoff; the in-flight turn is the run's first round. `turnStartedAt` is when that request's message
+		 * arrived, for R9's same-turn rule; a host that cannot give it opens nothing.
 		 */
-		startWithPlan?(spec: RunSpec, plan: RunPlan, validatedHash?: string): Promise<RunRequestResult>;
+		startWithPlan?(spec: RunSpec, plan: RunPlan, validatedHash?: string, turnStartedAt?: number): Promise<RunRequestResult>;
 		/**
 		 * Automatic delegation only: opens the run the `/storm` menu would resume (the same candidate and checks) inside
 		 * this turn, with its checkpoint restored and its plan in force. Nothing is started when there is no candidate or

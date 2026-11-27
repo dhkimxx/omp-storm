@@ -4,7 +4,7 @@
  * row state is the official disposition. Text that came from a plan, contract, lane, or attempt is bounded and made
  * single-line here so a stored record cannot forge a row or move the cursor.
  */
-import type { InfoTone, RunRecord, RunResult, RunResultState } from "../types.ts";
+import type { InfoTone, PlanLane, PlanLaneResult, RunRecord, RunResult, RunResultState } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
 import { ATTEMPT_REF } from "../runtime/attempt-report.ts";
 
@@ -23,6 +23,34 @@ export const RESULT_STATE_LABEL: Readonly<Record<RunResultState, string>> = {
 	reviewable: "검토 가능",
 	accepted: "이행",
 };
+
+/** Row 1: an accepted retained artifact is `kept` outside the target; the word every count uses for it. */
+export const RETAINED_LABEL = "보존";
+/** `보존 수용 N/M`: the acceptance count when every accepted row is a retained artifact, never read as a tree change. */
+export const RETAINED_ACCEPTED = "보존 수용";
+/** An old or damaged row proves an isolated artifact acceptance but carries no bound capture reference: say unknown. */
+export const RETAINED_REF_UNKNOWN = "참조 미확인(호스트 시도 기록)";
+/** A retained artifact's form, then a safe file name and a digest prefix; no absolute host path. */
+const RETAINED_FORM: Readonly<Record<NonNullable<RunResult["proof"]>["item"]["artifact"] & string, string>> = {
+	patch: "패치",
+	file: "파일",
+	directory: "디렉터리",
+};
+const DIGEST = /^[0-9a-f]{64}$/u;
+
+/** A safe, digest-bound reference to the retained source S1 accepted (never the absolute capture path). */
+function retainedCapture(result: RunResult): string | undefined {
+	const item = result.proof?.item;
+	const form = item?.artifact;
+	if (form === undefined) return undefined;
+	const source = result.proof?.artifact;
+	const name = typeof source?.path === "string" ? source.path.split(/[\\/]/u).pop() ?? "" : "";
+	const digest = source?.expectedDigest ?? item?.digest;
+	const parts = [RETAINED_FORM[form]];
+	if (name !== "") parts.push(bounded(name, 40));
+	if (digest !== undefined && DIGEST.test(digest)) parts.push(`sha256:${digest.slice(0, 12)}`);
+	return bounded(parts.join(" "), RESULT_REF_MAX) || undefined;
+}
 
 /** The operator's orthogonal scope marker. It says who excluded the row, not what its evidence state is. */
 export const RESULT_SCOPE_EXCLUDED = "excluded-by-user";
@@ -92,6 +120,10 @@ export interface ResultRow {
 	readonly attempt?: string;
 	/** Safe workspace-relative source reference, when the proof recorded one. */
 	readonly source?: string;
+	/** The accepted evidence is a retained artifact outside the target, never a tree change (row 1). */
+	readonly kept: boolean;
+	/** Safe digest-bound reference to the retained source: form, file name, digest prefix. Never an absolute path. */
+	readonly capture?: string;
 }
 
 export interface ResultCounts {
@@ -108,6 +140,8 @@ export interface ResultCounts {
 	readonly unjudged: number;
 	readonly running: number;
 	readonly pending: number;
+	/** In-scope accepted rows whose evidence is a retained artifact outside the target (row 1). */
+	readonly retained: number;
 	/** In-scope rows whose trusted remedy is a structured blocker, and those whose retry route is exhausted. */
 	readonly blocked: number;
 	readonly exhausted: number;
@@ -150,7 +184,12 @@ function planLabel(run: Pick<RunRecord, "plan">, result: RunResult): string {
 	return "";
 }
 
-function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: ReadonlySet<string> | undefined): ResultRow | undefined {
+interface PlannedIndex {
+	readonly byLane: ReadonlyMap<string, PlanLane>;
+	readonly byId: ReadonlyMap<string, PlanLaneResult>;
+}
+
+function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: ReadonlySet<string> | undefined, planned: PlannedIndex): ResultRow | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const result = value as RunResult & { readonly scope?: unknown };
 	const id = bounded(result.id, RESULT_ID_MAX);
@@ -169,6 +208,13 @@ function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: Reado
 			: undefined;
 	const attempt = typeof result.attemptId === "string" && ATTEMPT_REF.test(result.attemptId) ? result.attemptId : undefined;
 	const source = sourceRef(result);
+	// A row accepted as an artifact of an isolated lane is retained even when an old record lost its bound source; the
+	// kind comes from the stored contract, else the plan in force. Keyed lookups, so no per-row plan scan.
+	const lanePlan = result.lane === undefined ? undefined : planned.byLane.get(result.lane);
+	const plannedKind = result.contract?.kind ?? planned.byId.get(result.id)?.kind;
+	const kept = state === "accepted" &&
+		(result.proof?.item.artifact !== undefined || (lanePlan?.isolationReason !== undefined && plannedKind === "artifact"));
+	const capture = kept ? retainedCapture(result) ?? RETAINED_REF_UNKNOWN : undefined;
 	const excluded = result.scope === RESULT_SCOPE_EXCLUDED;
 	const running = !excluded && (state === "pending" || state === "unmet") &&
 		result.lane !== undefined && runningLanes?.has(result.lane) === true;
@@ -187,6 +233,8 @@ function rowOf(run: Pick<RunRecord, "plan">, value: unknown, runningLanes: Reado
 		...(unblock === undefined ? {} : { unblock }),
 		...(attempt === undefined ? {} : { attempt }),
 		...(source === undefined ? {} : { source }),
+		kept,
+		...(capture === undefined ? {} : { capture }),
 	};
 }
 
@@ -221,9 +269,12 @@ export function resultRowText(row: ResultRow, options: ResultRowTextOptions = {}
 	const remedy = row.state === "accepted" ? undefined : row.remedy;
 	const marker = remedy === "blocked" ? " · 차단" : remedy === "retry" ? " · 재시도 소진" : "";
 	const attempt = row.attempt === undefined ? "" : ` · 시도: ${row.attempt}`;
-	const source = row.source === undefined ? "" : ` · 출처: ${row.source}`;
+	// A retained artifact's declared path is where the candidate would land, not where it is now: `대상` names it and
+	// `보존` carries the digest-bound source. A tree or answer row keeps the old `출처`.
+	const source = row.source === undefined ? "" : row.kept ? ` · 대상: ${row.source}` : ` · 출처: ${row.source}`;
+	const capture = row.capture === undefined ? "" : ` · ${RETAINED_LABEL}: ${row.capture}`;
 	const unblock = row.state === "accepted" || row.unblock === undefined ? "" : ` · 해소: ${row.unblock}`;
-	const head = `${label}${reference}${lane}${options.includeState === false || row.excluded ? "" : ` ${row.stateLabel}`}${scope}${marker}${attempt}${source}`;
+	const head = `${label}${reference}${lane}${options.includeState === false || row.excluded ? "" : ` ${row.stateLabel}`}${scope}${marker}${attempt}${source}${capture}`;
 	const detail = `${reason}${unblock}`;
 	return detail === "" ? head : `${head} — ${detail}`;
 }
@@ -255,6 +306,8 @@ function firstByRank(rows: readonly ResultRow[]): ResultRow | undefined {
 function toneOf(counts: ResultCounts): InfoTone {
 	if (counts.inScope === 0) return "muted";
 	if (counts.blocked > 0 || counts.exhausted > 0 || counts.unmet > 0 || counts.unjudged > 0) return "warning";
+	// Row 1: retained artifacts are not a verified tree. No success mark and no tick for that acceptance.
+	if (counts.retained > 0 && counts.retained === counts.accepted) return "accent";
 	if (counts.reviewable > 0 || counts.pending > 0) return "accent";
 	if (counts.accepted === counts.inScope) return "success";
 	return "accent";
@@ -284,8 +337,15 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 	const seen = new Set<string>();
 	const rows: ResultRow[] = [];
 	const runningLanes = activeResultLanes(run);
+	const byLane = new Map<string, PlanLane>();
+	const byId = new Map<string, PlanLaneResult>();
+	for (const lane of run.plan?.lanes ?? []) {
+		byLane.set(lane.name, lane);
+		for (const result of lane.results ?? []) if (!byId.has(result.id)) byId.set(result.id, result);
+	}
+	const planned: PlannedIndex = { byLane, byId };
 	for (const value of Array.isArray(run.results) ? run.results : []) {
-		const row = rowOf(run, value, runningLanes);
+		const row = rowOf(run, value, runningLanes, planned);
 		if (row === undefined || seen.has(row.id)) continue;
 		seen.add(row.id);
 		rows.push(row);
@@ -298,6 +358,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 	let unjudged = 0;
 	let running = 0;
 	let pending = 0;
+	let retained = 0;
 	let blocked = 0;
 	let exhausted = 0;
 	for (const row of rows) {
@@ -306,8 +367,10 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 			continue;
 		}
 		scoped.push(row);
-		if (row.state === "accepted") accepted++;
-		else {
+		if (row.state === "accepted") {
+			accepted++;
+			if (row.kept) retained++;
+		} else {
 			if (row.running) {
 				running++;
 				continue;
@@ -331,6 +394,7 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 		unjudged,
 		running,
 		pending,
+		retained,
 		blocked,
 		exhausted,
 		excluded: excludedRows.length,
@@ -340,7 +404,10 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 	const delivered = scoped.find(row => row.state === "accepted");
 	const parts: string[] = [];
 	if (inScope > 0) {
-		parts.push(`이행 ${counts.accepted}/${inScope}`);
+		// Row 1: acceptance of retained artifacts is not tree work. When every accepted row is kept, the count says
+		// `보존 수용`; a mixed run adds a bounded `보존 N` part instead of reading the whole count as landed.
+		parts.push(counts.retained > 0 && counts.retained === counts.accepted ? `${RETAINED_ACCEPTED} ${counts.accepted}/${inScope}` : `이행 ${counts.accepted}/${inScope}`);
+		if (counts.retained > 0 && counts.retained !== counts.accepted) parts.push(`${RETAINED_LABEL} ${counts.retained}`);
 		if (counts.reviewable > 0) parts.push(`검토 가능 ${counts.reviewable}`);
 		if (counts.unmet > 0) parts.push(`미충족 ${counts.unmet}`);
 		if (counts.unjudged > 0) parts.push(`판정 전 종료 ${counts.unjudged}`);
@@ -375,6 +442,8 @@ export function resultProgress(run: ResultSnapshot): ResultProgress {
 				row.unblock,
 				row.attempt,
 				row.source,
+				row.kept,
+				row.capture,
 				row.remedy,
 				row.closedUnjudged,
 			]),

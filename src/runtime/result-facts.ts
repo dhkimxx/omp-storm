@@ -50,6 +50,15 @@ export interface ResultCoverage {
 	readonly missing: number;
 }
 
+/** Accepted retained artifacts kept outside the target: a count plus one safe reference, never a per-worker list. */
+export interface RetainedFacts {
+	readonly count: number;
+	/** The first accepted retained row's safe digest-bound capture reference. */
+	readonly capture?: string;
+	/** The first accepted retained row's host attempt. */
+	readonly attempt?: string;
+}
+
 /** Worker activity, counted apart from result rows. */
 export interface WorkerActivity {
 	/** Spawns this run routed (a worker it placed, with or without a lane). */
@@ -88,6 +97,11 @@ export interface ResultFacts {
 	 */
 	readonly noResultsNotice: boolean;
 	readonly progress: ResultProgress;
+	/**
+	 * Accepted retained artifacts, kept outside the target (row 1). `capture` and `attempt` are the first row's safe,
+	 * digest-bound reference; the count is all of them. Fixed size: no list grows with the number of workers.
+	 */
+	readonly retained: RetainedFacts;
 	readonly rows: ResultRowFacts;
 	readonly coverage: ResultCoverage;
 	readonly activity: WorkerActivity;
@@ -199,11 +213,19 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 		unplanned,
 		unplannedPlaced,
 	};
+	const keptRows = progress.rows.filter(row => !row.excluded && row.state === "accepted" && row.kept);
+	const firstKept = keptRows[0];
+	const retained: RetainedFacts = {
+		count: keptRows.length,
+		...(firstKept?.capture === undefined ? {} : { capture: firstKept.capture }),
+		...(firstKept?.attempt === undefined ? {} : { attempt: firstKept.attempt }),
+	};
 	return {
 		declaration,
 		hasDeclared,
 		noResultsNotice,
 		progress,
+		retained,
 		rows: { total: progress.rows.length, declared: declaredRows, removed, orphaned, excluded: progress.counts.excluded },
 		coverage,
 		activity,
@@ -224,6 +246,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 			coverage.declared,
 			coverage.missing,
 			activity,
+			retained,
 			outOfPlan,
 			changedPaths ?? null,
 		]),

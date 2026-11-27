@@ -30,6 +30,7 @@ import {
 import type { LaneKind, LaneNeed, LaneResultKind, PlanLaneResult, RunPlan, RunResult, StormConfig } from "../types.ts";
 import {
 	type ArtifactEvidenceSource,
+	ISOLATED_CHANGE_REASON,
 	type ResultEvidenceItem,
 	type ResultEvidenceLimits,
 	captureSharedBaseline,
@@ -363,6 +364,9 @@ export async function revalidateCheckpointProof(input: CheckpointProofInput): Pr
 	if (input.isolated === true && item.kind === "artifact" && artifact === undefined) {
 		return fail("격리 산출물에는 보존된 호스트 산출물 근거가 필요합니다.");
 	}
+	// Row 2: an isolated change has no accepted location in this version, old record or not. The parent tree is not
+	// this attempt's evidence, so a restored row is reopened instead of re-validated on whoever's bytes are there.
+	if (input.isolated === true && item.kind === "change") return fail(ISOLATED_CHANGE_REASON);
 
 	const projection = projectAcceptedResult({
 		row: { id: row.id, state: "accepted", attemptId, identity, contentVersion },

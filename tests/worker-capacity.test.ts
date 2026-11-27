@@ -41,7 +41,12 @@ const plan = (workers: RunPlan["workers"] = { implementer: 1, explorer: 1 }): Ru
 	workers,
 	submittedAt: "2026-11-23T00:00:00.000Z",
 });
-const event = (agent: string, spawnKey: string): SpawnEvent => ({ agent, invocationKind: "task", patterns: [], spawnKey });
+const event = (agent: string, spawnKey?: string): SpawnEvent => ({
+	agent,
+	invocationKind: "task",
+	patterns: [],
+	...(spawnKey === undefined ? {} : { spawnKey }),
+});
 const runtime = (runPlan: RunPlan, over: Partial<SpawnRuntime> = {}): SpawnRuntime => ({
 	now: NOW,
 	quotaMarks: [],
@@ -125,9 +130,12 @@ describe("one authoritative worker accounting", () => {
 		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, runtime(plan(), { maxConcurrency: 1 })))).toBeUndefined();
 	});
 
-	test("a role the plan has no lane for still cannot spawn", () => {
+	test("a role the plan has no lane for needs a host key, because no placement can be matched without one", () => {
 		const reviewOnly = plan({ explorer: 1 });
-		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(reviewOnly)))).toBe("role-not-in-plan");
+		// The plan/role refusals are gone: a keyed spawn is routed and its exact placement is checked at admission.
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(reviewOnly)))).toBeUndefined();
+		// A keyless spawn has nothing to correlate with a placement; that refusal stays for every Storm-decided spawn.
+		expect(codeOf(decideSpawn(event("storm-implementer"), { config: load, approval, shadows: [] }, runtime(reviewOnly)))).toBe("unassigned-lane");
 	});
 });
 
@@ -322,8 +330,15 @@ describe("job lanes are never AI worker targets", () => {
 		const lane = plannedTaskLanes({ agent: "storm-quick", task: "Work" }, jobPlan, team);
 		expect(lane.ok).toBe(true);
 		if (lane.ok) expect(lane.lanes[0]?.name).toBe("quick-work");
+		// R5: a name that matches a job lane is placed as an unplanned worker under a fresh handle, with one note; it
+		// never runs the job and never takes the job lane.
 		const work = new RunLanes(RUN);
-		expect(work.place({ agent: "storm-quick", name: "bench", task: "Run" }, jobPlan, team).ok).toBe(false);
+		const unplanned = work.place({ agent: "storm-quick", name: "bench", task: "Run" }, jobPlan, team);
+		expect(unplanned.ok).toBe(true);
+		if (unplanned.ok) {
+			expect(unplanned.notes?.[0]).toContain("계획 밖");
+			expect(unplanned.input.name).not.toBe("bench");
+		}
 	});
 
 	test("IRC reuse cannot bind to a job lane; job identity changes the route and replan", () => {

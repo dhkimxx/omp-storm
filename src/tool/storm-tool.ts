@@ -39,6 +39,8 @@ import {
 	closeoutSessionId,
 	parseCloseout,
 } from "../runtime/closeout.ts";
+import { PLANLESS_NO_TURN_TIME } from "../runtime/planless.ts";
+import { continuedHandoffText } from "../runtime/resume.ts";
 import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, ShadowInfo, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { ContinuedRun, StormToolHost } from "./host.ts";
@@ -261,6 +263,8 @@ const CONTINUE_NO_HOST = "이 호스트에서는 중단된 실행을 이어 갈 
 
 /** What a continued run carried over, in the words the director acts on. Facts and the next step, no plan dump. */
 function continuedText(runId: string, carried: ContinuedRun): string {
+	// R12: a run with no result rows opens a handoff, not a carry; it must never say the old plan was applied.
+	if (carried.mode === "handoff") return continuedHandoffText(runId, carried.from, carried.ended);
 	const parts = [`이어받은 결과 ${carried.kept}개(현재 근거로 다시 확인함)`, `다시 할 결과 ${carried.reopened}개`];
 	if (carried.blocked > 0) parts.push(`막힌 결과 ${carried.blocked}개`);
 	const open = carried.open.length === 0 ? "" : ` 남은 레인: ${carried.open.join(", ")}.`;
@@ -486,9 +490,12 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 		if (start === undefined) return rejected("이 호스트에서는 자동 위임 실행을 열 수 없습니다. /storm auto를 끄거나 호스트를 업데이트하세요.");
 		const turn = userTurnTask(host, AUTO_NO_TASK);
 		if ("outcome" in turn) return turn;
+		// R9's same-turn rule needs the time the user's message arrived; without it no start can be shown to follow
+		// a stop, so the plan is checked but no run opens.
+		if (turn.startedAt === undefined) return rejected(PLANLESS_NO_TURN_TIME);
 		const spec = runSpec(turn.task);
 		if (!spec.ok) return rejected(spec.error);
-		const started = await start(spec.spec, plan, validatedHash);
+		const started = await start(spec.spec, plan, validatedHash, turn.startedAt);
 		if (!started.ok) return rejected(started.reason);
 		return {
 			outcome: "ok",

@@ -29,13 +29,15 @@ import { listAgents, markAgentsCleaned, noteAgentEnd, resetAgents } from "../src
 import * as closeoutModule from "../src/runtime/closeout.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
 import { CONTRACT_TAG, ISOLATED_SCOPE } from "../src/runtime/contract-text.ts";
-import { CONTINUE_SAME_TURN, RunController, runSpawns } from "../src/runtime/controller.ts";
+import { CONTINUE_SAME_TURN, lastRunEndAt, RunController, runSpawns } from "../src/runtime/controller.ts";
 import * as ledgerModule from "../src/runtime/ledger.ts";
 import { activeLedgerRun, bindLedgerChild, getLedgerRun, resetLedger, spendNote } from "../src/runtime/ledger.ts";
 import { DISCARDED_TURN_PURPOSE } from "../src/runtime/side-spend.ts";
 import { processKey } from "../src/runtime/janitor.ts";
 import { LEDGER_READY_LEAD, noteLaneAgentEnd, onLaneReservationEnd, type ReservationEnd, WRITER_FREED_LEAD } from "../src/runtime/lanes.ts";
+import { PLANLESS_SAME_TURN } from "../src/runtime/planless.ts";
 import { endLabel, ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
+import { SPEND_CLOSED_LEAD, SPEND_TAG } from "../src/policy/spend-close.ts";
 import { DIRECTOR_EDIT_RULE, lastRun, readRun, writeRun } from "../src/runtime/run.ts";
 import { CONTINUATION_HEAD, EARLIER_REQUEST_MARKER, noteResumePointer } from "../src/runtime/resume.ts";
 import { readTrialStates } from "../src/runtime/state-files.ts";
@@ -382,7 +384,8 @@ describe("a run through the hooks", () => {
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		const impl = child.ctx(sub("Impl"));
+		// The worker id is the admission's spawn key; with the plan's lane, manual placement keeps the lane name.
+		const impl = child.ctx(sub("fix"));
 		const edit = { toolName: "edit", toolCallId: "edit-1", input: { path: "src/a.ts" } };
 
 		// Before a run the main session is an ordinary one.
@@ -406,20 +409,26 @@ describe("a run through the hooks", () => {
 		await omp.emit("message_end", { message: { role: "assistant", stopReason: "toolUse", content: callBlocks } }, main);
 		await omp.emit("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [] } }, main);
 
-		// Spawns wait for a plan, then follow it.
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("no-plan");
+		// R4: a spawn whose key is not exactly a pending placement of this run is refused, never guessed; the plan's
+		// lane is then placed and followed.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("internal");
 		expect(await omp.tool({ action: "plan", plan: { lanes: [fixLane] } }, main)).toBe("ok");
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("route:a/i");
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-reviewer", "Rev"), main))).toBe("role-not-in-plan");
-		// A spawn decided in a subagent's session sees the same run. The plan's count of workers per role is no longer a
-		// limit: only a role the plan has no lane for is refused (above), so a second implementer spawn is routed.
+		const placedFix = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "fix", task: "fix it" } }, main)) as { input: { name: string } };
+		expect(placedFix.input.name).toBe("fix");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "fix"), main))).toBe("route:a/i");
+		// R5: a role the plan has no lane for is placed as an unplanned worker under a handle; a read-only item reserves
+		// nothing, so it runs beside the planned writer. Its spawn is keyed by that handle.
+		const placedRev = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "Rev", task: "look around" } }, main)) as { input: { name: string } };
+		expect(placedRev.input.name).not.toBe("Rev");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", placedRev.input.name), main))).toMatch(/^route:/);
+		// A spawn decided in a subagent's session sees the same run; the plan's worker count is no limit.
 		expect(verdict(await child.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl2"), impl))).toBe("route:a/i");
 
 		// The subagent's first turn registers it under the run and brings its role's doc rules.
 		const section = docPromptFor("storm-implementer", TEAM);
 		expect(await child.emit("before_agent_start", { systemPrompt: ["base"] }, impl)).toEqual({ systemPrompt: ["base", section] });
 		expect(await child.emit("before_agent_start", { systemPrompt: ["base", section] }, impl)).toBeUndefined();
-		expect(listAgents({ runId: runId as string, scope: project.sessionDir }).map(agent => agent.id)).toEqual(["Impl"]);
+		expect(listAgents({ runId: runId as string, scope: project.sessionDir }).map(agent => agent.id)).toEqual(["fix"]);
 
 		// The director's reads are never refused for their size, whether or not a subagent read the file: Storm only
 		// counts them (a wide range of a file a subagent read is counted as duplicate, below).
@@ -439,10 +448,10 @@ describe("a run through the hooks", () => {
 
 		// Follow-ups count when delivered; progress notes and failed writes do not.
 		const followUp = (target: string, isError = false) => omp.emit("tool_result", { toolName: "write", input: { path: target }, isError, content: [] }, main);
-		await followUp("agent://Impl");
-		await followUp("agent://impl");
-		await followUp("agent://Impl?progress");
-		await followUp("agent://Impl", true);
+		await followUp("agent://fix");
+		await followUp("agent://FIX");
+		await followUp("agent://fix?progress");
+		await followUp("agent://fix", true);
 		await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, impl);
 		await child.emit("agent_end", {}, impl);
 
@@ -469,10 +478,10 @@ describe("a run through the hooks", () => {
 			plan: { lanes: [{ name: "fix", kind: "code", role: "implementer", results: changeFor("fix-change") }] },
 			results: [{ id: "fix-change", lane: "fix", state: "pending" }],
 		});
-		expect(record?.spawns.map(spawn => spawn.code ?? spawn.outcome)).toEqual(["no-plan", "routed", "role-not-in-plan", "routed"]);
+		expect(record?.spawns.map(spawn => spawn.code ?? spawn.outcome)).toEqual(["internal", "routed", "routed", "routed"]);
 		// The manual task name was matched to its unique planned lane without a rewrite.
-		expect(record?.spawns.find(spawn => spawn.spawnKey === "Impl" && spawn.outcome === "routed")?.lane).toBe("fix");
-		expect(record?.agents).toMatchObject([{ id: "Impl", role: "implementer", state: "idle", followUps: 2, costUsd: 0.5, contextTokens: 30_000, review: { reviews: 1, passed: 1 } }]);
+		expect(record?.spawns.find(spawn => spawn.spawnKey === "fix" && spawn.outcome === "routed")?.lane).toBe("fix");
+		expect(record?.agents).toMatchObject([{ id: "fix", role: "implementer", state: "idle", followUps: 2, costUsd: 0.5, contextTokens: 30_000, review: { reviews: 1, passed: 1 } }]);
 
 		// With the run closed by the session ending, the main session is ordinary again.
 		await omp.emit("session_shutdown", {}, main);
@@ -480,7 +489,7 @@ describe("a run through the hooks", () => {
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("task", "T", ["x/unapproved"]), main))).toBe("pass");
 	});
 
-	test("manual task placement keeps handles, flags only planned isolation and refuses a direct isolated claim", async () => {
+	test("manual task placement keeps planned handles, flags only planned isolation and places a direct isolated claim as unplanned private", async () => {
 		await approve(TEAM);
 		const settings = installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
 		const omp = fakeOmp(project);
@@ -506,7 +515,11 @@ describe("a run through the hooks", () => {
 		const core = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "core", task: "Core", isolated: true } }, main)) as { input: Record<string, unknown> };
 		expect(core.input).toMatchObject({ name: "core" });
 		expect(core.input).not.toHaveProperty("isolated");
-		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", task: "Stray", isolated: true } }, main))).toBe("isolation");
+		// D10: an unplanned item that asks for its own checkout is placed private beside other writers when omp's
+		// isolation is on and its merge is off; it gets a generated handle, never the caller's name as a lane.
+		const stray = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "Stray", task: "Stray", isolated: true } }, main)) as { input: Record<string, unknown> };
+		expect(stray.input).toMatchObject({ isolated: true });
+		expect(stray.input.name).not.toBe("Stray");
 		// Three task calls, one host capability read: the per-run cache holds across shared and selective spawns.
 		expect(settings.calls()).toBe(1);
 	});
@@ -521,7 +534,8 @@ describe("a run through the hooks", () => {
 
 		// A block ends a call with `details: {}`, which omp 19.2's task view cannot draw; a refused task call carries the field
 		// omp's task tool rejects first, keeps everything the director sent, and is told apart by the code in the marker.
-		const sent = { agent: "storm-explorer", name: "scout", task: "Look around" };
+		// The same planned lane twice is still a refusal this version keeps; it is the refusal this test exercises.
+		const sent = { tasks: [{ agent: "storm-implementer", name: "fix", task: "First" }, { agent: "storm-implementer", name: "fix", task: "Second" }] };
 		const answer = await omp.emit("tool_call", { toolName: "task", toolCallId: "refused-1", input: sent }, main);
 		expect(answer).not.toHaveProperty("block");
 		expect(verdict(answer)).toBe("lane");
@@ -588,7 +602,7 @@ describe("a run through the hooks", () => {
 			// whose prerequisite is not ready is no longer refused: it starts, and its result says so.)
 			{ call: "r-busy", input: item("E0", "storm-explorer"), spawns: [["storm-explorer", "E0"]], code: "lane-busy" },
 			// One bad item refuses the whole batch, the good item with it.
-			{ call: "r-batch", input: { context: "c", tasks: [item("C0"), item("C1"), item("stray")] }, spawns: [["storm-implementer", "C0"], ["storm-implementer", "C1"]], code: "lane" },
+			{ call: "r-batch", input: { context: "c", tasks: [item("C0"), item("C1"), item("stray")] }, spawns: [["storm-implementer", "C0"], ["storm-implementer", "C1"]], code: "lane-write" },
 			// No handle: omp names the spawn after the call, and a lane of the agent's role is the only candidate.
 			{ call: "r-nameless", input: { agent: "storm-explorer", task: "work" }, spawns: [["storm-explorer", "r-nameless:0"]], code: "lane-busy" },
 		];
@@ -673,14 +687,21 @@ describe("a run through the hooks", () => {
 		const main = omp.ctx(MAIN);
 		await omp.command("manual task", main);
 		expect(await omp.tool({ action: "plan", plan: { lanes: [fixLane] } }, main)).toBe("ok");
-		const refuse = (call: string) => omp.emit("tool_call", { toolName: "task", toolCallId: call, input: { agent: "storm-explorer", name: "scout", task: "x" } }, main);
+		// Two shared writers in one call: this is still a refusal. Nothing of it starts, and while its result is
+		// unsettled no other spawn starts either (the refusal is a fail-closed window, task-refusal.ts).
+		const refuse = (call: string) => omp.emit("tool_call", {
+			toolName: "task",
+			toolCallId: call,
+			input: { tasks: [{ agent: "storm-implementer", name: "fix", task: "One" }, { agent: "storm-implementer", name: "fix", task: "Two" }] },
+		}, main);
 		const spawn = async () => verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "fix"), main));
 		await refuse("c1");
 		expect(await spawn()).toBe("lane");
 		// The host cancelled the call: its end clears the hold.
 		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "c1", isError: true }, main);
-		expect(await spawn()).toBe("route:a/i");
-		// Any other verdict than the refusal's own proves the hold is gone (the plan's one implementer is taken now).
+		// A real placement of the plan's lane now starts.
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "fix", task: "work" } }, main))).toBe("pass");
+		expect(await spawn()).toMatch(/^route:/);
 
 		// A call the host never settles holds spawns only for its window.
 		setSystemTime(new Date("2030-01-01T00:00:00Z"));
@@ -1996,7 +2017,7 @@ describe("a run through the hooks", () => {
 		expect(await lastRun(project.sessionDir)).toMatchObject({ status: "ended", endReason: "no-changes", turns: 1 });
 	});
 
-	test("a planned batch with an unassigned item is refused whole before any child starts", async () => {
+	test("a planned batch with an unplanned writer beside a planned writer is refused whole before any child starts", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
@@ -2013,7 +2034,9 @@ describe("a run through the hooks", () => {
 			toolName: "task",
 			input: { tasks: [{ name: "A", agent: "storm-implementer", task: "a" }, { agent: "storm-implementer", task: "unassigned" }] },
 		};
-		expect(verdict(await omp.emit("tool_call", batch, main))).toBe("lane");
+		// R5 places the unassigned item as an unplanned writer; G1 refuses the whole batch because that is a second
+		// shared writer beside lane A, before anything is reserved or started.
+		expect(verdict(await omp.emit("tool_call", batch, main))).toBe("lane-write");
 		// No run spawn record exists for the refused batch, and a fully authorized single item still works.
 		expect(activeLedgerRun(project.sessionDir)?.plan?.lanes.map(lane => lane.name)).toEqual(["A", "B", "C"]);
 		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { name: "A", agent: "storm-implementer", task: "a" } }, main))).toBe("pass");
@@ -2034,6 +2057,7 @@ describe("a run through the hooks", () => {
 			lanes: [{ name: "Big", kind: "code", role: "implementer", files: ["big.txt"], results: changeFor("big-change") }],
 			workers: { implementer: 1 },
 		});
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "Big", task: "big" } }, main))).toBe("pass");
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Big"), main))).toBe("route:a/i");
 		const ctx = child.ctx(sub("Big"));
 		admitChild(runId, "Big");
@@ -2132,21 +2156,27 @@ describe("the spawn hook", () => {
 		const omp = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.command("task", main);
+		// Read-only lanes: their placements reserve no shared write, so the native ceiling is what the second spawn meets.
 		await applyRunPlan(omp, main, {
 			lanes: [
-				{ name: "A", kind: "code", role: "implementer", files: ["a.txt"], results: changeFor("a-change") },
-				{ name: "B", kind: "code", role: "implementer", files: ["b.txt"], results: changeFor("b-change") },
+				{ name: "A", kind: "explore", role: "explorer", goal: "Read A", results: answerFor("a-answer") },
+				{ name: "B", kind: "explore", role: "explorer", goal: "Read B", results: answerFor("b-answer") },
 			],
-			workers: { implementer: 2 },
+			workers: { explorer: 2 },
 		});
+		// R4: each fresh spawn has its exact placement before the hook.
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "A", task: "read a" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "B", task: "read b" } }, main))).toBe("pass");
 		const spawn = (name: string, maxConcurrency: number) =>
 			withActiveSettings(Settings.isolated({ "task.maxConcurrency": maxConcurrency }), () =>
-				omp.emit("before_subagent_spawn", spawnOf("storm-implementer", name), main));
-		expect(verdict(await spawn("A", 1))).toBe("route:a/i");
-		// A's reservation fills the one live native slot before any host agent row exists.
+				omp.emit("before_subagent_spawn", spawnOf("storm-explorer", name), main));
+		expect(verdict(await spawn("A", 1))).toMatch(/^route:/);
+		// A's reservation fills the one live native slot before any host agent row exists. The refused spawn consumes
+		// its placement (a blocked spawn never leaves a reservation behind), so the retry needs a new task call.
 		expect(verdict(await spawn("B", 1))).toBe("parallelism");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "B", task: "read b" } }, main))).toBe("pass");
 		// OMP's unlimited value adds no Storm cap of its own.
-		expect(verdict(await spawn("B", 0))).toBe("route:a/i");
+		expect(verdict(await spawn("B", 0))).toMatch(/^route:/);
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -2412,12 +2442,11 @@ describe("automatic delegation", () => {
 		expect(started.systemPrompt.at(-1)).toContain("plan");
 		expect(omp.statuses.at(-1)).toContain("자동 위임");
 
-		// What edits files, runs a command or spawns is refused until a plan opens the run, each with its own cause; reads
+		// What edits files or runs a command is refused until the request's run opens, each with its own cause; reads
 		// and searches are open (the director may look at the project itself).
 		for (const call of [
 			{ toolName: "edit", input: { path: "src/a.ts" } },
 			{ toolName: "bash", input: { command: "git status" } },
-			{ toolName: "task", input: { agent: "storm-implementer", task: "fix" } },
 		]) {
 			expect(verdict(await omp.emit("tool_call", call, main))).toBe("auto");
 		}
@@ -2435,6 +2464,11 @@ describe("automatic delegation", () => {
 		expect(verdict(await omp.emit("tool_call", { toolName: "storm", input: { action: "plan" } }, main))).toBe("pass");
 		// The spawn hook is the fail-closed backstop even when no tool-call guard sees the spawn.
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("auto");
+		// R9: the first `task` of the request opens this turn's run with no plan; it is no longer refused.
+		const opened = await omp.emit("tool_call", { toolName: "task", toolCallId: "open-1", input: { agent: "storm-explorer", name: "look", task: "read the tree" } }, main);
+		expect(opened).not.toHaveProperty("block");
+		expect(verdict(opened)).toBe("pass");
+		expect(activeLedgerRun(project.sessionDir)?.runId).toBeDefined();
 		// The stable instruction is appended once, not again on the next turn.
 		expect(await omp.emit("before_agent_start", { reason: "prompt", prompt: "more", systemPrompt: started.systemPrompt }, main)).toBeUndefined();
 	});
@@ -3693,12 +3727,14 @@ describe("persisted worker authority across module boundaries", () => {
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		const impl = child.ctx(sub("Impl"));
+		const impl = child.ctx(sub("fix"));
 		await omp.emit("session_start", {}, main);
 		await omp.command("task", main);
 		await applyRunPlan(omp, main, { lanes: [{ ...fixLane, files: ["allowed.txt"] }] });
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("route:a/i");
-		const record = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: "Impl" });
+		// R4: the spawn key is exactly the lane's pending placement (manual planned items keep the lane name).
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "fix", task: "edit" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "fix"), main))).toBe("route:a/i");
+		const record = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: "fix" });
 		expect(record).toMatchObject({ kind: "record", record: { lane: "fix", policy: { kind: "paths", paths: ["allowed.txt"] } } });
 
 		expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: "allowed.txt", content: "x" } }, impl))).toBe("pass");
@@ -3710,7 +3746,7 @@ describe("persisted worker authority across module boundaries", () => {
 		expect(verdict(await child.emit("tool_call", { toolName: "read", input: { path: "allowed.txt" } }, stray))).toBe("pass");
 
 		await omp.emit("session_shutdown", {}, main);
-		expect(await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: "Impl" })).toMatchObject({
+		expect(await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: "fix" })).toMatchObject({
 			kind: "record",
 			record: { revokedAt: expect.any(Number) },
 		});
@@ -3725,7 +3761,8 @@ describe("persisted worker authority across module boundaries", () => {
 		await omp.emit("session_start", {}, main);
 		await omp.command("task", main);
 		await applyRunPlan(omp, main, { lanes: [fixLane] });
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("route:a/i");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "fix", task: "edit" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "fix"), main))).toBe("route:a/i");
 		const pooled = child.ctx(sub("Pooled", "unrelated"));
 		const nested = { agent: "custom-worker", invocationKind: "task" as const, patterns: [], spawnKey: "Nested" };
 		expect(verdict(await child.emit("before_subagent_spawn", nested, pooled))).toBe("internal");
@@ -3748,7 +3785,7 @@ describe("persisted worker authority across module boundaries", () => {
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		const base = child.ctx(sub("Probe"));
+		const base = child.ctx(sub("probe"));
 		const privateDir = path.join(project.tmp, "private-checkout");
 		const movedDir = path.join(project.tmp, "moved-checkout");
 		await mkdir(privateDir, { recursive: true });
@@ -3760,7 +3797,8 @@ describe("persisted worker authority across module boundaries", () => {
 		await applyRunPlan(omp, main, {
 			lanes: [{ name: "probe", kind: "run", role: "implementer", isolationReason: "independent experiment", files: ["allowed.txt"], results: changeFor("probe-change") }],
 		});
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Probe"), main))).toBe("route:a/i");
+		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "probe", task: "probe" } }, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "probe"), main))).toBe("route:a/i");
 
 		expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: "allowed.txt", content: "x" } }, probe))).toBe("pass");
 		expect(verdict(await child.emit("tool_call", { toolName: "write", input: { path: path.join(project.root, "outside.txt"), content: "x" } }, probe))).toBe("lane-scope");
@@ -5033,13 +5071,28 @@ describe("hardening through the hooks: write order (G1)", () => {
 		await omp.emit("session_shutdown", {}, main);
 	});
 
-	test("a spawn in a run that has no plan is refused before any admission: there is no unplanned writer to place", async () => {
+	test("a run with no plan places a writer under a generated handle; only its live hold lets it write", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		await omp.command("manual task", main);
-		expect(verdict(await omp.emit("tool_call", taskCall("PA", "pa-1"), main))).toBe("pass");
-		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "PA"), main))).toBe("no-plan");
+		const placed = (await omp.emit("tool_call", taskCall("PA", "pa-1"), main)) as { input: Record<string, unknown> };
+		const handle = String(placed.input.name);
+		expect(handle).not.toBe("PA");
+		// The caller's name is nobody's spawn key: R4 refuses it instead of guessing the placement it might mean.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "PA"), main))).toBe("internal");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main))).toMatch(/^route:/);
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		const record = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: handle });
+		expect(record.kind).toBe("record");
+		if (record.kind === "record") expect(record.record.hold).toBe(`spawn:${handle}`);
+		const worker = child.ctx(sub(handle));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-1", input: { path: "pa.txt", content: "x" } }, worker))).toBe("pass");
+		// The place ends: the admission is revoked, and the same write no longer has a reservation behind it.
+		await revokeWorkerAdmissions(project.agentDir, { runId, childId: handle });
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-2", input: { path: "pa.txt", content: "x" } }, worker))).toBe("authority");
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -6919,4 +6972,285 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			await omp.emit("session_shutdown", {}, main);
 		}, 20_000);
 	});
+});
+
+describe("phase 3 through the hooks: the plan-less team", () => {
+	const call = (id: string, input: Record<string, unknown>) => ({ toolName: "task", toolCallId: id, input });
+	const recordOf = (value: unknown): Record<string, unknown> => {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("expected an object");
+		return value as Record<string, unknown>;
+	};
+	/** The host's final input of a placed `task` call. */
+	const placedInput = (answer: unknown): Record<string, unknown> => {
+		if (typeof answer !== "object" || answer === null || !("input" in answer)) throw new Error("the task call was not placed");
+		return recordOf(answer.input);
+	};
+	const handleOf = (answer: unknown): string => {
+		const handle = placedInput(answer).name;
+		if (typeof handle !== "string" || handle === "") throw new Error("the placement carried no handle");
+		return handle;
+	};
+	const enterAutoTurn = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, prompt = "fix the login bug"): Promise<void> => {
+		await omp.emit("session_start", {}, main);
+		await omp.emit("before_agent_start", { reason: "prompt", prompt, systemPrompt: [] }, main);
+	};
+
+	test("a reader cannot take a writer's place: a foreign key is refused and its placement stays pending", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		// One plan-less batch, the caller's two items share a name: R4 gives each its own generated handle.
+		const answer = await omp.emit("tool_call", call("open", {
+			tasks: [
+				{ agent: "storm-explorer", name: "same", task: "read" },
+				{ agent: "storm-implementer", name: "same", task: "write" },
+			],
+		}), main);
+		const items = placedInput(answer).tasks;
+		if (!Array.isArray(items) || items.length !== 2) throw new Error("the batch was not placed");
+		const readerKey = String(recordOf(items[0]).name);
+		const writerKey = String(recordOf(items[1]).name);
+		expect(readerKey).not.toBe(writerKey);
+		// The reader's spawn under the writer's key would bind the writer's place. R4 refuses it, and the writer's
+		// placement is still there for its own spawn.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", writerKey), main))).toBe("internal");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", writerKey), main))).toMatch(/^route:/);
+		// The reader still starts under its own key; a repeated key is nobody's pending placement any more.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", readerKey), main))).toMatch(/^route:/);
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", readerKey), main))).toBe("internal");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a spawn key of an earlier run is refused in the next run", async () => {
+		await approve(TEAM);
+		const first = fakeOmp(project);
+		const main = first.ctx(MAIN);
+		await first.command("first request", main);
+		await applyRunPlan(first, main, { lanes: [{ ...fixLane, name: "old" }], workers: { implementer: 1 } });
+		const oldRun = activeLedgerRun(project.sessionDir)?.runId;
+		expect(oldRun).toBeDefined();
+		await first.emit("session_shutdown", {}, main);
+		await until(async () => (await lastRun(project.sessionDir))?.runId === oldRun);
+
+		const second = fakeOmp(project);
+		const main2 = second.ctx(MAIN);
+		await second.command("second request", main2);
+		// No plan in the next run: the earlier run's key is nobody's placement, so R4 refuses it instead of routing it.
+		const newRun = activeLedgerRun(project.sessionDir)?.runId;
+		expect(newRun).not.toBe(oldRun);
+		expect((await readRun(project.sessionDir, newRun as string))?.plan).toBeUndefined();
+		expect(verdict(await second.emit("before_subagent_spawn", spawnOf("storm-implementer", "old"), main2))).toBe("internal");
+		// The next run's own placed item is admitted under its generated handle.
+		const placed = (await second.emit("tool_call", call("new-1", { agent: "storm-implementer", name: "new", task: "work" }), main2)) as { input: Record<string, unknown> };
+		const handle = String(placed.input.name);
+		expect(handle).not.toBe("new");
+		expect(verdict(await second.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main2))).toMatch(/^route:/);
+		await second.emit("session_shutdown", {}, main2);
+	});
+
+	test("a refused plan-less batch opens no run, no lease and no marker; one safe item then opens it", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		const refused = await omp.emit("tool_call", call("bad", {
+			tasks: [
+				{ agent: "storm-implementer", name: "a", task: "write a" },
+				{ agent: "storm-implementer", name: "b", task: "write b" },
+			],
+		}), main);
+		// A refused task call is carried into omp's own rejection (task-refusal.ts), never a plain block.
+		expect(verdict(refused)).toBe("lane-write");
+		expect(activeLedgerRun(project.sessionDir)).toBeUndefined();
+		expect(await lastRun(project.sessionDir)).toBeUndefined();
+		// The same turn's next call is a safe reader batch: the run opens with the read lease and the batch is placed.
+		const opened = await omp.emit("tool_call", call("good", { agent: "storm-explorer", name: "look", task: "read" }), main);
+		expect(opened).not.toHaveProperty("block");
+		expect(activeLedgerRun(project.sessionDir)?.runId).toBeDefined();
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a plan-less run opens at the first task call; after a stop at or after the prompt the same turn opens nothing, a new prompt does", async () => {
+		await approve({ ...TEAM, budget: { perRunUsd: 0.1, onExceed: "stop" } });
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		// A run of this session and target stops on the user's budget limit.
+		await omp.command("first request", main);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("message_end", assistant("m", "main", 1_000, 0.25), main);
+		await omp.emit("agent_end", {}, main);
+		await until(async () => (await lastRun(project.sessionDir)) !== undefined);
+		const sentBefore = omp.sent.length;
+		const stoppedAt = lastRunEndAt((await loadProjectState(project.env)).sessionDir, project.root);
+		if (stoppedAt === undefined) throw new Error("the stopped run left no end time");
+		expect(stoppedAt).toBeGreaterThan(0);
+		// R9: a prompt whose turn began at or before that stop cannot open a run, whatever the model sends next.
+		setSystemTime(new Date(stoppedAt - 1_000));
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "try again", systemPrompt: [] }, main);
+		const refused = await omp.emit("tool_call", call("t2", { agent: "storm-explorer", name: "look", task: "look" }), main);
+		expect(verdict(refused)).toBe("auto");
+		expect(activeLedgerRun(project.sessionDir)).toBeUndefined();
+		// The refusal's words reach the director as that call's own result.
+		const shown = (await omp.emit("tool_result", { ...call("t2", {}), isError: true, input: placedInput(refused), content: [], details: {} }, main)) as { content?: Array<{ text?: string }> };
+		expect(shown?.content?.[0]?.text ?? "").toContain(PLANLESS_SAME_TURN);
+		// The refused turn ends; the user speaks again after the stop and the plan-less run opens at its first task call.
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		setSystemTime(new Date(stoppedAt + 1_000));
+		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
+		const opened = await omp.emit("tool_call", call("t3", { agent: "storm-implementer", name: "fix", task: "fix the bug" }), main);
+		const handle = handleOf(opened);
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		expect(runId).toBeDefined();
+		expect(await readRun(project.sessionDir, runId)).toMatchObject({ status: "running", request: "fix the login bug" });
+		expect((await readRun(project.sessionDir, runId))?.plan).toBeUndefined();
+		// The in-flight turn is the run's first round: no handoff was sent.
+		expect(omp.sent).toHaveLength(sentBefore);
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main))).toMatch(/^route:/);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("an unplanned writer may write only while its admission carries a hold; a follow-up gets a fresh one", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		const handle = handleOf(await omp.emit("tool_call", call("t1", { agent: "storm-implementer", name: "fix", task: "fix" }), main));
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub(handle));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-1", input: { path: "one.txt", content: "1" } }, worker))).toBe("pass");
+		await child.emit("agent_end", {}, worker);
+		// Its turn ended: the admission is closed, and the same write has no place behind it.
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-2", input: { path: "one.txt", content: "2" } }, worker))).toBe("authority");
+		// R7: a work follow-up re-admits the worker with a new hold; the woken turn writes again.
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "f-1", input: { path: `agent://${handle}`, content: "write again" } }, main))).toBe("pass");
+		const read = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: handle });
+		expect(read.kind).toBe("record");
+		if (read.kind === "record") expect(read.record.hold).toBe(`spawn:${handle}`);
+		await child.emit("agent_start", {}, worker);
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-3", input: { path: "one.txt", content: "3" } }, worker))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("an unplanned isolated worker runs beside another writer, shell included, inside its own checkout", async () => {
+		await approve(TEAM);
+		installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		const writer = handleOf(await omp.emit("tool_call", call("t1", { agent: "storm-implementer", name: "shared", task: "write" }), main));
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", writer), main))).toMatch(/^route:/);
+		await child.emit("before_agent_start", { systemPrompt: [] }, child.ctx(sub(writer)));
+		// D10: while that writer holds the tree, an isolated implementer (a shell among its tools) is placed private.
+		const isolated = handleOf(await omp.emit("tool_call", call("t2", { agent: "storm-implementer", name: "experiment", task: "try", isolated: true }), main));
+		expect(isolated).not.toBe("experiment");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", isolated), main))).toMatch(/^route:/);
+		const checkout = path.join(project.tmp, "p3-checkout");
+		await mkdir(checkout, { recursive: true });
+		const base = child.ctx(sub(isolated));
+		const worker = { ...base, cwd: checkout } as ExtensionContext;
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		expect(verdict(await child.emit("tool_call", { toolName: "bash", toolCallId: "b-1", input: { command: "git status" } }, worker))).toBe("pass");
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-1", input: { path: "inside.txt", content: "x" } }, worker))).toBe("pass");
+		expect(verdict(await child.emit("tool_call", { toolName: "write", toolCallId: "w-2", input: { path: path.join(project.root, "outside.txt"), content: "x" } }, worker))).toBe("lane-scope");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("an isolated item that carries eval-defined tools of its own is refused before any run opens", async () => {
+		await approve(TEAM);
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		const refused = await omp.emit("tool_call", call("tools", {
+			agent: "storm-implementer",
+			name: "experiment",
+			task: "try",
+			isolated: true,
+			tools: ["my_tool"],
+		}), main);
+		expect(verdict(refused)).toBe("isolation");
+		expect(activeLedgerRun(project.sessionDir)).toBeUndefined();
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("the spend stop reaches a running worker's waking message and its next request, and says it was not the user", async () => {
+		await approve({ ...TEAM, budget: { perRunUsd: 0.1, onExceed: "stop" } });
+		await enableAuto();
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await enterAutoTurn(omp, main);
+		const handle = handleOf(await omp.emit("tool_call", call("t1", { agent: "storm-implementer", name: "fix", task: "fix" }), main));
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub(handle));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		// The worker's spend crosses the user's stop limit while its turn runs.
+		await child.emit("message_end", assistant("a", "i", 1_000, 0.25), worker);
+		// The stopped turn ends: the run stops on budget and the close stays on disk.
+		await child.emit("agent_end", {}, worker);
+		await omp.emit("agent_end", {}, main);
+		await until(async () => (await lastRun(project.sessionDir)) !== undefined);
+		// R15: the guard reads the close from disk. A waking send is refused; even a read would be under `stop`.
+		const send = await child.emit("tool_call", { toolName: "write", toolCallId: "send-1", input: { path: "agent://peer", content: "more" } }, worker);
+		expect(verdict(send)).toBe("spend");
+		expect(String(recordOf(send).reason)).toContain(SPEND_TAG);
+		expect(String(recordOf(send).reason)).toContain(SPEND_CLOSED_LEAD);
+		// The next request is not sent: the hook aborts the child's turn.
+		let aborts = 0;
+		const aborting = { ...worker, abort: () => { aborts += 1; } } as ExtensionContext;
+		await child.emit("before_provider_request", {}, aborting);
+		expect(aborts).toBe(1);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("no quick-only verdict after a director edit: the quick change is not credited to the cheap role", async () => {
+		await approve({ ...TEAM, roles: { ...TEAM.roles, quick: { agent: "storm-quick", models: ["a/q"], workers: { min: 1, max: 1 } } } });
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("quick change", main);
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		const sentBefore = omp.sent.length;
+		// A review lane with no declared results is the only plan lane; the quick worker that changes the tree is an
+		// admitted team worker outside the plan, so no implementer is on the run.
+		await applyRunPlan(omp, main, { lanes: [{ name: "check", kind: "review", role: "reviewer" }], workers: { reviewer: 1 } });
+		expect(verdict(await omp.emit("tool_call", call("r-1", { agent: "storm-reviewer", name: "check", task: "check" }), main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-reviewer", "check"), main))).toMatch(/^route:/);
+		const reviewer = child.ctx(sub("check", "storm-reviewer"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, reviewer);
+		// One request makes the lane's agent count as work, not as a launch that never started.
+		await child.emit("message_end", assistant("b", "r", 1_000, 0), reviewer);
+		await child.emit("agent_end", {}, reviewer);
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "r-1", isError: false }, main);
+		// The quick worker's change is observed on its own turn; it was not spawned through the plan.
+		admitChild(runId, "Q");
+		const quick = child.ctx(sub("Q", "storm-quick"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, quick);
+		await child.emit("tool_result", { toolName: "write", input: { path: "q.txt" }, isError: false, content: [] }, quick);
+		await child.emit("agent_end", {}, quick);
+		// The director also edits a project file. R10 says the quick role may not take the credit for that change.
+		expect(verdict(await omp.emit("tool_call", { toolName: "edit", toolCallId: "d-1", input: { path: "d.txt" } }, main))).toBe("pass");
+		await omp.emit("turn_end", {
+			message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "d-1", name: "edit", arguments: {} }] },
+			toolResults: [{ role: "toolResult", toolCallId: "d-1", toolName: "edit", isError: false, content: [] }],
+		}, main);
+		await omp.emit("agent_start", {}, main);
+		await omp.emit("agent_end", {}, main);
+		// Before the controller passes the fact to the gate the run ends `unreviewed` (quick-only). After it, the run
+		// either asks for the integrated review (a new round message) or ends for that reason; neither is `unreviewed`.
+		await until(async () => (await lastRun(project.sessionDir)) !== undefined || omp.sent.length > sentBefore);
+		expect((await lastRun(project.sessionDir))?.endReason).not.toBe("unreviewed");
+		await omp.emit("session_shutdown", {}, main);
+	}, 20_000);
 });

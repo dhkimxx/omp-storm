@@ -32,6 +32,12 @@
  * write table takes or refuses by name (14:25:30: refused while Body, a shell writer, runs); a placed worker is told its lane's
  * result contract (14:20:28); and the director's edit passes the supervisor gate during a run (14:25:04).
  *
+ * Phase 3 (0.29.0) removes the no-plan, role-in-plan and lane-binding refusals and adds exact correlation, the `hold`
+ * and the plan-less open. None of this session's 11 refusals in the window was one of those: all are write order,
+ * prerequisite (now refused by the write order) or the two tagged automatic ones. The count is therefore unchanged:
+ * write order 4/4, prerequisite 5/5 (all `lane-write`), automatic 1 left (isolation) and the progress note gone. The
+ * one assertion phase 3 changes is the citation one (`#L` is read now), below.
+ *
  * Tests assert behaviour: states, codes, which lanes a text names, what the ledger records. Set `REPLAY_TRANSCRIPT=1`
  * to print what Storm says at each moment.
  */
@@ -803,7 +809,7 @@ describe("how many of the session's refusals are left", () => {
 		const line = (kind: string) => `${left.filter(item => item.kind === kind).length}/${REAL.filter(item => item.kind === kind).length}`;
 		say(
 			"summary",
-			"refusals of the real session left after phase 2 (window 14:18 to 14:54)",
+			"refusals of the real session left after phase 3 (window 14:18 to 14:54)",
 			`write order ${line("write order")}, prerequisite ${line("prerequisite")}, automatic ${line("automatic")}: ${left.length} of ${REAL.length} remain; gone: ${gone.map(item => item.at).join(", ")}`,
 		);
 	});

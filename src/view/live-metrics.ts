@@ -6,6 +6,7 @@ import { formatUsd } from "../policy/spawn.ts";
 import { NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
 import type { InfoTone, RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, type RunPhase } from "./appearance.ts";
+import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
 
 export type LiveMetricKey = "results" | "round" | "workers" | "cost" | "time";
 export type LiveMetricIcon = "icon.goal" | "icon.loop" | "icon.agents" | "icon.cost" | "icon.time";
@@ -95,7 +96,11 @@ function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
 	const state = progress.focus?.excluded === true ? "사용자 제외" : (progress.focus?.stateLabel ?? "결과");
 	const excluded = counts.excluded === 0 ? "" : ` · 제외 ${counts.excluded}`;
 	const mixed = facts.outOfPlan === 0 ? "" : ` · ${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
-	const progressText = `이행 ${counts.accepted}/${counts.inScope}`;
+	// Row 1: retained artifact acceptance is not tree work; the count carries that word instead of a bare `이행`.
+	const retainedOnly = facts.retained.count > 0 && facts.retained.count === counts.accepted;
+	const progressText = retainedOnly
+		? `${RETAINED_ACCEPTED} ${counts.accepted}/${counts.inScope}`
+		: `이행 ${counts.accepted}/${counts.inScope}${facts.retained.count > 0 ? ` · ${RETAINED_LABEL} ${facts.retained.count}` : ""}`;
 	const full = (focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`) + mixed;
 	const forms: LiveMetricForm[] =
 		counts.inScope > 0

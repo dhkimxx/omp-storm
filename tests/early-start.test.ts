@@ -73,8 +73,6 @@ const report = (over: Partial<AttemptReport> & Pick<AttemptReport, "runId" | "sp
 	...over,
 });
 
-let serial = 0;
-
 interface Run {
 	h: FakeSession;
 	runId: string;
@@ -98,7 +96,8 @@ async function start(run: Run, laneName: string, dispatch: string): Promise<{ sp
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(p.lanes.flatMap(candidate => (candidate.dependsOn ?? []).map(dependency => dependency.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(p, needed);
-	const spawnKey = `${laneName}-${++serial}.${laneName}`;
+	// R4: manual planned items are keyed by their lane's own name.
+	const spawnKey = laneName;
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, p, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan: p, config: h.config });

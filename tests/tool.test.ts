@@ -637,23 +637,31 @@ describe("run", () => {
 });
 
 describe("automatic delegation", () => {
+	const SPOKE_AT = 1_700_000_000_000;
 	interface AutoStart {
 		spec: RunSpec;
 		plan: RunPlan;
 		hash: string | undefined;
+		turnStartedAt: number | undefined;
 	}
 
-	function autoHost(opts: { task?: string; active?: boolean; start?: RunRequestResult } = {}) {
+	function autoHost(opts: { task?: string; turnStartedAt?: number | null; active?: boolean; start?: RunRequestResult } = {}) {
 		const f = fakeHost({ ...(opts.active !== undefined ? { runActive: opts.active } : {}) });
 		const starts: AutoStart[] = [];
+		// `null`: the host reported the prompt but no time for it.
+		const startedAt = opts.turnStartedAt === undefined ? SPOKE_AT : (opts.turnStartedAt ?? undefined);
 		const host: StormToolHost = {
 			...f.host,
-			auto: () => ({ enabled: true, ...(opts.task !== undefined ? { task: opts.task } : {}) }),
+			auto: () => ({
+				enabled: true,
+				...(opts.task !== undefined ? { task: opts.task } : {}),
+				...(opts.task !== undefined && startedAt !== undefined ? { turnStartedAt: startedAt } : {}),
+			}),
 			runtime: {
 				...f.host.runtime,
 				runActive: () => opts.active ?? false,
-				startWithPlan: async (spec: RunSpec, plan: RunPlan, hash?: string) => {
-					starts.push({ spec, plan, hash });
+				startWithPlan: async (spec: RunSpec, plan: RunPlan, hash?: string, turnStartedAt?: number) => {
+					starts.push({ spec, plan, hash, turnStartedAt });
 					return opts.start ?? { ok: true, runId: "run-auto" };
 				},
 			},
@@ -677,6 +685,7 @@ describe("automatic delegation", () => {
 		expect(r.text).toContain("run-auto");
 		expect(starts).toHaveLength(1);
 		expect(starts[0]!.spec).toEqual({ task: "fix the login bug" });
+		expect(starts[0]!.turnStartedAt).toBe(SPOKE_AT);
 		expect(starts[0]!.hash).toMatch(/^jcs-sha256:/);
 		expect(starts[0]!.plan).toMatchObject({ lanes: [{ name: "core", kind: "code", role: "implementer" }], workers: { implementer: 1 } });
 		expect(f.plans).toEqual([]);
@@ -708,6 +717,15 @@ describe("automatic delegation", () => {
 		expect(f.plans).toEqual([]);
 	});
 
+	test("a prompt with no time for the same-turn rule opens nothing", async () => {
+		const { f, host, starts } = autoHost({ task: "fix it", turnStartedAt: null });
+		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
+		expect(r.outcome).toBe("rejected");
+		expect(r.text).toContain("시각");
+		expect(starts).toEqual([]);
+		expect(f.plans).toEqual([]);
+	});
+
 	test("an automatic start refusal is passed back unchanged", async () => {
 		const { host, starts } = autoHost({ task: "fix it", start: { ok: false, reason: "team approval is stale" } });
 		const r = await run({ host }, { action: "plan", plan: { lanes: [coreLane] } });
@@ -725,7 +743,7 @@ describe("automatic delegation", () => {
 });
 
 describe("continue: the director continues an interrupted run", () => {
-	const carried = { from: "run-20261126-073428-48cc", ended: "라운드 한도", kept: 2, reopened: 3, blocked: 1, open: ["Build", "Pin"] } as const;
+	const carried = { mode: "carry", from: "run-20261126-073428-48cc", ended: "라운드 한도", kept: 2, reopened: 3, blocked: 1, open: ["Build", "Pin"] } as const;
 	const SPOKE_AT = 1_700_000_000_000;
 
 	function continueHost(

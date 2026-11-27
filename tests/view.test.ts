@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { configHash, shortHash } from "../src/config/canonical.ts";
 import { validateConfig } from "../src/config/schema.ts";
 import { renderApproval } from "../src/proposals/present.ts";
-import { changedFields, renderConfigDiff, renderStatus, renderStatusBrief, renderTrial, resumeRunLine, runStatusText } from "../src/view/render.ts";
+import { changedFields, ISOLATION_ROUTED_STATE, renderConfigDiff, renderStatus, renderStatusBrief, renderTrial, resumeRunLine, runStatusText } from "../src/view/render.ts";
 import { rollbackLabels, runRollback } from "../src/view/review.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
@@ -867,7 +867,7 @@ describe("status", () => {
 		const md = renderStatus(view({ run: active }), NOW, "user", info);
 		expect(md).toContain("- 격리 레인: 러너 비교 — 새 러너가 기존 캐시를 지워 별도 체크아웃에서만 비교 · 아직 시작 전");
 		expect(md).toContain("git 브랜치와 별개의 분리 체크아웃이며, 성공해도 그 변경은 이 작업 트리로 자동 반영되지 않습니다");
-		expect(md).not.toContain("분리 체크아웃에서 시작함");
+		expect(md).not.toContain(ISOLATION_ROUTED_STATE);
 		const line = info.find(entry => entry.spans.some(span => span.text.includes("격리 레인")))!;
 		expect(line.icon).toBe("status.warning");
 		expect(md.split("\n")[line.index]).toContain("러너 비교");
@@ -885,10 +885,10 @@ describe("status", () => {
 		const denied = renderStatus(view({ run: refused }), NOW);
 		expect(denied).toContain("시작하지 못함: omp 격리가 꺼져 있습니다");
 		expect(denied).not.toContain("아직 시작 전");
-		expect(denied).not.toContain("분리 체크아웃에서 시작함");
+		expect(denied).not.toContain(ISOLATION_ROUTED_STATE);
 		const started = runRecord({ status: "running", plan, spawns: [spawnRecord({ lane: lane.name, agent: "storm-implementer", outcome: "routed" })] });
-		expect(renderStatus(view({ run: started }), NOW)).toContain("분리 체크아웃에서 시작함");
-		expect(renderStatus(view({ lastRun: started }), NOW)).toContain("- 격리 레인: 마이그레이션 실험 — 기존 DB를 건드리지 않는 별도 실험 · 분리 체크아웃에서 시작함");
+		expect(renderStatus(view({ run: started }), NOW)).toContain(ISOLATION_ROUTED_STATE);
+		expect(renderStatus(view({ lastRun: started }), NOW)).toContain(`- 격리 레인: 마이그레이션 실험 — 기존 DB를 건드리지 않는 별도 실험 · ${ISOLATION_ROUTED_STATE}`);
 	});
 
 	test("read-only status keeps the action at the top and returns to Runtime after storage", () => {

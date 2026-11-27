@@ -3,6 +3,7 @@ import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
+import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE } from "../runtime/contract-text.ts";
 import { goalTotals } from "../runtime/goal.ts";
 import { resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
@@ -1279,16 +1280,20 @@ export function isolationLaneLines(plan: RunPlan, run?: RunRecord): string[] {
 					: "시작하지 않음"
 				: spawn.outcome === "blocked"
 					? `시작하지 못함: ${visible(refusal ? refusal : "이유가 기록되지 않았습니다")}`
-					: "분리 체크아웃에서 시작함";
+					: ISOLATION_ROUTED_STATE;
 		return `- 격리 레인: ${visible(lane.name)} — ${oneLine(reason, ISOLATION_REASON_MAX)} · ${state}`;
 	});
 }
 
+/** Row 10: an admitted spawn is evidence of routing, not of a created checkout; the host record is the rest. */
+export const ISOLATION_ROUTED_STATE = "호스트가 분리 배치로 접수함(체크아웃 생성은 호스트 기록)";
+
 /** Keeps a reason-marked lane's separate result from being read as already in this tree or as a branch that merges itself. */
 export function isolationNote(plan: RunPlan): string | undefined {
-	return plan.lanes.some(lane => laneIsolationReason(lane) !== undefined)
-		? "- 격리 레인은 git 브랜치와 별개의 분리 체크아웃이며, 성공해도 그 변경은 이 작업 트리로 자동 반영되지 않습니다."
-		: undefined;
+	if (!plan.lanes.some(lane => laneIsolationReason(lane) !== undefined)) return undefined;
+	// §5, rows 7, 9 and 11: the one note every status view carries says what a checkout is, what it contains, and that
+	// its cleanup is not Storm's claim. Fixed size, whatever the team size.
+	return `- 격리 레인은 git 브랜치와 별개의 분리 체크아웃이며, 성공해도 그 변경은 이 작업 트리로 자동 반영되지 않습니다. ${CHECKOUT_PLACEMENT_NOTE} ${CHECKOUT_SNAPSHOT_NOTE} ${CHECKOUT_CLEANUP_NOTE}`;
 }
 
 function trialViewLines(v: TrialView): string[] {

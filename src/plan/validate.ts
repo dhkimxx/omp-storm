@@ -58,6 +58,16 @@ export const MAX_LANE_FILES = 5_000;
 export const MAX_PLAN_BYTES = 2 * 1024 * 1024;
 /** The fixed part of one result row in the record, measured on `{id, lane, state, identity, contract}` at ~274 bytes. */
 const RESULT_ROW_BYTES = 512;
+
+/**
+ * What the plan reply says beside any plan that places a lane in its own checkout (rows 7, 9, 11). Fixed size; the
+ * plan reply is the first place the director reads it, the worker contract and closeout repeat the same facts.
+ */
+export const CHECKOUT_PLAN_NOTE = "분리 체크아웃은 작업 위치일 뿐 차단벽이 아니며, 만들어진 시점의 사본이라 사용자의 미커밋 변경도 들어갑니다. 정리는 호스트가 맡고 Storm은 확인하지 못합니다.";
+/** Row 5: an `integrated` prerequisite on an isolated producer cannot be met in this version; the plan reply says so. */
+export const ISOLATED_INTEGRATED_WARNING = "격리 생산자를 선행으로 두고 need: integrated를 요구한 레인은 이 버전에서 그 조건을 충족할 수 없습니다. Storm은 격리 작업을 부모 작업 트리에 통합하지 않습니다. need를 result로 바꾸거나 통합 버전을 기다리세요.";
+/** Row 6: two private lanes may implement together; their candidates can still conflict when someone lands them. */
+export const PRIVATE_OVERLAP_WARNING = "두 레인 모두 격리 체크아웃에서 동시에 구현할 수 있지만, 후보를 부모 작업 트리에 함께 적용하면 충돌할 수 있습니다. 이 버전은 통합을 대신하지 않습니다.";
 export const RESULT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const RESULT_KINDS = ["change", "artifact", "answer"] as const satisfies readonly LaneResultKind[];
 const RESULT_KEYS: Readonly<Record<string, true>> = {
@@ -588,15 +598,37 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 		if (n > range.max) outOfBounds.push({ kind: "workers", role, want: n, max: range.max });
 	}
 
-	const owner = new Map<string, string>();
+	const owner = new Map<string, { name: string; isolated: boolean }>();
 	for (const l of lanes) {
 		if (!WRITING_KINDS.includes(l.kind)) continue;
+		const privateLane = l.isolationReason !== undefined || config.isolation === "isolated";
 		for (const f of new Set(l.files ?? [])) {
 			const other = owner.get(f);
-			if (other !== undefined) warnings.push(`${f}: ${other}, ${l.name} 레인이 같은 파일을 맡습니다. 동시에 돌리면 충돌하니 순서를 나누세요`);
-			else owner.set(f, l.name);
+			if (other !== undefined) {
+				// Row 6: two private lanes are allowed to implement at the same time; their candidates may still collide
+				// on landing, and this version does not manage that landing. A shared writer keeps the old warning.
+				warnings.push(
+					other.isolated && privateLane
+						? `${f}: ${other.name}, ${l.name} 레인이 같은 파일을 맡습니다. ${PRIVATE_OVERLAP_WARNING}`
+						: `${f}: ${other.name}, ${l.name} 레인이 같은 파일을 맡습니다. 동시에 돌리면 충돌하니 순서를 나누세요`,
+				);
+			} else owner.set(f, { name: l.name, isolated: privateLane });
 		}
 	}
+	// Rows 7, 9 and 11: one fixed-size qualification for any plan that uses a checkout, whatever the team size.
+	if (config.isolation === "isolated" || lanes.some(lane => lane.isolationReason !== undefined)) warnings.push(CHECKOUT_PLAN_NOTE);
+	// Row 5: an `integrated` edge on an isolated producer cannot be satisfied in this version, and the plan reply says
+	// so once, with the first affected consumer and how many there are.
+	const isolatedProducers = new Set(
+		lanes.filter(lane => lane.isolationReason !== undefined || config.isolation === "isolated").map(lane => lane.name),
+	);
+	const blocked: string[] = [];
+	for (const lane of lanes) {
+		for (const dependency of lane.dependsOn ?? []) {
+			if (dependency.need === "integrated" && isolatedProducers.has(dependency.lane)) blocked.push(lane.name);
+		}
+	}
+	if (blocked.length > 0) warnings.push(`${ISOLATED_INTEGRATED_WARNING} 대상 레인: ${blocked.slice(0, 3).join(", ")}${blocked.length > 3 ? ` 외 ${blocked.length - 3}개` : ""}`);
 
 	const note = typeof input.note === "string" ? input.note.trim() : "";
 	if (note.length > MAX_LANE_TEXT) errors.push(`plan.note: ${MAX_LANE_TEXT}자 이하여야 합니다`);

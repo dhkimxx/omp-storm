@@ -15,6 +15,7 @@ import {
 	ANSWER_CONTAINS_NOTE,
 	CITATION_ALIAS_FORMS,
 	CITATION_EXAMPLE,
+	CHECKOUT_PLACEMENT_SHORT,
 	CONTAINS_SHOWN_CHARS,
 	CONTRACT_HEADER,
 	CONTRACT_MAX_BYTES,
@@ -31,6 +32,7 @@ import {
 	type ApprovedCheckEvidence,
 	captureSharedBaseline,
 	evaluateSettledResults,
+	ISOLATED_CHANGE_REASON,
 	type ResultEvidenceState,
 } from "../src/runtime/result-evidence.ts";
 import type { ApprovalRecord, ConfigLoad, PlanLane, PlanLaneResult, StormConfig } from "../src/types.ts";
@@ -423,7 +425,7 @@ async function evaluateMet(combo: Combo, checkStatus: "passed" | "failed" = "pas
 	return evaluated.report.results[0]?.state;
 }
 
-const STATE_OF_JUDGE: Record<Exclude<ResultJudge, "cited">, ResultEvidenceState> = { machine: "accepted", reviewer: "reviewable", never: "unmet" };
+const STATE_OF_JUDGE: Record<Exclude<ResultJudge, "cited">, ResultEvidenceState> = { machine: "accepted", reviewer: "reviewable", never: "unmet", unavailable: "unmet" };
 
 /** Every combination whose promise (`judge`) and whose real outcome differ. */
 async function mismatches(judge: (combo: Combo) => ResultJudge): Promise<string[]> {
@@ -510,7 +512,7 @@ describe("the acceptance lines against the real evaluator", () => {
 		expect((await run(checksOf("passed")))?.state).toBe("unmet");
 	});
 
-	test("an isolated change is judged on the parent tree: a change that exists only in another directory is not seen", async () => {
+	test("an isolated change is never accepted in 0.29.0, in its checkout or on parent bytes; the contract says so", async () => {
 		const result: PlanLaneResult = { id: "r", kind: "change", criterion: "c", path: "app.ts", contains: LITERAL };
 		const parent = await tempRoot("parent");
 		const checkout = await tempRoot("checkout");
@@ -520,9 +522,16 @@ describe("the acceptance lines against the real evaluator", () => {
 		await put(checkout, "app.ts", `${LITERAL}\n`);
 		const evaluated = await evaluateSettledResults({ lane: "api", attemptId: "attempt-1", results: [result], shared: { root: parent, baseline: captured.baseline }, artifactMode: "isolated" });
 		expect(evaluated.ok && evaluated.report.results[0]?.state).toBe("unmet");
+		expect(evaluated.ok ? evaluated.report.results[0]?.reason : undefined).toBe(ISOLATED_CHANGE_REASON);
+		// Someone else writes the exact literal to the parent after the baseline: still not this attempt's evidence (P7-B).
+		await put(parent, "app.ts", `${LITERAL}\n`);
+		const onParentBytes = await evaluateSettledResults({ lane: "api", attemptId: "attempt-1", results: [result], shared: { root: parent, baseline: captured.baseline }, artifactMode: "isolated" });
+		expect(onParentBytes.ok && onParentBytes.report.results[0]?.state).toBe("unmet");
 		const text = laneContractText(lane({ results: [result] }), { isolated: true }) as string;
-		expect(text).toContain("부모 작업 트리의 같은 경로를 읽습니다");
-		expect(laneContractText(lane({ results: [result] }), { isolated: false })).not.toContain("부모 작업 트리");
+		expect(text).toContain(JUDGE_TEXT.unavailable);
+		expect(text).toContain(CHECKOUT_PLACEMENT_SHORT);
+		expect(text).not.toContain(JUDGE_TEXT.machine);
+		expect(laneContractText(lane({ results: [result] }), { isolated: false })).not.toContain(CHECKOUT_PLACEMENT_SHORT);
 	});
 
 	test("an artifact: shared needs a path; isolated reads only the retained artifact, never the parent tree", async () => {

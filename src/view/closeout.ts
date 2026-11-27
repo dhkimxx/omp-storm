@@ -7,8 +7,9 @@
  * and they can only restyle text the plain content already says — never add a word, a control or a button.
  */
 import { formatUsd } from "../policy/spawn.ts";
-import { NO_DECLARED_RESULTS } from "../runtime/result-facts.ts";
+import { NO_DECLARED_RESULTS, type RetainedFacts } from "../runtime/result-facts.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
+import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
 
 /** Schema version of a closeout record's `details`; anything else is drawn as the plain frame. */
 export const CLOSEOUT_DETAILS_VERSION = 1;
@@ -100,12 +101,17 @@ export function goalText(goal: NonNullable<CloseoutBrief["goal"]> | undefined): 
 	return `실행 ${Math.floor(runs)}회 · ${formatUsd(usd)} · ${spanText(ms)} · ${Math.floor(turns)}라운드`;
 }
 
-/** The official tail after the status label: counts only, all from code. */
-function officialCounts(official: CloseoutBrief["official"]): string[] {
+/** The official tail after the status label: counts only, all from code. A retained artifact's acceptance is counted
+ * with its own word, so no count reads as if the target tree held the work (row 1). */
+function officialCounts(brief: CloseoutBrief & { readonly retained?: RetainedFacts }): string[] {
+	const official = brief.official;
+	const retained = brief.retained?.count ?? 0;
 	const parts: string[] = [];
 	// No declared rows means no fraction: the card says what the record holds instead of `0/0`.
-	if (official.hasResults) parts.push(`수용 ${official.accepted}/${official.inScope}`);
-	else parts.push(NO_DECLARED_RESULTS);
+	if (official.hasResults) {
+		parts.push(retained > 0 && retained === official.accepted ? `${RETAINED_ACCEPTED} ${official.accepted}/${official.inScope}` : `수용 ${official.accepted}/${official.inScope}`);
+		if (retained > 0 && retained !== official.accepted) parts.push(`${RETAINED_LABEL} ${retained}`);
+	} else parts.push(NO_DECLARED_RESULTS);
 	for (const key of Object.keys(OPEN_LABEL) as Array<keyof typeof OPEN_LABEL>) {
 		const count = official.open[key];
 		if (Number.isInteger(count) && count > 0) parts.push(`${OPEN_LABEL[key]} ${count}`);
@@ -150,7 +156,7 @@ function officialLine(brief: CloseoutBrief, duration: string | undefined, out: B
 	const official = brief.official;
 	const tone: InfoTone = TONES.has(official.tone) ? official.tone : "muted";
 	const label = clean(official.label, OFFICIAL_LABEL_MAX) || "상태 미상";
-	const tail = [...officialCounts(official), ...(duration !== undefined && brief.tier !== "card" ? [duration] : [])];
+	const tail = [...officialCounts(brief), ...(duration !== undefined && brief.tier !== "card" ? [duration] : [])];
 	out.item([{ text: label, tone }, ...(tail.length > 0 ? [{ text: ` · ${tail.join(" · ")}` }] : [])], {
 		icon: TONE_ICON[tone],
 		emphasis: "title",
@@ -162,7 +168,7 @@ function officialLine(brief: CloseoutBrief, duration: string | undefined, out: B
  * when numbered actions were actually registered for this session; otherwise actions are listed unnumbered and no
  * input instruction appears. A `line` (or `none`) brief is one factual line.
  */
-export function renderCloseout(brief: CloseoutBrief, showChoices: boolean): { markdown: string; info: InfoLine[] } {
+export function renderCloseout(brief: CloseoutBrief & { readonly retained?: RetainedFacts }, showChoices: boolean): { markdown: string; info: InfoLine[] } {
 	const out = new Builder();
 	const duration = closeoutDuration(brief.startedAt, brief.endedAt);
 	if (brief.tier !== "card") {
@@ -179,6 +185,17 @@ export function renderCloseout(brief: CloseoutBrief, showChoices: boolean): { ma
 	out.item(where);
 
 	officialLine(brief, duration, out);
+
+	// Row 1/row 4: where the accepted bytes are and how to reach them. One bounded line, first reference only.
+	const kept = brief.retained;
+	if (kept !== undefined && kept.count > 0) {
+		const ref = [kept.capture, kept.attempt === undefined ? undefined : `시도: ${kept.attempt}`].filter((part): part is string => part !== undefined && part !== "").join(" · ");
+		out.item([
+			{ text: `${RETAINED_LABEL}: `, tone: "muted" },
+			{ text: `수용 ${kept.count}건은 부모 작업 트리 밖에 있습니다. Storm은 적용하지 않았습니다.` },
+			...(ref === "" ? [] : [{ text: ` · ${ref}` }]),
+		]);
+	}
 
 	// Known residual risk leads any prose, so no explanation can sit between the status and its warnings.
 	for (const risk of brief.residual.slice(0, RESIDUAL_MAX)) {

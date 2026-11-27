@@ -76,6 +76,8 @@ import {
 import { supervisorRunToolBlock, supervisorToolBlock, type SupervisorScope, type SupervisorScopeSource } from "./policy/supervisor.ts";
 import { placementWouldPool, pooledThreadNotice } from "./policy/thread.ts";
 import { decideDirectorCall } from "./policy/toolcall.ts";
+import { classifyUnplannedItem, unplannedBatchFacts, unplannedBatchGate } from "./policy/unplanned-spawn.ts";
+import { spendRequestStop, spendToolRefusal } from "./policy/spend-close.ts";
 import { PACKAGE_JSON, ROLE_AGENT_PREFIX, ROLES, STORM_VERSION } from "./roles.ts";
 import {
 	listAgents,
@@ -106,9 +108,9 @@ import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { laneContract } from "./runtime/contract-text.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector, type AttemptHostJob } from "./runtime/attempt-collector.ts";
-import { noteRunNotice, noteRunRan, noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
+import { lastRunEndAt, noteRunNotice, noteRunRan, noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
-import { broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, taskLaneProblem, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
+import { broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, spawnKeyMismatchReason, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { mayMakeSideCalls, settleSideSpend } from "./runtime/side-spend.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
@@ -118,6 +120,7 @@ import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quot
 import { verdictOf } from "./runtime/review.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "./runtime/state-files.ts";
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
+import { planlessOpen } from "./runtime/planless.ts";
 import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
 import { isRunId, readRun } from "./runtime/run.ts";
 import { TREE_READ_TIMEOUT_MS, treeAgainst, type TreeReading } from "./runtime/tree.ts";
@@ -153,12 +156,15 @@ import { plannedResultLabels } from "./view/results.ts";
 import {
 	acknowledgeChildStop,
 	activeWorkerRunInTree,
+	admissionMayUseNonReadTools,
 	clearChildStops,
+	closeWorkerSpend,
 	endWorkerAdmission,
 	persistWorkerAdmission,
 	readChildBinding,
 	readChildStops,
 	readWorkerAdmission,
+	readWorkerSpendClose,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
 	writeChildStop,
@@ -210,6 +216,10 @@ interface AgentAuthority {
 	checkout?: string;
 	/** Planned lane name for a compact refusal; absent for an unplanned child. */
 	lane?: string;
+	/** The write reservation bound to this attempt (R7); absent for plain readers and older records. */
+	hold?: string;
+	/** The run this authority was frozen for, so a follow-up never reads an earlier run's lane as this run's. */
+	runId?: string;
 }
 
 /** Workers admitted by this process's Storm runs (same native id across follow-ups), scoped by artifact tree. */
@@ -328,7 +338,7 @@ interface AutoStatus {
 const AUTO_INSTRUCTION = `<storm-auto>
 This session delegates project work automatically.
 - General conversation needs no tools: answer directly.
-- Inspection, verification and larger changes belong to the approved team: a storm plan opens this request's run; size it to the request. Use task for work lanes, storm execute for approved jobs. While workers run, end your turn: their results wake you. Do not ask the user whom to spawn.
+- Inspection, verification and larger changes belong to the approved team: a task opens this request's run; a plan only adds result rows. Use storm execute for approved jobs. While workers run, end your turn: their results wake you. Do not ask the user whom to spawn.
 - Read and search yourself; once the run is open, edit/write files. Shell, eval and MCP are the team's; notes go to local://<name>.md, messages to agent://<id> (?progress for a quiet note).
 - Finish every declared result, even without edits. With a reviewer, verification needs the reviewer to accept the current tree.
 - A resent refused call is refused again: read its reason. Run questions go to storm status, not a new plan.
@@ -777,6 +787,15 @@ export default function storm(pi: ExtensionAPI): void {
 	 */
 	let sessionGeneration = 0;
 	/**
+	 * The last main-session agent id this instance saw, for the spend-close marker the controller's threshold writes: the
+	 * marker is keyed by the canonical artifact root and the main agent id (the workers' parentId), and the controller's
+	 * dependency signature carries none of that.
+	 */
+	let mainAgentId: string | undefined;
+	const rememberMainAgent = (ctx: ExtensionContext): void => {
+		if (ctx.agent.kind === "main") mainAgentId = ctx.agent.id;
+	};
+	/**
 	 * The director's own path edits that hold the run's write table, by the host's tool call id, with what a switch of conversation
 	 * needs to know about each call: whether the host started it, whether its result was seen, and whether the `message_end` of the
 	 * message that carries the call was handled (`seen`). An entry leaves with its release (`releaseDirectorHolds`); the table's own
@@ -1001,6 +1020,8 @@ export default function storm(pi: ExtensionAPI): void {
 		root: checkout ?? record.targetRoot,
 		...(checkout === undefined ? {} : { checkout }),
 		...(record.lane === undefined ? {} : { lane: record.lane }),
+		...(record.hold === undefined ? {} : { hold: record.hold }),
+		runId: record.runId,
 	});
 	/**
 	 * A child's actual authority. The persisted admission is authoritative for every non-read tool, so a rebound
@@ -1103,6 +1124,8 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 
 	/** Parent side: write the exact admission before returning from the spawn hook. */
+	/** The main agent id that admitted each run's first worker, for the spend-close marker (its key includes it). */
+	const runDirectors = new Map<string, string>();
 	const persistChildAdmission = async (input: {
 		ctx: ExtensionContext;
 		run: LedgerRun;
@@ -1110,9 +1133,13 @@ export default function storm(pi: ExtensionAPI): void {
 		childId: string;
 		lane?: PlanLane;
 		authority: AgentAuthority;
+		/** The write reservation behind this attempt (R7), written by the main-session hook only. */
+		hold?: string;
 		/** What this worker's role (and trial, when the spawn was routed to one) approves: the snapshot its own check reads on any thread. */
 		approved: ReadonlyArray<{ selector: string; effort?: Effort }>;
 	}): Promise<void> => {
+		runDirectors.set(input.run.runId, input.ctx.agent.id);
+		const hold = input.hold ?? input.authority.hold;
 		// Through the same key a reservation's end revokes under: an older end never interleaves with this newer write.
 		await serialized(admissionKey(input.run.runId, input.childId), () =>
 			persistWorkerAdmission({
@@ -1127,6 +1154,7 @@ export default function storm(pi: ExtensionAPI): void {
 				targetRoot: input.run.root,
 				...(input.lane === undefined ? {} : { lane: input.lane.name }),
 				policy: input.authority.policy,
+				...(hold === undefined ? {} : { hold }),
 				...(input.approved.length === 0 ? {} : { approved: input.approved }),
 			}),
 		);
@@ -1138,10 +1166,31 @@ export default function storm(pi: ExtensionAPI): void {
 	const runs = new RunController({
 		pi,
 		ui: ctx => createUiPort(pi, ctx),
-		loadState: async ctx => loadProjectState(projectEnv(ctx)),
+		loadState: async ctx => {
+			rememberMainAgent(ctx);
+			return loadProjectState(projectEnv(ctx));
+		},
 		now: Date.now,
 		agents: (runId, sessionDir) => listAgents({ runId, scope: sessionDir }),
 		settleEnds: runId => settleEndRevokes(runId),
+		// R15: at the limit the marker on disk carries the close; a worker reads it before its own tools and requests. A
+		// run that never admitted a worker has no marker and nothing to close; every other failure is thrown so the
+		// controller's own notice names it (a close no worker can read is the hole this exists to prevent).
+		closeSpend: async (runId, onExceed) => {
+			const run = getLedgerRun(runId);
+			const parentId = runDirectors.get(runId) ?? mainAgentId;
+			if (run === undefined || parentId === undefined) {
+				throw new Error("실행의 관리 표시 위치를 확인하지 못했습니다");
+			}
+			const closed = await closeWorkerSpend({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: run.artifactsDir,
+				parentId,
+				runId,
+				onExceed,
+			});
+			if (!closed.ok) throw new Error(closed.reason);
+		},
 		tree: (root, base) => treeAgainst(exec, root, base),
 		// Cleanup inventory only: the janitor passes the session it is sweeping, never a process-wide view.
 		ledger: sessionDir => listAgents({ scope: sessionDir }),
@@ -1488,7 +1537,7 @@ export default function storm(pi: ExtensionAPI): void {
 				submitCloseout: draft => (stillOwner() ? runs.submitCloseout(ctx, draft) : { ok: false, reason: stale }),
 				runActive: () => stillOwner() && runs.runId() !== undefined,
 				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) =>
-					startAutomatic(() => runs.startWithPlan(ctx, spec, plan, validatedHash)),
+					startAutomatic(() => runs.startWithPlan(ctx, spec, plan, validatedHash, autoSnapshot(sessionId).turnStartedAt)),
 				continueRun: (said, turnStartedAt) => startAutomatic(() => runs.continueInTurn(ctx, said, turnStartedAt)),
 				agents: () => (stillOwner() && scope !== undefined ? listAgents({ ancestorId: ctx.agent.id, scope }) : []),
 			},
@@ -1537,6 +1586,18 @@ export default function storm(pi: ExtensionAPI): void {
 		const generation = sessionGeneration;
 		const mainId = mainSessionId(ctx);
 		const auto = autoOf(ctx);
+		// R15: a worker's nested spawn (its `eval` can call `agent()`, which reaches this hook, not the tool guard) is
+		// new work. The close is read from disk, so it reaches a worker on any thread; an unreadable marker fails closed
+		// on the spawn while the running turn's reads continue.
+		if (ctx.agent.kind === "sub") {
+			const spend = await readWorkerSpendClose({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: artifactsOf(ctx),
+				parentId: ctx.agent.parentId,
+			});
+			const spendRefusal = spendToolRefusal(spend, { toolName: "task" });
+			if (spendRefusal !== undefined) return { block: true, reason: spendRefusal.reason };
+		}
 		// Automatic delegation never lets the main session spawn its way around the plan: before the first plan
 		// opens a run, every spawn is refused. This is checked before any state read, so it also holds when the
 		// team config or approval cannot be read; subagent sessions are not fenced by this session's policy.
@@ -1565,6 +1626,8 @@ export default function storm(pi: ExtensionAPI): void {
 		const placement = event.spawnKey === undefined ? undefined : capturedLanes?.placementOf(event.spawnKey);
 		const decisionToken = Symbol("spawn-decision");
 		let ownAuthority: AgentAuthority | undefined;
+		/** This spawn's key names another agent's pending placement: refuse without consuming that placement (R4). */
+		let foreignPlacement = false;
 		// A separate native child has no Storm session: only the run its parent admitted can route it. There is no
 		// unscoped ledger lookup here, so a same-id worker of another session is never consulted. If its artifact tree
 		// still has a live managed run, even a non-Storm name is an unattributed nested spawn and fails closed.
@@ -1713,6 +1776,15 @@ export default function storm(pi: ExtensionAPI): void {
 						return ledgerBlock(pooledThreadNotice(event.agent), current, now, "pooled-thread");
 					}
 				}
+				// R4's correlation is checked before anything is reserved: a spawn of another agent under a pending
+				// placement's key (a reader named like the writer) is refused and leaves that placement pending.
+				if (ctx.agent.kind === "main" && event.spawnKey !== undefined && current !== undefined) {
+					const placedAgent = runs.runLanes()?.placementAgent(event.spawnKey);
+					if (placedAgent !== undefined && placedAgent !== event.agent) {
+						foreignPlacement = true;
+						return ledgerBlock(spawnKeyMismatchReason(event.spawnKey), current, now);
+					}
+				}
 				// The positive decision reserves its slot before any later admission can await. If a later guard refuses
 				// the spawn, the decision's block path releases it; no other spawn sees the window as free.
 				if (record?.spawnKey !== undefined && current !== undefined) {
@@ -1736,24 +1808,53 @@ export default function storm(pi: ExtensionAPI): void {
 						return ledgerBlock("실행의 승인된 팀 설정을 확인하지 못해 자식 스폰을 허용하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요.", current, now);
 					}
 					const plan = current.plan;
-					// The director's task call was rewritten to a reserved lane before the host allocated this spawn.
-					if (ctx.agent.kind === "main" && plan !== undefined && config !== undefined) {
+					// R4/R3/R7: the director session's own task spawn is admitted against its exact placement, with or
+					// without a plan. The table matches the key, proves the policy the hook will persist against the
+					// frozen placement and returns the reservation key this worker's admission stores (`hold`). A spawn
+					// whose key is not exactly a pending placement of this run is refused, never guessed.
+					let admittedPolicy: LanePolicy | undefined;
+					let admittedHold: string | undefined;
+					if (ctx.agent.kind === "main") {
 						if (record === undefined) {
-							if (autoOn || plan !== undefined) {
-								return ledgerBlock("스폰 기록을 만들지 못해 승인된 레인을 확인할 수 없습니다. 다시 스폰하세요.", current, now);
-							}
-						} else {
-							const admission = runs.runLanes()?.admitChecked(record, autoOn ? undefined : { plan, config });
-							if (admission !== undefined && !admission.ok) return ledgerBlock(admission.reason, current, now);
-							const lane = admission?.ok ? admission.lane : undefined;
-							if (lane !== undefined) record.lane = lane;
-							else if (plan !== undefined) {
-								return ledgerBlock("승인된 계획의 구체적인 레인에 속하지 않은 자식이라 스폰을 허용하지 않았습니다. 레인 이름과 역할을 맞춰 다시 계획하세요.", current, now);
-							}
+							return ledgerBlock("스폰 기록을 만들지 못해 대기 중인 배치를 확인할 수 없습니다. 다시 스폰하세요.", current, now);
 						}
+						const lanesNow = runs.runLanes();
+						if (lanesNow === undefined) {
+							return ledgerBlock("이 실행의 레인 배정을 확인하지 못해 자식 스폰을 허용하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요.", current, now);
+						}
+						const tools = effectiveAgentTools(event.agent, state.shadows, PLUGIN_AGENTS_DIR);
+						const admission = lanesNow.admitChecked(record, !autoOn && plan !== undefined ? { plan, config } : undefined, {
+							directorTask: {
+								policy: frozen => {
+									if (frozen.lane === undefined) {
+										// The frozen placement already decided isolation and the item's own tools; the spawn
+										// event carries neither, so the approved definition's tools and the frozen authority
+										// reproduce the policy the placement froze (R3, R6).
+										const classified = classifyUnplannedItem({
+											agent: event.agent,
+											tools,
+											toolsCarried: false,
+											isolated: frozen.authority.kind === "private",
+										});
+										if (!classified.ok) throw new Error(classified.reason);
+										return classified.item.policy;
+									}
+									const lane = plan?.lanes.find(candidate => candidate.name === frozen.lane);
+									if (lane === undefined) throw new Error("lane not found");
+									const derived = lanePolicy({ lane, tools, isolated: frozen.authority.kind === "private" });
+									// A paths lane is persisted with the exact canonical scope the placement reserved: the
+									// hook's declared paths may spell the same files differently.
+									return derived.kind === "paths" && frozen.authority.paths !== undefined
+										? { ...derived, paths: [...frozen.authority.paths] }
+										: derived;
+								},
+							},
+						});
+						if (!admission.ok) return ledgerBlock(admission.reason, current, now);
+						if (admission.lane !== undefined) record.lane = admission.lane;
+						admittedPolicy = admission.policy;
+						admittedHold = admission.hold;
 					}
-					// A run with no plan never reaches this point with a spawn: `decideSpawn` refuses every spawn of a planless run
-					// (`no-plan`), so there is no unplanned writer whose placement could lapse and be admitted late.
 					const spawnKey = event.spawnKey;
 					if (spawnKey === undefined) {
 						return ledgerBlock("호스트가 스폰 키를 주지 않아 자식 실행을 결속하지 못했습니다. 다시 스폰하세요.", current, now);
@@ -1762,20 +1863,36 @@ export default function storm(pi: ExtensionAPI): void {
 						return ledgerBlock("자식 실행을 원장에 결속하지 못했습니다. 실행 상태를 확인한 뒤 다시 스폰하세요.", current, now);
 					}
 					// The lane's approved capability is decided before the child starts: a read-only intent is enforced by
-					// restricting tools, and a write-capable intent never becomes a shared writer by role label alone.
+					// restricting tools, and a write-capable intent never becomes a shared writer by role label alone. The
+					// director's child takes the policy admission proved; a sub-session child keeps the read-only route.
 					if (config !== undefined) {
 						const lane = record?.lane === undefined ? undefined : plan?.lanes.find(candidate => candidate.name === record.lane);
-						const authority = await authorityFor({
-							agent: event.agent,
-							lane,
-							shadows: state.shadows,
-							config,
-							root: current.root,
-							auto: autoOn,
-						});
-						if (!authority.ok) return ledgerBlock(authority.reason, current, now);
-						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority.authority);
-						ownAuthority = authority.authority;
+						let authority: AgentAuthority;
+						if (ctx.agent.kind === "main") {
+							if (admittedPolicy === undefined) {
+								return ledgerBlock("이 배치의 승인된 쓰기 권한을 확인하지 못했습니다. 같은 task 호출을 다시 보내 새 배치를 만드세요.", current, now);
+							}
+							authority = {
+								policy: admittedPolicy,
+								root: current.root,
+								runId: current.runId,
+								...(lane === undefined ? {} : { lane: lane.name }),
+								...(admittedHold === undefined ? {} : { hold: admittedHold }),
+							};
+						} else {
+							const computed = await authorityFor({
+								agent: event.agent,
+								lane,
+								shadows: state.shadows,
+								config,
+								root: current.root,
+								auto: autoOn,
+							});
+							if (!computed.ok) return ledgerBlock(computed.reason, current, now);
+							authority = { ...computed.authority, runId: current.runId };
+						}
+						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority);
+						ownAuthority = authority;
 						// What this exact spawn's role and trial approve travels with its admission: the child's own check reads this
 						// snapshot, on the main thread as well as on any other, never the live team file. The decision made for this
 						// spawn carries the trial; a historical spawn record is not consulted.
@@ -1790,7 +1907,8 @@ export default function storm(pi: ExtensionAPI): void {
 								artifacts,
 								childId: spawnKey,
 								...(lane === undefined ? {} : { lane }),
-								authority: authority.authority,
+								authority,
+								...(ctx.agent.kind === "main" && admittedHold !== undefined ? { hold: admittedHold } : {}),
 								approved,
 							});
 						} catch {
@@ -1852,7 +1970,7 @@ export default function storm(pi: ExtensionAPI): void {
 			// A refused spawn must not keep its lane/write/capacity reservation or its enforced authority: another
 			// worker may start.
 			if (decision !== undefined && "block" in decision && event.spawnKey !== undefined) {
-				capturedLanes?.cancel(event.spawnKey, placement);
+				if (!foreignPlacement) capturedLanes?.cancel(event.spawnKey, placement);
 				const run = getLedgerRun(capturedRunId);
 				const slot = run === undefined ? undefined : workerSlot(run.runId, event.spawnKey);
 				if (run !== undefined && slot !== undefined && slotOwners.get(slot) === decisionToken) releaseWorkerSlot(run.runId, event.spawnKey);
@@ -1906,6 +2024,7 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("message_end", async (event, ctx) => {
+		rememberMainAgent(ctx);
 		// 3. The backstop for all of it. On the host (19.2.1) the hooks of a message's calls run first, then that message's own
 		//    `message_end` comes, then its calls execute: so this event must never free the holds of the message it ends. A
 		//    hold is `seen` once the `message_end` of the message carrying its call was handled; a completed assistant message
@@ -2236,6 +2355,23 @@ export default function storm(pi: ExtensionAPI): void {
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.agent.kind !== "sub") return undefined;
 		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
+		// R15: a request after the user's `stop` at the limit is not sent. The close is on disk, so this works on any
+		// thread; a running turn under `block-spawns` is not cut. The notice says this was the budget, not the user (D9).
+		const spend = await readWorkerSpendClose({
+			agentDir: workerAdmissionAgentDir(),
+			artifactRoot: artifactsOf(ctx),
+			parentId: ctx.agent.parentId,
+		});
+		const spendStop = spendRequestStop(spend, ctx.agent.id);
+		if (spendStop.stop) {
+			const ledger = childLedger(ctx);
+			if (ledger !== undefined) stopChild(ctx, ledger, key, spendStop.notice);
+			else {
+				stoppedChildren.set(key, spendStop.notice);
+				ctx.abort();
+			}
+			return undefined;
+		}
 		const model = ctx.model;
 		if (stoppedChildren.has(key)) {
 			ctx.abort();
@@ -2432,15 +2568,28 @@ export default function storm(pi: ExtensionAPI): void {
 			agents: listAgents({ runId: run.runId, scope: run.scope }),
 		});
 		if (!committed.ok) return refused(directorWriteBlock(committed.reason));
+		// R10: the gate may not attribute this change to a quick worker; the run keeps the fact in memory only.
+		runs.noteDirectorEdit(run.runId);
 		directorHolds.set(callId, { runId: run.runId, root: run.root, started: false, resulted: false, seen: seenDirectorCalls.has(callId) });
 		committedHere.add(callId);
 		return undefined;
 	};
 
 	const guardToolCall = async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+		rememberMainAgent(ctx);
 		// The host's budget for this hook starts about now (see `directorPathEdit`).
 		const hookStart = Date.now();
 		if (ctx.agent.kind === "sub") {
+			// R15: the spend close is read from disk, by the canonical artifact root the caller's parent id names, so it
+			// reaches a worker on any thread. It runs before every other refusal: after the limit nothing new starts, and
+			// under `stop` nothing but the worker's own result runs. A marker that cannot be read refuses new work only.
+			const spend = await readWorkerSpendClose({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: artifactsOf(ctx),
+				parentId: ctx.agent.parentId,
+			});
+			const spendRefusal = spendToolRefusal(spend, { toolName: event.toolName, input: event.input });
+			if (spendRefusal !== undefined) return { block: true, reason: spendRefusal.reason };
 			const ledger = childLedger(ctx);
 			const boundRunId = ledger?.runId;
 			let authority = agentAuthorities.get(authorityKey(artifactsOf(ctx), ctx.agent.id));
@@ -2505,13 +2654,14 @@ export default function storm(pi: ExtensionAPI): void {
 				const who = lane === undefined ? ctx.agent.id : `'${lane}' 레인(${ctx.agent.id})`;
 				// The subject form: a fixed noun stands before the particle whatever the inserted id is.
 				const whoTopic = lane === undefined ? `${ctx.agent.id} 에이전트는` : `'${lane}' 레인(${ctx.agent.id})은`;
-				// An unplanned worker has no concrete lane: it may read, but it never gains shared write or exec
-				// powers merely because it lives in the same tree as an approved writer.
-				if (policy.kind === "blocked" || (policy.kind === "unknown" && lane === undefined)) {
+				// R7: an unplanned admission may use non-read tools only while the attempt carries the reservation bound
+				// to it (`hold`); a record without one keeps the read-only meaning every earlier record has. A planned
+				// lane is bound by its lane policy below.
+				if (policy.kind === "blocked" || (lane === undefined && !admissionMayUseNonReadTools(authority.hold === undefined ? {} : { hold: authority.hold }))) {
 					if (!readOnlyTool(event.toolName)) {
 						return {
 							block: true,
-							reason: `[storm:lane] ${whoTopic} 승인된 계획의 구체적인 레인에 속하지 않아 '${event.toolName}' 쓰기·실행 권한을 받지 못했습니다. 감독이 레인을 계획해야 합니다.`,
+							reason: `[storm:lane] ${whoTopic} 이번 시도의 쓰기 예약이 없어 '${event.toolName}' 쓰기·실행 권한을 받지 못했습니다. 감독이 이 워커를 쓰기 순서에 세운 뒤에만 쓰기·실행을 허용합니다.`,
 						};
 					}
 				}
@@ -2576,19 +2726,90 @@ export default function storm(pi: ExtensionAPI): void {
 		const autoOn = auto?.enabled === true;
 		const generation = sessionGeneration;
 		const mainId = mainSessionId(ctx);
-		const runId = runs.runId();
+		let runId = runs.runId();
 		if (event.toolName === "ask") {
 			const blocked = mainAskGate(ctx, event.input, autoOn, runId);
 			if (blocked !== undefined) return blocked;
 		}
+		// R9's plan-less open, read before the run exists. The batch is classified and gated before a run is opened,
+		// so a refused batch opens nothing; the open takes the lease the batch needs and leaves the normal placement
+		// below in this same handler.
+		let planlessState: ProjectState | undefined;
+		let planlessHost: TaskIsolationHost | undefined;
 		if (runId === undefined) {
-			// Automatic delegation: the main session may orchestrate and inspect worker results, but every repository
-			// tool and every direct spawn is refused until the first plan opens this turn's run.
 			if (!autoOn || event.toolName === "storm") return undefined;
-			const detail =
-				event.toolName === "task" ? AUTO_SPAWN_REASON : supervisorToolBlock(event.toolName, event.input, supervisorScope(ctx), planModeOn(ctx));
-			if (detail === undefined) return undefined;
-			return { block: true, reason: autoRefusal(auto?.problem, detail) };
+			if (event.toolName !== "task") {
+				const detail = supervisorToolBlock(event.toolName, event.input, supervisorScope(ctx), planModeOn(ctx));
+				if (detail === undefined) return undefined;
+				return { block: true, reason: autoRefusal(auto?.problem, detail) };
+			}
+			// The same public-mode refusal every automatic start meets; the controller re-checks the team and modes.
+			const modes = ctx.sessionModes;
+			if (modes !== undefined) {
+				try {
+					if (modes.getState().plan.status === "active") {
+						return { block: true, reason: "[storm:auto] omp 계획 모드가 켜져 있어 자동 실행을 열지 않았습니다. 계획 모드를 끝낸 뒤 다시 요청하세요." };
+					}
+				} catch {
+					return { block: true, reason: "[storm:auto] omp 계획 모드를 확인하지 못해 자동 실행을 열지 않았습니다. 다시 요청하세요." };
+				}
+			}
+			if (mainId === undefined) {
+				return { block: true, reason: "[storm:session] 이 세션의 id를 확인하지 못해 실행을 열지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			let state: ProjectState;
+			try {
+				state = await loadProjectState(projectEnv(ctx));
+			} catch {
+				return { block: true, reason: "[storm:auto] 팀 설정을 확인하지 못해 실행을 열지 않았습니다. /storm 으로 확인하세요." };
+			}
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			// The team and mode checks as the automatic plan start makes them, from the state and modes read now.
+			const blockedNow = auto?.problem ?? teamProblem(state) ?? modeProblem(ctx);
+			const verdict = planlessOpen({
+				automatic: autoOn,
+				runActive: false,
+				task: auto?.task,
+				turnStartedAt: auto?.turnStartedAt,
+				lastEndAt: lastRunEndAt(state.sessionDir, state.repo.root),
+				blocked: blockedNow,
+			});
+			if (!verdict.ok) return { block: true, reason: autoRefusal(blockedNow, verdict.reason) };
+			const configNow = state.config.status === "ok" ? state.config.config : undefined;
+			if (configNow === undefined) {
+				return { block: true, reason: autoRefusal(blockedNow, teamProblem(state) ?? "실행의 승인된 팀 설정을 확인하지 못해 실행을 열지 않았습니다. /storm 으로 확인하세요.") };
+			}
+			const facts = unplannedBatchFacts(
+				event.input,
+				configNow.isolation === "isolated",
+				agent => effectiveAgentTools(agent, state.shadows, PLUGIN_AGENTS_DIR),
+			);
+			if (!facts.ok) return { block: true, reason: `[storm:lane] ${facts.reason}` };
+			const host = configNow.isolation === "isolated" || facts.items.some(item => item.isolated)
+				? await isolationHost(`planless:${state.sessionDir}:${state.repo.root}`)
+				: undefined;
+			const batch = unplannedBatchGate(facts.items, host);
+			if (!batch.ok) return { block: true, reason: `[storm:${batch.code}] ${batch.reason}` };
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
+				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
+			}
+			const timeout = liveToolCallTimeoutMs();
+			const started = await runs.startPlanless(ctx, { task: verdict.task }, {
+				turnStartedAt: verdict.turnStartedAt,
+				deadline: hookStart + timeout - Math.min(2_000, timeout / 2),
+				lease: batch.writers > 0 ? "write" : "read",
+			});
+			if (!started.ok) return { block: true, reason: autoRefusal(blockedNow, started.reason) };
+			// The same live boundary every automatic start is: a heavy context gets its one background checkpoint.
+			runs.startAutoCheckpoint();
+			runId = runs.runId();
+			if (runId === undefined) {
+				return { block: true, reason: "[storm:auto] 실행을 열었지만 실행 id를 확인하지 못했습니다. 실행 상태를 확인한 뒤 다시 시도하세요." };
+			}
+			planlessState = state;
+			planlessHost = host;
 		}
 		// A live run must name the session that owns it: without that, no direct tool is safe to allow.
 		if (mainId === undefined) {
@@ -2668,30 +2889,38 @@ export default function storm(pi: ExtensionAPI): void {
 			if (lanes === undefined) {
 				return { block: true, reason: "[storm:isolation] 이 실행의 레인 배정을 확인하지 못해 task를 막았습니다. 실행 상태를 확인한 뒤 다시 스폰하세요." };
 			}
-			const host = needsIsolationHost(plan, config) ? await isolationHost(runId) : undefined;
+			// A plan-less call may place items isolated itself (D10); the host capability is read for it too, and the
+			// host the pre-open gate already read is reused.
+			const input = event.input;
+			const inputItems: readonly unknown[] =
+				typeof input === "object" && input !== null && !Array.isArray(input) && "tasks" in input && Array.isArray(input.tasks)
+					? input.tasks
+					: [event.input];
+			const wantsIsolation = needsIsolationHost(plan, config) || inputItems.some(item =>
+				typeof item === "object" && item !== null && !Array.isArray(item) && "isolated" in item && item.isolated === true,
+			);
+			const host = wantsIsolation ? planlessHost ?? await isolationHost(runId) : undefined;
 			const readiness = await readinessFor(plan);
 			const ledgerRun = getLedgerRun(runId);
 			const planRoot = plan === undefined ? undefined : ledgerRun?.root ?? (await repoFor(ctx)).root;
 			const planEnv = planRoot === undefined ? undefined : ledgerRun !== undefined ? runEnv(ledgerRun) : envForSession(mainId, planRoot);
 			const planState = planEnv === undefined ? undefined : await stateCache.get(planEnv);
+			// The R6 classification needs the approved definition's tools for every unplanned item, planned run or not:
+			// a manual plan-less run reads the state of the run's own target once (cached), never falls back to a guess.
+			const ownerEnv = planEnv ?? (ledgerRun === undefined ? undefined : runEnv(ledgerRun));
+			const ownerState = planState ?? planlessState ?? (ownerEnv === undefined ? undefined : await stateCache.get(ownerEnv));
 			const policyView = plan !== undefined && planRoot !== undefined && planState !== undefined
 				? await policiesForPlan(plan, config, planState.shadows, planRoot, autoOn)
 				: undefined;
 			if (policyView !== undefined && !policyView.ok) return { block: true, reason: `[storm:lane-capability] ${policyView.reason}` };
-			{
-				const problem = taskLaneProblem(event.input, plan, config);
-				if (problem !== undefined) return { block: true, reason: `[storm:${problem.code}] ${problem.reason}` };
-			}
-			if (autoOn && plan === undefined) {
-				return { block: true, reason: "[storm:auto] 계획을 확인하지 못해 task를 막았습니다. plan을 다시 제출하세요." };
-			}
 			// The awaits above may have outlived the conversation that asked for this placement.
 			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
 				return { block: true, reason: "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." };
 			}
-			// A spawn that may write claims the target's write lease before any name, lane or worker exists. Read-only
-			// spawns keep their read lease so concurrent reading runs stay independent.
-			if (planMayWrite(plan)) {
+			// A planned spawn that may write claims the target's write lease before any name, lane or worker exists.
+			// Read-only spawns keep their read lease so concurrent reading runs stay independent. A plan-less run
+			// already took the claim its gated batch needed when it opened; it never upgrades on the way.
+			if (plan !== undefined && planMayWrite(plan)) {
 				const writable = await runs.ensureWrite(ctx);
 				if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
 				if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId) {
@@ -2703,6 +2932,11 @@ export default function storm(pi: ExtensionAPI): void {
 					...(host === undefined ? {} : { host }),
 					...(readiness === undefined ? {} : { readiness }),
 					...(policyView === undefined || !policyView.ok ? {} : { policies: policyView.policies, canonicalFiles: policyView.canonicalFiles }),
+					// The R6 classification of an unplanned item reads the approved definition's effective tools; without
+					// them every unplanned item is an unknown writer (safe, but serialised).
+					...(ownerState === undefined ? {} : {
+						agentTools: (agent: string) => effectiveAgentTools(agent, ownerState.shadows, PLUGIN_AGENTS_DIR),
+					}),
 					// Each item's own lane's result contract: what Storm will judge, and how. Per item, because isolation is.
 					decorate: ({ lane, isolated }: { lane: PlanLane | undefined; isolated: boolean }): string | undefined => {
 						const contract = lane === undefined ? undefined : laneContract(lane, { isolated });
@@ -2713,10 +2947,11 @@ export default function storm(pi: ExtensionAPI): void {
 					agents: listAgents({ runId, scope: runScope }),
 					...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 					now: Date.now(),
+					// Automatic direction rewrites planned lane names; manual direction keeps the lane's own name. Unplanned
+					// items get a generated handle under either (D6).
+					rewriteNames: autoOn,
 					};
-				return autoOn && plan !== undefined
-					? lanes.assign(event.input, plan, config, now)
-					: lanes.place(event.input, plan, config, now);
+				return lanes.place(event.input, plan, config, now);
 			};
 			let placed = placeOnce();
 			const waitUntil = Date.now() + WRITE_WAIT_MS;
@@ -2810,23 +3045,62 @@ export default function storm(pi: ExtensionAPI): void {
 				return { block: true, reason: "[storm:session] 실행 원장을 확인하지 못해 후속 지시를 적용하지 않았습니다. 실행 상태를 확인하세요." };
 			}
 			const plan = run.plan;
-			const laneName = runSpawns(runId).find(spawn => spawn.spawnKey === followAgent.id && spawn.outcome !== "blocked")?.lane;
+			const workerKey = authorityKey(artifactsOf(ctx), followAgent.id);
+			// The worker's own frozen state, not a role guess: a spawn row of this run, or an earlier admission on disk.
+			// A worker this run placed without a lane is never adopted into a lane of its role (R7).
+			const spawn = runSpawns(runId).find(item => item.spawnKey === followAgent.id && item.outcome !== "blocked");
+			let laneName = spawn?.lane;
+			let unplanned = spawn !== undefined && spawn.lane === undefined;
+			let authority: AgentAuthority | undefined = agentAuthorities.get(workerKey);
+			// Only this run's frozen lane may name this run's lane; an earlier run's record may still tell us the worker
+			// is lane-bound (for the one-lane role fallback) or unplanned (which is never adopted by role).
+			let frozenLane = authority?.lane;
+			let frozenThisRun = authority !== undefined && authority.runId === runId;
+			if (authority === undefined || !frozenThisRun) {
+				try {
+					const read = await readWorkerAdmission({
+						agentDir: workerAdmissionAgentDir(),
+						artifactRoot: artifactsOf(ctx),
+						parentId: ctx.agent.id,
+						childId: followAgent.id,
+					});
+					if (read.kind === "record") {
+						authority = authorityFromAdmission(read.record);
+						agentAuthorities.set(workerKey, authority);
+						frozenLane = read.record.lane;
+						frozenThisRun = read.record.runId === runId;
+					}
+				} catch {
+					// An unreadable previous admission proves no lane and no scope; the gates below fail closed.
+				}
+			}
+			if (laneName === undefined && frozenThisRun) {
+				if (frozenLane !== undefined) laneName = frozenLane;
+				else unplanned = true;
+			}
+			// An earlier run's unplanned worker is never adopted into a lane of its role by guess (R7).
+			if (laneName === undefined && !frozenThisRun && frozenLane === undefined && authority !== undefined) unplanned = true;
 			// A reused live agent has no spawn row in this run; it may still be bound to the plan only when exactly one
 			// lane of its role is authorized. Ambiguous same-role lanes never guess.
 			const byRole = plan?.lanes.filter(candidate => candidate.job === undefined && candidate.role === followAgent.role) ?? [];
-			const lane = laneName !== undefined ? plan?.lanes.find(candidate => candidate.name === laneName) : byRole.length === 1 ? byRole[0] : undefined;
-			// An unplanned non-reviewer worker has no authorized write target for more work. A read-only reviewer in a
-			// run with no plan can still deliver a verdict: it gets no write admission, and its tools are read-only.
-			if (lane === undefined && followAgent.role !== "reviewer") {
+			const lane = laneName !== undefined
+				? plan?.lanes.find(candidate => candidate.name === laneName)
+				: unplanned
+					? undefined
+					: byRole.length === 1
+						? byRole[0]
+						: undefined;
+			// An unplanned worker needs its frozen authority to send more work; a worker this run never placed and
+			// whose authority cannot be established is refused. A read-only reviewer in a plan-less run can still
+			// deliver a verdict: it gets no write admission, and its tools are read-only.
+			if (lane === undefined && !unplanned && followAgent.role !== "reviewer") {
 				return { block: true, reason: "[storm:lane] 이 워커는 승인된 계획의 구체적인 레인에 속하지 않아 후속 작업을 보내지 않았습니다. 레인을 다시 계획하세요." };
 			}
 			followLane = lane;
-			let authority: AgentAuthority | undefined;
 			if (lane !== undefined) {
-				// A reused agent must keep its enforced capability; recompute if this session did not see its spawn.
-				const workerKey = authorityKey(artifactsOf(ctx), followAgent.id);
-				authority = agentAuthorities.get(workerKey);
-				if (authority === undefined) {
+				// A reused agent must keep the enforced capability of the lane it is entering now; an authority frozen
+				// for an earlier run is never reused as this run's lane policy.
+				if (authority === undefined || authority.runId !== runId) {
 					const state = await stateCache.get(runEnv(run));
 					const currentConfig = state.config.status === "ok" ? state.config.config : config;
 					const computed = await authorityFor({
@@ -2838,9 +3112,11 @@ export default function storm(pi: ExtensionAPI): void {
 						auto: autoOn,
 					});
 					if (!computed.ok) return { block: true, reason: `[storm:lane-capability] ${computed.reason}` };
-					authority = computed.authority;
+					authority = { ...computed.authority, runId: run.runId };
 					agentAuthorities.set(workerKey, authority);
 				}
+			} else if (unplanned && authority === undefined) {
+				return { block: true, reason: "[storm:lane] 이 워커의 승인된 쓰기 권한을 확인하지 못해 후속 작업을 보내지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요." };
 			}
 			const readiness = await readinessFor(plan);
 			// A lease upgrade, a state read and a readiness probe are all awaits; the conversation may have changed.
@@ -2892,14 +3168,25 @@ export default function storm(pi: ExtensionAPI): void {
 			// The reused worker's next turn runs in its own module (possibly another thread): refresh the exact
 			// admission with a new attempt before the delivery can execute. A quiet note does not: the woken turn keeps the
 			// admission its last turn ended, so it can read and yield but never write or run a command.
-			if (!quietWake && lane !== undefined && authority !== undefined) {
+			// R7: a work follow-up opens a new attempt with a new reservation key (`hold`). An unplanned writer takes
+			// the same path with no lane; a read-only unplanned worker has no hold and keeps its ended admission.
+			if (!quietWake && authority !== undefined && (lane !== undefined || gate.hold !== undefined)) {
 				// The followed worker's original spawn names its trial; a follow-up keeps that candidate approval rather than
 				// re-deriving it from the live team file. The admission's snapshot is what its own request check reads.
 				const original = runSpawns(run.runId).findLast(item => item.spawnKey === followAgent.id && item.outcome !== "blocked");
 				const trial = original?.trialId === undefined ? undefined : config.trials?.find(item => item.id === original.trialId);
 				const approved = approvedEntries(config, followAgent.name, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
 				try {
-					await persistChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority, approved });
+					await persistChildAdmission({
+						ctx,
+						run,
+						artifacts: artifactsOf(ctx),
+						childId: followAgent.id,
+						...(lane === undefined ? {} : { lane }),
+						authority,
+						...(gate.hold === undefined ? {} : { hold: gate.hold }),
+						approved,
+					});
 				} catch {
 					followLanes.finishFollowUp(followToken, false);
 					return { block: true, reason: "[storm:authority] 후속 작업의 자식 실행 권한을 저장하지 못해 전달하지 않았습니다. 프로필 경로와 권한을 확인하세요." };
@@ -3249,6 +3536,7 @@ export default function storm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		rememberMainAgent(ctx);
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
 			const settled = !(event.willContinue || event.awaitingAsyncWork);

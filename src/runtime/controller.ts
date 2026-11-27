@@ -132,7 +132,7 @@ import {
 	type RoundProgress,
 } from "./rounds.ts";
 import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "./answer-review.ts";
-import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
+import { captureSharedBaseline, evaluateSettledResults, ISOLATED_CHANGE_REASON, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
 import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { carryGoal } from "./goal.ts";
@@ -403,6 +403,12 @@ interface PreparedAttempt {
 	artifactMode: AttemptArtifactMode;
 	results: readonly PlanLaneResult[];
 	laneFiles?: readonly string[];
+	/**
+	 * The lane runs in its own checkout (an isolation reason, or a team that isolates every worker). Derived once at
+	 * preparation from the plan in force; memory only, never a record field. An isolated `change` is never judged
+	 * against the parent tree in 0.29.0: Storm does not bring isolated work into the tree in this version.
+	 */
+	isolated?: true;
 	/** Producer result versions this attempt started from; absent when the lane declared no prerequisites. */
 	consumed?: readonly ResultInputVersion[];
 	/**
@@ -501,6 +507,23 @@ function compactResultReason(text: string): string {
 }
 
 /**
+ * Row 2 of the 0.29.0 table, the one pure rule every evaluation path shares: an isolated lane's `change` result is
+ * never accepted and never made reviewable in this version, whatever the parent tree holds. Another writer may have
+ * written those bytes (ISO P7-B), and a reviewer on the parent tree cannot see the candidate. The reason names the
+ * missing managed integration, never "the worker changed nothing". Every other result kind is returned untouched, and
+ * an item that already failed keeps its own reason: only a judgeable state is replaced.
+ */
+export function isolatedChangeItems(items: readonly ResultEvidenceItem[], isolated: boolean): ResultEvidenceItem[] {
+	if (!isolated) return items as ResultEvidenceItem[];
+	return items.map(item => {
+		if (item.kind !== "change" || (item.state !== "accepted" && item.state !== "reviewable")) return item;
+		const copy = { ...item };
+		delete copy.checkDeferred;
+		return { ...copy, state: "unmet" as const, reason: ISOLATED_CHANGE_REASON };
+	});
+}
+
+/**
  * Whether acting on this plan can change the target or run commands there. A safe reader stays a reader; every other
  * lane kind, declared file or non-answer result must hold the worktree write claim before the plan is bound.
  */
@@ -530,6 +553,26 @@ function persistedResultContract(result: PlanLaneResult): PlanLaneResult {
 const ORPHAN_RESULT_REASON = "계획에서 빠진 필수 결과입니다. 다시 배정하거나 사용자가 범위를 바꿔야 합니다.";
 /** A user exclusion is not an orphan: it keeps its binding and reason, and no later plan may recreate it. */
 const EXCLUDED_RESULT_REASON = "사용자가 이 결과를 실행 범위에서 제외했습니다.";
+
+/**
+ * Row 2 of the 0.29.0 table: a `change` result of an isolated lane is never accepted or made reviewable in this
+ * version. The reason lives in the evaluator (`result-evidence.ts`) and is re-exported here for the controller, views
+ * and tests; it names the missing capability, never the worker.
+ */
+export { ISOLATED_CHANGE_REASON };
+/**
+ * Row 5: an `integrated` prerequisite on an isolated producer cannot be met in 0.29.0 because no integration exists.
+ * Exported so the controller and its test share the one sentence.
+ */
+export const ISOLATED_INTEGRATED_REASON = "이 버전은 격리 작업을 부모 트리에 통합하지 않으므로 통합 반영 조건은 충족될 수 없습니다";
+/** Row 3: a successful isolated attempt with no captured patch may be a branch, which this version cannot read. */
+export const ISOLATED_BRANCH_UNREAD = "브랜치 결과는 이 버전이 읽지 못합니다";
+/** Row 3: the full capture reason; the native delivery is the only place the rest of the outcome is recorded. */
+export const ISOLATED_CAPTURE_UNREAD = `보존 패치를 받지 못했습니다. ${ISOLATED_BRANCH_UNREAD}`;
+/** Row 8: a proved successful attempt that captured nothing is "no change captured", never a failed host attempt. */
+export const EMPTY_CAPTURE_REASON = "성공으로 끝났지만 보존할 변경이 없었습니다";
+/** Row 8: a native cancel whose identity Storm could not bind says the cause is unconfirmed, not that the worker did nothing. */
+export const CANCEL_IDENTITY_UNKNOWN = "취소로 끝났지만 이 시도의 신원을 확인하지 못했습니다";
 /** The audit list is bounded like every other record list; the newest actions win. */
 const ADJUSTMENTS_MAX = 50;
 /** A repeated ordinary directive within this window is a duplicate delivery, not a second attempt. */
@@ -1614,6 +1657,9 @@ export class RunController {
 					} else {
 						integrated = location.integrated;
 						retained = location.retained;
+						// Row 5: an isolated producer's result has no integrated location in this version. The reason is
+						// carried beside the result so the prerequisite refusal says why the condition cannot be met.
+						if (isolated && !integrated && result.kind !== "answer") retainedReason = ISOLATED_INTEGRATED_REASON;
 					}
 				} else if (result.kind === "answer" && state === "reviewable" && row !== undefined) {
 					// A consumer that may start from a reviewable answer still starts only from the cited bytes S1 read.
@@ -1648,6 +1694,7 @@ export class RunController {
 					...(citation === undefined ? {} : { citation: { path: citation.path, ...(citation.line === undefined ? {} : { line: citation.line }) } }),
 					...(retained === undefined ? {} : { retained }),
 					...(reason === undefined ? {} : { reason }),
+					...(isolated ? { isolated: true as const } : {}),
 				});
 			}
 			const settled = coverage.get(name) === true;
@@ -1692,6 +1739,9 @@ export class RunController {
 		if (hasStaleInputs(row, own.record.results ?? [])) {
 			return { ok: false, reason: "선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다." };
 		}
+		// Row 2: an isolated change has no parent-tree location this version can judge. Even when someone else wrote
+		// the declared bytes, they are not this attempt's work (ISO P7-B); a restored or review-accepted row is reopened.
+		if (isolated === true && result.kind === "change") return { ok: false, reason: ISOLATED_CHANGE_REASON };
 		if (restoredSubmission) {
 			const source = await revalidateCheckpointProof({ row, result, root: own.root, forReview: true });
 			if (!source.ok) return source;
@@ -1853,6 +1903,7 @@ export class RunController {
 			route,
 			artifactMode: input.artifactMode,
 			results: lane.results,
+			...(lane.isolationReason !== undefined || own.config.isolation === "isolated" ? { isolated: true as const } : {}),
 			...(consumed.length === 0 ? {} : { consumed }),
 			declaredInputs: declared,
 			...(lane.files === undefined ? {} : { laneFiles: lane.files }),
@@ -2603,6 +2654,18 @@ export class RunController {
 	}
 
 	/**
+	 * Whether the result's lane in the plan in force is isolated. A lane that left the plan has no isolation fact left
+	 * to read; only a team that isolates every worker still answers for it. Used by the review refresh, so an older
+	 * reviewable change of an isolated lane cannot become accepted on parent-tree bytes (row 2).
+	 */
+	#rowIsolated(own: OwnRun, row: RunResult): boolean {
+		if (own.config.isolation === "isolated") return true;
+		const lanes = own.record.plan?.lanes ?? [];
+		const lane = lanes.find(candidate => candidate.name === row.lane) ?? lanes.find(candidate => (candidate.results ?? []).some(result => result.id === row.id));
+		return lane?.isolationReason !== undefined;
+	}
+
+	/**
 	 * Whether the plan still declares, for every result this attempt can produce, exactly the logical inputs it started
 	 * under. Result ids locate the owning lane, so a pure rename of the producer or consumer lane keeps the attempt.
 	 */
@@ -2915,7 +2978,19 @@ export class RunController {
 	/** A report that cannot bind leaves every non-accepted requirement unresolved without an attempt id. */
 	#applyUnusableAttempt(own: OwnRun, prepared: PreparedAttempt, report: AttemptReport): void {
 		const code = report.captureError ?? (report.attemptId === undefined ? "native-result-missing" : "spawn-mismatch");
-		const reason = compactResultReason(`호스트 시도를 확인하지 못했습니다(${code}).`);
+		// Row 8: keep the native outcome separate from the capture proof. A cancel whose identity could not be bound
+		// says the cause is unconfirmed; a proved success with an empty patch says no change was captured (not a failed
+		// attempt). Row 3: an isolated success with no patch may be a branch, which this version cannot read; the
+		// native delivery is named instead of inventing a branch or a failure.
+		const reason = compactResultReason(
+			report.outcome === "cancel"
+				? `${CANCEL_IDENTITY_UNKNOWN}(${code}). 네이티브 기록과 호스트의 취소 기록을 확인하세요.`
+				: report.outcome === "success" && code === "patch-artifact-empty"
+					? `${EMPTY_CAPTURE_REASON}(${code}).`
+					: report.outcome === "success" && prepared.isolated === true && prepared.results.some(result => result.kind === "artifact")
+						? `${ISOLATED_CAPTURE_UNREAD}(${code}). 네이티브 결과: agent://${prepared.spawnKey}`
+						: `호스트 시도를 확인하지 못했습니다(${code}).`,
+		);
 		const rows = own.record.results ?? [];
 		for (const result of prepared.results) {
 			const row = rows.find(candidate => candidate.id === result.id);
@@ -2948,6 +3023,11 @@ export class RunController {
 		const checkNames = prepared.results.filter(result => result.check !== undefined).map(result => result.id);
 		const checks = checkNames.length === 0 ? undefined : await this.#approvedCheckEvidence(own);
 		const deferred = new Set(checkNames.length > 0 && checks === undefined ? checkNames : []);
+		// An isolated change is judged on the retained candidate, never on the parent tree in this version: it never
+		// becomes accepted or reviewable, and a declared check cannot turn it into a deferred review.
+		if (prepared.isolated === true) {
+			for (const result of prepared.results) if (result.kind === "change") deferred.delete(result.id);
+		}
 		settled.checkDeferred = deferred.size > 0;
 		const wantsAnswer = prepared.results.some(result => result.kind === "answer");
 		const evaluation = await evaluateSettledResults({
@@ -3008,8 +3088,9 @@ export class RunController {
 			this.#invalidateConsumers(own);
 			return;
 		}
-		this.#applyEvaluated(own, prepared, settled.attemptId, evaluation.report.results, deferred);
-		for (const item of evaluation.report.results) {
+		const items = isolatedChangeItems(evaluation.report.results, prepared.isolated === true);
+		this.#applyEvaluated(own, prepared, settled.attemptId, items, deferred);
+		for (const item of items) {
 			const row = own.record.results?.find(candidate => candidate.id === item.id);
 			if (row?.attemptId !== settled.attemptId) continue;
 			const proof = (item.state === "accepted" || (item.kind === "change" && item.state === "reviewable")) && row.state === item.state
@@ -3115,6 +3196,9 @@ export class RunController {
 			// An answer is never bound to, settled by or reopened from a tree: its verdict scopes its exact submission
 			// (`#refreshAnswerReviews`) and its cited bytes are re-read by `#revokeUnlocatedAccepted`.
 			if ((planned ?? row.contract)?.kind === "answer") continue;
+			// Row 2: an isolated change never becomes review-accepted on parent-tree bytes, including an older record's
+			// reviewable row; no check or review refresh may credit it.
+			if ((planned ?? row.contract)?.kind === "change" && this.#rowIsolated(own, row)) continue;
 			// A review state was bound to an older tree: the submission itself is still there, so reopen it for judgement.
 			if (row.origin === "review" && row.reviewTree !== treeNow) {
 				row.state = "reviewable";
@@ -4060,6 +4144,7 @@ export class RunController {
 				now: now.state,
 			},
 			this.#coverage(own, undefined, planLanes),
+			{ directorEdit: own.directorEdit === true },
 		);
 		return gate.state === "unverified" && gate.cause === "coverage";
 	}
@@ -4083,7 +4168,7 @@ export class RunController {
 		// look timer, never inside omp's agent_end handler: they may take far longer than its budget.
 		const initial = this.#coverage(own, undefined, planLanes);
 		initial.checks = [];
-		const baseGate = reviewGate(agents, own.config, tree, initial);
+		const baseGate = reviewGate(agents, own.config, tree, initial, { directorEdit: own.directorEdit === true });
 		// A required result that names an approved check may need that check to decide it. The check runner normally
 		// starts only when the gate is otherwise check-ready; a deferred row is exactly that case, and leaving it as
 		// `results` would stop the runner from ever supplying the evidence the row waits for.
@@ -4102,7 +4187,7 @@ export class RunController {
 			...(now !== undefined ? { now: now.state } : {}),
 		};
 		const coverage = this.#coverage(own, now?.state, planLanes);
-		const gate = reviewGate(agents, own.config, currentTree, coverage);
+		const gate = reviewGate(agents, own.config, currentTree, coverage, { directorEdit: own.directorEdit === true });
 		const decision = decideRound({
 			gate,
 			turns: own.record.turns ?? 0,
@@ -4753,6 +4838,7 @@ export class RunController {
 				...(now !== undefined ? { now: now.state } : {}),
 			},
 			coverage,
+			{ directorEdit: own.directorEdit === true },
 		);
 		if (gate.state === "passed") return "verified";
 		if (gate.state === "none") {

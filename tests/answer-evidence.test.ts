@@ -251,8 +251,6 @@ function report(over: Partial<AttemptReport> & Pick<AttemptReport, "runId" | "sp
 	};
 }
 
-let admitSerial = 0;
-
 /** Admits one planned lane the way manual direction does, with the readiness its declared edges read. */
 async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneName: string): Promise<string> {
 	const lane = plan.lanes.find(candidate => candidate.name === laneName);
@@ -262,9 +260,8 @@ async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneNa
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set((lane.dependsOn ?? []).map(dependency => dependency.lane));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	// `<serial>.<lane>`: manual admission binds the handle's last segment to that lane, so several answer lanes of one
-	// role stay unambiguous.
-	const spawnKey = `${laneName}-${++admitSerial}.${laneName}`;
+	// R4: a manual planned item is keyed by its lane's own name; the placement and the spawn must use that one key.
+	const spawnKey = laneName;
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });

@@ -26,15 +26,15 @@ const planFor = (lanes: RunPlan["lanes"], workers: Record<string, number>): RunP
 const report = (over: Partial<AttemptReport> & Pick<AttemptReport, "runId" | "spawnKey" | "attemptId">): AttemptReport => ({
 	schema: "storm.attempt-report/v1", parentId: "main", outcome: "success", capture: "observed", observedAt: T0 + 1, version: "unknown", artifacts: [], observations: [], ...over,
 });
-let serial = 0;
 async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneName: string): Promise<string> {
 	const lane = plan.lanes.find(c => c.name === laneName)!;
 	const lanes = h.controller.runLanes()!;
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(plan.lanes.flatMap(c => (c.dependsOn ?? []).map(d => d.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	const spawnKey = `${laneName}-${++serial}`;
-	const bound = lanes.place({ name: spawnKey, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
+	// R4: manual planned items are keyed by their lane's own name.
+	const spawnKey = laneName;
+	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);

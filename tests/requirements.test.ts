@@ -76,16 +76,15 @@ async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneNa
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(plan.lanes.flatMap(candidate => (candidate.dependsOn ?? []).map(dependency => dependency.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	const spawnKey = `${laneName}-${++admitSerial}`;
-	const bound = lanes.place({ name: spawnKey, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
+	// R4: a manual planned item is keyed by its lane's own name; the placement and the spawn must use that one key.
+	const spawnKey = laneName;
+	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);
 	agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: at }));
 	return spawnKey;
 }
-
-let admitSerial = 0;
 
 /** Settles one attempt and releases its shared write reservation, as the host's child-end event does. */
 async function settle(h: FakeSession, input: AttemptSettlement): Promise<void> {

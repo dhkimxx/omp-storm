@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	CHECKOUT_PLAN_NOTE,
 	MAX_LANES,
 	MAX_LANE_DEPENDENCIES,
 	MAX_LANE_FILES,
@@ -221,9 +222,11 @@ describe("validatePlan", () => {
 			NOW,
 		);
 		expect(r.errors).toEqual([]);
-		const overlap = r.warnings;
+		const overlap = r.warnings.filter(warning => warning.includes("x.ts"));
 		expect(overlap).toHaveLength(1);
 		expect(overlap[0]).toContain("순서");
+		// The plan uses a checkout, so the reply also carries the one fixed qualification about it.
+		expect(r.warnings).toContain(CHECKOUT_PLAN_NOTE);
 		expect(r.plan!.lanes[1]).not.toHaveProperty("isolationReason");
 	});
 

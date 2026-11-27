@@ -23,8 +23,9 @@ import type {
 import { MAX_RESULT_ID } from "../plan/validate.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import type { ResultRow } from "../view/results.ts";
+import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE } from "./contract-text.ts";
 import { goalTotals } from "./goal.ts";
-import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type ResultFacts } from "./result-facts.ts";
+import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type ResultFacts, type RetainedFacts } from "./result-facts.ts";
 import { HANDOFF_RESUME_LABEL } from "./resume.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
 import { spendText, unplannedLine, unplannedTotal } from "./unplanned.ts";
@@ -220,12 +221,22 @@ function acceptedOutput(run: RunRecord, result: RunResult): boolean {
  * with no declared result row says that too: its review verified changes, not a result count.
  */
 export const NO_RESULTS_VERDICT = "리뷰 통과(결과 집계 없음)";
+/**
+ * Row 1: when every accepted result is a retained artifact, the run met its artifact requirements outside the target.
+ * The words never claim the tree holds the work; the tone is accent, so no tick is drawn.
+ */
+export const RETAINED_ONLY_VERDICT = "보존 산출물 충족 · 대상 트리 변경 없음";
+/** Row 2: a recorded stop is a separate fact from the final result evidence, and the card says so. */
+export const STOP_SEPARATE_NOTE = "실행 종료 사유는 결과 판정과 별개로 기록되었습니다";
 
 function runReasonLabel(run: RunRecord, facts: ResultFacts): string {
 	const reason = run.endReason;
 	if (reason === undefined) return "";
 	if (reason !== "verified") return endLabel(reason);
 	if (!facts.hasDeclared) return NO_RESULTS_VERDICT;
+	// All accepted evidence is kept outside the target: the verdict says that instead of "required results met", which
+	// reads as if the tree held the candidates.
+	if (facts.retained.count > 0 && facts.retained.count === facts.progress.counts.accepted) return RETAINED_ONLY_VERDICT;
 	const results = run.results ?? [];
 	const reviewed = (run.agents ?? []).some(agent => (agent.review?.passed ?? 0) > 0);
 	const changed = (run.agents ?? []).some(agent => (agent.changes ?? 0) > 0);
@@ -294,10 +305,20 @@ function namesText(names: readonly string[], shown = 2): string {
  * Risks the record itself supports, never an inference about external state: writes that no verification covered,
  * host jobs whose end was never observed, planned lanes no open row already names, and a budget stop.
  */
-function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes: ReadonlySet<string>): string[] {
+function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes: ReadonlySet<string>, retained: RetainedFacts): string[] {
 	const out: string[] = [];
 	const agents: readonly AgentEntry[] = Array.isArray(run.agents) ? run.agents : [];
 	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick").length;
+	// §5/rows 9 and 11: an isolated run's closeout carries what a checkout is and is not, and that its cleanup is not
+	// Storm's claim. Fixed size, one line, whether one lane or a hundred.
+	const isolatedLanes = (Array.isArray(run.plan?.lanes) ? run.plan.lanes : []).filter(
+		lane => typeof lane.isolationReason === "string" && lane.isolationReason.trim() !== "",
+	).length;
+	if (retained.count > 0 || isolatedLanes > 0) out.push(`${CHECKOUT_PLACEMENT_NOTE} ${CHECKOUT_CLEANUP_NOTE}`);
+	// Row 2 (P7-B): the record's stop and its final evidence are separate facts; the card must not imply one judged the other.
+	if (run.status === "stopped" && (run.results ?? []).some(row => row.state === "accepted")) {
+		out.push(`${STOP_SEPARATE_NOTE}.`);
+	}
 	if (run.endReason !== "verified" && writers > 0) {
 		out.push(`검증되지 않은 변경이 작업 트리에 남아 있을 수 있습니다(변경한 워커 ${writers}개).`);
 	}
@@ -324,7 +345,12 @@ function minutesOf(run: RunRecord): number | undefined {
 
 function toneOf(run: RunRecord, facts: ResultFacts, open: number, residual: number): InfoTone {
 	if (run.status === "running") return "muted";
-	if (open > 0 || residual > 0 || run.status === "stopped" || run.status === "budget-exceeded") return "warning";
+	if (run.status === "stopped" || run.status === "budget-exceeded") return "warning";
+	if (open > 0) return "warning";
+	// Row 1: kept artifacts are not verified tree work, so the card gets no success mark or tick. The checkout
+	// qualification is a caveat, not an open risk, so it does not turn this into a warning.
+	if (run.endReason === "verified" && facts.retained.count > 0 && facts.retained.count === facts.progress.counts.accepted) return "accent";
+	if (residual > 0) return "warning";
 	// A pass over changes is not a pass over declared results: no success mark when the record holds no result row.
 	if (!facts.hasDeclared) return "accent";
 	return run.status === "done" ? "success" : "accent";
@@ -341,6 +367,11 @@ function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
 	return item.why === undefined ? task : `${task} — ${clean(item.why, CLOSEOUT_WHY_MAX)}`;
 }
 
+export interface CloseoutRetainedBrief extends CloseoutBrief {
+	/** Row 1: accepted retained artifacts kept outside the target, with one safe reference. */
+	readonly retained?: RetainedFacts;
+}
+
 /**
  * The brief of a settled run, from its record alone. `resumable` is the caller's proof that this exact run is the
  * session's trusted resume candidate; without it no resume action is offered, whatever the draft says.
@@ -351,7 +382,7 @@ function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
  * - `card`: everything else. The director's result and remaining appear only here, marked stale when finalization
  *   changed a row after the draft could have been written.
  */
-export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } = {}): CloseoutBrief {
+export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } = {}): CloseoutRetainedBrief {
 	const fact = resultFacts(run);
 	const progress = fact.progress;
 	const markers = finalizedById(run);
@@ -367,7 +398,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		if (row.lane !== undefined) openLanes.add(row.lane);
 	}
 	const openTotal = Object.values(open).reduce((sum, n) => sum + n, 0);
-	const residual = residualOf(run, stored, openLanes);
+	const residual = residualOf(run, stored, openLanes, fact.retained);
 	// Work that happened outside the declared results is a fact the card names, not a risk: it shapes neither the tier
 	// nor the tone, and it takes a place on the card only from the lowest-ranked risk.
 	const unplanned = unplannedLine(run);
@@ -379,6 +410,8 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		CLEAN_ENDS.has(run.endReason) &&
 		openTotal === 0 &&
 		progress.counts.excluded === 0 &&
+		// A retained acceptance must show its patch reference; a one-line closeout would hide where the bytes are.
+		fact.retained.count === 0 &&
 		residual.length === 0;
 	const tier: CloseoutBrief["tier"] =
 		run.status === "running" ? "none" : settled && (minutes === undefined || minutes < CLOSEOUT_CARD_MINUTES) ? "line" : "card";
@@ -424,6 +457,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 	return {
 		runId: run.runId,
 		tier,
+		retained: fact.retained,
 		request: clean(run.task, REQUEST_MAX),
 		...(target ? { target } : {}),
 		startedAt: run.startedAt,
@@ -515,6 +549,13 @@ export function closeoutHandoff(run: RunRecord): string {
 	const results = official.hasResults
 		? `- Results: accepted ${official.accepted}/${official.inScope}${official.excluded > 0 ? `, excluded by user ${official.excluded}` : ""}${openParts.length > 0 ? `; open: ${openParts.join(", ")}` : ""}`
 		: "- Results: none declared";
+	// Row 1: retained artifact acceptance is not tree work. One bounded line names the count and the first safe patch
+	// reference; Storm applied nothing to the target.
+	const kept = brief.retained;
+	const retainedLine =
+		kept === undefined || kept.count === 0
+			? undefined
+			: `- Retained: ${kept.count} accepted artifact${kept.count === 1 ? "" : "s"} kept outside the target${kept.capture === undefined ? "" : ` (${scrub(kept.capture, PROOF_MAX)}${kept.attempt === undefined ? "" : `, ${scrub(kept.attempt, NAME_MAX)}`})`}; Storm applied nothing to the target`;
 	// Work that answers no declared result is part of the record a handoff carries: who delivered, whether it changed
 	// files and what it cost. The list is bounded like every other handoff line.
 	const deliveries = Array.isArray(run.unplanned) ? run.unplanned : [];
@@ -542,6 +583,7 @@ export function closeoutHandoff(run: RunRecord): string {
 		`- Request: ${scrub(run.task, REQUEST_MAX)}`,
 		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
 		results,
+		retainedLine,
 		outOfPlan,
 		goal,
 		brief.target ? `- Target: ${scrub(brief.target, TARGET_MAX)}` : undefined,

@@ -56,18 +56,30 @@ export const CONTRACT_HEADER = "Storm이 아래 결과로 완료를 판정합니
 export const ANSWER_CONTAINS_NOTE = "근거 줄의 내용은 Storm이 직접 확인합니다.";
 /** The scope line of an isolated item: the paths are relative to its own checkout. */
 export const ISOLATED_SCOPE = "격리 체크아웃 안의 같은 상대 경로";
+/**
+ * Row 9/§5: what a checkout really is. Plan reply, worker contract, status and closeout all carry this sentence or
+ * quote it; a checkout is a placement, not a filesystem boundary.
+ */
+export const CHECKOUT_PLACEMENT_NOTE = "분리 체크아웃은 작업을 두는 위치일 뿐 파일시스템 차단벽이 아닙니다. 셸은 체크아웃 밖 경로도 건드릴 수 있습니다.";
+/** The same fact in one clause, for the worker contract's byte bound. */
+export const CHECKOUT_PLACEMENT_SHORT = "체크아웃은 작업 위치일 뿐 차단벽이 아닙니다";
+/** Row 7: the checkout is a point-in-time copy, including the user's uncommitted bytes; there is no clean common base. */
+export const CHECKOUT_SNAPSHOT_NOTE = "체크아웃은 만들어진 시점의 사본이며 사용자의 미커밋 변경도 들어갑니다. 깨끗한 공통 기준이라는 보장은 없습니다.";
+/** Row 11: Storm never claims a checkout cleanup it did not observe; the host owns it. */
+export const CHECKOUT_CLEANUP_NOTE = "체크아웃 정리는 호스트가 맡으며 Storm은 지워졌는지 확인하지 못합니다.";
 
 /** What a result's per-result line says about who decides it once its conditions are met. */
 export const JUDGE_TEXT = {
 	machine: "조건을 충족하면 Storm이 기계로 인정합니다",
 	reviewer: "조건을 충족해도 리뷰어가 판정합니다",
 	never: "경로가 없어 Storm이 인정하지 못합니다",
+	unavailable: "이 버전은 격리 change를 수용하지 않습니다",
 } as const;
 
 const CHANGE_RULE =
 	"change: 작업 시작 때 잡은 기준선과 비교해 대상 파일의 내용이 실제로 바뀌어야 합니다. 대상은 path가 있으면 그 파일, 없으면 레인의 파일 범위입니다. 요구 문자열이 있으면 바뀐 파일 안에 공백까지 그대로 있어야 합니다.";
 const CHANGE_ISOLATED_RULE =
-	"격리 실행이라 Storm은 부모 작업 트리의 같은 경로를 읽습니다. 체크아웃 안에서만 바뀐 내용은 거기에 반영되기 전에는 보이지 않습니다.";
+	"격리 실행의 change는 이 버전에서 수용되지 않습니다. Storm은 격리 작업을 부모 작업 트리로 가져오지 않으므로 결과는 artifact로 선언하세요.";
 const ARTIFACT_SHARED_RULE =
 	"artifact: 공유 작업 트리에서는 change와 같게 기준선과 비교해 판정하며 path가 있어야 합니다. path가 없으면 인정되지 않습니다.";
 const ARTIFACT_ISOLATED_RULE =
@@ -77,7 +89,7 @@ const CHECK_RULE =
 	"검사: 이름이 붙은 승인된 검사를 Storm이 직접 실행해 통과해야 합니다. 통과하지 못했거나 아직 실행되지 못했으면 인정되지 않습니다.";
 
 /** Who decides a result once its stated conditions are met; `cited` is an answer, which depends on the answer's form. */
-export type ResultJudge = "machine" | "reviewer" | "never" | "cited";
+export type ResultJudge = "machine" | "reviewer" | "never" | "cited" | "unavailable";
 
 /**
  * What `evaluateSettledResults` does with a result whose stated conditions are all met, derived from
@@ -93,6 +105,8 @@ export type ResultJudge = "machine" | "reviewer" | "never" | "cited";
  */
 export function resultJudge(result: Pick<PlanLaneResult, "kind" | "path" | "contains" | "check">, options: { isolated: boolean; laneHasFiles: boolean }): ResultJudge {
 	if (result.kind === "answer") return "cited";
+	// Row 2: an isolated change has no accepted outcome in 0.29.0, whatever its path, literal or check says.
+	if (result.kind === "change" && options.isolated) return "unavailable";
 	// A change with no path is judged on the lane's files; with none of those either there is nothing to compare to a baseline.
 	if (result.kind === "change" && result.path === undefined && !options.laneHasFiles) return "never";
 	if (result.kind === "artifact" && options.isolated) {
@@ -231,6 +245,8 @@ function render(lane: PlanLane, results: readonly PlanLaneResult[], options: Lan
 	const scope = scopeText(lane.files, caps);
 	if (scope !== undefined) head.push(`쓰기 범위: ${options.isolated ? `${ISOLATED_SCOPE} ` : ""}${scope}`);
 	else if (options.isolated) head.push(`쓰기 범위: ${ISOLATED_SCOPE}`);
+	// Row 9 and §5: the worker is told what its checkout is and is not, in every isolated contract.
+	if (options.isolated) head.push(`배치: ${CHECKOUT_PLACEMENT_SHORT}. 시점: 만들어진 시점의 사본이고 사용자 미커밋 변경도 포함합니다.`);
 	const units = results.map(result => resultLines(result, options, caps, (lane.files ?? []).length > 0));
 	let text = "";
 	for (let shownCount = results.length; shownCount >= 0; shownCount--) {
