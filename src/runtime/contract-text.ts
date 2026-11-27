@@ -105,25 +105,22 @@ export function resultJudge(result: Pick<PlanLaneResult, "kind" | "path" | "cont
 
 /** The characters JSON.stringify leaves as they are but that can hide or fake structure in a line of text. */
 const INVISIBLE_RANGES: ReadonlyArray<readonly [number, number]> = [[0x7f, 0x9f], [0xad, 0xad], [0x61c, 0x61c], [0x180e, 0x180e], [0x200b, 0x200f], [0x2028, 0x202e], [0x2060, 0x206f], [0xfeff, 0xfeff], [0xfff9, 0xfffb]];
-/** Brackets other than the ASCII one that a reader may take for the opening or closing of a `[storm:…]` header: all escaped, wherever they stand. */
-const BRACKET_LOOKALIKES = new Set([0x2045, 0x2046, 0x27e6, 0x27e7, 0x3010, 0x3011, 0x3014, 0x3015, 0x301a, 0x301b, 0xfe5d, 0xfe5e, 0xff3b, 0xff3d]);
+/** Every opening/closing bracket and initial/final quote punctuation mark, which a reader may take for a header's edge. */
+const BRACKET_PUNCTUATION = /[\p{Ps}\p{Pe}\p{Pi}\p{Pf}]/u;
 
-/** Whether the text after an ASCII `[` reads as `storm` once width forms, case and spaces are folded away. */
-function opensStormHeader(rest: string): boolean {
-	return rest.slice(0, 24).normalize("NFKC").toLowerCase().replace(/\s+/gu, "").startsWith("storm");
+/** A code point as JSON's `\uXXXX` escape(s); a non-BMP point becomes its surrogate pair, never a JS-only `\u{...}`. */
+function unicodeEscape(code: number): string {
+	if (code <= 0xffff) return `\\u${code.toString(16).padStart(4, "0")}`;
+	const rest = code - 0x10000;
+	return `${unicodeEscape(0xd800 + (rest >> 10))}${unicodeEscape(0xdc00 + (rest & 0x3ff))}`;
 }
 
-/** One field as a JSON string literal that cannot carry a newline, a control character or a raw `[storm` header (in any bracket or width form). */
+/** One field as a JSON string literal that cannot carry a newline, a control character or a raw bracket header in any bracket or width form. */
 function quote(value: string): string {
-	const escaped = Array.from(JSON.stringify(value), char => {
+	return Array.from(JSON.stringify(value), char => {
 		const code = char.codePointAt(0) ?? 0;
-		return INVISIBLE_RANGES.some(([from, to]) => code >= from && code <= to) || BRACKET_LOOKALIKES.has(code) ? `\\u${code.toString(16).padStart(4, "0")}` : char;
+		return INVISIBLE_RANGES.some(([from, to]) => code >= from && code <= to) || BRACKET_PUNCTUATION.test(char) ? unicodeEscape(code) : char;
 	}).join("");
-	let out = "";
-	for (let at = 0; at < escaped.length; at++) {
-		out += escaped[at] === "[" && opensStormHeader(escaped.slice(at + 1)) ? "\\u005b" : escaped[at];
-	}
-	return out;
 }
 
 const byteLength = (text: string): number => Buffer.byteLength(text, "utf8");

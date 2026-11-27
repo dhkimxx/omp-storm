@@ -12,7 +12,7 @@ import { AgentRegistry, type CompactOptions, type ExtensionAPI, type ExtensionCo
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
-import { writeConfig } from "../src/config/store.ts";
+import { writeConfig, configPath } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
 import storm from "../src/extension.ts";
 import { approveAndSave } from "../src/flows.ts";
@@ -20,6 +20,8 @@ import { WHY_SHELL_READER, WHY_SHELL_REVIEWER } from "../src/policy/capability.t
 import { DIRECTOR_EDIT_LEAD } from "../src/policy/director.ts";
 import { docPromptFor } from "../src/policy/docs.ts";
 import { SUPERVISOR_REASONS } from "../src/policy/supervisor.ts";
+import { pooledThreadNotice } from "../src/policy/thread.ts";
+import { sha256Hex } from "../src/config/canonical.ts";
 import { DIRECTOR_EDIT_ENDS, DIRECTOR_EDITING, DIRECTOR_REWRITTEN, DIRECTOR_WRITE_LATE, DIRECTOR_WRITE_LEAD, holderPhrase } from "../src/runtime/arbiter.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { modelMismatchNotice } from "../src/policy/model-check.ts";
@@ -43,7 +45,7 @@ import { sessionStoreDir } from "../src/session-scope.ts";
 import { loadProjectState } from "../src/state.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
 import * as admissionModule from "../src/worker-admission.ts";
-import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions } from "../src/worker-admission.ts";
+import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions, workerAdmissionKey } from "../src/worker-admission.ts";
 import type { CloseoutAction, RunPlan, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { refusedCodeOf } from "../src/runtime/task-refusal.ts";
 import { until } from "./fake-session.ts";
@@ -5547,119 +5549,172 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		await omp.emit("session_shutdown", {}, main);
 	});
 
-	// 0.27.0 hole (found on the real host, a worker past the eighth runs on a pooled thread with its own module state): the thread has
-	// no run in memory, so the child's lookup of its run found nothing and the check of its own model returned early, unchecked. The run
-	// is now read from the child's persisted admission, and what the child decides is published for the director's thread.
-	describe("a worker on a pooled thread: no run in this thread's memory", () => {
-		/** The child's lookups of its run find nothing, as on a pooled thread; the persisted admission is what remains. */
+	// Decision D5: omp keeps the first eight concurrent subagents on the main thread and puts later ones on pooled threads,
+	// each with its own module state. A Storm worker placed there stops before its first request; nothing it could not
+	// establish (its model, its spend, a verdict) is invented, and the one sentence the director needs travels by file.
+	describe("a worker on a pooled thread: stopped before its first request (D5)", () => {
+		/** The child's lookups of its run find nothing, as on a pooled thread; its persisted admission is what remains. */
 		const pooled = () => [
 			spyOn(ledgerModule, "ledgerRunForLineage").mockImplementation(() => undefined),
 			spyOn(ledgerModule, "ledgerRunForChild").mockImplementation(() => undefined),
 			spyOn(ledgerModule, "ledgerRunForTree").mockImplementation(() => undefined),
 		];
+		const noticesIn = (answers: unknown[]): number =>
+			answers.filter(answer => JSON.stringify(answer ?? "").includes("풀 스레드")).length;
 
-		test("a worker on a model the team did not approve is stopped before its request, its verdict reaches the director's record, and the director is told", async () => {
+		test("a worker on a pooled thread stops before its first request, its stop is validated and told once, and no spend or verdict is invented", async () => {
 			await approve(TEAM);
 			const omp = fakeOmp(project);
 			const child = fakeOmp(project);
 			const main = omp.ctx(MAIN);
-			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
-			const worker = await startWorker(omp, child, main, "A");
-			const spies = pooled();
-			try {
-				child.thinking.level = "high";
-				const outsider = asking(worker, "fake9", "outsider-z");
-				await child.emit("before_provider_request", { payload: {} }, outsider.ctx);
-				expect(outsider.aborted()).toBe(1);
-				// It only reports from now on, and its authority is revoked on disk.
-				expect(verdict(await child.emit("tool_call", { toolName: "bash", input: { command: "touch a.txt" } }, worker))).toBe("model-mismatch");
-				// The director's thread reads what the child published at its next request.
-				const told = (await omp.emit("context", { messages: [] }, main)) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
-				expect(told?.messages.at(-1)?.content[0]?.text).toContain("워커를 멈췄습니다");
-				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toMatchObject({ model: "fake9/outsider-z", verdict: "mismatch" });
-			} finally {
-				for (const spy of spies) spy.mockRestore();
-			}
-			await omp.emit("session_shutdown", {}, main);
-		});
-
-		test("an approved model passes and is recorded as verified; what the worker's requests cost is added to the run once", async () => {
-			await approve(TEAM);
-			const omp = fakeOmp(project);
-			const child = fakeOmp(project);
-			const main = omp.ctx(MAIN);
-			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
-			const worker = await startWorker(omp, child, main, "A");
+			const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+			const worker = await startWorker(omp, child, main, "look", "storm-explorer");
 			const spies = pooled();
 			try {
 				child.thinking.level = "low";
-				const fine = asking(worker, "a", "i");
-				await child.emit("before_provider_request", { payload: {} }, fine.ctx);
-				expect(fine.aborted()).toBe(0);
-				await child.emit("message_end", assistant("a", "i", 1_000, 0.5), worker);
-				await child.emit("message_end", assistant("a", "i", 1_000, 0.25), worker);
-				await omp.emit("context", { messages: [] }, main);
-				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toMatchObject({ model: "a/i", verdict: "verified" });
-				expect(getLedgerRun(runId)?.costUsd).toBeCloseTo(0.75, 6);
-				// Read again, nothing new: the same spend is not counted twice.
-				await omp.emit("context", { messages: [] }, main);
-				expect(getLedgerRun(runId)?.costUsd).toBeCloseTo(0.75, 6);
+				const request = asking(worker, "a", "x");
+				await child.emit("before_provider_request", { payload: {} }, request.ctx);
+				expect(request.aborted()).toBe(1);
+				await until(async () => (await admissionModule.readChildStops(project.env.agentDir, runId)).length === 1);
+				const stops = await admissionModule.readChildStops(project.env.agentDir, runId);
+				expect(stops).toHaveLength(1);
+				expect(stops[0]).toMatchObject({ childId: "look", notice: pooledThreadNotice("storm-explorer") });
+				// The stop file carries no cost and no verdict, and the spawn record does not invent one.
+				expect(Object.keys(stops[0] ?? {}).sort()).toEqual(["at", "attempt", "childId", "notice", "runId", "schema"]);
+				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "look")?.ran).toBeUndefined();
+				// A request that somehow follows (no such request is sent) adds no spend: the pooled channel carries none.
+				await child.emit("message_end", assistant("a", "x", 1_000, 0.25), worker);
+				// Two result hooks and a later request all read the same stop: the director is told exactly once.
+				const answers = await Promise.all([
+					omp.emit("context", { messages: [] }, main),
+					omp.emit("context", { messages: [] }, main),
+				]);
+				answers.push(await omp.emit("context", { messages: [] }, main));
+				const told = answers.find(answer => answer !== undefined) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
+				expect(told?.messages.at(-1)?.content[0]?.text).toContain(pooledThreadNotice("storm-explorer"));
+				expect(noticesIn(answers)).toBe(1);
+				expect(getLedgerRun(runId)?.costUsd).toBe(0);
+				expect(await admissionModule.readChildStops(project.env.agentDir, runId)).toEqual([]);
 			} finally {
 				for (const spy of spies) spy.mockRestore();
 			}
 			await omp.emit("session_shutdown", {}, main);
 		});
 
-		test("a pooled worker whose admission names no approved models (an old record) cannot be checked, and is stopped with that cause", async () => {
+		test("a stop file is trusted only with its own name, run, attempt, time and bounded notice; a stop of another attempt is ignored", async () => {
 			await approve(TEAM);
 			const omp = fakeOmp(project);
 			const child = fakeOmp(project);
 			const main = omp.ctx(MAIN);
-			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
-			const worker = await startWorker(omp, child, main, "A");
-			const real = admissionModule.readChildBinding;
-			const spies = [
-				...pooled(),
-				spyOn(admissionModule, "readChildBinding").mockImplementation(async input => {
-					const bound = await real(input);
-					if (bound.kind !== "bound") return bound;
-					const { approved: _dropped, ...rest } = bound;
-					return rest;
-				}),
-			];
-			try {
-				child.thinking.level = "low";
-				const fine = asking(worker, "a", "i");
-				await child.emit("before_provider_request", { payload: {} }, fine.ctx);
-				expect(fine.aborted()).toBe(1);
-				const told = (await omp.emit("context", { messages: [] }, main)) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
-				expect(told?.messages.at(-1)?.content[0]?.text).toContain("팀 설정을 시간 안에 읽지 못했거나");
-				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toBeUndefined();
-			} finally {
-				for (const spy of spies) spy.mockRestore();
-			}
+			const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+			await startWorker(omp, child, main, "look", "storm-explorer");
+			const record = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+			if (record.kind !== "record") throw new Error(JSON.stringify(record));
+			const dir = path.join(project.env.agentDir, "storm", "admissions", "stops", sha256Hex(`stops\u0000${runId}`));
+			await mkdir(dir, { recursive: true });
+			const name = (childId: string): string => `${sha256Hex(`child\u0000${childId}`)}.json`;
+			const raw = (body: Record<string, unknown>, file = name("look")): Promise<void> => writeFile(path.join(dir, file), JSON.stringify({ schema: "storm.child-stop/v1", runId, childId: "look", attempt: record.record.attempt, notice: "valid", at: Date.now(), ...body }));
+			await raw({ runId: "another-run" });
+			await raw({}, name("other"));
+			await raw({ attempt: "not-an-attempt" });
+			await raw({ at: -1 });
+			await raw({ notice: "bad\u0001notice" });
+			expect(await admissionModule.readChildStops(project.env.agentDir, runId)).toEqual([]);
+			// A well-formed stop of a different admission attempt is readable but not this worker's: adoption ignores it.
+			await admissionModule.writeChildStop(project.env.agentDir, { runId, childId: "look", attempt: "00000000-0000-4000-8000-000000000000", notice: "foreign attempt" });
+			expect(await admissionModule.readChildStops(project.env.agentDir, runId)).toHaveLength(1);
+			expect(await omp.emit("context", { messages: [] }, main)).toBeUndefined();
+			// The same child's real attempt is adopted, and only once.
+			await admissionModule.writeChildStop(project.env.agentDir, { runId, childId: "look", attempt: record.record.attempt, notice: pooledThreadNotice("storm-explorer") });
+			const first = await omp.emit("context", { messages: [] }, main);
+			expect(JSON.stringify(first)).toContain("풀 스레드");
+			expect(await omp.emit("context", { messages: [] }, main)).toBeUndefined();
 			await omp.emit("session_shutdown", {}, main);
 		});
 
-		test("a managed child whose run cannot be named is stopped with the cause, not let through unchecked; an unrelated native child is untouched", async () => {
+		test("an ordinary native child on another thread has no Storm run and is left alone", async () => {
 			await approve(TEAM);
-			const omp = fakeOmp(project);
-			const child = fakeOmp(project);
-			const main = omp.ctx(MAIN);
-			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
-			// A worker is admitted (it writes the run's marker for its parent); the stray child below has no record.
-			await startWorker(omp, child, main, "A");
+			const omp = fakeOmp(project), child = fakeOmp(project), main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
 			const spies = pooled();
 			try {
-				// No admission record for this child, while the run's marker for its parent is live.
-				const stray = asking(child.ctx(sub("Stray", "storm-implementer")), "a", "i");
-				await child.emit("before_provider_request", { payload: {} }, stray.ctx);
-				expect(stray.aborted()).toBe(1);
+				const native = asking(child.ctx(sub("native", "unrelated")), "a", "i");
+				await child.emit("before_provider_request", { payload: {} }, native.ctx);
+				expect(native.aborted()).toBe(0);
 			} finally {
 				for (const spy of spies) spy.mockRestore();
 			}
 			await omp.emit("session_shutdown", {}, main);
 		});
+
+		test("RF7: the request check reads the admission snapshot, so a team file edited after admission cannot authorize a main-thread worker", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+			const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+			child.thinking.level = "low";
+			const before = asking(worker, "a", "x");
+			await child.emit("before_provider_request", { payload: {} }, before.ctx);
+			expect(before.aborted()).toBe(0);
+			await writeConfig(project.sessionDir, { ...TEAM, roles: { ...TEAM.roles, explorer: { ...TEAM.roles.explorer, models: ["a/not-approved"] } } });
+			setSystemTime(new Date(Date.now() + 3_000));
+			const after = asking(worker, "a", "not-approved");
+			await child.emit("before_provider_request", { payload: {} }, after.ctx);
+			expect(after.aborted()).toBe(1);
+			expect(runSpawns(runId).find(spawn => spawn.spawnKey === "look")?.ran).toMatchObject({ model: "a/not-approved", verdict: "mismatch" });
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("RF4: a trial-routed spawn writes its candidate into the admission snapshot, so the main-thread check accepts it", async () => {
+			const trial = { id: "probe", role: "explorer", model: "trial/candidate", effort: "low" as const, share: 1, maxSpawns: 10, budgetUsd: 0.1, startsAt: new Date(Date.now() - 60_000).toISOString(), endsAt: new Date(Date.now() + 60_000).toISOString() };
+			await approve({ ...TEAM, trials: [trial] });
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+			const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+			expect(runSpawns(activeLedgerRun(project.sessionDir)?.runId as string).find(spawn => spawn.spawnKey === "look")?.outcome).toBe("trial");
+			const record = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+			expect(record.kind === "record" && record.record.approved?.some(entry => entry.selector === "trial/candidate")).toBe(true);
+			child.thinking.level = "low";
+			const candidate = asking(worker, "trial", "candidate");
+			await child.emit("before_provider_request", { payload: {} }, candidate.ctx);
+			expect(candidate.aborted()).toBe(0);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a ninth spawn is refused with the pooled sentence only when its eight live workers were checked on this thread and task.workerThreads is above zero", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const names = Array.from({ length: 9 }, (_, index) => `E${index}`);
+			const lanes = names.map(name => ({ name, kind: "explore" as const, role: "explorer", goal: "Read the tree", results: answerFor(`${name}-answer`) }));
+			await openRun(omp, main, { lanes, workers: { explorer: 4 } });
+			for (const name of names.slice(0, 8)) {
+				const worker = await startWorker(omp, child, main, name, "storm-explorer");
+				child.thinking.level = "low";
+				const checked = asking(worker, "a", "x");
+				await child.emit("before_provider_request", { payload: {} }, checked.ctx);
+				expect(checked.aborted()).toBe(0);
+			}
+			// The ninth worker's own director call places its lane: R4 matches a spawn to its placement exactly, so a spawn
+			// emitted with no placement is refused for that reason and this test would prove the wrong rule.
+			const ninthCall = { toolName: "task", input: { agent: "storm-explorer", name: names[8], task: `work ${names[8]}` } };
+			expect(verdict(await omp.emit("tool_call", ninthCall, main))).toBe("pass");
+			const ninth = spawnOf("storm-explorer", names[8]);
+			const refused = await withActiveSettings(Settings.isolated({ "task.workerThreads": 4 }), () => omp.emit("before_subagent_spawn", ninth, main));
+			expect(verdict(refused)).toBe("pooled-thread");
+			expect(JSON.stringify(refused)).toContain(pooledThreadNotice("storm-explorer"));
+			// A refused spawn releases its placement, so the retry is a new director call and a new placement, exactly as the
+			// director's next task call after the refusal would be.
+			expect(verdict(await omp.emit("tool_call", ninthCall, main))).toBe("pass");
+			const allowed = await withActiveSettings(Settings.isolated({ "task.workerThreads": 0 }), () => omp.emit("before_subagent_spawn", ninth, main));
+			expect(verdict(allowed)).toMatch(/^route:/);
+			await omp.emit("session_shutdown", {}, main);
+		}, 30_000);
 	});
 
 	// R-G234 H1 (decision): the promise about approved models is about the model and effort a worker's own loop runs on. A tool
@@ -5701,22 +5756,31 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		await omp.emit("session_shutdown", {}, main);
 	});
 
-	// R-final N6: the stop is right; the cause told must be the real one.
-	test("a worker whose request meets a team that cannot be read is stopped with that cause, not with 'the team has no role for it'", async () => {
+	// R-final N6 + RF7: the request check reads the admission snapshot, so a live team file that cannot be read does not
+	// decide the request; an admission that cannot be read is the check that cannot be made, and stops the worker with that cause.
+	test("a worker's request is checked against its admission, not the live team file: a broken team file passes, a broken admission stops with that cause", async () => {
 		await approve(TEAM);
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
 		const worker = await startWorker(omp, child, main, "look", "storm-explorer");
-		const { configPath } = await import("../src/config/store.ts");
 		await writeFile(configPath(project.sessionDir), "{ not json");
-		// The state cache keeps what it read for two seconds: the request comes after that.
-		await new Promise(resolve => setTimeout(resolve, 2_200));
+		// The state cache holds what it read for two seconds; advancing the clock makes any old read stale. (The check itself no
+		// longer reads state: the admission is its input.)
+		setSystemTime(new Date(Date.now() + 2_500));
+		child.thinking.level = "low";
+		const admitted = asking(worker, "a", "x");
+		await child.emit("before_provider_request", { payload: {} }, admitted.ctx);
+		expect(admitted.aborted()).toBe(0);
+		expect(runSpawns(runId).find(spawn => spawn.spawnKey === "look")?.ran).toMatchObject({ model: "a/x", verdict: "verified" });
+		// The same worker with its admission unreadable: nothing trustworthy says what it may run, so it is stopped with the real cause.
+		const read = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+		if (read.kind !== "record") throw new Error(JSON.stringify(read));
+		await writeFile(path.join(project.env.agentDir, "storm", "admissions", `${workerAdmissionKey(project.root, "Main", "look")}.json`), "{ not json");
 		const asked = asking(worker, "a", "x");
 		await child.emit("before_provider_request", { payload: {} }, asked.ctx);
 		expect(asked.aborted()).toBe(1);
-		expect(runSpawns(runId).find(spawn => spawn.spawnKey === "look")?.ran).toBeUndefined();
 		const told = (await omp.emit("context", { messages: [] }, main)) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
 		const text = told?.messages.at(-1)?.content[0]?.text ?? "";
 		expect(text).toContain("storm-explorer 워커를 멈췄습니다");
@@ -6147,6 +6211,41 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			// e-1 is older than that message: gone. e-3 is that message's own: held.
 			expect(await holds(omp, main)).toBe(true);
 			await omp.emit("turn_end", turnEndOf([{ id: "e-3" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("RF1: a recovered message_end arrives before this call's hook, an unclean turn keeps the hold seen, and the next completed answer ends it", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			// The host's Harmony recovery: the message that carries the call ends before the call's own pre-dispatch hook.
+			await omp.emit("message_end", assistantEnd("toolUse", ["recovered"]), main);
+			expect(verdict(await omp.emit("tool_call", edit("recovered", "e.txt"), main))).toBe("pass");
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "recovered", args: { path: "e.txt" } }, main);
+			await omp.emit("tool_result", { ...edit("recovered"), isError: true, content: [] }, main);
+			await omp.emit("turn_end", turnEndOf([{ id: "recovered", error: true }]), main);
+			// The unclean turn keeps it; the next completed assistant answer ends it although its own hook came first.
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("message_end", assistantEnd("toolUse", ["next"]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("RF3: a director write that is no file change is rewritten into a project path before it starts; it gets a hold and a notice at execution start", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "scratch", input: { path: "local://note", content: "text" } }, main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["scratch"]), main);
+			// A later extension rewrote the same call into a write of a project file; the host's final arguments say so.
+			await omp.emit("tool_execution_start", { toolName: "write", toolCallId: "scratch", args: { path: "a.txt", content: "text" } }, main);
+			expect(verdict(await omp.emit("tool_call", taskCall("A", "unheld"), main))).toBe("lane-write");
+			const notice = await omp.emit("context", { messages: [] }, main);
+			expect(JSON.stringify(notice)).toContain(DIRECTOR_REWRITTEN.slice(0, 20));
+			await omp.emit("turn_end", turnEndOf([{ id: "scratch" }]), main);
 			expect(await holds(omp, main)).toBe(false);
 			await omp.emit("session_shutdown", {}, main);
 		});

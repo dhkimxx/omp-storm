@@ -610,6 +610,7 @@ export type SpawnBlockCode =
 	| "unassigned-lane"
 	| "role-cap"
 	| "parallelism"
+	| "pooled-thread"
 	| "budget"
 	| "internal";
 

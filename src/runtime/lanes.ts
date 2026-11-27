@@ -36,6 +36,7 @@ import {
 	type HolderView,
 } from "./arbiter.ts";
 import { requirementConflictFromPlan } from "./requirements.ts";
+import { sharedMap } from "./thread-state.ts";
 
 interface Assignment {
 	/** The planned lane, or absent for an unplanned placement (R5). */
@@ -1197,7 +1198,7 @@ export function spawnKeyMismatchReason(spawnKey: string): string {
 export const PLACEMENT_CHANGED_REASON =
 	"설정이 배치 뒤에 바뀌었습니다. 이 자식의 승인된 권한이 배치 때 예약한 쓰기 범위보다 넓어 스폰을 허용하지 않았습니다. 같은 task 호출을 다시 보내 새 배치를 만드세요.";
 
-const liveLanes = new Map<string, WeakRef<RunLanes>>();
+const liveLanes = sharedMap<string, WeakRef<RunLanes>>("storm.lanes.liveLanes");
 
 /**
  * A child session loads the extension on its own and holds no run, yet its turn start is the fact that ends a follow-up's
@@ -2165,6 +2166,26 @@ export class RunLanes {
 		const existing = this.#writes.get(key);
 		if (existing === undefined || existing.kind !== "director-path" || existing.scope.kind !== "paths") return false;
 		existing.scope = { kind: "paths", paths: [...new Set([...existing.scope.paths, ...paths.filter(path => path !== "")])].sort() };
+		return true;
+	}
+
+	/**
+	 * Holds the files a director call really writes when Storm first saw it as no file change at all and another extension rewrote
+	 * its arguments before it started: the call already runs, so no refusal is possible and the entry is made without the conflict
+	 * loop (a writer that already held one of those files is not stopped). An entry this call already has is widened instead.
+	 * Nothing happens for an empty path list. Returns whether an entry now holds the call.
+	 */
+	holdDirectorCall(callId: string, paths: readonly string[]): boolean {
+		const clean = [...new Set(paths.filter(path => path !== ""))].sort();
+		if (clean.length === 0) return false;
+		const key = directorKey(callId);
+		const existing = this.#writes.get(key);
+		if (existing !== undefined) {
+			if (existing.kind !== "director-path" || existing.scope.kind !== "paths") return false;
+			existing.scope = { kind: "paths", paths: [...new Set([...existing.scope.paths, ...clean])].sort() };
+			return true;
+		}
+		this.#writes.set(key, { scope: { kind: "paths", paths: clean }, kind: "director-path", callId, at: Date.now() });
 		return true;
 	}
 

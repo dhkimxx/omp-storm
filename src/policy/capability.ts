@@ -320,13 +320,15 @@ export function pathsOverlap(a: string, b: string): boolean {
 
 /**
  * The write table's comparison of two scopes: two writers must be ordered when their files could be one file. On the default macOS
- * volume and on Windows `src/NEW.ts` and `src/new.ts` are one file, and so are the NFD and NFC spellings of one name, so both
- * sides are compared in NFC with the case folded. It costs a rare over-refusal on a case-sensitive volume (two files whose names
- * differ only by case are ordered) and needs no probe of the volume. Only the table uses this: whether one file lies inside a
- * worker's declared scope (`pathsOverlap`) stays exact, because folding there would let a worker write another file.
+ * volume and on Windows `src/NEW.ts` and `src/new.ts` are one file, and so are the NFD and NFC spellings of one name; the same
+ * volume also folded Greek final sigma (`ς`) onto `σ` while `toLowerCase()` left it apart. Both sides are normalised, lowercased,
+ * uppercased and lowercased again (the host-independent fold that maps final sigma and sharp s onto their caseless forms) and
+ * normalised once more. It may order two names that a case-sensitive volume keeps apart; that is a stated trade, not a host
+ * limit. Only the table uses this: whether one file lies inside a worker's declared scope (`pathsOverlap`) stays exact, because
+ * folding there would let a worker write another file.
  */
 export function scopesOverlap(a: readonly string[], b: readonly string[]): boolean {
-	const fold = (scope: string): string => scope.normalize("NFC").toLowerCase();
+	const fold = (scope: string): string => scope.normalize("NFC").toLowerCase().toUpperCase().toLowerCase().normalize("NFC");
 	return a.some(left => b.some(right => pathsOverlap(fold(left), fold(right))));
 }
 

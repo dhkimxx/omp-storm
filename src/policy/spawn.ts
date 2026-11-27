@@ -3,6 +3,7 @@ import { shortHash } from "../config/canonical.ts";
 import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES, roleTitle } from "../roles.ts";
 import { activeTrialFor, shouldRouteToTrial } from "../runtime/trials.ts";
 import { formatModelEntry, parseModelEntry } from "../selector.ts";
+import { sharedMap } from "../runtime/thread-state.ts";
 import { type ApprovedEntry, entryPattern, exactEntries, hasCredentials, roleEntries } from "./model-check.ts";
 import type {
 	AgentEntry,
@@ -174,7 +175,7 @@ export interface WorkerSlot {
  * note to an already running worker reuses its slot and a `?progress` note never reaches admission. Release happens
  * only on an observed failure, a settled turn (or park), or a closed run — never because a pending timer expired.
  */
-const workerSlots = new Map<string, Map<string, WorkerSlot>>();
+const workerSlots = sharedMap<string, Map<string, WorkerSlot>>("storm.spawn.workerSlots");
 
 function slotsOf(runId: string): Map<string, WorkerSlot> {
 	let slots = workerSlots.get(runId);
