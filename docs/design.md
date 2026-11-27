@@ -323,9 +323,10 @@ Storm의 화면은 OMP 19.2의 UI 라이브러리(`@oh-my-pi/pi-tui`) 위에 있
 
 ```sh
 npm ci --ignore-scripts && npm rebuild bun --ignore-scripts=false
-npm run verify   # 타입 검사와 단위 테스트
+npm run verify   # 타입 검사와 단위 테스트(여러 프로세스로 나눠 돌린다)
 npm run e2e      # 가짜 LLM 서버를 사용하는 OMP 통합 검사
 npm run e2e:tui  # 터미널 UI 통합 검사
+npm run e2e:all  # 모든 통합 검사(기본 네 개씩 함께, 인자로 개수를 준다); 목록·환경·묶음은 scripts/e2e/suites.ts 한 곳에 있다
 bun scripts/e2e/unplanned.ts       # Storm이 시킨 도착은 계획 밖으로 세지 않고, 다른 워커가 깨운 워커의 답이 감독에 닿지 않는다는 것을 고정한다
 bun scripts/e2e/early-start.ts     # 선행이 수용되기 전에 시작한 레인의 결과는 다시 돌아야 수용된다
 bun scripts/e2e/director-reads.ts  # 자동 위임의 감독이 읽고 검색하며, 계획 전의 편집과 명령은 이유와 함께 거절되고 실행 중의 편집은 열린다
@@ -337,4 +338,4 @@ bun scripts/e2e/read-shell.ts         # 셸이 있는 읽기 레인은 쓰기 �
 bun scripts/e2e/plugin-layout.ts      # node_modules 없는 폴더의 Storm에서 감독의 편집이 대상 해석기를 거친다(OMP_BIN으로 다른 omp 바이너리를 시험)
 bun scripts/e2e/hardening-writers.ts  # 늦게 시작한 쓰기 워커도 자리를 지키고, 이름 있는 서비스는 거절되며, 하위 프로세스를 남긴 잡은 통과가 아니다
 ```
-각 검사는 가짜 LLM 서버로 고정 OMP를 돌린다. 검사마다 포트(`E2E_PORT`)와 작업 폴더(`E2E_WORK`)가 따로라 네 개까지 함께 돌릴 수 있고, 다른 검사와 함께 돌다 실패한 검사는 혼자 다시 돌려 본다.
+각 검사는 가짜 LLM 서버로 고정 OMP를 돌린다. 검사마다 포트(`E2E_PORT`)와 작업 폴더(`E2E_WORK`)가 따로라 네 개까지 함께 돌릴 수 있고, 다른 검사와 함께 돌다 실패한 검사는 혼자 다시 돌려 본다. `npm run e2e:all`이 그 일을 한다: `scripts/e2e/suites.ts`의 목록을 읽어 기본 네 개씩 돌리고, 끝에 검사별 결과와 시간 표를 찍으며, 혼자 다시 돌려도 실패한 검사가 있으면 0이 아닌 코드로 끝난다. `scripts/e2e/qa-linux.sh`와 CI의 각 작업도 같은 목록의 한 묶음(`--group`)을 그 명령으로 돌린다.

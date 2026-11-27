@@ -9,6 +9,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { MAX_JOB_TIMEOUT_MS } from "../config/schema.ts";
 import type { ApprovalRecord, ConfigLoad, RequiredCheck } from "../types.ts";
+import { DEFAULT_TIMINGS, type StormTimings } from "./timings.ts";
 
 /**
  * Per-check wall clock when the check sets none: the job default. Spelled out rather than imported because the job
@@ -20,19 +21,6 @@ export const MAX_CHECK_TIMEOUT_MS = MAX_JOB_TIMEOUT_MS;
 /** Bytes kept from each stream; the rest is counted and dropped rather than carried into a conversation. */
 export const DEFAULT_CHECK_OUTPUT_BYTES = 4_096;
 export const MAX_CHECK_OUTPUT_BYTES = 65_536;
-/** SIGTERM is followed by SIGKILL on this schedule; the result settles even if the child cannot be reaped. */
-const KILL_GRACE_MS = 1_000;
-const HARD_TEARDOWN_MS = 3_000;
-/**
- * After the leader closed, members that are still in its group get this long to finish on their own (a helper that is
- * exiting in the same instant is not "left behind") before the group is stopped. The wait only delays the end; the
- * fence is never released during it.
- */
-const GROUP_SETTLE_MS = 50;
-const GROUP_PROBE_MS = 25;
-/** After the result settled without proof, the group is probed this often, unreferenced, to resolve `ended` later. */
-const GROUP_LATE_PROBE_MS = 250;
-
 /**
  * Whether a command's process group can be observed. POSIX only: the leader is started with its own group and
  * `kill(-pgid, 0)` answers ESRCH exactly when no member is left. Where this is false (Windows) the end of the command
@@ -128,6 +116,8 @@ export interface RequiredChecksInput {
 	 * of their own.
 	 */
 	onEndUnproven?: (info: { check: string; ended: Promise<void> }) => void;
+	/** Teardown and group-probe waits; the product's when absent (see `timings.ts`). */
+	timings?: StormTimings;
 }
 
 export type CheckGate =
@@ -311,6 +301,8 @@ export interface BoundedProcessInput {
 	timeoutMs: number;
 	outputLimitBytes: number;
 	signal?: AbortSignal;
+	/** Teardown and group-probe waits; the product's when absent (see `timings.ts`). */
+	timings?: StormTimings;
 }
 
 export interface BoundedProcessResult {
@@ -347,6 +339,7 @@ export interface BoundedProcessResult {
  */
 export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedProcessResult> {
 	const { argv, cwd, timeoutMs, outputLimitBytes, signal } = input;
+	const timings = input.timings ?? DEFAULT_TIMINGS;
 	const stdout = new BoundedTail(outputLimitBytes);
 	const stderr = new BoundedTail(outputLimitBytes);
 	const startedAt = new Date().toISOString();
@@ -452,7 +445,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 		signalChild(child, "SIGTERM");
 		killGrace = setTimeout(() => {
 			if (!settled) signalChild(child, "SIGKILL");
-		}, KILL_GRACE_MS);
+		}, timings.killGraceMs);
 		hardTeardown = setTimeout(() => {
 			if (settled) return;
 			// A process that cannot be reaped must not keep this promise or this process alive. Its end is unproven, but
@@ -460,7 +453,7 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			releasePipes(child);
 			child.unref();
 			finish(leader?.code ?? null, leader?.endedBy ?? null, false);
-		}, KILL_GRACE_MS + HARD_TEARDOWN_MS);
+		}, timings.killGraceMs + timings.hardTeardownMs);
 	};
 	const terminate = (timeout: boolean): void => {
 		if (settled) return;
@@ -499,11 +492,11 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			}
 			// Members were left behind. If nobody asked to stop the command, stop them now; a timeout or an abort already
 			// runs its own teardown, which this probe only observes.
-			if (!settled && killGrace === undefined && performance.now() - closedAt >= GROUP_SETTLE_MS) {
+			if (!settled && killGrace === undefined && performance.now() - closedAt >= timings.groupSettleMs) {
 				leftBehind = true;
 				beginTeardown();
 			}
-			const next = setTimeout(probe, settled ? GROUP_LATE_PROBE_MS : GROUP_PROBE_MS);
+			const next = setTimeout(probe, settled ? timings.groupLateProbeMs : timings.groupProbeMs);
 			// A result that already gave up must not keep this process alive while it waits for a proof that may never come.
 			if (settled) next.unref();
 		};
@@ -550,6 +543,7 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 			timeoutMs: checkTimeoutMs(check),
 			outputLimitBytes,
 			...(input.signal === undefined ? {} : { signal: input.signal }),
+			...(input.timings === undefined ? {} : { timings: input.timings }),
 		});
 		evidence.push({
 			name: check.name,

@@ -113,12 +113,10 @@ import {
 	END_STATUS,
 	endLabel,
 	stopWords,
-	HOLD_MS,
 	lastWriterChangeAt,
 	maxRounds,
 	reviewGate,
 	reviewProof,
-	ROUND_DELAY_MS,
 	STATUS_LABEL,
 	treeFingerprint,
 	type CoverageCheck,
@@ -137,6 +135,7 @@ import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
+import { DEFAULT_TIMINGS, type StormTimings } from "./timings.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
@@ -153,21 +152,8 @@ const phaseWatchers = new Map<string, () => void>();
  * phase watcher, so an event that outlives its run cannot mark the next one as waiting.
  */
 const userWaits = new Map<string, Set<string>>();
-/**
- * How often an active run's record is rewritten at most. The live record is what remains of a run whose process
- * dies: the next run's janitor marks it stopped and it shows up as the last run with what it had spent and spawned.
- */
-const LIVE_FLUSH_MS = 2_000;
-/** How often a stopping run asks whether work it still owns has settled. */
-const DRAIN_POLL_MS = 1_000;
 /** How long a stopping run keeps its scope, lease and accounting while owned work settles. */
 const DRAIN_MAX_MS = 30_000;
-/**
- * How long a consumer's admission may wait for an already-started settlement of its prerequisite. A native delivery
- * often lands just before the next tool call: without this barrier the consumer would read the previous pending row
- * and be refused for a result that is being written in the same tick.
- */
-const ADMISSION_SETTLE_WAIT_MS = 1_000;
 /** What the director reads about the ledger in one request: a few lines, never a dump. */
 const NOTICE_MAX_CHARS = 900;
 
@@ -742,8 +728,8 @@ export interface RunControllerDeps {
 	ledger?(sessionDir: string): AgentEntry[];
 	/** omp's agent dir: the janitor deletes omp records only below its `sessions/`. Absent → no omp record cleanup. */
 	agentDir?: string;
-	/** How long a live rewrite of the run record waits to batch changes; defaults to LIVE_FLUSH_MS. */
-	flushMs?: number;
+	/** The runtime's fixed waits (live flush, drain poll, round delay, admission settlement); the product's when absent. */
+	timings?: StormTimings;
 	/** The look timer's clock; real timers when absent. */
 	timers?: RunTimers;
 	/** Acquires the session's execution lease; the real hard-link lease when absent. */
@@ -778,8 +764,11 @@ export class RunController {
 	#liveWrite: Promise<unknown> = Promise.resolve();
 	/** One finalization per run: a second stop during drain joins it instead of writing a second record. */
 	#finishing: Promise<RunRecord | undefined> | undefined;
+	readonly #timings: StormTimings;
 
-	constructor(private readonly deps: RunControllerDeps) {}
+	constructor(private readonly deps: RunControllerDeps) {
+		this.#timings = deps.timings ?? DEFAULT_TIMINGS;
+	}
 
 	/** Wake one consumer admission when a prerequisite's settlement finishes or times out. */
 	readonly #settleWaiters = new Set<() => void>();
@@ -1400,7 +1389,7 @@ export class RunController {
 		if (own === undefined) return new Map<string, LaneReadiness>();
 		// A native delivery can land just before the consumer's call. Wait only for the prerequisites this admission
 		// actually reads, and never past a bounded window: a running producer still blocks.
-		await this.#awaitSettlements(own, needed, ADMISSION_SETTLE_WAIT_MS);
+		await this.#awaitSettlements(own, needed, this.#timings.settleWaitMs);
 		return this.#readLaneReadiness(own, plan, needed);
 	}
 
@@ -3302,6 +3291,7 @@ export class RunController {
 							: [`target:${createHash("sha256").update(own.root).digest("hex")}`],
 						signal: jobSignal,
 						targetFence: true,
+						timings: this.#timings,
 						canStart: async () => {
 							if (!(await approved())) return false;
 							setJobReceipt(own.record, { lane: lane.name, name: job.name, status: "started", exitCode: null,
@@ -3831,12 +3821,12 @@ export class RunController {
 			if ((decision.reason === "round-limit" || decision.reason === "no-progress") && this.#hasPendingCheck(own, tree)) {
 				if (!this.#live(own, turns)) return;
 				own.checksOnlyEnd = decision.reason;
-				this.#arm(own, ctx, ROUND_DELAY_MS);
+				this.#arm(own, ctx, this.#timings.roundDelayMs);
 				return;
 			}
 			return this.#stop(own, decision.reason, ctx);
 		}
-		this.#arm(own, ctx, ROUND_DELAY_MS);
+		this.#arm(own, ctx, this.#timings.roundDelayMs);
 	}
 
 	/**
@@ -4228,6 +4218,7 @@ export class RunController {
 					cwd: own.root,
 					fingerprint,
 					signal: own.abort.signal,
+					timings: this.#timings,
 					onEndUnproven: ({ ended }) => {
 						fenced = true;
 						own.lanes.fenceHolder("check", holderKey);
@@ -4290,7 +4281,7 @@ export class RunController {
 	 */
 	async #look(own: OwnRun, ctx: ExtensionContext): Promise<void> {
 		// A held session is no round, and a tree read is two git processes: wait out the hold before deciding.
-		if (this.#held(ctx)) return this.#arm(own, ctx, HOLD_MS);
+		if (this.#held(ctx)) return this.#arm(own, ctx, this.#timings.holdMs);
 		const turns = own.record.turns ?? 0;
 		const checkOnly = own.checksOnlyEnd;
 		const { decision } = await this.#roundDecision(own, false, true);
@@ -4484,7 +4475,7 @@ export class RunController {
 		own.drained = true;
 		const polls = (own.drainPolls ?? 0) + 1;
 		own.drainPolls = polls;
-		if (!own.drainWarned && polls * DRAIN_POLL_MS > DRAIN_MAX_MS) {
+		if (!own.drainWarned && polls * this.#timings.drainPollMs > DRAIN_MAX_MS) {
 			own.drainWarned = true;
 			const ctx = own.finishCtx;
 			if (ctx) {
@@ -4509,7 +4500,7 @@ export class RunController {
 				const ctx = own.finishCtx;
 				if (ctx) this.deps.ui(ctx).notify(`Storm 실행을 끝내지 못했습니다: ${errorText(error)}`, "error");
 			});
-		}, DRAIN_POLL_MS);
+		}, this.#timings.drainPollMs);
 	}
 
 	/** Finalizes a drained run once its owned work has settled; shares the one-finalization guard. */
@@ -5008,7 +4999,7 @@ export class RunController {
 			if (!live || this.#own !== own) return;
 			this.#liveStatus(own.ctx, live);
 			void this.#writeLiveSnapshot(own).catch(() => undefined);
-		}, this.deps.flushMs ?? LIVE_FLUSH_MS);
+		}, this.#timings.liveFlushMs);
 		this.#flushTimer.unref?.();
 	}
 

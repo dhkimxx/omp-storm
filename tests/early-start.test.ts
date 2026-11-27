@@ -19,6 +19,7 @@ import { resetLedger } from "../src/runtime/ledger.ts";
 import { staleRequirementIdsForPlan } from "../src/runtime/requirements.ts";
 import type { AgentEntry, PlanLane, RunPlan, RunResult, StormConfig } from "../src/types.ts";
 import { fakeSession, type FakeSession } from "./fake-session.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
 const T0 = Date.parse("2026-11-20T09:00:00Z");
@@ -84,7 +85,7 @@ interface Run {
 
 async function begin(p: RunPlan): Promise<Run> {
 	const agents: AgentEntry[] = [];
-	const h = fakeSession({ root, agents, config: TEAM });
+	const h = fakeSession({ root, agents, config: TEAM, timings: TEST_TIMINGS });
 	const runId = await h.start();
 	expect(await h.controller.setPlan(h.ctx, p)).toEqual({ ok: true });
 	return { h, runId, agents, p };

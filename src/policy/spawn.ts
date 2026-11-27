@@ -539,6 +539,9 @@ export const SPAWN_DECISION_MS = 25_000;
 export function deadline(ms: number): { expired: Promise<never>; cancel(): void } {
 	const { promise, reject } = Promise.withResolvers<never>();
 	const timer = setTimeout(() => reject(new Error(`${Math.round(ms / 1000)}초 안에 판단하지 못함`)), ms);
+	// A decision that returns before its deadline never cancels this promise; an abandoned timer must not keep the
+	// process (or a test run) alive for the rest of the budget, and must still fire while real work continues.
+	timer.unref?.();
 	return { expired: promise, cancel: () => clearTimeout(timer) };
 }
 
