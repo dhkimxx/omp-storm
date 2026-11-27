@@ -170,6 +170,19 @@ export function sessionFileIn(dir: string, sessionId: string): string | undefine
 	return name === undefined ? undefined : join(dir, name);
 }
 
+/** The native spawn keys a run placed for one plan lane, oldest first (a lane may be attempted again). */
+export function laneSpawnKeys(run: RunRecord, lane: string): string[] {
+	return run.spawns
+		.filter(spawn => spawn.lane === lane && spawn.outcome !== "blocked")
+		.sort((left, right) => left.ts.localeCompare(right.ts))
+		.flatMap(spawn => (spawn.spawnKey === undefined ? [] : [spawn.spawnKey]));
+}
+
+/** The latest native spawn key a run placed for one plan lane; the id a follow-up addresses. */
+export function laneSpawnKey(run: RunRecord, lane: string): string | undefined {
+	return laneSpawnKeys(run, lane).at(-1);
+}
+
 /**
  * Lanes a settled run left unfinished, from its final on-disk ledger (`closeoutFacts`, captured before the session's
  * team or target can change). The card no longer lists them; undefined means the record carries no such facts.

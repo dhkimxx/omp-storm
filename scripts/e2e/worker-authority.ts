@@ -86,7 +86,8 @@ function childTranscript(agentId: string): string | undefined {
 
 async function main(): Promise<void> {
 	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
-	writeFileSync(join(env.agentDir, "config.yml"), `setupVersion: 3\ntask:\n  maxConcurrency: ${COUNT}\n`);
+	// `workerThreads: 0`: 0.28.0 stops a worker omp would pool, so nine same-tree workers run only on the main thread.
+	writeFileSync(join(env.agentDir, "config.yml"), `setupVersion: 3\ntask:\n  maxConcurrency: ${COUNT}\n  workerThreads: 0\n`);
 	const shadowDir = join(env.project, ".omp", "agents");
 	Bun.spawnSync(["mkdir", "-p", shadowDir]);
 	writeFileSync(join(shadowDir, "storm-implementer.md"), "---\nname: storm-implementer\ndescription: path-only worker authority\ntools: read, write, edit\n---\nPath-only worker.\n");
@@ -128,22 +129,29 @@ async function main(): Promise<void> {
 		} else {
 			check("no path-only child wrote outside its lane", present.length === 0, `outside=${present.join(",") || "none"}`);
 		}
-		// Worker tags are flushed when the host records the child session exit, slightly after the file lands.
-		const workers = await until(() => {
-			const found = Array.from({ length: COUNT }, (_, i) => ({ id: `L${i}`, worker: workerSession(`L${i}`) })).filter(item => item.worker !== undefined);
-			return found.length > 0 ? found : undefined;
-		}, 20_000, "a host worker-tagged child").catch(() => []);
-		check("the host ran at least one child on a pooled worker thread", workers.length > 0, JSON.stringify(workers));
-		const sameThread = Array.from({ length: COUNT }, (_, i) => `L${i}`).find(id => workerSession(id) === undefined);
-		check("a same-thread child also ran", sameThread !== undefined, sameThread ?? "");
-		for (const id of [sameThread, workers[0]?.id].filter((value): value is string => value !== undefined)) {
-			const text = childTranscript(id) ?? "";
+		// The native id of each lane's worker is its run-unique handle; the session file and any thread tag carry that id.
+		const settled = files.run(running.runId);
+		const keys = Array.from({ length: COUNT }, (_, i) => settled?.spawns.find(spawn => spawn.lane === `L${i}` && spawn.outcome !== "blocked")?.spawnKey);
+		// Wait for every child transcript before reading the host's thread tags: a child with no tag ran on the main thread.
+		await until(() => (keys.every(key => key !== undefined && childTranscript(key) !== undefined) ? true : undefined), 30_000, "nine child transcripts").catch(() => undefined);
+		const workers = keys.flatMap(key => {
+			const worker = key === undefined ? undefined : workerSession(key);
+			return worker === undefined || key === undefined ? [] : [{ id: key, worker }];
+		});
+		// With `task.workerThreads: 0` omp keeps every child on the main thread; 0.28.0 stops a pooled worker, so the
+		// suite runs the authority checks where the workers really run.
+		check("the user's workerThreads: 0 kept every child on the main thread", workers.length === 0, JSON.stringify(workers));
+		const sameThread = keys.filter((key): key is string => key !== undefined && workerSession(key) === undefined);
+		check("all nine ran on the main thread", sameThread.length === COUNT, sameThread.join(","));
+		for (const [index, key] of keys.entries()) {
+			if (index >= 2 || key === undefined) continue;
+			const text = childTranscript(key) ?? "";
 			if (MODE === "authorized") {
-				check(`${id}: its authorized write is in the transcript as a success`, text.includes("storm child change") && !text.includes("lane-scope"), text.slice(-800));
-				check(`${id}: its authorized file exists`, existsSync(join(env.project, `declared-${id.slice(1)}.txt`)), "");
+				check(`L${index}: its authorized write is in the transcript as a success`, text.includes("storm child change") && !text.includes("lane-scope"), text.slice(-800));
+				check(`L${index}: its authorized file exists`, existsSync(join(env.project, `declared-${index}.txt`)), "");
 			} else {
-				check(`${id}: its unauthorized write is blocked with lane-scope`, text.includes("lane-scope"), text.slice(-800));
-				check(`${id}: no unauthorized file exists`, !existsSync(join(env.project, `outside-${id.slice(1)}.txt`)), "");
+				check(`L${index}: its unauthorized write is blocked with lane-scope`, text.includes("lane-scope"), text.slice(-800));
+				check(`L${index}: no unauthorized file exists`, !existsSync(join(env.project, `outside-${index}.txt`)), "");
 			}
 		}
 		await rpc.close();

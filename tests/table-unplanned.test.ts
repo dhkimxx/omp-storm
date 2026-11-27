@@ -42,8 +42,8 @@ test("a reader cannot take a writer's place, even with the same name in one plan
 	const writer = String(tasks[0]!.name);
 	const reader = String(tasks[1]!.name);
 	// Every unplanned item gets its own handle; the director's shared name is not a correlation key (R4).
-	expect(writer).toMatch(/^storm-implementer-\d+-\d+$/);
-	expect(reader).toMatch(/^storm-explorer-\d+-\d+$/);
+	expect(writer).toMatch(/^storm-implementer-run-.+-\d+$/);
+	expect(reader).toMatch(/^storm-explorer-run-.+-\d+$/);
 	expect(writer).not.toBe(reader);
 
 	// The reader's hook runs first. It binds its own read placement and reserves nothing.
@@ -104,24 +104,31 @@ test("a spawn key of an earlier run is refused in the next run (Q7)", () => {
 	expect(first.admitChecked({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, undefined, DIRECT)).toMatchObject({ ok: true, placed: true });
 });
 
-test("an item whose name matches no lane is placed unplanned; a wrong-role or job-lane name gets a note", () => {
+test("a name that matches no lane takes its role's only lane; ambiguity is unplanned; a wrong-role or job-lane name gets a note", () => {
 	const p = plan(lane("api"), { name: "look", kind: "explore", role: "explorer" }, { name: "bench", kind: "run", role: "quick", job: "bench" });
-	const unmatched = new RunLanes("run-r5").assign({ agent: "storm-implementer", name: "ghost", task: "G" }, p, team, { agentTools });
+	// Manual direction's own handle: the director's name is no lane, and the role has one usable lane. Binding it is what
+	// placement always did, and what keeps a named task's results on its lane.
+	const work = new RunLanes("run-r5");
+	const unmatched = work.assign({ agent: "storm-implementer", name: "ghost", task: "G" }, p, team, { agentTools });
 	expect(unmatched.ok).toBe(true);
 	if (unmatched.ok) {
-		expect(unmatched.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
-		expect(unmatched.notes).toBeUndefined();
+		expect(unmatched.input.name).toBe("run-r5-lane-1");
+		expect(work.admitChecked({ spawnKey: String(unmatched.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
 	}
+	// Two usable lanes make the same name ambiguous: the unplanned record state, with no refusal.
+	const ambiguous = new RunLanes("run-r5-amb").assign({ agent: "storm-implementer", name: "ghost", task: "G" }, plan(lane("api"), lane("view")), team, { agentTools });
+	expect(ambiguous.ok).toBe(true);
+	if (ambiguous.ok) expect(ambiguous.input.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	const wrongRole = new RunLanes("run-r5-role").assign({ agent: "storm-explorer", name: "api", task: "R" }, p, team, { agentTools });
 	expect(wrongRole.ok).toBe(true);
 	if (wrongRole.ok) {
-		expect(wrongRole.input.name).toMatch(/^storm-explorer-\d+-\d+$/);
+		expect(wrongRole.input.name).toMatch(/^storm-explorer-run-.+-\d+$/);
 		expect(wrongRole.notes?.some(note => note.includes(UNPLANNED_NOTE_TAG) && note.includes("역할"))).toBe(true);
 	}
 	const job = new RunLanes("run-r5-job").assign({ agent: "storm-quick", name: "bench", task: "B" }, p, team, { agentTools });
 	expect(job.ok).toBe(true);
 	if (job.ok) {
-		expect(job.input.name).toMatch(/^storm-quick-\d+-\d+$/);
+		expect(job.input.name).toMatch(/^storm-quick-run-.+-\d+$/);
 		expect(job.notes?.some(note => note.includes(UNPLANNED_NOTE_TAG) && note.includes("정형 작업"))).toBe(true);
 	}
 	// The same lane twice in one batch keeps its refusal.
@@ -133,17 +140,70 @@ test("an item whose name matches no lane is placed unplanned; a wrong-role or jo
 	if (planned.ok) expect(planned.input.name).toBe("run-r5-lane-1");
 });
 
-test("the lane resolver keeps only the same-lane refusal and the unambiguous nameless lane", () => {
+test("a manual planned lane re-attempted in one run gets a run-unique handle, and the lane stays the same", () => {
+	const work = new RunLanes("run-reattempt");
+	const p = plan(lane("api"));
+	const first = work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { agentTools });
+	expect(first.ok).toBe(true);
+	if (!first.ok) return;
+	expect(first.input.name).toBe("api");
+	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
+	// The first attempt ends before a re-attempt is placed.
+	work.releaseAgent("api");
+	// omp would dedupe a second placement under the lane name to `api-2`; R4 refuses that. The re-attempt gets a handle.
+	const second = work.place({ agent: "storm-implementer", name: "api", task: "A again" }, p, team, { agentTools });
+	expect(second.ok).toBe(true);
+	if (!second.ok) return;
+	expect(String(second.input.name)).toMatch(/^run-reattempt-lane-\d+$/);
+	expect(work.admitChecked({ spawnKey: String(second.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
+});
+
+test("a resumed run's planned lanes get handles on their first attempt, because the session has seen their names", () => {
+	const work = new RunLanes("run-resumed", undefined, true);
+	const placed = work.place({ agent: "storm-implementer", name: "api", task: "A" }, plan(lane("api")), team, { agentTools });
+	expect(placed.ok).toBe(true);
+	if (placed.ok) expect(String(placed.input.name)).toMatch(/^run-resumed-lane-\d+$/);
+});
+
+test("a blocked spawn still names its lane, so the lane's retry in the same run gets a handle", () => {
+	const work = new RunLanes("run-blocked-retry");
+	const p = plan(lane("api"));
+	const first = work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { agentTools });
+	expect(first.ok).toBe(true);
+	// The host named the spawn, then the hook's blocked path released the placement; the hook also records the name.
+	work.noteSpawnName("api");
+	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "blocked" }, { plan: p, config: team })).toMatchObject({ ok: true });
+	const retry = work.place({ agent: "storm-implementer", name: "api", task: "A again" }, p, team, { agentTools });
+	expect(retry.ok).toBe(true);
+	if (!retry.ok) return;
+	expect(String(retry.input.name)).toMatch(/^run-blocked-retry-lane-\d+$/);
+	expect(work.admitChecked({ spawnKey: String(retry.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
+});
+
+test("an unplanned handle carries its run id, so a resumed session in a new process cannot reuse one", () => {
+	const place = (runId: string) => new RunLanes(runId).place({ agent: "storm-explorer", name: "look", task: "read" }, undefined, team, { agentTools });
+	const first = place("run-20260101-000000-aaaa");
+	const second = place("run-20260101-000000-bbbb");
+	expect(first.ok && second.ok).toBe(true);
+	if (!first.ok || !second.ok) return;
+	// omp dedupes any name the native session has seen; a fresh process's counter starts at one again, so only the run
+	// id (unique across processes) keeps the handle a first use. A handle without it is refused as `<name>-2`.
+	expect(String(first.input.name)).toContain("run-20260101-000000-aaaa");
+	expect(String(second.input.name)).toContain("run-20260101-000000-bbbb");
+	expect(first.input.name).not.toBe(second.input.name);
+});
+
+test("the lane resolver keeps only the same-lane refusal and the unique role lane", () => {
 	const p = plan(lane("api"), { name: "look", kind: "explore", role: "explorer" });
 	const named = resolveTaskLanes({ agent: "storm-implementer", name: "api", task: "A" }, p, team);
 	expect(named.ok).toBe(true);
 	if (named.ok) expect(named.items[0]?.lane?.name).toBe("api");
+	// A name that matches no lane takes the role's one usable lane, named or not.
 	const unmatched = resolveTaskLanes({ agent: "storm-implementer", name: "ghost", task: "G" }, p, team);
-	if (unmatched.ok) expect(unmatched.items[0]?.lane).toBeUndefined();
-	// An item with no name takes its role's only lane.
+	if (unmatched.ok) expect(unmatched.items[0]?.lane?.name).toBe("api");
 	const nameless = resolveTaskLanes({ agent: "storm-explorer", task: "R" }, p, team);
 	if (nameless.ok) expect(nameless.items[0]?.lane?.name).toBe("look");
-	// Two usable lanes for a nameless item is ambiguous: unplanned, not guessed.
+	// Two usable lanes for an unmatched or nameless item is ambiguous: unplanned, not guessed.
 	const ambiguous = resolveTaskLanes({ agent: "storm-implementer", task: "A" }, plan(lane("api"), lane("view")), team);
 	if (ambiguous.ok) expect(ambiguous.items[0]?.lane).toBeUndefined();
 	// The plan's absence makes every item unplanned.
@@ -196,7 +256,7 @@ test("an isolated unplanned item is private and runs beside a shared writer (D10
 	expect(isolated.ok).toBe(true);
 	if (isolated.ok) {
 		expect(isolated.input).toMatchObject({ isolated: true });
-		expect(isolated.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
+		expect(isolated.input.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	}
 });
 
@@ -339,9 +399,13 @@ test("a policy wider than the frozen placement is refused; a narrower one is adm
 	const wider = broad.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => pathsPolicy(["api.ts", "other.ts"]) } });
 	expect(wider).toMatchObject({ ok: false, code: "internal" });
 	if (!wider.ok) expect(wider.reason).toBe(PLACEMENT_CHANGED_REASON);
-	// The refused admission released the placement: the same lane may be placed again.
-	expect(broad.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) }).ok).toBe(true);
-	expect(broad.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => pathsPolicy(["api.ts"]) } })).toMatchObject({
+	// The refused admission released the placement. The lane is attempted again in the same run; the host already
+	// allocated the lane's name for the refused spawn, so the re-attempt gets a run-unique handle (R4/HF-2).
+	const replanned = broad.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) });
+	expect(replanned.ok).toBe(true);
+	if (!replanned.ok) return;
+	expect(String(replanned.input.name)).toMatch(/^run-r3-broad-lane-\d+$/);
+	expect(broad.admitChecked({ spawnKey: String(replanned.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => pathsPolicy(["api.ts"]) } })).toMatchObject({
 		ok: true,
 		hold: "lane:api",
 	});

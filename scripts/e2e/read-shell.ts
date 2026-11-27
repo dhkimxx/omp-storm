@@ -92,10 +92,12 @@ async function main(): Promise<void> {
 
 	await suite.step("shell: its path write and a named service are refused, the command is not", async () => {
 		const service = join(env.work, "read-shell-service");
+		// One lane name per native session: this scenario places its own shell lane.
+		const secondLane = { ...shellLane, name: "S2" };
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const steps: Step[] = [
-				contractPlan([shellLane], { contract: true, workers: { explorer: 1 } }),
-				{ tasks: [{ name: "S", agent: "storm-explorer", task: "Read", say: `E2E-CHILD-SERVICE ${base64(`printf started > ${JSON.stringify(service)}; echo ready; sleep 20`)} E2E-CHILD-SH ${base64("true")} E2E-CHILD-WRITE s-own.txt ${CITED}` }] },
+				contractPlan([secondLane], { contract: true, workers: { explorer: 1 } }),
+				{ tasks: [{ name: "S2", agent: "storm-explorer", task: "Read", say: `E2E-CHILD-SERVICE ${base64(`printf started > ${JSON.stringify(service)}; echo ready; sleep 20`)} E2E-CHILD-SH ${base64("true")} E2E-CHILD-WRITE s-own.txt ${CITED}` }] },
 				{ wait: true },
 			];
 			const llm = new LlmCursor(env);

@@ -192,6 +192,25 @@ function closeoutKeepsOpen(row: ResultRow | undefined, report: string): boolean 
 	return row !== undefined && row.state !== "accepted" && closeoutBody(report).length > 1;
 }
 
+/**
+ * Every plan's lane names get a suite-unique suffix: omp keeps a name the native session has already seen as
+ * `<name>-2`, and R4 refuses a deduped key, so one lane name is used once in this session. Checks find a lane by its
+ * base name through `laneIs`; dependency edges are renamed with their plan.
+ */
+let planSerial = 0;
+function laneIs(actual: string | undefined, base: string): boolean {
+	return actual === base || (actual !== undefined && actual.startsWith(`${base}-`));
+}
+function reworkPlan(lanes: readonly ContractLane[], options: Parameters<typeof contractPlan>[1], suffix: number): Step {
+	const renamed = new Map(lanes.map(lane => [lane.name, `${lane.name}-${suffix}`]));
+	const next = lanes.map(lane => ({
+		...lane,
+		name: renamed.get(lane.name) as string,
+		...(lane.dependsOn === undefined ? {} : { dependsOn: lane.dependsOn.map(dep => ({ ...dep, lane: renamed.get(dep.lane) ?? dep.lane })) }),
+	}));
+	return contractPlan(next, options);
+}
+
 /** Lanes whose plan is bound to a non-blocked native spawn. */
 function lanesWithSpawn(run: RunRecord): string[] {
 	return [...new Set(run.spawns.filter((spawn: SpawnRecord) => spawn.outcome !== "blocked" && spawn.lane !== undefined).map(spawn => spawn.lane!))];
@@ -203,7 +222,7 @@ function agentRows(run: RunRecord, role: string): AgentEntry[] {
 
 /** A persisted lane as unknown: baseline PlanLane cannot carry the new wire, so read it through `in` guards. */
 function persistedLane(run: RunRecord, laneName: string): unknown {
-	return run.plan?.lanes.find(candidate => candidate.name === laneName);
+	return run.plan?.lanes.find(candidate => laneIs(candidate.name, laneName));
 }
 
 /** The planned result ids as persisted; empty on baseline, which is a technical limit rather than behavior. */
@@ -442,6 +461,7 @@ async function main(): Promise<void> {
 	);
 
 	await suite.step("T05: B v1 is consumed by A, C is independent, B v2 reopens A", async () => {
+		const tag = ++planSerial;
 		const root = markerDir("t05");
 		const llm = new LlmCursor(env);
 		const b1 = bWriteV1(root);
@@ -449,7 +469,7 @@ async function main(): Promise<void> {
 		const b2 = bWriteV2Direct(root);
 		const reviewWaits = waitFor(root, ["b-v2"], "printf 'ready\\n' > " + shq(marker(root, "review-ready")));
 		const steps: Step[] = [
-			contractPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }),
+			reworkPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }, tag),
 			{ task: ["storm-implementer"], as: "T5B1", say: `E2E-CHILD-SH ${b64(b1)}` },
 			{ task: ["storm-quick"], as: "T5A1", say: `E2E-CHILD-SH ${b64(a1)}`, after: 'round="2/4"' },
 			{ task: ["storm-explorer"], as: "T5C", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/4"' },
@@ -475,7 +495,7 @@ async function main(): Promise<void> {
 				const explorerAgents = agentRows(run, "explorer");
 				const implementers = agentRows(run, "implementer");
 				const laneNames = lanesWithSpawn(run);
-				const aSpawns = run.spawns.filter(spawn => spawn.lane === "a-consume" && spawn.outcome !== "blocked");
+				const aSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "a-consume") && spawn.outcome !== "blocked");
 				const b1Seen = children(llm).some(user => user.includes(b64(b1)));
 				const a1Seen = children(llm).some(user => user.includes(b64(a1)));
 				const reviewAttempts = children(llm).filter(user => user.includes(b64(reviewWaits))).length;
@@ -488,10 +508,10 @@ async function main(): Promise<void> {
 				const rows = `b=${resultRowText(bRow)} a=${resultRowText(aRow)} c=${resultRowText(cRow)}`;
 				const aNeeds = aRow?.consumed?.find(input => input.id === "b-result");
 				const official =
-					bRow?.state === "accepted" && bRow.lane === "b-produce" && typeof bRow.contentVersion === "string" &&
-					aRow?.state === "unmet" && aRow.lane === "a-consume" && typeof aRow.attemptId === "string" && aRow.attemptId.includes("T5A10") &&
+					bRow?.state === "accepted" && laneIs(bRow.lane, "b-produce") && typeof bRow.contentVersion === "string" &&
+					aRow?.state === "unmet" && laneIs(aRow.lane, "a-consume") && typeof aRow.attemptId === "string" && aSpawns.length === 1 && aRow.attemptId === `job:${aSpawns[0]?.spawnKey ?? ""}:${aSpawns[0]?.spawnKey ?? ""}` &&
 					aNeeds !== undefined && aNeeds.version !== bRow.contentVersion && typeof aNeeds.version === "string" && aNeeds.version !== "" &&
-					cRow?.state === "accepted" && cRow.lane === "c-independent" && typeof cRow.contentVersion === "string" &&
+					cRow?.state === "accepted" && laneIs(cRow.lane, "c-independent") && typeof cRow.contentVersion === "string" &&
 					explorerAgents.length === 1 && aSpawns.length === 1;
 				const closeoutOpen = closeoutKeepsOpen(aRow, report);
 				observationOf("T05", run, report);
@@ -499,7 +519,7 @@ async function main(): Promise<void> {
 				// The downstream review is only attempted: a valid S2 implementation may block it while A is invalid.
 				check(
 					"T05: the producing, consuming and independent lanes were bound to real native spawns",
-					["b-produce", "a-consume", "c-independent"].every(name => laneNames.includes(name)),
+					["b-produce", "a-consume", "c-independent"].every(name => laneNames.some(actual => laneIs(actual, name))),
 					JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.outcome, spawn.lane])),
 				);
 				check(
@@ -521,7 +541,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"T05: C settled as an independent lane",
-					(bRow === undefined ? !pending.includes("c-independent") : cRow?.state === "accepted") &&
+					(bRow === undefined ? !pending.some(name => laneIs(name, "c-independent")) : cRow?.state === "accepted") &&
 						explorerAgents.some(agent => agent.state !== "running" && agent.requests > 0 && agent.lastWorkFailed !== true),
 					JSON.stringify({ pending, rows, explorer: explorerAgents }),
 				);
@@ -534,7 +554,7 @@ async function main(): Promise<void> {
 				}
 				reproduction(
 					"the run ended done/verified while A's accepted report names replaced B v1",
-					run.status === "done" && run.endReason === "verified" && !pending.includes("a-consume") && aReport.includes("b-version: v1") && bOutput.includes("version: v2"),
+					run.status === "done" && run.endReason === "verified" && !pending.some(name => laneIs(name, "a-consume")) && aReport.includes("b-version: v1") && bOutput.includes("version: v2"),
 					`run=${run.runId} status=${run.status} endReason=${run.endReason} pending=[${pending.join(",")}] rows=${rows} aReport=${JSON.stringify(aReport.trim())} bOutput=${JSON.stringify(bOutput.trim())}`,
 				);
 				expectation(
@@ -560,7 +580,7 @@ async function main(): Promise<void> {
 					);
 					check(
 						"T05 accept: the plan persists the result ids and A's dependency on B",
-						wire.b.includes("b-result") && wire.a.includes("a-result") && wire.aDeps.some(dep => dep.lane === "b-produce" && dep.need === "result"),
+						wire.b.includes("b-result") && wire.a.includes("a-result") && wire.aDeps.some(dep => laneIs(dep.lane, "b-produce") && dep.need === "result"),
 						JSON.stringify(wire),
 					);
 				}
@@ -571,6 +591,7 @@ async function main(): Promise<void> {
 	});
 
 	await suite.step("T05 retry: A fails its own result check against B v2; the old success stays unusable", async () => {
+		const tag = ++planSerial;
 		const root = markerDir("t05-retry");
 		const llm = new LlmCursor(env);
 		const b1 = bWriteV1(root);
@@ -579,7 +600,7 @@ async function main(): Promise<void> {
 		const retry = aRetryRejected(root);
 		const reviewWaits = waitFor(root, ["b-v2", "a-retry-rejected"], "printf 'ready\\n' > " + shq(marker(root, "retry-review-ready")));
 		const steps: Step[] = [
-			contractPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }),
+			reworkPlan(t05Lanes("version:"), { contract: ACCEPT, workers: t05Workers }, tag),
 			{ task: ["storm-implementer"], as: "T5RB1", say: `E2E-CHILD-SH ${b64(b1)}` },
 			{ task: ["storm-quick"], as: "T5RA1", say: `E2E-CHILD-SH ${b64(a1)}`, after: 'round="2/5"' },
 			{ task: ["storm-explorer"], as: "T5RC", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/5"' },
@@ -598,7 +619,7 @@ async function main(): Promise<void> {
 				const bOutput = readProject("b-output.txt");
 				const quickAgents = agentRows(run, "quick");
 				const explorerAgents = agentRows(run, "explorer");
-				const aSpawns = run.spawns.filter(spawn => spawn.lane === "a-consume" && spawn.outcome !== "blocked");
+				const aSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "a-consume") && spawn.outcome !== "blocked");
 				const retrySeen = children(llm).some(user => user.includes(b64(retry)));
 				const reviewAttempts = children(llm).filter(user => user.includes(b64(reviewWaits))).length;
 				const wire = { b: resultIds(run, "b-produce"), a: resultIds(run, "a-consume") };
@@ -610,10 +631,10 @@ async function main(): Promise<void> {
 				const rows = `b=${resultRowText(bRow)} a=${resultRowText(aRow)} c=${resultRowText(cRow)}`;
 				const aNeeds = aRow?.consumed?.find(input => input.id === "b-result");
 				const official =
-					bRow?.state === "accepted" && bRow.lane === "b-produce" && typeof bRow.contentVersion === "string" &&
-					aRow?.state === "unmet" && aRow.lane === "a-consume" && typeof aRow.attemptId === "string" && aRow.attemptId.includes("T5RA2") &&
+					bRow?.state === "accepted" && laneIs(bRow.lane, "b-produce") && typeof bRow.contentVersion === "string" &&
+					aRow?.state === "unmet" && laneIs(aRow.lane, "a-consume") && typeof aRow.attemptId === "string" && aSpawns.length === 2 && aRow.attemptId === `job:${aSpawns[1]?.spawnKey ?? ""}:${aSpawns[1]?.spawnKey ?? ""}` &&
 					aNeeds !== undefined && aNeeds.version === bRow.contentVersion &&
-					cRow?.state === "accepted" && cRow.lane === "c-independent" &&
+					cRow?.state === "accepted" && laneIs(cRow.lane, "c-independent") &&
 					explorerAgents.length === 1 && aSpawns.length === 2;
 				const closeoutOpen = closeoutKeepsOpen(aRow, report);
 				observationOf("T05-retry", run, report);
@@ -624,7 +645,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"T05 retry: C stayed independent and settled",
-					(bRow === undefined ? !pending.includes("c-independent") : cRow?.state === "accepted") &&
+					(bRow === undefined ? !pending.some(name => laneIs(name, "c-independent")) : cRow?.state === "accepted") &&
 						explorerAgents.some(agent => agent.state !== "running" && agent.requests > 0 && agent.lastWorkFailed !== true),
 					JSON.stringify({ pending, rows, explorer: explorerAgents }),
 				);
@@ -636,7 +657,7 @@ async function main(): Promise<void> {
 				}
 				reproduction(
 					"the failed A retry and the old A success still produced a verified run",
-					run.status === "done" && run.endReason === "verified" && !pending.includes("a-consume") && aReport.includes("result: rejected"),
+					run.status === "done" && run.endReason === "verified" && !pending.some(name => laneIs(name, "a-consume")) && aReport.includes("result: rejected"),
 					`run=${run.runId} status=${run.status} endReason=${run.endReason} pending=[${pending.join(",")}] rows=${rows} aReport=${JSON.stringify(aReport.trim())}`,
 				);
 				expectation(
@@ -668,21 +689,22 @@ async function main(): Promise<void> {
 	});
 
 	await suite.step("T05 control: progress edited only after A settles does not reopen A", async () => {
+		const tag = ++planSerial;
 		const root = markerDir("t05-control");
 		const llm = new LlmCursor(env);
 		const b = controlB(root);
 		const a = controlA(root);
 		const reviewWaits = waitFor(root, ["control-a"], "printf 'ready\\n' > " + shq(marker(root, "control-review-ready")));
 		const lanes = t05Lanes("version: control", true);
-		const progressLanes: ContractLane[] = lanes.map(lane => (lane.name === "b-produce" ? { ...lane, progress: "B result unchanged; status only" } : lane));
+		const progressLanes: ContractLane[] = lanes.map(lane => (laneIs(lane.name, "b-produce") ? { ...lane, progress: "B result unchanged; status only" } : lane));
 		const steps: Step[] = [
-			contractPlan(lanes, { contract: ACCEPT, workers: t05Workers }),
+			reworkPlan(lanes, { contract: ACCEPT, workers: t05Workers }, tag),
 			{ task: ["storm-implementer"], as: "T5CB", say: `E2E-CHILD-SH ${b64(b)}` },
 			// A and C run first; the run only reaches round 3 after they settle and the review lane is still pending.
 			{ task: ["storm-quick"], as: "T5CA", say: `E2E-CHILD-SH ${b64(a)}`, after: 'round="2/3"' },
 			{ task: ["storm-explorer"], as: "T5CC", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}`, after: 'round="2/3"' },
 			// The progress edit is submitted only now, after A's settled result is already in the run.
-			{ ...contractPlan(progressLanes, { contract: ACCEPT, workers: t05Workers }), after: 'round="3/3"' },
+			{ ...reworkPlan(progressLanes, { contract: ACCEPT, workers: t05Workers }, tag), after: 'round="3/3"' },
 			{ task: ["storm-reviewer"], as: "T5CRev", say: `E2E-CHILD-VERDICT correct E2E-CHILD-SH ${b64(reviewWaits)}`, after: 'round="3/3"' },
 		];
 		try {
@@ -691,8 +713,8 @@ async function main(): Promise<void> {
 				const report = await reportOf(rpc, run.runId, from);
 				const pending = pendingLanes(run, report);
 				const quick = agentRows(run, "quick");
-				const aSpawns = run.spawns.filter(spawn => spawn.lane === "a-consume" && spawn.outcome !== "blocked");
-				const progress = run.plan?.lanes.find(lane => lane.name === "b-produce")?.progress;
+				const aSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "a-consume") && spawn.outcome !== "blocked");
+				const progress = run.plan?.lanes.find(lane => laneIs(lane.name, "b-produce"))?.progress;
 				const log = llm.all();
 				const aAt = log.findIndex(entry => entry.who === "child" && entry.lastUser.includes(b64(a)));
 				const progressAt = log.findIndex(entry => entry.who === "main" && JSON.stringify(entry.decision.args ?? null).includes("B result unchanged"));
@@ -706,10 +728,10 @@ async function main(): Promise<void> {
 				const rows = `b=${resultRowText(bRow)} a=${resultRowText(aRow)} c=${resultRowText(cRow)}`;
 				const aNeeds = aRow?.consumed?.find(input => input.id === "control-b-result");
 				const official =
-					bRow?.state === "accepted" && bRow.lane === "b-produce" &&
-					aRow?.state === "accepted" && aRow.lane === "a-consume" &&
+					bRow?.state === "accepted" && laneIs(bRow.lane, "b-produce") &&
+					aRow?.state === "accepted" && laneIs(aRow.lane, "a-consume") &&
 					aNeeds !== undefined && aNeeds.version === bRow.contentVersion &&
-					cRow?.state === "accepted" && cRow.lane === "c-independent";
+					cRow?.state === "accepted" && laneIs(cRow.lane, "c-independent");
 				observationOf("T05-control", run, report);
 				check(
 					"T05 control: B stayed unchanged and A wrote its accepted report before the progress edit",
@@ -765,13 +787,14 @@ async function main(): Promise<void> {
 	});
 
 	await suite.step("T04: A survives B's failure; dropping B's lane must not become a normal completion", async () => {
+		const tag = ++planSerial;
 		const llm = new LlmCursor(env);
 		const steps: Step[] = [
-			contractPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, reviewer: 1 } }),
+			reworkPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, reviewer: 1 } }, tag),
 			{ task: ["storm-explorer"], as: "T4DA", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 			// No directive: the child's first request hits the approved 429 model and the native job fails.
 			{ task: ["storm-implementer"], as: "T4DB" },
-			{ ...contractPlan(t04Replan(false), { contract: ACCEPT, workers: { explorer: 1, reviewer: 1 } }), after: 'round="2/4"' },
+			{ ...reworkPlan(t04Replan(false), { contract: ACCEPT, workers: { explorer: 1, reviewer: 1 } }, tag), after: 'round="2/4"' },
 			// The replan and the last required lane settle in round 2, so the run can reach its natural end.
 			{ task: ["storm-reviewer"], as: "T4DRev", say: "E2E-CHILD-VERDICT correct", after: 'round="2/4"' },
 		];
@@ -787,12 +810,12 @@ async function main(): Promise<void> {
 				const explorer = agentRows(run, "explorer");
 				const implementers = agentRows(run, "implementer");
 				const bAttempts = llm.of("child").filter(entry => entry.model === "quota-out");
-				const bLaneSpawns = run.spawns.filter(spawn => spawn.lane === "b-write" && spawn.outcome !== "blocked");
-				const aLaneSpawns = run.spawns.filter(spawn => spawn.lane === "a-read" && spawn.outcome !== "blocked");
+				const bLaneSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "b-write") && spawn.outcome !== "blocked");
+				const aLaneSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "a-read") && spawn.outcome !== "blocked");
 				const finalPlan = run.plan?.lanes.map(lane => lane.name) ?? [];
-				const removed = !finalPlan.includes("b-write");
+				const removed = !finalPlan.some(name => laneIs(name, "b-write"));
 				const reviewDeps = depsOf(run, "review");
-				const noDangling = !reviewDeps.some(dep => dep.lane === "b-write");
+				const noDangling = !reviewDeps.some(dep => laneIs(dep.lane, "b-write"));
 				const bRow = resultOf(run, "b-result");
 				const aRow = resultOf(run, "a-answer");
 				const claimSeen = children(llm).some(user => user.includes(TRACKED_CLAIM));
@@ -812,7 +835,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"T04 drop: the replan really removed b-write and did not write B's file",
-					!finalPlan.includes("b-write") && finalPlan.includes("a-read") && finalPlan.includes("review") && !existsSync(join(env.project, "b-output.txt")),
+					!finalPlan.some(name => laneIs(name, "b-write")) && finalPlan.some(name => laneIs(name, "a-read")) && finalPlan.some(name => laneIs(name, "review")) && !existsSync(join(env.project, "b-output.txt")),
 					JSON.stringify({ finalPlan, bOutput: existsSync(join(env.project, "b-output.txt")) }),
 				);
 				reproduction(
@@ -863,14 +886,15 @@ async function main(): Promise<void> {
 	});
 
 	await suite.step("T04: B's requirement transfers under the same result id and only repairs B", async () => {
+		const tag = ++planSerial;
 		const root = markerDir("t04-repair");
 		const llm = new LlmCursor(env);
 		const repair = quickRepair(root);
 		const steps: Step[] = [
-			contractPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, quick: 1, reviewer: 1 } }),
+			reworkPlan(t04InitialLanes(), { contract: ACCEPT, workers: { implementer: 1, explorer: 1, quick: 1, reviewer: 1 } }, tag),
 			{ task: ["storm-explorer"], as: "T4TA", say: `E2E-CHILD-READ ${FACT_FILE}\nE2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
 			{ task: ["storm-implementer"], as: "T4TB" },
-			{ ...contractPlan(t04Replan(true), { contract: ACCEPT, workers: { explorer: 1, quick: 1, reviewer: 1 } }), after: 'round="2/4"' },
+			{ ...reworkPlan(t04Replan(true), { contract: ACCEPT, workers: { explorer: 1, quick: 1, reviewer: 1 } }, tag), after: 'round="2/4"' },
 			{ task: ["storm-quick"], as: "T4TRepair", say: `E2E-CHILD-SH ${b64(repair)}`, after: 'round="2/4"' },
 			{ task: ["storm-reviewer"], as: "T4TRev", say: "E2E-CHILD-VERDICT correct", after: 'round="3/4"' },
 		];
@@ -885,6 +909,7 @@ async function main(): Promise<void> {
 				const bAttempts = llm.of("child").filter(entry => entry.model === "quota-out");
 				const finalPlan = run.plan?.lanes.map(lane => lane.name) ?? [];
 				const ids = resultIds(run, "b-repair");
+				const repairSpawns = run.spawns.filter(spawn => laneIs(spawn.lane, "b-repair") && spawn.outcome !== "blocked");
 				const repairDeps = depsOf(run, "review");
 				const bRow = resultOf(run, "b-result");
 				const aRow = resultOf(run, "a-answer");
@@ -895,9 +920,9 @@ async function main(): Promise<void> {
 					requiredResult("b-result", "change", "b-output.txt holds the accepted B result", { path: "b-output.txt", contains: "b-status: ok" }),
 				);
 				const official =
-					bRow?.state === "accepted" && bRow.lane === "b-repair" && bRow.identity === expectedIdentity &&
-					typeof bRow.attemptId === "string" && bRow.attemptId.includes("T4TRepair") && typeof bRow.contentVersion === "string" &&
-					aRow?.state === "accepted" && aRow.lane === "a-read" && typeof aRow.attemptId === "string" &&
+					bRow?.state === "accepted" && laneIs(bRow.lane, "b-repair") && bRow.identity === expectedIdentity &&
+					typeof bRow.attemptId === "string" && repairSpawns.length === 1 && bRow.attemptId === `job:${repairSpawns[0]?.spawnKey ?? ""}:${repairSpawns[0]?.spawnKey ?? ""}` && typeof bRow.contentVersion === "string" &&
+					aRow?.state === "accepted" && laneIs(aRow.lane, "a-read") && typeof aRow.attemptId === "string" &&
 					explorer.length === 1 && quick.length === 1 && implementers.length === 1 && implementers[0]?.lastWorkFailed === true;
 				observationOf("T04-repair", run, report);
 				check(
@@ -907,7 +932,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"T04 repair: only b-write was replaced; A stayed intact and was not rerun",
-					!finalPlan.includes("b-write") && finalPlan.includes("a-read") && finalPlan.includes("b-repair") && finalPlan.includes("review") &&
+					!finalPlan.some(name => laneIs(name, "b-write")) && finalPlan.some(name => laneIs(name, "a-read")) && finalPlan.some(name => laneIs(name, "b-repair")) && finalPlan.some(name => laneIs(name, "review")) &&
 						explorer.length === 1 && explorer[0]?.requests !== undefined && explorer[0].requests > 0 &&
 						aRow?.state === "accepted" && quick.length === 1,
 					JSON.stringify({ finalPlan, explorer: explorer.map(agent => [agent.id, agent.state, agent.requests]), quick: quick.map(agent => [agent.id, agent.state, agent.requests]), ids, rows }),
@@ -926,8 +951,8 @@ async function main(): Promise<void> {
 				if (ACCEPT) {
 					check(
 						"T04 accept: the repair keeps B's exact requirement id, identity, new lane and review dependency",
-						ids.includes("b-result") && repairDeps.some(dep => dep.lane === "b-repair" && dep.need === "result") &&
-							bRow?.identity === expectedIdentity && bRow.lane === "b-repair" && bRow.state === "accepted",
+						ids.includes("b-result") && repairDeps.some(dep => laneIs(dep.lane, "b-repair") && dep.need === "result") &&
+							bRow?.identity === expectedIdentity && laneIs(bRow.lane, "b-repair") && bRow.state === "accepted",
 						JSON.stringify({ ids, repairDeps, expectedIdentity, rows }),
 					);
 					check(

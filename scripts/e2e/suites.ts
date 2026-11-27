@@ -30,6 +30,16 @@ export const E2E_GROUPS: readonly E2eGroup[] = ["e2e", "e2e-guarantees", "e2e-tu
  */
 export const E2E_SUITES: readonly E2eSuite[] = [
 	{ name: "tui", script: "tui.ts", group: "e2e-tui", note: "the interactive host: setup, approvals, ask, resume" },
+	{ name: "late-async-item", script: "late-async-item.ts", group: "e2e", note: "an earlier ask's queued item cannot join the next run" },
+	{ name: "late-permit-unplanned", script: "late-permit-unplanned.ts", group: "e2e-guarantees", note: "a writer that starts after 30 s keeps its place" },
+	{ name: "implementer-team", script: "implementer-team.ts", group: "e2e-guarantees", note: "a team of isolated implementers, planned and plan-less" },
+	{ name: "same-turn-reopen", script: "same-turn-reopen.ts", group: "e2e", note: "a budget stop stands until the user speaks again" },
+	{ name: "spend-close", script: "spend-close.ts", group: "e2e-guarantees", note: "the budget stop written to disk and met by workers" },
+	{ name: "planless-auto", script: "planless-auto.ts", group: "e2e", note: "a task with no plan opens a run; continue hands it off" },
+	{ name: "wiring-limits", script: "wiring-limits.ts", group: "e2e-guarantees", note: "branch, empty and cancelled isolated results on the host" },
+	{ name: "handle-collision", script: "handle-collision.ts", group: "e2e", note: "two same-named items get separate handles" },
+	{ name: "read-batch", script: "read-batch.ts", group: "e2e", note: "six plan-less explorers under omp's ceiling of three" },
+	{ name: "citation-aliases", script: "citation-aliases.ts", group: "e2e", note: "citation aliases read exactly as path:line" },
 	{ name: "host-facts", script: "host-facts.ts", group: "e2e-guarantees", note: "host facts the write order leans on" },
 	{ name: "run", script: "run.ts", group: "e2e", note: "RPC consumer paths and the native run lifecycle" },
 	{ name: "follow-up-job-snapshot", script: "follow-up-job-snapshot.ts", group: "e2e", note: "omp's job rows at a follow-up write" },

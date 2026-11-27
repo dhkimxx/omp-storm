@@ -37,10 +37,6 @@ const suite = new Suite("E2E (a worker's second answer is recorded as an unplann
 const check = suite.check.bind(suite);
 const sessions = new Sessions(env);
 
-/** Names of the shape a real run gives its workers; also the host's agent ids. */
-const LOOK = "run-20261127-101010-1a2b-lane-1";
-const WRITER = "run-20261127-101010-1a2b-lane-2";
-const REVIEW = "run-20261127-101010-1a2b-lane-3";
 const W_FILE = "e2e-woken-writer.txt";
 /** The one word the woken explorer answers with. */
 const WOKEN = "E2E-WOKEN-ANSWER-7";
@@ -48,7 +44,7 @@ const PING = "please-look-again";
 
 const row = (rows: readonly RunResult[] | undefined, id: string): RunResult | undefined => (rows ?? []).find(candidate => candidate.id === id);
 const lookResult = requiredResult("look-answer", "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE });
-const lookTask = { name: LOOK, agent: "storm-explorer", task: "Report from source", say: `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${FACT_CLAIM}\nE2E-WAKE-CLAIM ${WOKEN}` };
+const lookTaskFor = (lane: string) => ({ name: lane, agent: "storm-explorer", task: "Report from source", say: `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${FACT_CLAIM}\nE2E-WAKE-CLAIM ${WOKEN}` });
 
 async function main(): Promise<void> {
 	installProfile(env);
@@ -58,21 +54,24 @@ async function main(): Promise<void> {
 	}, 120_000);
 
 	await suite.step("A: a review lane's verdict and its answer to a follow-up are expected deliveries: nothing is recorded as unplanned, no notice", async () => {
+		// A lane name is used once in this native session; each scenario names its own lanes.
+		const look = "look-a";
+		const review = "review-a";
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const steps: Step[] = [
 				contractPlan(
 					[
-						{ name: LOOK, kind: "explore", results: [lookResult] },
-						{ name: REVIEW, kind: "review" },
+						{ name: look, kind: "explore", results: [lookResult] },
+						{ name: review, kind: "review" },
 					],
 					{ contract: true, workers: { explorer: 1, reviewer: 1 } },
 				),
-				{ tasks: [lookTask] },
+				{ tasks: [lookTaskFor(look)] },
 				{ wait: true },
-				{ tasks: [{ name: REVIEW, agent: "storm-reviewer", task: "Review", say: "E2E-CHILD-VERDICT correct" }] },
+				{ tasks: [{ name: review, agent: "storm-reviewer", task: "Review", say: "E2E-CHILD-VERDICT correct" }] },
 				{ wait: true },
 				// The director asks the reviewer again: its second answer is the follow-up's, expected as well.
-				{ edit: `agent://${REVIEW}`, content: "review once more" },
+				{ edit: `agent://${review}`, content: "review once more" },
 				{ wait: true },
 			];
 			const llm = new LlmCursor(env);
@@ -82,7 +81,8 @@ async function main(): Promise<void> {
 			const main = llm.of("main");
 			check("no delivery is recorded as unplanned (a review lane has no declared result; its deliveries were asked for)", (run.unplanned ?? []).length === 0 && run.unplannedCount === undefined, JSON.stringify({ unplanned: run.unplanned ?? null, count: run.unplannedCount }));
 			check("the director read no notice about an unplanned delivery", !main.some(entry => entry.notes.some(text => text.includes("결과와 무관한 도착"))), JSON.stringify(main.map(entry => entry.notes)));
-			check("the explorer's result row is accepted on its first attempt", row(run.results, "look-answer")?.state === "accepted" && row(run.results, "look-answer")?.attemptId === `job:${LOOK}:${LOOK}`, JSON.stringify(row(run.results, "look-answer")));
+			const lookKey = run.spawns.find(entry => entry.lane === look && entry.outcome !== "blocked")?.spawnKey;
+			check("the explorer's result row is accepted on its first attempt", row(run.results, "look-answer")?.state === "accepted" && lookKey !== undefined && row(run.results, "look-answer")?.attemptId === `job:${lookKey}:${lookKey}`, JSON.stringify({ row: row(run.results, "look-answer") ?? null, spawnKey: lookKey ?? null }));
 			const from = rpc.frames.length;
 			await rpc.prompt("/storm status");
 			const text = stormRecords(rpc.frames, from).at(-1)?.text ?? "";
@@ -91,27 +91,30 @@ async function main(): Promise<void> {
 	}, 300_000);
 
 	await suite.step("B: another worker's message wakes it: the answer goes back to that worker, the director is not told", async () => {
+		const look = "look-b";
+		const writer = "writer-b";
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const steps: Step[] = [
 				contractPlan(
 					[
-						{ name: LOOK, kind: "explore", results: [lookResult] },
-						{ name: WRITER, kind: "code", files: [W_FILE], results: [requiredResult("writer-change", "change", `the implementer wrote ${W_FILE}`, { path: W_FILE, contains: "storm child change" })] },
+						{ name: look, kind: "explore", results: [lookResult] },
+						{ name: writer, kind: "code", files: [W_FILE], results: [requiredResult("writer-change", "change", `the implementer wrote ${W_FILE}`, { path: W_FILE, contains: "storm child change" })] },
 					],
 					{ contract: true, workers: { explorer: 1, implementer: 1 } },
 				),
-				{ tasks: [lookTask] },
+				{ tasks: [lookTaskFor(look)] },
 				{ wait: true },
 				// The implementer messages the idle explorer before it writes its own file; omp wakes the explorer.
-				{ tasks: [{ name: WRITER, agent: "storm-implementer", task: "Change one file", say: `E2E-CHILD-SEND ${LOOK} ${PING} E2E-CHILD-WRITE ${W_FILE}` }] },
+				{ tasks: [{ name: writer, agent: "storm-implementer", task: "Change one file", say: `E2E-CHILD-SEND @storm-explorer ${PING} E2E-CHILD-WRITE ${W_FILE}` }] },
 				{ wait: true },
 			];
 			const llm = new LlmCursor(env);
 			const before = files.runIds();
 			await rpc.prompt(runRequest(steps, 1), 240_000);
 			const run = await files.finishedRun(before);
+			const writerKey = run.spawns.find(entry => entry.lane === writer && entry.outcome !== "blocked")?.spawnKey;
 			await Bun.sleep(3_000);
-			const writerLog = [...new Bun.Glob(`**/${WRITER}.jsonl`).scanSync({ cwd: join(env.work, "sessions"), absolute: true })].at(-1);
+			const writerLog = writerKey === undefined ? undefined : [...new Bun.Glob(`**/${writerKey}.jsonl`).scanSync({ cwd: join(env.work, "sessions"), absolute: true })].at(-1);
 			const relayed = writerLog === undefined ? "" : readFileSync(writerLog, "utf8");
 			check(
 				"the explorer's second answer came back to the implementer that woke it, as an irc message",
@@ -124,12 +127,13 @@ async function main(): Promise<void> {
 	}, 300_000);
 
 	await suite.step("C: the director's quiet note and its broadcast wake an answered explorer: its answer reaches the director nowhere, nothing is recorded", async () => {
+		const look = "look-c";
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const steps: Step[] = [
-				contractPlan([{ name: LOOK, kind: "explore", results: [lookResult] }], { contract: true, workers: { explorer: 1 } }),
-				{ tasks: [lookTask] },
+				contractPlan([{ name: look, kind: "explore", results: [lookResult] }], { contract: true, workers: { explorer: 1 } }),
+				{ tasks: [lookTaskFor(look)] },
 				{ wait: true },
-				{ edit: `agent://${LOOK}?progress`, content: PING },
+				{ edit: "agent://@storm-explorer?progress", content: PING },
 				{ edit: "agent://all", content: PING },
 				{ wait: true },
 			];

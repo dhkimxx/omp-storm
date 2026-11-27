@@ -113,7 +113,19 @@ function ownedFiles(): StormFiles {
 const hash = (value: string | Uint8Array): string => new Bun.CryptoHasher("sha256").update(value).digest("hex").slice(0, 12);
 const runRequest = (steps: Step[], rounds?: number): string =>
 	`/storm E2E-ROUTE ${JSON.stringify({ action: "run", ...(rounds !== undefined ? { rounds } : {}) })} E2E-STEPS ${JSON.stringify(steps)}`;
-const planFor = (lanes: readonly ContractLane[], workers?: Record<string, number>): Step => contractPlan(lanes, { contract: CONTRACT, ...(workers !== undefined ? { workers } : {}) });
+/**
+ * Every plan's lane names get a suite-unique suffix. omp keeps a name the native session has already seen as
+ * `<name>-2`, and R4 refuses a deduped key, so a lane name is used once in this session; the checks below find a lane
+ * by its base name, which is what the plan's author wrote.
+ */
+let planSerial = 0;
+const planFor = (lanes: readonly ContractLane[], workers?: Record<string, number>): Step => {
+	planSerial += 1;
+	const renamed = lanes.map(lane => ({ ...lane, name: `${lane.name}-${planSerial}` }));
+	return contractPlan(renamed, { contract: CONTRACT, ...(workers !== undefined ? { workers } : {}) });
+};
+/** Whether a persisted lane is the plan's lane written under its base name (see `planFor`). */
+const laneIs = (actual: string | undefined, base: string): boolean => actual === base || (actual !== undefined && actual.startsWith(`${base}-`));
 
 function observe(name: string, run: RunRecord, detail: string): void {
 	const results = runResults(run).map(result => `${result.id}:${result.state}${result.attemptId === undefined ? "" : `@${result.attemptId}`}`).join(",");
@@ -130,7 +142,7 @@ function summaryOf(files: StormFiles, runId: string): RunSummary | undefined {
 /** The plan lane as the run record holds it; contract fields are read without making them required by the baseline. */
 function laneOf(run: RunRecord, name: string): Record<string, unknown> | undefined {
 	const lanes = (run.plan?.lanes ?? []) as unknown as Array<Record<string, unknown>>;
-	return lanes.find(lane => lane.name === name);
+	return lanes.find(lane => typeof lane.name === "string" && laneIs(lane.name, name));
 }
 
 /** The planned result wire as persisted; baseline does not store it. */
@@ -373,7 +385,7 @@ async function main(): Promise<void> {
 					"T01a contract: the named obligation is unmet on the attempted job",
 					obligation !== undefined &&
 						obligation.state === "unmet" &&
-						obligation.lane === "report" &&
+						laneIs(obligation.lane, "report") &&
 						obligation.reason !== undefined &&
 						obligation.reason.trim() !== "" &&
 						attemptMatches(obligation.attemptId, spawn?.spawnKey) &&
@@ -471,7 +483,7 @@ async function main(): Promise<void> {
 					"T01b contract: the accepted answer binds to the native attempt, not a role or a plan entry",
 					obligation !== undefined &&
 						obligation.state === "accepted" &&
-						obligation.lane === "read-report" &&
+						laneIs(obligation.lane, "read-report") &&
 						attemptMatches(obligation.attemptId, spawn?.spawnKey) &&
 						obligation.attemptId !== child?.name &&
 						obligation.attemptId !== child?.role,
@@ -560,7 +572,7 @@ async function main(): Promise<void> {
 					"T01c generic: the answer stays reviewable on the producer's native attempt",
 					obligation !== undefined &&
 						obligation.state === "reviewable" &&
-						obligation.lane === answerLane &&
+						laneIs(obligation.lane, answerLane) &&
 						attemptMatches(obligation.attemptId, producer?.spawnKey),
 					JSON.stringify({ obligation: obligation ?? null, spawnKey: producer?.spawnKey ?? null }),
 				);
@@ -654,7 +666,7 @@ async function main(): Promise<void> {
 					"T01c scoped: the answer is accepted on the producer's native attempt",
 					obligation !== undefined &&
 						obligation.state === "accepted" &&
-						obligation.lane === answerLane &&
+						laneIs(obligation.lane, answerLane) &&
 						attemptMatches(obligation.attemptId, producer?.spawnKey),
 					JSON.stringify({ obligation: obligation ?? null, spawnKey: producer?.spawnKey ?? null }),
 				);
@@ -870,8 +882,9 @@ async function main(): Promise<void> {
 					{ task: ["storm-implementer"], as: "Submitter", say: `E2E-CHILD-SH ${qualitativeWrite}` },
 				];
 				const run = await runOf(rpc, files, runRequest(steps, 1));
-				const writer = run.agents?.find(agent => agent.role === "implementer" && agent.id.startsWith("Submitter"));
-				const spawn = run.spawns.find(entry => entry.lane === "submit");
+				const writerKey = run.spawns.find(entry => laneIs(entry.lane, "submit") && entry.outcome !== "blocked")?.spawnKey;
+				const writer = run.agents?.find(agent => agent.id === writerKey);
+				const spawn = run.spawns.find(entry => laneIs(entry.lane, "submit"));
 				const reviewer = run.agents?.some(agent => agent.role === "reviewer") === true;
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "submit", "qualitative-submission");
@@ -915,7 +928,7 @@ async function main(): Promise<void> {
 						"T06 contract: the obligation is reviewable on the submitter's native attempt",
 						obligation !== undefined &&
 							obligation.state === "reviewable" &&
-							obligation.lane === "submit" &&
+							laneIs(obligation.lane, "submit") &&
 							attemptMatches(obligation.attemptId, spawn?.spawnKey) &&
 							obligation.attemptId !== writer?.name &&
 							obligation.attemptId !== writer?.role,
@@ -955,7 +968,7 @@ async function main(): Promise<void> {
 				];
 				const run = await runOf(rpc, files, runRequest(steps, 1));
 				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
-				const spawn = run.spawns.find(entry => entry.lane === "write");
+				const spawn = run.spawns.find(entry => laneIs(entry.lane, "write"));
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "write", "incorrect-change");
 				const progress = await officialStatusText(rpc);
@@ -987,7 +1000,7 @@ async function main(): Promise<void> {
 						"T06 contract: an incorrect verdict leaves the obligation unmet with a reason",
 						obligation !== undefined &&
 							obligation.state === "unmet" &&
-							obligation.lane === "write" &&
+							laneIs(obligation.lane, "write") &&
 							obligation.reason !== undefined &&
 							obligation.reason.trim() !== "" &&
 							attemptMatches(obligation.attemptId, spawn?.spawnKey),
@@ -1030,11 +1043,11 @@ async function main(): Promise<void> {
 				];
 				const run = await runOf(rpc, files, runRequest(steps, 1));
 				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
-				const late = run.agents?.find(agent => agent.id === "Late0");
 				// The lane's current attempt is the last one the host admitted for it; the row must still belong to that
 				// exact job (never to a role or to the first writer after a later attempt replaced its evidence).
-				const laneAttempts = run.spawns.filter(entry => entry.lane === "write").sort((a, b) => a.ts.localeCompare(b.ts));
+				const laneAttempts = run.spawns.filter(entry => laneIs(entry.lane, "write")).sort((a, b) => a.ts.localeCompare(b.ts));
 				const currentAttempt = laneAttempts.at(-1)?.spawnKey;
+				const late = run.agents?.find(agent => agent.id === currentAttempt);
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "write", "stale-change");
 				const progress = await officialStatusText(rpc);
@@ -1073,7 +1086,7 @@ async function main(): Promise<void> {
 						"T06 contract: the stale verdict leaves the obligation unaccepted on the lane's current native attempt",
 						obligation !== undefined &&
 							obligation.state !== "accepted" &&
-							obligation.lane === "write" &&
+							laneIs(obligation.lane, "write") &&
 							laneAttempts.length >= 2 &&
 							attemptMatches(obligation.attemptId, currentAttempt) &&
 							obligation.attemptId !== late?.name &&
@@ -1127,9 +1140,10 @@ async function main(): Promise<void> {
 					{ task: ["storm-reviewer"], as: "Reviewer", say: "E2E-CHILD-VERDICT correct", after: '<storm-run id="' },
 				];
 				const run = await runOf(rpc, files, runRequest(steps));
-				const writer = run.agents?.find(agent => agent.role === "implementer" && agent.id.startsWith("Submitter"));
+				const writerKey = run.spawns.find(entry => laneIs(entry.lane, "submit") && entry.outcome !== "blocked")?.spawnKey;
+				const writer = run.agents?.find(agent => agent.id === writerKey);
 				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
-				const spawn = run.spawns.find(entry => entry.lane === "submit");
+				const spawn = run.spawns.find(entry => laneIs(entry.lane, "submit"));
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "submit", "qualitative-submission");
 				const evidence = run.checks?.find(item => item.name === checkName);
@@ -1175,7 +1189,7 @@ async function main(): Promise<void> {
 						"T06 contract: the reviewer's verdict accepts the submitter's native attempt",
 						obligation !== undefined &&
 							obligation.state === "accepted" &&
-							obligation.lane === "submit" &&
+							laneIs(obligation.lane, "submit") &&
 							attemptMatches(obligation.attemptId, spawn?.spawnKey) &&
 							obligation.attemptId !== writer?.name &&
 							obligation.attemptId !== writer?.role,
@@ -1213,7 +1227,7 @@ async function main(): Promise<void> {
 				];
 				const run = await runOf(rpc, files, runRequest(steps, 1));
 				const reviewer = run.agents?.find(agent => agent.role === "reviewer");
-				const spawn = run.spawns.find(entry => entry.lane === "write");
+				const spawn = run.spawns.find(entry => laneIs(entry.lane, "write"));
 				const summary = summaryOf(files, run.runId);
 				const planned = plannedResult(run, "write", "checked-change");
 				const evidence = run.checks?.find(item => item.name === checkName);
@@ -1250,7 +1264,7 @@ async function main(): Promise<void> {
 						"T06 contract: the reviewer accepts the obligation while the failed check keeps the run unverified",
 						obligation !== undefined &&
 							obligation.state === "accepted" &&
-							obligation.lane === "write" &&
+							laneIs(obligation.lane, "write") &&
 							attemptMatches(obligation.attemptId, spawn?.spawnKey) &&
 							run.status !== "done" &&
 							run.endReason !== "verified",

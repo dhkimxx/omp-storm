@@ -1698,6 +1698,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				const now = Date.now();
 				const current = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
 				if (capturedRunId !== undefined && (current === undefined || current.closing)) return closed();
+				// The host already named this spawn: a later attempt of the same manual planned lane in this run must not
+				// reuse a name the native session has seen, even if this hook refuses the spawn (R4/HF-2).
+				if (current !== undefined && ctx.agent.kind === "main" && event.spawnKey !== undefined) runs.runLanes()?.noteSpawnName(event.spawnKey);
 				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(state.sessionDir, now), readTrialStates(state.sessionDir)]);
 				if (!stillOwn()) return moved();
 				// One authoritative count for this decision: reservations and running Storm rows dedupe by worker id,
@@ -2951,8 +2954,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					agents: listAgents({ runId, scope: runScope }),
 					...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 					now: Date.now(),
-					// Automatic direction rewrites planned lane names; manual direction keeps the lane's own name. Unplanned
-					// items get a generated handle under either (D6).
+					// Automatic direction rewrites planned lane names; manual direction keeps the lane's own name (R4).
+					// Unplanned items get a handle that carries the run id under either (D6).
 					rewriteNames: autoOn,
 					};
 				return lanes.place(event.input, plan, config, now);

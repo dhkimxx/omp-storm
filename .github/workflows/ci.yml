@@ -22,6 +22,7 @@ jobs:
   # job below runs one group of that list: `--group e2e`, `--group e2e-guarantees`, `--group e2e-tui`. The groups keep
   # every job inside its 20 minute limit as a guard against a hung scenario, not as a budget: the slowest scenario in a
   # group is about 3 minutes (TUI), so a group's wall time is close to that rather than to the sum of its scenarios.
+  # 0.29.0 adds ten plan-less, isolated-team, budget and citation scenarios to the same list; they run here unchanged.
   # The `qa` group holds the release-QA scenarios no CI job runs; `scripts/e2e/qa-linux.sh` runs every group in order.
   e2e:
     runs-on: ubuntu-latest
@@ -41,8 +42,9 @@ jobs:
           PATH="$PWD/node_modules/.bin:$PATH" omp --version
           ls node_modules/@oh-my-pi | tr '\n' ' '
       # RPC and print surfaces, automatic delegation, checkpoint across a native restart, the follow-up ledger, omp's job
-      # rows at a follow-up write, and continue-after-host-death. The harness keeps each scenario's work dir (omp stderr,
-      # RPC frames, screens, model requests) when a check fails.
+      # rows at a follow-up write, continue-after-host-death, and the plan-less team (an open at the first task, the
+      # read pool, a late async item, a budget stop and citation aliases). The harness keeps each scenario's work dir
+      # (omp stderr, RPC frames, screens, model requests) when a check fails.
       - name: E2E (RPC, automatic delegation, the native lifecycle)
         run: E2E_WORK_ROOT="$RUNNER_TEMP" npm run e2e:all -- --group e2e
       - name: Upload the work dirs
@@ -79,7 +81,9 @@ jobs:
           ls node_modules/@oh-my-pi | tr '\n' ' '
       # A woken worker's answer, an early-start lane, the director's reads under automatic delegation, the approved model
       # and effort, two writers on one tree, the host facts the write order leans on, the director's own edits, a read
-      # lane with a shell, and Storm installed in a folder with no node_modules.
+      # lane with a shell, Storm installed in a folder with no node_modules, a team of isolated implementers (planned and
+      # plan-less, with the retained/change/integrated truths), a writer that starts after its 30 s window, the budget
+      # stop's marker, and branch/empty/cancelled isolated results.
       - name: E2E (phase 1 and the hardening guarantees)
         run: E2E_WORK_ROOT="$RUNNER_TEMP" npm run e2e:all -- --group e2e-guarantees
       - name: Upload the work dirs

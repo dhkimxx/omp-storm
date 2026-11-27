@@ -255,7 +255,6 @@ const LAPSED_MAX = 256;
  * the counters never restart, so a handle is never a name omp has already seen (it would dedupe it to `-2`, which no
  * placement matches). A reload starts a new instance: a reused name is then refused, never guessed.
  */
-let sessionRunSerial = 0;
 let sessionHandleSerial = 0;
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -424,11 +423,13 @@ export type TaskPlacements =
 	| { ok: false; code: "lane"; reason: string };
 
 /**
- * R5: every item of one call resolved to a lane or to the unplanned record state. A name that matches no lane is
- * unplanned, with no refusal; a name that matches a lane of another role or a job lane is unplanned with one note for
- * the call's result. The same lane twice in one batch is still refused. An item with no name takes its role's only
- * usable lane, as placement always did: it names no lane, so there is nothing to match or mismatch. This is the lane
- * resolution every new placement uses; `plannedTaskLanes` stays for callers the wiring pass still has to replace.
+ * R5: every item of one call resolved to a lane or to the unplanned record state. A name that matches a lane of
+ * another role or a job lane is unplanned with one note for the call's result. The same lane twice in one batch is
+ * still refused. An item whose name matches no lane at all takes its role's only usable lane, as manual direction
+ * always did: the director's own handle names no lane, so there is nothing to match or mismatch. That lane is
+ * unambiguous only when the role has exactly one left in this batch; with none or several the item is unplanned, with
+ * no refusal. With no plan every item is unplanned. This is the lane resolution every new placement uses;
+ * `plannedTaskLanes` stays for callers the wiring pass still has to replace.
  */
 export function resolveTaskLanes(input: unknown, plan: RunPlan | undefined, config: StormConfig): TaskPlacements {
 	if (!object(input)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
@@ -466,8 +467,10 @@ export function resolveTaskLanes(input: unknown, plan: RunPlan | undefined, conf
 			placed.push({ lane: named });
 			continue;
 		}
-		if (name === undefined && plan !== undefined) {
-			// No name to match: the one lane of this agent's role is unambiguous, and placement has always taken it.
+		if (plan !== undefined) {
+			// The director's own name that matches no lane: the one lane of this agent's role is unambiguous, and manual
+			// direction has always kept the caller's handle and bound it there. A wrong-role or job-lane name was decided
+			// above (unplanned, R5); with no lane or several, the item is unplanned below.
 			const eligible = role === undefined ? [] : (byRole.get(role) ?? []).filter(candidate => !used.has(candidate.name));
 			if (eligible.length === 1) {
 				used.add(eligible[0]!.name);
@@ -475,7 +478,8 @@ export function resolveTaskLanes(input: unknown, plan: RunPlan | undefined, conf
 				continue;
 			}
 		}
-		// A name that matches nothing, or no name with no unambiguous lane, is the unplanned record state (R5).
+		// A name that matches nothing with no unambiguous role lane, or any item with no plan, is the unplanned record
+		// state (R5).
 		placed.push({});
 	}
 	return { ok: true, items: placed };
@@ -1279,6 +1283,8 @@ export class RunLanes {
 	 * allocates the first one's id. Cleared by the matching admission, cancel or release; expires like a pending write.
 	 */
 	readonly #held = new Map<string, LaneHold>();
+	/** Lanes this run has placed a name for, blocked or admitted: a later attempt must not reuse that name (R4/HF-2). */
+	readonly #lanePlaced = new Set<string>();
 	/** Follow-up admission tokens; only a failed preflight releases the write/capacity reservations it created. */
 	readonly #followTokens = new Map<
 		string,
@@ -1294,13 +1300,12 @@ export class RunLanes {
 	#placementSerial = 0;
 	#tokenSerial = 0;
 	/** This run's place in the session-wide handle counter (R4); fixed for the run's life. */
-	readonly #runSerial = ++sessionRunSerial;
 
 	/**
 	 * `hostJobs` is the one synchronous view of the director session's own async jobs. It is what makes a command the
 	 * director sent to the background a holder in this table, and what tells that a worker's task job is over.
 	 */
-	constructor(readonly runId: string, private readonly hostJobs?: HostJobSource) {
+	constructor(readonly runId: string, private readonly hostJobs?: HostJobSource, private readonly resumed = false) {
 		liveLanes.set(runId, new WeakRef(this));
 	}
 
@@ -1454,18 +1459,27 @@ export class RunLanes {
 			const call = options.callId === undefined ? {} : { callId: options.callId };
 			let handle: string;
 			if (entry.lane === undefined) {
-				// R4: every unplanned item, auto or manual, gets a session-wide unique handle omp keeps as the spawn key.
-				handle = `${entry.agent}-${this.#runSerial}-${++sessionHandleSerial}`;
+				// R4/D6: every unplanned item, auto or manual, gets a handle omp keeps as the spawn key. It carries the run
+				// id: omp dedupes any name the native session has seen, including one an earlier process of the same
+				// session used, so an in-memory counter alone would hand a resumed session a `-2` key R4 must refuse.
+				handle = `${entry.agent}-${this.runId}-${++sessionHandleSerial}`;
 				this.#assigned.set(handle, { agent: entry.agent, placement, scope: entry.scope, ...call });
 				next = { ...next, name: handle };
 			} else if (rewrite) {
 				handle = `${this.runId}-lane-${++this.#serial}`;
 				this.#assigned.set(handle, { key: key(entry.lane), lane: entry.lane.name, agent: entry.agent, placement, scope: entry.scope, ...call });
 				next = { ...next, name: handle };
-			} else {
-				// Manual direction keeps the lane's own name, the one key its spawn is matched by (R4).
+			} else if (!this.resumed && !this.#lanePlaced.has(entry.lane.name) && !this.#agents.has(entry.lane.name) && !this.#held.has(entry.lane.name)) {
+				// Manual direction keeps the lane's own name, the one key its spawn is matched by (R4), for the lane's
+				// first attempt in this run.
 				handle = entry.lane.name;
 				if (next.name !== handle) next = { ...next, name: handle };
+			} else {
+				// A lane attempted again in this run would reach omp as `<lane>-2`, a name R4 must refuse; the re-attempt
+				// gets a run-unique handle that admits exactly as an automatic placement does. The lane stays the same.
+				handle = `${this.runId}-lane-${++this.#serial}`;
+				this.#assigned.set(handle, { key: key(entry.lane), lane: entry.lane.name, agent: entry.agent, placement, scope: entry.scope, ...call });
+				next = { ...next, name: handle };
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
 			const refs = entry.lane === undefined ? undefined : dependencyRefs(entry.lane, options.readiness);
@@ -1495,6 +1509,14 @@ export class RunLanes {
 		delete next.isolated;
 		const all = pinned.size === 0 ? notes : [...notes, pinnedFieldsNote(TASK_PINNED_FIELDS.filter(field => pinned.has(field)))];
 		return { ok: true, input: next, ...(all.length === 0 ? {} : { notes: all }) };
+	}
+
+	/**
+	 * The host named a spawn this run placed: remember a planned lane's name even when its hook refuses the spawn, so a
+	 * later attempt of the lane in this run uses a run-unique handle instead of the name the host already allocated.
+	 */
+	noteSpawnName(spawnKey: string): void {
+		if (this.#laneScopes.has(spawnKey) || this.#held.has(spawnKey) || this.#agents.has(spawnKey)) this.#lanePlaced.add(spawnKey);
 	}
 
 	/** Consume an approved spawn's reservation; the lane comes back when the placement matched one (R4/R5). */
@@ -1544,6 +1566,8 @@ export class RunLanes {
 			}
 		}
 		const matched = assignment !== undefined;
+		// The host allocated this lane's name even when the hook refuses the spawn; a later attempt must not reuse it.
+		if (assignment?.lane !== undefined) this.#lanePlaced.add(assignment.lane);
 		if (spawn.outcome === "blocked") {
 			// A blocked spawn never runs: the placement it would have used is consumed, and anything reserved for it ends.
 			if (matched) this.#assigned.delete(spawn.spawnKey);

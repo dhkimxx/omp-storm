@@ -1300,7 +1300,7 @@ async function main(): Promise<void> {
 				{ tasks: [{ name: api, agent: "storm-explorer", task: "Verify the API criterion from source", say: "E2E-CHILD-DELAY 15000 E2E-CHILD-CLAIM not verified yet" }] },
 				{ wait: true },
 				{
-					followUp: `agent://${api}`,
+					followUp: `agent://@${api}`,
 					content: `Retry the failed API verification against source. ${readProbe}`,
 					after: 'action="retry"',
 					releaseFile: { name: retryRelease, receipt: "not verified yet" },

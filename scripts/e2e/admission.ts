@@ -46,6 +46,7 @@ import {
 	type Frame,
 	type LlmEntry,
 	LlmCursor,
+	laneSpawnKey,
 	linkPlugin,
 	modelsYml,
 	prepare,
@@ -259,7 +260,18 @@ function taskNames(args: object): string[] {
 	}
 	return "name" in args && typeof args.name === "string" ? [args.name] : [];
 }
-const attempted = (frames: readonly Frame[], name: string): boolean => taskCalls(frames).some(args => taskNames(args).includes(name));
+/** The lane names a task call's items were bound to, read from the contract block placement appended. */
+function taskLanes(args: object): string[] {
+	const items: unknown[] = "tasks" in args && Array.isArray(args.tasks) ? args.tasks : [args];
+	return items.flatMap(item => {
+		if (item === null || typeof item !== "object") return [];
+		const text = "task" in item && typeof item.task === "string" ? item.task : "";
+		const lane = /레인: "([^"]+)"/.exec(text)?.[1];
+		return lane === undefined ? [] : [lane];
+	});
+}
+const attempted = (frames: readonly Frame[], name: string): boolean =>
+	taskCalls(frames).some(args => taskNames(args).includes(name) || taskLanes(args).includes(name));
 
 /** One lane field the baseline type does not name yet; only contract mode asserts these planned fields. */
 function planField(run: RunRecord, laneName: string, field: string): unknown {
@@ -446,13 +458,13 @@ async function main(): Promise<void> {
 			// (`task.workerThreads: 0`), so nothing here is stopped by the D5 pooled-thread rule and the gates run for E0.
 			{ tasks: fillerTasks },
 			{ task: ["storm-implementer"], as: "E", say: `E2E-CHILD-DELAY 3000 E2E-EXPERIMENT E2E-CHILD-SH ${b64(experimentCommand)}` },
-			{ task: ["storm-explorer"], as: "C", say: "E2E-CHILD-DELAY 8000 E2E-COMPARE-EARLY" },
-			{ task: ["storm-implementer"], as: "B", say: `E2E-CHILD-DELAY 8000 E2E-BUILD-EARLY E2E-CHILD-BASH ${buildCommand}` },
+			{ task: ["storm-explorer"], as: "C", say: "E2E-CHILD-DELAY 8000 E2E-COMPARE-EARLY E2E-CHILD-CLAIM compare0-done" },
+			{ task: ["storm-implementer"], as: "B", say: `E2E-CHILD-DELAY 8000 E2E-BUILD-EARLY E2E-CHILD-BASH ${buildCommand} E2E-CHILD-CLAIM build0-done` },
 			// 0.27.0 (P1-c): the early consumers above start with a note and their results are not accepted on a missing input.
 			// What the note asks for is the way on: a follow-up to the comparison's worker once the experiment's result exists.
 			// The build needs the integrated tree: after its first worker ended, a second start is still refused.
-			{ followUp: "agent://C0", content: "E2E-COMPARE-LATE", afterResult: 'id="C0"' },
-			{ task: ["storm-implementer"], as: "B", say: "E2E-BUILD-LATE", afterResult: 'id="B0"' },
+			{ followUp: "agent://@C0", content: "E2E-COMPARE-LATE", afterResult: "compare0-done" },
+			{ task: ["storm-implementer"], as: "B", say: "E2E-BUILD-LATE", afterResult: "build0-done" },
 		];
 		let retainedPatch = "";
 		await session(cancelAll, async (rpc, files) => {
@@ -478,8 +490,9 @@ async function main(): Promise<void> {
 			// The promised stable result id is the compact reference a consumer may receive; the host's absolute
 			// temporary patch path is not part of the product contract.
 			const compareWithRef = [...earlyCompare, ...lateCompare].filter(entry => entry.lastUser.includes("experiment-patch"));
-			const worker = await until(() => workerSession("E0"), 15_000, "the E0 worker-thread log record").catch(() => undefined);
-			const quick = run.agents?.find(agent => agent.id === "E0");
+			const e0 = laneSpawnKey(run, "E0");
+			const worker = await until(() => (e0 === undefined ? undefined : workerSession(e0)), 15_000, "the E0 worker-thread log record").catch(() => undefined);
+			const quick = run.agents?.find(agent => agent.id === e0);
 			const fillerReads = llm.of("child").filter(entry => entry.lastUser.includes("E2E-FILLER-READ") && entry.lastTool.includes(FACT_LINE));
 
 			check(
@@ -524,8 +537,10 @@ async function main(): Promise<void> {
 			const comparison = run.results?.find(row => row.id === "comparison");
 			check(
 				"T02: a comparison consumer started before the experiment's result exists is told so and not accepted on that input",
-				compareAttempted && earlyCompare.length > 0 && directorNotes.some(note => note.includes("'C0'") && note.includes("수용되지 않")) && directorNotes.some(note => note.includes("'C0' 레인의 결과를 수용하지 않았습니다")),
-				`attempt=${compareAttempted} early=${earlyCompare.map(entry => entry.ts).join(",") || "none"} notes=${JSON.stringify(directorNotes.filter(note => note.includes("'C0'")).map(note => note.slice(0, 160)))}`,
+				compareAttempted && earlyCompare.length > 0 &&
+					directorNotes.some(note => note.includes("'C0'") && note.includes("조건이 충족되기 전에 시작했습니다")) &&
+					comparison?.state !== "accepted",
+				`attempt=${compareAttempted} early=${earlyCompare.map(entry => entry.ts).join(",") || "none"} row=${JSON.stringify(comparison ?? null)} notes=${JSON.stringify(directorNotes.filter(note => note.includes("'C0'")).map(note => note.slice(0, 160)))}`,
 			);
 			check(
 				"T02: after the result exists the comparison runs again through a follow-up",
@@ -585,9 +600,9 @@ async function main(): Promise<void> {
 		];
 		const adoptionSteps: Step[] = [
 			planFor(adoptionLanes, { implementer: 2 }),
-			{ task: ["storm-implementer"], as: "AD", say: `E2E-CHILD-DELAY 1500 E2E-ADOPT E2E-CHILD-SH ${b64(adoptCommand)}` },
+			{ task: ["storm-implementer"], as: "AD", say: `E2E-CHILD-DELAY 1500 E2E-ADOPT E2E-CHILD-SH ${b64(adoptCommand)} E2E-CHILD-CLAIM adopt-done` },
 			{ task: ["storm-implementer"], as: "BA", say: `E2E-BUILD-ADOPT-EARLY E2E-CHILD-SH ${b64(earlyReadCommand)}` },
-			{ task: ["storm-implementer"], as: "BA", say: `E2E-BUILD-ADOPT-LATE E2E-CHILD-SH ${b64(lateReadCommand)}`, afterResult: 'id="AD0"' },
+			{ task: ["storm-implementer"], as: "BA", say: `E2E-BUILD-ADOPT-LATE E2E-CHILD-SH ${b64(lateReadCommand)}`, afterResult: "adopt-done" },
 		];
 		try {
 			await session(cancelAll, async (rpc, files) => {
@@ -650,9 +665,9 @@ async function main(): Promise<void> {
 		];
 		const steps: Step[] = [
 			planFor(lanes, { implementer: 1, quick: 1, explorer: 1 }),
-			{ task: ["storm-implementer"], as: "P", say: "E2E-CHILD-DELAY 1500 E2E-PRODUCER-NO-REPORT" },
+			{ task: ["storm-implementer"], as: "P", say: "E2E-CHILD-DELAY 1500 E2E-PRODUCER-NO-REPORT E2E-CHILD-CLAIM producer-settled" },
 			{ task: ["storm-quick"], as: "Q", say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-MISSING-FILLER E2E-CHILD-CLAIM ${TRACKED_CLAIM}` },
-			{ task: ["storm-explorer"], as: "C", say: "E2E-MISSING-CONSUMER", afterResult: 'id="P0"' },
+			{ task: ["storm-explorer"], as: "C", say: "E2E-MISSING-CONSUMER", afterResult: "producer-settled" },
 		];
 		await session(cancelAll, async (rpc, files) => {
 			const llm = new LlmCursor(env);
@@ -661,7 +676,7 @@ async function main(): Promise<void> {
 			await rpc.prompt(startRun(steps), 120_000);
 			const run = await files.finishedRun(before, 180_000);
 			const frames = rpc.frames.slice(from);
-			const producer = run.agents?.find(agent => agent.id === "P0");
+			const producer = run.agents?.find(agent => agent.id === laneSpawnKey(run, "P0"));
 			const consumer = childRequests(llm, "E2E-MISSING-CONSUMER");
 			const attemptedConsumer = attempted(frames, "C0");
 			const reportMissing = !existsSync(join(env.project, "generated-report.txt"));
@@ -717,7 +732,7 @@ async function main(): Promise<void> {
 			const producerChildren = childRequests(llm, "E2E-FAILED-PRODUCER");
 			const consumer = childRequests(llm, "E2E-FAILED-CONSUMER");
 			const attemptedConsumer = attempted(frames, "C0");
-			const blockedProducer = (run.spawns ?? []).some(spawn => spawn.outcome === "blocked" && spawn.spawnKey === "P0");
+			const blockedProducer = (run.spawns ?? []).some(spawn => spawn.outcome === "blocked" && (spawn.lane === "P0" || spawn.agent === "storm-admission-missing"));
 			check(
 				"T02 failed attempt: the producer spawn was refused and no producer child ran",
 				(blockedProducer || taskErrors.length > 0) && producerChildren.length === 0,
@@ -783,8 +798,8 @@ async function main(): Promise<void> {
 		const workers = { implementer: 1, quick: 3 };
 		const steps: Step[] = [
 			planFor(lanes, workers),
-			{ task: ["storm-implementer"], as: "H", say: "E2E-CHILD-DELAY 1000 E2E-T03-HOLDER" },
-			{ task: ["storm-quick"], as: "W", say: `E2E-T03-WRITER E2E-CHILD-SH ${b64(w0Command)}` },
+			{ task: ["storm-implementer"], as: "H", say: "E2E-CHILD-DELAY 1000 E2E-T03-HOLDER E2E-CHILD-CLAIM h0-idle" },
+			{ task: ["storm-quick"], as: "W", say: `E2E-T03-WRITER E2E-CHILD-SH ${b64(w0Command)} E2E-CHILD-CLAIM t03-writer-done` },
 			{
 				tasks: [
 					{ name: "X0", agent: "storm-quick", task: "Write the shared file", say: `E2E-T03-BATCH E2E-CHILD-SH ${b64(batchCommand)}` },
@@ -793,12 +808,12 @@ async function main(): Promise<void> {
 			},
 			planFor(lanes.map(lane => (lane.name === "W0" ? { ...lane, progress } : lane)), workers),
 			// A work-bearing follow-up to the idle holder: its lane owns the file W0 is writing.
-			{ followUp: "agent://H0", content: `E2E-T03-WORK-FOLLOW E2E-CHILD-BASH ${TRACKED_FILE}` },
+			{ followUp: "agent://@H0", content: `E2E-T03-WORK-FOLLOW E2E-CHILD-BASH ${TRACKED_FILE}`, afterResult: "h0-idle" },
 			// Native progress note: same agent handle with `?progress`. It wakes the idle holder into a read-only turn: let through.
-			{ edit: "agent://H0?progress" },
+			{ edit: "agent://@H0?progress", afterResult: "h0-idle" },
 			{
 				tasks: [{ name: "X1", agent: "storm-quick", task: "Write the independent file", say: `E2E-T03-INDEPENDENT-LATE E2E-CHILD-SH ${b64(independentCommand)}` }],
-				afterResult: 'id="W0"',
+				afterResult: "t03-writer-done",
 			},
 		];
 		try {
@@ -810,11 +825,12 @@ async function main(): Promise<void> {
 				await until(() => (existsSync(join(dir, "w0-cwd")) ? true : undefined), 20_000, "the writer to start").catch(() => false);
 				const run = await files.finishedRun(before, 180_000);
 				const frames = rpc.frames.slice(from);
-				const holder = run.agents?.find(agent => agent.id === "H0");
+				const holderKey = laneSpawnKey(run, "H0");
+				const holder = run.agents?.find(agent => agent.id === holderKey);
 				const batchChildren = childRequests(llm, "E2E-T03-BATCH");
 				const independentLate = childRequests(llm, "E2E-T03-INDEPENDENT-LATE");
 				const routed = (run.spawns ?? []).filter(spawn => spawn.outcome !== "blocked");
-				const blockedBatchRouted = routed.filter(spawn => (spawn.lane === "X0" || spawn.lane === "X1") && spawn.spawnKey !== "X1");
+				const blockedBatchRouted = routed.filter(spawn => spawn.lane === "X0");
 				check(
 					"T03 conflict: the fresh batch is attempted while W0 owns the shared file",
 					attempted(frames, "X0") && attempted(frames, "X1") && existsSync(join(dir, "w0-cwd")),
@@ -834,7 +850,7 @@ async function main(): Promise<void> {
 					`H0=${JSON.stringify(holder)} workFollows=${JSON.stringify(workFollows.map(entry => entry.ts))} w0DoneAt=${w0DoneAt ?? "missing"} run=${run.runId}`,
 				);
 				const mainEntries = llm.of("main");
-				const noteAt = mainEntries.findIndex(entry => entry.decision.tool === "write" && entry.decision.args?.path === "agent://H0?progress");
+				const noteAt = mainEntries.findIndex(entry => entry.decision.tool === "write" && entry.decision.args?.path === `agent://${holderKey ?? "H0"}?progress`);
 				const noteResult = noteAt < 0 ? undefined : mainEntries.slice(noteAt + 1).find(entry => entry.lastTool !== "")?.lastTool;
 				check(
 					"T03 progress: the native ?progress note to the idle holder is not refused with lane-write while W0 writes, and is no follow-up",
@@ -847,7 +863,7 @@ async function main(): Promise<void> {
 						existsSync(join(dir, "independent-cwd")) &&
 						existsSync(join(env.project, "other-t03.txt")) &&
 						readFileSync(join(env.project, "other-t03.txt"), "utf8") === "independent t03\n" &&
-						routed.some(spawn => spawn.lane === "X1" && spawn.spawnKey === "X1"),
+						routed.some(spawn => spawn.lane === "X1"),
 					`lateChildren=${independentLate.map(entry => entry.ts).join(",") || "none"} marker=${existsSync(join(dir, "independent-cwd"))} content=${JSON.stringify(existsSync(join(env.project, "other-t03.txt")) ? readFileSync(join(env.project, "other-t03.txt"), "utf8") : "")} spawns=${JSON.stringify(routed.map(spawn => [spawn.spawnKey, spawn.lane]))}`,
 				);
 				check(
@@ -959,8 +975,8 @@ async function main(): Promise<void> {
 			const readsB = childRequests(llm, "E2E-READ-B");
 			const contentA = readsA.some(entry => entry.lastTool.includes(FACT_LINE));
 			const contentB = readsB.some(entry => entry.lastTool.includes(FACT_LINE));
-			const agentA = run.agents?.find(agent => agent.id === "R0");
-			const agentB = run.agents?.find(agent => agent.id === "R1");
+			const agentA = run.agents?.find(agent => agent.id === laneSpawnKey(run, "R0"));
+			const agentB = run.agents?.find(agent => agent.id === laneSpawnKey(run, "R1"));
 			const overlapped = agentA !== undefined && agentB !== undefined && agentA.lastActivityAt > agentB.startedAt && agentB.lastActivityAt > agentA.startedAt;
 			const routed = (run.spawns ?? []).filter(spawn => spawn.outcome !== "blocked").map(spawn => spawn.lane);
 			check(

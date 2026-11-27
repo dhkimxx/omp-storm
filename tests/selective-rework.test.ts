@@ -120,10 +120,11 @@ async function start(run: Run, plan: RunPlan, laneName: string, dispatch: string
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(plan.lanes.flatMap(candidate => (candidate.dependsOn ?? []).map(dependency => dependency.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	// R4: manual planned items are keyed by their lane's own name.
-	const spawnKey = laneName;
+	// R4: a manual planned item is keyed by the placed name — the lane's own name on its first attempt in this run,
+	// and a run-unique handle on a re-attempt (omp would dedupe the reused name to `<lane>-2`).
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
+	const spawnKey = String(bound.input.name);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);
 	agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: T0 + 1 }));

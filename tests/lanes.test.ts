@@ -22,7 +22,7 @@ test("two same-role lanes require actual distinct assignments and a spawned work
 	const stray = new RunLanes("run-stray");
 	const unmatched = stray.assign({ agent: "storm-implementer", task: "Implement" }, p, team);
 	expect(unmatched.ok).toBe(true);
-	if (unmatched.ok) expect(unmatched.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
+	if (unmatched.ok) expect(unmatched.input.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	expect(work.assign({ tasks: [{ agent: "storm-implementer", name: "api" }, { agent: "storm-implementer", name: "api" }] }, p, team).ok).toBe(false);
 	const id = assigned(work, p, "api");
 	expect(work.admit({ spawnKey: id, agent: "storm-explorer", outcome: "routed" })).toBeUndefined();
@@ -238,7 +238,7 @@ test("a planned batch resolves names to lanes and places everything else unplann
 		const tasks = mixed.input.tasks as Array<Record<string, unknown>>;
 		expect(tasks[0]).toMatchObject({ name: "A", isolated: true });
 		expect(tasks[1]).toMatchObject({ isolated: true });
-		expect(tasks[1]!.name).toMatch(/^storm-implementer-\d+-\d+$/);
+		expect(tasks[1]!.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	}
 	// A manual planned item keeps its lane name and its isolation placement.
 	const good = new RunLanes("run-atomic-good");
@@ -291,7 +291,7 @@ test("a planned batch resolves names to lanes and places everything else unplann
 	expect(wrongRole.ok).toBe(true);
 	if (wrongRole.ok) {
 		const tasks = wrongRole.input.tasks as Array<Record<string, unknown>>;
-		expect(tasks[0]!.name).toMatch(/^storm-explorer-\d+-\d+$/);
+		expect(tasks[0]!.name).toMatch(/^storm-explorer-run-.+-\d+$/);
 		expect(tasks[0]).toMatchObject({ isolated: true });
 		expect(wrongRole.notes?.some(note => note.includes(UNPLANNED_NOTE_TAG) && note.includes("역할"))).toBe(true);
 	}
@@ -334,7 +334,7 @@ test("an unplanned isolated item needs omp isolation on and apply off; a rejecte
 	expect(isolated.ok).toBe(true);
 	if (isolated.ok) {
 		expect(isolated.input).toMatchObject({ isolated: true });
-		expect(isolated.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
+		expect(isolated.input.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	}
 	// Two shared writers in one batch are refused before either reserves; no placement serial advanced.
 	const rejected = work.place(

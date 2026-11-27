@@ -1230,8 +1230,15 @@ function typedValueOf(text: string): { key?: string; value: Scalar } | undefined
 	return typedPairOf(text);
 }
 
-/** A trailing `(file.ext:line)` reference list is the answer's citation, not its content. */
-const TRAILING_REFERENCE = /\s*\((?:[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?)(?:\s*,\s*[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?)*\)\s*([.。]?)\s*$/u;
+/**
+ * A trailing `(file.ext:line)` reference list is the answer's citation, not its content. R13's aliases are rewritten
+ * to that form before the evaluator (`normalizeAnswerText`), except a Markdown link keeps its label: `[source](p:1)` is
+ * stripped too, bare or inside the parentheses, so an answer with it states exactly what the same answer with `p:1` does.
+ */
+const TRAILING_REFERENCE = new RegExp(
+	String.raw`(?:\s*\((?:\[[^\]]*\]\([A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?\)|[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?(?:\s*,\s*[A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?)*)\)|\s*\[[^\]]*\]\([A-Za-z0-9_./-]+\.[A-Za-z0-9]+(?::\d+)?\))\s*([.。]?)\s*$`,
+	"u",
+);
 
 /**
  * The typed value a whole answer states: what `typedValueOf` reads, or exactly `[the] <key> is|equals <scalar>` with at

@@ -1334,7 +1334,7 @@ export class RunController {
 				store: state.store,
 				// The run reads the director session's own background jobs through the lane table: a command the director sent to
 				// the background is a holder there, and a worker's task job that still runs keeps its reservation.
-				lanes: new RunLanes(runId, () => hostJobRows(ctx)),
+				lanes: new RunLanes(runId, () => hostJobRows(ctx), continued !== undefined),
 				attempts: new Map(),
 				attemptSerial: 0,
 				planRevision: 0,

@@ -24,6 +24,7 @@ import * as path from "node:path";
 import type { AttemptSettlement } from "../src/runtime/attempt-bridge.ts";
 import type { AttemptReport } from "../src/runtime/attempt-report.ts";
 import { answerReviewReceipt } from "../src/runtime/answer-review.ts";
+import { normalizeAnswerText } from "../src/runtime/attempt-collector.ts";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { resetLedger } from "../src/runtime/ledger.ts";
 import { evaluateSettledResults, verifyAnswerReceipt, type AnswerCitation, type ResultEvidenceItem } from "../src/runtime/result-evidence.ts";
@@ -95,6 +96,14 @@ describe("deterministic answer agreement", () => {
 		expect((await evaluate(open, "42", totalLine)).state).toBe("accepted");
 		expect((await evaluate(open, "-42", totalLine)).state).not.toBe("accepted");
 		expect((await evaluate(open, "-42", offsetLine)).state).toBe("accepted");
+	});
+
+	test("a Markdown citation is the citation, not answer content: it accepts exactly as path:line does", async () => {
+		// The host normalises an alias to `path:line` before this evaluator; a Markdown link keeps its label, and the
+		// trailing reference (bare or in parentheses) is still the citation, not prose beside the stated value.
+		for (const text of ["The total is 42 (report.json:2)", "The total is 42 (report.json#L2)", "The total is 42 ([report](report.json#L2))", "The total is 42 ([report](report.json:2))"]) {
+			expect((await evaluate(total(), normalizeAnswerText(text), totalLine)).state).toBe("accepted");
+		}
 	});
 
 	test("prose with misleading token overlap or a copied number is never fast-accepted", async () => {
@@ -260,10 +269,11 @@ async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneNa
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set((lane.dependsOn ?? []).map(dependency => dependency.lane));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	// R4: a manual planned item is keyed by its lane's own name; the placement and the spawn must use that one key.
-	const spawnKey = laneName;
+	// R4: the spawn is keyed by the placed name — the lane's own name on a first attempt, a handle on a re-attempt or a
+	// resumed run (the native session has seen the lane name).
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
+	const spawnKey = String(bound.input.name);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);
 	agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: T0 + 1 }));

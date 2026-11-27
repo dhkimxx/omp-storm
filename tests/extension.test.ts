@@ -82,6 +82,7 @@ interface Tool {
 
 const fakeSessionShutdowns: Array<(kind: Agent["kind"]) => Promise<void>> = [];
 
+
 async function shutdownFakeSessions(): Promise<void> {
 	const shutdowns = fakeSessionShutdowns.splice(0);
 	// A main session keeps its worktree lease while its workers are running, so close children first.
@@ -2177,9 +2178,11 @@ describe("the spawn hook", () => {
 		// A's reservation fills the one live native slot before any host agent row exists. The refused spawn consumes
 		// its placement (a blocked spawn never leaves a reservation behind), so the retry needs a new task call.
 		expect(verdict(await spawn("B", 1))).toBe("parallelism");
-		expect(verdict(await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "B", task: "read b" } }, main))).toBe("pass");
+		const retried = (await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-explorer", name: "B", task: "read b" } }, main)) as { input: { name: string } };
+		// The host named the refused spawn; the lane's retry gets a run-unique handle (R4/HF-2).
+		expect(retried.input.name).not.toBe("B");
 		// OMP's unlimited value adds no Storm cap of its own.
-		expect(verdict(await spawn("B", 0))).toMatch(/^route:/);
+		expect(verdict(await spawn(retried.input.name, 0))).toMatch(/^route:/);
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -5766,8 +5769,10 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 			expect(JSON.stringify(refused)).toContain(pooledThreadNotice("storm-explorer"));
 			// A refused spawn releases its placement, so the retry is a new director call and a new placement, exactly as the
 			// director's next task call after the refusal would be.
-			expect(verdict(await omp.emit("tool_call", ninthCall, main))).toBe("pass");
-			const allowed = await withActiveSettings(Settings.isolated({ "task.workerThreads": 0 }), () => omp.emit("before_subagent_spawn", ninth, main));
+			const retried = (await omp.emit("tool_call", ninthCall, main)) as { input: { name: string } };
+			// The host named the refused spawn; the lane's retry gets a run-unique handle (R4/HF-2).
+			expect(retried.input.name).not.toBe(names[8]);
+			const allowed = await withActiveSettings(Settings.isolated({ "task.workerThreads": 0 }), () => omp.emit("before_subagent_spawn", spawnOf("storm-explorer", retried.input.name), main));
 			expect(verdict(allowed)).toMatch(/^route:/);
 			await omp.emit("session_shutdown", {}, main);
 		}, 30_000);

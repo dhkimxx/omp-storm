@@ -476,6 +476,52 @@ function writeCall(path: string, content: string): Decision {
 	return { kind: "tool", name: "write", args: { path, content } };
 }
 
+/**
+ * Native agent ids of the latest spawn per approved agent, read from the director's own task results. Storm names every
+ * placement with a run-unique handle, so a scripted follow-up addresses `agent://@<agent>` and this table turns it into
+ * the id the host really allocated; only tests need this, the product's director reads the id from the task result.
+ */
+const spawnedIds = new Map<string, string>();
+
+function spawnTarget(path: string): string {
+	const match = /^agent:\/\/@([^?/]+)(.*)$/.exec(path);
+	if (match === null) return path;
+	const id = spawnedIds.get(match[1]!);
+	return id === undefined ? path : `agent://${id}${match[2] ?? ""}`;
+}
+
+function noteSpawnedAgents(messages: Message[]): void {
+	for (let at = 0; at < messages.length; at++) {
+		const message = messages[at];
+		if (message?.role !== "assistant") continue;
+		const call = message.tool_calls?.find(item => item.function?.name === "task");
+		if (call === undefined) continue;
+		let args: unknown;
+		try {
+			args = JSON.parse(call.function?.arguments ?? "");
+		} catch {
+			continue;
+		}
+		if (args === null || typeof args !== "object") continue;
+		const record = args as Record<string, unknown>;
+		const items: unknown[] = Array.isArray(record.tasks) ? record.tasks : [record];
+		const after = messages.slice(at + 1).map(entry => textOf(entry.content)).join("\n");
+		for (const item of items) {
+			if (item === null || typeof item !== "object") continue;
+			const { name, agent, task } = item as { name?: unknown; agent?: unknown; task?: unknown };
+			if (typeof name !== "string" || typeof agent !== "string") continue;
+			const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			// A one-item call lists "Spawned agent `<id>`"; a batch lists every id in backticks under "Spawned N agents".
+			const id = new RegExp(`\`(${escaped}(?:-\\d+)?)\``).exec(after)?.[1];
+			if (id === undefined) continue;
+			spawnedIds.set(agent, id);
+			// The lane the placement bound is in the assignment's contract block; a follow-up addresses it by that name.
+			const lane = typeof task === "string" ? /레인: "([^"]+)"/.exec(task)?.[1] : undefined;
+			if (lane !== undefined) spawnedIds.set(lane, id);
+		}
+	}
+}
+
 /** A `bash` call: a change made this way is invisible to the edit-tool counter. */
 function bashCall(tools: Tool[] | undefined, command: string): Decision {
 	return { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command } };
@@ -604,11 +650,11 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 		const decision = taskItemsCall(tools, step.tasks, step.context ?? "OMP Storm E2E");
 		return step.awaitChildren === undefined ? decision : { ...decision, awaitChildren: step.awaitChildren };
 	}
-	if ("read" in step) return readCall(tools, step.read);
+	if ("read" in step) return readCall(tools, spawnTarget(step.read));
 	if ("call" in step) return { kind: "tool", name: step.call, args: { ...requiredArgs(schemaOf(tools, step.call)), ...step.args } };
-	if ("edit" in step) return writeCall(step.edit, step.content ?? "storm director check\n");
+	if ("edit" in step) return writeCall(spawnTarget(step.edit), step.content ?? "storm director check\n");
 	if ("bash" in step) return step.async === true ? { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command: step.bash, async: true } } : bashCall(tools, step.bash);
-	if ("followUp" in step) return writeCall(step.followUp, step.content ?? "follow-up");
+	if ("followUp" in step) return writeCall(spawnTarget(step.followUp), step.content ?? "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
 	if ("wait" in step) {
 		const decision = extensionCall(tools, "wait", {});
@@ -621,7 +667,12 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | undefined): Decision {
 	if (!step) return { kind: "text", text: "done" };
 	const seen = (text: string, from: (role: string) => boolean) => later.some(m => from(m.role) && textOf(m.content).includes(text));
-	if (step.afterResult !== undefined && !seen(step.afterResult, role => role === "user")) return { kind: "text", text: "waiting" };
+	// `@agent` is the test-only latest-spawn placeholder: the native id is resolved when the step is judged, and the
+	// async result of that spawn is the message the step waits for. A raw id or a claim text is matched as written.
+	const wanted = step.afterResult?.includes("@") === true
+		? step.afterResult.replace(/@([A-Za-z0-9_.-]+)/g, (whole, name: string) => spawnedIds.get(name) ?? whole)
+		: step.afterResult;
+	if (wanted !== undefined && !seen(wanted, role => role === "user")) return { kind: "text", text: "waiting" };
 	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) {
 		const gate = step.releaseFile;
 		return gate !== undefined && seen(gate.receipt, role => role === "user" || role === "tool")
@@ -629,7 +680,9 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 			: { kind: "text", text: "waiting" };
 	}
 	// A follow-up waits for its target's async result (a user message), so the target's usage is on the ledger by then.
-	if ("followUp" in step && !seen(step.followUp.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
+	// An `@agent` target is a test-only placeholder the fake model resolves to a native handle: its raw text never
+	// appears in the conversation, so such a step says what it waits for through `after`/`afterResult`.
+	if ("followUp" in step && !step.followUp.includes("@") && !seen(step.followUp.replace(/^agent:\/\//, ""), role => role === "user")) return { kind: "text", text: "waiting" };
 	if ("ifAskApproved" in step) {
 		// The step still consumes its slot on a denial, so the script proceeds without applying the proposed effect.
 		return approvedByAsk(lastAskResult(later) ?? "") ? bashCall(tools, step.ifAskApproved) : extensionCall(tools, "storm", { action: "status" });
@@ -695,7 +748,7 @@ function childDecision(request: ChatRequest): Decision {
 	if (sh !== undefined && shells === before) return bashCall(request.tools, Buffer.from(sh, "base64").toString("utf8"));
 	if (bash !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${bash}`);
 	const writes = calls.filter(name => name === "write").length;
-	if (send !== undefined && writes === 0) return writeCall(`agent://${send[1]}`, send[2] ?? "hello");
+	if (send !== undefined && writes === 0) return writeCall(spawnTarget(`agent://${send[1]}`), send[2] ?? "hello");
 	if (write !== undefined && writes < (send === undefined ? 1 : 2)) return writeCall(write, "storm child change\n");
 	// Woken after it already answered (a text reply, then a new user message): the answer is the scenario's own word.
 	const answeredAt = messages.findIndex(message => message.role === "assistant" && !hasCalls(message) && textOf(message.content) !== "");
@@ -746,6 +799,7 @@ function decide(request: ChatRequest, who: Who): Decision {
 		return { kind: "text", text: JSON.stringify(isRecord(reply) ? reply : { action: "menu" }) };
 	}
 	if (who === "child") return childDecision(request);
+	if (who === "main") noteSpawnedAgents(messages);
 	const scripted = scriptedSteps(messages, request.tools);
 	if (scripted) return scripted;
 	if (messages.at(-1)?.role === "tool") return { kind: "text", text: "done" };
