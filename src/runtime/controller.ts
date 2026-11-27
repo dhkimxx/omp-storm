@@ -40,6 +40,7 @@ import type {
 	RunAdjustment,
 	SpawnBlockCode,
 	SpawnRecord,
+	SpawnStop,
 	StormConfig,
 	UnplannedDelivery,
 	UiPort,
@@ -65,6 +66,7 @@ import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, Attempt
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, trackUnprovenCheck, uncertainCheckBlock, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import { forgetTrialSpawns } from "./trials.ts";
 import { runConfiguredJob, targetJobBlock } from "./job-executor.ts";
 import {
 	CLOSEOUT_TITLE,
@@ -87,7 +89,7 @@ import {
 	revalidateCheckpointProof,
 } from "./checkpoint-import.ts";
 import { hostJobRows } from "./host-jobs.ts";
-import { dependencyBlock, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, writerFreedNotice, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { dependencyBlock, forgetRunLanes, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, writerFreedNotice, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
 import { reviewLane, type LanePolicy } from "../policy/capability.ts";
 import {
 	attemptInputsCurrent,
@@ -284,6 +286,14 @@ export function noteRunRan(runId: string, spawnKey: string, ran: RanModel): void
 	// woken again) never replaces it.
 	if (record.ran?.verdict === "mismatch" && ran.verdict !== "mismatch") return;
 	record.ran = ran;
+	touchRun(runId);
+}
+
+/** The stop the worker's own instance recorded for one attempt; a later attempt's verified reading stays its own. */
+export function noteRunStopped(runId: string, spawnKey: string, stop: SpawnStop): void {
+	const record = spawnsByRun.get(runId)?.findLast(spawn => spawn.spawnKey === spawnKey && spawn.outcome !== "blocked");
+	if (record === undefined) return;
+	record.stop = stop;
 	touchRun(runId);
 }
 
@@ -5098,6 +5108,7 @@ export class RunController {
 		let finalReason: RunEndReason =
 			reason === "verified" && (onlyExcluded || inScopeRows.some(row => row.state !== "accepted")) ? "no-progress" : reason;
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
+		forgetTrialSpawns(own.sessionDir, spawns.flatMap(spawn => (spawn.spawnKey === undefined ? [] : [spawn.spawnKey])));
 		const seen = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		// A team with doc consistency off asked for no doc findings, so none are counted.
 		const agents = docsEnabled(own.config) ? seen : seen.map(withoutDocFindings);
@@ -5195,6 +5206,9 @@ export class RunController {
 				}
 			}
 		}
+		// What the run's shared entries described has ended with its record: they must not outlive it in a long-lived host.
+		// Agent rows are process state a later run may still write to, so only the session shutdown removes them.
+		forgetRunLanes(own.record.runId);
 		return record;
 	}
 
@@ -5365,6 +5379,7 @@ const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
 	"unassigned-lane": "계획 레인 미배정",
 	"role-cap": "역할 워커 상한",
 	parallelism: "동시 상한",
+	// Legacy: removed 0.28.0 spawn prediction; kept only so a record an earlier tree wrote still has a label.
 	"pooled-thread": "풀 스레드 배치",
 	budget: "예산 초과",
 	internal: "내부 오류",
@@ -5389,10 +5404,11 @@ export function summarizeRun(run: RunRecord): string {
 			)
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
-	// What a spawn was answered with is not what ran: only a child's own first request says that, and only where one was read.
+	// What a spawn was answered with is not what ran: only a child's own request says that, and only where one was read.
+	// Each `ran` is one attempt's observation, so the line names the attempts rather than current status (RF4-8).
 	const verified = run.spawns.filter(spawn => spawn.ran?.verdict === "verified").length;
 	const mismatched = run.spawns.filter(spawn => spawn.ran?.verdict === "mismatch").length;
-	const ranLine = verified + mismatched === 0 ? "" : ` · 실행 모델 확인 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
+	const ranLine = verified + mismatched === 0 ? "" : ` · 시도별 실행 모델 관측 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
 	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept and
 	// from every uncapped run.

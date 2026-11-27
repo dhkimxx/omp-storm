@@ -8,18 +8,20 @@
  * only those host-supplied facts: never cwd alone, a model reply, or a bare id. The record is a claimable, revocable
  * capability, not a second team approval: a missing or invalid record never grants anything.
  */
-import { link, lstat, mkdir, open, readFile, readdir, realpath, rm, stat, chmod } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, chmod } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
+import { buildId } from "./build.ts";
 import { sha256Hex } from "./config/canonical.ts";
+import { MAX_ADMISSION_BYTES, validModelSelector } from "./config/schema.ts";
 import { serialized, writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
 import { isSpendClose, type SpendClose, type SpendCloseRead } from "./policy/spend-close.ts";
 import { assertSessionStoreSafe } from "./session-scope.ts";
-import { EFFORTS } from "./types.ts";
+import { EFFORTS, type WorkerStopReason } from "./types.ts";
 
-export const WORKER_ADMISSION_SCHEMA = "storm.worker-admission/v1";
+export const WORKER_ADMISSION_SCHEMA = "storm.worker-admission/v2";
 const KEY = /^[0-9a-f]{64}$/;
 const ATTEMPT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
@@ -27,11 +29,15 @@ const MAX_ID = 512;
 const MAX_PATHS = 256;
 const MAX_PATH = 1024;
 const MAX_RECORDS = 512;
-/** One worker's approved-model snapshot: a role's models plus a trial candidate. More is not a team this check can hold. */
-const MAX_APPROVED = 256;
 const ACTIVE_TTL_MS = 7 * 24 * 60 * 60_000;
 const CLOSED_TTL_MS = 24 * 60 * 60_000;
 const LOCK_RETRY_MS = 10;
+/** How long a conditional record update waits for another copy's short critical section, and when a leftover lock is abandoned. */
+const LOCK_WAIT_MS = 2_000;
+const LOCK_STALE_MS = 5_000;
+/** Schema tags an older release wrote. Housekeeping recognizes them only to remove them after their own lifetime; never to grant. */
+const OBSOLETE_ADMISSION_SCHEMAS: readonly string[] = ["storm.worker-admission/v1"];
+const OBSOLETE_RUN_SCHEMAS: readonly string[] = ["storm.worker-run/v1"];
 
 export interface WorkerAdmissionPolicy {
 	kind: LanePolicy["kind"];
@@ -48,6 +54,8 @@ export interface WorkerAdmissionPolicy {
 /** The exact authority one admitted worker may exercise on the target. */
 export interface WorkerAdmissionRecord {
 	schema: typeof WORKER_ADMISSION_SCHEMA;
+	/** The build of Storm that wrote this record; a copy of another build never reads it. */
+	build: string;
 	/** sha256 of the canonical artifact root, parent id and child id. */
 	key: string;
 	runId: string;
@@ -80,6 +88,29 @@ export interface WorkerAdmissionRecord {
 	 * could not name them: a worker whose run is not in its thread's memory and whose record lacks them is stopped, never let through.
 	 */
 	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
+	/**
+	 * Why this attempt was stopped by the worker's own instance, written at the moment it withdrew the record's authority.
+	 * A closed reason, not free text: the director writes its own sentence from it. Absent for an ordinary end.
+	 */
+	stop?: WorkerStop;
+}
+
+/** Why a worker stopped itself: the closed set the director turns into a sentence. */
+export type { WorkerStopReason };
+
+export interface WorkerStop {
+	reason: WorkerStopReason;
+	at: number;
+}
+
+const STOP_REASONS: readonly WorkerStopReason[] = ["pooled-thread", "state-not-shared"];
+
+/** One worker's stop as the director's thread reads it: the attempt it belongs to, never an earlier one. */
+export interface WorkerStopReading {
+	childId: string;
+	attempt: string;
+	reason: WorkerStopReason;
+	at: number;
 }
 
 export interface WorkerAdmissionInput {
@@ -131,17 +162,21 @@ function isPolicy(value: unknown): value is WorkerAdmissionPolicy {
 	return value.paths.every(item => typeof item === "string" && item.length <= MAX_PATH && normalizeScopePath(item) === item);
 }
 
-/** One approved model entry: `provider/id`, bounded and free of control characters, at a known effort when one is given. */
+/** One approved model entry: `provider/id` under the same rule the team config uses, at a known effort when one is given. */
 function isApprovedEntry(value: unknown): value is { selector: string; effort?: (typeof EFFORTS)[number] } {
-	if (!isRecord(value) || typeof value.selector !== "string") return false;
-	const selector = value.selector;
-	const slash = selector.indexOf("/");
-	if (slash <= 0 || slash === selector.length - 1 || selector.length > MAX_ID || CONTROL_CHARS.test(selector)) return false;
+	if (!isRecord(value) || !validModelSelector(value.selector)) return false;
 	return value.effort === undefined || (typeof value.effort === "string" && EFFORTS.includes(value.effort as (typeof EFFORTS)[number]));
+}
+
+function isStop(value: unknown): value is WorkerStop {
+	if (!isRecord(value)) return false;
+	if (typeof value.reason !== "string" || !STOP_REASONS.includes(value.reason as WorkerStopReason)) return false;
+	return typeof value.at === "number" && Number.isFinite(value.at) && value.at > 0;
 }
 
 function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (!isRecord(value) || value.schema !== WORKER_ADMISSION_SCHEMA) return false;
+	if (typeof value.build !== "string" || value.build === "" || value.build.length > MAX_ID) return false;
 	if (typeof value.key !== "string" || !KEY.test(value.key)) return false;
 	if (typeof value.attempt !== "string" || !ATTEMPT.test(value.attempt)) return false;
 	for (const field of ["runId", "sessionId", "sessionDir", "repoId", "targetRoot", "artifactRoot", "parentId", "childId"] as const) {
@@ -161,8 +196,9 @@ function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (value.revokedAt !== undefined && (typeof value.revokedAt !== "number" || !Number.isFinite(value.revokedAt))) return false;
 	if (value.endedAt !== undefined && (typeof value.endedAt !== "number" || !Number.isFinite(value.endedAt))) return false;
 	if (value.approved !== undefined) {
-		if (!Array.isArray(value.approved) || value.approved.length > MAX_APPROVED || !value.approved.every(isApprovedEntry)) return false;
+		if (!Array.isArray(value.approved) || !value.approved.every(isApprovedEntry)) return false;
 	}
+	if (value.stop !== undefined && !isStop(value.stop)) return false;
 	return true;
 }
 
@@ -218,6 +254,11 @@ function claimFile(dir: string, key: string, attempt: string): string {
 	return path.join(dir, `${key}.${attempt}.claim`);
 }
 
+/** The queue one child's persisted authority is written, stopped and revoked through, so those steps never interleave. */
+export function admissionKey(runId: string, childId: string): string {
+	return `admission:${runId}:${childId}`;
+}
+
 /** Create the profile-owned admission directory and prove it is neither a symlink escape nor inside the target. */
 async function ensureAdmissionsDir(agentDir: string, targetRoot: string): Promise<string> {
 	const dir = admissionsDir(agentDir);
@@ -243,7 +284,7 @@ function policyOf(policy: LanePolicy): WorkerAdmissionPolicy {
 	return { kind: policy.kind, paths, reason: policy.reason.slice(0, 2_000), ...(policy.kind === "read" && policy.shell === true ? { shell: true as const } : {}) };
 }
 
-async function readRecordFile(file: string): Promise<{ kind: "missing" } | { kind: "invalid"; reason: string } | { kind: "value"; value: unknown }> {
+async function readRecordFile(file: string, maxBytes = MAX_ADMISSION_BYTES): Promise<{ kind: "missing" } | { kind: "invalid"; reason: string } | { kind: "value"; value: unknown }> {
 	let info;
 	try {
 		info = await lstat(file);
@@ -253,11 +294,168 @@ async function readRecordFile(file: string): Promise<{ kind: "missing" } | { kin
 	}
 	// A symlink is not a record Storm wrote; never follow it.
 	if (!info.isFile()) return { kind: "invalid", reason: "자식 권한 기록이 일반 파일이 아닙니다" };
+	if (info.size > maxBytes) return { kind: "invalid", reason: "자식 권한 기록이 너무 큽니다" };
 	try {
 		return { kind: "value", value: JSON.parse(await readFile(file, "utf8")) };
 	} catch {
 		return { kind: "invalid", reason: "자식 권한 기록이 손상됐습니다" };
 	}
+}
+
+/**
+ * One record's short critical section, shared by every loaded copy of this build on every thread: an exclusive create
+ * under the profile. The section itself is a read and a rename, never a slow write, because the content that precedes it
+ * is a temp file made outside the lock. A lock a writer left behind by dying is abandoned after `LOCK_STALE_MS`; a live
+ * one is waited for only `LOCK_WAIT_MS`, then the caller fails closed.
+ */
+async function withRecordLock<T>(dir: string, key: string, task: () => Promise<T>): Promise<T> {
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const lock = path.join(dir, `.${key}.lock`);
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	for (;;) {
+		try {
+			await (await open(lock, "wx", 0o600)).close();
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const info = await lstat(lock).catch(() => undefined);
+			if (info !== undefined && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+				await rm(lock, { force: true }).catch(() => undefined);
+				continue;
+			}
+			if (Date.now() >= deadline) throw new Error("자식 권한 기록의 잠금을 기다리다 시간이 지났습니다");
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, LOCK_RETRY_MS);
+			await promise;
+		}
+	}
+	try {
+		return await task();
+	} finally {
+		await rm(lock, { force: true }).catch(() => undefined);
+	}
+}
+
+/**
+ * Publishes `next` only if the record is still the record `expected` was read as, under the record's lock. The new
+ * content is written to a temp file first, so the lock is held only for the compare and the rename. This is what makes
+ * every change conditional on the attempt it was read for: a stop for attempt T can never replace T+1, whichever copy
+ * or thread writes it.
+ */
+async function publishRecord(dir: string, file: string, key: string, expected: WorkerAdmissionRecord, next: WorkerAdmissionRecord): Promise<boolean> {
+	const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
+	await writeJsonAtomic(temp, next);
+	try {
+		return await withRecordLock(dir, key, async () => {
+			const read = await readRecordFile(file);
+			if (read.kind !== "value" || !isAdmission(read.value)) return false;
+			const current = read.value;
+			if (current.build !== expected.build || current.attempt !== expected.attempt) return false;
+			if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
+			await rename(temp, file);
+			await chmod(file, 0o600).catch(() => undefined);
+			return true;
+		});
+	} finally {
+		await rm(temp, { force: true }).catch(() => undefined);
+	}
+}
+
+/**
+ * Reads one record of this build and publishes what `change` derives from it, retrying when another copy changed the
+ * record between the read and the publish. A record of another build, or a change that no longer applies, writes nothing.
+ */
+async function mutateRecord(
+	dir: string,
+	file: string,
+	key: string,
+	change: (record: WorkerAdmissionRecord) => WorkerAdmissionRecord | undefined,
+): Promise<boolean> {
+	for (let round = 0; round < 3; round++) {
+		const read = await readRecordFile(file);
+		if (read.kind !== "value" || !isAdmission(read.value)) return false;
+		const current = read.value;
+		if (current.build !== buildId()) return false;
+		const next = change(current);
+		if (next === undefined) return false;
+		if (JSON.stringify(next) === JSON.stringify(current)) return true;
+		if (await publishRecord(dir, file, key, current, next)) return true;
+	}
+	return false;
+}
+
+/** The same conditional publication for one run marker. */
+async function mutateMarker(
+	dir: string,
+	file: string,
+	key: string,
+	change: (marker: WorkerRunMarker) => WorkerRunMarker | undefined,
+): Promise<boolean> {
+	for (let round = 0; round < 3; round++) {
+		const read = await readRecordFile(file);
+		if (read.kind !== "value" || !isRunMarker(read.value)) return false;
+		const current = read.value;
+		if (current.build !== buildId()) return false;
+		const next = change(current);
+		if (next === undefined) return false;
+		if (JSON.stringify(next) === JSON.stringify(current)) return true;
+		const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
+		await writeJsonAtomic(temp, next);
+		try {
+			const published = await withRecordLock(dir, key, async () => {
+				const again = await readRecordFile(file);
+				if (again.kind !== "value" || !isRunMarker(again.value)) return false;
+				if (again.value.build !== current.build || again.value.key !== current.key) return false;
+				if (JSON.stringify(again.value) !== JSON.stringify(current)) return false;
+				await rename(temp, file);
+				await chmod(file, 0o600).catch(() => undefined);
+				return true;
+			});
+			if (published) return true;
+		} finally {
+			await rm(temp, { force: true }).catch(() => undefined);
+		}
+	}
+	return false;
+}
+
+function obsoleteSchema(value: unknown, schemas: readonly string[]): boolean {
+	return isRecord(value) && typeof value.schema === "string" && schemas.includes(value.schema);
+}
+
+/** Whether the record's own run marker still names a live run of this build: a live run's records are never pruned for age. */
+async function runIsLive(dir: string, record: WorkerAdmissionRecord, now: number): Promise<boolean> {
+	const key = runMarkerKey(record.artifactRoot, record.parentId);
+	const read = await readRecordFile(path.join(runsDir(dir), `${key}.json`));
+	// Only a readable marker of this build for this exact run proves the run closed. Anything else cannot prove it, and a
+	// record whose run may still be live is kept rather than pruned.
+	if (read.kind === "missing") return false;
+	if (read.kind === "invalid" || !isRunMarker(read.value)) return true;
+	const marker = read.value;
+	if (marker.build !== buildId() || marker.key !== key) return true;
+	if (marker.runId !== record.runId || marker.artifactRoot !== record.artifactRoot || marker.parentId !== record.parentId) return true;
+	return marker.revokedAt === undefined && marker.expiresAt > now;
+}
+
+/** Removes one record under its lock if it is still this build's same attempt and `due` says so of the current one. */
+async function removeRecordIf(
+	dir: string,
+	file: string,
+	expected: WorkerAdmissionRecord,
+	due: (record: WorkerAdmissionRecord, ageMs: number) => boolean | Promise<boolean>,
+): Promise<boolean> {
+	const key = path.basename(file, ".json");
+	return withRecordLock(dir, key, async () => {
+		const current = await readRecordFile(file);
+		if (current.kind !== "value" || !isAdmission(current.value)) return false;
+		const record = current.value;
+		if (record.build !== buildId() || record.attempt !== expected.attempt || record.runId !== expected.runId) return false;
+		const info = await lstat(file).catch(() => undefined);
+		if (info === undefined) return false;
+		if (!(await due(record, Date.now() - info.mtimeMs))) return false;
+		await rm(file, { force: true });
+		return true;
+	});
 }
 
 async function prune(dir: string, now: number): Promise<void> {
@@ -268,7 +466,7 @@ async function prune(dir: string, now: number): Promise<void> {
 		return;
 	}
 	let active = 0;
-	const records: Array<{ name: string; at: number; closed: boolean }> = [];
+	const records: Array<{ name: string; at: number; closed: boolean; live: boolean; record: WorkerAdmissionRecord }> = [];
 	for (const name of names) {
 		const file = path.join(dir, name);
 		const info = await lstat(file).catch(() => undefined);
@@ -276,42 +474,51 @@ async function prune(dir: string, now: number): Promise<void> {
 		const isRecord = /^[0-9a-f]{64}\.json$/.test(name);
 		if (isRecord) {
 			const read = await readRecordFile(file);
-			const record = read.kind === "value" && isAdmission(read.value) ? read.value : undefined;
-			const closed = record !== undefined && (record.revokedAt !== undefined || record.endedAt !== undefined);
-			const age = now - info.mtimeMs;
-			if ((closed && age > CLOSED_TTL_MS) || (record !== undefined && record.expiresAt < now)) {
-				await rm(file, { force: true });
+			const value = read.kind === "value" ? read.value : undefined;
+			// An older release's tombstone carries no authority in this build; housekeeping may remove it once its own
+			// active lifetime is over. It is never read as this build's admission.
+			if (obsoleteSchema(value, OBSOLETE_ADMISSION_SCHEMAS)) {
+				if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true });
 				continue;
 			}
+			// A record of another build, or one this build cannot read, is never removed and never counted here.
+			if (value === undefined || !isAdmission(value) || value.build !== buildId()) continue;
+			const record = value;
+			const closed = record.revokedAt !== undefined || record.endedAt !== undefined;
+			const live = closed && (await runIsLive(dir, record, now));
+			const age = now - info.mtimeMs;
+			if (!live && ((closed && age > CLOSED_TTL_MS) || record.expiresAt < now)) {
+				const removed = await removeRecordIf(dir, file, record, async (current, currentAge) => {
+					const nowClosed = current.revokedAt !== undefined || current.endedAt !== undefined;
+					if (!nowClosed && current.expiresAt >= now) return false;
+					if (nowClosed && currentAge <= CLOSED_TTL_MS && current.expiresAt >= now) return false;
+					return !(nowClosed && (await runIsLive(dir, current, now)));
+				});
+				if (removed) continue;
+			}
 			if (!closed) active++;
-			records.push({ name, at: record?.createdAt ?? info.mtimeMs, closed });
+			records.push({ name, at: record.createdAt, closed, live, record });
 			continue;
 		}
 		if (name.endsWith(".claim") && now - info.mtimeMs > CLOSED_TTL_MS) await rm(file, { force: true });
 	}
 	if (records.length <= MAX_RECORDS) return;
 	records.sort((a, b) => (a.closed === b.closed ? a.at - b.at : a.closed ? -1 : 1));
-	for (const record of records.slice(0, Math.max(0, records.length - MAX_RECORDS))) {
-		if (!record.closed) break;
-		await rm(path.join(dir, record.name), { force: true });
+	for (const entry of records.slice(0, Math.max(0, records.length - MAX_RECORDS))) {
+		if (!entry.closed) break;
+		if (entry.live) continue;
+		await removeRecordIf(dir, path.join(dir, entry.name), entry.record, current => current.revokedAt !== undefined || current.endedAt !== undefined);
 	}
 	if (active > MAX_RECORDS) throw new Error("보관 중인 자식 권한 기록이 너무 많습니다");
-	// A stop directory belongs to one run; a run's own end removes it. A store left behind by a crash must not accumulate.
-	const stops = path.join(dir, "stops");
-	for (const name of await readdir(stops).catch(() => [] as string[])) {
-		const file = path.join(stops, name);
-		const info = await lstat(file).catch(() => undefined);
-		if (info === undefined || !info.isDirectory()) continue;
-		if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { recursive: true, force: true });
-	}
 }
 
-const RUN_MARKER_SCHEMA = "storm.worker-run/v1";
+const RUN_MARKER_SCHEMA = "storm.worker-run/v2";
 const RUN_KEY = /^[0-9a-f]{64}$/;
 const MAX_RUN_MARKERS = 128;
 
 interface WorkerRunMarker {
 	schema: typeof RUN_MARKER_SCHEMA;
+	build: string;
 	key: string;
 	runId: string;
 	sessionId: string;
@@ -341,6 +548,7 @@ function runsDir(dir: string): string {
 
 function isRunMarker(value: unknown): value is WorkerRunMarker {
 	if (!isRecord(value) || value.schema !== RUN_MARKER_SCHEMA) return false;
+	if (typeof value.build !== "string" || value.build === "" || value.build.length > MAX_ID) return false;
 	if (typeof value.key !== "string" || !RUN_KEY.test(value.key)) return false;
 	for (const field of ["runId", "sessionId", "sessionDir", "repoId", "targetRoot", "artifactRoot", "parentId"] as const) {
 		const fieldValue = value[field];
@@ -371,6 +579,7 @@ async function writeWorkerRunMarker(input: {
 	if (!real.startsWith(input.dir + path.sep)) throw new Error("자식 권한 실행 표시가 프로필 밖으로 연결되어 있습니다");
 	const marker: WorkerRunMarker = {
 		schema: RUN_MARKER_SCHEMA,
+		build: buildId(),
 		key: runMarkerKey(input.artifactRoot, input.parentId),
 		runId: input.runId,
 		sessionId: input.sessionId,
@@ -383,13 +592,23 @@ async function writeWorkerRunMarker(input: {
 		expiresAt: input.now + ACTIVE_TTL_MS,
 	};
 	const file = path.join(dir, `${marker.key}.json`);
-	// A spawn admitted after the limit must not erase the close: the director refuses new spawns past it, but one
-	// already in flight can still reach here. A new run of the same tree and parent writes its own run id, so it is open.
-	const existing = await readRecordFile(file);
-	if (existing.kind === "value" && isRunMarker(existing.value) && existing.value.runId === marker.runId && existing.value.spendClosedAt !== undefined) {
-		marker.spendClosedAt = existing.value.spendClosedAt;
-	}
-	await writeJsonAtomic(file, marker);
+	await withRecordLock(dir, marker.key, async () => {
+		const existing = await readRecordFile(file);
+		// Another build's marker means this profile is shared with a copy whose state this build cannot read: never replace it.
+		if (existing.kind === "invalid") throw new Error(`기존 관리 실행 표시를 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}`);
+		if (existing.kind === "value") {
+			const value = existing.value;
+			if (isRunMarker(value)) {
+				if (value.build !== marker.build) throw new Error("다른 빌드의 Storm이 쓴 관리 실행 표시가 있어 덮어쓰지 않았습니다");
+				// A spawn admitted after the limit must not erase the close: the director refuses new spawns past it, but one
+				// already in flight can still reach here. A new run of the same tree and parent writes its own run id, so it is open.
+				if (value.runId === marker.runId && value.spendClosedAt !== undefined) marker.spendClosedAt = value.spendClosedAt;
+			} else if (!obsoleteSchema(value, OBSOLETE_RUN_SCHEMAS)) {
+				throw new Error("기존 관리 실행 표시의 형식이 올바르지 않아 덮어쓰지 않았습니다");
+			}
+		}
+		await writeJsonAtomic(file, marker);
+	});
 	await chmod(file, 0o600).catch(() => undefined);
 }
 
@@ -408,13 +627,29 @@ async function pruneRunMarkers(dir: string, now: number): Promise<void> {
 		const info = await lstat(file).catch(() => undefined);
 		if (info === undefined || !info.isFile()) continue;
 		const read = await readRecordFile(file);
-		const marker = read.kind === "value" && isRunMarker(read.value) ? read.value : undefined;
-		const closed = marker?.revokedAt !== undefined;
-		if ((closed && now - info.mtimeMs > CLOSED_TTL_MS) || (marker !== undefined && marker.expiresAt < now)) {
-			await rm(file, { force: true });
+		const value = read.kind === "value" ? read.value : undefined;
+		// An older release's marker is not this build's; housekeeping removes it only after its own active lifetime.
+		if (obsoleteSchema(value, OBSOLETE_RUN_SCHEMAS)) {
+			if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true });
 			continue;
 		}
-		kept.push({ name, at: marker?.createdAt ?? info.mtimeMs, closed });
+		// Another build's marker, or one this build cannot read: never removed, never counted.
+		if (value === undefined || !isRunMarker(value) || value.build !== buildId()) continue;
+		const marker = value;
+		const closed = marker.revokedAt !== undefined;
+		if ((closed && now - info.mtimeMs > CLOSED_TTL_MS) || marker.expiresAt < now) {
+			const key = path.basename(file, ".json");
+			await withRecordLock(root, key, async () => {
+				const again = await readRecordFile(file);
+				if (again.kind !== "value" || !isRunMarker(again.value)) return;
+				if (again.value.build !== marker.build || again.value.key !== marker.key || again.value.runId !== marker.runId) return;
+				if (again.value.createdAt !== marker.createdAt) return;
+				if (now - info.mtimeMs <= CLOSED_TTL_MS && again.value.expiresAt >= now) return;
+				await rm(file, { force: true });
+			});
+			continue;
+		}
+		kept.push({ name, at: marker.createdAt, closed });
 	}
 	if (kept.length <= MAX_RUN_MARKERS) return;
 	kept.sort((a, b) => (a.closed === b.closed ? a.at - b.at : a.closed ? -1 : 1));
@@ -439,6 +674,7 @@ async function readWorkerRunMarker(
 	if (read.kind === "missing") return { kind: "missing" };
 	if (read.kind === "invalid") return read;
 	if (!isRunMarker(read.value)) return { kind: "invalid", reason: "관리 실행 표시의 형식이 올바르지 않습니다" };
+	if (read.value.build !== buildId()) return { kind: "invalid", reason: "다른 빌드의 Storm이 쓴 관리 실행 표시입니다" };
 	if (read.value.key !== key || read.value.artifactRoot !== artifactRoot || read.value.parentId !== parentId) {
 		return { kind: "invalid", reason: "관리 실행 표시의 신원이 일치하지 않습니다" };
 	}
@@ -481,9 +717,16 @@ export async function closeWorkerSpend(input: {
 		if (!isRunMarker(read.value) || read.value.key !== key || read.value.artifactRoot !== artifactRoot || read.value.parentId !== input.parentId) {
 			return { ok: false, reason: "관리 실행 표시의 신원이 일치하지 않아 예산 한도를 워커에게 알리지 못했습니다" };
 		}
+		if (read.value.build !== buildId()) return { ok: false, reason: "다른 빌드의 Storm이 쓴 관리 실행 표시라 예산 한도를 워커에게 알리지 못했습니다" };
 		if (read.value.runId !== input.runId) return { ok: false, reason: "관리 실행 표시가 다른 실행을 가리켜 예산 한도를 워커에게 알리지 못했습니다" };
-		const marker: WorkerRunMarker = { ...read.value, spendClosedAt: { at: input.now ?? Date.now(), onExceed: input.onExceed } };
-		await writeJsonAtomic(file, marker);
+		const at = input.now ?? Date.now();
+		// One conditional change, like every other marker write: published only onto the marker it was read from, under the
+		// record lock, so a marker another copy of this build replaced in between is never overwritten.
+		const closed = await mutateMarker(admissionsDir(input.agentDir), file, key, marker => {
+			if (marker.runId !== input.runId) return undefined;
+			return { ...marker, spendClosedAt: { at, onExceed: input.onExceed } };
+		});
+		if (!closed) return { ok: false, reason: "관리 실행 표시가 그 사이에 바뀌어 예산 한도를 워커에게 알리지 못했습니다" };
 		await chmod(file, 0o600).catch(() => undefined);
 		return { ok: true };
 	} catch {
@@ -530,6 +773,8 @@ export async function readWorkerSpendClose(input: {
 			read.value.parentId !== input.parentId
 		) {
 			answer = { kind: "unknown", reason: "관리 실행 표시의 형식이나 신원이 올바르지 않습니다" };
+		} else if (read.value.build !== buildId()) {
+			answer = { kind: "unknown", reason: "다른 빌드의 Storm이 쓴 관리 실행 표시입니다" };
 		} else if (read.value.spendClosedAt === undefined) {
 			answer = { kind: "open" };
 		} else {
@@ -558,6 +803,7 @@ async function hasActiveWorkerRun(agentDir: string, artifactRoot: string, now: n
 		const read = await readRecordFile(path.join(root, name));
 		if (read.kind !== "value" || !isRunMarker(read.value)) continue;
 		const marker = read.value;
+		if (marker.build !== buildId()) continue;
 		if (marker.artifactRoot !== artifactRoot) continue;
 		if (marker.revokedAt === undefined && marker.expiresAt > now) return true;
 	}
@@ -602,6 +848,7 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	const key = workerAdmissionKey(artifactRoot, parentId, childId);
 	const record: WorkerAdmissionRecord = {
 		schema: WORKER_ADMISSION_SCHEMA,
+		build: buildId(),
 		key,
 		runId,
 		sessionId,
@@ -619,11 +866,30 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	if (input.lane !== undefined) record.lane = identity(input.lane, "레인 이름");
 	if (hold !== undefined) record.hold = hold;
 	if (input.approved !== undefined) {
-		if (input.approved.length > MAX_APPROVED || !input.approved.every(isApprovedEntry)) throw new Error("승인된 모델 목록이 올바르지 않거나 너무 많습니다");
+		if (!input.approved.every(isApprovedEntry)) throw new Error("승인된 모델 목록이 올바르지 않습니다");
 		record.approved = input.approved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
 	}
+	const encoded = `${JSON.stringify(record, null, 2)}\n`;
+	if (Buffer.byteLength(encoded) > MAX_ADMISSION_BYTES) {
+		throw new Error(`자식 권한 기록이 ${MAX_ADMISSION_BYTES}바이트를 넘습니다. 역할의 모델 목록이나 레인 경로를 줄여 다시 승인하세요`);
+	}
 	const file = admissionFile(dir, key);
-	await writeJsonAtomic(file, record);
+	await withRecordLock(dir, key, async () => {
+		const existing = await readRecordFile(file);
+		// A record this build cannot read is not replaced: it may belong to another build sharing the profile, and a copy
+		// of another build must not replace what it cannot read. A missing file, this build's own record, or an older
+		// release's record are the only states a new attempt is written over.
+		if (existing.kind === "invalid") throw new Error(`기존 자식 권한 기록을 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}`);
+		if (existing.kind === "value") {
+			const value = existing.value;
+			if (isAdmission(value)) {
+				if (value.build !== record.build) throw new Error("다른 빌드의 Storm이 쓴 자식 권한 기록이 있어 덮어쓰지 않았습니다");
+			} else if (!obsoleteSchema(value, OBSOLETE_ADMISSION_SCHEMAS)) {
+				throw new Error("기존 자식 권한 기록의 형식이 올바르지 않아 덮어쓰지 않았습니다");
+			}
+		}
+		await writeJsonAtomic(file, record);
+	});
 	await chmod(file, 0o600).catch(() => undefined);
 	return { key, record };
 }
@@ -653,6 +919,7 @@ export async function readWorkerAdmission(input: {
 	if (read.kind === "invalid") return read;
 	if (!isAdmission(read.value)) return { kind: "invalid", reason: "자식 권한 기록의 형식이 올바르지 않습니다" };
 	const record = read.value;
+	if (record.build !== buildId()) return { kind: "invalid", reason: "다른 빌드의 Storm이 쓴 자식 권한 기록입니다" };
 	if (record.key !== key || record.parentId !== parentId || record.childId !== childId || record.artifactRoot !== artifactRoot) {
 		return { kind: "invalid", reason: "자식 권한 기록의 신원이 일치하지 않습니다" };
 	}
@@ -738,7 +1005,9 @@ export async function claimWorkerAdmission(
 		} finally {
 			await rm(tmp, { force: true }).catch(() => undefined);
 		}
-		await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS));
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, LOCK_RETRY_MS);
+		await promise;
 	}
 	return { ok: false, reason: "자식 권한 서명을 확인하지 못했습니다" };
 }
@@ -749,15 +1018,6 @@ interface WorkerClaim {
 	session: string;
 	/** Physical checkout this attempt was bound to. */
 	checkout: string;
-}
-
-async function rewriteRecord(file: string, change: (record: WorkerAdmissionRecord) => WorkerAdmissionRecord): Promise<boolean> {
-	const read = await readRecordFile(file);
-	if (read.kind !== "value" || !isAdmission(read.value)) return false;
-	const next = change(read.value);
-	await writeJsonAtomic(file, next);
-	await chmod(file, 0o600).catch(() => undefined);
-	return true;
 }
 
 /** Parent-side revocation for one run, one session, or one exact attempt. Closed records remain as tombstones. */
@@ -789,17 +1049,18 @@ export async function revokeWorkerAdmissions(
 	for (const name of names) {
 		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
 		const file = path.join(dir, name);
-		const read = await readRecordFile(file);
-		if (read.kind !== "value" || !isAdmission(read.value)) continue;
-		const record = read.value;
-		if (match.runId !== undefined && record.runId !== match.runId) continue;
-		if (match.sessionId !== undefined && record.sessionId !== match.sessionId) continue;
-		if (match.key !== undefined && record.key !== match.key) continue;
-		if (match.attempt !== undefined && record.attempt !== match.attempt) continue;
-		if (match.childId !== undefined && record.childId !== match.childId) continue;
-		if (match.createdBefore !== undefined && record.createdAt >= match.createdBefore) continue;
-		if (record.revokedAt !== undefined) continue;
-		if (await rewriteRecord(file, value => ({ ...value, revokedAt: now }))) count++;
+		const key = path.basename(name, ".json");
+		if (await mutateRecord(dir, file, key, record => {
+			if (record.build !== buildId()) return undefined;
+			if (match.runId !== undefined && record.runId !== match.runId) return undefined;
+			if (match.sessionId !== undefined && record.sessionId !== match.sessionId) return undefined;
+			if (match.key !== undefined && record.key !== match.key) return undefined;
+			if (match.attempt !== undefined && record.attempt !== match.attempt) return undefined;
+			if (match.childId !== undefined && record.childId !== match.childId) return undefined;
+			if (match.createdBefore !== undefined && record.createdAt >= match.createdBefore) return undefined;
+			if (record.revokedAt !== undefined) return undefined;
+			return { ...record, revokedAt: now };
+		})) count++;
 	}
 	// A run marker must close too: otherwise a child that never received a record in this run would still look
 	// managed while a finished run blocks it forever, or an unrecorded child would lose the managed marker. An exact
@@ -810,16 +1071,15 @@ export async function revokeWorkerAdmissions(
 	for (const name of markers) {
 		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
 		const file = path.join(root, name);
-		const read = await readRecordFile(file);
-		if (read.kind !== "value" || !isRunMarker(read.value)) continue;
-		const marker = read.value;
-		if (match.runId !== undefined && marker.runId !== match.runId) continue;
-		if (match.sessionId !== undefined && marker.sessionId !== match.sessionId) continue;
-		if (marker.revokedAt !== undefined) continue;
-		const next: WorkerRunMarker = { ...marker, revokedAt: now };
-		await writeJsonAtomic(file, next);
-		await chmod(file, 0o600).catch(() => undefined);
-		count++;
+		const key = path.basename(name, ".json");
+		const closed = await mutateMarker(root, file, key, marker => {
+			if (marker.build !== buildId()) return undefined;
+			if (match.runId !== undefined && marker.runId !== match.runId) return undefined;
+			if (match.sessionId !== undefined && marker.sessionId !== match.sessionId) return undefined;
+			if (marker.revokedAt !== undefined) return undefined;
+			return { ...marker, revokedAt: now };
+		});
+		if (closed) count++;
 	}
 	return count;
 }
@@ -853,7 +1113,7 @@ export async function endWorkerAdmission(
 		}
 	}
 	const file = admissionFile(dir, key);
-	return rewriteRecord(file, record => (record.attempt === attempt && record.revokedAt === undefined ? { ...record, endedAt: now } : record));
+	return mutateRecord(dir, file, key, record => (record.attempt === attempt && record.revokedAt === undefined ? { ...record, endedAt: now } : undefined));
 }
 
 export type WorkerAdmissionCheck =
@@ -941,136 +1201,83 @@ export async function resolveWorkerAdmission(input: {
 	return { kind: "authorized", record, checkout: claimed.checkout };
 }
 
-// ── why a child on another thread was stopped ──────────────────────────────────────────────────────────────────────────────
+// ── why a worker was stopped, on the worker's own record ───────────────────────────────────────────────────────────────────
 
 /**
- * What a worker whose omp thread does not share the director's Storm instance still owes the director: why it was stopped.
- * omp runs the ninth and later concurrent subagents on pooled threads, each with its own module state; a Storm worker found
- * there stops before its first request (decision D5), and this one small file per child carries the sentence to the director's
- * thread. It carries no spend and no model verdict: those cannot be established for a thread Storm does not own, and the worker
- * never runs a request there. Every field is checked before it is trusted (filename hash, bounded identities, a known attempt,
- * a finite time, a bounded one-line notice), and adoption deletes the file, so reading it twice changes nothing.
+ * A worker's own instance can stop it where the director's memory is not shared: on the host's pooled thread (decision D5)
+ * or, on the main thread, when no run of this build is in the shared state (a foreign build or lost state). It then owes
+ * the director one fact: why. That reason is a closed enum written onto the admission record the parent already wrote, at
+ * the attempt the worker is withdrawing, never free text and never a second file. The director reads its own run's
+ * records and writes the sentence itself. A record read twice is harmless: the director's seen-attempt set keeps it once.
  */
-const STOP_SCHEMA = "storm.child-stop/v1";
-const MAX_STOP_BYTES = 8 * 1024;
-const MAX_STOPS_PER_RUN = 1024;
-const MAX_NOTICE = 4_000;
-
-export interface ChildStop {
-	schema: typeof STOP_SCHEMA;
-	runId: string;
-	childId: string;
-	/** The admission attempt the stop belongs to; a newer attempt of the same child is a different record. */
-	attempt: string;
-	/** Why the worker was stopped, for the director. One line. */
-	notice: string;
-	at: number;
-}
-
-function stopsRoot(agentDir: string): string {
-	return path.join(admissionsDir(agentDir), "stops");
-}
-
-function stopsDir(agentDir: string, runId: string): string {
-	return path.join(stopsRoot(agentDir), sha256Hex(`stops\u0000${runId}`));
-}
-
-function stopFile(dir: string, childId: string): string {
-	return path.join(dir, `${sha256Hex(`child\u0000${childId}`)}.json`);
-}
-
-/** Whether the raw value is a stop this schema and run accept; the filename and the child's admission are checked by the caller. */
-function isChildStop(value: unknown, runId: string, now: number): value is ChildStop {
-	if (!isRecord(value) || value.schema !== STOP_SCHEMA) return false;
-	if (value.runId !== runId) return false;
-	if (typeof value.childId !== "string" || value.childId.trim() === "" || value.childId.length > MAX_ID || CONTROL_CHARS.test(value.childId)) return false;
-	if (typeof value.attempt !== "string" || !ATTEMPT.test(value.attempt)) return false;
-	if (typeof value.notice !== "string" || value.notice.trim() === "" || value.notice.length > MAX_NOTICE || CONTROL_CHARS.test(value.notice)) return false;
-	if (typeof value.at !== "number" || !Number.isFinite(value.at) || value.at <= 0) return false;
-	// A timestamp far outside this store's life is not a stop Storm wrote now; do not trust it as one.
-	return value.at <= now + 300_000 && value.at >= now - ACTIVE_TTL_MS;
-}
-
-async function readStopFile(file: string, runId: string, now: number): Promise<ChildStop | undefined> {
-	const info = await lstat(file).catch(() => undefined);
-	if (info === undefined || !info.isFile() || info.size > MAX_STOP_BYTES) return undefined;
-	let value: unknown;
+export async function recordWorkerStop(
+	agentDir: string,
+	input: { key: string; runId: string; childId: string; attempt: string; reason: WorkerStopReason },
+	now = Date.now(),
+): Promise<boolean> {
+	if (!KEY.test(input.key) || !ATTEMPT.test(input.attempt)) return false;
+	if (!STOP_REASONS.includes(input.reason)) return false;
 	try {
-		value = JSON.parse(await readFile(file, "utf8"));
-	} catch {
-		return undefined;
-	}
-	return isChildStop(value, runId, now) ? value : undefined;
-}
-
-/** Writes this child's stop, whole and atomically. A failure is returned, not thrown: the stop itself already happened. */
-export async function writeChildStop(agentDir: string, stop: Omit<ChildStop, "schema" | "at">, now = Date.now()): Promise<boolean> {
-	try {
-		const runId = identity(stop.runId, "실행 id");
-		const childId = identity(stop.childId, "자식 에이전트 id");
-		const dir = stopsDir(agentDir, runId);
-		await mkdir(dir, { recursive: true, mode: 0o700 });
-		const root = stopsRoot(agentDir);
-		const [realDir, realRoot] = await Promise.all([realpath(dir), realpath(root)]);
-		if (!realDir.startsWith(realRoot + path.sep)) throw new Error("자식 중지 기록이 프로필 밖으로 연결되어 있습니다");
-		await serialized(`child-stop\u0000${agentDir}\u0000${runId}\u0000${childId}`, async () => {
-			await writeJsonAtomic(stopFile(dir, childId), { schema: STOP_SCHEMA, ...stop, runId, childId, at: now } satisfies ChildStop);
-			await chmod(stopFile(dir, childId), 0o600).catch(() => undefined);
-		});
-		return true;
+		const runId = identity(input.runId, "실행 id");
+		const childId = identity(input.childId, "자식 에이전트 id");
+		const dir = admissionsDir(agentDir);
+		const file = admissionFile(dir, input.key);
+		// The record's own attempt decides: a stop that was read while attempt T was current writes nothing once any copy
+		// has opened T+1. The conditional publish is what makes that hold across loaded copies and threads.
+		return await serialized(admissionKey(runId, childId), () =>
+			mutateRecord(dir, file, input.key, record => {
+				if (record.runId !== runId || record.childId !== childId || record.attempt !== input.attempt) return undefined;
+				return { ...record, stop: { reason: input.reason, at: now }, revokedAt: record.revokedAt ?? now };
+			}),
+		);
 	} catch {
 		return false;
 	}
 }
 
-/** Every well-formed stop of one run, filtered before any cap so an unreadable old file cannot starve a later one. */
-export async function readChildStops(agentDir: string, runId: string, now = Date.now()): Promise<ChildStop[]> {
-	const dir = stopsDir(agentDir, runId);
-	let names: string[];
-	try {
-		names = await readdir(dir);
-	} catch {
-		return [];
+/**
+ * The stops this build's records of one run carry. With `childIds`, exactly those children; without, every record this
+ * build wrote for the run, which is the evidence that the director admitted the child (a spawn row is not: a reused
+ * worker admitted again by a follow-up has none). Each reading is tied to the record's current attempt: a follow-up that
+ * opened a newer one is a different attempt, and an earlier stop is not confused with it. A missing or foreign record is
+ * not a stop.
+ */
+export async function readWorkerStops(
+	agentDir: string,
+	input: { runId: string; artifactRoot: string | undefined; parentId: string | undefined; childIds?: readonly string[] },
+): Promise<WorkerStopReading[]> {
+	if (input.childIds !== undefined) {
+		const readings = await Promise.all(
+			[...new Set(input.childIds)].map(async childId => {
+				const read = await readWorkerAdmission({ agentDir, artifactRoot: input.artifactRoot, parentId: input.parentId, childId });
+				if (read.kind !== "record" || read.record.runId !== input.runId || read.record.stop === undefined) return undefined;
+				return { childId: read.record.childId, attempt: read.record.attempt, reason: read.record.stop.reason, at: read.record.stop.at } satisfies WorkerStopReading;
+			}),
+		);
+		return readings.filter((reading): reading is WorkerStopReading => reading !== undefined);
 	}
-	const candidates = names.filter(name => /^[0-9a-f]{64}\.json$/.test(name));
-	if (candidates.length > MAX_STOPS_PER_RUN) throw new Error("자식 중지 기록이 너무 많습니다");
-	const out: ChildStop[] = [];
-	for (const name of candidates) {
-		const stop = await readStopFile(path.join(dir, name), runId, now);
-		// The filename must be the child's own hash: a record renamed onto another child is not that child's stop.
-		if (stop === undefined || path.basename(stopFile(dir, stop.childId)) !== name) continue;
-		out.push(stop);
+	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
+	if (artifactRoot === undefined || input.parentId === undefined) return [];
+	const dir = admissionsDir(agentDir);
+	const names = await readdir(dir).catch(() => [] as string[]);
+	const readings: WorkerStopReading[] = [];
+	for (const name of names) {
+		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+		const read = await readRecordFile(path.join(dir, name));
+		if (read.kind !== "value" || !isAdmission(read.value)) continue;
+		const record = read.value;
+		if (record.build !== buildId() || record.runId !== input.runId) continue;
+		if (record.artifactRoot !== artifactRoot || record.parentId !== input.parentId) continue;
+		if (record.key !== path.basename(name, ".json") || record.key !== workerAdmissionKey(artifactRoot, input.parentId, record.childId)) continue;
+		if (record.stop === undefined) continue;
+		readings.push({ childId: record.childId, attempt: record.attempt, reason: record.stop.reason, at: record.stop.at });
 	}
-	return out;
-}
-
-/** Deletes one adopted stop. Another stop for the same child (a newer attempt) is left for the next adoption. */
-export async function acknowledgeChildStop(agentDir: string, stop: ChildStop): Promise<void> {
-	try {
-		const dir = stopsDir(agentDir, stop.runId);
-		const file = stopFile(dir, stop.childId);
-		await serialized(`child-stop\u0000${agentDir}\u0000${stop.runId}\u0000${stop.childId}`, async () => {
-			const current = await readStopFile(file, stop.runId, Date.now());
-			if (current === undefined || current.attempt !== stop.attempt || current.at !== stop.at) return;
-			await rm(file, { force: true });
-		});
-	} catch {
-		// A stop that cannot be deleted is already recorded; the run-scoped cleanup below is the backstop.
-	}
-}
-
-/** Removes one run's stops (a finished run leaves nothing behind). Best effort: cleanup never fails the caller. */
-export async function clearChildStops(agentDir: string, runId: string): Promise<void> {
-	try {
-		await rm(stopsDir(agentDir, identity(runId, "실행 id")), { recursive: true, force: true });
-	} catch {
-		// A stale directory is pruned with the rest of the admission store.
-	}
+	return readings.sort((a, b) => (a.childId === b.childId ? a.attempt.localeCompare(b.attempt) : a.childId.localeCompare(b.childId)));
 }
 
 /** The run a child on this thread belongs to, from its persisted admission when the thread's memory has no run for it. */
 export type ChildBinding =
-	| { kind: "bound"; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; attempt: string; createdAt: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
+	| { kind: "bound"; key: string; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; attempt: string; createdAt: number; revokedAt?: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
 	| { kind: "unmanaged" }
 	| { kind: "unknown"; reason: string };
 
@@ -1084,7 +1291,7 @@ export async function readChildBinding(input: { agentDir: string; artifactRoot: 
 	if (read.kind === "invalid") return { kind: "unknown", reason: read.reason };
 	if (read.kind === "record") {
 		const { record } = read;
-		return { kind: "bound", runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, attempt: record.attempt, createdAt: record.createdAt, ...(record.approved === undefined ? {} : { approved: record.approved }) };
+		return { kind: "bound", key: read.key, runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, attempt: record.attempt, createdAt: record.createdAt, ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }), ...(record.approved === undefined ? {} : { approved: record.approved }) };
 	}
 	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 	if (artifactRoot === undefined) return { kind: "unmanaged" };

@@ -1,11 +1,17 @@
 /** The persisted parent-to-child admission bridge, exercised without any in-process authority map. */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildId, STORM_BUILD } from "../src/build.ts";
+import { MAX_APPROVED_BYTES } from "../src/config/schema.ts";
+import * as fsutil from "../src/fsutil.ts";
 import { lanePolicy } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
+import { sharedMap } from "../src/runtime/thread-state.ts";
 import type { PlanLane } from "../src/types.ts";
+import * as admissionModule from "../src/worker-admission.ts";
 import {
 	admissionMayUseNonReadTools,
 	closeWorkerSpend,
@@ -14,8 +20,11 @@ import {
 	readChildBinding,
 	readWorkerAdmission,
 	readWorkerSpendClose,
+	readWorkerStops,
+	recordWorkerStop,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
+	workerAdmissionKey,
 } from "../src/worker-admission.ts";
 
 let tmp: string;
@@ -127,15 +136,69 @@ describe("worker admission records", () => {
 		if (plain.kind === "record") expect(plain.record.policy.shell).toBeUndefined();
 	});
 
-	test("RF10: the approved snapshot is kept whole and validated; a bad selector or effort is refused, never truncated", async () => {
-		const entries = Array.from({ length: 65 }, (_, index) => ({ selector: `models/model-${index}`, effort: "low" }));
+	test("RF3-5/RF3-9: the approved snapshot is kept whole and validated; a bad selector or effort is refused, never truncated", async () => {
+		const entries = Array.from({ length: 257 }, (_, index) => ({ selector: `models/model-${index}`, effort: "low" }));
 		await admit({ approved: entries });
 		const binding = await readChildBinding({ agentDir, artifactRoot: artifacts, parentId, childId });
-		expect(binding.kind === "bound" && binding.approved?.length).toBe(65);
-		expect(binding.kind === "bound" && binding.approved?.at(-1)?.selector).toBe("models/model-64");
+		expect(binding.kind === "bound" && binding.approved?.length).toBe(257);
+		expect(binding.kind === "bound" && binding.approved?.at(-1)?.selector).toBe("models/model-256");
 		await expect(admit({ childId: "BadEffort", approved: [{ selector: "models/x", effort: "not-an-effort" }] })).rejects.toThrow();
 		await expect(admit({ childId: "BadSelector", approved: [{ selector: "no-provider" }] })).rejects.toThrow();
-		await expect(admit({ childId: "TooMany", approved: Array.from({ length: 257 }, (_, index) => ({ selector: `models/m-${index}` })) })).rejects.toThrow();
+		await expect(admit({ childId: "BadSpaces", approved: [{ selector: "bad provider/   " }] })).rejects.toThrow();
+	});
+
+	test("RF3-1: a record of another build or an older schema is fail-closed, never read as this build's admission", async () => {
+		await admit();
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (read.kind !== "record") throw new Error(JSON.stringify(read));
+		expect(read.record.build).toBe(buildId());
+		expect(read.record.build).toBe(STORM_BUILD);
+		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
+		const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		await writeFile(file, JSON.stringify({ ...raw, build: "another-build" }));
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({ kind: "invalid" });
+		expect(await readChildBinding({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({ kind: "unknown" });
+		// An older build's v1 record has no build field at all and is rejected by the same shape check.
+		await writeFile(file, JSON.stringify({ ...raw, schema: "storm.worker-admission/v1", build: undefined }));
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({ kind: "invalid" });
+	});
+
+	test("RF3-1/RF3-7: shared maps are namespaced by this build, so another build's state is not visible", async () => {
+		const name = `tests.build.${randomUUID()}`;
+		sharedMap<string, string>(name).set("k", "v");
+		const root = globalThis as { __stormSharedMaps?: Map<string, Map<unknown, unknown>> };
+		const keys = [...(root.__stormSharedMaps?.keys() ?? [])];
+		expect(keys).toContain(`${STORM_BUILD}\u0000${name}`);
+		expect(keys.filter(key => key.includes(name))).toHaveLength(1);
+	});
+
+	test("RF3-6/RF3-11: a stop is a closed reason on the record of its own attempt, read twice without a second effect", async () => {
+		await admit({ approved: [{ selector: "models/x", effort: "low" }] });
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (read.kind !== "record") throw new Error(JSON.stringify(read));
+		expect(await recordWorkerStop(agentDir, { key: read.key, runId, childId, attempt: read.record.attempt, reason: "pooled-thread" })).toBe(true);
+		const first = await readWorkerStops(agentDir, { runId, artifactRoot: artifacts, parentId, childIds: [childId] });
+		expect(first).toEqual([{ childId, attempt: read.record.attempt, reason: "pooled-thread", at: expect.any(Number) }]);
+		// The record is not deleted: a second read returns the same attempt, and the director's seen set is what makes it once.
+		expect(await readWorkerStops(agentDir, { runId, artifactRoot: artifacts, parentId, childIds: [childId] })).toEqual(first);
+		// Another attempt, another run or another child never adopts this record's stop.
+		expect(await recordWorkerStop(agentDir, { key: read.key, runId, childId, attempt: "00000000-0000-4000-8000-000000000000", reason: "pooled-thread" })).toBe(false);
+		expect(await readWorkerStops(agentDir, { runId: "another-run", artifactRoot: artifacts, parentId, childIds: [childId] })).toEqual([]);
+		// The stop carries no free text or cost; a crafted reason outside the closed set makes the record invalid.
+		const file = join(agentDir, "storm", "admissions", `${read.key}.json`);
+		const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		await writeFile(file, JSON.stringify({ ...raw, stop: { reason: "free text", at: Date.now() } }));
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({ kind: "invalid" });
+	});
+
+	test("a stopped record withdraws its authority and stays a tombstone the same attempt can read", async () => {
+		await admit({ lane: "L1" });
+		expect(await resolve()).toMatchObject({ kind: "authorized" });
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (read.kind !== "record") throw new Error(JSON.stringify(read));
+		expect(await recordWorkerStop(agentDir, { key: read.key, runId, childId, attempt: read.record.attempt, reason: "state-not-shared" })).toBe(true);
+		expect(await resolve()).toMatchObject({ kind: "denied" });
+		expect(await readChildBinding({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({ kind: "bound", attempt: read.record.attempt });
 	});
 
 	test("an unrecorded child of the active managed run is denied, and a revoked run leaves unrelated work alone", async () => {
@@ -174,10 +237,11 @@ describe("worker admission records", () => {
 		// A claim now exists for this attempt: closing must still find the session that made it.
 		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
 		expect(await resolve()).toMatchObject({ kind: "denied" });
-		// Another session cannot close it, and a stale attempt closes nothing of a newer one.
+		// Another session cannot close it, and a stale attempt closes nothing of a newer one: the write is conditional on
+		// the attempt it was read for, so it reports no change rather than rewriting the newer record.
 		await admit({ lane: "L1" });
 		expect(await resolve()).toMatchObject({ kind: "authorized" });
-		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
+		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(false);
 		expect(await resolve()).toMatchObject({ kind: "authorized" });
 		const fresh = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
 		if (fresh.kind !== "record") throw new Error("no record");
@@ -297,5 +361,86 @@ describe("worker admission records", () => {
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toMatchObject({ kind: "unknown" });
 		// The identity of the worker's parent is required: without it no marker can be named.
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined })).toMatchObject({ kind: "unknown" });
+	});
+
+	test("RF4-1: an aged closed record of a live run is kept until that run closes", async () => {
+		await admit();
+		// Close the record only (the run marker stays open): the run is still live.
+		expect(await revokeWorkerAdmissions(agentDir, { runId, childId })).toBe(1);
+		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
+		const stale = new Date(Date.now() - 25 * 3_600_000);
+		await utimes(file, stale, stale);
+		await admit({ childId: "Other" });
+		const kept = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(kept.kind === "record" && kept.record.revokedAt).toEqual(expect.any(Number));
+		// The same aged record is housekeeping's to remove once the run itself has closed.
+		await revokeWorkerAdmissions(agentDir, { runId });
+		await admit({ childId: "Another" });
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+	});
+
+	test("RF4-2: a stop that read an earlier attempt writes nothing once a newer attempt exists", async () => {
+		const first = await admit();
+		// A separately loaded copy of this build: its memory is not the parent's, only the record is shared.
+		const late = (await import(`../src/worker-admission.ts?late=${randomUUID()}`)) as typeof admissionModule;
+		const real = fsutil.writeJsonAtomic;
+		let interleaved = false;
+		const gate = spyOn(fsutil, "writeJsonAtomic").mockImplementation(async (file, value) => {
+			// The old writer is publishing its stop; open the next attempt after its read, before its write.
+			if (!interleaved && typeof value === "object" && value !== null && "stop" in value) {
+				interleaved = true;
+				await admit();
+			}
+			await real(file, value);
+		});
+		try {
+			expect(await late.recordWorkerStop(agentDir, { key: first.key, runId, childId, attempt: first.record.attempt, reason: "pooled-thread" })).toBe(false);
+		} finally {
+			gate.mockRestore();
+		}
+		const got = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(got.kind === "record" && got.record.attempt).not.toBe(first.record.attempt);
+		expect(got.kind === "record" && got.record.stop).toBeUndefined();
+	});
+
+	test("RF4-3: neither revocation nor a new acknowledgement replaces a record or marker of another build", async () => {
+		await admit();
+		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
+		const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		await writeFile(file, JSON.stringify({ ...raw, build: "another-build" }));
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		const [markerName] = await readdir(runs);
+		const markerFile = join(runs, markerName!);
+		const markerRaw = JSON.parse(await readFile(markerFile, "utf8")) as Record<string, unknown>;
+		await writeFile(markerFile, JSON.stringify({ ...markerRaw, build: "another-build" }));
+		expect(await revokeWorkerAdmissions(agentDir, { runId })).toBe(0);
+		expect((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>).build).toBe("another-build");
+		expect((JSON.parse(await readFile(markerFile, "utf8")) as Record<string, unknown>).build).toBe("another-build");
+		// A new acknowledgement refuses the foreign marker, and then the foreign record.
+		await expect(admit()).rejects.toThrow(/다른 빌드/);
+		await writeFile(markerFile, JSON.stringify(markerRaw));
+		await expect(admit()).rejects.toThrow(/다른 빌드/);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("invalid");
+	});
+
+	test("RF4-9: an approved snapshot the store cannot hold is refused before anything is written", async () => {
+		const wide = Array.from({ length: 4096 }, (_, index) => `a/${"m".repeat(1050)}-${index}`);
+		expect(Buffer.byteLength(JSON.stringify(wide.map(selector => ({ selector, effort: "low" }))))).toBeGreaterThan(MAX_APPROVED_BYTES);
+		await expect(admit({ approved: wide.map(selector => ({ selector, effort: "low" })) })).rejects.toThrow(/바이트/);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+	});
+
+	test("RF4-11: housekeeping removes an aged record of an older schema and leaves a fresh one", async () => {
+		const dir = join(agentDir, "storm", "admissions");
+		await mkdir(dir, { recursive: true });
+		const aged = join(dir, `${"a".repeat(64)}.json`);
+		const fresh = join(dir, `${"b".repeat(64)}.json`);
+		await writeFile(aged, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
+		await writeFile(fresh, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
+		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
+		await utimes(aged, stale, stale);
+		await admit({ childId: "AfterTombstone" });
+		expect(await lstat(aged).catch(() => undefined)).toBeUndefined();
+		expect((await lstat(fresh)).isFile()).toBe(true);
 	});
 });

@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Real-host proof that a persisted lane admission enforces path scope in both same-thread and pooled children.
+ * Real-host proof that a persisted lane admission enforces path scope on the workers Storm lets run.
  *
- * Run twice with PROBE_MODE=authorized and PROBE_MODE=unauthorized on disposable dirs/ports. Nine concurrent
- * path-only workers force the host's default worker pool; the script reads the host's own worker-tagged log records,
- * then checks both the resulting files and the child transcripts. No worker-thread or isolation setting is disabled.
+ * Run twice with PROBE_MODE=authorized and PROBE_MODE=unauthorized on disposable dirs/ports. A Storm worker on a pooled
+ * thread stops before its first request (0.28.0, decisions D5/D7), so this suite takes the documented way out —
+ * `task.workerThreads: 0` — and all nine path-only children run on the director's thread. The pooled stop itself is
+ * proved by `hardening-pins`; here the script checks the resulting files and the child transcripts and that no child was
+ * placed on a pooled thread.
  */
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -117,7 +119,7 @@ async function main(): Promise<void> {
 			const run = files.run(running.runId);
 			return run !== undefined && run.spawns.filter(spawn => spawn.outcome === "routed").length >= COUNT ? run : undefined;
 		}, 60_000, "nine routed children");
-		// The children hold their first reply five seconds; wait for the writes and for the host to flush its worker logs.
+		// The children hold their first reply five seconds; wait for the writes and for the host to flush the transcripts.
 		const expected = Array.from({ length: COUNT }, (_, i) => `${MODE === "authorized" ? "declared" : "outside"}-${i}.txt`);
 		await until(() => {
 			const present = expected.filter(name => existsSync(join(env.project, name)));

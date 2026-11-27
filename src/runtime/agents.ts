@@ -428,6 +428,17 @@ export function markAgentsCleaned(ids: readonly string[], now: number, scope: st
 	}
 }
 
+/** Every live row of one session store leaves the shared ledger at that session's real shutdown, whatever run last touched it. */
+export function forgetScopeAgents(scope: string): void {
+	if (!validScope(scope)) return;
+	for (const [key, record] of agents) {
+		if (record.scope === scope) {
+			agents.delete(key);
+			registryEntries.delete(key);
+		}
+	}
+}
+
 /** Tests only. */
 export function resetAgents(): void {
 	agents.clear();

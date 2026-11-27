@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ApprovalStore } from "../src/approval/store.ts";
 import { canonicalJson, configHash, escapeUnsafe, parseStrictJson } from "../src/config/canonical.ts";
-import { MAX_JOB_TIMEOUT_MS, teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
+import { MAX_APPROVED_BYTES, MAX_JOB_TIMEOUT_MS, teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
 import { configPath, loadConfig, serializeConfig, writeConfig } from "../src/config/store.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
@@ -234,6 +234,7 @@ describe("validateConfig", () => {
 		["model whitespace", c => (c.roles.explorer.models = ["a/b", "a/ b"]), "roles.explorer.models[1]:"],
 		["model empty id", c => (c.roles.explorer.models = ["a/"]), "roles.explorer.models[0]:"],
 		["model non-string", c => (c.roles.explorer.models = [1]), "roles.explorer.models[0]:"],
+		["model bytes over the record budget", c => (c.roles.explorer.models = Array.from({ length: 4096 }, (_, index) => `a/${"m".repeat(1050)}-${index}`)), "roles.explorer.models:"],
 		["effort", c => (c.roles.reviewer.effort = "huge"), "roles.reviewer.effort:"],
 		["isolation", c => (c.isolation = "none"), "isolation:"],
 		["runtime", c => (c.runtime = "orca"), "runtime:"],
@@ -288,6 +289,17 @@ describe("validateConfig", () => {
 		delete c.budget;
 		delete c.roles.reviewer.effort;
 		expect(validateConfig(c).errors).toEqual([]);
+	});
+
+	test("RF4-9: a role is bounded by the bytes its approval stores, not by a count of models", () => {
+		const many = clone();
+		many.roles.explorer!.models = Array.from({ length: 4097 }, (_, index) => `a/m${index}`);
+		expect(validateConfig(many).config).toBeDefined();
+		const wide = clone();
+		wide.roles.explorer!.models = Array.from({ length: 4096 }, (_, index) => `a/${"m".repeat(1050)}-${index}`);
+		const rejected = validateConfig(wide);
+		expect(rejected.config).toBeUndefined();
+		expect(rejected.errors.some(error => error.includes(`${MAX_APPROVED_BYTES}바이트`))).toBe(true);
 	});
 
 	test("requiredChecks is a known ordered field; absent keeps the hash, present joins it", () => {
