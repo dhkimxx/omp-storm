@@ -22,6 +22,8 @@ import { signal } from "../src/tui/kit.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
 import * as frameModule from "../src/view/lane/frame.ts";
 import { LANE_MIN_ROWS, laneHeight, LIVE_WIDGET_KEY, LiveStatus, liveWidgetRows } from "../src/view/live.ts";
+import { liveMetricFacts } from "../src/view/live-metrics.ts";
+import { NO_DECLARED_RESULTS } from "../src/runtime/result-facts.ts";
 import type { RunRecord, RunResult } from "../src/types.ts";
 import { agentEntry, runRecord, spawnRecord } from "./fixtures.ts";
 import { extensionTheme, mountWidget } from "./tui-host.ts";
@@ -969,6 +971,22 @@ function laneSetup(options: { rows?: number; switch?: () => boolean; settings?: 
 const SETTLE_MS = 3_000;
 const RADAR_ROW = /\[[⠁-⣿]{18}\]$/;
 
+describe("the result chip with many workers", () => {
+	test("a hundred workers remain one bounded count, not a list", () => {
+		const spawns = Array.from({ length: 120 }, (_, index) => spawnRecord({ spawnKey: `w${index}`, agent: `storm-explorer-${index}` }));
+		const agents = spawns.map((spawn, index) =>
+			agentEntry({ id: spawn.spawnKey!, state: index % 2 === 0 ? "running" : "idle", changes: index % 4 === 0 ? 1 : 0 }),
+		);
+		const run = runRecord({ status: "running", startedAt: new Date(NOW - 180_000).toISOString(), spawns, agents });
+		const facts = liveMetricFacts(run, "workers", NOW);
+		const chip = facts.chips.find(item => item.key === "results")!;
+		expect(chip.forms.length).toBeLessThanOrEqual(3);
+		for (const form of chip.forms) expect(`${form.value}${form.suffix ?? ""}`.length).toBeLessThan(40);
+		expect(chip.aria).toContain(NO_DECLARED_RESULTS);
+		expect(chip.aria).not.toContain("storm-explorer");
+	});
+});
+
 describe("the live run widget in lane mode", () => {
 	test("draws the status row without the radar, then only the rows the picture needs, never past the cap", () => {
 		vi.useFakeTimers();
@@ -983,7 +1001,8 @@ describe("the live run widget in lane mode", () => {
 				expect(drawn.every(row => visibleWidth(row) <= columns)).toBe(true);
 				// No blank row anywhere, least of all under the last lane.
 				expect(text.every(row => row.trim() !== "")).toBe(true);
-				expect(text[0]).toStartWith(STORM_MARK);
+				// A run with workers and no declared results says so in its status row; the radar stays off it.
+				expect(text[0]).toContain(NO_DECLARED_RESULTS);
 				expect(text[0]).not.toMatch(RADAR_ROW);
 				expect(text[0]!.includes("[")).toBe(false);
 				// The trunk and at least one lane have something on them; nothing below the picture is invented.
@@ -1131,10 +1150,10 @@ describe("the live run widget in lane mode", () => {
 		expect(plain(short)[1]).toStartWith("›");
 		lane.host.terminal.rows = 40;
 		expect(draw(120)).toHaveLength(LANE_RUN_ROWS);
-		// Narrow: the compact line alone.
+		// Narrow: the compact line alone, which still names the missing declared results.
 		const narrow = draw(50);
 		expect(narrow).toHaveLength(1);
-		expect(plain(narrow)[0]).toStartWith(STORM_MARK);
+		expect(plain(narrow)[0]).toContain(NO_DECLARED_RESULTS);
 		expect(draw(0)).toEqual([]);
 		expect(liveWidgetRows()).toBe(0);
 		// The switch off mid-run, then on again.

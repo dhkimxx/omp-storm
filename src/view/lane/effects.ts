@@ -36,7 +36,7 @@ export function paint(scene: Scene, canvas: Canvas, t: number, motion: boolean):
 	const routes = buildRoutes(fx);
 	const shown = routes.filter((route) => (scene.rowOf[route.lane] ?? -1) >= 0);
 	// Settled lanes first so live ones stay on top where cells are shared.
-	const settled = (last: string): number => (last === "accepted" || last === "excluded" ? 1 : 0);
+	const settled = (last: string): number => (last === "accepted" || last === "excluded" || last === "refused" ? 1 : 0);
 	shown.sort((a, b) => settled(b.last) - settled(a.last));
 	for (const route of shown) drawRoute(fx, route);
 	for (const strand of scene.strands) {

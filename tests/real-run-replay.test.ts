@@ -199,8 +199,8 @@ const P6: PlanInput = {
 };
 
 /**
- * The delivered answers, with the citation forms the real ones carried. `local://` and `#L` links are not read; a
- * `path:line` under the project is.
+ * The delivered answers, with the citation forms the real ones carried. `local://` is not read; a `path:line` under the
+ * project and the common aliases (`path#L12`, Markdown links) are read.
  */
 const CLAW_FIRST = `The producer receipt is missing for the supplied decoder. Source: ${HYBRID}:13 and what was checked is listed.`;
 const CLAW_FOLLOW = `Closed with the official result, cited at ${EXECUTORCH}:93-105 and ${EXECUTORCH}:122-146.`;
@@ -668,8 +668,9 @@ describe("14:35 to 14:56: the stuck lane no longer blocks, and the running imple
 		await waitDelivery("14:40:37", "PinGemmaHeadControl", HEAD_FOLLOW_2, `${head}-2`);
 		expect(rowOf("head-control-source").attemptId).not.toBe(before);
 		expect(await running("PinGemmaHeadControl")).toBe(false);
-		// The answer still cites only a `local://` file and a `#L` link: both are not read, so it stays unmet, with the reason.
-		expect(rowOf("head-control-source").state).toBe("unmet");
+		// The answer cites a `local://` file (never read) and a `#L` link (read as its first line): the project citation
+		// is verified, and the prose answer still needs a reviewer, so it is reviewable rather than unmet.
+		expect(rowOf("head-control-source").state).toBe("reviewable");
 	});
 
 	test("14:44:33 the answer is still unmet, the dependency does not refuse, and the running writer is what holds the call", async () => {

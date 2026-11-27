@@ -15,6 +15,7 @@ import {
 	AttemptCollector,
 	ATTEMPT_PROGRESS_TTL_MS,
 	answerCitations,
+	normalizeAnswerText,
 	type AttemptRegistry,
 	type AttemptRegistryEvent,
 	type AttemptRegistryRef,
@@ -1444,5 +1445,65 @@ describe("citation candidates", () => {
 			{ path: "src/a.ts", line: 2 },
 			{ path: "src/b.ts", line: 3 },
 		]);
+	});
+
+	test("every alias form becomes the same path and first line as path:line", () => {
+		const canonical = [{ path: "src/a.ts", line: 12 }];
+		for (const text of [
+			"src/a.ts:12",
+			"src/a.ts:12-20",
+			"src/a.ts#L12",
+			"src/a.ts#L12-L20",
+			"src/a.ts#L12-20",
+			"[the line](src/a.ts#L12)",
+			"[the line](<src/a.ts#L12>)",
+		]) {
+			expect(answerCitations(undefined, `see ${text} for it`)).toEqual(canonical);
+		}
+		// A structured candidate keeps the path-only form only when it carries no coordinate at all.
+		expect(answerCitations({ citations: [{ path: "src/a.ts" }] }, undefined)).toEqual([{ path: "src/a.ts" }]);
+	});
+
+	test("an invalid coordinate is not a citation and never falls back to the path alone", () => {
+		for (const text of [
+			"src/a.ts:0",
+			"src/a.ts#L0",
+			"src/a.ts#Lx",
+			"src/a.ts#L9-L3",
+			"src/a.ts:9-3",
+			"[the line](src/a.ts#L0)",
+		]) {
+			expect(answerCitations(undefined, `see ${text}`)).toEqual([]);
+		}
+		// The same applies to a structured candidate that names a coordinate it cannot have.
+		for (const line of [0, -1, 1.5, 10_000_001]) {
+			expect(answerCitations({ citations: [{ path: "src/a.ts", line }] }, undefined)).toEqual([]);
+		}
+	});
+
+	test("the answer text is rewritten to path:line, and an unreadable form is left alone", () => {
+		expect(normalizeAnswerText("limit: 42 (src/a.ts#L2-L3)")).toBe("limit: 42 (src/a.ts:2)");
+		expect(normalizeAnswerText("[the line](src/a.ts#L2)")).toBe("[the line](src/a.ts:2)");
+		expect(normalizeAnswerText("see src/a.ts:12 and src/b.ts:3-4")).toBe("see src/a.ts:12 and src/b.ts:3");
+		const root = "/tmp/storm-citation-root";
+		expect(normalizeAnswerText(`see ${root}/src/a.ts#L2`, { root })).toBe("see src/a.ts:2");
+		// Nothing the parser does not read is rewritten into a citation.
+		for (const text of ["bad src/a.ts#L0", "bad src/a.ts#L9-L3", "bad /etc/passwd:12", "local://doc.md#L3", "https://example.test/x.ts#L9"]) {
+			expect(normalizeAnswerText(text, { root })).toBe(text);
+		}
+	});
+
+	test("an absolute path is read only inside the canonical root, and never guessed from the cwd", () => {
+		const root = "/tmp/storm-citation-root";
+		expect(answerCitations(undefined, `see ${root}/src/a.ts#L12`)).toEqual([]);
+		expect(answerCitations(undefined, `see ${root}/src/a.ts:12`, { root })).toEqual([{ path: "src/a.ts", line: 12 }]);
+		expect(answerCitations(undefined, `see ${root}/src/a.ts#L12-L20`, { root })).toEqual([{ path: "src/a.ts", line: 12 }]);
+		expect(answerCitations({ citations: [{ path: `${root}/src/a.ts`, line: 12 }] }, undefined, { root })).toEqual([
+			{ path: "src/a.ts", line: 12 },
+		]);
+		// Outside the root, and every non-project scheme, is not a citation.
+		for (const text of [`/etc/passwd:12`, `${root}/../secret.ts:12`, "local://doc.md:3", "agent://worker:3", "https://example.test/x.ts:9"]) {
+			expect(answerCitations(undefined, `see ${text}`, { root })).toEqual([]);
+		}
 	});
 });

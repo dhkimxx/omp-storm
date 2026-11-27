@@ -7,6 +7,7 @@
  * and they can only restyle text the plain content already says — never add a word, a control or a button.
  */
 import { formatUsd } from "../policy/spawn.ts";
+import { NO_DECLARED_RESULTS } from "../runtime/result-facts.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
 
 /** Schema version of a closeout record's `details`; anything else is drawn as the plain frame. */
@@ -102,7 +103,9 @@ export function goalText(goal: NonNullable<CloseoutBrief["goal"]> | undefined): 
 /** The official tail after the status label: counts only, all from code. */
 function officialCounts(official: CloseoutBrief["official"]): string[] {
 	const parts: string[] = [];
+	// No declared rows means no fraction: the card says what the record holds instead of `0/0`.
 	if (official.hasResults) parts.push(`수용 ${official.accepted}/${official.inScope}`);
+	else parts.push(NO_DECLARED_RESULTS);
 	for (const key of Object.keys(OPEN_LABEL) as Array<keyof typeof OPEN_LABEL>) {
 		const count = official.open[key];
 		if (Number.isInteger(count) && count > 0) parts.push(`${OPEN_LABEL[key]} ${count}`);

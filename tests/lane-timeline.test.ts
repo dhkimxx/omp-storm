@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { RunPhase } from "../src/view/appearance.ts";
 import { QUIET_MS, LaneTimeline } from "../src/view/lane/timeline.ts";
-import type { LaneSnapshot, LaneSpan, LaneState, LaneTrack } from "../src/view/lane/model.ts";
+import { UNPLANNED_LABEL, type LaneSnapshot, type LaneSpan, type LaneState, type LaneTrack } from "../src/view/lane/model.ts";
 import type { AgentEntry, PlanLane, RunJob, RunRecord, RunResult, SpawnRecord } from "../src/types.ts";
 import { agentEntry, runRecord, spawnRecord } from "./fixtures.ts";
 
@@ -26,6 +26,8 @@ function worker(id: string, laneName: string | undefined, over: Partial<AgentEnt
 
 interface World {
 	lanes?: PlanLane[];
+	/** False writes a record with no plan at all (the plan-less run). */
+	plan?: false;
 	results?: RunResult[];
 	workers?: { agent: AgentEntry; spawn: SpawnRecord }[];
 	jobs?: RunJob[];
@@ -36,10 +38,18 @@ interface World {
 }
 
 function world(w: World): RunRecord {
+	const lanes = (w.lanes ?? []).map(item => {
+		// A ledger row bound to a lane is a declared result of that lane; the fixture's plan states the same declaration.
+		if (item.results !== undefined) return item;
+		const declared = (w.results ?? [])
+			.filter(row => row.lane === item.name)
+			.map(row => ({ id: row.id, kind: "change" as const, criterion: row.id, path: "a.ts" }));
+		return declared.length === 0 ? item : { ...item, results: declared };
+	});
 	return runRecord({
 		status: w.status ?? "running",
 		startedAt: w.startedAt ?? iso(0),
-		plan: { lanes: w.lanes ?? [], workers: {}, submittedAt: w.submittedAt ?? iso(0) },
+		...(w.plan === false ? {} : { plan: { lanes, workers: {}, submittedAt: w.submittedAt ?? iso(0) } }),
 		results: w.results ?? [],
 		agents: (w.workers ?? []).map(item => item.agent),
 		spawns: (w.workers ?? []).map(item => item.spawn),
@@ -281,6 +291,66 @@ test("a job lane is marked as a job, runs while its receipt says started, and is
 	expect(track(running, "lint").label).not.toBe("");
 	see(timeline, world({ lanes: plan, results: [result("l", "lint", "accepted")], jobs: [receipt("passed")] }), 9_000);
 	expect(story(track(look(timeline, 9_500), "lint").spans)).toEqual([["reserved", 0], ["running", 2_000], ["accepted", 9_000]]);
+});
+
+test("a passed job lane with no declared results is idle, not accepted", () => {
+	const timeline = new LaneTimeline();
+	const plan = [lane("lint", { job: "lint", role: "quick", kind: "run" })];
+	const receipt: RunJob = { lane: "lint", name: "lint", status: "passed", exitCode: 0, startedAt: iso(2_000), finishedAt: iso(9_000) };
+	see(timeline, world({ lanes: plan, jobs: [receipt] }), 9_000);
+	const snapshot = look(timeline, 9_500);
+	expect(track(snapshot, "lint").spans.at(-1)?.state).toBe("idle");
+	expect(snapshot.complete).toBe(false);
+});
+
+test("a worker placed without a lane gets a row after the plan's, running then idle, never accepted", () => {
+	const timeline = new LaneTimeline();
+	const plan = [lane("api")];
+	const rows = [result("r", "api", "pending")];
+	const busy = worker("outside", undefined, { state: "running", startedAt: START, lastActivityAt: START });
+	see(timeline, world({ lanes: plan, results: rows, workers: [busy] }), 0);
+	const live = look(timeline, 0);
+	expect(live.lanes.map(item => item.name)).toEqual(["api", "outside"]);
+	expect(track(live, "outside").label).toBe(UNPLANNED_LABEL);
+	expect(states(track(live, "outside").spans)).toEqual(["running"]);
+
+	const settled = worker("outside", undefined, { state: "idle", startedAt: START, lastActivityAt: START });
+	see(timeline, world({ lanes: plan, results: rows, workers: [settled] }), 5_000);
+	const done = track(look(timeline, 5_000), "outside");
+	expect(done.spans.at(-1)?.state).toBe("idle");
+	expect(done.spans.some(span => span.state === "accepted")).toBe(false);
+});
+
+test("a plan-less run draws its placed workers and its refusals, never accepted", () => {
+	const timeline = new LaneTimeline();
+	const placed = worker("w", undefined, { state: "running", startedAt: START, lastActivityAt: START });
+	see(timeline, world({ plan: false, workers: [placed] }), 0);
+	const live = look(timeline, 0);
+	expect(live.lanes.map(item => item.name)).toEqual(["w"]);
+	expect(track(live, "w").label).toBe(UNPLANNED_LABEL);
+	expect(live.complete).toBe(false);
+
+	const refused = runRecord({
+		status: "running",
+		startedAt: iso(0),
+		spawns: [spawnRecord({ spawnKey: "r", outcome: "blocked", code: "internal", reason: "not admitted" })],
+	});
+	see(timeline, refused, 1_000);
+	const row = track(look(timeline, 1_000), "r");
+	expect(states(row.spans)).toEqual(["refused"]);
+	expect(row.label).toBe(UNPLANNED_LABEL);
+});
+
+test("a hundred placements stay one bounded picture: every row is present and none is accepted", () => {
+	const timeline = new LaneTimeline();
+	const workers = Array.from({ length: 120 }, (_, index) =>
+		worker(`w${index}`, undefined, { state: index % 2 === 0 ? "running" : "idle", startedAt: START, lastActivityAt: START }),
+	);
+	see(timeline, world({ plan: false, workers }), 0);
+	const snapshot = look(timeline, 0);
+	expect(snapshot.lanes).toHaveLength(120);
+	expect(snapshot.lanes.every(item => item.spans.at(-1)?.state !== "accepted")).toBe(true);
+	expect(snapshot.complete).toBe(false);
 });
 
 test("a failed job is unmet and a job that could not be spawned is blocked", () => {

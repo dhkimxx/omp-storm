@@ -265,7 +265,7 @@ describe("decideSpawn: other agents during a run", () => {
 		expect(task.record).toMatchObject({ outcome: "substituted", role: "reviewer" });
 	});
 
-	test("a read-only explore plan cannot admit an unmapped native agent; mapped built-ins need their role lane", () => {
+	test("a read-only explore plan cannot admit an unmapped native agent; mapping alone does not supply a team role", () => {
 		const readPlan: RunPlan = {
 			lanes: [{ name: "look", kind: "explore", role: "explorer" }],
 			workers: { explorer: 1 },
@@ -277,8 +277,10 @@ describe("decideSpawn: other agents during a run", () => {
 		}
 		// eval() spawns go through the same decision; an unmapped writer is refused there too.
 		expect(code(decideSpawn({ agent: "sonic", invocationKind: "eval", patterns: ["google/gemini-flash"] }, state(), readRun))).toBe("unmapped-agent");
-		// `task` maps implementer, but this plan has no implementer lane.
-		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), readRun))).toBe("role-not-in-plan");
+		// `task` maps implementer. A role the plan has no lane for is no longer refused: the child is placed unplanned,
+		// so only a keyless spawn is refused here. This team has no implementer, so the model approval still refuses.
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"]), state(), readRun))).toBe("unassigned-lane");
+		expect(code(decideSpawn(ev("task", ["openai/gpt-5.2"], "build"), state(), readRun))).toBe("unapproved");
 		// `scout` maps explorer and the plan has its lane; extension must still bind it to that lane and its read tools.
 		expect(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), readRun).record).toMatchObject({ outcome: "allowed", role: "explorer" });
 		// Native unrelated work outside Storm is unaffected, even with an unreadable/unapproved team.
@@ -290,7 +292,7 @@ describe("decideSpawn: other agents during a run", () => {
 		}
 	});
 
-	test("a role spawn needs a plan lane and a host key; several lanes defer exact assignment to admission", () => {
+	test("a role spawn needs only a host key; a plan with no lane for its role places it unplanned", () => {
 		const c = withConfig({
 			...config,
 			roles: { ...config.roles, implementer: { agent: "storm-implementer", models: ["a/i"] } },
@@ -304,13 +306,14 @@ describe("decideSpawn: other agents during a run", () => {
 			submittedAt: "2026-11-20T11:00:00.000Z",
 		};
 		const rt = inRun({ plan });
-		// The extension's lane admission resolves the exact lane from its reservation, so a host key is enough here.
+		// The host key is the one correlation fact the spawn decision needs; placement matched it exactly (R4).
 		expect(code(decideSpawn(ev("storm-implementer", [], "api"), c, rt))).toBeUndefined();
 		expect(code(decideSpawn(ev("storm-implementer", [], "run-1-lane-2"), c, rt))).toBeUndefined();
 		expect(code(decideSpawn(ev("storm-implementer"), c, rt))).toBe("unassigned-lane");
-		// A plan that claims the role's workers but has no lane for it cannot own the child.
+		// A plan with no lane for the role no longer refuses the child: it is placed unplanned (R5), keyed by the host.
 		const laneLess = inRun({ plan: { ...plan, lanes: [] } });
-		expect(code(decideSpawn(ev("storm-implementer", [], "api"), c, laneLess))).toBe("unassigned-lane");
+		expect(code(decideSpawn(ev("storm-implementer", [], "api"), c, laneLess))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-implementer"), c, laneLess))).toBe("unassigned-lane");
 	});
 
 	test("an approved shadow role definition spawns through its approved lane", () => {
@@ -335,9 +338,11 @@ describe("decideSpawn: other agents during a run", () => {
 		// With a slot free it runs, and its record names the role so it takes the slot.
 		const free = inRun({ plan: capPlan, active: { total: 0, byRole: {} } });
 		expect(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), free).record).toMatchObject({ outcome: "allowed", role: "explorer" });
-		// A role the plan has no lane for cannot spawn through its built-in either.
+		// A role the plan has no lane for still spawns through its built-in when the host gives the key; only a keyless
+		// spawn is refused, because it cannot be correlated to a placement.
 		const noLane = inRun({ plan: { ...PLAN, workers: { reviewer: 2 } } });
-		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), noLane))).toBe("role-not-in-plan");
+		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), noLane))).toBeUndefined();
+		expect(code(decideSpawn(ev("scout", ["x/unknown"]), state(), noLane))).toBe("unassigned-lane");
 	});
 });
 
@@ -385,12 +390,15 @@ describe("decideSpawn: role states", () => {
 });
 
 describe("decideSpawn: run plan and live caps", () => {
-	test("order of the run checks: budget, then plan, then the role's lane, then the native ceiling", () => {
+	test("order of the run checks: budget, then the native ceiling, then the host key", () => {
 		const spent = { costUsd: 9, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
 		const { plan: _plan, ...noPlan } = inRun().run as Run;
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: { ...noPlan, ...spent } })))).toBe("budget");
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: noPlan })))).toBe("no-plan");
-		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), runtime({ run: noPlan })))).toBe("no-plan");
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), runtime({ run: { ...noPlan, ...spent } })))).toBe("budget");
+		// A plan-less run is no refusal: only a spawn the host gave no key cannot be correlated.
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), runtime({ run: noPlan })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: noPlan })))).toBe("unassigned-lane");
+		// An unmapped native agent is refused before the key check (and before the native ceiling).
+		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"], "own"), state(), runtime({ run: noPlan })))).toBe("unmapped-agent");
 		const full = { total: 2, byRole: { reviewer: 2 } };
 		// The plan's worker count for the role is no limit: two live reviewers against a plan of one never blocked by role.
 		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), inRun({ active: full }, { maxConcurrency: 8 })))).toBeUndefined();
@@ -415,9 +423,10 @@ describe("decideSpawn: run plan and live caps", () => {
 		expect(blocked.decision && "block" in blocked.decision ? blocked.decision.reason : "").toContain("task.maxConcurrency 2");
 	});
 
-	test("a role absent from the plan cannot spawn; outside a run no plan is needed", () => {
+	test("a role absent from the plan still spawns with the host's key; outside a run no key is needed", () => {
 		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1 } };
-		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan })))).toBe("role-not-in-plan");
+		expect(code(decideSpawn(ev("storm-explorer", [], "look"), state(), inRun({ plan })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan })))).toBe("unassigned-lane");
 		expect(code(decideSpawn(ev("storm-explorer"), state(), runtime()))).toBeUndefined();
 	});
 

@@ -4,13 +4,14 @@ import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { goalTotals } from "../runtime/goal.ts";
+import { resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
 import { unplannedLine } from "../runtime/unplanned.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import { GOAL_LABEL, goalText } from "./closeout.ts";
-import { resultProgress, resultRowText, type ResultProgress } from "./results.ts";
+import { resultRowText, type ResultProgress } from "./results.ts";
 import type {
 	BudgetConfig,
 	InfoLine,
@@ -487,15 +488,21 @@ interface ResultLine {
  * rows repeat every criterion and id, so above them only the aggregate counts add information. Where no row follows
  * (the compact brief, the plain widget and the model view), the focus name stays in this line.
  */
-function resultLine(progress: ResultProgress, options: { prefix?: string; detailed?: boolean } = {}): ResultLine | undefined {
-	if (!progress.present) return undefined;
+function resultLine(facts: ResultFacts, options: { prefix?: string; detailed?: boolean } = {}): ResultLine | undefined {
+	const progress = facts.progress;
+	if (!progress.present && !facts.noResultsNotice) return undefined;
 	const prefix = options.prefix ?? "";
-	const body = options.detailed === true && progress.rows.length > 0 ? progress.parts.join(" · ") : progress.headline;
+	// No declared rows: the line says so and names the workers, never a fraction over an empty count.
+	const body = !facts.hasDeclared
+		? `${facts.headline}${facts.activity.placed > 0 ? ` · ${workerCountText(facts.activity)}` : ""}`
+		: options.detailed === true && progress.rows.length > 0
+			? facts.parts.join(" · ")
+			: facts.headline;
 	const label = `- ${prefix}결과(공식): `;
 	return {
 		text: `${label}${body}`,
-		spans: [{ text: label }, { text: body, tone: progress.tone }],
-		icon: RESULT_ICON[progress.tone],
+		spans: [{ text: label }, { text: body, tone: facts.tone }],
+		icon: RESULT_ICON[facts.tone],
 	};
 }
 
@@ -576,13 +583,13 @@ export function renderStatus(
 		if (!run) return;
 		out.push("");
 		heading("실행 중", undefined, "status.running");
-		const outcome = resultProgress(run);
+		const outcome = resultFacts(run);
 		const outcomeLine = resultLine(outcome, { detailed: !model });
 		if (outcomeLine !== undefined) {
 			const index = out.length;
 			out.push(outcomeLine.text);
 			if (info) info.push({ index, icon: outcomeLine.icon, spans: outcomeLine.spans });
-			if (!model) for (const row of outcome.rows) {
+			if (!model) for (const row of outcome.progress.rows) {
 				const tone: InfoTone = row.excluded ? "muted" : row.state === "accepted" ? "success" : row.state === "unmet" && !row.running ? "warning" : "accent";
 				styled([{ text: `- ${resultRowText(row, { includeScope: true })}`, tone }], undefined, RESULT_ICON[tone]);
 			}
@@ -839,7 +846,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 				...(meter ? { meter } : {}),
 			});
 		}
-		const outcome = resultProgress(run);
+		const outcome = resultFacts(run);
 		const outcomeLine = resultLine(outcome);
 		if (outcomeLine !== undefined) {
 			const resultIndex = out.length;
@@ -886,7 +893,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 				],
 			});
 		}
-		const outcome = resultProgress(run);
+		const outcome = resultFacts(run);
 		const outcomeLine = resultLine(outcome, { prefix: "마지막 " });
 		if (outcomeLine !== undefined) {
 			const resultIndex = out.length;
@@ -1029,8 +1036,12 @@ export function runStatusCounters(run: RunRecord, now: number): string {
 
 /** Plain fallback shows the same grounded result focus before the counters. */
 export function runStatusText(run: RunRecord, now: number): string {
-	const results = resultProgress(run);
-	const headline = results.present ? `결과 ${results.headline} · ` : "";
+	const facts = resultFacts(run);
+	const headline = facts.hasDeclared
+		? `결과 ${facts.headline} · `
+		: facts.noResultsNotice
+			? `${facts.headline}${facts.activity.placed > 0 ? ` · ${workerCountText(facts.activity)}` : ""} · `
+			: "";
 	return `storm ▶ ${headline}${runStatusCounters(run, now)}`;
 }
 
@@ -1060,10 +1071,10 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 	const hostEnded = run.endReason === "host-ended" ? ` (${endLabel(run.endReason)})` : "";
 	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]}${hostEnded} · ${spendText(run.costUsd, run.budget, run.spend)}`];
 	// The official result disposition leads a settled run; spawn receipts and plan shape follow it.
-	const progress = resultProgress(run);
-	const outcome = resultLine(progress, { detailed: details });
+	const facts = resultFacts(run);
+	const outcome = resultLine(facts, { detailed: details });
 	if (outcome !== undefined) out.push(outcome.text);
-	if (details) for (const row of progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
+	if (details) for (const row of facts.progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
 	// Work that answered no declared result: a count, beside the result count it never changes.
 	const unplanned = unplannedLine(run);
 	if (unplanned !== undefined) out.push(`- ${unplanned}`);
@@ -1089,7 +1100,7 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 			.map(check => `${visible(check.name)}: ${check.status === "passed" ? "통과" : visible(check.status)}${typeof check.exitCode === "number" ? ` (exit ${check.exitCode})` : ""}`);
 		if (checks.length) out.push(`- 검사 결과: ${checks.join(" · ")}`);
 	}
-	if (details) out.push(...settledDetailLines(run, progress));
+	if (details) out.push(...settledDetailLines(run, facts.progress));
 	return out;
 }
 

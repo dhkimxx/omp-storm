@@ -10,10 +10,11 @@
  * History grows with the number of changes, never with time.
  */
 import { BUILTIN_AGENT_ROLES, ROLES, roleTitle } from "../../roles.ts";
-import type { AgentEntry, PlanLane, RunJob, RunRecord } from "../../types.ts";
+import type { AgentEntry, PlanLane, RunJob, RunRecord, SpawnRecord } from "../../types.ts";
+import { resultFacts } from "../../runtime/result-facts.ts";
 import type { RunPhase } from "../appearance.ts";
-import { resultProgress, type ResultProgress } from "../results.ts";
-import type { LaneSnapshot, LaneSpan, LaneState, LaneTrack, PhaseSpan } from "./model.ts";
+import type { ResultProgress } from "../results.ts";
+import { UNPLANNED_LABEL, type LaneSnapshot, type LaneSpan, type LaneState, type LaneTrack, type PhaseSpan } from "./model.ts";
 
 /** A running worker with no activity for this long is `quiet` (a long tool call, a slow generation). */
 export const QUIET_MS = 60_000;
@@ -201,7 +202,7 @@ function deriveLane(run: RunRecord, byName: ReadonlyMap<string, PlanLane>, lane:
 			return run.status === "running" ? done("running", undefined, startedAt) : done("idle", undefined, startedAt);
 		}
 		if (receipt.status === "passed") {
-			return done(tally === undefined || tally.rows === 0 ? "accepted" : tally.blocked ? "blocked" : tally.reviewable > 0 ? "submitted" : "idle", undefined, startedAt);
+			return done(tally === undefined || tally.rows === 0 ? "idle" : tally.blocked ? "blocked" : tally.reviewable > 0 ? "submitted" : "idle", undefined, startedAt);
 		}
 		if (receipt.status === "spawn-error") return done("blocked", undefined, startedAt);
 		if (receipt.status === "unknown") return done("idle", undefined, startedAt);
@@ -229,6 +230,24 @@ function deriveLane(run: RunRecord, byName: ReadonlyMap<string, PlanLane>, lane:
 	if (tally !== undefined && tally.unmet > 0) return done("unmet", undefined, startedAt);
 	if (tally !== undefined && tally.reviewable > 0) return done("submitted", undefined, startedAt);
 	return started ? done("idle", undefined, startedAt) : done(waiting());
+}
+
+/**
+ * One row for a worker the run placed without a lane. Its state is what the record can prove: refused at its hook,
+ * placed but not started, running or quiet by the same allowance as a lane, and idle once its turn is over. It is never
+ * accepted and never joins the trunk; a planned lane that declares no results is idle too.
+ */
+function deriveUnplanned(spawn: SpawnRecord, name: string, now: number, agents: ReadonlyMap<string, AgentEntry>): Derived {
+	const agent = spawn.spawnKey === undefined ? undefined : agents.get(spawn.spawnKey);
+	const base = { name, label: UNPLANNED_LABEL, job: false, dependsOn: [], progress: undefined, startedAt: agent?.startedAt ?? epoch(spawn.ts) };
+	if (spawn.outcome === "blocked") return { ...base, state: "refused", activityAt: undefined, startedAt: epoch(spawn.ts) };
+	if (agent === undefined) return { ...base, state: "reserved", activityAt: undefined };
+	if (agent.state === "running") {
+		const last = agent.lastActivityAt;
+		const quiet = !(last > 0) || now - last >= QUIET_MS;
+		return { ...base, state: quiet ? "quiet" : "running", activityAt: Number.isFinite(last) ? last : 0 };
+	}
+	return { ...base, state: "idle", activityAt: undefined };
 }
 
 /** One lane's history: spans are ordered and gapless, the last one is open. */
@@ -307,50 +326,72 @@ export class LaneTimeline {
 		}
 		this.#turns = turns;
 
-		const progress = resultProgress(run);
+		const facts = resultFacts(run);
+		const progress = facts.progress;
 		const plan = run.plan?.lanes;
-		if (plan !== undefined) {
-			const byName = new Map<string, PlanLane>();
-			for (const lane of plan) if (typeof lane?.name === "string" && !byName.has(lane.name)) byName.set(lane.name, lane);
-			const crew = crewOf(run);
-			const tallies = tallyResults(run, progress);
-			const planned = epoch(run.plan?.submittedAt);
-			const seen = new Set<string>();
-			const order: string[] = [];
-			for (const lane of plan) {
-				if (typeof lane?.name !== "string" || seen.has(lane.name)) continue;
-				seen.add(lane.name);
-				order.push(lane.name);
-				const derived = deriveLane(run, byName, lane, crew, tallies, now);
-				if (this.#apply(derived, first, start, at, planned)) changed = true;
-			}
-			// Excluding a lane takes it out of the plan but not out of the run: its results stay, all out of scope. Such a
-			// lane stays in the picture as excluded, where it was. Any other lane the plan dropped leaves with its history.
-			for (const name of [...this.#lanes.keys()]) {
-				if (seen.has(name)) continue;
-				const tally = tallies.get(name);
-				const history = this.#lanes.get(name)!;
-				if (tally === undefined || tally.rows === 0 || tally.inScope > 0) {
-					this.#lanes.delete(name);
-					changed = true;
-					continue;
-				}
-				if (history.spans[history.spans.length - 1]!.state !== "excluded") {
-					this.#move(history, "excluded", at);
-					history.activityAt = undefined;
-					history.progress = undefined;
-					history.track = trackOf(history);
-					changed = true;
-				}
-				order.splice(Math.min(Math.max(0, this.#order.indexOf(name)), order.length), 0, name);
-			}
-			if (!sameList(order, this.#order)) changed = true;
-			this.#order = order;
+		const crew = crewOf(run);
+		const tallies = tallyResults(run, progress);
+		const byName = new Map<string, PlanLane>();
+		for (const lane of plan ?? []) if (typeof lane?.name === "string" && !byName.has(lane.name)) byName.set(lane.name, lane);
+		const planned = epoch(run.plan?.submittedAt);
+		const seen = new Set<string>();
+		const order: string[] = [];
+		for (const lane of plan ?? []) {
+			if (typeof lane?.name !== "string" || seen.has(lane.name)) continue;
+			seen.add(lane.name);
+			order.push(lane.name);
+			const derived = deriveLane(run, byName, lane, crew, tallies, now);
+			if (this.#apply(derived, first, start, at, planned)) changed = true;
 		}
+		// One row per unplanned placement, after the plan's rows. The name is the handle the director used; a name the
+		// plan already has (or a second worker with the same one) gets a stable ordinal. The row is never accepted.
+		const agentById = new Map<string, AgentEntry>();
+		for (const agent of Array.isArray(run.agents) ? run.agents : []) agentById.set(agent.id, agent);
+		const nameCounts = new Map<string, number>();
+		for (const spawn of Array.isArray(run.spawns) ? run.spawns : []) {
+			if (spawn.lane !== undefined) continue;
+			const base = spawn.spawnKey ?? spawn.agent;
+			let ordinal = (nameCounts.get(base) ?? 0) + 1;
+			let name = ordinal === 1 ? base : `${base} ${ordinal}`;
+			while (seen.has(name)) {
+				ordinal += 1;
+				name = `${base} ${ordinal}`;
+			}
+			nameCounts.set(base, ordinal);
+			seen.add(name);
+			order.push(name);
+			const derived = deriveUnplanned(spawn, name, now, agentById);
+			if (this.#apply(derived, first, start, at, epoch(spawn.ts))) changed = true;
+		}
+		// Excluding a lane takes it out of the plan but not out of the run: its results stay, all out of scope. Such a
+		// lane stays in the picture as excluded, in its previous order. Any other row the plan or the run dropped leaves
+		// with its history. One pass over the previous order keeps this linear in the number of workers.
+		const excluded: string[] = [];
+		for (const name of this.#order) {
+			if (seen.has(name)) continue;
+			const tally = tallies.get(name);
+			const history = this.#lanes.get(name);
+			if (history === undefined) continue;
+			if (tally === undefined || tally.rows === 0 || tally.inScope > 0) {
+				this.#lanes.delete(name);
+				changed = true;
+				continue;
+			}
+			if (history.spans[history.spans.length - 1]!.state !== "excluded") {
+				this.#move(history, "excluded", at);
+				history.activityAt = undefined;
+				history.progress = undefined;
+				history.track = trackOf(history);
+				changed = true;
+			}
+			excluded.push(name);
+		}
+		order.push(...excluded);
+		if (!sameList(order, this.#order)) changed = true;
+		this.#order = order;
 
-		const complete = progress.counts.inScope > 0 && progress.counts.accepted === progress.counts.inScope;
-		if (complete !== this.#complete) {
-			this.#complete = complete;
+		if (facts.complete !== this.#complete) {
+			this.#complete = facts.complete;
 			changed = true;
 		}
 		if (changed) this.#rebuild();
@@ -429,11 +470,16 @@ export class LaneTimeline {
 		else {
 			const offset = (value: number | undefined): number | undefined => (value === undefined ? undefined : Math.min(at, Math.max(0, value - start)));
 			const began = offset(derived.startedAt);
-			const appears = Math.min(offset(planned) ?? 0, began ?? Number.POSITIVE_INFINITY);
-			const quietBefore = derived.state === "reserved" || derived.state === "waiting" || derived.state === "excluded";
-			if (began !== undefined && began > appears && !quietBefore) {
-				spans.push({ from: appears, to: began, state: "reserved" }, { from: began, state: derived.state });
-			} else spans.push({ from: appears, state: derived.state });
+			// A refused placement never ran: its row starts at the refusal, with no reserved stretch before it.
+			if (derived.state === "refused") {
+				spans.push({ from: began ?? at, state: "refused" });
+			} else {
+				const appears = Math.min(offset(planned) ?? 0, began ?? Number.POSITIVE_INFINITY);
+				const quietBefore = derived.state === "reserved" || derived.state === "waiting" || derived.state === "excluded";
+				if (began !== undefined && began > appears && !quietBefore) {
+					spans.push({ from: appears, to: began, state: "reserved" }, { from: began, state: derived.state });
+				} else spans.push({ from: appears, state: derived.state });
+			}
 		}
 		const activityAt = derived.state === "running" || derived.state === "quiet" ? derived.activityAt : undefined;
 		const history: History = {

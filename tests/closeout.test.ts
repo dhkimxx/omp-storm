@@ -11,15 +11,19 @@ import {
 	closeoutHandoff,
 	closeoutTargetName,
 	isSubstantiveRun,
+	NO_RESULTS_VERDICT,
 	parseCloseout,
 	rememberCloseoutReport,
 	resetCloseoutChoices,
 	storedCloseout,
 	takeCloseoutChoice,
 } from "../src/runtime/closeout.ts";
+import { HANDOFF_RESUME_LABEL } from "../src/runtime/resume.ts";
+import { NO_DECLARED_RESULTS } from "../src/runtime/result-facts.ts";
 import type { CloseoutAction, RunJob, RunPlan, RunRecord, RunResult } from "../src/types.ts";
 import { plannedResultLabels } from "../src/view/results.ts";
-import { agentEntry, runRecord } from "./fixtures.ts";
+import { renderCloseout } from "../src/view/closeout.ts";
+import { agentEntry, runRecord, spawnRecord } from "./fixtures.ts";
 
 const draft = (over: Partial<CloseoutDraft> = {}): CloseoutDraft => ({
 	result: "API를 추가했습니다.",
@@ -342,6 +346,68 @@ describe("closeout brief tiers", () => {
 	});
 });
 
+describe("a run with no declared result rows", () => {
+	const rowless = (over: Partial<RunRecord> = {}): RunRecord =>
+		record({
+			status: "done",
+			endReason: "verified",
+			endedAt: after(20),
+			agents: [agentEntry({ changes: 2 })],
+			spawns: [spawnRecord({ spawnKey: "w" })],
+			...over,
+		});
+
+	test("the card says so with no tick and offers a handoff, never a carry of confirmed results", () => {
+		const brief = closeoutBrief(rowless(), { resumable: true });
+		expect(brief.tier).toBe("card");
+		expect(brief.official.hasResults).toBe(false);
+		expect(brief.official.label).toContain(NO_RESULTS_VERDICT);
+		expect(brief.official.tone).not.toBe("success");
+		expect(brief.actions).toContainEqual({ kind: "resume", label: HANDOFF_RESUME_LABEL });
+		const card = renderCloseout(brief, false).markdown;
+		expect(card).toContain(NO_DECLARED_RESULTS);
+		expect(card).not.toContain("0/0");
+		expect(card).not.toContain("수용 0/0");
+	});
+
+	test("the handoff states no declared results and the first out-of-plan deliveries", () => {
+		const run = rowless({
+			unplanned: [
+				{ id: "d1", kind: "unplaced", agent: "storm-explorer", endedAt: Date.parse(after(4)), changed: true, costUsd: 0.03 },
+				{ id: "d2", kind: "woken", agent: "storm-implementer", endedAt: Date.parse(after(5)), costUsd: 0.02 },
+			],
+			unplannedCount: 2,
+		});
+		const handoff = closeoutHandoff(run);
+		expect(handoff).toContain("- Results: none declared");
+		expect(handoff).toContain("- Out-of-plan deliveries: 2");
+		expect(handoff).toContain("storm-explorer (changed, $0.0300)");
+		expect(handoff).toContain("storm-implementer (change unknown, $0.0200)");
+		expect(Buffer.byteLength(handoff)).toBeLessThanOrEqual(CLOSEOUT_HANDOFF_MAX_BYTES);
+	});
+
+	test("many deliveries stay one bounded count, not a list that grows with the number of workers", () => {
+		const run = rowless({
+			unplanned: Array.from({ length: 200 }, (_, index) => ({
+				id: `d${index}`,
+				kind: "unplaced" as const,
+				agent: `storm-explorer-${index}`,
+				endedAt: Date.parse(after(4)),
+				changed: index % 2 === 0,
+				costUsd: 0.01,
+			})),
+			unplannedCount: 200,
+		});
+		const brief = closeoutBrief(run);
+		expect(brief.official.label.length).toBeLessThan(120);
+		const handoff = closeoutHandoff(run);
+		expect(Buffer.byteLength(handoff)).toBeLessThanOrEqual(CLOSEOUT_HANDOFF_MAX_BYTES);
+		expect(handoff).toContain("Out-of-plan deliveries: 200");
+		expect(handoff).toContain("197 not listed");
+		expect(handoff.match(/storm-explorer-/g)?.length ?? 0).toBeLessThanOrEqual(3);
+	});
+});
+
 describe("closeout residual and facts", () => {
 	test("F6: an interrupted run with writes reports unverified changes, never a fake completion", () => {
 		const brief = closeoutBrief(
@@ -422,7 +488,7 @@ describe("closeout actions", () => {
 		expect(full.actions.map(action => action.kind)).toEqual(["run", "run", "run"]);
 		// Without a draft the only possible action is the exact resume; nothing fills the slots.
 		const bare = closeoutBrief(record({ status: "stopped", endReason: "interrupted", endedAt: after(3) }), { resumable: true });
-		expect(bare.actions).toEqual([{ kind: "resume", label: "이어 가기 — 중단된 같은 요청을 이어서 진행합니다" }]);
+		expect(bare.actions).toEqual([{ kind: "resume", label: HANDOFF_RESUME_LABEL }]);
 		expect(closeoutBrief(record({ status: "stopped", endReason: "interrupted", endedAt: after(3) })).actions).toEqual([]);
 	});
 

@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { textWidth } from "../src/view/lane/canvas.ts";
 import { TRUNK_LABEL, layout } from "../src/view/lane/layout.ts";
 import type { LaneSnapshot, LaneSpan, LaneState, LaneTrack } from "../src/view/lane/model.ts";
+import { UNPLANNED_LABEL } from "../src/view/lane/model.ts";
 import type { Scene, Strand } from "../src/view/lane/scene.ts";
 
 const SECOND = 1000;
@@ -272,6 +273,18 @@ describe("folding", () => {
 		expect(over.rows).toBe(11);
 		expect(over.rowOf.filter((r) => r > 0)).toHaveLength(9);
 		expect(summaryOf(over)!.left).toContain("2");
+	});
+
+	test("a hundred placements fold into the summary row instead of growing the picture", () => {
+		const lanes = Array.from({ length: 120 }, (_, i) =>
+			lane(`w${i}`, [[i % 7, i % 3 === 0 ? "refused" : "idle"]], { label: UNPLANNED_LABEL }),
+		);
+		const scene = layout(snapshot(60, lanes), 100, 9);
+		expectSound(scene, 100, 9);
+		expect(scene.rows).toBe(9);
+		expect(names(scene).length).toBeLessThanOrEqual(8);
+		expect(summaryOf(scene)!.left).toContain("+");
+		expect(scene.snapshot.lanes.every(lane => lastState(lane) !== "accepted")).toBe(true);
 	});
 
 	test("two rows: the trunk and a summary of everything", () => {

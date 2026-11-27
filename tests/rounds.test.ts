@@ -1383,3 +1383,31 @@ describe("S3 retry route witness", () => {
 		expect(decideRound({ ...base, gate, progressSince: { changes: 0, reviews: 0, requests: 1, result: moved } })).toMatchObject({ action: "continue" });
 	});
 });
+
+describe("reviewGate with a director edit", () => {
+	const quick = agentEntry({ id: "Q", role: "quick", changes: 2, lastChangeAt: T0 });
+
+	test("quick alone still ends quick-only; a director edit in the run does not", () => {
+		expect(reviewGate([quick], TEAM, { start: CLEAN, now: CHANGED })).toEqual({ state: "none", why: "quick-only" });
+		expect(reviewGate([quick], TEAM, { start: CLEAN, now: CHANGED }, undefined, {})).toEqual({ state: "none", why: "quick-only" });
+		expect(reviewGate([quick], TEAM, { start: CLEAN, now: CHANGED }, undefined, { directorEdit: true })).toEqual({
+			state: "unverified",
+			cause: "no-review",
+			changes: 2,
+			reviews: 0,
+			requests: 1,
+		});
+	});
+
+	test("a director edit is not credited to quick even when the tree shows no change now", () => {
+		expect(reviewGate([quick], TEAM, { start: CLEAN, now: CLEAN }, undefined, { directorEdit: true })).toMatchObject({
+			state: "unverified",
+			cause: "no-review",
+		});
+	});
+
+	test("the integrated review still settles a quick change the director also made", () => {
+		const gate = reviewGate([quick, reviewer(T0 + 1, true, { tree: NOW })], TEAM, { start: CLEAN, now: CHANGED }, coverage(), { directorEdit: true });
+		expect(gate).toEqual({ state: "passed" });
+	});
+});

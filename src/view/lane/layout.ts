@@ -48,7 +48,7 @@ export const TRUNK_LABEL = "감독";
 /** The word a lane row ends with for each state. */
 export const STATE_WORD: Record<LaneState, string> = {
 	reserved: "예약", waiting: "선행 대기", running: "작업 중", quiet: "조용", submitted: "제출", reviewing: "검토 중",
-	accepted: "승인", unmet: "미충족", blocked: "막힘", excluded: "제외", idle: "유휴",
+	accepted: "승인", unmet: "미충족", blocked: "막힘", excluded: "제외", idle: "유휴", refused: "거부",
 };
 const PHASE_WORDS: Record<RunPhase, readonly string[]> = {
 	working: ["진행 중"],
@@ -64,7 +64,7 @@ const PHASE_WORDS: Record<RunPhase, readonly string[]> = {
  * result waits for a verdict (2), then lanes that need a person's eye (1), and last the lanes that are working (0).
  */
 const FOLD_RANK: Record<LaneState, number> = {
-	accepted: 6, excluded: 6, reserved: 5, waiting: 4, submitted: 2, idle: 2, blocked: 1, unmet: 1, running: 0, quiet: 0, reviewing: 0,
+	accepted: 6, excluded: 6, reserved: 5, waiting: 4, submitted: 2, idle: 2, blocked: 1, unmet: 1, running: 0, quiet: 0, reviewing: 0, refused: 7,
 };
 const FINISHED_RANK = 6;
 
@@ -117,7 +117,7 @@ function lastState(lane: LaneTrack): LaneState {
 }
 
 function isTerminal(state: LaneState): boolean {
-	return state === "accepted" || state === "blocked" || state === "excluded";
+	return state === "accepted" || state === "blocked" || state === "excluded" || state === "refused";
 }
 
 function phaseWord(phase: RunPhase, width: number): string {

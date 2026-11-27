@@ -269,15 +269,6 @@ export function activeAgents(
 	return { total: counted.size, byRole };
 }
 
-/** During a run every Storm-decided spawn waits for the director's run plan. */
-function planBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
-	if (!runtime.run || runtime.run.plan) return undefined;
-	return {
-		code: "no-plan",
-		reason: "실행 계획이 없어 스폰을 막았습니다. 먼저 storm 도구의 plan 동작으로 레인(name·kind)을 내세요. 작은 작업은 레인 하나면 됩니다.",
-	};
-}
-
 /** Live agents of the run against this main session's native subagent ceiling. Absent or 0 means no Storm guard. */
 function totalBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 	const limit = runtime.maxConcurrency;
@@ -291,42 +282,15 @@ function totalBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 }
 
 /**
- * A role the run plan has no lane for cannot spawn. The plan's worker count for a role is a planning figure, not a
- * limit: how many workers run at once is omp's own `task.maxConcurrency` (`totalBlock`), the user's setting.
+ * A spawn needs the host's spawn key so its placement can be correlated exactly (R4). Every other lane refusal is
+ * gone: a plan-less run and an item that matches no lane are record states, held by the write table.
  */
-function roleInPlanBlock(runtime: SpawnRuntime, roleId: string, agent: string): SpawnBlock | undefined {
-	const plan = runtime.run?.plan;
-	if (!runtime.run || !plan) return undefined;
-	if ((plan.workers[roleId] ?? 0) > 0) return undefined;
+function spawnKeyBlock(runtime: SpawnRuntime, agent: string, spawnKey: string | undefined): SpawnBlock | undefined {
+	if (!runtime.run || spawnKey !== undefined) return undefined;
 	return {
-		code: "role-not-in-plan",
-		reason: `실행 계획에 ${roleTitle(roleId)} 역할 레인이 없어 ${agent} 스폰을 막았습니다. 이 역할이 필요하면 plan 동작으로 그 레인을 넣어 계획을 다시 내세요.`,
+		code: "unassigned-lane",
+		reason: `호스트가 스폰 키를 주지 않아 ${agent} 에이전트를 이 실행의 대기 중인 배치와 결속할 수 없습니다. task 항목마다 이름을 붙여 다시 스폰하세요.`,
 	};
-}
-
-/**
- * A role spawn needs a concrete plan lane and a host spawn key so its lane capability and result owner can be bound.
- * The exact lane name may be rewritten by automatic placement before the host allocates the key; the extension's lane
- * admission resolves that assignment, so this guard only refuses a plan with no lane for the role or a keyless spawn.
- */
-function laneBindingBlock(runtime: SpawnRuntime, roleId: string, agent: string, spawnKey: string | undefined): SpawnBlock | undefined {
-	const plan = runtime.run?.plan;
-	if (!plan) return undefined;
-	// A job lane uses a role only to name its lane kind; its work is run by the host, never by an AI worker.
-	const eligible = plan.lanes.filter(lane => lane.job === undefined && lane.role === roleId);
-	if (eligible.length === 0) {
-		return {
-			code: "unassigned-lane",
-			reason: `실행 계획에 ${roleTitle(roleId)} 역할 레인이 없어 ${agent} 스폰을 배정할 수 없습니다. plan으로 그 역할의 레인을 만들거나 맞는 역할의 에이전트를 쓰세요.`,
-		};
-	}
-	if (spawnKey === undefined) {
-		return {
-			code: "unassigned-lane",
-			reason: `호스트가 스폰 키를 주지 않아 ${agent} 에이전트를 계획 레인에 배정할 수 없습니다. task 항목마다 계획 레인 이름을 붙여 다시 스폰하세요.`,
-		};
-	}
-	return undefined;
 }
 
 /** The record of a refused spawn: what was asked for, the block's code and what the model was told. */
@@ -415,17 +379,15 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 			builtinKey === undefined
 				? {
 						code: "unmapped-agent",
-						reason: `실행 중에는 계획 레인에 매핑된 에이전트만 스폰할 수 있습니다. ${event.agent} 에이전트는 팀 역할에 매핑되지 않아 쓰기 권한과 결과 소유자를 정할 수 없습니다. 팀의 storm-* 에이전트를 쓰거나 plan으로 역할이 있는 레인을 지정하세요.`,
+						reason: `실행 중에는 승인된 팀 역할의 에이전트만 쓸 수 있습니다. ${event.agent} 에이전트는 팀 역할에 매핑되지 않아 그 정의와 모델을 확인할 수 없으므로(승인 밖 모델이 돌 수 있음) 스폰을 막았습니다. 팀의 storm-* 에이전트를 쓰세요.`,
 					}
 				: undefined;
 		// The ceiling counts every agent of a run, with a role or without one: an agent that fills no bundled role is
 		// still a live worker, so it never skips `parallelism`.
 		const runBlock =
-			planBlock(runtime) ??
 			unmapped ??
-			(counted.role === undefined ? undefined : roleInPlanBlock(runtime, counted.role, event.agent)) ??
 			totalBlock(runtime) ??
-			(counted.role === undefined ? undefined : laneBindingBlock(runtime, counted.role, event.agent, event.spawnKey));
+			spawnKeyBlock(runtime, event.agent, event.spawnKey);
 		if (runBlock) return block(runBlock, counted);
 		const requested = stripEffort(event.patterns[0] ?? "");
 		// The role whose approved models this agent may run on: its bundled role, else the team's fallback role.
@@ -470,13 +432,10 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	const config = checked.config;
 	const entry = Object.entries(config.roles).find(([, r]) => r.agent === event.agent);
 	let roleKey: string;
-	/** The role id this spawn asked for: a stand-in borrows `roleKey`'s models but counts against this one. */
-	let requestedRole: string;
 	let role: StormConfig["roles"][string];
 	let standIn = false;
 	if (entry) {
 		[roleKey, role] = entry;
-		requestedRole = roleKey;
 	} else {
 		const spec = ROLES.find(r => r.agent === event.agent);
 		if (!spec) return block(missingRole());
@@ -493,7 +452,6 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		roleKey = usable;
 		role = borrowed;
 		standIn = true;
-		requestedRole = spec.id;
 	}
 
 	const shadow = shadowBlock(state, event.agent);
@@ -504,11 +462,7 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	}
 	const overBudget = budgetBlock(runtime);
 	if (overBudget) return block(overBudget, { role: roleKey });
-	const runBlock =
-		planBlock(runtime) ??
-		roleInPlanBlock(runtime, requestedRole, event.agent) ??
-		totalBlock(runtime) ??
-		laneBindingBlock(runtime, requestedRole, event.agent, event.spawnKey);
+	const runBlock = totalBlock(runtime) ?? spawnKeyBlock(runtime, event.agent, event.spawnKey);
 	if (runBlock) return block(runBlock, { role: roleKey });
 
 	// Only models that can authenticate are answered: omp answers a role whose models all fail with the parent's model.

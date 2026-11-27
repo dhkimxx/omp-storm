@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants, createReadStream } from "node:fs";
 import { promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { basename, isAbsolute } from "node:path";
+import { basename, isAbsolute, relative, sep } from "node:path";
 import { RESULT_EVIDENCE_LIMITS, type AnswerCitation } from "./result-evidence.ts";
 import {
 	UNKNOWN_HOST_VERSION,
@@ -124,6 +124,11 @@ export interface AttemptCollectorDeps {
 	now?(): number;
 	/** Bounded wait for an isolated async registry patch; tests tighten it. */
 	registryWaitMs?: number;
+	/**
+	 * The canonical target root, when the caller can read it: an absolute citation path inside it is read as its
+	 * relative path. Absent leaves absolute paths unread; the collector never guesses one from the process cwd.
+	 */
+	targetRoot?(): Promise<string | undefined> | string | undefined;
 }
 
 /** One open native `task` tool call; used only to attach the host's toolCallId to admitted sync children. */
@@ -711,15 +716,69 @@ function waitablePatch(error: string | undefined): boolean {
 	return error === "patch-artifact-missing" || error === "patch-artifact-unchanged" || error === "artifact-capture-stale";
 }
 
+/** The largest line coordinate the evaluator accepts; a larger or non-positive one is not a citation. */
+const MAX_CITED_LINE = 10_000_000;
+/**
+ * One citation in answer text: `path:12`, `path:12-20`, `path#L12`, `path#L12-L20`, `path#L12-20`, or the target of a
+ * Markdown link (the `(` or `<` before it is the boundary). The greedy absolute form backtracks to leave the
+ * coordinate in its own group; `safeRelativePath` and the root check decide whether the path is usable at all. A path
+ * needs a directory segment or a file extension, so a clock time like `12:30` stays text.
+ */
+const CITED = /(?:^|[\s(`"'<])((?:(?:[A-Za-z]:[\\/]|\/)[^\s`"'()\[\]{}<>]*|(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)))(?:#L(\d{1,7})(?:-L?(\d{1,7}))?|:(\d{1,7})(?:-(\d{1,7}))?)\b/g;
+
+/** What the caller can establish about a model-supplied citation path. */
+export interface AnswerCitationOptions {
+	/**
+	 * The canonical target root. With it, an absolute path inside this root is read as its relative path; without it,
+	 * an absolute path is not a citation (the caller could not prove where it points).
+	 */
+	readonly root?: string;
+}
+
+/** A cited path under the tree the caller owns; an absolute path is accepted only when the root proves it is inside. */
+function citationPath(value: unknown, root: string | undefined): string | undefined {
+	if (typeof value !== "string" || value.length === 0 || value.length > RESULT_EVIDENCE_LIMITS.pathChars) return undefined;
+	if (!isAbsolute(value)) return safeRelativePath(value);
+	if (root === undefined || !isAbsolute(root)) return undefined;
+	const rel = relative(root, value);
+	if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+	return safeRelativePath(sep === "/" ? rel : rel.split(sep).join("/"));
+}
+
+/**
+ * The same answer with every citation alias rewritten to today's `path:line`, a range anchored at its first line. An
+ * invalid coordinate, a path outside the root, and every non-project scheme are left exactly as they were: the
+ * evaluator then sees no citation, never a path-only check of the original path.
+ */
+export function normalizeAnswerText(text: string, options: AnswerCitationOptions = {}): string {
+	return text.replace(CITED, (whole: string, pathValue: string, aliasStart?: string, aliasEnd?: string, colonStart?: string, colonEnd?: string) => {
+		const path = citationPath(pathValue, options.root);
+		const start = Number(aliasStart ?? colonStart);
+		const endText = aliasEnd ?? colonEnd;
+		const end = endText === undefined ? undefined : Number(endText);
+		if (path === undefined) return whole;
+		if (!Number.isSafeInteger(start) || start <= 0 || start > MAX_CITED_LINE) return whole;
+		if (end !== undefined && (!Number.isSafeInteger(end) || end < start || end > MAX_CITED_LINE)) return whole;
+		const prefix = whole.slice(0, whole.indexOf(pathValue));
+		return `${prefix}${path}:${start}`;
+	});
+}
+
 /** Citation candidates from one attempt's structured data and its own text; at most the evaluator's citation count. */
-export function answerCitations(structured: unknown, text: string | undefined): AnswerCitation[] {
+export function answerCitations(structured: unknown, text: string | undefined, options: AnswerCitationOptions = {}): AnswerCitation[] {
 	const out: AnswerCitation[] = [];
 	const seen = new Set<string>();
 	const add = (pathValue: unknown, lineValue: unknown, quoteValue?: unknown): void => {
 		if (out.length >= RESULT_EVIDENCE_LIMITS.citations) return;
-		const path = safeRelativePath(pathValue);
+		const path = citationPath(pathValue, options.root);
 		if (path === undefined) return;
-		const line = typeof lineValue === "number" && Number.isSafeInteger(lineValue) && lineValue > 0 && lineValue <= 10_000_000 ? lineValue : undefined;
+		// An explicit coordinate that cannot be read makes the whole candidate not a citation. It never falls back to a
+		// path-only check, which would accept a different question's answer.
+		let line: number | undefined;
+		if (lineValue !== undefined) {
+			if (typeof lineValue !== "number" || !Number.isSafeInteger(lineValue) || lineValue <= 0 || lineValue > MAX_CITED_LINE) return;
+			line = lineValue;
+		}
 		const quote = hostText(quoteValue)?.slice(0, RESULT_EVIDENCE_LIMITS.quoteChars);
 		const key = `${path}\0${line ?? ""}\0${quote ?? ""}`;
 		if (seen.has(key)) return;
@@ -734,10 +793,15 @@ export function answerCitations(structured: unknown, text: string | undefined): 
 	}
 
 	if (text !== undefined) {
-		// `path:line` / `path:start-end` references are exact locations; the evaluator re-reads each source.
-		const pattern = /(?:^|[\s(`"'])((?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+):(\d{1,7})\b/g;
-		for (const match of text.matchAll(pattern)) {
-			add(match[1], Number(match[2]));
+		// A range anchors at its first line. An end before the start, a zero, or any other unreadable coordinate makes
+		// the match not a citation; the pattern itself never yields a path without its coordinate.
+		for (const match of text.matchAll(CITED)) {
+			const start = Number(match[2] ?? match[4]);
+			const endText = match[3] ?? match[5];
+			const end = endText === undefined ? undefined : Number(endText);
+			if (!Number.isSafeInteger(start) || start <= 0 || start > MAX_CITED_LINE) continue;
+			if (end !== undefined && (!Number.isSafeInteger(end) || end < start || end > MAX_CITED_LINE)) continue;
+			add(match[1], start);
 			if (out.length >= RESULT_EVIDENCE_LIMITS.citations) break;
 		}
 	}
@@ -1725,7 +1789,16 @@ export class AttemptCollector {
 			// Only a usable attempt's text can become evidence; nothing is read for a failed or unbound one.
 			const final = attemptUsable(report) ? await this.#wholeAnswer(tracked, answer) : { ...(answer.text === undefined ? {} : { text: answer.text }), partial: false };
 			const reportText = final.text;
-			const citations = answerCitations(answer.data, reportText);
+			let root: string | undefined;
+			try {
+				root = await this.#deps.targetRoot?.();
+			} catch {
+				root = undefined;
+			}
+			const options: AnswerCitationOptions = root === undefined ? {} : { root };
+			// The evaluator reads today's `path:line`; rewriting the aliases first keeps its judgment unchanged.
+			const judgedText = reportText === undefined ? undefined : normalizeAnswerText(reportText, options);
+			const citations = answerCitations(answer.data, judgedText, options);
 			await this.#deps.port.settle({
 				runId: tracked.runId,
 				lane: tracked.lane,
@@ -1735,7 +1808,7 @@ export class AttemptCollector {
 				startedAt: tracked.startedAt,
 				observedAt: report.observedAt,
 				report,
-				...(reportText === undefined ? {} : { reportText }),
+				...(judgedText === undefined ? {} : { reportText: judgedText }),
 				...(final.partial ? { reportPartial: true as const } : {}),
 				citations,
 			});

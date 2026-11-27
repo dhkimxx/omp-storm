@@ -22,10 +22,12 @@ import type {
 } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
 import { formatUsd } from "../policy/spawn.ts";
-import { resultProgress, type ResultRow } from "../view/results.ts";
+import type { ResultRow } from "../view/results.ts";
 import { goalTotals } from "./goal.ts";
+import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type ResultFacts } from "./result-facts.ts";
+import { HANDOFF_RESUME_LABEL } from "./resume.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
-import { spendText, unplannedLine } from "./unplanned.ts";
+import { spendText, unplannedLine, unplannedTotal } from "./unplanned.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
@@ -214,12 +216,16 @@ function acceptedOutput(run: RunRecord, result: RunResult): boolean {
 
 /**
  * The verified reason normally names a code review. A run settled only by accepted answers/artifacts must not claim a
- * review it never had; the official status is still done, and the per-result rows carry the actual evidence.
+ * review it never had; the official status is still done, and the per-result rows carry the actual evidence. A run
+ * with no declared result row says that too: its review verified changes, not a result count.
  */
-function runReasonLabel(run: RunRecord): string {
+export const NO_RESULTS_VERDICT = "리뷰 통과(결과 집계 없음)";
+
+function runReasonLabel(run: RunRecord, facts: ResultFacts): string {
 	const reason = run.endReason;
 	if (reason === undefined) return "";
 	if (reason !== "verified") return endLabel(reason);
+	if (!facts.hasDeclared) return NO_RESULTS_VERDICT;
 	const results = run.results ?? [];
 	const reviewed = (run.agents ?? []).some(agent => (agent.review?.passed ?? 0) > 0);
 	const changed = (run.agents ?? []).some(agent => (agent.changes ?? 0) > 0);
@@ -227,9 +233,9 @@ function runReasonLabel(run: RunRecord): string {
 	return "필수 결과 이행";
 }
 
-function statusLine(run: RunRecord, card: boolean): string {
+function statusLine(run: RunRecord, card: boolean, facts: ResultFacts): string {
 	const status = STATUS_LABEL[run.status] ?? clean(run.status, NAME_MAX);
-	const label = clean(runReasonLabel(run), NAME_MAX);
+	const label = clean(runReasonLabel(run, facts), NAME_MAX);
 	const reason = label === "" ? "" : ` · ${label}`;
 	const rounds =
 		typeof run.turns !== "number"
@@ -243,7 +249,10 @@ function statusLine(run: RunRecord, card: boolean): string {
 	// has room, and `/storm status` always has the figure.
 	const spent = Number.isFinite(run.costUsd) && run.costUsd > 0;
 	const spend = spent && (card || run.spend?.lowerBound === true) ? ` · 비용 ${spendText(run)}` : "";
-	return `${status}${reason}${rounds}${spend}`;
+	// A run with no declared rows states the work it did instead of a result fraction it does not have.
+	const workers = !facts.hasDeclared && facts.activity.placed > 0 ? ` · ${workerCountText(facts.activity)}` : "";
+	const mixed = facts.outOfPlan > 0 ? ` · ${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}` : "";
+	return `${status}${reason}${rounds}${spend}${workers}${mixed}`;
 }
 
 type OpenKind = keyof CloseoutBrief["official"]["open"];
@@ -313,16 +322,18 @@ function minutesOf(run: RunRecord): number | undefined {
 	return (end - start) / 60_000;
 }
 
-function toneOf(run: RunRecord, open: number, residual: number): InfoTone {
+function toneOf(run: RunRecord, facts: ResultFacts, open: number, residual: number): InfoTone {
 	if (run.status === "running") return "muted";
 	if (open > 0 || residual > 0 || run.status === "stopped" || run.status === "budget-exceeded") return "warning";
+	// A pass over changes is not a pass over declared results: no success mark when the record holds no result row.
+	if (!facts.hasDeclared) return "accent";
 	return run.status === "done" ? "success" : "accent";
 }
 
 /** The code-written resume label: what the existing resume path does, never a selective acceptance. */
-function resumeLabel(accepted: number, inScope: number): string {
-	if (inScope === 0) return "이어 가기 — 중단된 같은 요청을 이어서 진행합니다";
-	return `이어 가기 — 수용 ${accepted}건은 현재 증거로 다시 확인하고 나머지 ${inScope - accepted}건을 다시 엽니다`;
+function resumeLabel(facts: ResultFacts): string {
+	if (!facts.hasDeclared) return HANDOFF_RESUME_LABEL;
+	return `이어 가기 — 수용 ${facts.progress.counts.accepted}건은 현재 증거로 다시 확인하고 나머지 ${facts.progress.counts.inScope - facts.progress.counts.accepted}건을 다시 엽니다`;
 }
 
 function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
@@ -341,9 +352,10 @@ function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
  *   changed a row after the draft could have been written.
  */
 export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } = {}): CloseoutBrief {
-	const progress = resultProgress(run);
+	const fact = resultFacts(run);
+	const progress = fact.progress;
 	const markers = finalizedById(run);
-	const facts = storedFacts(run.closeoutFacts);
+	const stored = storedFacts(run.closeoutFacts);
 	const open: Record<OpenKind, number> = { unsettled: 0, revoked: 0, blocked: 0, retry: 0, reviewable: 0, pending: 0, unmet: 0 };
 	const openLanes = new Set<string>();
 	let stale = false;
@@ -355,7 +367,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		if (row.lane !== undefined) openLanes.add(row.lane);
 	}
 	const openTotal = Object.values(open).reduce((sum, n) => sum + n, 0);
-	const residual = residualOf(run, facts, openLanes);
+	const residual = residualOf(run, stored, openLanes);
 	// Work that happened outside the declared results is a fact the card names, not a risk: it shapes neither the tier
 	// nor the tone, and it takes a place on the card only from the lowest-ranked risk.
 	const unplanned = unplannedLine(run);
@@ -393,9 +405,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		}
 		for (const item of draft?.next ?? []) if (item.kind === "user") addUser(clean(item.text, CLOSEOUT_NEXT_MAX));
 		const resume: CloseoutAction | undefined =
-			options.resumable === true
-				? { kind: "resume", label: resumeLabel(progress.counts.accepted, progress.counts.inScope) }
-				: undefined;
+			options.resumable === true ? { kind: "resume", label: resumeLabel(fact) } : undefined;
 		let resumed = false;
 		for (const item of draft?.next ?? []) {
 			if (item.kind === "resume") {
@@ -409,7 +419,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		}
 		if (resume !== undefined && !resumed && actions.length < CLOSEOUT_NEXT_COUNT) actions.push(resume);
 	}
-	const target = facts?.target;
+	const target = stored?.target;
 	const goal = goalTotals(run, Date.now());
 	return {
 		runId: run.runId,
@@ -419,9 +429,9 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		startedAt: run.startedAt,
 		...(typeof run.endedAt === "string" ? { endedAt: run.endedAt } : {}),
 		official: {
-			label: statusLine(run, tier === "card"),
-			tone: toneOf(run, openTotal, residual.length),
-			hasResults: progress.present,
+			label: statusLine(run, tier === "card", fact),
+			tone: toneOf(run, fact, openTotal, residual.length),
+			hasResults: fact.hasDeclared,
 			accepted: progress.counts.accepted,
 			inScope: progress.counts.inScope,
 			excluded: progress.counts.excluded,
@@ -504,7 +514,20 @@ export function closeoutHandoff(run: RunRecord): string {
 		.map(kind => `${OPEN_WORDS[kind]} ${official.open[kind]}`);
 	const results = official.hasResults
 		? `- Results: accepted ${official.accepted}/${official.inScope}${official.excluded > 0 ? `, excluded by user ${official.excluded}` : ""}${openParts.length > 0 ? `; open: ${openParts.join(", ")}` : ""}`
-		: undefined;
+		: "- Results: none declared";
+	// Work that answers no declared result is part of the record a handoff carries: who delivered, whether it changed
+	// files and what it cost. The list is bounded like every other handoff line.
+	const deliveries = Array.isArray(run.unplanned) ? run.unplanned : [];
+	const deliveryTotal = unplannedTotal(run);
+	const shownDeliveries = deliveries.slice(0, 3).map(delivery => {
+		const changed = delivery.changed === true ? "changed" : delivery.changed === false ? "no change" : "change unknown";
+		const cost = typeof delivery.costUsd === "number" && Number.isFinite(delivery.costUsd) ? formatUsd(delivery.costUsd) : "cost unknown";
+		return `${scrub(delivery.agent, NAME_MAX)} (${changed}, ${cost})`;
+	});
+	const outOfPlan =
+		deliveryTotal === 0
+			? undefined
+			: `- Out-of-plan deliveries: ${deliveryTotal}${shownDeliveries.length > 0 ? `: ${shownDeliveries.join("; ")}` : ""}${deliveryTotal > shownDeliveries.length ? ` (+${deliveryTotal - shownDeliveries.length} not listed)` : ""}`;
 	const stale = [...finalizedById(run).values()].some(marker => marker !== undefined);
 	const said = stale ? "director's words, written before the final judgment; the counts above prevail" : "director's words, not evidence";
 	const blockers = brief.userActions;
@@ -519,6 +542,7 @@ export function closeoutHandoff(run: RunRecord): string {
 		`- Request: ${scrub(run.task, REQUEST_MAX)}`,
 		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
 		results,
+		outOfPlan,
 		goal,
 		brief.target ? `- Target: ${scrub(brief.target, TARGET_MAX)}` : undefined,
 		...brief.residual.map(text => `- Residual: ${scrub(text, 100)}`),
@@ -552,6 +576,8 @@ export function closeoutHandoff(run: RunRecord): string {
 /** Whether a settled run left work worth more than a quiet automatic end: a brief, a result, several lanes, or real work. */
 export function isSubstantiveRun(run: RunRecord): boolean {
 	if (run.closeout !== undefined) return true;
+	// A run that placed workers did work worth a record, even when it declared no result rows.
+	if (resultFacts(run).activity.placed > 0) return true;
 	const results = run.results ?? [];
 	// An open requirement is worth reporting even when its lane changed nothing and the run ended quietly (T01).
 	if (results.some(result => result.state !== "accepted")) return true;

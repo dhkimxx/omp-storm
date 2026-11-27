@@ -1,15 +1,18 @@
 /** The persisted parent-to-child admission bridge, exercised without any in-process authority map. */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lanePolicy } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import type { PlanLane } from "../src/types.ts";
 import {
+	admissionMayUseNonReadTools,
+	closeWorkerSpend,
 	endWorkerAdmission,
 	persistWorkerAdmission,
 	readWorkerAdmission,
+	readWorkerSpendClose,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
 } from "../src/worker-admission.ts";
@@ -44,6 +47,8 @@ const admit = (over: {
 	childId?: string;
 	policy?: Parameters<typeof persistWorkerAdmission>[0]["policy"];
 	lane?: string;
+	hold?: string;
+	runId?: string;
 	targetRoot?: string;
 	artifactRoot?: string;
 } = {}) =>
@@ -52,12 +57,13 @@ const admit = (over: {
 		artifactRoot: over.artifactRoot ?? artifacts,
 		parentId: over.parentId ?? parentId,
 		childId: over.childId ?? childId,
-		runId,
+		runId: over.runId ?? runId,
 		sessionId: "main-session",
 		sessionDir,
 		repoId: "repo-test",
 		targetRoot: over.targetRoot ?? project,
 		...(over.lane === undefined ? {} : { lane: over.lane }),
+		...(over.hold === undefined ? {} : { hold: over.hold }),
 		policy: over.policy ?? { kind: "paths", paths: ["allowed.txt"], reason: "test lane" },
 	});
 
@@ -187,5 +193,95 @@ describe("worker admission records", () => {
 		await writeFile(outside, "outside\n");
 		await symlink(outside, join(project, "allowed.txt"));
 		expect(await resolve()).toMatchObject({ kind: "denied" });
+	});
+
+	test("an admission without hold keeps its read-only meaning, and a hold is accepted only as a non-empty string", async () => {
+		const plain = await admit();
+		expect(plain.record.hold).toBeUndefined();
+		expect(admissionMayUseNonReadTools(plain.record)).toBe(false);
+		// A record from before this field reads exactly like one written without it.
+		const old = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (old.kind !== "record") throw new Error("expected the persisted record");
+		expect(old.record.hold).toBeUndefined();
+		expect(admissionMayUseNonReadTools(old.record)).toBe(false);
+
+		const held = await admit({ childId: "Held", hold: "spawn:Held" });
+		expect(held.record.hold).toBe("spawn:Held");
+		expect(admissionMayUseNonReadTools(held.record)).toBe(true);
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Held" })).toMatchObject({
+			kind: "record",
+			record: { hold: "spawn:Held" },
+		});
+
+		// Only a non-empty key names a reservation: an empty one is refused where it is written, and a blank one on
+		// disk makes the record malformed instead of granting a writer's tools.
+		await expect(admit({ childId: "Empty", hold: "" })).rejects.toThrow();
+		const file = join(agentDir, "storm", "admissions", `${held.key}.json`);
+		const value = JSON.parse(await readFile(file, "utf8"));
+		await writeFile(file, JSON.stringify({ ...value, hold: "   " }));
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Held" })).toMatchObject({ kind: "invalid" });
+		await writeFile(file, JSON.stringify({ ...value, hold: "" }));
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Held" })).toMatchObject({ kind: "invalid" });
+	});
+
+	test("a hold on a revoked or ended admission grants nothing", async () => {
+		const held = await admit({ hold: "spawn:Impl" });
+		expect(admissionMayUseNonReadTools(held.record)).toBe(true);
+		expect(admissionMayUseNonReadTools({ ...held.record, revokedAt: 1 })).toBe(false);
+		expect(admissionMayUseNonReadTools({ ...held.record, endedAt: 1 })).toBe(false);
+		await revokeWorkerAdmissions(agentDir, { runId });
+		expect(await resolve()).toMatchObject({ kind: "denied" });
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (read.kind !== "record") throw new Error("expected the revoked record");
+		expect(read.record.hold).toBe("spawn:Impl");
+		expect(admissionMayUseNonReadTools(read.record)).toBe(false);
+	});
+
+	test("a marker without a close reads as open, and a written close is seen, cached and kept across later admissions", async () => {
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
+		await admit({ childId: "A" });
+		// The read above cached an answer before the marker existed; the marker it now names is still open.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
+		const at = 1_800_000_000_000;
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop", now: at })).toEqual({ ok: true });
+		// The reader had just cached the open marker: a changed file is read again rather than served from the cache.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		// A spawn admitted after the close does not erase it.
+		await admit({ childId: "B" });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "block-spawns", now: at + 1 })).toEqual({ ok: true });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({
+			kind: "closed",
+			close: { at: at + 1, onExceed: "block-spawns" },
+		});
+	});
+
+	test("a new run in the same tree and parent starts open, and a close names exactly its own run", async () => {
+		await admit({ childId: "A" });
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId: "run-other", onExceed: "stop" })).toMatchObject({ ok: false });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop" })).toEqual({ ok: true });
+		await admit({ childId: "B", runId: "run-next" });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
+		// No marker at all is a close no worker could read: it is reported as a failure, never treated as done.
+		const bare = await mkdtemp(join(tmpdir(), "storm-admission-bare-"));
+		await mkdir(join(bare, "agent"), { recursive: true });
+		expect(await closeWorkerSpend({ agentDir: join(bare, "agent"), artifactRoot: join(bare, "artifacts"), parentId, runId, onExceed: "stop" })).toMatchObject({
+			ok: false,
+		});
+		await rm(bare, { recursive: true, force: true });
+	});
+
+	test("a marker Storm cannot read is unknown, and a readable close is not remembered over it", async () => {
+		await admit();
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop" })).toEqual({ ok: true });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toMatchObject({ kind: "closed" });
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		const names = (await readdir(runs)).filter(name => name.endsWith(".json"));
+		expect(names).toHaveLength(1);
+		await writeFile(join(runs, names[0] ?? ""), "{ not a marker");
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toMatchObject({ kind: "unknown" });
+		// The identity of the worker's parent is required: without it no marker can be named.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined })).toMatchObject({ kind: "unknown" });
 	});
 });

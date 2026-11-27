@@ -10,9 +10,10 @@ import * as path from "node:path";
 import { configHash } from "../src/config/canonical.ts";
 import { parseLaneResults } from "../src/plan/validate.ts";
 import type { CheckReport } from "../src/runtime/checks.ts";
-import { answerCitations } from "../src/runtime/attempt-collector.ts";
+import { answerCitations, normalizeAnswerText } from "../src/runtime/attempt-collector.ts";
 import {
 	ANSWER_CONTAINS_NOTE,
+	CITATION_ALIAS_FORMS,
 	CITATION_EXAMPLE,
 	CONTAINS_SHOWN_CHARS,
 	CONTRACT_HEADER,
@@ -298,6 +299,10 @@ describe("the citation example", () => {
 		// The text carries the example next to the form it names, so a worker copies the shape and not a made-up one.
 		const text = laneContractText(lane({ results: [{ id: "r", kind: "answer", criterion: "c" }] }), { isolated: false }) as string;
 		expect(text).toContain(`path:line 형식으로 적으세요(예: ${CITATION_EXAMPLE})`);
+		// The alias forms are read by the same parser, so the block names them as read.
+		expect(text).toContain(CITATION_ALIAS_FORMS);
+		expect(text).toContain("첫 줄을 기준으로");
+		expect(text).not.toContain("읽지 않음");
 	});
 });
 
@@ -549,8 +554,10 @@ describe("the answer line against the real evaluator", () => {
 	async function judgeAnswer(result: PlanLaneResult, answer: string, files: Record<string, string> = { "src/a.ts": SOURCE }): Promise<{ state: ResultEvidenceState; citations: number }> {
 		const root = await tempRoot("answer");
 		for (const [name, content] of Object.entries(files)) await put(root, name, content);
-		const citations = answerCitations(undefined, answer);
-		const evaluated = await evaluateSettledResults({ lane: "ask", attemptId: "attempt-1", results: [result], shared: { root }, answer: { text: answer, citations } });
+		// The collector normalises aliases before the evaluator; this helper judges exactly what production would.
+		const text = normalizeAnswerText(answer);
+		const citations = answerCitations(undefined, text);
+		const evaluated = await evaluateSettledResults({ lane: "ask", attemptId: "attempt-1", results: [result], shared: { root }, answer: { text, citations } });
 		if (!evaluated.ok) throw new Error(evaluated.reason);
 		return { state: evaluated.report.results[0]?.state as ResultEvidenceState, citations: citations.length };
 	}
@@ -574,6 +581,26 @@ describe("the answer line against the real evaluator", () => {
 		expect((await judgeAnswer(plain, "limit: 42")).state).toBe("unmet");
 		expect((await judgeAnswer(plain, "limit: 42 (src/a.ts:99)")).state).toBe("unmet");
 		expect((await judgeAnswer(plain, "limit: 42 (src/missing.ts:2)")).state).toBe("unmet");
+	});
+
+	test("an alias form is judged exactly as its path:line, and an invalid coordinate is not a citation", async () => {
+		// Each bare form names line 2, which states `limit: 42`; the canonical form and every alias are one answer.
+		for (const answer of [
+			"limit: 42 (src/a.ts:2)",
+			"limit: 42 (src/a.ts#L2)",
+			"limit: 42 (src/a.ts#L2-L3)",
+			"limit: 42 (src/a.ts#L2-3)",
+		]) {
+			expect((await judgeAnswer(plain, answer)).state).toBe("accepted");
+		}
+		// A Markdown target is normalised in place, so the alias link and the canonical link are judged the same.
+		const linked = await judgeAnswer(plain, "limit: 42 ([the line](src/a.ts#L2))");
+		expect(linked.citations).toBe(1);
+		expect(linked).toEqual(await judgeAnswer(plain, "limit: 42 ([the line](src/a.ts:2))"));
+		// An unreadable coordinate makes the answer uncited: it never falls back to accepting the path alone.
+		for (const answer of ["limit: 42 (src/a.ts#L0)", "limit: 42 (src/a.ts#Lx)", "limit: 42 (src/a.ts#L4-L2)"]) {
+			expect((await judgeAnswer(plain, answer)).state).toBe("unmet");
+		}
 	});
 
 	test("a path on the result must be the cited path", async () => {

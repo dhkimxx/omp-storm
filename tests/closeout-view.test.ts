@@ -8,6 +8,7 @@ import { infoFrame, infoSymbol } from "../src/ui/info-node.ts";
 import { registerReportRenderer } from "../src/ui.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine } from "../src/types.ts";
 import { CLOSEOUT_CHOICE_HINT, CLOSEOUT_STATUS_COMMAND, closeoutDetails, closeoutDuration, readCloseoutRecord, renderCloseout } from "../src/view/closeout.ts";
+import { NO_DECLARED_RESULTS } from "../src/runtime/result-facts.ts";
 import { mountMessage, type TuiView } from "./tui-host.ts";
 
 const TITLE = "Storm 실행 결과";
@@ -135,6 +136,17 @@ describe("closeout text", () => {
 		expect(info).toEqual([
 			{ index: 0, spans: [{ text: "완료 · 검증됨", tone: "success" }, { text: " · 수용 1/1 · 3분" }], icon: "status.success", emphasis: "title" },
 		]);
+	});
+
+	test("a card with no declared rows says so and carries no success mark", () => {
+		const rowless = brief({
+			official: { label: "완료 · 리뷰 통과(결과 집계 없음)", tone: "accent", hasResults: false, accepted: 0, inScope: 0, excluded: 0, open: NONE_OPEN },
+		});
+		const { markdown, info } = renderCloseout(rowless, false);
+		expect(markdown).toContain(NO_DECLARED_RESULTS);
+		expect(markdown).not.toContain("0/0");
+		const title = info.find(line => line.emphasis === "title");
+		expect(title?.icon).not.toBe("status.success");
 	});
 
 	test("a card leads with request, target and duration, then the official line, warnings, account, proof and actions", () => {

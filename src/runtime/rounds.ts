@@ -491,14 +491,26 @@ function outputSettled(
 	return true;
 }
 
+/**
+ * Run-level facts the gate needs beyond the ledger and the tree. Absent keeps every earlier answer.
+ */
+export interface GateFacts {
+	/**
+	 * A director path edit was committed during the run. The change may then be the director's own, so the gate must not
+	 * credit it to the cheap role: `quick-only` is refused and the integrated review is required (R10, F2).
+	 */
+	directorEdit?: boolean;
+}
+
 /** What the run's file changes, the work tree and review verdicts amount to: nothing to verify, verified, or unverified with why. */
 export function reviewGate(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
 	tree?: { start?: TreeState; now?: TreeState },
 	coverage?: CoverageInput,
+	facts?: GateFacts,
 ): Gate {
-	const gate = gateCore(agents, config, tree, coverage);
+	const gate = gateCore(agents, config, tree, coverage, facts);
 	if (gate.state === "none" && gate.why === "no-changes" && outputSettled(agents, config, tree, coverage)) return { state: "passed" };
 	return withResults(gate, coverage);
 }
@@ -508,6 +520,7 @@ function gateCore(
 	config: StormConfig,
 	tree?: { start?: TreeState; now?: TreeState },
 	coverage?: CoverageInput,
+	facts?: GateFacts,
 ): Gate {
 	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick");
 	const changes = agents.reduce((sum, agent) => sum + (agent.changes ?? 0), 0);
@@ -516,7 +529,9 @@ function gateCore(
 	const treeChanged = coverage?.restoredChange === true ||
 		(tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files));
 	// A change the team can put down to the quick role alone needs no reviewer: quick agents do small, self-contained work.
-	const quickOnly = agents.some(agent => agent.role === "quick") && !agents.some(agent => agent.role === "implementer" || agent.role === undefined);
+	// A director edit in the run removes that reading: the change may be the director's own, so only a review can settle it.
+	const directorEdit = facts?.directorEdit === true;
+	const quickOnly = !directorEdit && agents.some(agent => agent.role === "quick") && !agents.some(agent => agent.role === "implementer" || agent.role === undefined);
 	const treeNow = tree?.now === undefined || tree.now.incomplete ? undefined : treeFingerprint(tree.now);
 	const lastChangeAt = writers.length ? Math.max(...writers.map(agent => agent.lastChangeAt ?? 0)) : undefined;
 	// A lane or quick-only state needs no reviewer; the approved reviewer is authority only for a change review.
@@ -544,7 +559,8 @@ function gateCore(
 	}
 	// Configured names are authority even when the payload omitted them: a quick-only state must not hide one.
 	const requiredChecks = [...new Set([...(config.requiredChecks ?? []).map(check => check.name), ...(coverage?.requiredChecks ?? [])])];
-	if (writers.length === 0 && !(treeChanged && !quickOnly)) {
+	// A director edit is a change no cheap role may be credited with, even when the tree shows none now: review it.
+	if (!directorEdit && writers.length === 0 && !(treeChanged && !quickOnly)) {
 		// Planned work that never ran is the first continuation reason; checks are evaluated once that work exists.
 		if (pendingLane) return unverified("lanes", { lane: pendingLane.name });
 		// Quick work stays unreviewed only when no configured check is failed or missing.

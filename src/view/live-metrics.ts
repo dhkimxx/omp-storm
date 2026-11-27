@@ -3,9 +3,9 @@
  * description read the same chips; only the layout decides which whole chips fit. Animation never reaches this file.
  */
 import { formatUsd } from "../policy/spawn.ts";
+import { NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
 import type { InfoTone, RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, type RunPhase } from "./appearance.ts";
-import { resultProgress, type ResultProgress } from "./results.ts";
 
 export type LiveMetricKey = "results" | "round" | "workers" | "cost" | "time";
 export type LiveMetricIcon = "icon.goal" | "icon.loop" | "icon.agents" | "icon.cost" | "icon.time";
@@ -60,24 +60,52 @@ function money(value: number, digits: number): string {
  * state, and the accepted/in-scope count; narrower forms keep the count and the state word so a small terminal still
  * shows what is blocked rather than only worker telemetry.
  */
-function resultChip(progress: ResultProgress): LiveMetricChip | undefined {
-	if (!progress.present) return undefined;
+function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
+	const progress = facts.progress;
+	if (!facts.hasDeclared) {
+		if (!facts.noResultsNotice) return undefined;
+		const workers = `${WORKER_LABEL} ${facts.activity.placed}`;
+		const changed =
+			facts.changedPaths === undefined
+				? facts.activity.changed === 0
+					? undefined
+					: `변경한 워커 ${facts.activity.changed}`
+				: `변경 ${facts.changedPaths}`;
+		const out = facts.outOfPlan === 0 ? undefined : `${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
+		const tail = [workers, changed, out].filter((part): part is string => part !== undefined).join(" · ");
+		const forms: LiveMetricForm[] =
+			tail === workers
+				? [{ value: NO_DECLARED_RESULTS, suffix: ` · ${workers}` }, { value: NO_DECLARED_RESULTS }]
+				: [
+						{ value: NO_DECLARED_RESULTS, suffix: ` · ${tail}` },
+						{ value: NO_DECLARED_RESULTS, suffix: ` · ${workers}` },
+						{ value: NO_DECLARED_RESULTS },
+					];
+		return {
+			key: "results",
+			icon: "icon.goal",
+			forms,
+			aria: `${NO_DECLARED_RESULTS}, ${tail}`,
+			tone: "dim",
+		};
+	}
 	const counts = progress.counts;
 	const label = progress.focus?.label ?? "결과";
 	const focusState = progress.focus?.state;
 	const state = progress.focus?.excluded === true ? "사용자 제외" : (progress.focus?.stateLabel ?? "결과");
 	const excluded = counts.excluded === 0 ? "" : ` · 제외 ${counts.excluded}`;
+	const mixed = facts.outOfPlan === 0 ? "" : ` · ${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
 	const progressText = `이행 ${counts.accepted}/${counts.inScope}`;
-	const full = focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`;
+	const full = (focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`) + mixed;
 	const forms: LiveMetricForm[] =
 		counts.inScope > 0
 			? [
 					{ value: label, suffix: full },
-					{ value: `${counts.accepted}/${counts.inScope}`, suffix: ` ${state}${excluded}` },
+					{ value: `${counts.accepted}/${counts.inScope}`, suffix: ` ${state}${excluded}${mixed}` },
 					{ value: `${counts.accepted}/${counts.inScope}` },
 				]
 			: [
-					{ value: label, suffix: ` 사용자 제외 ${counts.excluded}` },
+					{ value: label, suffix: ` 사용자 제외 ${counts.excluded}${mixed}` },
 					{ value: `제외 ${counts.excluded}` },
 				];
 	const tone: LiveMetricTone = progress.tone === "muted" ? "dim" : progress.tone;
@@ -146,10 +174,10 @@ function timeChip(run: RunRecord, now: number): LiveMetricChip {
 }
 
 /** Shape the snapshot once per controller update; the same facts feed ANSI and native output. */
-export function liveMetricFacts(run: RunRecord, phase: RunPhase, now: number): LiveMetricFacts {
+export function liveMetricFacts(run: RunRecord, phase: RunPhase, now: number, options: ResultFactOptions = {}): LiveMetricFacts {
 	const look = RUN_APPEARANCE[phase];
-	const progress = resultProgress(run);
-	const results = resultChip(progress);
+	const facts = resultFacts(run, options);
+	const results = resultChip(facts);
 	const chips = [results, roundChip(run), workersChip(run), costChip(run), timeChip(run, now)].filter(
 		(chip): chip is LiveMetricChip => chip !== undefined,
 	);
@@ -157,6 +185,6 @@ export function liveMetricFacts(run: RunRecord, phase: RunPhase, now: number): L
 		phase: { label: look.label, tone: look.tone },
 		chips,
 		// The ledger key includes the displayed result label/state/count: settlement repaints even if counters are stable.
-		key: JSON.stringify([phase, progress.key, chips.map(chip => [chip.key, chip.forms, chip.tone, chip.state, chip.aria])]),
+		key: JSON.stringify([phase, facts.key, chips.map(chip => [chip.key, chip.forms, chip.tone, chip.state, chip.aria])]),
 	};
 }

@@ -2,7 +2,9 @@ import type { RunPhase } from "../appearance.ts";
 
 export type LaneState =
 	| "reserved" | "waiting" | "running" | "quiet" | "submitted" | "reviewing"
-	| "accepted" | "unmet" | "blocked" | "excluded" | "idle";
+	| "accepted" | "unmet" | "blocked" | "excluded" | "idle" | "refused";
+/** The role word of a row that exists because the run placed a worker outside the plan. */
+export const UNPLANNED_LABEL = "계획 밖";
 /** Milliseconds from run start. `to` absent means the span is still open at `now`. */
 export interface LaneSpan { from: number; to?: number; state: LaneState }
 export interface PhaseSpan { from: number; to?: number; phase: RunPhase }

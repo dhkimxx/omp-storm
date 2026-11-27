@@ -24,6 +24,8 @@ import type { PlanLane, PlanLaneResult } from "../types.ts";
 export const CONTRACT_TAG = "[storm:계약]";
 /** A citation the real parser (`answerCitations`) reads; a test pins that, so the hint cannot drift from the parser. */
 export const CITATION_EXAMPLE = "src/a.ts:42";
+/** The alias forms the same parser reads; exported so the test and the block cannot disagree. */
+export const CITATION_ALIAS_FORMS = "path#L12, path#L12-L20, [텍스트](path#L12)";
 /** The most UTF-8 bytes one block may hold. */
 export const CONTRACT_MAX_BYTES = 2_400;
 /** How much of a `contains` a worker sees; the judgement always uses the whole string. */
@@ -70,7 +72,7 @@ const ARTIFACT_SHARED_RULE =
 	"artifact: 공유 작업 트리에서는 change와 같게 기준선과 비교해 판정하며 path가 있어야 합니다. path가 없으면 인정되지 않습니다.";
 const ARTIFACT_ISOLATED_RULE =
 	"artifact: 이 시도에 결속된 보존 산출물 안에서 path를 읽습니다(부모 작업 트리는 읽지 않습니다). 요구 문자열은 그 파일 내용에, 패치라면 추가된 줄에 있어야 합니다.";
-const ANSWER_RULE = `answer: 답에 근거 위치를 path:line 형식으로 적으세요(예: ${CITATION_EXAMPLE}). Storm이 인용한 줄을 다시 읽고, 답 전체가 그 줄과 같거나 답이 값 하나(숫자, true/false, null, 따옴표 문자열, 키: 값)이고 그 줄의 값과 같을 때만 기계로 인정합니다. 서술형 답이나 기계로 확인하지 못하는 답은 리뷰어가 판정합니다. 읽을 수 없는 위치만 인용하면 인정되지 않고, 결과에 path가 있으면 그 경로를 인용해야 합니다. 요구 내용이 있는 결과는 인용한 줄에 그 내용이 있어야 하며, 답의 숫자·true/false 값이 어긋나면 인정되지 않습니다.`;
+const ANSWER_RULE = `answer: 답에 근거 위치를 path:line 형식으로 적으세요(예: ${CITATION_EXAMPLE}). Storm이 인용한 줄을 다시 읽고, 답 전체가 그 줄과 같거나 답이 값 하나(숫자, true/false, null, 따옴표 문자열, 키: 값)이고 그 줄의 값과 같을 때만 기계로 인정합니다. 서술형 답이나 기계로 확인하지 못하는 답은 리뷰어가 판정합니다. ${CITATION_ALIAS_FORMS} 형식도 같은 위치로 읽고, 범위는 첫 줄을 기준으로 읽습니다. 읽을 수 없는 위치만 인용하면 인정되지 않고, 결과에 path가 있으면 그 경로를 인용해야 합니다. 요구 내용이 있는 결과는 인용한 줄에 그 내용이 있어야 하며, 답의 숫자·true/false 값이 어긋나면 인정되지 않습니다.`;
 const CHECK_RULE =
 	"검사: 이름이 붙은 승인된 검사를 Storm이 직접 실행해 통과해야 합니다. 통과하지 못했거나 아직 실행되지 못했으면 인정되지 않습니다.";
 

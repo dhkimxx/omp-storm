@@ -70,16 +70,17 @@ export function drawRoute(fx: Fx, route: Route): void {
 			case "unmet": visible = i % 2 === 0; colour = mix(base, white(fx), 0.3); energy = 0.7; break;
 			case "idle": colour = mix(base, greyOf(fx), 0.7); energy = 0.3; break;
 			case "excluded": visible = i % 3 === 0; colour = greyOf(fx); energy = 0.34; break;
+			case "refused": visible = i % 3 === 0; colour = greyOf(fx); energy = 0.24; break;
 			case "blocked": colour = base; energy = 0.6; offs = [0, 1]; break;
 			case "accepted": energy = 0.7; offs = [0, 1]; break;
 			default: break;
 		}
-		if (last === "excluded") { visible = i % 3 === 0; colour = greyOf(fx); energy = 0.34; offs = [0]; }
+		if (last === "excluded" || last === "refused") { visible = i % 3 === 0; colour = greyOf(fx); energy = 0.34; offs = [0]; }
 		// Stems and joins are the graph's own lines: one clear thin line in the lane's hue, as bright as the lane itself.
 		if (p.kind === "stem" || p.kind === "join") {
 			visible = true;
-			colour = last === "excluded" ? mix(base, greyOf(fx), 0.6) : base;
-			energy = last === "excluded" ? 0.5 : p.kind === "join" ? 0.8 : 0.9;
+			colour = last === "excluded" || last === "refused" ? mix(base, greyOf(fx), 0.6) : base;
+			energy = last === "excluded" || last === "refused" ? 0.5 : p.kind === "join" ? 0.8 : 0.9;
 			offs = [0];
 		}
 		if (!visible) return;

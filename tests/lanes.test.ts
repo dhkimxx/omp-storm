@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { broadcastBlock, dependencyBlock, dependencyStart, PENDING_WRITE_MS, replanConflict, RunLanes } from "../src/runtime/lanes.ts";
+import { broadcastBlock, dependencyBlock, dependencyStart, PENDING_WRITE_MS, replanConflict, RunLanes, UNPLANNED_NOTE_TAG } from "../src/runtime/lanes.ts";
 import type { LanePolicy } from "../src/policy/capability.ts";
 import { reservedWorkers } from "../src/policy/spawn.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
@@ -18,7 +18,11 @@ function assigned(work: RunLanes, p: RunPlan, name: string): string {
 test("two same-role lanes require actual distinct assignments and a spawned worker cannot cover another lane", () => {
 	const work = new RunLanes("run-example");
 	const p = plan(lane("api", "Implement API"), lane("view", "Render output"));
-	expect(work.assign({ agent: "storm-implementer", task: "Implement" }, p, team).ok).toBe(false);
+	// An item with no name and two usable lanes names nothing to match, so it is unplanned (R5), never guessed.
+	const stray = new RunLanes("run-stray");
+	const unmatched = stray.assign({ agent: "storm-implementer", task: "Implement" }, p, team);
+	expect(unmatched.ok).toBe(true);
+	if (unmatched.ok) expect(unmatched.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
 	expect(work.assign({ tasks: [{ agent: "storm-implementer", name: "api" }, { agent: "storm-implementer", name: "api" }] }, p, team).ok).toBe(false);
 	const id = assigned(work, p, "api");
 	expect(work.admit({ spawnKey: id, agent: "storm-explorer", outcome: "routed" })).toBeUndefined();
@@ -212,12 +216,13 @@ test("a team whose configuration says isolated needs omp's apply setting off, li
 	expect(new RunLanes("shared-apply").place(input, p, team, { host: { enabled: true, apply: true } }).ok).toBe(true);
 });
 
-test("a planned batch requires one concrete lane per item before any reservation, including team isolation", () => {
-	const work = new RunLanes("run-atomic");
+test("a planned batch resolves names to lanes and places everything else unplanned; isolation runs them together", () => {
 	const p = plan(lane("A", "Implement A"), lane("B", "Implement B"), lane("C", "Implement C"));
-	// A whole-team-isolated request is not an exemption: the unassigned second item fails before item A reserves.
+	// A team that isolates every worker makes a planned and an unplanned item alike private; private items do not wait
+	// on the shared write order (D10). The unnamed item is unplanned (R5), never given the planned item's lane.
 	const isolated = teamOf({ implementer: "fake/dev" }, { isolation: "isolated" });
-	const mixed = work.place(
+	const atomic = new RunLanes("run-atomic");
+	const mixed = atomic.place(
 		{
 			tasks: [
 				{ agent: "storm-implementer", name: "A", task: "A" },
@@ -228,9 +233,16 @@ test("a planned batch requires one concrete lane per item before any reservation
 		isolated,
 		{ host: { enabled: true, apply: false } },
 	);
-	expect(mixed.ok).toBe(false);
-	// The refused batch left A free: the same approved batch can run as a whole and puts both items in isolation.
-	const good = work.place(
+	expect(mixed.ok).toBe(true);
+	if (mixed.ok) {
+		const tasks = mixed.input.tasks as Array<Record<string, unknown>>;
+		expect(tasks[0]).toMatchObject({ name: "A", isolated: true });
+		expect(tasks[1]).toMatchObject({ isolated: true });
+		expect(tasks[1]!.name).toMatch(/^storm-implementer-\d+-\d+$/);
+	}
+	// A manual planned item keeps its lane name and its isolation placement.
+	const good = new RunLanes("run-atomic-good");
+	const approved = good.place(
 		{
 			tasks: [
 				{ agent: "storm-implementer", name: "A", task: "A" },
@@ -242,36 +254,21 @@ test("a planned batch requires one concrete lane per item before any reservation
 		isolated,
 		{ host: { enabled: true, apply: false } },
 	);
-	expect(good.ok).toBe(true);
-	if (good.ok) {
-		const tasks = good.input.tasks as Array<Record<string, unknown>>;
-		expect(tasks[0]).toMatchObject({ isolated: true });
-		expect(tasks[1]).toMatchObject({ isolated: true });
-		expect(tasks[2]).toMatchObject({ isolated: true });
+	expect(approved.ok).toBe(true);
+	if (approved.ok) {
+		const tasks = approved.input.tasks as Array<Record<string, unknown>>;
+		expect(tasks[0]).toMatchObject({ name: "A", isolated: true });
+		expect(tasks[1]).toMatchObject({ name: "B", isolated: true });
+		expect(tasks[2]).toMatchObject({ name: "C", isolated: true });
 	}
 
-	// A planned isolated item must name the lane its claim belongs to. Unplanned, duplicate and wrong-role items all
-	// fail before the earlier valid item can reserve its write scope.
 	const selected = plan(
 		{ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" },
 		lane("api", "Implement API"),
 		lane("extra", "Implement Extra"),
 	);
-	const shared = new RunLanes("run-atomic-shared");
-	const unplanned = shared.place(
-		{
-			tasks: [
-				{ agent: "storm-implementer", name: "api", task: "API" },
-				{ agent: "storm-implementer", task: "Stray", isolated: true },
-			],
-		},
-		selected,
-		team,
-		{ host: { enabled: true, apply: false } },
-	);
-	expect(unplanned.ok).toBe(false);
-	if (!unplanned.ok) expect(unplanned.reason).toContain("계획에 없는");
-	const duplicate = shared.place(
+	// The same lane twice is still refused, before anything is reserved.
+	const duplicate = new RunLanes("run-dup").place(
 		{
 			tasks: [
 				{ agent: "storm-implementer", name: "probe", task: "Probe", isolated: true },
@@ -284,57 +281,73 @@ test("a planned batch requires one concrete lane per item before any reservation
 	);
 	expect(duplicate.ok).toBe(false);
 	if (!duplicate.ok) expect(duplicate.reason).toContain("이미 사용");
-	const wrongRole = shared.place(
+	// A name that matches another role's lane is placed unplanned under a new handle, with one line in the result.
+	const wrongRole = new RunLanes("run-wrong-role").place(
 		{ tasks: [{ agent: "storm-explorer", name: "probe", task: "Probe", isolated: true }] },
 		selected,
 		team,
 		{ host: { enabled: true, apply: false } },
 	);
-	expect(wrongRole.ok).toBe(false);
-	if (!wrongRole.ok) expect(wrongRole.reason).toContain("역할");
-	// The same batch is accepted after the atomic refusals: probe reserves its isolated lane and api its shared one.
-	const approved = shared.place(
+	expect(wrongRole.ok).toBe(true);
+	if (wrongRole.ok) {
+		const tasks = wrongRole.input.tasks as Array<Record<string, unknown>>;
+		expect(tasks[0]!.name).toMatch(/^storm-explorer-\d+-\d+$/);
+		expect(tasks[0]).toMatchObject({ isolated: true });
+		expect(wrongRole.notes?.some(note => note.includes(UNPLANNED_NOTE_TAG) && note.includes("역할"))).toBe(true);
+	}
+	// An isolated unplanned item runs beside a planned shared writer: it is private, not another shared writer.
+	const beside = new RunLanes("run-mixed").place(
 		{
 			tasks: [
-				{ agent: "storm-implementer", name: "probe", task: "Probe" },
 				{ agent: "storm-implementer", name: "api", task: "API" },
+				{ agent: "storm-implementer", task: "Stray", isolated: true },
 			],
 		},
 		selected,
 		team,
 		{ host: { enabled: true, apply: false } },
 	);
-	expect(approved.ok).toBe(true);
-	if (approved.ok) {
-		const tasks = approved.input.tasks as Array<Record<string, unknown>>;
-		expect(tasks[0]).toMatchObject({ isolated: true });
-		expect(tasks[1]).not.toHaveProperty("isolated");
-	}
-});
-
-test("an unbound direct task cannot claim an isolated lane, and a rejected batch reserves nothing", () => {
-	const work = new RunLanes("run-reserve");
-	const p = plan({ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
-	const direct = work.place({ agent: "storm-implementer", task: "Probe", isolated: true }, undefined, team);
-	expect(direct.ok).toBe(false);
-	if (!direct.ok) expect(direct.reason).toContain("계획에 없는");
-	expect(work.place({ agent: "storm-implementer", task: "Probe" }, undefined, team).ok).toBe(true);
-	const rejected = work.place(
+	expect(beside.ok).toBe(true);
+	// With no declared files an unplanned item is never `paths`: two of them are two exclusive writers.
+	const writers = new RunLanes("run-writers").place(
 		{
 			tasks: [
-				{ agent: "storm-implementer", name: "probe", task: "Probe" },
-				{ agent: "storm-implementer", task: "Stray", isolated: true },
+				{ agent: "storm-implementer", task: "One" },
+				{ agent: "storm-implementer", task: "Two" },
 			],
 		},
-		p,
+		selected,
 		team,
-		{ host: { enabled: true, apply: false } },
+	);
+	expect(writers.ok).toBe(false);
+	if (!writers.ok) expect(writers.code).toBe("lane-write");
+});
+
+test("an unplanned isolated item needs omp isolation on and apply off; a rejected batch reserves nothing", () => {
+	const work = new RunLanes("run-reserve");
+	// With no host facts the isolation cannot be proven, so the item is refused before anything is reserved.
+	const direct = work.place({ agent: "storm-implementer", task: "Probe", isolated: true }, undefined, team);
+	expect(direct.ok).toBe(false);
+	if (!direct.ok) expect(direct.reason).toContain("격리");
+	// With both facts the same item runs private (D10), whatever its tools, under a new handle.
+	const isolated = work.place({ agent: "storm-implementer", task: "Probe", isolated: true }, undefined, team, { host: { enabled: true, apply: false } });
+	expect(isolated.ok).toBe(true);
+	if (isolated.ok) {
+		expect(isolated.input).toMatchObject({ isolated: true });
+		expect(isolated.input.name).toMatch(/^storm-implementer-\d+-\d+$/);
+	}
+	// Two shared writers in one batch are refused before either reserves; no placement serial advanced.
+	const rejected = work.place(
+		{ tasks: [{ agent: "storm-implementer", name: "one", task: "One" }, { agent: "storm-implementer", name: "two", task: "Two" }] },
+		undefined,
+		team,
 	);
 	expect(rejected.ok).toBe(false);
-	// The rejected batch did not advance the reservation serial or leave a lane behind.
+	if (!rejected.ok) expect(rejected.code).toBe("lane-write");
+	const p = plan({ ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent result" });
 	const assigned = work.assign({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
 	expect(assigned.ok).toBe(true);
-	if (assigned.ok) expect(assigned.input.name).toContain("run-reserve-lane-1");
+	if (assigned.ok) expect(assigned.input.name).toBe("run-reserve-lane-1");
 });
 
 test("isolation presence is lane identity while its wording is not, and shared evidence keeps covering", () => {

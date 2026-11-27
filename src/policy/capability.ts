@@ -101,6 +101,8 @@ export const WHY_AUTO_WRITER = "자동 위임";
 /** Why a shared writer's scope cannot be narrowed; short enough to sit in parentheses of a refusal or a plan line. */
 export const WHY_EXEC_WRITER = "임의 실행 도구가 있음";
 export const WHY_UNDECLARED_WRITER = "파일 목록이 없음";
+/** Why an agent definition whose tools could not be read is an unbounded writer: the host default is every tool. */
+export const WHY_TOOLS_UNKNOWN = "도구 목록을 확인하지 못해 전체 도구로 봄";
 /** A reviewer that may run commands can change files like any shell worker, so it is ordered like a writer. */
 export const WHY_SHELL_REVIEWER = "리뷰어가 셸 명령을 실행할 수 있음";
 /** The same for any other read lane (explore, design, answer-only) whose agent definition lists a shell. */
@@ -147,7 +149,7 @@ export function reviewLane(lane: PlanLane): boolean {
 }
 
 /** Whether the list is read-only tools plus only the shell (`bash`), and has at least one shell tool. */
-function readOnlyWithShell(tools: readonly string[] | undefined): boolean {
+export function readOnlyWithShell(tools: readonly string[] | undefined): boolean {
 	if (tools === undefined) return false;
 	let shell = false;
 	for (const raw of tools) {
@@ -167,6 +169,46 @@ export function shellReader(policy: LanePolicy | undefined): boolean {
 /** Why a shell reader is ordered like a writer, for a refusal or a plan line: names the review lane when it is one. */
 export function shellReaderWhy(lane: PlanLane | undefined): string {
 	return lane !== undefined && reviewLane(lane) ? WHY_SHELL_REVIEWER : WHY_SHELL_READER;
+}
+
+/**
+ * A placement's frozen shared-tree authority, as the write table holds it. It is the public form of the table's scope:
+ * `read` can only read, `private` writes only inside its own isolated checkout, `paths` writes the named paths, and
+ * `unknown` can write anywhere or run commands. A worker's persisted policy may never be wider than this (R3).
+ */
+export interface WriteAuthority {
+	kind: "read" | "private" | "paths" | "unknown";
+	/** Workspace-relative paths a `paths` authority covers; absent for every other kind. */
+	paths?: readonly string[];
+}
+
+/** Whether `path` is `scope` or lies below it; `"."` covers the tree. A path that escapes is never covered. */
+function withinScope(path: string, scope: string): boolean {
+	const clean = normalizeScopePath(path);
+	const root = normalizeScopePath(scope);
+	if (clean === undefined || root === undefined) return false;
+	if (root === ".") return true;
+	return clean === root || clean.startsWith(`${root}/`);
+}
+
+/**
+ * R3: whether the authority a placement froze is at least as wide as the policy the spawn hook derived now. A hook
+ * policy narrower than the placement is safe; a wider one has no reservation behind it and is refused. `private` is not
+ * ordered with the shared kinds: a shared placement read as private would let path tools write the parent root, and a
+ * private placement read as shared would write beside other workers with no reservation.
+ */
+export function authorityCovers(authority: WriteAuthority, policy: LanePolicy): boolean {
+	if (policy.kind === "blocked") return false;
+	if (policy.kind === "private") return authority.kind === "private";
+	// A plain reader needs no shared write order; any placement covers it.
+	if (policy.kind === "read") return policy.shell === true ? authority.kind === "unknown" : true;
+	if (policy.kind === "paths") {
+		if (authority.kind === "unknown") return true;
+		if (authority.kind !== "paths") return false;
+		const held = authority.paths ?? [];
+		return (policy.paths ?? []).every(path => held.some(scope => withinScope(path, scope)));
+	}
+	return authority.kind === "unknown";
 }
 
 /**

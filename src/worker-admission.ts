@@ -15,6 +15,7 @@ import { sha256Hex } from "./config/canonical.ts";
 import { writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
+import { isSpendClose, type SpendClose, type SpendCloseRead } from "./policy/spend-close.ts";
 import { assertSessionStoreSafe } from "./session-scope.ts";
 import type { RanModel } from "./types.ts";
 
@@ -61,6 +62,12 @@ export interface WorkerAdmissionRecord {
 	policy: WorkerAdmissionPolicy;
 	createdAt: number;
 	expiresAt: number;
+	/**
+	 * The key of the write reservation bound to this attempt, written only by the main session's spawn hook after
+	 * `admitChecked` bound one (R7). An admission with no lane may use tools beyond reading only while this field is
+	 * present and the record is open; absent keeps the read-only meaning every earlier record has.
+	 */
+	hold?: string;
 	/** Set by the parent's run/session revocation. A closed record denies writes but still proves management. */
 	revokedAt?: number;
 	/** Set when the child's own settled turn ends; a follow-up admission opens a new attempt. */
@@ -85,6 +92,8 @@ export interface WorkerAdmissionInput {
 	targetRoot: string;
 	lane?: string;
 	policy: LanePolicy;
+	/** The bound reservation key behind an unplanned worker's non-read tools (see `WorkerAdmissionRecord.hold`). */
+	hold?: string;
 	/** See `WorkerAdmissionRecord.approved`. */
 	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
 }
@@ -137,6 +146,7 @@ function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt)) return false;
 	if (!isPolicy(value.policy)) return false;
 	if (value.lane !== undefined && (typeof value.lane !== "string" || value.lane.length > MAX_ID)) return false;
+	if (value.hold !== undefined && (typeof value.hold !== "string" || value.hold.trim() === "" || CONTROL_CHARS.test(value.hold) || value.hold.length > MAX_ID)) return false;
 	if (value.revokedAt !== undefined && (typeof value.revokedAt !== "number" || !Number.isFinite(value.revokedAt))) return false;
 	if (value.endedAt !== undefined && (typeof value.endedAt !== "number" || !Number.isFinite(value.endedAt))) return false;
 	if (value.approved !== undefined) {
@@ -298,6 +308,12 @@ interface WorkerRunMarker {
 	createdAt: number;
 	expiresAt: number;
 	revokedAt?: number;
+	/**
+	 * Set when the director's instance observed spend reach the user's limit; absent means the run has not closed its
+	 * spend. Workers read it from disk, often on another thread, through `readWorkerSpendClose` (D8, R15). The value
+	 * carries the user's own `budget.onExceed`, because the workers must know which stop the user chose.
+	 */
+	spendClosedAt?: SpendClose;
 }
 
 function runMarkerKey(artifactRoot: string, parentId: string): string {
@@ -318,6 +334,7 @@ function isRunMarker(value: unknown): value is WorkerRunMarker {
 	if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt)) return false;
 	if (typeof value.expiresAt !== "number" || !Number.isFinite(value.expiresAt)) return false;
 	if (value.revokedAt !== undefined && (typeof value.revokedAt !== "number" || !Number.isFinite(value.revokedAt))) return false;
+	if (value.spendClosedAt !== undefined && !isSpendClose(value.spendClosedAt)) return false;
 	return true;
 }
 
@@ -351,6 +368,12 @@ async function writeWorkerRunMarker(input: {
 		expiresAt: input.now + ACTIVE_TTL_MS,
 	};
 	const file = path.join(dir, `${marker.key}.json`);
+	// A spawn admitted after the limit must not erase the close: the director refuses new spawns past it, but one
+	// already in flight can still reach here. A new run of the same tree and parent writes its own run id, so it is open.
+	const existing = await readRecordFile(file);
+	if (existing.kind === "value" && isRunMarker(existing.value) && existing.value.runId === marker.runId && existing.value.spendClosedAt !== undefined) {
+		marker.spendClosedAt = existing.value.spendClosedAt;
+	}
 	await writeJsonAtomic(file, marker);
 	await chmod(file, 0o600).catch(() => undefined);
 }
@@ -407,6 +430,103 @@ async function readWorkerRunMarker(
 	return { kind: "record", marker: read.value };
 }
 
+/** One cached marker close, keyed by the marker file: a worker reads it on every tool call and every request. */
+interface SpendCloseCacheEntry {
+	mtimeMs: number;
+	size: number;
+	read: SpendCloseRead;
+}
+
+const spendCloseCache = new Map<string, SpendCloseCacheEntry>();
+
+/**
+ * Closes this run's spend in the marker the workers read. Called once, by the director's own instance, when observed
+ * spend reaches the limit. The run id is checked so a stale caller cannot close another run's marker, and a missing
+ * marker is a failure the caller must tell the user about rather than a silent no-op: no worker would see the stop.
+ */
+export async function closeWorkerSpend(input: {
+	agentDir: string;
+	artifactRoot: string | undefined;
+	parentId: string;
+	runId: string;
+	onExceed: SpendClose["onExceed"];
+	now?: number;
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+	if (input.onExceed !== "block-spawns" && input.onExceed !== "stop") {
+		return { ok: false, reason: "사용자가 고른 예산 초과 동작을 확인하지 못해 예산 한도를 워커에게 알리지 못했습니다" };
+	}
+	try {
+		const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
+		if (artifactRoot === undefined) return { ok: false, reason: "자식 산출물 루트를 확인하지 못해 예산 한도를 워커에게 알리지 못했습니다" };
+		const key = runMarkerKey(artifactRoot, input.parentId);
+		const file = path.join(runsDir(admissionsDir(input.agentDir)), `${key}.json`);
+		const read = await readRecordFile(file);
+		if (read.kind === "missing") return { ok: false, reason: "이 실행의 관리 표시가 없어 예산 한도를 워커에게 알리지 못했습니다" };
+		if (read.kind === "invalid") return { ok: false, reason: read.reason };
+		if (!isRunMarker(read.value) || read.value.key !== key || read.value.artifactRoot !== artifactRoot || read.value.parentId !== input.parentId) {
+			return { ok: false, reason: "관리 실행 표시의 신원이 일치하지 않아 예산 한도를 워커에게 알리지 못했습니다" };
+		}
+		if (read.value.runId !== input.runId) return { ok: false, reason: "관리 실행 표시가 다른 실행을 가리켜 예산 한도를 워커에게 알리지 못했습니다" };
+		const marker: WorkerRunMarker = { ...read.value, spendClosedAt: { at: input.now ?? Date.now(), onExceed: input.onExceed } };
+		await writeJsonAtomic(file, marker);
+		await chmod(file, 0o600).catch(() => undefined);
+		return { ok: true };
+	} catch {
+		return { ok: false, reason: "예산 한도를 실행 표시에 쓰지 못했습니다" };
+	}
+}
+
+/**
+ * What this run's marker says about the spend limit, for a worker's guard and the check before its requests. The marker
+ * is looked up by the canonical artifact root and the parent id the host gave the child, never by memory: the worker may
+ * run on another host thread (D8, HF-4). Reads are cached by the marker's modification time and size; the file is
+ * replaced atomically, so a changed file changes the cache key.
+ */
+export async function readWorkerSpendClose(input: {
+	agentDir: string;
+	artifactRoot: string | undefined;
+	parentId: string | undefined;
+}): Promise<SpendCloseRead> {
+	try {
+		if (input.parentId === undefined) return { kind: "unknown", reason: "부모 에이전트 id를 확인하지 못했습니다" };
+		const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
+		if (artifactRoot === undefined) return { kind: "unknown", reason: "자식 산출물 루트를 확인하지 못했습니다" };
+		const key = runMarkerKey(artifactRoot, input.parentId);
+		const file = path.join(runsDir(admissionsDir(input.agentDir)), `${key}.json`);
+		const info = await lstat(file).catch(() => undefined);
+		if (info === undefined) {
+			spendCloseCache.delete(file);
+			return { kind: "open" };
+		}
+		if (!info.isFile()) return { kind: "unknown", reason: "관리 실행 표시가 일반 파일이 아닙니다" };
+		const cached = spendCloseCache.get(file);
+		if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.read;
+		const read = await readRecordFile(file);
+		let answer: SpendCloseRead;
+		if (read.kind === "missing") {
+			spendCloseCache.delete(file);
+			return { kind: "open" };
+		} else if (read.kind === "invalid") {
+			answer = { kind: "unknown", reason: read.reason };
+		} else if (
+			!isRunMarker(read.value) ||
+			read.value.key !== key ||
+			read.value.artifactRoot !== artifactRoot ||
+			read.value.parentId !== input.parentId
+		) {
+			answer = { kind: "unknown", reason: "관리 실행 표시의 형식이나 신원이 올바르지 않습니다" };
+		} else if (read.value.spendClosedAt === undefined) {
+			answer = { kind: "open" };
+		} else {
+			answer = { kind: "closed", close: read.value.spendClosedAt };
+		}
+		spendCloseCache.set(file, { mtimeMs: info.mtimeMs, size: info.size, read: answer });
+		return answer;
+	} catch {
+		return { kind: "unknown", reason: "관리 실행 표시를 읽지 못했습니다" };
+	}
+}
+
 /** Whether any managed run is live in this exact artifact tree; used to fence unattributed child spawns. */
 export async function activeWorkerRunInTree(agentDir: string, artifactRoot: string | undefined): Promise<boolean> {
 	const root = await canonicalWorkerArtifactRoot(artifactRoot);
@@ -436,6 +556,9 @@ async function hasActiveWorkerRun(agentDir: string, artifactRoot: string, now: n
 export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promise<{ key: string; record: WorkerAdmissionRecord }> {
 	const parentId = identity(input.parentId, "부모 에이전트 id");
 	const childId = identity(input.childId, "자식 에이전트 id");
+	// A hold is the reservation key behind the child's non-read tools: an empty one names nothing, so it is refused
+	// before any file of this admission is written.
+	const hold = input.hold === undefined ? undefined : identity(input.hold, "예약 키");
 	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 	if (artifactRoot === undefined) throw new Error("자식 산출물 루트를 확인하지 못했습니다");
 	const targetRoot = await realpath(input.targetRoot);
@@ -479,6 +602,7 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 		expiresAt: now + ACTIVE_TTL_MS,
 	};
 	if (input.lane !== undefined) record.lane = identity(input.lane, "레인 이름");
+	if (hold !== undefined) record.hold = hold;
 	if (input.approved !== undefined) record.approved = input.approved.slice(0, 64).map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
 	const file = admissionFile(dir, key);
 	await writeJsonAtomic(file, record);
@@ -515,6 +639,19 @@ export async function readWorkerAdmission(input: {
 		return { kind: "invalid", reason: "자식 권한 기록의 신원이 일치하지 않습니다" };
 	}
 	return { kind: "record", key, record };
+}
+
+/**
+ * The one rule R7 asks of a worker's guard: may this admission use a tool other than reading? A planned lane's powers
+ * are the lane policy's to grant or refuse. An admission with no lane gets them only from the write reservation its
+ * attempt holds: `hold` is written by the main session's hook after `admitChecked` bound one, and it ends with that
+ * reservation. A record without it (every record written before this field) keeps the read-only meaning; a revoked or
+ * ended record grants nothing even when it still carries one.
+ */
+export function admissionMayUseNonReadTools(record: Pick<WorkerAdmissionRecord, "lane" | "hold" | "revokedAt" | "endedAt">): boolean {
+	if (record.revokedAt !== undefined || record.endedAt !== undefined) return false;
+	if (record.lane !== undefined) return true;
+	return record.hold !== undefined && record.hold.trim() !== "";
 }
 
 /**

@@ -113,6 +113,7 @@ function stateStyle(fx: Fx, lane: number, state: LaneState): { colour: Rgb; ener
 		case "accepted": return { colour: textColour(fx, HUE_GREEN, 0.1), energy: 0.85, bold: false };
 		case "unmet": return { colour: textColour(fx, hue, 0.1), energy: 1, bold: true };
 		case "blocked": return { colour: textColour(fx, HUE_RED, 0.18), energy: 1, bold: true };
+		case "refused": return { colour: textGrey(fx), energy: 0.55, bold: false };
 		default: return { colour: textGrey(fx), energy: 0.8, bold: false };
 	}
 }
@@ -144,7 +145,7 @@ export function drawLabels(fx: Fx): void {
 		const state = fx.last[lane] ?? "idle";
 		const hue = fx.hues[lane] ?? 0;
 		if (label.side === "left") {
-			const final = state === "accepted" || state === "excluded";
+			const final = state === "accepted" || state === "excluded" || state === "refused";
 			const roleAt = track.label !== "" && label.text.endsWith(track.label) ? label.text.length - track.label.length : -1;
 			const name = roleAt >= 0 ? label.text.slice(0, roleAt) : label.text;
 			const colour = final ? mix(textColour(fx, hue, 0.13), textGrey(fx), fx.dark ? 0.4 : 0.2) : textColour(fx, hue, state === "waiting" || state === "idle" ? 0.07 : 0.14);

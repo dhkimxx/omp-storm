@@ -19,9 +19,10 @@ import { tokens } from "../report/agents.ts";
 import { MID_RUN_WINDOW_SHARE, RUN_START_WINDOW_SHARE, roleTitle, windowThreshold, workerRange } from "../roles.ts";
 import { isApproved, type ProjectState } from "../state.ts";
 import { assertSessionStoreSafe } from "../session-scope.ts";
-import type { RunRequestResult } from "../tool/host.ts";
+import type { ContinuedRun, RunRequestResult } from "../tool/host.ts";
 import type {
 	AgentEntry,
+	BudgetConfig,
 	CloseoutFacts,
 	LiveCheck,
 	PlanLane,
@@ -103,6 +104,7 @@ import {
 	staleRequirementIdsForPlan,
 } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
+import { PLANLESS_DEADLINE, PLANLESS_NO_TURN_TIME, PLANLESS_SAME_TURN, planlessOpen, stoppedInTurn } from "./planless.ts";
 import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, spendNote, startLedgerRun } from "./ledger.ts";
 import type { AttemptUnplannedDelivery } from "./attempt-collector.ts";
 import { UNPLANNED_MAX, unplannedNotice } from "./unplanned.ts";
@@ -140,6 +142,60 @@ import type { TreeReading, TreeState } from "./tree.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
 const spawnsByRun = new Map<string, SpawnRecord[]>();
+/**
+ * Each run's last admitted spawn by its key, and each key's delivery kind, both keyed for a lookup by key: with many
+ * workers a request or a delivery must not scan the run's whole spawn list (D11). Every record reaches these through
+ * `noteRunSpawn`, which is the one writer of `spawnsByRun` after a run's start; a later record of a key wins.
+ */
+const lastSpawnByKey = new Map<string, Map<string, SpawnRecord>>();
+const deliveryKindsByRun = new Map<string, Map<string, "lane" | "blocked" | "unplanned">>();
+
+/**
+ * When a run of one session and target last ended or stopped in this process, keyed by the session's own store and the
+ * target it ran on. R9's same-turn rule reads it: a stop at or after this turn's prompt means the user has not spoken
+ * since. In memory, like the spawn records: a run another process stopped is read from disk by the continuation path,
+ * which has the older run's own end time.
+ */
+const lastRunEnds = new Map<string, number>();
+
+/** When this session and target last ended or stopped a run in this process; absent when none did here. */
+export function lastRunEndAt(sessionDir: string, root: string): number | undefined {
+	return lastRunEnds.get(`${sessionDir}\u0000${root}`);
+}
+
+function noteRunEnd(sessionDir: string, root: string, at: number): void {
+	const key = `${sessionDir}\u0000${root}`;
+	const seen = lastRunEnds.get(key);
+	if (seen === undefined || at > seen) lastRunEnds.set(key, at);
+}
+
+/** Which of R12's two continuations happened: the old plan and rows carried, or a handoff with nothing re-proved. */
+export type ContinuedMode = "carry" | "handoff";
+
+/** What a continuation carried, with the one in-memory fact its caller acts on (R12). Until `host.ts` names it, this is
+ * the richer shape a caller reads; it is assignable wherever `RunRequestResult` is expected. */
+export interface ContinuedRunOutcome extends ContinuedRun {
+	mode: ContinuedMode;
+}
+
+/** A start's answer, richer than `RunRequestResult` only in the continuation's `mode`. */
+export type RunStartResult =
+	| { ok: true; runId: string; continued?: ContinuedRunOutcome }
+	| { ok: false; reason: string };
+
+/**
+ * What a plan-less automatic open needs from its caller, which has already classified and gated the batch. The
+ * controller then applies R9's ordered checks itself and opens the run through the same admission every start uses.
+ */
+export interface PlanlessStart {
+	/** When the message that began this turn arrived (ms since epoch), as the host recorded it. */
+	turnStartedAt: number;
+	/** The host's deadline for the `tool_call` handler: `hookStart + timeout - min(2 000, timeout/2)`. */
+	deadline: number;
+	/** What the gated batch needs of the target: a batch of safe readers must not take the write lease (R9). */
+	lease: "read" | "write";
+}
+
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
 const liveWriters = new Map<string, () => void>();
@@ -236,7 +292,7 @@ export function noteRunNotice(runId: string, text: string): boolean {
 
 /** What a child's check read of the model its spawn ran on, set on the spawn's record. No spawn of that key, no change. */
 export function noteRunRan(runId: string, spawnKey: string, ran: RanModel): void {
-	const record = spawnsByRun.get(runId)?.findLast(spawn => spawn.spawnKey === spawnKey && spawn.outcome !== "blocked");
+	const record = lastSpawnByKey.get(runId)?.get(spawnKey);
 	if (record === undefined) return;
 	// A worker that ran on what the team did not approve stays recorded as such: a later reading of an approved model (it was
 	// woken again) never replaces it.
@@ -254,6 +310,16 @@ export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 	const list = spawnsByRun.get(runId);
 	if (!list) return;
 	list.push(record);
+	// One keyed write per spawn, so a delivery or a model report never walks the run's spawn list (D11).
+	const spawnKey = record.spawnKey;
+	if (spawnKey !== undefined && spawnKey !== "") {
+		const last = lastSpawnByKey.get(runId);
+		const kinds = deliveryKindsByRun.get(runId);
+		if (last !== undefined && record.outcome !== "blocked") last.set(spawnKey, record);
+		if (kinds !== undefined) {
+			kinds.set(spawnKey, record.outcome === "blocked" ? "blocked" : record.lane !== undefined ? "lane" : "unplanned");
+		}
+	}
 	touchRun(runId);
 }
 
@@ -268,13 +334,23 @@ const NO_CONTINUABLE_RUN =
 	"이어 갈 중단된 실행이 없습니다. 이 세션과 이 작업 트리에서 시작해 끝나지 않은 실행만 이어 갑니다. 새 작업이면 계획을 plan으로 제출하세요.";
 const CONTINUE_PLAN_REFUSED =
 	"중단된 실행의 계획이 지금 승인된 팀 범위에 맞지 않아 이어 가지 않았습니다. 사용자가 /storm 의 이어 가기를 고르면 결과는 이어받고 계획은 새로 세웁니다. 팀 범위 변경도 사용자가 /storm 에서 합니다.";
-const CONTINUE_NO_LANES = "중단된 실행의 범위에 남은 레인이 없어 이어 가지 않았습니다. 새 작업이면 계획을 plan으로 제출하세요.";
 /** A continued run whose place in the lineage could not be written starts nothing, so two runs never claim one parent. */
 export const RESUME_POINTER_FAILED =
 	"이어 가는 실행의 계보를 기록하지 못해 시작하지 않았습니다. 세션 저장소의 쓰기 권한과 여유 공간을 확인한 뒤 다시 이어 가세요.";
 /** The run stopped at or after this turn began: the user has not spoken since, so a limit or a stop of theirs stands. */
 export const CONTINUE_SAME_TURN =
 	"중단된 실행이 이번 사용자 요청과 같은 턴이거나 그 뒤에 멈춘 것이라 이어 가지 않았습니다. 멈춘 뒤에 사용자가 이어 가라고 말해야 이어 갑니다. 사용자에게 멈춘 이유를 알리고 어떻게 할지 물어 보세요.";
+
+/**
+ * R9's same-turn rule for an automatic plan start: a run of this session and target that ended or stopped at or after
+ * this turn's prompt refuses it. An old caller that supplies no prompt time keeps 0.28.0's behaviour; the wiring always
+ * passes the turn's own time. A continuation has the candidate's recorded stop time instead (see `#begin`).
+ */
+function sameTurnRefusal(turnStartedAt: number | undefined, sessionDir: string, root: string): string | undefined {
+	if (turnStartedAt === undefined) return undefined;
+	if (!Number.isFinite(turnStartedAt)) return PLANLESS_NO_TURN_TIME;
+	return stoppedInTurn(turnStartedAt, lastRunEndAt(sessionDir, root)) ? PLANLESS_SAME_TURN : undefined;
+}
 
 /** Whether a turn ended because it was interrupted: omp closes it with an assistant message marked aborted. */
 export function turnAborted(messages: readonly unknown[] | undefined): boolean {
@@ -703,6 +779,11 @@ interface OwnRun {
 	shownPhase?: RunPhase;
 	/** View-only: a required-check runner is inside `runRequiredChecks` now, not merely being prepared. */
 	checksRunning?: boolean;
+	/**
+	 * The director committed one of its own path edits in this run (R10's gate input): a run with one is never
+	 * "quick-only". Memory only, never a record field; the extension raises it through `noteDirectorEdit`.
+	 */
+	directorEdit?: boolean;
 }
 
 type Refusal = Extract<RunRequestResult, { ok: false }>;
@@ -762,7 +843,24 @@ export interface RunControllerDeps {
 	 * the run then says nothing about writers rather than guess.
 	 */
 	lanePolicies?(runId: string, plan: RunPlan): Promise<{ policies: ReadonlyMap<string, LanePolicy>; canonicalFiles: ReadonlyMap<string, readonly string[]> } | undefined>;
+	/**
+	 * R15: observed spend reached the run's limit, so the spend is closed for the workers already running. The
+	 * director's instance calls this once, at the limit, with the run's own `onExceed`; the implementation writes the
+	 * marker a worker on another thread reads from disk (P3-guard's `spend-close.ts`). Absent in hosts and tests that
+	 * have no marker.
+	 */
+	closeSpend?(runId: string, onExceed: BudgetConfig["onExceed"]): void | Promise<void>;
 }
+
+/**
+ * Which door a start came through. Only the manual one waits for a handoff; the other three open inside a turn that is
+ * already running. `planless` is R9's explicit start mode: it is not `#start` with no plan, which is the manual branch.
+ */
+type StartMode =
+	| { kind: "manual" }
+	| { kind: "plan"; plan: RunPlan; configHash?: string; turnStartedAt?: number }
+	| { kind: "continue"; said: string | undefined; turnStartedAt: number }
+	| { kind: "planless"; turnStartedAt: number; deadline: number; lease: "read" | "write" };
 
 export class RunController {
 	#pending: { runId: string; spec: RunSpec } | undefined;
@@ -871,17 +969,41 @@ export class RunController {
 	 * handler use `launch`.
 	 */
 	async start(ctx: ExtensionContext, spec: RunSpec, runId = newRunId(this.deps.now())): Promise<RunRequestResult> {
-		return this.#start(ctx, spec, runId);
+		return this.#start(ctx, spec, runId, { kind: "manual" });
 	}
 
 	/**
 	 * Starts an automatic probe inside the main turn that is already running, under a caller-validated plan. It sends
 	 * no handoff (the turn continues), does not wait for idle or compact, and asks no dialog; the in-flight turn is the
 	 * run's first round. The plan is bound before this returns, so the first spawn sees it. When the caller passes the
-	 * team hash it validated the plan against, a different approved team refuses the start.
+	 * team hash it validated the plan against, a different approved team refuses the start. `turnStartedAt` is the
+	 * message that began this turn: R9's same-turn rule refuses a start after a run of this session and target ended or
+	 * stopped at or after it. The wiring passes it for every automatic plan; callers that do not keep 0.28.0's checks.
 	 */
-	async startWithPlan(ctx: ExtensionContext, spec: RunSpec, plan: RunPlan, configHash?: string): Promise<RunRequestResult> {
-		return this.#start(ctx, spec, newRunId(this.deps.now()), plan, configHash);
+	async startWithPlan(ctx: ExtensionContext, spec: RunSpec, plan: RunPlan, configHash?: string, turnStartedAt?: number): Promise<RunRequestResult> {
+		return this.#start(ctx, spec, newRunId(this.deps.now()), {
+			kind: "plan",
+			plan,
+			...(configHash !== undefined ? { configHash } : {}),
+			...(turnStartedAt !== undefined ? { turnStartedAt } : {}),
+		});
+	}
+
+	/**
+	 * Opens an automatic run with no plan at the director's first `task` call of a user turn (R9). The caller has
+	 * already classified the batch (R6) and gated it against an empty table; this start applies R9's ordered checks
+	 * again, opens the run inside the running turn, binds no plan and sends no handoff, and leaves the batch's normal
+	 * `task` placement to that same handler. The lease is what the gated batch needs: a batch of safe readers takes the
+	 * read claim, a batch with a shared writer or a shell reader takes the write claim. An open that outlives the host's
+	 * handler deadline is finished at once as stopped, so it cannot hold the lease with no work.
+	 */
+	async startPlanless(ctx: ExtensionContext, spec: RunSpec, input: PlanlessStart): Promise<RunRequestResult> {
+		return this.#start(ctx, spec, newRunId(this.deps.now()), {
+			kind: "planless",
+			turnStartedAt: input.turnStartedAt,
+			deadline: input.deadline,
+			lease: input.lease,
+		});
 	}
 
 	/**
@@ -890,28 +1012,23 @@ export class RunController {
 	 * same start with the same checks: the candidate is `findResumeCandidate`'s, the pointer must still vouch for it,
 	 * the checkpoint is proven again before an accepted result is carried, the goal is carried and `resumeOf` records
 	 * the lineage. Its plan is the old one re-validated against the approved team (`normalizeCheckpointPlan`, the
-	 * `validatePlan` the `plan` action uses): a plan outside those bounds starts nothing. The caller has already
-	 * decided that this is the user's turn and that delegation is automatic.
+	 * `validatePlan` the `plan` action uses): a plan outside those bounds starts nothing. A run with nothing to carry —
+	 * no result rows, or no lane left in force — opens a new run with no plan instead (R12); `continued.mode` says
+	 * which of the two happened. The caller has already decided that this is the user's turn and that delegation is
+	 * automatic.
 	 */
-	async continueInTurn(ctx: ExtensionContext, said: string | undefined, turnStartedAt: number): Promise<RunRequestResult> {
-		return this.#start(ctx, { task: "" }, newRunId(this.deps.now()), undefined, undefined, { said, turnStartedAt });
+	async continueInTurn(ctx: ExtensionContext, said: string | undefined, turnStartedAt: number): Promise<RunStartResult> {
+		return this.#start(ctx, { task: "" }, newRunId(this.deps.now()), { kind: "continue", said, turnStartedAt });
 	}
 
-	async #start(
-		ctx: ExtensionContext,
-		spec: RunSpec,
-		runId: string,
-		plan?: RunPlan,
-		configHash?: string,
-		continuing?: { said: string | undefined; turnStartedAt: number },
-	): Promise<RunRequestResult> {
+	async #start(ctx: ExtensionContext, spec: RunSpec, runId: string, mode: StartMode): Promise<RunStartResult> {
 		// A queued run is not in the way of its own start: `onAgentEnd` takes it off the queue first.
 		const reason = this.refusal();
 		if (reason !== undefined) return refuse(reason);
 		const generation = this.#generation;
 		this.#starting = true;
 		try {
-			return await this.#begin(ctx, spec, runId, plan, configHash, generation, continuing);
+			return await this.#begin(ctx, spec, runId, mode, generation);
 		} finally {
 			this.#starting = false;
 		}
@@ -935,25 +1052,23 @@ export class RunController {
 		ctx: ExtensionContext,
 		asked: RunSpec,
 		runId: string,
-		plan: RunPlan | undefined,
-		configHash: string | undefined,
+		mode: StartMode,
 		generation: number,
-		continuing?: { said: string | undefined; turnStartedAt: number },
-	): Promise<RunRequestResult> {
-		// Only an automatic probe starts inside a turn that is already running; a manual start waits for its handoff. A
-		// continuation by the director is one: it is told the carried state in the answer to its call, not by a handoff.
-		const auto = plan !== undefined || continuing !== undefined;
+	): Promise<RunStartResult> {
+		// Only a manual start waits for its handoff; every other door opens inside the turn that is already running — a
+		// first plan, a continuation the director asked for, or a plan-less batch at the turn's first task call.
+		const auto = mode.kind !== "manual";
+		const continuing = mode.kind === "continue" ? { said: mode.said, turnStartedAt: mode.turnStartedAt } : undefined;
+		const planless = mode.kind === "planless" ? mode : undefined;
+		let plan: RunPlan | undefined = mode.kind === "plan" ? mode.plan : undefined;
+		const configHash = mode.kind === "plan" ? mode.configHash : undefined;
 		let requested = asked;
 		const gone = (): Refusal => refuse("세션이 바뀌어 Storm 실행을 시작하지 않았습니다.");
 		const state = await this.deps.loadState(ctx);
 		if (this.#generation !== generation) return gone();
+		// Pure reads, decided in R9's order below: the plan-less gate needs the team's and the shadow's refusals last.
 		const gate = teamGate(state);
-		if (!gate.ok) return refuse(gate.block.reason);
-		if (configHash !== undefined && gate.hash !== configHash) {
-			return refuse("계획을 검증한 팀 설정과 지금 승인된 팀 설정이 다릅니다. 계획을 다시 내세요.");
-		}
 		const shadow = shadowBlock(state);
-		if (shadow) return refuse(shadow.reason);
 		// The session's own store is the only persistence base; without a host-attested identity there is no safe one.
 		// Never substitute cwd, a run id or a literal "main" for a missing session id.
 		const sessionId = closeoutSessionId(ctx);
@@ -964,6 +1079,30 @@ export class RunController {
 		const target: ResumeTarget = { repoId: state.repo.repoId, root };
 		const busy = refuse("이 세션에서 다른 Storm 실행이 진행 중입니다.");
 		if (activeLedgerRun(sessionDir)) return busy;
+		// R9: a run of this session and target that ended or stopped at or after this turn's prompt refuses a plan and a
+		// plan-less open alike. The plan-less gate runs the rule's checks in its own order: automatic consent, this
+		// turn's prompt and its time, the same-turn fact, then the team and mode refusals as its last step.
+		if (planless !== undefined) {
+			const opened = planlessOpen({
+				automatic: true,
+				// `#start` refused an active, queued or starting run, and the ledger check above is this store's own.
+				runActive: false,
+				task: requested.task,
+				turnStartedAt: planless.turnStartedAt,
+				lastEndAt: lastRunEndAt(sessionDir, root),
+				blocked: !gate.ok ? gate.block.reason : shadow?.reason,
+			});
+			if (!opened.ok) return refuse(opened.reason);
+		} else if (mode.kind === "plan") {
+			const sameTurn = sameTurnRefusal(mode.turnStartedAt, sessionDir, root);
+			if (sameTurn !== undefined) return refuse(sameTurn);
+		}
+		// R9's step 4 last: the approved team, the team hash the plan was checked against, then a shadowed definition.
+		if (!gate.ok) return refuse(gate.block.reason);
+		if (configHash !== undefined && gate.hash !== configHash) {
+			return refuse("계획을 검증한 팀 설정과 지금 승인된 팀 설정이 다릅니다. 계획을 다시 내세요.");
+		}
+		if (shadow) return refuse(shadow.reason);
 		if (continuing !== undefined) {
 			// The candidate is the menu's own: the newest trusted unfinished run of this session and target.
 			const candidate = await findResumeCandidate(sessionDir, target).catch(() => undefined);
@@ -974,7 +1113,10 @@ export class RunController {
 			// millisecond counts as after: no turn begins and runs a run to its stop within one. A record that gives no time
 			// cannot be shown to precede the turn.
 			const stoppedAt = Date.parse(candidate.endedAt ?? candidate.updatedAt ?? candidate.startedAt);
-			if (!Number.isFinite(stoppedAt) || continuing.turnStartedAt < stoppedAt) return refuse(CONTINUE_SAME_TURN);
+			if (!Number.isFinite(stoppedAt) || stoppedInTurn(continuing.turnStartedAt, stoppedAt)) return refuse(CONTINUE_SAME_TURN);
+			// R9 says every run of this session and target, not only the candidate: a later run that ended after the
+			// prompt stands for the same rule, and the candidate's own recorded end is the same fact on disk.
+			if (stoppedInTurn(continuing.turnStartedAt, lastRunEndAt(sessionDir, root))) return refuse(CONTINUE_SAME_TURN);
 			const built = resumeSpec(candidate, continuing.said);
 			if (!built.ok) return refuse(built.error);
 			requested = built.spec;
@@ -991,12 +1133,22 @@ export class RunController {
 		// The dialog and the compaction awaited: a run of this session may have started meanwhile.
 		if (activeLedgerRun(sessionDir)) return busy;
 
-		// The last step before the baseline snapshot: take this session's slot and a read claim on the target. A safe
-		// reader may run beside another session's reader; a writer of any session conflicts. A failed acquisition is a
-		// refusal, and everything below releases the lease unless the run takes ownership.
+		// The last step before the baseline snapshot: take this session's slot and the target claim the start needs. A
+		// safe reader may run beside another session's reader; a writer of any session conflicts. A plan-less batch
+		// takes the claim its classification needs before anything of it is placed (R9), so a writer never passes a
+		// reader's lease on the way to its reservation. A failed acquisition is a refusal, and everything below releases
+		// the lease unless the run takes ownership.
+		const writeFirst = planless?.lease === "write";
 		let acquired: AcquireRunLeaseResult;
 		try {
-			acquired = await (this.deps.lease ?? acquireRunLease)({ sessionDir, sessionId, root, runId, mode: "read" });
+			acquired = await (this.deps.lease ?? acquireRunLease)({
+				sessionDir,
+				sessionId,
+				root,
+				runId,
+				mode: writeFirst ? "write" : "read",
+				...(writeFirst ? { scope: { kind: "unbounded" as const } } : {}),
+			});
 		} catch (error) {
 			return refuse(`실행 잠금을 확인하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 		}
@@ -1046,9 +1198,10 @@ export class RunController {
 				followUp = source;
 			}
 			const restoredPlan = continued?.plan === undefined ? undefined : normalizeCheckpointPlan(gate.config, continued.plan);
-			// A director's continuation puts the old plan in force before its first spawn, so that plan must be one the
-			// approved team could be given today: the same bounds a submitted plan is held to. Otherwise nothing starts.
-			if (continuing !== undefined && restoredPlan === undefined) return refuse(CONTINUE_PLAN_REFUSED);
+			// A continuation with rows needs a plan the approved team could be given today (the same bounds a submitted
+			// plan is held to); with nothing to carry there is no plan to hold, and the open becomes a handoff below.
+			const carriedRows = Array.isArray(continued?.results) ? continued.results.length : 0;
+			if (continuing !== undefined && carriedRows > 0 && restoredPlan === undefined) return refuse(CONTINUE_PLAN_REFUSED);
 			if (restoredPlan !== undefined && planNeedsWrite(restoredPlan)) {
 				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
 				if (!upgraded.ok) return refuse(upgraded.reason);
@@ -1064,7 +1217,11 @@ export class RunController {
 			});
 			if (plan !== undefined) plan = stripExcludedPlan(plan, priorExcluded);
 			else if (restoredPlan !== undefined) plan = stripExcludedPlan(restoredPlan, priorExcluded);
-			if (continuing !== undefined && plan === undefined) return refuse(CONTINUE_NO_LANES);
+			// R12: a continuation with nothing to carry — no result rows at all, or no lane left to carry them under — is
+			// a handoff: a new run, no plan applied, nothing re-proved. Where 0.28.0 refused with CONTINUE_NO_LANES, the
+			// caller now gets `continued.mode: "handoff"` and says 인계.
+			const handoffContinuation = continuing !== undefined && (carriedRows === 0 || plan === undefined);
+			if (handoffContinuation) plan = undefined;
 			// A resume continues its parent's goal; a follow-up and a fresh run start their own. Fixed here, never updated.
 			const goal = continued === undefined ? undefined : carryGoal(continued);
 			const resume =
@@ -1173,12 +1330,12 @@ export class RunController {
 				...(startTree !== undefined ? { tree: startTree.state, base: startTree.base } : {}),
 				...(requested.minutes !== undefined ? { minutes: requested.minutes } : {}),
 			};
-			if (continued !== undefined) {
+			if (continued !== undefined && !handoffContinuation) {
 				const receipts = checkpointReceipts(continued);
 				if (receipts.length > 400) return refuse("이전 정형 작업 기록이 너무 많아 중복 실행 없이 이어갈 수 없습니다.");
 				if (receipts.length > 0) record.jobs = receipts;
 			}
-			if (continued !== undefined) {
+			if (continued !== undefined && !handoffContinuation) {
 				await this.#restoreCheckpoint(own, continued, plan);
 				const current = await this.deps.loadState(ctx).catch(() => undefined);
 				if (stale()) return gone();
@@ -1237,6 +1394,8 @@ export class RunController {
 				// Bound before anything below awaits: a spawn decided the moment this returns must see the first plan.
 				if (plan !== undefined) setLedgerPlan(runId, plan);
 				spawnsByRun.set(runId, []);
+				lastSpawnByKey.set(runId, new Map());
+				deliveryKindsByRun.set(runId, new Map());
 				noticeSinks.set(runId, text => {
 					if (this.#own === own) own.notices.push(text);
 				});
@@ -1263,6 +1422,13 @@ export class RunController {
 					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
 					return gone();
 				}
+				// R9's deadline: the host has blocked this `tool_call` handler after its budget and ignores what this
+				// continuation does. A run opened now can never place the batch, so it is finished at once as stopped
+				// instead of holding the lease with no work. The caller is refused with the real cause.
+				if (planless !== undefined && this.deps.now() >= planless.deadline) {
+					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
+					return refuse(PLANLESS_DEADLINE);
+				}
 			} catch (error) {
 				// This session directs and the ledger is open, but nothing was handed off: close both rather than leave a run nobody started.
 				await this.#stop(own, "start-failed", ctx).catch(() => undefined);
@@ -1281,11 +1447,23 @@ export class RunController {
 				});
 			}
 			if (continuing !== undefined && continued !== undefined) {
+				if (handoffContinuation) {
+					// A handoff: the old run's request opens the new run, nothing of its plan or rows is applied.
+					return {
+						ok: true,
+						runId,
+						continued: { mode: "handoff", from: continued.runId, ended: stopWords(continued.endReason), kept: 0, reopened: 0, blocked: 0, open: [] },
+					};
+				}
 				const rows = own.record.results ?? [];
 				const kept = rows.filter(row => row.restoredFrom !== undefined && row.state === "accepted").length;
 				const blocked = rows.filter(row => row.remedy === "blocked").length;
 				const open = (plan?.lanes ?? []).filter(lane => !own.restoredLanes.has(lane.name)).map(lane => lane.name);
-				return { ok: true, runId, continued: { from: continued.runId, ended: stopWords(continued.endReason), kept, reopened: rows.length - kept - blocked, blocked, open: open.slice(0, 12) } };
+				return {
+					ok: true,
+					runId,
+					continued: { mode: "carry", from: continued.runId, ended: stopWords(continued.endReason), kept, reopened: rows.length - kept - blocked, blocked, open: open.slice(0, 12) },
+				};
 			}
 			return { ok: true, runId };
 		} finally {
@@ -1930,25 +2108,30 @@ export class RunController {
 	 * A delivery the run received that answers no declared result (see `AttemptUnplannedDelivery`). It is kept in the
 	 * record as the host showed it: whose child, when, what the worker cost so far, and whether it changed files when
 	 * the agent ledger knew. It never touches a result row, a lane or an attempt, and it is not acceptance. The
-	 * director reads one line for it, in the notice path an evaluated delivery uses.
+	 * director reads one line for it, in the notice path an evaluated delivery uses, except for the expected answers of
+	 * a worker this run placed without a lane (R11a): those are recorded for the views and not told as a delivery
+	 * nobody asked for.
 	 */
 	noteUnplannedDelivery(input: AttemptUnplannedDelivery): void {
 		const own = this.#own;
 		if (own === undefined || own.record.runId !== input.runId) return;
 		const list = own.record.unplanned ?? [];
 		if (list.some(entry => entry.id === input.id)) return;
-		// A delivery Storm itself asked for is not one nobody planned: the first delivery of a worker it placed in a lane (a lane with
-		// no declared results, a review lane, has no row to match it to; a spawn Storm refused delivers its refusal) and one for
-		// each follow-up that started a turn of that worker. Only deliveries beyond those (someone else woke it) are recorded and told;
-		// a worker Storm never placed always is.
-		const ledgerAgent = this.deps.agents?.(own.record.runId, own.sessionDir).find(entry => entry.id === input.agent);
+		// A delivery Storm itself asked for is not one nobody planned: a refused spawn delivers its refusal and a lane
+		// worker's results reach their own rows or a lane with no declared results, so neither is recorded or told here.
+		// An unplanned placement's answer is expected work too, but the views count it: it is recorded without a notice.
+		// Only deliveries beyond those (someone else woke it) are recorded and told; a worker Storm never placed always is.
+		let expected = false;
 		if (input.kind === "unplaced") {
 			const seen = (own.deliveries.get(input.agent) ?? 0) + 1;
 			own.deliveries.set(input.agent, seen);
-			const placed = runSpawns(input.runId).findLast(spawn => spawn.spawnKey === input.agent);
-			if (placed !== undefined && (placed.outcome === "blocked" || placed.lane !== undefined) && seen <= 1 + (own.wakes.get(input.agent) ?? 0)) return;
+			const placed = deliveryKindsByRun.get(input.runId)?.get(input.agent);
+			if (placed !== undefined && seen <= 1 + (own.wakes.get(input.agent) ?? 0)) {
+				if (placed !== "unplanned") return;
+				expected = true;
+			}
 		}
-		const agent = ledgerAgent;
+		const agent = this.deps.agents?.(own.record.runId, own.sessionDir).find(entry => entry.id === input.agent);
 		const changed =
 			agent === undefined || input.startedAt === undefined
 				? undefined
@@ -1971,13 +2154,29 @@ export class RunController {
 		while (list.length > UNPLANNED_MAX) list.shift();
 		own.record.unplanned = list;
 		own.record.unplannedCount = (own.record.unplannedCount ?? 0) + 1;
-		own.notices.push(unplannedNotice(entry));
+		if (!expected) own.notices.push(unplannedNotice(entry));
 		this.#scheduleFlush(own);
 	}
 
 	/** Something the director should read at its next request (the one place a hook that already answered can still tell it something). */
 	noteDirector(text: string): void {
 		this.#own?.notices.push(text);
+	}
+
+	/**
+	 * The director's own path edit was committed in this run (R10's gate input). The extension raises it right after
+	 * `RunLanes.commitWriter` returned; `runId` keeps a late commit of a finished run from marking the next one.
+	 * Memory only: the gate reads it through `directorEdited`, and no record field carries it.
+	 */
+	noteDirectorEdit(runId?: string): void {
+		const own = this.#own;
+		if (own === undefined || (runId !== undefined && own.record.runId !== runId)) return;
+		own.directorEdit = true;
+	}
+
+	/** Whether the director committed one of its own path edits in this run; the review gate's input (R10). */
+	directorEdited(): boolean {
+		return this.#own?.directorEdit === true;
 	}
 
 	/**
@@ -4445,6 +4644,8 @@ export class RunController {
 		const own = this.#own;
 		if (!own) return undefined;
 		own.ending ??= reason;
+		// R9's same-turn fact: the run is stopped from now on, even while owned work drains and the final record waits.
+		noteRunEnd(own.sessionDir, own.root, this.deps.now());
 		if (ctx !== undefined) own.finishCtx ??= ctx;
 		own.abort.abort();
 		// A background checkpoint belongs to this run: cancel it before the run leaves; a late commit cannot mark another.
@@ -4833,6 +5034,8 @@ export class RunController {
 		}
 		const pendingLanes = (own.record.plan?.lanes ?? []).filter(lane => pendingNames.has(lane.name)).map(lane => lane.name);
 		spawnsByRun.delete(own.record.runId);
+		lastSpawnByKey.delete(own.record.runId);
+		deliveryKindsByRun.delete(own.record.runId);
 		noticeSinks.delete(own.record.runId);
 		clearRunReads(own.record.runId);
 		const record: RunRecord = {
@@ -5030,6 +5233,18 @@ export class RunController {
 			return;
 		}
 		const stop = budget?.onExceed === "stop";
+		// R15: the workers already running read the close from the marker on disk, so the director's instance writes it
+		// here, once, at the limit and before anything else this limit does. A failing close is reported and does not
+		// keep the stop itself from happening.
+		try {
+			const closing = this.deps.closeSpend?.(run.runId, stop ? "stop" : "block-spawns");
+			if (closing !== undefined) {
+				void Promise.resolve(closing).catch((error: unknown) =>
+					ui.notify(`사용량 마감을 워커에게 알리지 못했습니다: ${errorText(error)}`, "error"));
+			}
+		} catch (error) {
+			ui.notify(`사용량 마감을 워커에게 알리지 못했습니다: ${errorText(error)}`, "error");
+		}
 		ui.notify(
 			// The figure is the spend Storm has seen: no new spawn and no work message to an idle worker from here, and with `stop` the director's turn is aborted,
 			// but what workers already run still finishes (and its spend lands after this notice).

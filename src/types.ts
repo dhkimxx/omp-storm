@@ -601,9 +601,12 @@ export type SpawnBlockCode =
 	| "unapproved"
 	| "shadow"
 	| "disabled-role"
+	/** Historical: no version produces it since 0.29.0; a plan-less run is a record state, not a refusal. Old records read. */
 	| "no-plan"
+	/** Historical: no version produces it since 0.29.0; a role without a lane is placed unplanned. Old records read. */
 	| "role-not-in-plan"
 	| "unmapped-agent"
+	/** Kept for a spawn the host gave no key: with no key it cannot be correlated to a placement (G1). */
 	| "unassigned-lane"
 	| "role-cap"
 	| "parallelism"

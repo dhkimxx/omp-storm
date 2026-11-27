@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
+	authorityCovers,
 	canonicalScope,
 	effectiveAgentTools,
 	lanePolicy,
@@ -287,5 +288,44 @@ describe("effective definitions and symlink aliases", () => {
 		expect(await canonicalScope(root, ["./real/../real/a.ts"])).toEqual(["real/a.ts"]);
 		expect(await canonicalScope(root, ["../outside.ts"])).toBeUndefined();
 		expect(scopesOverlap(await canonicalScope(root, ["alias"]) as string[], await canonicalScope(root, ["real/a.ts"]) as string[])).toBe(true);
+	});
+});
+
+describe("R3: a persisted policy may not be wider than the authority the placement froze", () => {
+	const read = { kind: "read" as const, reason: "read" };
+	const shell = { kind: "read" as const, reason: "shell", shell: true as const };
+	const priv = { kind: "private" as const, reason: "private" };
+	const unknown = { kind: "unknown" as const, reason: "unknown" };
+	const paths = (values: string[]) => ({ kind: "paths" as const, reason: "paths", paths: values });
+
+	test("an unknown reservation covers every shared writer; a paths reservation covers only the paths it holds", () => {
+		for (const policy of [read, shell, priv, unknown, paths(["src/a.ts"])]) {
+			// `private` is the exception: a private policy in a shared placement would write the parent root.
+			expect(authorityCovers({ kind: "unknown" }, policy)).toBe(policy.kind !== "private");
+		}
+		expect(authorityCovers({ kind: "paths", paths: ["src"] }, read)).toBe(true);
+		expect(authorityCovers({ kind: "paths", paths: ["src"] }, paths(["src/a.ts"]))).toBe(true);
+		expect(authorityCovers({ kind: "paths", paths: ["src/a.ts"] }, paths(["src"]))).toBe(false);
+		expect(authorityCovers({ kind: "paths", paths: ["src/a.ts"] }, paths(["src/b.ts"]))).toBe(false);
+		expect(authorityCovers({ kind: "paths", paths: ["."] }, paths(["any/where.ts"]))).toBe(true);
+		expect(authorityCovers({ kind: "paths", paths: ["src"] }, unknown)).toBe(false);
+		expect(authorityCovers({ kind: "paths", paths: ["src"] }, shell)).toBe(false);
+		expect(authorityCovers({ kind: "paths", paths: ["src"] }, paths(["../out.ts"]))).toBe(false);
+	});
+
+	test("a read reservation covers only itself; a private one covers a reader", () => {
+		expect(authorityCovers({ kind: "read" }, read)).toBe(true);
+		expect(authorityCovers({ kind: "read" }, shell)).toBe(false);
+		expect(authorityCovers({ kind: "read" }, paths(["a.ts"]))).toBe(false);
+		expect(authorityCovers({ kind: "read" }, unknown)).toBe(false);
+		expect(authorityCovers({ kind: "private" }, read)).toBe(true);
+		expect(authorityCovers({ kind: "private" }, priv)).toBe(true);
+		expect(authorityCovers({ kind: "private" }, paths(["a.ts"]))).toBe(false);
+		expect(authorityCovers({ kind: "private" }, unknown)).toBe(false);
+		expect(authorityCovers({ kind: "private" }, shell)).toBe(false);
+	});
+
+	test("a blocked policy is never covered", () => {
+		expect(authorityCovers({ kind: "unknown" }, { kind: "blocked", reason: "blocked" })).toBe(false);
 	});
 });
