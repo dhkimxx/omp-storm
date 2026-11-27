@@ -229,17 +229,17 @@ function pooledThreadOf(agentId: string): string | undefined {
 }
 
 /**
- * A hole of 0.27.0, seen on this host in the integration pass: omp runs the first eight concurrent subagents on the main thread and
- * puts the next ones on pooled threads, each with its own module state. There the child's lookup of its run in memory found nothing,
- * so the check of its own model before each request returned early and never ran: a worker that a later extension had put on a
- * model outside the team made requests on it and was never stopped. Ten explorers in one call, every spawn answered with the
- * outsider by a later extension: all ten must be stopped before any request is sent, each with its verdict on the spawn record,
- * and the director told, whichever thread a worker landed on.
+ * Decision D5 as D7 amends it, on the real host: omp places concurrent subagents by its own pool rules, and with
+ * `task.workerThreads` above zero it may put some on a pooled thread with its own module state. Storm predicts nothing
+ * at the spawn hook (no spawn is refused for a predicted placement). A Storm worker on a pooled thread detects it from
+ * the runtime, stops before its first request, and writes the closed reason on its own admission; the director writes
+ * the sentence once per worker. The workers omp keeps on the main thread run, are checked, recorded as verified and
+ * counted as usual. Ten explorers in one call: every child holds its first reply, so all ten are live together and the
+ * later ones are the ones omp places on a pooled thread.
  */
-async function aSwappedModelOnAPooledThreadIsStopped(): Promise<void> {
+async function aWorkerOnAPooledThreadStopsBeforeItsRequest(): Promise<void> {
 	const COUNT = 10;
-	const sessions = new Sessions(env, OUTSIDER);
-	const swap = join(import.meta.dir, "swap-plugin.ts");
+	const sessions = new Sessions(env);
 	await suite.step("pooled: a team that may run twelve explorers is approved", async () => {
 		setOmpSettings(env, "task:\n  maxConcurrency: 12\n  workerThreads: 4\n");
 		writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, PROVIDERS_WITH_OUTSIDER));
@@ -258,9 +258,7 @@ async function aSwappedModelOnAPooledThreadIsStopped(): Promise<void> {
 		});
 	}, 180_000);
 
-	await suite.step("pooled: ten workers, the ninth and tenth answered with a model outside the team: both are stopped before any request, on whatever thread they run", async () => {
-		// The first eight stay on the approved team and are held at their first reply (live together), so the last two are the ones omp puts on a pooled thread.
-		env.childEnv.SWAP_KEYS = "F8,F9";
+	await suite.step("pooled: no spawn is refused; the workers the host pools never reach the provider and are each told once, while the main-thread workers finish", async () => {
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const names = Array.from({ length: COUNT }, (_, index) => `F${index}`);
 			const lanes = names.map(name => ({ name, kind: "explore" as const, role: "explorer", goal: "read one file", results: [requiredResult(`${name.toLowerCase()}-answer`, "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE })] }));
@@ -276,23 +274,82 @@ async function aSwappedModelOnAPooledThreadIsStopped(): Promise<void> {
 			const run = await files.finishedRun(before, 180_000);
 			const kids = llm.of("child");
 			const spawns = names.map(name => run.spawns.find(row => row.spawnKey === name && row.outcome !== "blocked"));
-			const pooled = names.filter(name => pooledThreadOf(name) !== undefined);
-			console.log(`HOST-FACT pooled: ${JSON.stringify({ pooledWorkers: pooled, ran: spawns.map(spawn => [spawn?.spawnKey, spawn?.ran?.verdict]), childRequests: kids.length })}`);
-			check("one of the swapped workers (the ninth or tenth) ran on a pooled thread", pooled.some(name => name === "F8" || name === "F9"), `pooled=${pooled.join(",") || "none"}`);
-			check("all ten spawns were routed", spawns.every(spawn => spawn !== undefined), JSON.stringify(spawns.map(spawn => spawn?.spawnKey)));
-			const outside = kids.filter(entry => entry.model.includes("outsider"));
-			check("no request on the outside model reached the provider: the swapped workers were stopped by the check in their own session first", outside.length === 0, JSON.stringify(outside.map(entry => [entry.model, entry.effort])));
-			check("the eight approved workers did run (their requests reached the provider)", kids.length >= 8, `child requests=${kids.length}`);
-			check("the swapped spawns' records carry the verdict mismatch with the outside model, the pooled one included", spawns.slice(8).every(spawn => spawn?.ran?.verdict === "mismatch" && spawn.ran.model === OUTSIDER), JSON.stringify(spawns.slice(8).map(spawn => [spawn?.spawnKey, spawn?.ran])));
-			check("the other eight are recorded as verified on the approved model", spawns.slice(0, 8).every(spawn => spawn?.ran?.verdict === "verified"), JSON.stringify(spawns.slice(0, 8).map(spawn => [spawn?.spawnKey, spawn?.ran?.verdict])));
-			const told = rpc.frames.filter(frame => frame.type === "message_end" && JSON.stringify(frame.message ?? {}).includes("워커를 멈췄습니다")).length;
-			check("the director was told the workers were stopped (at least one notice, as the notice of every stop reaches it)", told >= 1, `notices=${told}`);
-			check("the swapped workers' answers were not accepted: nothing ran to produce them", !run.results?.some(row => (row.id === "f8-answer" || row.id === "f9-answer") && row.state === "accepted"), JSON.stringify(run.results?.map(row => [row.id, row.state])));
-		}, ["-e", swap]);
-		delete env.childEnv.SWAP_KEYS;
+			const blocked = run.spawns.filter(row => row.outcome === "blocked");
+			const spawned = spawns.flatMap((spawn, index) => (spawn === undefined ? [] : [{ spawn, name: names[index]! }]));
+			const pooled = spawned.filter(entry => pooledThreadOf(entry.name) !== undefined).map(entry => entry.name);
+			const mainThread = spawned.filter(entry => !pooled.includes(entry.name));
+			const verified = mainThread.filter(entry => entry.spawn.ran?.verdict === "verified").map(entry => entry.name);
+			console.log(`HOST-FACT pooled: ${JSON.stringify({ pooledWorkers: pooled, blocked: blocked.map(row => [row.spawnKey, row.code]), verified, childRequests: kids.length, results: run.results?.map(row => [row.id, row.state]) })}`);
+			// D7: nothing is predicted or refused at the spawn hook; every spawn that reached the run was routed.
+			check("no spawn was refused for a predicted placement", blocked.length === 0, JSON.stringify(blocked.map(row => [row.spawnKey, row.code, row.reason])));
+			check("the host really put at least one worker on a pooled thread in this run", pooled.length > 0, `pooled=${pooled.join(",") || "none"} spawns=${run.spawns.length}`);
+			// The rule: a pooled worker stops before its first request and is never recorded as having run.
+			check("no spawn the host put on a pooled thread reached a provider or got a model verdict", pooled.every(name => spawns.find(spawn => spawn?.spawnKey === name)?.ran === undefined), JSON.stringify({ pooled, ran: spawned.map(entry => [entry.name, entry.spawn.ran]) }));
+			check("the main-thread workers each ran and were checked on this thread", mainThread.length > 0 && verified.length === mainThread.length && mainThread.every(entry => entry.spawn.ran?.verdict === "verified"), `main=${mainThread.map(entry => entry.name).join(",")} verified=${verified.join(",")}`);
+			check("the main-thread workers' answers were accepted: they were not disturbed", mainThread.every(entry => (run.results ?? []).some(row => row.id === `${entry.name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
+			check("the pooled workers' answers were not accepted: nothing ran to produce them", pooled.every(name => !(run.results ?? []).some(row => row.id === `${name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
+			// One sentence per stopped worker, injected once. The host reports both the start and the end of the same
+			// developer message, and the message stays in later history; count the injected message, not every echo.
+			const told = rpc.frames
+				.filter(frame => frame.type === "message_start")
+				.map(frame => JSON.stringify(frame.message ?? ""))
+				.join("\n")
+				.match(/풀 스레드/g)?.length ?? 0;
+			check("the director was told why and both ways out once per pooled worker", told === pooled.length, `notices=${told} pooled=${pooled.length}`);
+		});
 	}, 420_000);
 
 	await suite.step("pooled: every OMP session exited cleanly", async () => {
+		check("no session exited non-zero", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);
+	});
+}
+
+/**
+ * A same-build isolated worker on the main thread loads its own copy of the plugin (omp clears the extension paths for
+ * the isolated session) and must still be checked, recorded as verified and counted. `task.workerThreads: 0` keeps the
+ * child on the main thread, and a lane's isolation reason puts it in its own checkout. This is the other half of the D7
+ * rule: absence of this thread's memory is never read as a pooled thread; shared state is keyed by build, so a copy of
+ * the same build finds it.
+ */
+async function anIsolatedWorkerOnTheMainThreadIsStillChecked(): Promise<void> {
+	const sessions = new Sessions(env);
+	await suite.step("isolated-main: host isolation is on without auto-merge, all subagents on the main thread", async () => {
+		setOmpSettings(env, "task:\n  maxConcurrency: 4\n  workerThreads: 0\n  isolation:\n    enabled: true\n    apply: false\n");
+		writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
+		await sessions.open(cancelAll, async (rpc, files) => {
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			rpc.answer = choose("자동 위임 끄기");
+			await rpc.prompt("/storm auto");
+			await rpc.turn("hello");
+			check("the team is approved", files.approvals().length >= 1, `approvals=${files.approvals().length}`);
+		});
+	}, 180_000);
+
+	await suite.step("isolated-main: the isolated worker is checked, recorded as verified and counted while the main thread is shared", async () => {
+		await sessions.open(cancelAll, async (rpc, files) => {
+			const name = "I0";
+			const lanes = [{ name, kind: "explore" as const, role: "explorer", goal: "read one file in a private checkout", isolationReason: "an independent checkout for this read", results: [requiredResult("i0-answer", "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE })] }];
+			const steps: Step[] = [
+				contractPlan(lanes, { contract: true, workers: { explorer: 1 } }),
+				{ tasks: [{ name, agent: "storm-explorer", task: "Report from source", say: CITED }] },
+				{ wait: true },
+			];
+			const llm = new LlmCursor(env);
+			const before = files.runIds();
+			await rpc.prompt(runRequest(steps), 180_000);
+			const run = await files.finishedRun(before, 120_000);
+			const spawn = run.spawns.find(row => row.spawnKey === name && row.outcome !== "blocked");
+			const kids = llm.of("child");
+			console.log(`HOST-FACT isolated-main: ${JSON.stringify({ thread: pooledThreadOf(name) ?? "main", ran: spawn?.ran, childRequests: kids.length, costUsd: run.costUsd, results: run.results?.map(row => [row.id, row.state]) })}`);
+			check("the isolated worker reached the provider on the main thread", kids.length > 0 && pooledThreadOf(name) === undefined, `children=${kids.length} thread=${pooledThreadOf(name) ?? "main"}`);
+			check("the isolated worker's request was checked and recorded as verified", spawn?.ran?.verdict === "verified", JSON.stringify(spawn?.ran));
+			check("the isolated worker's spend was counted in the run", (run.costUsd ?? 0) > 0, `cost=${run.costUsd}`);
+			check("the isolated worker settled into the run's agent ledger", (run.agents ?? []).some(agent => agent.id === name && agent.requests > 0), JSON.stringify(run.agents ?? []));
+		});
+	}, 300_000);
+
+	await suite.step("isolated-main: every OMP session exited cleanly", async () => {
 		check("no session exited non-zero", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);
 	});
 }
@@ -303,7 +360,8 @@ try {
 	await effortIsPinned();
 	await credentialsAreRequired();
 	await aSwappedAnswerNeverReachesTheProvider();
-	await aSwappedModelOnAPooledThreadIsStopped();
+	await aWorkerOnAPooledThreadStopsBeforeItsRequest();
+	await anIsolatedWorkerOnTheMainThreadIsStillChecked();
 } catch (error) {
 	suite.check("harness", false, error instanceof Error ? (error.stack ?? error.message) : String(error));
 } finally {

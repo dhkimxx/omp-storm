@@ -9,8 +9,9 @@
  *   needs the integrated tree waits until it is integrated. A later authorized shared worker applies the retained
  *   patch in the disposable parent, and the integrated consumer must then read its exact content. A producer that
  *   settled without its required result, or whose attempt failed, starts no consumer. Eight read-only fillers (seven
- *   explorers, an architect) force the experiment onto an omp subagent worker thread; the observation
- *   is the host's own worker-tagged log record, not a logical child label.
+ *   explorers, an architect) and the experiment run on the director's thread: this fixture sets
+ *   `task.workerThreads: 0`, the documented way out, because the scenarios here need more than eight workers at once
+ *   and a Storm worker is never placed on a pooled thread (D5; `hardening-pins.ts` exercises that rule itself).
  * - T03: a native batch whose item overlaps an in-flight shared write is refused before any item is reserved or
  *   started; after the writer settles the valid independent item is submitted again and must start. A work-bearing
  *   `write agent://<id>` follow-up waits. A native `?progress` note does not: it wakes the idle holder into a turn whose
@@ -88,7 +89,9 @@ function hostSettings(isolation: { enabled: boolean; apply?: boolean } = { enabl
 	const lines = [
 		PROFILE_CONFIG.trimEnd(),
 		"task:",
-		"  workerThreads: 4",
+		// Decision D5's user-facing way out: these scenarios need more than eight live workers at once, and a Storm
+		// worker placed on one of omp's pooled threads stops before its request. `hardening-pins.ts` tests that rule.
+		"  workerThreads: 0",
 		// The native subagent ceiling this fixture needs: eight independent reads plus the experiment.
 		"  maxConcurrency: 12",
 		// The host parks an idle subagent after this TTL (default 7 min). A kept-alive subagent still homed on a
@@ -439,8 +442,8 @@ async function main(): Promise<void> {
 		];
 		const steps: Step[] = [
 			planFor(lanes, { explorer: 8, architect: 1, implementer: 2 }),
-			// Seven read-only explorers (and the comparison's), one architect: genuine independent reads, not ambiguous
-			// writable quick lanes, keep eight subagent runs in flight so the ninth (E0) is homed on a worker thread.
+			// Eight independent reads (seven explorers, an architect). The fixture keeps every subagent on the main thread
+			// (`task.workerThreads: 0`), so nothing here is stopped by the D5 pooled-thread rule and the gates run for E0.
 			{ tasks: fillerTasks },
 			{ task: ["storm-implementer"], as: "E", say: `E2E-CHILD-DELAY 3000 E2E-EXPERIMENT E2E-CHILD-SH ${b64(experimentCommand)}` },
 			{ task: ["storm-explorer"], as: "C", say: "E2E-CHILD-DELAY 8000 E2E-COMPARE-EARLY" },
@@ -499,8 +502,8 @@ async function main(): Promise<void> {
 				`fillerReads=${fillerReads.length} run=${run.runId}`,
 			);
 			check(
-				"T02: the host ran E0 on an observed subagent worker thread",
-				worker !== undefined,
+				"T02: E0 ran on the director's thread; a Storm worker is never placed on a pooled thread (D5)",
+				worker === undefined,
 				worker === undefined ? "no worker-tagged log record for E0" : `thread=${worker.thread} evidence=${worker.evidence}`,
 			);
 			check(

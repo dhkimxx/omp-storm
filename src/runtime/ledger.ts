@@ -1,5 +1,6 @@
 import { withJosa } from "../josa.ts";
 import type { BudgetConfig, RunPlan, RunSpendNote } from "../types.ts";
+import { sharedMap } from "./thread-state.ts";
 
 /** Spend and dispatch authority of one run, shared with its children inside this process. */
 export interface LedgerRun {
@@ -39,11 +40,12 @@ export interface LedgerRun {
 }
 
 // The owner key is the profile's session directory, not a worktree or a bare native id: one profile/session owns one run.
-const sessions = new Map<string, LedgerRun>();
-const runs = new Map<string, LedgerRun>();
+// Shared per thread (see thread-state.ts): an isolated subagent can load a second instance of this module on the same thread.
+const sessions = sharedMap<string, LedgerRun>("storm.ledger.sessions");
+const runs = sharedMap<string, LedgerRun>("storm.ledger.runs");
 // OMP agent ids are unique within an artifact tree, not within the entire process.
-const children = new Map<string, string>();
-const childKeysByRun = new Map<string, Set<string>>();
+const children = sharedMap<string, string>("storm.ledger.children");
+const childKeysByRun = sharedMap<string, Set<string>>("storm.ledger.childKeysByRun");
 
 function childKey(id: string, parentId: string | undefined, artifactsDir: string | undefined): string {
 	return `${artifactsDir ?? ""}\0${parentId ?? ""}\0${id}`;
@@ -97,32 +99,6 @@ export function startLedgerRun(init: {
 	sessions.set(run.sessionDir, run);
 	runs.set(run.runId, run);
 	return run;
-}
-
-/**
- * A run as a child on another host thread knows it: named by the child's persisted admission, in no map. It carries what the
- * child's own hooks read (ids, work tree, session store), never the director's spend or plan: nothing a hook writes into it is
- * seen by any other thread, which is why such a child reports through `writeChildReport` instead.
- */
-export function detachedLedgerRun(init: { runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactsDir?: string; startedAt: number }): LedgerRun {
-	return {
-		runId: init.runId,
-		sessionId: init.sessionId,
-		sessionDir: init.sessionDir,
-		repoId: init.repoId,
-		root: init.root,
-		startedAt: init.startedAt,
-		...(init.artifactsDir === undefined ? {} : { artifactsDir: init.artifactsDir }),
-		costUsd: 0,
-		costByModel: {},
-		treeCostUsd: 0,
-		evalCostUsd: 0,
-		evalCostBySource: {},
-		evalUnread: new Set(),
-		warned: false,
-		exceeded: false,
-		closing: false,
-	};
 }
 
 /** The run owned by this profile/session directory; a different session in the same worktree is a different run. */

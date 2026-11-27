@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -287,5 +287,25 @@ describe("effective definitions and symlink aliases", () => {
 		expect(await canonicalScope(root, ["./real/../real/a.ts"])).toEqual(["real/a.ts"]);
 		expect(await canonicalScope(root, ["../outside.ts"])).toBeUndefined();
 		expect(scopesOverlap(await canonicalScope(root, ["alias"]) as string[], await canonicalScope(root, ["real/a.ts"]) as string[])).toBe(true);
+	});
+
+	test("RF2: caseless comparison does not depend on position in the word (final sigma) or on the sharp s, after normalisation; the exact target check stays exact", () => {
+		expect(scopesOverlap(["src/Σ.ts"], ["src/ς.ts"])).toBe(true);
+		expect(scopesOverlap(["src/ς.ts"], ["src/Σ.ts"])).toBe(true);
+		expect(scopesOverlap(["src/ΟΣ.ts"], ["src/οσ.ts"])).toBe(true);
+		expect(scopesOverlap(["src/ẞ.ts"], ["src/ß.ts"])).toBe(true);
+		expect(scopesOverlap(["src/résumé"], ["src/re\u0301sume\u0301"])).toBe(true);
+		// The authorization of a worker's own target is still exact, whatever the volume does.
+		expect(pathsOverlap("src/Σ.ts", "src/ς.ts")).toBe(false);
+		expect(targetWithinScope("src/Σ.ts", ["src/ς.ts"], ".")).toBe(false);
+	});
+
+	test("RF3-8: the scope comparison is an approximation that may over-order even on an insensitive volume, and the design says so", async () => {
+		// Dotless I and I are different names a case-sensitive volume keeps apart; the conservative fold orders them.
+		expect(scopesOverlap(["I"], ["ı"])).toBe(true);
+		expect(scopesOverlap(["ı"], ["I"])).toBe(true);
+		expect(pathsOverlap("I", "ı")).toBe(false);
+		const design = await readFile(new URL("../docs/design.md", import.meta.url), "utf8");
+		expect(design).toContain("근사");
 	});
 });

@@ -39,6 +39,7 @@ import type {
 	RunAdjustment,
 	SpawnBlockCode,
 	SpawnRecord,
+	SpawnStop,
 	StormConfig,
 	UnplannedDelivery,
 	UiPort,
@@ -64,6 +65,7 @@ import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, Attempt
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
 import { runRequiredChecks, trackUnprovenCheck, uncertainCheckBlock, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import { forgetTrialSpawns } from "./trials.ts";
 import { runConfiguredJob, targetJobBlock } from "./job-executor.ts";
 import {
 	CLOSEOUT_TITLE,
@@ -86,7 +88,7 @@ import {
 	revalidateCheckpointProof,
 } from "./checkpoint-import.ts";
 import { hostJobRows } from "./host-jobs.ts";
-import { dependencyBlock, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, writerFreedNotice, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { dependencyBlock, forgetRunLanes, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, writerFreedNotice, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
 import { reviewLane, type LanePolicy } from "../policy/capability.ts";
 import {
 	attemptInputsCurrent,
@@ -136,22 +138,23 @@ import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import { DEFAULT_TIMINGS, type StormTimings } from "./timings.ts";
+import { sharedMap } from "./thread-state.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
-const spawnsByRun = new Map<string, SpawnRecord[]>();
+const spawnsByRun = sharedMap<string, SpawnRecord[]>("storm.controller.spawnsByRun");
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
-const liveWriters = new Map<string, () => void>();
+const liveWriters = sharedMap<string, () => void>("storm.controller.liveWriters");
 /**
  * Immediate phase listeners of the controlling session, keyed by run id. A child session reports its start, settle
  * and approvals through these: the main session draws, the child never does. View-only, like the phases themselves.
  */
-const phaseWatchers = new Map<string, () => void>();
+const phaseWatchers = sharedMap<string, () => void>("storm.controller.phaseWatchers");
 /**
  * View-only keys of the host dialogs this process's live run is waiting on. A key exists only while its run has a
  * phase watcher, so an event that outlives its run cannot mark the next one as waiting.
  */
-const userWaits = new Map<string, Set<string>>();
+const userWaits = sharedMap<string, Set<string>>("storm.controller.userWaits");
 /** How long a stopping run keeps its scope, lease and accounting while owned work settles. */
 const DRAIN_MAX_MS = 30_000;
 /** What the director reads about the ledger in one request: a few lines, never a dump. */
@@ -207,7 +210,7 @@ export function runSpawns(runId: string): SpawnRecord[] {
 }
 
 /** Where a fact about a worker reaches the director of a run, by run id; set while this process's controller owns the run. */
-const noticeSinks = new Map<string, (text: string) => void>();
+const noticeSinks = sharedMap<string, (text: string) => void>("storm.controller.noticeSinks");
 
 /**
  * A fact the director must read that only a child's session can see (a worker stopped because it ran on a model the team
@@ -228,6 +231,14 @@ export function noteRunRan(runId: string, spawnKey: string, ran: RanModel): void
 	// woken again) never replaces it.
 	if (record.ran?.verdict === "mismatch" && ran.verdict !== "mismatch") return;
 	record.ran = ran;
+	touchRun(runId);
+}
+
+/** The stop the worker's own instance recorded for one attempt; a later attempt's verified reading stays its own. */
+export function noteRunStopped(runId: string, spawnKey: string, stop: SpawnStop): void {
+	const record = spawnsByRun.get(runId)?.findLast(spawn => spawn.spawnKey === spawnKey && spawn.outcome !== "blocked");
+	if (record === undefined) return;
+	record.stop = stop;
 	touchRun(runId);
 }
 
@@ -4811,6 +4822,7 @@ export class RunController {
 		let finalReason: RunEndReason =
 			reason === "verified" && (onlyExcluded || inScopeRows.some(row => row.state !== "accepted")) ? "no-progress" : reason;
 		const spawns = spawnsByRun.get(own.record.runId) ?? [];
+		forgetTrialSpawns(own.sessionDir, spawns.flatMap(spawn => (spawn.spawnKey === undefined ? [] : [spawn.spawnKey])));
 		const seen = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		// A team with doc consistency off asked for no doc findings, so none are counted.
 		const agents = docsEnabled(own.config) ? seen : seen.map(withoutDocFindings);
@@ -4906,6 +4918,9 @@ export class RunController {
 				}
 			}
 		}
+		// What the run's shared entries described has ended with its record: they must not outlive it in a long-lived host.
+		// Agent rows are process state a later run may still write to, so only the session shutdown removes them.
+		forgetRunLanes(own.record.runId);
 		return record;
 	}
 
@@ -5064,6 +5079,8 @@ const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
 	"unassigned-lane": "계획 레인 미배정",
 	"role-cap": "역할 워커 상한",
 	parallelism: "동시 상한",
+	// Legacy: removed 0.28.0 spawn prediction; kept only so a record an earlier tree wrote still has a label.
+	"pooled-thread": "풀 스레드 배치",
 	budget: "예산 초과",
 	internal: "내부 오류",
 };

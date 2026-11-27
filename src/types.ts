@@ -607,6 +607,8 @@ export type SpawnBlockCode =
 	| "unassigned-lane"
 	| "role-cap"
 	| "parallelism"
+	/** Legacy: the removed 0.28.0 spawn prediction wrote this code. Never produced now; kept so old records still display. */
+	| "pooled-thread"
 	| "budget"
 	| "internal";
 
@@ -804,6 +806,21 @@ export interface SpawnRecord {
 	 * it. `models` is only what Storm answered to omp, never evidence of what ran. Optional: older records carry none.
 	 */
 	ran?: RanModel;
+	/**
+	 * A stop the worker's own instance recorded on its admission, keyed by the attempt it withdrew. This is why the
+	 * director was told; it is not a model verdict, and it never replaces what an earlier attempt really ran.
+	 */
+	stop?: SpawnStop;
+}
+
+/** Why a worker stopped itself (see `WorkerAdmissionRecord.stop`). */
+export type WorkerStopReason = "pooled-thread" | "state-not-shared";
+
+/** One attempt's stop, on the spawn record the director reads. */
+export interface SpawnStop {
+	attempt: string;
+	reason: WorkerStopReason;
+	at: number;
 }
 
 /** What a child's check read of the model its request used, and what that meant for the team. */
@@ -814,6 +831,8 @@ export interface RanModel {
 	effort?: string;
 	/** `verified`: the child's own request matched the team. `mismatch`: it did not, and the worker was stopped. */
 	verdict: "verified" | "mismatch";
+	/** The admission attempt this reading is about: a later attempt's stop does not reinterpret an earlier verified request. */
+	attempt?: string;
 }
 
 /** Execution evidence for one approved command: raw output is not part of the run record. */

@@ -38,7 +38,7 @@ import {
 	startsService,
 	WORKER_SERVICE_REASON,
 } from "./policy/director-exec.ts";
-import { approvedEntries, checkChildModel, checkChildModelAgainst, modelMismatchNotice, probeCredentialsDetailed, roleOfAgent, selectorOf, teamSelectors, withinDeadline } from "./policy/model-check.ts";
+import { approvedEntries, checkChildModelAgainst, modelMismatchNotice, probeCredentialsDetailed, selectorOf, teamSelectors, withinDeadline, type ChildCheck } from "./policy/model-check.ts";
 import { docPromptFor } from "./policy/docs.ts";
 import { agentControlTarget, deliveredFollowUp, deliveryOutcome, deliveryWokeTurn, followUpAgent, followUpFailureNote, followUpProgress, followUpTarget } from "./policy/followup.ts";
 import {
@@ -74,9 +74,11 @@ import {
 	workerSlot,
 } from "./policy/spawn.ts";
 import { supervisorRunToolBlock, supervisorToolBlock, type SupervisorScope, type SupervisorScopeSource } from "./policy/supervisor.ts";
+import * as threadPolicy from "./policy/thread.ts";
 import { decideDirectorCall } from "./policy/toolcall.ts";
 import { PACKAGE_JSON, ROLE_AGENT_PREFIX, ROLES, STORM_VERSION } from "./roles.ts";
 import {
+	forgetRunAgents,
 	listAgents,
 	noteAgentChange,
 	noteAgentEnd,
@@ -105,12 +107,13 @@ import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { laneContract } from "./runtime/contract-text.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector, type AttemptHostJob } from "./runtime/attempt-collector.ts";
-import { noteRunNotice, noteRunRan, noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
+import { noteRunNotice, noteRunRan, noteRunSpawn, noteRunStopped, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
 import { broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, taskLaneProblem, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
-import { bindLedgerChild, anyLedgerRun, detachedLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
+import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { mayMakeSideCalls, settleSideSpend } from "./runtime/side-spend.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
+import { sharedMap } from "./runtime/thread-state.ts";
 import { closeoutHandoff, closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
 import { DecisionRequests, decisionAsk } from "./runtime/decisions.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "./runtime/quota-auto.ts";
@@ -141,8 +144,10 @@ import type {
 	RunSpec,
 	ShadowInfo,
 	SpawnDecision,
+	SpawnBlockCode,
 	StormConfig,
 	UiPort,
+	WorkerStopReason,
 } from "./types.ts";
 import { createUiPort, registerReportRenderer } from "./ui.ts";
 import { isLiveTui, LiveStatus } from "./view/live.ts";
@@ -151,15 +156,18 @@ import { boundedHandoff, runStatusText } from "./view/render.ts";
 import { plannedResultLabels } from "./view/results.ts";
 import {
 	activeWorkerRunInTree,
+	admissionKey,
 	endWorkerAdmission,
 	persistWorkerAdmission,
 	readChildBinding,
-	readChildReports,
 	readWorkerAdmission,
+	readWorkerStops,
+	recordWorkerStop,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
-	writeChildReport,
+	type ChildBinding,
 	type WorkerAdmissionRecord,
+	type WorkerStopReading,
 } from "./worker-admission.ts";
 
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../agents/", import.meta.url));
@@ -224,17 +232,12 @@ function authorityKey(artifacts: string | undefined, agentId: string): string {
 	return `${artifacts ?? ""}\0${agentId}`;
 }
 
-/** The queue one child's persisted write authority is written and revoked through, so those steps never interleave. */
-function admissionKey(runId: string, childId: string): string {
-	return `admission:${runId}:${childId}`;
-}
-
 /**
  * Children stopped because the model or effort of their own request was not the one approved for their role, by the
  * child's authority key. A stopped child may only report: every tool call but `yield` is refused. Module state, shared by
  * the sessions of this thread.
  */
-const stoppedChildren = new Map<string, string>();
+const stoppedChildren = sharedMap<string, string>("storm.extension.stoppedChildren");
 
 /** The reasoning level a child reports, in the team's own scale; "off" is below every approved effort, unknown levels are unread. */
 function observedEffort(level: unknown): string | undefined {
@@ -532,10 +535,10 @@ interface ReviewerBaseline {
 	reviewerRoot: string;
 }
 
-/** Reviewer starts per child session, keyed by the artifact root and the id its parent admitted. */
-const reviewerBaselines = new Map<string, ReviewerBaseline>();
-/** The work tree each subagent session actually runs in, so a reused reviewer's copy cannot pass for the parent. */
-const childWorkTrees = new Map<string, string>();
+/** Reviewer starts per child session, keyed by the artifact root and the id its parent admitted. Shared by this build. */
+const reviewerBaselines = sharedMap<string, ReviewerBaseline>("storm.extension.reviewerBaselines");
+/** The work tree each subagent session actually runs in, so a reused reviewer's copy cannot pass for the parent. Shared. */
+const childWorkTrees = sharedMap<string, string>("storm.extension.childWorkTrees");
 /**
  * A snapshot that outlasts this is no snapshot: the proof must not wait on a hung git read. It leaves the tree reader
  * its own full deadline, so a slow but working read of a large repository is still a tree, never a missing one.
@@ -780,8 +783,28 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 * entry is the hold, this is only the host's side of the story.
 	 */
 	const directorHolds = new Map<string, { runId: string; root: string; started: boolean; resulted: boolean; seen: boolean }>();
+	/**
+	 * The assistant-message call ids whose `message_end` this handler already saw, whether or not a hold existed then. Harmony recovery on
+	 * the pinned host can deliver the recovered `message_end` before the pre-dispatch hooks: a hold committed afterwards must count as seen
+	 * at once, or an unclean turn could never release it (RF1). Bounded, never silently lossy (RF3-4): on overflow the association is not
+	 * trusted any more and every hold of the message counts as seen (the conservative outcome), rather than the oldest id being dropped.
+	 */
+	const seenDirectorCalls = new Set<string>();
+	let seenDirectorCallsOverflowed = false;
+	/**
+	 * Calls of the director this hook let through as no file change, kept until the host starts them: another extension may rewrite the
+	 * arguments in between, and a call that only then becomes a project file write must still get its hold and notice (RF3). Cleared at
+	 * the turn end and the conversation's end; bounded per message. A call whose memo was evicted is not lost: at execution start it is
+	 * reclassified and, if it is a file change, held on the whole tree and told (RF3-4).
+	 */
+	const revisableDirectorCalls = new Map<string, { runId: string; root: string; generation: number }>();
 	/** Calls whose hold this very hook committed: its answer is final and waits for nothing more (no await after the commit). */
 	const committedHere = new Set<string>();
+	/**
+	 * Director path calls this hook refused. The host still emits a start for a blocked call, and that is not a rewrite:
+	 * the call was judged and refused, so the start must neither hold the whole tree nor claim another extension changed it.
+	 */
+	const refusedDirectorCalls = new Set<string>();
 	/**
 	 * The digest of the result-contract block (`laneContract`) a worker was last sent, so a work follow-up repeats the block only
 	 * when the worker has not been sent the current one. In memory: unknown means send again. `placed` is the digest of the lane's
@@ -1095,14 +1118,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		childId: string;
 		lane?: PlanLane;
 		authority: AgentAuthority;
-		/** The team's config and the agent's name: what the worker's role (and trial) approves travels with its admission (a pooled thread reads only disk). */
-		config?: StormConfig;
-		agent?: string;
+		/** What this worker's role (and trial, when the spawn was routed to one) approves: the snapshot its own check reads on any thread. */
+		approved: ReadonlyArray<{ selector: string; effort?: Effort }>;
 	}): Promise<void> => {
-		const spawn = runSpawns(input.run.runId).findLast(item => item.spawnKey === input.childId && item.outcome !== "blocked");
-		const trial = spawn?.trialId === undefined ? undefined : input.config?.trials?.find(item => item.id === spawn.trialId);
-		const agentName = spawn?.agent ?? input.agent;
-		const approved = input.config === undefined || agentName === undefined ? undefined : approvedEntries(input.config, agentName, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
 		// Through the same key a reservation's end revokes under: an older end never interleaves with this newer write.
 		await serialized(admissionKey(input.run.runId, input.childId), () =>
 			persistWorkerAdmission({
@@ -1117,9 +1135,63 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				targetRoot: input.run.root,
 				...(input.lane === undefined ? {} : { lane: input.lane.name }),
 				policy: input.authority.policy,
-				...(approved === undefined || approved.length === 0 ? {} : { approved }),
+				...(input.approved.length === 0 ? {} : { approved: input.approved }),
 			}),
 		);
+	};
+	/**
+	 * Parent side: reopen a follow-up with a new attempt whose approved snapshot is the one the decision that admitted this
+	 * worker wrote, read from that worker's own admission — never rebuilt from the run's starting configuration (RF3-2).
+	 * A worker of this run with no such snapshot, or a foreign/other-build record, is refused rather than guessed. A reused
+	 * agent this run never admitted has no earlier decision: this follow-up is its first admission and uses the current
+	 * approved entries the caller supplies.
+	 */
+	const reopenChildAdmission = async (input: {
+		ctx: ExtensionContext;
+		run: LedgerRun;
+		artifacts: string | undefined;
+		childId: string;
+		lane?: PlanLane;
+		authority: AgentAuthority;
+		/** What the current approved team names for this agent: used only when this run never admitted the worker. */
+		approved: () => ReadonlyArray<{ selector: string; effort?: Effort }>;
+	}): Promise<{ ok: true } | { ok: false; reason: string }> => {
+		return serialized(admissionKey(input.run.runId, input.childId), async () => {
+			const read = await readWorkerAdmission({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: input.artifacts,
+				parentId: input.ctx.agent.id,
+				childId: input.childId,
+			});
+			if (read.kind === "invalid") {
+				return { ok: false as const, reason: "이 워커의 실행 기록을 읽지 못해 후속 작업의 모델 승인을 확인할 수 없습니다. 실행 상태를 확인한 뒤 다시 보내세요." };
+			}
+			const prior = read.kind === "record" && read.record.runId === input.run.runId ? read.record.approved : undefined;
+			if (read.kind === "record" && read.record.runId === input.run.runId && (prior === undefined || prior.length === 0)) {
+				return { ok: false as const, reason: "이 워커의 승인 모델 기록이 남아 있지 않아 후속 작업을 보내지 않았습니다. 실행을 새로 시작하세요." };
+			}
+			const approved = prior === undefined
+				? input.approved().map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }))
+				: prior.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort as Effort }) }));
+			if (approved.length === 0) {
+				return { ok: false as const, reason: "이 워커의 승인 모델 기록이 남아 있지 않아 후속 작업을 보내지 않았습니다. 실행을 새로 시작하세요." };
+			}
+			await persistWorkerAdmission({
+				agentDir: workerAdmissionAgentDir(),
+				artifactRoot: input.artifacts,
+				parentId: input.ctx.agent.id,
+				childId: input.childId,
+				runId: input.run.runId,
+				sessionId: input.run.sessionId,
+				sessionDir: input.run.sessionDir,
+				repoId: input.run.repoId,
+				targetRoot: input.run.root,
+				...(input.lane === undefined ? {} : { lane: input.lane.name }),
+				policy: input.authority.policy,
+				approved,
+			});
+			return { ok: true as const };
+		});
 	};
 
 	/** The last run shown live; its child admissions close when finalization reports no run. */
@@ -1166,6 +1238,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			announcedResultPlan = undefined;
 			if (ended !== undefined) {
 				void revokeWorkerAdmissionsFor({ runId: ended });
+				for (const key of adoptedStops.keys()) if (key.startsWith(`${ended}\0`)) adoptedStops.delete(key);
+				for (const [key, baseline] of reviewerBaselines) if (baseline.runId === ended) reviewerBaselines.delete(key);
 				endRevokes.delete(ended);
 			}
 			liveStatus.clear();
@@ -1289,6 +1363,26 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (hold !== undefined) {
 				hold.started = true;
 				widenToWhatRuns(event, ctx, hold.root);
+			} else if (!refusedDirectorCalls.delete(event.toolCallId)) {
+				// A call Storm itself refused is not a rewrite: the host still reports its start, but it never runs, so it
+				// must not hold the tree or claim another extension changed it. Only a call the hook let through is re-read.
+				const revisable = revisableDirectorCalls.get(event.toolCallId);
+				revisableDirectorCalls.delete(event.toolCallId);
+				const runId = runs.runId();
+				const run = getLedgerRun(runId);
+				const memoValid = revisable !== undefined && revisable.runId === runId && revisable.generation === sessionGeneration;
+				if (runId !== undefined && run !== undefined) {
+					const root = memoValid ? revisable.root : run.root;
+					const real = decideDirectorCall({ toolName: event.toolName, input: event.args, cwd: ctx.cwd, root });
+					if (real.kind !== "allow") {
+						const lanes = runs.runLanes();
+						const paths = memoValid && real.kind === "director-path" && real.paths.length > 0 ? real.paths : ["."];
+						if (lanes !== undefined && lanes.runId === runId && lanes.holdDirectorCall(event.toolCallId, paths)) {
+							directorHolds.set(event.toolCallId, { runId, root, started: true, resulted: false, seen: seenDirectorCallsOverflowed || seenDirectorCalls.has(event.toolCallId) });
+							runs.noteDirector(`[storm:director-edit] ${DIRECTOR_REWRITTEN}`);
+						}
+					}
+				}
 			}
 		}
 		// A synchronous wait is the one mid-run tool call that can outlast the plan: if the context crossed 70% of its window
@@ -1570,8 +1664,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const stillOwn = (): boolean =>
 			ctx.agent.kind !== "main" || (generation === sessionGeneration && mainSessionId(ctx) === mainId);
 		const autoOn = auto?.enabled === true;
-		const ledgerBlock = (reason: string, run: LedgerRun, now: number): SpawnDecision => {
-			const block = { code: "internal" as const, reason };
+		const ledgerBlock = (reason: string, run: LedgerRun, now: number, code: SpawnBlockCode = "internal"): SpawnDecision => {
+			const block = { code, reason };
 			if (getLedgerRun(run.runId) === run) noteRunSpawn(run.runId, blockedSpawn(event, block, now));
 			return { block: true, reason: blockText(block) };
 		};
@@ -1673,6 +1767,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				}
 				if (timedOut) return closed();
 				if (!stillOwn()) return moved();
+				// No placement is predicted here (decision D7): the child's own positive thread check is the rule, and an
+				// unlucky spawn costs only that child's start. The director reads the stop reason from its admission.
 				// The positive decision reserves its slot before any later admission can await. If a later guard refuses
 				// the spawn, the decision's block path releases it; no other spawn sees the window as free.
 				if (record?.spawnKey !== undefined && current !== undefined) {
@@ -1736,7 +1832,12 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 						if (!authority.ok) return ledgerBlock(authority.reason, current, now);
 						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority.authority);
 						ownAuthority = authority.authority;
-						// Persist before returning: a pooled/rebound child has no access to this thread's map. A failure
+						// What this exact spawn's role and trial approve travels with its admission: the child's own check reads this
+						// snapshot, on the main thread as well as on any other, never the live team file. The decision made for this
+						// spawn carries the trial; a historical spawn record is not consulted.
+						const trial = record?.trialId === undefined ? undefined : config.trials?.find(item => item.id === record.trialId);
+						const approved = approvedEntries(config, event.agent, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
+						// Persist before returning: the child's own hooks run in its session, which may be another thread. A failure
 						// here blocks the spawn rather than allowing an unverifiable writer.
 						try {
 							await persistChildAdmission({
@@ -1746,8 +1847,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 								childId: spawnKey,
 								...(lane === undefined ? {} : { lane }),
 								authority: authority.authority,
-								config,
-								agent: event.agent,
+								approved,
 							});
 						} catch {
 							return ledgerBlock("자식 실행 권한을 프로필에 저장하지 못해 스폰을 허용하지 않았습니다. 프로필 경로와 권한을 확인하세요.", current, now);
@@ -1854,6 +1954,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	//    what an aborted call wrote. The next completed assistant message of this conversation ends them (below).
 	pi.on("turn_end", (event, ctx) => {
 		if (ctx.agent.kind !== "main") return;
+		// Every call of this message has executed (or was aborted); nothing of it can still start after its turn end.
+		revisableDirectorCalls.clear();
+		refusedDirectorCalls.clear();
 		const held = [...directorCallIds(event)].filter(id => directorHolds.has(id));
 		if (held.length === 0 || !directorTurnClean(event)) return;
 		releaseDirectorHolds(held);
@@ -1867,6 +1970,19 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		//    (the host hands one extension its events in the order it emitted them). Only such a hold is released here.
 		if (ctx.agent.kind === "main" && isAssistantMessage(event.message)) {
 			const own = directorCallIds({ message: event.message });
+			// Whatever this message's stop reason, its call ids were carried by a `message_end` this handler now saw. A hold that a
+			// later hook commits for one of them (the recovered-event order) is born seen and the next completed answer can end it.
+			for (const id of own) {
+				if (!seenDirectorCallsOverflowed) {
+					seenDirectorCalls.add(id);
+					if (seenDirectorCalls.size > 256) {
+						// The id association is no longer trustworthy. A hold of this message counts as seen, so it is released by
+						// the next completed answer instead of being lost (RF3-4); no entry is dropped in silence.
+						seenDirectorCallsOverflowed = true;
+						for (const hold of directorHolds.values()) hold.seen = true;
+					}
+				}
+			}
 			if (completedAssistantMessage(event.message)) {
 				const older = [...directorHolds].filter(([id, hold]) => hold.seen && !own.has(id)).map(([id]) => id);
 				// A table entry this handler never heard of (a restart of the handler's state) is older than this message too.
@@ -1887,18 +2003,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
 		const ledger = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
-		if (ctx.agent.kind === "sub" && ledger === undefined) {
-			// A pooled thread has no run in memory: what the request cost is published for the director's thread to add to the run.
-			if (usage.usd <= 0) return;
-			const bound = await pooledRun(ctx);
-			if (bound.kind !== "run") return;
-			await publishChildReport(ctx, bound.ledger, report => {
-				report.costByModel[usage.selector] = (report.costByModel[usage.selector] ?? 0) + usage.usd;
-			});
-			return;
-		}
 		if (ctx.agent.kind === "sub") {
-			// A bare child has no attested Storm owner: its own native session is never substituted.
+			// A bare child has no attested Storm owner: its own native session is never substituted. A child on another thread
+			// (a pooled worker) never reaches here with a request; it was stopped before its first one.
 			if (ledger === undefined) return;
 			noteAgentRun(ctx.agent.id, ledger.runId, ledger.sessionDir);
 			if (usage.promptTokens > 0) {
@@ -2064,13 +2171,15 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			return { systemPrompt: [...kept, ...additions] };
 		}
 		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
-		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd. On a pooled
-		// thread the run is not in memory and its persisted admission names it (the docs and the reviewer's baseline are files).
-		let ledger = childLedger(ctx);
+		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd. A
+		// managed child without its run in memory is not on the director's thread; it stops before its first request (D5).
+		const ledger = childLedger(ctx);
 		if (ledger === undefined) {
-			const bound = await pooledRun(ctx);
-			if (bound.kind !== "run") return undefined;
-			ledger = bound.ledger;
+			const binding = await childBindingOf(ctx);
+			// A child whose admission names its run is a Storm worker on a thread that does not share the run: stop it now. A
+			// child of a live managed tree with no record is left for the request check, which stops it with its own cause.
+			if (binding.kind === "bound") stopDetachedChild(ctx, binding);
+			return undefined;
 		}
 		const { id, name } = ctx.agent;
 		const artifacts = artifactsOf(ctx);
@@ -2091,7 +2200,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	});
 
 	/** The last model a managed child's request was seen on, by the child's authority key: the record is written on a change only. */
-	const lastRan = new Map<string, string>();
+	const lastRan = sharedMap<string, string>("storm.extension.lastRan");
 	/**
 	 * What the hook answered is what Storm asked for, not what runs: a credential that broke after the answer, a later
 	 * extension replacing the answer or omp's own retry fallback can end on another model. Every request of a managed child
@@ -2102,79 +2211,71 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	/** The check of a child's request must answer well inside omp's own budget for a handler (30 s): past it omp sends the request unchecked. */
 	const CHILD_CHECK_MS = 10_000;
 	/**
-	 * A child on a pooled thread has no run in this thread's memory, so what it decides from the run is read from disk (its persisted
-	 * admission names the run) and what the director must learn is published (`writeChildReport`), because nothing a hook writes into
-	 * this thread's ledger is seen by the director's thread. `childReports` is this thread's cumulative copy of what it published.
+	 * Stops this director's thread already told, by run, child and admission attempt. Shared by this build's copies on the
+	 * thread: a second read of the same attempt (two result hooks of one message, a later request) changes nothing, and the
+	 * record itself is never deleted, so reading it is always harmless.
 	 */
-	const childReports = new Map<string, { runId: string; childId: string; ran?: RanModel; notice?: string; costByModel: Record<string, number> }>();
-	/** Whether this run lives in this thread's memory: a child of a run that does not reports through the profile store instead. */
-	const detachedLedgers = new WeakSet<LedgerRun>();
-	const detached = (ledger: LedgerRun): boolean => detachedLedgers.has(ledger);
-	const publishChildReport = async (ctx: ExtensionContext, ledger: LedgerRun, change: (report: { ran?: RanModel; notice?: string; costByModel: Record<string, number> }) => void): Promise<void> => {
-		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
-		const report = childReports.get(key) ?? { runId: ledger.runId, childId: ctx.agent.id, costByModel: {} };
-		change(report);
-		childReports.set(key, report);
-		const written = await writeChildReport(workerAdmissionAgentDir(), report);
-		// A report that could not be written is a verdict the director will never read: the worker's own guard still stops it (fail closed).
-		if (!written && report.notice !== undefined) stoppedChildren.set(key, report.notice);
-	};
-	/** The run of this child when this thread's memory has none: from its persisted admission. `unknown` is a managed child whose run cannot be named. */
-	const pooledRun = async (ctx: ExtensionContext): Promise<{ kind: "run"; ledger: LedgerRun; approved?: ReadonlyArray<{ selector: string; effort?: string }> } | { kind: "none" } | { kind: "unknown"; reason: string }> => {
+	const adoptedStops = sharedMap<string, true>("storm.extension.adoptedStops");
+	/** Whether this child's own hooks ran without the run in memory: it is not on the director's thread and cannot work (decision D5). */
+	const childBindingOf = async (ctx: ExtensionContext): Promise<ChildBinding> => {
 		try {
-			const bound = await readChildBinding({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id });
-			if (bound.kind === "unmanaged") return { kind: "none" };
-			if (bound.kind === "unknown") return bound;
-			const ledger = detachedLedgerRun({ runId: bound.runId, sessionId: bound.sessionId, sessionDir: bound.sessionDir, repoId: bound.repoId, root: bound.root, artifactsDir: bound.artifactRoot, startedAt: bound.createdAt });
-			detachedLedgers.add(ledger);
-			return { kind: "run", ledger, ...(bound.approved === undefined ? {} : { approved: bound.approved }) };
+			const binding = await withinDeadline(
+				readChildBinding({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id }),
+				CHILD_CHECK_MS,
+			);
+			return binding ?? { kind: "unknown", reason: "자식 실행 기록을 제한 시간 안에 읽지 못했습니다" };
 		} catch {
 			return { kind: "unknown", reason: "자식 실행 기록을 읽지 못했습니다" };
 		}
 	};
-	/** What the director's thread already took from each child's report, by run and child: a report is cumulative, so only the difference is new. */
-	const adoptedReports = new Map<string, { ran?: string | undefined; noticed: boolean; costByModel: Record<string, number> }>();
 	/**
-	 * Takes what children on pooled threads published (see `publishChildReport`) into this thread's run: the verdict of their model
-	 * check goes on the spawn's record, a stop is told to the director once, and what they spent counts against the budget. Only a
-	 * report of a child this run admitted counts (its persisted admission names this run); the rest is ignored.
+	 * Stops a worker whose own instance has no run in this thread's shared state. The cause is established positively: off
+	 * the host's main thread it is a pooled thread (D5); on the main thread it is another build or lost state (D7). Its
+	 * first request never reaches the provider. When its own admission names the run, the reason is written there at the
+	 * attempt being withdrawn; the director's thread writes the sentence. The write is started, not awaited, so the
+	 * permission path never waits on disk; a lost write leaves the worker stopped all the same (fail closed).
 	 */
-	const adoptChildReports = async (ctx: ExtensionContext, runId: string): Promise<void> => {
+	const stopDetachedChild = (ctx: ExtensionContext, binding: ChildBinding): void => {
+		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
+		if (binding.kind === "bound") {
+			const reason: WorkerStopReason = threadPolicy.onHostMainThread() ? "state-not-shared" : "pooled-thread";
+			stoppedChildren.set(key, threadPolicy.workerStopNotice(ctx.agent.name, reason));
+			void recordWorkerStop(workerAdmissionAgentDir(), { key: binding.key, runId: binding.runId, childId: ctx.agent.id, attempt: binding.attempt, reason });
+		} else {
+			const reason = binding.kind === "unknown" ? binding.reason : "실행 기록이 없습니다";
+			stoppedChildren.set(key, `[storm:model-mismatch] 이 워커가 어느 실행에 속하는지 확인하지 못해 실제 모델을 검사할 수 없었고, 그래서 멈췄습니다(${reason}). 지금까지의 결과를 감독에게 보고하세요.`);
+		}
+		ctx.abort();
+	};
+	/**
+	 * Reads this run's own admission records for the children it admitted and tells the director, once per worker attempt,
+	 * the sentence for the reason each stopped itself. The record's build, run and attempt are checked by its reader; the
+	 * record is not deleted, so a repeated read is harmless and the shared seen-attempt set is what makes it once.
+	 */
+	const adoptChildStops = async (ctx: ExtensionContext, runId: string): Promise<void> => {
 		if (getLedgerRun(runId) === undefined) return;
-		let reports: Awaited<ReturnType<typeof readChildReports>>;
+		const spawns = runSpawns(runId).filter(spawn => spawn.outcome !== "blocked" && spawn.spawnKey !== undefined);
+		if (spawns.length === 0) return;
+		let stops: WorkerStopReading[];
 		try {
-			reports = await readChildReports(workerAdmissionAgentDir(), runId);
+			stops = await readWorkerStops(workerAdmissionAgentDir(), {
+				runId,
+				artifactRoot: artifactsOf(ctx),
+				parentId: ctx.agent.id,
+				childIds: spawns.map(spawn => spawn.spawnKey as string),
+			});
 		} catch {
 			return;
 		}
-		for (const report of reports) {
-			const key = `${runId}\0${report.childId}`;
-			const seen: { ran?: string | undefined; noticed: boolean; costByModel: Record<string, number> } = adoptedReports.get(key) ?? { noticed: false, costByModel: {} };
-			const ranKey = report.ran === undefined ? undefined : `${report.ran.model}:${report.ran.effort ?? ""}:${report.ran.verdict}`;
-			const newCost = Object.entries(report.costByModel).some(([model, usd]) => usd > (seen.costByModel[model] ?? 0));
-			if (ranKey === seen.ran && (report.notice === undefined || seen.noticed) && !newCost) continue;
-			try {
-				const read = await readWorkerAdmission({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.id, childId: report.childId });
-				if (read.kind !== "record" || read.record.runId !== runId) continue;
-			} catch {
-				continue;
-			}
-			if (report.ran !== undefined && ranKey !== seen.ran) {
-				noteRunRan(runId, report.childId, report.ran);
-				seen.ran = ranKey;
-			}
-			if (report.notice !== undefined && !seen.noticed) {
-				noteRunNotice(runId, report.notice);
-				seen.noticed = true;
-			}
-			for (const [model, usd] of Object.entries(report.costByModel)) {
-				const delta = usd - (seen.costByModel[model] ?? 0);
-				if (delta <= 0) continue;
-				recordCost(runId, model, delta);
-				seen.costByModel[model] = usd;
-			}
+		for (const stop of stops) {
+			const key = `${runId}\0${stop.childId}\0${stop.attempt}`;
+			if (adoptedStops.has(key)) continue;
+			// Claim it before anything else can read the same attempt in this turn.
+			adoptedStops.set(key, true);
+			const agent = spawns.find(spawn => spawn.spawnKey === stop.childId)?.agent ?? stop.childId;
+			noteRunStopped(runId, stop.childId, { attempt: stop.attempt, reason: stop.reason, at: stop.at });
+			noteRunNotice(runId, threadPolicy.workerStopNotice(agent, stop.reason));
 			touchRun(runId);
-			adoptedReports.set(key, seen);
 		}
 	};
 
@@ -2183,13 +2284,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		stoppedChildren.set(key, notice);
 		if (ran !== undefined) noteRunRan(ledger.runId, ctx.agent.id, ran);
 		noteRunNotice(ledger.runId, notice);
-		// On a pooled thread the two lines above reached no one: the director's thread reads what the child publishes.
-		if (detached(ledger)) {
-			void publishChildReport(ctx, ledger, report => {
-				report.notice = notice;
-				if (ran !== undefined) report.ran = ran;
-			});
-		}
 		// A child on another thread cannot see this map: its persisted authority is revoked so its next write fails closed.
 		void serialized(admissionKey(ledger.runId, ctx.agent.id), async () => {
 			try {
@@ -2202,82 +2296,77 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	};
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.agent.kind !== "sub") return undefined;
-		let ledger = childLedger(ctx);
-		let pooledApproved: ReadonlyArray<{ selector: string; effort?: string }> | undefined;
-		const model = ctx.model;
 		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
-		if (ledger === undefined) {
-			// This thread's memory has no run for the child (a pooled thread). Its persisted admission says which run it belongs to;
-			// a managed child whose run cannot be named is stopped, never let through unchecked.
-			const bound = await pooledRun(ctx);
-			if (bound.kind === "none") return undefined;
-			if (bound.kind === "unknown") {
-				stoppedChildren.set(key, `[storm:model-mismatch] 이 워커가 어느 실행에 속하는지 확인하지 못해 팀이 승인한 모델인지 검사할 수 없었고, 그래서 멈췄습니다(${bound.reason}). 지금까지의 결과를 감독에게 보고하세요.`);
-				ctx.abort();
-				return undefined;
-			}
-			ledger = bound.ledger;
-			pooledApproved = bound.approved;
-		}
-		if (model === undefined) return undefined;
+		const model = ctx.model;
 		if (stoppedChildren.has(key)) {
 			ctx.abort();
 			return undefined;
 		}
-		let agent = ctx.agent.name;
+		const ledger = childLedger(ctx);
+		if (ledger === undefined) {
+			// This thread has no run in memory: the worker is not on the director's thread. On this host that means omp placed it on
+			// a pooled thread, where the promises about what runs, what it spends and the record cannot be held. Stop it before its
+			// first request; an ordinary native child (no run binding) is not Storm's and is left alone.
+			const binding = await childBindingOf(ctx);
+			if (binding.kind !== "unmanaged") stopDetachedChild(ctx, binding);
+			return undefined;
+		}
+		if (model === undefined) return undefined;
+		const selector = selectorOf(model);
+		let level: unknown;
 		try {
-			// The state is read under a deadline: expiry, like any error, is a check that could not be made, and a check that could
-			// not be made stops the worker (omp would otherwise send the request as it is).
-			const state = await withinDeadline(stateCache.get(runEnv(ledger)), CHILD_CHECK_MS);
-			const config = state?.config.status === "ok" ? state.config.config : undefined;
-			const spawn = runSpawns(ledger.runId).findLast(item => item.spawnKey === ctx.agent.id && item.outcome !== "blocked");
-			agent = spawn?.agent ?? ctx.agent.name;
-			const trialId = spawn?.outcome === "trial" ? spawn.trialId : undefined;
-			const trial = trialId === undefined ? undefined : config?.trials?.find(item => item.id === trialId);
-			let level: unknown;
+			level = pi.getThinkingLevel?.();
+		} catch {
+			level = undefined;
+		}
+		const effort = observedEffort(level);
+		const spawn = runSpawns(ledger.runId).findLast(item => item.spawnKey === ctx.agent.id && item.outcome !== "blocked");
+		const agent = spawn?.agent ?? ctx.agent.name;
+		// What the host resolves a team selector to: the answer and this check agree on the model, not on its spelling.
+		const resolve = (entry: string): string | undefined => {
+			const slash = entry.indexOf("/");
+			if (slash <= 0) return undefined;
 			try {
-				level = pi.getThinkingLevel?.();
+				const found = ctx.modelRegistry.find(entry.slice(0, slash), entry.slice(slash + 1));
+				return found === undefined ? undefined : `${found.provider}/${found.id}`;
 			} catch {
-				level = undefined;
-			}
-			const effort = observedEffort(level);
-			const selector = selectorOf(model);
-			// What the host resolves a team selector to: the answer and this check agree on the model, not on its spelling.
-			const resolve = (entry: string): string | undefined => {
-				const slash = entry.indexOf("/");
-				if (slash <= 0) return undefined;
-				try {
-					const found = ctx.modelRegistry.find(entry.slice(0, slash), entry.slice(slash + 1));
-					return found === undefined ? undefined : `${found.provider}/${found.id}`;
-				} catch {
-					return undefined;
-				}
-			};
-			// On a pooled thread the spawn records (and so the trial) are not here: the parent wrote what the worker's role and trial
-			// approve into its admission. A worker whose admission has none of them cannot be checked, and is stopped.
-			const observed = { provider: model.provider, id: model.id, resolve, ...(effort === undefined ? {} : { effort }) };
-			const check: ReturnType<typeof checkChildModel> =
-				detached(ledger)
-					? pooledApproved === undefined || pooledApproved.length === 0
-						? { ok: false, reason: "unchecked", observed: selector, approved: [] }
-						: checkChildModelAgainst(pooledApproved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort as Effort }) })), observed)
-					: config === undefined
-					? { ok: false, reason: "unchecked", observed: selector, approved: [] }
-					: checkChildModel(config, agent, { provider: model.provider, id: model.id, resolve, ...(effort === undefined ? {} : { effort }) }, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
-			const ran = { model: selector, ...(effort === undefined ? {} : { effort }) };
-			if (check.ok) {
-				const seen = `${selector}:${effort ?? ""}`;
-				if (lastRan.get(key) !== seen) {
-					lastRan.set(key, seen);
-					noteRunRan(ledger.runId, ctx.agent.id, { ...ran, verdict: "verified" });
-					if (detached(ledger)) await publishChildReport(ctx, ledger, report => { if (report.ran?.verdict !== "mismatch") report.ran = { ...ran, verdict: "verified" }; });
-				}
 				return undefined;
 			}
-			stopChild(ctx, ledger, key, modelMismatchNotice(agent, check, config === undefined ? undefined : roleOfAgent(config, agent)?.key), check.reason === "unchecked" ? undefined : { ...ran, verdict: "mismatch" });
+		};
+		// One bounded decision over everything the check awaits: the admission written at spawn (the approved snapshot this worker
+		// was admitted under, never the live team file) and the comparison. The permission path only decides; it never waits for a
+		// report to be written. A check that could not finish is a check that could not be made, and the worker is stopped.
+		let check: ChildCheck | undefined;
+		let admissionAttempt: string | undefined;
+		try {
+			check = await withinDeadline(
+				(async (): Promise<ChildCheck> => {
+					const read = await readWorkerAdmission({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id });
+					if (read.kind !== "record" || read.record.runId !== ledger.runId || read.record.approved === undefined || read.record.approved.length === 0) {
+						return { ok: false, reason: "unchecked", observed: selector, approved: [] };
+					}
+					admissionAttempt = read.record.attempt;
+					return checkChildModelAgainst(
+						read.record.approved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort as Effort }) })),
+						{ provider: model.provider, id: model.id, resolve, ...(effort === undefined ? {} : { effort }) },
+					);
+				})(),
+				CHILD_CHECK_MS,
+			);
 		} catch {
-			stopChild(ctx, ledger, key, modelMismatchNotice(agent, { ok: false, reason: "unchecked", observed: selectorOf(model), approved: [] }));
+			check = undefined;
 		}
+		const decided = check ?? { ok: false as const, reason: "unchecked" as const, observed: selector, approved: [] };
+		const ran = { model: selector, ...(effort === undefined ? {} : { effort }), ...(admissionAttempt === undefined ? {} : { attempt: admissionAttempt }) };
+		if (decided.ok) {
+			const seen = `${selector}:${effort ?? ""}`;
+			if (lastRan.get(key) !== seen) {
+				lastRan.set(key, seen);
+				noteRunRan(ledger.runId, ctx.agent.id, { ...ran, verdict: "verified" });
+			}
+			return undefined;
+		}
+		stopChild(ctx, ledger, key, modelMismatchNotice(agent, decided), decided.reason === "unchecked" ? undefined : { ...ran, verdict: "mismatch" });
 		return undefined;
 	});
 
@@ -2406,7 +2495,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			agents: listAgents({ runId: run.runId, scope: run.scope }),
 		});
 		if (!committed.ok) return refused(directorWriteBlock(committed.reason));
-		directorHolds.set(callId, { runId: run.runId, root: run.root, started: false, resulted: false, seen: false });
+		directorHolds.set(callId, { runId: run.runId, root: run.root, started: false, resulted: false, seen: seenDirectorCallsOverflowed || seenDirectorCalls.has(callId) });
 		committedHere.add(callId);
 		return undefined;
 	};
@@ -2624,9 +2713,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (!taken.ok) return { block: true, reason: `[storm:director-exec] ${taken.reason}` };
 		}
 		// The director's own change of a project file: a path tool whose exact targets Storm names and commits to the run's write
-		// table as the last step before the call runs, or a refusal with its cause. Every other file change stays refused.
+		// table as the last step before the call runs, or a refusal with its cause. Every other file change stays refused. A call
+		// that is no file change now is remembered until it starts, so a later extension's rewrite into one still gets a hold (RF3).
 		if (directorFileChange(event.toolName, event.input) !== undefined) {
 			return directorPathEdit(event, ctx, { runId, root: runLedger?.root ?? ctx.cwd, scope: runScope, generation, mainId, hookStart });
+		}
+		if (typeof event.toolCallId === "string") {
+			revisableDirectorCalls.set(event.toolCallId, { runId, root: runLedger?.root ?? ctx.cwd, generation });
+			if (revisableDirectorCalls.size > 256) revisableDirectorCalls.delete(revisableDirectorCalls.keys().next().value as string);
 		}
 		// Every native task call is placed before omp allocates its spawn id: auto direction also reserves a lane name,
 		// manual direction keeps the caller's handle. The plan decides isolation for both; a direct isolated claim
@@ -2862,11 +2956,20 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// admission with a new attempt before the delivery can execute. A quiet note does not: the woken turn keeps the
 			// admission its last turn ended, so it can read and yield but never write or run a command.
 			if (!quietWake && lane !== undefined && authority !== undefined) {
-				try {
-					await persistChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority, config, agent: followAgent.name });
-				} catch {
+				// The follow-up carries the approved entries of the decision that admitted this worker, read from its own
+				// admission. Rebuilding them from the current team file (or the run-start one) would re-authorize a model the
+				// user did not approve at that decision (RF3-2). A worker this run never admitted (a reused leftover) has no
+				// earlier decision, so this follow-up is its first admission and uses the current approved entries.
+				const original = runSpawns(run.runId).findLast(item => item.spawnKey === followAgent.id && item.outcome !== "blocked");
+				const trial = original?.trialId === undefined ? undefined : config.trials?.find(item => item.id === original.trialId);
+				const fallback = () => approvedEntries(config, followAgent.name, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
+				const reopened = await reopenChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority, approved: fallback }).catch(() => ({
+					ok: false as const,
+					reason: "후속 작업의 자식 실행 권한을 저장하지 못했습니다. 프로필 경로와 권한을 확인하세요.",
+				}));
+				if (!reopened.ok) {
 					followLanes.finishFollowUp(followToken, false);
-					return { block: true, reason: "[storm:authority] 후속 작업의 자식 실행 권한을 저장하지 못해 전달하지 않았습니다. 프로필 경로와 권한을 확인하세요." };
+					return { block: true, reason: `[storm:authority] ${reopened.reason}` };
 				}
 			}
 		}
@@ -2954,6 +3057,12 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const runId = runs.runId();
 			const unsettled = runId === undefined ? undefined : await settleEndRevokes(runId);
 			if (unsettled !== undefined) verdict = { block: true, reason: unsettled };
+		}
+		if (verdict?.block === true && ctx.agent.kind === "main" && typeof event.toolCallId === "string") {
+			// The host still reports a start for a blocked call. It was judged and refused, not rewritten by another
+			// extension, so its start must not hold the whole tree or claim a rewrite.
+			refusedDirectorCalls.add(event.toolCallId);
+			if (refusedDirectorCalls.size > 256) refusedDirectorCalls.delete(refusedDirectorCalls.values().next().value as string);
 		}
 		if (verdict?.block !== true || event.toolName !== "task" || typeof event.toolCallId !== "string") return verdict;
 		const reason = verdict.reason ?? "";
@@ -3163,7 +3272,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (cleaned !== undefined) parts.push(cleaned);
 		}
 		if (event.toolName === "wait" || event.toolName === "task") {
-			if (runId !== undefined) await adoptChildReports(ctx, runId);
+			if (runId !== undefined) await adoptChildStops(ctx, runId);
 			const notice = await runs.noticesForDirector();
 			if (notice !== undefined) parts.push(notice);
 		}
@@ -3194,7 +3303,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			await Promise.race([Promise.allSettled(arrived), limit]);
 			clearTimeout(timer);
 		}
-		await adoptChildReports(ctx, runId);
+		await adoptChildStops(ctx, runId);
 		const notice = await runs.noticesForDirector();
 		if (notice === undefined) return undefined;
 		return { messages: [...event.messages, { role: "developer", content: [{ type: "text", text: notice }], attribution: "agent", timestamp: Date.now() }] };
@@ -3321,6 +3430,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		openWaits.clear();
 		resetCloseoutChoices(ctx);
 		refusedCalls.clear();
+		seenDirectorCalls.clear();
+		seenDirectorCallsOverflowed = false;
+		revisableDirectorCalls.clear();
+		refusedDirectorCalls.clear();
+		adoptedStops.clear();
 	};
 	/**
 	 * Every host transition that replaces the conversation (new, resume, fork, branch, context clear) shares this:
@@ -3345,11 +3459,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const active = getLedgerRun(runs.runId());
 		if (active !== undefined) await revokeWorkerAdmissionsFor({ runId: active.runId });
 		await runs.finish("shutdown", ctx);
-		if (active !== undefined) clearWorkerSlots(active.runId);
+		if (active !== undefined) {
+			clearWorkerSlots(active.runId);
+		}
 		await syncSession(ctx).catch(() => undefined);
 	};
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		let ended: LedgerRun | undefined;
 		// A subagent's session closes when omp parks it (idle TTL), kills it, or exits.
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
@@ -3363,7 +3480,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			agentAuthorities.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			stoppedChildren.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			lastRan.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
-			childReports.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
 			reviewerBaselines.delete(key);
 			childWorkTrees.delete(key);
@@ -3373,6 +3489,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			forgetConversation(ctx);
 			const active = getLedgerRun(runs.runId());
 			if (active !== undefined) {
+				ended = active;
 				await revokeWorkerAdmissionsFor({ runId: active.runId });
 				clearWorkerSlots(active.runId);
 			}
@@ -3381,6 +3498,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		liveStatus.beginSession();
 		openWaits.clear();
 		await runs.finish("shutdown");
+		// The run's record has its agents; the live rows of that process are gone with the session that described them.
+		if (ended !== undefined) forgetRunAgents(ended.runId, ended.sessionDir);
 	});
 
 	// /new, /resume, a fork or a branch puts another conversation in this session: the run's handoff is not in it.

@@ -14,6 +14,7 @@ import { ROLE_AGENT_PREFIX } from "../roles.ts";
 import type { AgentEntry } from "../types.ts";
 import { anyLedgerRun, ledgerRunForChildId } from "./ledger.ts";
 import { reviewPart, tallyFromYield, type ReviewEvidenceEntry } from "./review.ts";
+import { sharedMap } from "./thread-state.ts";
 
 /** Parked entries older than this are dropped when a new agent is added. */
 const PARKED_KEEP_MS = 24 * 3_600_000;
@@ -27,9 +28,9 @@ interface AgentRecord {
 	scope: string;
 }
 
-const agents = new Map<string, AgentRecord>();
+const agents = sharedMap<string, AgentRecord>("storm.agents.byKey");
 /** Entries this thread created from the host registry because no child-session event reached it. */
-const registryEntries = new Set<string>();
+const registryEntries = sharedMap<string, true>("storm.agents.registryEntries");
 
 function validScope(scope: unknown): scope is string {
 	return typeof scope === "string" && scope.length > 0 && !scope.includes("\u0000");
@@ -306,7 +307,7 @@ export function noteRegistryAgent(facts: RegistryAgentFacts): void {
 		if (facts.model !== undefined) entry.model = facts.model;
 		if (facts.status === "aborted" || facts.lastWorkFailed === true) entry.lastWorkFailed = true;
 		agents.set(key, { entry, scope: facts.scope });
-		registryEntries.add(key);
+		registryEntries.set(key, true);
 		return;
 	}
 	const e = existingRecord.entry;
@@ -424,6 +425,17 @@ export function markAgentsCleaned(ids: readonly string[], now: number, scope: st
 	for (const id of ids) {
 		const record = recordOf(id, scope);
 		if (record) record.entry.cleanedAt = now;
+	}
+}
+
+/** A finished run's rows leave the shared ledger: what it described ended with its final record. */
+export function forgetRunAgents(runId: string, scope: string): void {
+	if (!validScope(scope)) return;
+	for (const [key, record] of agents) {
+		if (record.entry.runId === runId && record.scope === scope) {
+			agents.delete(key);
+			registryEntries.delete(key);
+		}
 	}
 }
 

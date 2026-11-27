@@ -1,5 +1,6 @@
 import { parseModelEntry } from "../selector.ts";
 import type { StormConfig, TrialConfig, TrialState } from "../types.ts";
+import { sharedMap } from "./thread-state.ts";
 
 export function trialPhase(
 	trial: TrialConfig,
@@ -48,7 +49,7 @@ export function activeTrialFor(
  * session store. Module-level on purpose: the subagent's own session reports its spend through this same module. The
  * scope keeps two profiles or native sessions from charging one session's trial for another's same-named agent.
  */
-const routedAgents = new Map<string, string>();
+const routedAgents = sharedMap<string, string>("storm.trials.routedAgents");
 
 function routedKey(scope: string, spawnKey: string): string {
 	return `${scope}\u0000${spawnKey}`;
@@ -75,4 +76,9 @@ export function trialCharge(agentId: string, selector: string, config: Pick<Stor
 /** Tests only. */
 export function resetTrialSpawns(): void {
 	routedAgents.clear();
+}
+
+/** A finished run's spawn keys leave the shared routing map: what they described ended with the run's record. */
+export function forgetTrialSpawns(scope: string, spawnKeys: readonly string[]): void {
+	for (const spawnKey of spawnKeys) routedAgents.delete(routedKey(scope, spawnKey));
 }

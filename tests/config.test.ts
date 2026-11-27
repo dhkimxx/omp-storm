@@ -234,6 +234,7 @@ describe("validateConfig", () => {
 		["model whitespace", c => (c.roles.explorer.models = ["a/b", "a/ b"]), "roles.explorer.models[1]:"],
 		["model empty id", c => (c.roles.explorer.models = ["a/"]), "roles.explorer.models[0]:"],
 		["model non-string", c => (c.roles.explorer.models = [1]), "roles.explorer.models[0]:"],
+		["too many models", c => (c.roles.explorer.models = Array.from({ length: 4097 }, (_, index) => `a/m${index}`)), "roles.explorer.models:"],
 		["effort", c => (c.roles.reviewer.effort = "huge"), "roles.reviewer.effort:"],
 		["isolation", c => (c.isolation = "none"), "isolation:"],
 		["runtime", c => (c.runtime = "orca"), "runtime:"],
