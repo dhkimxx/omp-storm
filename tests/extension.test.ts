@@ -2456,7 +2456,10 @@ describe("automatic delegation", () => {
 		expect(reply.text).toContain("자동 위임 실행");
 		const runId = activeLedgerRun(project.sessionDir)?.runId;
 		expect(runId).toBeDefined();
-		expect(await readRun(project.sessionDir, runId as string)).toMatchObject({
+		// The live record is rewritten atomically on a timer; a read that crosses a rewrite sees no file, so wait for the state.
+		let opened: RunRecord | undefined;
+		await until(async () => (opened = await readRun(project.sessionDir, runId as string))?.request === "fix the login bug");
+		expect(opened).toMatchObject({
 			status: "running",
 			request: "fix the login bug",
 			plan: { lanes: [{ name: "fix", kind: "code", role: "implementer", results: changeFor("fix-change") }] },
@@ -2718,7 +2721,9 @@ describe("automatic delegation", () => {
 		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
 		expect(reply.outcome).toBe("ok");
 		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
-		expect(await readRun(project.sessionDir, runId as string)).toMatchObject({ request: "new request" });
+		let record: RunRecord | undefined;
+		await until(async () => (record = await readRun(project.sessionDir, runId as string))?.request === "new request");
+		expect(record).toMatchObject({ request: "new request" });
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -2755,7 +2760,9 @@ describe("automatic delegation", () => {
 		expect((await lastRun(project.sessionDir))?.request).toBe("old request");
 		expect((await omp.toolReply(plan, main)).text).toContain("자동 위임 실행");
 		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
-		expect(await readRun(project.sessionDir, runId)).toMatchObject({ request: "new request" });
+		let reopened: RunRecord | undefined;
+		await until(async () => (reopened = await readRun(project.sessionDir, runId))?.request === "new request");
+		expect(reopened).toMatchObject({ request: "new request" });
 		expect(omp.sent).toEqual([]);
 		await omp.emit("session_shutdown", {}, main);
 	});
