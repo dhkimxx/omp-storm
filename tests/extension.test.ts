@@ -51,6 +51,7 @@ import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions, wo
 import type { CloseoutAction, RunPlan, RunRecord, RunSpec, StormConfig, TrialConfig } from "../src/types.ts";
 import { refusedCodeOf } from "../src/runtime/task-refusal.ts";
 import { until } from "./fake-session.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
 import { git, gitRepo, makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
 import { extensionTheme } from "./tui-host.ts";
@@ -177,7 +178,7 @@ function fakeOmp(project: TestProject) {
 		},
 		registerMessageRenderer: () => undefined,
 	};
-	storm(pi as unknown as ExtensionAPI);
+	storm(pi as unknown as ExtensionAPI, { timings: TEST_TIMINGS });
 	const ctx = (agent: Agent): ExtensionContext =>
 		({
 			cwd: project.root,
@@ -669,7 +670,9 @@ describe("a run through the hooks", () => {
 		expect(verdict(await call("w", "W0"))).toBe("pass");
 		// X0 waits for the writer; the writer's call fails and the conversation changes while it waits, after X0 was placed.
 		const waiting = call("x", "X0");
-		await new Promise(resolve => setTimeout(resolve, 200));
+		const started = Promise.withResolvers<void>();
+		setTimeout(started.resolve, 40);
+		await started.promise;
 		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "w", isError: true }, main);
 		omp.setSessionId("session-switched");
 		expect(verdict(await waiting)).toBe("session");
@@ -6401,7 +6404,8 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 		test("a switch keeps the hold of a call that started and has no result: the run cannot finish, and the next completed message ends the wait", async () => {
 			const { omp, main, finalized } = await switched({ started: true, resulted: false });
 			// Fail closed: the host may still be committing what that call writes, and nothing else tells that it is not.
-			await Bun.sleep(1_300);
+			// Twenty of the test host's drain looks pass while the hold stands; only the real clock can show it stayed.
+			await Bun.sleep(100);
 			expect(await finalized()).toBe(false);
 			expect(activeLedgerRun(project.sessionDir)).toBeDefined();
 			// The director's next completed answer (the loop made another request) ends the wait, and the run finishes at its next look.
@@ -6586,7 +6590,7 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 		};
 
 		test("an edit during a job is refused naming the job, and passes once the job ends", async () => {
-			await approve({ ...TEAM, jobs: [slowJob(1_200)] });
+			await approve({ ...TEAM, jobs: [slowJob(500)] });
 			const omp = fakeOmp(project);
 			const main = omp.ctx(MAIN);
 			await openRun(omp, main, jobPlan);
@@ -6644,7 +6648,7 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 		const check = (ms: number) => ({ name: "unit", argv: [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker("check-started"))}, "1"); setTimeout(() => {}, ${ms})`] });
 
 		test("an edit while the required check runs is refused naming the check, and passes once it has ended", async () => {
-			const { omp, main, runId } = await dueCheck(check(1_000));
+			const { omp, main, runId } = await dueCheck(check(400));
 			await omp.emit("agent_start", {}, main);
 			const look = omp.emit("agent_end", {}, main);
 			await eventually(() => started("check-started"));
@@ -6663,7 +6667,8 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			expect(verdict(await omp.emit("tool_call", edit("e-1", "notes.txt"), main))).toBe("pass");
 			await omp.emit("agent_start", {}, main);
 			await omp.emit("agent_end", { willContinue: false }, main);
-			await Bun.sleep(300);
+			// Several round looks (the test host's 10 ms delay) pass with the edit held; none may start the check.
+			await Bun.sleep(100);
 			expect(await started("check-started")).toBe(false);
 			// The turn that made the edit ended: the next look asks again, and nothing was remembered as already looked at.
 			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
@@ -6680,7 +6685,8 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
 			await omp.emit("agent_start", {}, main);
 			await omp.emit("agent_end", { willContinue: false }, main);
-			await Bun.sleep(300);
+			// Several round looks (the test host's 10 ms delay) pass with the edit held; none may start the check.
+			await Bun.sleep(100);
 			expect(await started("check-started")).toBe(false);
 			// The last event of the idle run is the release: no `agent_start` or `agent_end` follows it.
 			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);

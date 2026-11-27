@@ -12,11 +12,12 @@
   "omp": { "extensions": ["./src/entry.ts"] },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "bun test tests",
+    "test": "bun test tests --parallel",
     "verify": "npm run check && npm test",
     "e2e": "bun scripts/e2e/run.ts",
     "e2e:auto": "bun scripts/e2e/auto.ts",
-    "e2e:tui": "bun scripts/e2e/tui.ts"
+    "e2e:tui": "bun scripts/e2e/tui.ts",
+    "e2e:all": "bun scripts/e2e/all.ts"
   },
   "devDependencies": {
     "@oh-my-pi/pi-ai": "19.2.1",

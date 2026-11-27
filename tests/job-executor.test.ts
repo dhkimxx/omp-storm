@@ -15,6 +15,8 @@ import {
 } from "../src/runtime/job-executor.ts";
 import type { ConfiguredJob } from "../src/types.ts";
 import { acquireTargetMarker, releaseTargetMarker } from "../src/runtime/job-fence.ts";
+import type { StormTimings } from "../src/runtime/timings.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { TEAM } from "./support.ts";
 
 const dirs: string[] = [];
@@ -54,6 +56,7 @@ function runJob(
 		signal?: AbortSignal;
 		canStart?: () => boolean | Promise<boolean>;
 		targetFence?: true;
+		timings?: StormTimings;
 	} = {},
 ): Promise<JobExecutionReceipt> {
 	return runConfiguredJob({
@@ -63,6 +66,7 @@ function runJob(
 		...(options.signal === undefined ? {} : { signal: options.signal }),
 		...(options.canStart === undefined ? {} : { canStart: options.canStart }),
 		...(options.targetFence === undefined ? {} : { targetFence: options.targetFence }),
+		...(options.timings === undefined ? {} : { timings: options.timings }),
 	});
 }
 
@@ -451,7 +455,7 @@ setTimeout(() => { writeFileSync("holder.done", "yes"); process.exit(0); }, 200)
 			"tree.mjs",
 			`import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
-const child = spawn(process.execPath, ["-e", "setTimeout(() => require('node:fs').writeFileSync('grandchild.ran','x'), 400)"], { stdio: "ignore" });
+const child = spawn(process.execPath, ["-e", "setTimeout(() => require('node:fs').writeFileSync('grandchild.ran','x'), 250)"], { stdio: "ignore" });
 writeFileSync("parent.started", String(child.pid));
 setTimeout(() => {}, 10000);
 `,
@@ -461,11 +465,13 @@ setTimeout(() => {}, 10000);
 			{ name: "tree", argv: [process.execPath, "tree.mjs"], timeoutMs: 100 },
 			root,
 			[key],
+			{ timings: TEST_TIMINGS },
 		);
 		expect(receipt.status).toBe("timed-out");
 		expect(receipt.fence).toBeUndefined();
 		expect(receipt.detail).toContain("시간 한도");
-		await Bun.sleep(700);
+		// The grandchild would have written grandchild.ran by now had the group teardown missed it; only the real clock proves it did not.
+		await Bun.sleep(400);
 		expect(await Bun.file(path.join(root, "grandchild.ran")).exists()).toBe(false);
 		const after = await runJob(
 			{ name: "after-timeout", argv: [process.execPath, "-e", "process.exit(0)"], timeoutMs: 5_000 },
@@ -716,7 +722,7 @@ process.exit(0);
 				{ name: "late", argv: [process.execPath, "late.mjs"], timeoutMs: 100 },
 				root,
 				[],
-				{ targetFence: true },
+				{ targetFence: true, timings: TEST_TIMINGS },
 			);
 			await waitForFile(path.join(root, "grandchild.started"), 5_000);
 			grandchild = Number(await fs.readFile(path.join(root, "grandchild.started"), "utf8"));

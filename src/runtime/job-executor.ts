@@ -55,6 +55,7 @@ import {
 	type FenceOwner,
 	type TargetMarker,
 } from "./job-fence.ts";
+import type { StormTimings } from "./timings.ts";
 
 /** Per-job wall clock when the approved config sets none. */
 export const DEFAULT_JOB_TIMEOUT_MS = 10 * 60_000;
@@ -147,6 +148,8 @@ export interface RunConfiguredJobInput {
 	 * plan or tree changed while this attempt waited; the job is then `unrun` and every lock is released.
 	 */
 	canStart?: () => boolean | Promise<boolean>;
+	/** Teardown and group-probe waits of the child; the product's when absent (see `timings.ts`). */
+	timings?: StormTimings;
 }
 
 interface ResourceLockRecord {
@@ -587,6 +590,7 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 			timeoutMs,
 			outputLimitBytes: MAX_CHECK_OUTPUT_BYTES,
 			...(input.signal === undefined ? {} : { signal: input.signal }),
+			...(input.timings === undefined ? {} : { timings: input.timings }),
 		});
 	} catch (error) {
 		// The shared runner settles instead of throwing; if that ever changes, the child's end is unproven.

@@ -23,6 +23,7 @@ import { NO_END_REASON, stopWords } from "../src/runtime/rounds.ts";
 import { readRun, writeRun } from "../src/runtime/run.ts";
 import type { PlanLane, RunPlan, RunSpec } from "../src/types.ts";
 import { type FakeSession, fakeSession } from "./fake-session.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
 const T0 = Date.parse("2026-11-26T05:20:00Z");
@@ -87,7 +88,7 @@ interface Rig {
 /** A run with the explorer lane admitted and its first dispatch prepared at `T0 + 1000`. */
 async function rig(task?: string): Promise<Rig> {
 	const agents: ReturnType<typeof agentEntry>[] = [];
-	const h = fakeSession({ root, agents });
+	const h = fakeSession({ root, agents, timings: TEST_TIMINGS });
 	const runId = await h.start(task === undefined ? undefined : { task });
 	expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
 	const bound = h.controller.runLanes()!.assign({ name: pinLane.name, agent: "storm-explorer" }, plan, h.config, {});
@@ -628,7 +629,7 @@ describe("no dispatch stays open once the worker has delivered", () => {
 
 	test("a settled newest dispatch closes the lane's older open ones, so the end of the run cannot rewrite its judged rows", async () => {
 		const agents: ReturnType<typeof agentEntry>[] = [];
-		const h = fakeSession({ root, agents });
+		const h = fakeSession({ root, agents, timings: TEST_TIMINGS });
 		const runId = await h.start();
 		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
 		const input = (dispatch: string, startedAt: number) => ({ runId, lane: "Pin", spawnKey: "agent-a", parentId: "main", dispatch, followUp: false, artifactMode: "shared" as const, startedAt });
@@ -800,7 +801,7 @@ describe("a follow-up that never reached the worker is not left open", () => {
 
 	test("the controller drops one prepared dispatch and keeps the lane's earlier open one live", async () => {
 		const agents: ReturnType<typeof agentEntry>[] = [];
-		const h = fakeSession({ root, agents });
+		const h = fakeSession({ root, agents, timings: TEST_TIMINGS });
 		const runId = await h.start();
 		expect(await h.controller.setPlan(h.ctx, plan)).toEqual({ ok: true });
 		const input = (dispatch: string, startedAt: number) => ({ runId, lane: "Pin", spawnKey: "agent-a", parentId: "main", dispatch, followUp: false, artifactMode: "shared" as const, startedAt });
@@ -1025,7 +1026,7 @@ describe("the notice a delivery leaves for the director", () => {
 	test("an accepted delivery with nothing waiting on it says nothing", async () => {
 		const solo: RunPlan = { ...plan, lanes: [plan.lanes[0] as PlanLane] };
 		const agents: ReturnType<typeof agentEntry>[] = [];
-		const h = fakeSession({ root, agents });
+		const h = fakeSession({ root, agents, timings: TEST_TIMINGS });
 		const runId = await h.start();
 		expect(await h.controller.setPlan(h.ctx, solo)).toEqual({ ok: true });
 		const bound = h.controller.runLanes()!.assign({ name: pinLane.name, agent: "storm-explorer" }, solo, h.config, {});
@@ -1121,6 +1122,7 @@ describe("the director continues the interrupted run", () => {
 			root: over.root ?? root,
 			sessionId: over.sessionId ?? r.h.sessionId,
 			agentDir: r.h.agentDir,
+			timings: TEST_TIMINGS,
 			...(over.config === undefined ? {} : { config: over.config }),
 		});
 
@@ -1236,7 +1238,7 @@ describe("the director continues the interrupted run", () => {
 	});
 
 	test("no interrupted run: nothing starts", async () => {
-		const fresh = fakeSession({ root });
+		const fresh = fakeSession({ root, timings: TEST_TIMINGS });
 		const result = await fresh.controller.continueInTurn(fresh.ctx, "이어서 해줘", Date.now());
 		expect(result.ok).toBe(false);
 		expect(fresh.controller.active()).toBeUndefined();

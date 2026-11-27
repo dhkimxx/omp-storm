@@ -16,6 +16,7 @@ import type {
 	WriteScope,
 } from "../src/runtime/lease.ts";
 import type { TreeReading } from "../src/runtime/tree.ts";
+import type { StormTimings } from "../src/runtime/timings.ts";
 import type { ProjectState } from "../src/state.ts";
 import type { AgentEntry, RunRecord, RunSpec, StormConfig } from "../src/types.ts";
 import { approvedState, fixtureSession, teamOf } from "./fixtures.ts";
@@ -376,6 +377,8 @@ export interface SessionOptions {
 	/** What the fake main session reports as its running and recent async jobs (default: omp's snapshot with no jobs, as on the pinned host; `null` models a host that cannot show them). */
 	asyncJobs?: () => AsyncJobSnapshot | null;
 	now?: () => number;
+	/** The runtime's waits when this host is a test host that should not sit on the product's clock; product defaults when absent. */
+	timings?: StormTimings;
 }
 
 /** A run controller over a fake main session. */
@@ -472,6 +475,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		agents: () => (typeof opts.agents === "function" ? opts.agents() : (opts.agents ?? [])),
 		...(opts.tree ? { tree: async (root: string, base?: string) => opts.tree!(root, base) } : {}),
 		timers: timers.api,
+		...(opts.timings === undefined ? {} : { timings: opts.timings }),
 		lease,
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
 		agentDir: profile.agentDir,

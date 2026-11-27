@@ -33,6 +33,7 @@ import { treeFingerprint } from "../src/runtime/rounds.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { AgentEntry, LiveCheck, RunPlan, StormConfig } from "../src/types.ts";
 import { fakeSession, SESSION_TEAM, type SessionOptions, until } from "./fake-session.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { agentEntry, teamOf, treeOf } from "./fixtures.ts";
 
 let root: string;
@@ -45,7 +46,7 @@ afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
 });
 
-const session = (opts: Omit<SessionOptions, "root"> = {}) => fakeSession({ root, ...opts });
+const session = (opts: Omit<SessionOptions, "root"> = {}) => fakeSession({ root, timings: TEST_TIMINGS, ...opts });
 const T0 = Date.parse("2026-11-20T09:00:00Z");
 const treeAt = (state: TreeState): TreeReading => ({ base: "base-0", state });
 const writer = (over: Partial<AgentEntry> = {}): AgentEntry => agentEntry({ changes: 1, lastChangeAt: T0, ...over });
@@ -340,8 +341,8 @@ describe("through the run controller", () => {
 		await h.turn();
 		agents.push({ ...agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at: T0 + 1, correct: true, tree: treeFingerprint(tree) } }), reviewLog: [{ at: T0 + 1, correct: true, findings: [], tree: treeFingerprint(tree) }] } as AgentEntry);
 		h.timers.fire();
-		// The look ran no check while the command held the tree.
-		await Bun.sleep(300);
+		// The look ran no check while the command held the tree: several 10 ms round looks pass here.
+		await Bun.sleep(100);
 		expect(await Bun.file(path.join(root, "check-count")).exists()).toBe(false);
 		lanes.callEnded("c1");
 		await h.controller.finish("no-changes");

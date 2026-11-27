@@ -62,6 +62,7 @@ import type { AgentEntry, PlanLane, RunPlan, RunResult } from "../src/types.ts";
 import { resultProgress } from "../src/view/results.ts";
 import { fakeHost } from "./fake-host.ts";
 import { type FakeSession, fakeSession } from "./fake-session.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
 /** Wall clock of the real run (Korean time), as milliseconds. */
@@ -404,7 +405,7 @@ async function freshSession(at: string): Promise<void> {
 	jobStart.clear();
 	resetLedger();
 	resetAgents();
-	h = fakeSession({ root, config: team, agents, now: () => clock.t });
+	h = fakeSession({ root, config: team, agents, now: () => clock.t, timings: TEST_TIMINGS });
 	clock.t = KST(at);
 	runId = await h.start();
 	collector = new AttemptCollector({

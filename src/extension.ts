@@ -124,6 +124,7 @@ import { planlessOpen } from "./runtime/planless.ts";
 import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
 import { isRunId, readRun } from "./runtime/run.ts";
 import { TREE_READ_TIMEOUT_MS, treeAgainst, type TreeReading } from "./runtime/tree.ts";
+import { timingsOf, type TimingOverrides } from "./runtime/timings.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
@@ -189,16 +190,8 @@ const SHORTCUTS = [
 	{ value: "reset", label: "reset", description: "Storm 설정과 기록 초기화" },
 ] as const;
 const SHORTCUT_NAMES: readonly string[] = SHORTCUTS.map(shortcut => shortcut.value);
-/**
- * How long a single fresh task/follow-up may wait for a conflicting shared writer to settle before the admission is
- * refused. It is a wait, not a queue: a long-running writer still leaves the call blocked, and no reservation leaks.
- */
 /** Said when omp ran a `task` call that Storm had refused; the refusal did not hold. */
 const REFUSAL_NOT_HELD = "Storm이 거절한 task 호출을 OMP가 실행했습니다. Storm은 그 호출이 끝나기 전까지 워커 스폰을 막았으므로 새 워커는 쓰기 권한을 받지 못했어야 하지만, 결과가 오류가 아니니 레인과 워커 상태를 /storm status로 확인하세요.";
-const WRITE_WAIT_MS = 1_500;
-/** Most the director's next request waits for the evaluation of a delivery that just arrived, before it carries the notice. */
-const NOTICE_WAIT_MS = 1_500;
-const WRITE_WAIT_STEP_MS = 50;
 
 /** A bounded local pause; no host channel is polled. */
 async function pause(ms: number): Promise<void> {
@@ -747,7 +740,17 @@ function idleStatusText(
 	return parts.join(" · ");
 }
 
-export default function storm(pi: ExtensionAPI): void {
+/** What a host may supply when it creates the extension; production passes nothing, so every product default applies. */
+export interface StormOptions {
+	/**
+	 * The fixed waits of this session. Only tests supply them (they are not a user setting): a check that does not test
+	 * a wait passes a short one and leaves the ones that matter alone. See `src/runtime/timings.ts`.
+	 */
+	timings?: TimingOverrides;
+}
+
+export default function storm(pi: ExtensionAPI, options: StormOptions = {}): void {
+	const timings = timingsOf(options.timings);
 	const exec = execPort(pi);
 	/**
 	 * The native sessions whose lane view the user turned off with `/storm view`. The view is on by default; like the
@@ -1195,6 +1198,7 @@ export default function storm(pi: ExtensionAPI): void {
 		// Cleanup inventory only: the janitor passes the session it is sweeping, never a process-wide view.
 		ledger: sessionDir => listAgents({ scope: sessionDir }),
 		agentDir: pi.pi.getAgentDir(),
+		timings,
 		// The approved write authority of each lane, for the line that says which writing lanes the write order now lets start.
 		lanePolicies: async (runId, plan) => {
 			const ledger = getLedgerRun(runId);
@@ -2954,13 +2958,13 @@ export default function storm(pi: ExtensionAPI): void {
 				return lanes.place(event.input, plan, config, now);
 			};
 			let placed = placeOnce();
-			const waitUntil = Date.now() + WRITE_WAIT_MS;
+			const waitUntil = Date.now() + timings.writeWaitMs;
 			// A single fresh item waits briefly for a writer that is settling (a native task often returns before its
 			// worker starts). A batch never waits: a conflicting batch refuses before any item is reserved or started.
 			// A batch-internal overlap never waits because no host event can clear it.
 			const oneItem = !Array.isArray(event.input.tasks) || event.input.tasks.length === 1;
 			while (oneItem && !placed.ok && placed.retry === true && Date.now() < waitUntil) {
-				await pause(WRITE_WAIT_STEP_MS);
+				await pause(timings.writeWaitStepMs);
 				placed = placeOnce();
 			}
 			if (!placed.ok) {
@@ -3511,7 +3515,7 @@ export default function storm(pi: ExtensionAPI): void {
 		if (arrived.length > 0) {
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const limit = new Promise<void>(resolve => {
-				timer = setTimeout(resolve, NOTICE_WAIT_MS);
+				timer = setTimeout(resolve, timings.noticeWaitMs);
 				timer.unref?.();
 			});
 			await Promise.race([Promise.allSettled(arrived), limit]);

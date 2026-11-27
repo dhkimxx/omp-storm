@@ -16,8 +16,10 @@ import {
 } from "../src/runtime/checks.ts";
 import { configHash } from "../src/config/canonical.ts";
 import { runConfiguredJob, targetJobBlock } from "../src/runtime/job-executor.ts";
+import { DEFAULT_TIMINGS, type StormTimings } from "../src/runtime/timings.ts";
 import type { ApprovalRecord, ConfigLoad, StormConfig } from "../src/types.ts";
 import { approvalRecord } from "./fixtures.ts";
+import { TEST_TIMINGS } from "./timings.ts";
 import { TEAM } from "./support.ts";
 
 const dirs: string[] = [];
@@ -86,25 +88,27 @@ function leader(child: string, opts: { exitCode?: number; detached?: boolean; st
 	);
 }
 
-const run = (cwd: string, source: string, timeoutMs = 10_000, signal?: AbortSignal) =>
+const run = (cwd: string, source: string, timeoutMs = 10_000, signal?: AbortSignal, timings: StormTimings = TEST_TIMINGS) =>
 	runBoundedProcess({
 		argv: [process.execPath, "-e", source],
 		cwd,
 		timeoutMs,
 		outputLimitBytes: 4_096,
+		timings,
 		...(signal === undefined ? {} : { signal }),
 	});
 
 describe("the end of a command is an empty process group", () => {
 	test("a member left behind by a clean exit is stopped before the end is reported, and the run does not count as passed", async () => {
 		const cwd = await tempRoot();
-		const result = await run(cwd, leader(descendant({ lateMs: 700 })));
+		const result = await run(cwd, leader(descendant({ lateMs: 300 })));
 		const pid = await pidIn(cwd);
 		strays.push(pid);
 		expect(result.processEnded).toBe(true);
 		// Nothing of the command is left, so nothing can write after the end was reported.
 		expect(alive(pid)).toBe(false);
-		await Bun.sleep(900);
+		// The descendant writes late.txt only if it outlived the stop; the real clock is the proof that it did not.
+		await Bun.sleep(450);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 		// The leader's own code is kept as observed, but a command cut off mid-work did not pass.
 		expect(result.exitCode).toBe(0);
@@ -115,45 +119,48 @@ describe("the end of a command is an empty process group", () => {
 
 	test("a non-zero exit with a member left behind is stopped too", async () => {
 		const cwd = await tempRoot();
-		const result = await run(cwd, leader(descendant({ lateMs: 700 }), { exitCode: 3 }));
+		const result = await run(cwd, leader(descendant({ lateMs: 300 }), { exitCode: 3 }));
 		const pid = await pidIn(cwd);
 		strays.push(pid);
 		expect(result.processEnded).toBe(true);
 		expect(result.status).toBe("failed");
 		expect(result.exitCode).toBe(3);
 		expect(alive(pid)).toBe(false);
-		await Bun.sleep(900);
+		// The descendant writes late.txt only if it outlived the stop; the real clock is the proof that it did not.
+		await Bun.sleep(450);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	});
 
 	test("a member that ignores SIGTERM is killed after the grace, still before the end is reported", async () => {
 		const cwd = await tempRoot();
-		const result = await run(cwd, leader(descendant({ lateMs: 2_600, ignoreTerm: true })));
+		const result = await run(cwd, leader(descendant({ lateMs: 1_500, ignoreTerm: true })), 10_000, undefined, DEFAULT_TIMINGS);
 		const pid = await pidIn(cwd);
 		strays.push(pid);
 		expect(result.processEnded).toBe(true);
 		expect(result.durationMs).toBeGreaterThanOrEqual(900);
 		expect(alive(pid)).toBe(false);
-		await Bun.sleep(2_000);
+		// The SIGKILLed member would have written late.txt by now had the grace let it live; only the real clock proves it did not.
+		await Bun.sleep(700);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	}, 15_000);
 
 	test("a timeout whose leader dies on SIGTERM still kills a member that ignores it", async () => {
 		const cwd = await tempRoot();
-		const result = await run(cwd, leader(descendant({ lateMs: 2_600, ignoreTerm: true }), { stay: true }), 300);
+		const result = await run(cwd, leader(descendant({ lateMs: 1_500, ignoreTerm: true }), { stay: true }), 300, undefined, DEFAULT_TIMINGS);
 		const pid = await pidIn(cwd);
 		strays.push(pid);
 		expect(result.status).toBe("timed-out");
 		expect(result.processEnded).toBe(true);
 		expect(alive(pid)).toBe(false);
-		await Bun.sleep(2_000);
+		// The SIGKILLed member would have written late.txt by now had the grace let it live; only the real clock proves it did not.
+		await Bun.sleep(700);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	}, 15_000);
 
 	test("an abort whose leader dies on SIGTERM still kills a member that ignores it", async () => {
 		const cwd = await tempRoot();
 		const abort = new AbortController();
-		const running = run(cwd, leader(descendant({ lateMs: 2_600, ignoreTerm: true }), { stay: true }), 30_000, abort.signal);
+		const running = run(cwd, leader(descendant({ lateMs: 1_500, ignoreTerm: true }), { stay: true }), 30_000, abort.signal, DEFAULT_TIMINGS);
 		await waitFor(path.join(cwd, "child.pid"));
 		abort.abort();
 		const result = await running;
@@ -162,13 +169,14 @@ describe("the end of a command is an empty process group", () => {
 		expect(result.status).toBe("cancelled");
 		expect(result.processEnded).toBe(true);
 		expect(alive(pid)).toBe(false);
-		await Bun.sleep(2_000);
+		// The member would have written late.txt by now had SIGKILL not landed; only the real clock can prove it did not.
+		await Bun.sleep(700);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	}, 15_000);
 
 	test("a member that holds the output pipe is still waited for and is not a leftover", async () => {
 		const cwd = await tempRoot();
-		const child = `require('node:fs').writeFileSync('child.pid',String(process.pid));setTimeout(()=>require('node:fs').writeFileSync('late.txt','x'),500);`;
+		const child = `require('node:fs').writeFileSync('child.pid',String(process.pid));setTimeout(()=>require('node:fs').writeFileSync('late.txt','x'),200);`;
 		const source =
 			`const c=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(child)}],{stdio:'inherit'});c.unref();` +
 			`const fs=require('node:fs');while(!fs.existsSync('child.pid')){}process.exit(0);`;
@@ -195,7 +203,7 @@ describe("the end of a command is an empty process group", () => {
 describe("a configured job keeps its fence until the group is empty", () => {
 	test("the next job for the same key and target starts only after the first job's members are gone", async () => {
 		const cwd = await tempRoot();
-		await fs.writeFile(path.join(cwd, "lead.mjs"), leader(descendant({ lateMs: 1_200 })));
+		await fs.writeFile(path.join(cwd, "lead.mjs"), leader(descendant({ lateMs: 400 })));
 		await fs.writeFile(
 			path.join(cwd, "next.mjs"),
 			`import {existsSync,writeFileSync} from 'node:fs'; writeFileSync('next-started.txt', existsSync('child.pid')?'seen':'none');`,
@@ -206,6 +214,7 @@ describe("a configured job keeps its fence until the group is empty", () => {
 			cwd,
 			resourceKeys: [key],
 			targetFence: true,
+			timings: TEST_TIMINGS,
 		});
 		const pid = await pidIn(cwd);
 		strays.push(pid);
@@ -221,9 +230,11 @@ describe("a configured job keeps its fence until the group is empty", () => {
 			cwd,
 			resourceKeys: [key],
 			targetFence: true,
+			timings: TEST_TIMINGS,
 		});
 		expect(second.status).toBe("passed");
-		await Bun.sleep(1_500);
+		// The first job's member would have written late.txt by now had the fence released before its group emptied.
+		await Bun.sleep(600);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	}, 15_000);
 });
@@ -261,6 +272,7 @@ describe("an end that cannot be proven keeps the fence", () => {
 					cwd,
 					resourceKeys: [key],
 					targetFence: true,
+					timings: TEST_TIMINGS,
 				});
 				strays.push(await pidIn(cwd));
 				expect(first.fence?.cause).toBe("process-unproven");
@@ -272,6 +284,7 @@ describe("an end that cannot be proven keeps the fence", () => {
 					cwd,
 					resourceKeys: [key],
 					targetFence: true,
+					timings: TEST_TIMINGS,
 				});
 				expect(blocked.status).toBe("unrun");
 				expect(blocked.unrunCause).toBe("queue-timeout");
@@ -294,6 +307,7 @@ describe("an end that cannot be proven keeps the fence", () => {
 					cwd,
 					resourceKeys: [key],
 					targetFence: true,
+					timings: TEST_TIMINGS,
 				});
 				expect(free.status).toBe("passed");
 			} finally {
@@ -320,6 +334,7 @@ describe("an end that cannot be proven keeps the fence", () => {
 				approval: approved(config.hash),
 				cwd,
 				fingerprint: "tree-1",
+				timings: TEST_TIMINGS,
 				onEndUnproven: (info) => seen.push(info.check),
 			});
 			if (result.status === "skipped") throw new Error("checks skipped");
@@ -342,11 +357,11 @@ describe("an end that cannot be proven keeps the fence", () => {
 		const config = loaded({
 			...TEAM,
 			requiredChecks: [
-				{ name: "first", argv: [process.execPath, "-e", leader(descendant({ lateMs: 900 }))] },
+				{ name: "first", argv: [process.execPath, "-e", leader(descendant({ lateMs: 300 }))] },
 				{ name: "second", argv: [process.execPath, "-e", `require('node:fs').writeFileSync('second.ran',require('node:fs').existsSync('late.txt')?'late':'quiet')`] },
 			],
 		});
-		const result = await runRequiredChecks({ config, approval: approved(config.hash), cwd, fingerprint: "tree-1" });
+		const result = await runRequiredChecks({ config, approval: approved(config.hash), cwd, fingerprint: "tree-1", timings: TEST_TIMINGS });
 		if (result.status === "skipped") throw new Error("checks skipped");
 		strays.push(await pidIn(cwd));
 		expect(result.endUnproven).toBeUndefined();
@@ -354,7 +369,8 @@ describe("an end that cannot be proven keeps the fence", () => {
 		expect(result.checks[0]!.exitCode).toBe(0);
 		expect(result.checks[0]!.note).toBeDefined();
 		expect(result.status).toBe("failed");
-		await Bun.sleep(1_100);
+		// The member would have written late.txt by now had it outlived the stop before the next check started.
+		await Bun.sleep(500);
 		expect(await exists(path.join(cwd, "late.txt"))).toBe(false);
 	}, 15_000);
 });

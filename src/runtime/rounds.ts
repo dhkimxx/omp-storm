@@ -7,12 +7,13 @@ import type { AgentEntry, RunEndReason, RunStatus, StormConfig } from "../types.
 import { ATTEMPT_REF } from "./attempt-report.ts";
 import { reviewEvidenceOf, type ReviewEvidence } from "./review.ts";
 import type { TreeState } from "./tree.ts";
+import { DEFAULT_TIMINGS } from "./timings.ts";
 
 export const MAX_EXTRA_ROUNDS = 10;
 /** How long Storm waits before looking again while the session is held. */
-export const HOLD_MS = 5_000;
+export const HOLD_MS = DEFAULT_TIMINGS.holdMs;
 /** How long after a round ends Storm looks whether to send the next: the session is still closing the turn before that; omp's own continuations wait as long. */
-export const ROUND_DELAY_MS = 800;
+export const ROUND_DELAY_MS = DEFAULT_TIMINGS.roundDelayMs;
 
 /** Korean labels for the states a run record can be in. */
 export const STATUS_LABEL: Record<RunStatus, string> = {
