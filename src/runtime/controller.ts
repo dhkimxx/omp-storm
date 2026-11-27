@@ -5104,10 +5104,11 @@ export function summarizeRun(run: RunRecord): string {
 			)
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
-	// What a spawn was answered with is not what ran: only a child's own first request says that, and only where one was read.
+	// What a spawn was answered with is not what ran: only a child's own request says that, and only where one was read.
+	// Each `ran` is one attempt's observation, so the line names the attempts rather than current status (RF4-8).
 	const verified = run.spawns.filter(spawn => spawn.ran?.verdict === "verified").length;
 	const mismatched = run.spawns.filter(spawn => spawn.ran?.verdict === "mismatch").length;
-	const ranLine = verified + mismatched === 0 ? "" : ` · 실행 모델 확인 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
+	const ranLine = verified + mismatched === 0 ? "" : ` · 시도별 실행 모델 관측 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
 	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept and
 	// from every uncapped run.

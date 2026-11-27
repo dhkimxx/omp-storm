@@ -2807,12 +2807,12 @@ describe("run summary", () => {
 	test("a routed spawn is told as an answer given, and what ran is stated only where a child's own request was read", () => {
 		const unread = summarizeRun({ ...base, spawns: [spawn] }).split("\n")[1] ?? "";
 		expect(unread).toContain("승인 모델로 배정");
-		expect(unread).not.toContain("실행 모델 확인");
+		expect(unread).not.toContain("시도별 실행 모델 관측");
 		const read = summarizeRun({
 			...base,
 			spawns: [spawn, { ...spawn, spawnKey: "B", ran: { model: "a/i", verdict: "verified" } }, { ...spawn, spawnKey: "C", ran: { model: "x/y", verdict: "mismatch" } }],
 		}).split("\n")[1] ?? "";
-		expect(read).toContain("실행 모델 확인 1, 승인 밖 1(멈춤)");
+		expect(read).toContain("시도별 실행 모델 관측 1, 승인 밖 1(멈춤)");
 	});
 
 	test("stays within five lines when every line is present; the director line carries its numbers", () => {

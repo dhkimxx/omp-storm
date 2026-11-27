@@ -63,10 +63,14 @@ export function validModelSelector(value: unknown): value is string {
 	return typeof value === "string" && MODEL_RE.test(value);
 }
 /**
- * A role's model list is what the user approves; a bound is checked here, at approval, so an approved team never meets a
- * surprise refusal later at spawn. It is far above any real fallback chain and keeps one admission file bounded.
+ * The largest admission record the store writes or reads, in encoded bytes. The user's approval is checked against the
+ * same budget: a role's encoded model snapshot must leave room for the rest of the record, so a team is never approved
+ * into a record the store would refuse. One bound, not a second count of models.
  */
-export const MAX_MODELS_PER_ROLE = 4096;
+export const MAX_ADMISSION_BYTES = 4 * 1024 * 1024;
+/** Room the rest of an admission record (identity, lane policy paths, timestamps) may need inside that budget. */
+const ADMISSION_RECORD_RESERVE = 512 * 1024;
+export const MAX_APPROVED_BYTES = MAX_ADMISSION_BYTES - ADMISSION_RECORD_RESERVE;
 // A portable resource key: ASCII only, no whitespace, no quoting; case-sensitive on purpose.
 const RESOURCE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+=#-]*$/;
 
@@ -387,12 +391,17 @@ export function validateConfig(value: unknown): ConfigValidation {
 			if (!Array.isArray(role.models) || role.models.length === 0) {
 				errors.push(`${path}.models: 모델이 하나 이상 있어야 합니다`);
 			} else {
-				if (role.models.length > MAX_MODELS_PER_ROLE) errors.push(`${path}.models: 한 역할의 모델은 ${MAX_MODELS_PER_ROLE}개 이하여야 합니다`);
 				role.models.forEach((m, i) => {
 					if (!validModelSelector(m)) {
 						errors.push(`${path}.models[${i}]: provider/id 형식이 아닙니다`);
 					}
 				});
+				// The bytes that will be stored, including the role's effort on every entry: the record read and write
+				// paths apply the same budget to the same encoding.
+				const encoded = Buffer.byteLength(
+					JSON.stringify(role.models.map(selector => (typeof role.effort === "string" ? { selector, effort: role.effort } : { selector }))),
+				);
+				if (encoded > MAX_APPROVED_BYTES) errors.push(`${path}.models: 승인 기록이 ${MAX_APPROVED_BYTES}바이트를 넘습니다`);
 			}
 			if (role.effort !== undefined && !oneOf(role.effort, EFFORTS)) {
 				errors.push(`${path}.effort: ${EFFORTS.join("|")} 중 하나여야 합니다`);

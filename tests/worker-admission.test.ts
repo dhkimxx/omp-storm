@@ -1,14 +1,17 @@
 /** The persisted parent-to-child admission bridge, exercised without any in-process authority map. */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildId, STORM_BUILD } from "../src/build.ts";
+import { MAX_APPROVED_BYTES } from "../src/config/schema.ts";
+import * as fsutil from "../src/fsutil.ts";
 import { lanePolicy } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import { sharedMap } from "../src/runtime/thread-state.ts";
 import type { PlanLane } from "../src/types.ts";
+import * as admissionModule from "../src/worker-admission.ts";
 import {
 	endWorkerAdmission,
 	persistWorkerAdmission,
@@ -228,10 +231,11 @@ describe("worker admission records", () => {
 		// A claim now exists for this attempt: closing must still find the session that made it.
 		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
 		expect(await resolve()).toMatchObject({ kind: "denied" });
-		// Another session cannot close it, and a stale attempt closes nothing of a newer one.
+		// Another session cannot close it, and a stale attempt closes nothing of a newer one: the write is conditional on
+		// the attempt it was read for, so it reports no change rather than rewriting the newer record.
 		await admit({ lane: "L1" });
 		expect(await resolve()).toMatchObject({ kind: "authorized" });
-		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
+		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(false);
 		expect(await resolve()).toMatchObject({ kind: "authorized" });
 		const fresh = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
 		if (fresh.kind !== "record") throw new Error("no record");
@@ -261,5 +265,86 @@ describe("worker admission records", () => {
 		await writeFile(outside, "outside\n");
 		await symlink(outside, join(project, "allowed.txt"));
 		expect(await resolve()).toMatchObject({ kind: "denied" });
+	});
+
+	test("RF4-1: an aged closed record of a live run is kept until that run closes", async () => {
+		await admit();
+		// Close the record only (the run marker stays open): the run is still live.
+		expect(await revokeWorkerAdmissions(agentDir, { runId, childId })).toBe(1);
+		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
+		const stale = new Date(Date.now() - 25 * 3_600_000);
+		await utimes(file, stale, stale);
+		await admit({ childId: "Other" });
+		const kept = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(kept.kind === "record" && kept.record.revokedAt).toEqual(expect.any(Number));
+		// The same aged record is housekeeping's to remove once the run itself has closed.
+		await revokeWorkerAdmissions(agentDir, { runId });
+		await admit({ childId: "Another" });
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+	});
+
+	test("RF4-2: a stop that read an earlier attempt writes nothing once a newer attempt exists", async () => {
+		const first = await admit();
+		// A separately loaded copy of this build: its memory is not the parent's, only the record is shared.
+		const late = (await import(`../src/worker-admission.ts?late=${randomUUID()}`)) as typeof admissionModule;
+		const real = fsutil.writeJsonAtomic;
+		let interleaved = false;
+		const gate = spyOn(fsutil, "writeJsonAtomic").mockImplementation(async (file, value) => {
+			// The old writer is publishing its stop; open the next attempt after its read, before its write.
+			if (!interleaved && typeof value === "object" && value !== null && "stop" in value) {
+				interleaved = true;
+				await admit();
+			}
+			await real(file, value);
+		});
+		try {
+			expect(await late.recordWorkerStop(agentDir, { key: first.key, runId, childId, attempt: first.record.attempt, reason: "pooled-thread" })).toBe(false);
+		} finally {
+			gate.mockRestore();
+		}
+		const got = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(got.kind === "record" && got.record.attempt).not.toBe(first.record.attempt);
+		expect(got.kind === "record" && got.record.stop).toBeUndefined();
+	});
+
+	test("RF4-3: neither revocation nor a new acknowledgement replaces a record or marker of another build", async () => {
+		await admit();
+		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
+		const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		await writeFile(file, JSON.stringify({ ...raw, build: "another-build" }));
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		const [markerName] = await readdir(runs);
+		const markerFile = join(runs, markerName!);
+		const markerRaw = JSON.parse(await readFile(markerFile, "utf8")) as Record<string, unknown>;
+		await writeFile(markerFile, JSON.stringify({ ...markerRaw, build: "another-build" }));
+		expect(await revokeWorkerAdmissions(agentDir, { runId })).toBe(0);
+		expect((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>).build).toBe("another-build");
+		expect((JSON.parse(await readFile(markerFile, "utf8")) as Record<string, unknown>).build).toBe("another-build");
+		// A new acknowledgement refuses the foreign marker, and then the foreign record.
+		await expect(admit()).rejects.toThrow(/다른 빌드/);
+		await writeFile(markerFile, JSON.stringify(markerRaw));
+		await expect(admit()).rejects.toThrow(/다른 빌드/);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("invalid");
+	});
+
+	test("RF4-9: an approved snapshot the store cannot hold is refused before anything is written", async () => {
+		const wide = Array.from({ length: 4096 }, (_, index) => `a/${"m".repeat(1050)}-${index}`);
+		expect(Buffer.byteLength(JSON.stringify(wide.map(selector => ({ selector, effort: "low" }))))).toBeGreaterThan(MAX_APPROVED_BYTES);
+		await expect(admit({ approved: wide.map(selector => ({ selector, effort: "low" })) })).rejects.toThrow(/바이트/);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+	});
+
+	test("RF4-11: housekeeping removes an aged record of an older schema and leaves a fresh one", async () => {
+		const dir = join(agentDir, "storm", "admissions");
+		await mkdir(dir, { recursive: true });
+		const aged = join(dir, `${"a".repeat(64)}.json`);
+		const fresh = join(dir, `${"b".repeat(64)}.json`);
+		await writeFile(aged, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
+		await writeFile(fresh, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
+		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
+		await utimes(aged, stale, stale);
+		await admit({ childId: "AfterTombstone" });
+		expect(await lstat(aged).catch(() => undefined)).toBeUndefined();
+		expect((await lstat(fresh)).isFile()).toBe(true);
 	});
 });

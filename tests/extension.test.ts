@@ -5591,6 +5591,113 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		await omp.emit("session_shutdown", {}, main);
 	});
 
+	// RF4-1: a worker this run admitted whose record is gone is not admitted again under another model list. The record
+	// of a live run is not pruned, so the only way it goes is that it was lost; the follow-up is refused with that cause.
+	test("RF4-1: a follow-up whose admitted record was lost is refused, and nothing is rebuilt for it", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+		const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+		await child.emit("agent_end", {}, worker);
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "call-look", isError: false }, main);
+		await rm(path.join(project.env.agentDir, "storm", "admissions", `${workerAdmissionKey(project.root, "Main", "look")}.json`));
+		const refused = await omp.emit("tool_call", { toolName: "write", toolCallId: "follow-look", input: { path: "agent://look", content: "read more" } }, main);
+		expect(verdict(refused)).toBe("authority");
+		expect((await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" })).kind).toBe("missing");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	// RF4-1: a worker of an earlier run that this run takes over is a first admission for this run, so it gets the
+	// approval the user's team names now — as a new spawn would — never the run's frozen starting list.
+	test("RF4-1: a takeover of a prior-run worker uses the current approval, not the run-start list", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const firstRun = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+		const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+		await child.emit("agent_end", {}, worker);
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "call-look", isError: false }, main);
+		await omp.emit("session_switch", { reason: "resume" }, main);
+		expect(getLedgerRun(firstRun)).toBeUndefined();
+		const explorer = (models: string[]) => ({ ...TEAM, roles: { ...TEAM.roles, explorer: { ...TEAM.roles.explorer, models } } });
+		await approve(explorer(["a/run-start"]));
+		setSystemTime(new Date(Date.now() + 3_000));
+		const secondRun = await openRun(omp, main, { lanes: [{ name: "New", kind: "explore", role: "explorer", goal: "Read more", results: answerFor("new-answer") }], workers: { explorer: 1 } });
+		await approve(explorer(["a/now-approved"]));
+		setSystemTime(new Date(Date.now() + 3_000));
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "follow-look", input: { path: "agent://look", content: "read more" } }, main))).toBe("pass");
+		const admitted = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+		expect(admitted.kind === "record" && admitted.record.runId).toBe(secondRun);
+		expect(admitted.kind === "record" && admitted.record.approved).toEqual([{ selector: "a/now-approved", effort: "low" }]);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	// RF4-4: the children this run admitted are its own records, not its spawn rows: a worker taken over by a
+	// follow-up has no row, and a stop it records is still the director's to tell.
+	test("RF4-4: a stop on a reused worker admitted by a follow-up is read by the director", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const firstRun = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+		const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+		await child.emit("agent_end", {}, worker);
+		await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "call-look", isError: false }, main);
+		await omp.emit("session_switch", { reason: "resume" }, main);
+		expect(getLedgerRun(firstRun)).toBeUndefined();
+		const secondRun = await openRun(omp, main, { lanes: [{ name: "New", kind: "explore", role: "explorer", goal: "Read more", results: answerFor("new-answer") }], workers: { explorer: 1 } });
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "follow-look", input: { path: "agent://look", content: "read more" } }, main))).toBe("pass");
+		expect(runSpawns(secondRun).some(spawn => spawn.spawnKey === "look")).toBe(false);
+		const admitted = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+		if (admitted.kind !== "record") throw new Error(JSON.stringify(admitted));
+		expect(await admissionModule.recordWorkerStop(project.env.agentDir, { key: admitted.key, runId: secondRun, childId: "look", attempt: admitted.record.attempt, reason: "pooled-thread" })).toBe(true);
+		const told = await omp.emit("context", { messages: [] }, main);
+		expect(JSON.stringify(told ?? "")).toContain(threadPolicy.workerStopNotice("look", "pooled-thread").slice(0, 30));
+		expect(await omp.emit("context", { messages: [] }, main)).toBeUndefined();
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	// RF4-7: the memory of delivered stop sentences belongs to the run that closes. A shutdown of another main session
+	// never forgets it, so the same attempt is not told twice.
+	test("RF4-7: an unrelated session's shutdown does not repeat a delivered stop sentence", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), main))).toMatch(/^route:/);
+		const admitted = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: "look" });
+		if (admitted.kind !== "record") throw new Error(JSON.stringify(admitted));
+		expect(await admissionModule.recordWorkerStop(project.env.agentDir, { key: admitted.key, runId, childId: "look", attempt: admitted.record.attempt, reason: "pooled-thread" })).toBe(true);
+		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).toContain(threadPolicy.workerStopNotice("storm-explorer", "pooled-thread").slice(0, 30));
+		expect(await omp.emit("context", { messages: [] }, main)).toBeUndefined();
+		const unrelated = fakeOmp(project);
+		await unrelated.emit("session_shutdown", {}, unrelated.ctx({ ...MAIN, id: `unrelated-${randomUUID()}` }));
+		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).not.toContain(threadPolicy.workerStopNotice("storm-explorer", "pooled-thread").slice(0, 30));
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	// RF4-10: a conversation switch keeps worker rows so a later run can follow a worker up; the session's real shutdown
+	// clears every row of the closing session store, including rows of a run that already finished.
+	test("RF4-10: a finished run's worker rows leave at the real shutdown, with no run active", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+		const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+		await child.emit("agent_end", {}, worker);
+		await child.emit("session_shutdown", {}, worker);
+		await omp.emit("session_switch", { reason: "resume" }, main);
+		expect(getLedgerRun(runId)).toBeUndefined();
+		const hasRow = () => listAgents({ scope: project.sessionDir, runId }).some(agent => agent.id === "look");
+		expect(hasRow()).toBe(true);
+		await omp.emit("session_shutdown", {}, main);
+		expect(hasRow()).toBe(false);
+	});
+
 
 	test("RF3-7: a finished run's live-lanes key and agent rows leave the shared state", async () => {
 		await approve(TEAM);
@@ -6431,7 +6538,7 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			await omp.emit("session_shutdown", {}, main);
 		});
 
-		test("RF3-4: a 257-id recovered message keeps its first hold's seen association; the next completed answer releases it", async () => {
+		test("RF4-5: a 257-id message too wide to remember leaves its hold unseen; only a clean turn end naming it releases it", async () => {
 			await approve(TEAM);
 			const omp = fakeOmp(project);
 			const main = omp.ctx(MAIN);
@@ -6443,9 +6550,31 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			await omp.emit("tool_result", { ...edit(ids[0]!), isError: true, content: [] }, main);
 			await omp.emit("turn_end", turnEndOf([{ id: ids[0]!, error: true }]), main);
 			expect(await holds(omp, main)).toBe(true);
-			// The association of the earliest id is not silently lost: on overflow every hold of that message counts as seen,
-			// so the next completed answer ends it (the conservative outcome, RF3-4).
+			// RF4-5 corrects D7: a message too wide to remember whole records no ids, so this hold's own message end cannot
+			// be matched and it is not treated as seen. An unrelated completed answer must not release it.
 			await omp.emit("message_end", assistantEnd("stop"), main);
+			expect(await holds(omp, main)).toBe(true);
+			// The clean turn end that names the call is what releases it.
+			await omp.emit("turn_end", turnEndOf([{ id: ids[0]! }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("RF4-5: many small messages never overflow; a hold whose own message end was not delivered is not released by an unrelated end", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			// 257 completed messages, one call each, and none of them wide: the memory is scoped to a message and dropped at
+			// its turn end, so nothing accumulates and no fallback is ever reached.
+			for (let index = 0; index < 257; index++) await omp.emit("message_end", assistantEnd("toolUse", [`small-${index}`]), main);
+			expect(verdict(await omp.emit("tool_call", edit("unseen"), main))).toBe("pass");
+			expect(await holds(omp, main)).toBe(true);
+			// The message that carried this call never had its `message_end` delivered, so an unrelated completed answer is
+			// no evidence that the call's batch is over. The hold stays until a clean turn end names it.
+			await omp.emit("message_end", assistantEnd("stop", ["not-the-edit"]), main);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("turn_end", turnEndOf([{ id: "unseen" }]), main);
 			expect(await holds(omp, main)).toBe(false);
 			await omp.emit("session_shutdown", {}, main);
 		});
@@ -6465,6 +6594,24 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 			expect(JSON.stringify(notice)).toContain(DIRECTOR_REWRITTEN.slice(0, 20));
 			await omp.emit("turn_end", turnEndOf([{ id: "local-0" }]), main);
 			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("RF4-6: 257 refused writes keep their refusal; the first blocked start makes no tree hold and no rewrite notice", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			const ids = Array.from({ length: 257 }, (_, index) => `refused-${index}`);
+			const sshWrite = (toolCallId: string) => ({ toolName: "write", toolCallId, input: { path: "ssh://host/file", content: "x" } });
+			for (const toolCallId of ids) expect(verdict(await omp.emit("tool_call", sshWrite(toolCallId), main))).toBe("director-edit");
+			await omp.emit("message_end", assistantEnd("toolUse", ids), main);
+			// The host reports a start for a call it blocked after Storm's hook: it was judged and refused, never rewritten,
+			// so it neither holds the tree nor claims another extension changed it. A refusal is never evicted into that state.
+			await omp.emit("tool_execution_start", { toolName: "write", toolCallId: ids[0], args: { path: "ssh://host/file", content: "x" } }, main);
+			await omp.emit("turn_end", turnEndOf(ids.map(id => ({ id, name: "write", error: true }))), main);
+			expect(await holds(omp, main)).toBe(false);
+			expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).not.toContain(DIRECTOR_REWRITTEN.slice(0, 20));
 			await omp.emit("session_shutdown", {}, main);
 		});
 
