@@ -247,10 +247,11 @@ export function modelMismatchNotice(agent: string, check: Extract<ChildCheck, { 
 	if (check.reason === "no-role") {
 		return `${agent} 워커를 멈췄습니다. 승인된 팀에 이 워커가 쓸 역할이 없어 실제 모델(${check.observed})이 승인된 것인지 확인할 수 없습니다. 사용자에게 알리고 같은 스폰을 다시 보내지 마세요.`;
 	}
-	// The check itself could not be made: the team's settings were not read in time, or could not be read at all. That is no
-	// statement about the worker's role, so it is not told as one; the stop is still the safe answer (G2).
+	// The check itself could not be made: the admission's approved snapshot was not read in time, could not be read, or
+	// holds nothing. That is no statement about the worker's role, so it is not told as one; the stop is still the safe
+	// answer (G2).
 	if (check.reason === "unchecked") {
-		return `${agent} 워커를 멈췄습니다. 팀 설정을 시간 안에 읽지 못했거나 읽을 수 없어 실제 모델(${check.observed})이 승인된 것인지 확인하지 못했습니다. 사용자에게 팀 설정(/storm)을 확인해 달라고 알리고, 설정이 읽힌 뒤에 새로 스폰하세요.`;
+		return `${agent} 워커를 멈췄습니다. 스폰 때 저장한 승인 기록을 시간 안에 읽지 못했거나 읽을 수 없어 실제 모델(${check.observed})이 승인된 것인지 확인하지 못했습니다. 사용자에게 팀 설정(/storm)을 확인해 달라고 알리고, 새 워커를 스폰하세요.`;
 	}
 	if (check.reason === "effort-unread") {
 		return `${agent} 워커를 멈췄습니다. 호스트가 이 워커의 추론 강도를 알려 주지 않아${role} 승인된 강도(${check.approved.join(", ")}) 이하로 도는지 확인할 수 없습니다. 사용자에게 알리고, 확인되기 전에는 같은 스폰을 다시 보내지 마세요.`;

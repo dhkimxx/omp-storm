@@ -32,7 +32,7 @@ export const DIRECTOR_WRITE_NO_TARGET = "대상 경로를 확인할 수 없어 �
  * the director, or a restart of omp, ends the wait. Said by the drain warning in place of its generic sentence.
  */
 export const DIRECTOR_DRAIN_WARNING =
-	"Storm 실행이 감독 자신의 파일 편집 호출이 끝나기를 기다립니다. 그 편집을 한 메시지에서 호출이 거절되거나 중단됐거나, 대화가 바뀐 뒤에는 호출의 끝 신호가 오지 않아, 감독의 다음 답변이 끝날 때까지(또는 omp를 다시 시작할 때까지) 실행 범위·잠금·회계를 유지한 채 기다립니다.";
+	"Storm 실행이 감독 자신의 파일 편집 호출이 끝나기를 기다립니다. 그 편집을 한 메시지에서 호출이 거절·실패·중단됐거나, 대화가 바뀐 뒤에는 호출의 끝 신호가 오지 않아, 감독의 다음 답변이 끝날 때까지(또는 omp를 다시 시작할 때까지) 실행 범위·잠금·회계를 유지한 채 기다립니다.";
 
 /** The director's notice when another extension rewrote an edit's arguments after Storm's hook: the call writes more than Storm was shown. */
 export const DIRECTOR_REWRITTEN =
@@ -106,9 +106,11 @@ export function directorWriteBlock(reason: string): Block<"director-write"> {
 /**
  * What a worker's, a job's or a check's refusal says when the files it wanted are held by the director's own path edit: the
  * director is editing files itself, and that hold ends with the message that made the call, not with a worker's end.
- * `next` is what the caller may do afterwards, in its own words.
+ * `next` is what the caller may do afterwards, in its own words. It names failure too: a call can end in an error while its
+ * file was still changed, and the same message's hooks run before its `message_end`, so the retry waits for the next answer
+ * to finish, not just the next message.
  */
-export const DIRECTOR_EDIT_ENDS = "감독의 편집은 그 편집을 한 메시지의 호출이 모두 잘 끝나면 풀립니다. 호출 하나라도 거절되거나 중단됐으면 감독의 다음 답변이 끝날 때 풀립니다.";
+export const DIRECTOR_EDIT_ENDS = "감독의 편집은 그 편집을 한 메시지의 호출이 모두 잘 끝나면 풀립니다. 호출 하나라도 거절·실패·중단됐으면 감독의 다음 답변이 끝날 때 풀립니다.";
 
 /** The refusal of something Storm starts (a job, a check, a command of the director) while the director is editing files. */
 export function directorEditWait(what: string): string {
@@ -116,7 +118,7 @@ export function directorEditWait(what: string): string {
 }
 
 /** The refusal of a worker placement or follow-up that meets the director's path edit: what the retry waits for. */
-export const DIRECTOR_EDIT_RETRY = `${DIRECTOR_EDIT_ENDS} 다음 메시지에서 같은 호출을 다시 보내세요.`;
+export const DIRECTOR_EDIT_RETRY = `${DIRECTOR_EDIT_ENDS} 같은 메시지에서 곧바로 다시 보내면 그 답변의 호출 검사가 끝나기 전이라 아직 잠겨 있으니, 다음 답변이 끝난 뒤에 같은 호출을 다시 보내세요.`;
 
 interface ContentBlock {
 	type?: unknown;

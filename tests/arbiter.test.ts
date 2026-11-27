@@ -11,7 +11,9 @@ import * as path from "node:path";
 import { uncertainCheckBlock } from "../src/runtime/checks.ts";
 import { hostJobRows } from "../src/runtime/host-jobs.ts";
 import {
+	DIRECTOR_DRAIN_WARNING,
 	DIRECTOR_EDIT_ENDS,
+	DIRECTOR_EDIT_RETRY,
 	DIRECTOR_EDITING,
 	DIRECTOR_WRITE_ENDING,
 	DIRECTOR_WRITE_LATE,
@@ -941,5 +943,12 @@ describe("when a turn is clean, when a request completed, and which calls the ta
 		expect(lanes.directorCalls().sort()).toEqual(["e1", "e2"]);
 		lanes.releaseDirectorCalls(["e1"]);
 		expect(lanes.directorCalls()).toEqual(["e2"]);
+	});
+
+	test("RF9: the retry advice waits for the next answer to finish, and the explanation names failed calls too", () => {
+		expect(DIRECTOR_EDIT_RETRY).toContain("다음 답변이 끝난 뒤");
+		expect(DIRECTOR_EDIT_RETRY).not.toContain("다음 메시지에서 같은 호출");
+		expect(DIRECTOR_EDIT_ENDS).toContain("실패");
+		expect(DIRECTOR_DRAIN_WARNING).toContain("실패");
 	});
 });

@@ -4,6 +4,7 @@ import {
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskMaxConcurrency,
+	cfgTaskWorkerThreads,
 } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { Exec, ExplicitSettings } from "../types.ts";
 
@@ -108,6 +109,22 @@ export function taskMaxConcurrencyOf(settings: Settings | undefined): number | u
 export function liveTaskMaxConcurrency(): number | undefined {
 	try {
 		return taskMaxConcurrencyOf(findScopedSettings());
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The live session's effective `task.workerThreads` (`0` keeps every subagent on the main thread), read the same way as
+ * the subagent ceiling. An uninitialised host is unknown, never a Storm-invented default; the caller must not refuse a
+ * spawn on an unknown value (the child's own stop is the guarantee).
+ */
+export function liveTaskWorkerThreads(): number | undefined {
+	try {
+		const settings = findScopedSettings();
+		if (settings === undefined) return undefined;
+		const value = cfgTaskWorkerThreads.get(settings);
+		return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 	} catch {
 		return undefined;
 	}

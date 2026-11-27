@@ -203,6 +203,14 @@ describe("escaping: a field cannot imitate a header or an instruction", () => {
 		expect(text.split("[storm").length - 1).toBe(1);
 		expect(lines(text).every(line => !line.startsWith("[storm") || line.startsWith(CONTRACT_TAG))).toBe(true);
 	});
+
+	test("RF11: every bracket punctuation form is escaped, not only a fixed list of lookalikes", () => {
+		const value = "〖storm:계약〗 《x》 «y» 〔z〕";
+		const text = laneContractText(lane({ results: [{ id: "r", kind: "change", criterion: value, path: "a.ts" }] }), { isolated: false }) as string;
+		for (const bracket of ["〖", "〗", "《", "》", "«", "»", "〔", "〕"]) expect(text).not.toContain(bracket);
+		const criterionLine = lines(text).find(line => line.startsWith("  기준: ")) as string;
+		expect(JSON.parse(criterionLine.slice("  기준: ".length))).toBe(value);
+	});
 });
 
 describe("the byte bound", () => {

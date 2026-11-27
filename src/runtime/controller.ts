@@ -137,22 +137,23 @@ import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
 import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
+import { sharedMap } from "./thread-state.ts";
 import type { RunPhase } from "../view/appearance.ts";
 
-const spawnsByRun = new Map<string, SpawnRecord[]>();
+const spawnsByRun = sharedMap<string, SpawnRecord[]>("storm.controller.spawnsByRun");
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
-const liveWriters = new Map<string, () => void>();
+const liveWriters = sharedMap<string, () => void>("storm.controller.liveWriters");
 /**
  * Immediate phase listeners of the controlling session, keyed by run id. A child session reports its start, settle
  * and approvals through these: the main session draws, the child never does. View-only, like the phases themselves.
  */
-const phaseWatchers = new Map<string, () => void>();
+const phaseWatchers = sharedMap<string, () => void>("storm.controller.phaseWatchers");
 /**
  * View-only keys of the host dialogs this process's live run is waiting on. A key exists only while its run has a
  * phase watcher, so an event that outlives its run cannot mark the next one as waiting.
  */
-const userWaits = new Map<string, Set<string>>();
+const userWaits = sharedMap<string, Set<string>>("storm.controller.userWaits");
 /**
  * How often an active run's record is rewritten at most. The live record is what remains of a run whose process
  * dies: the next run's janitor marks it stopped and it shows up as the last run with what it had spent and spawned.
@@ -221,7 +222,7 @@ export function runSpawns(runId: string): SpawnRecord[] {
 }
 
 /** Where a fact about a worker reaches the director of a run, by run id; set while this process's controller owns the run. */
-const noticeSinks = new Map<string, (text: string) => void>();
+const noticeSinks = sharedMap<string, (text: string) => void>("storm.controller.noticeSinks");
 
 /**
  * A fact the director must read that only a child's session can see (a worker stopped because it ran on a model the team
@@ -5073,6 +5074,7 @@ const BLOCK_LABEL: Record<SpawnBlockCode, string> = {
 	"unassigned-lane": "계획 레인 미배정",
 	"role-cap": "역할 워커 상한",
 	parallelism: "동시 상한",
+	"pooled-thread": "풀 스레드 배치",
 	budget: "예산 초과",
 	internal: "내부 오류",
 };

@@ -9,6 +9,7 @@ import type { PlanLane } from "../src/types.ts";
 import {
 	endWorkerAdmission,
 	persistWorkerAdmission,
+	readChildBinding,
 	readWorkerAdmission,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
@@ -46,6 +47,7 @@ const admit = (over: {
 	lane?: string;
 	targetRoot?: string;
 	artifactRoot?: string;
+	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
 } = {}) =>
 	persistWorkerAdmission({
 		agentDir,
@@ -59,6 +61,7 @@ const admit = (over: {
 		targetRoot: over.targetRoot ?? project,
 		...(over.lane === undefined ? {} : { lane: over.lane }),
 		policy: over.policy ?? { kind: "paths", paths: ["allowed.txt"], reason: "test lane" },
+		...(over.approved === undefined ? {} : { approved: over.approved }),
 	});
 
 const resolve = (over: {
@@ -116,6 +119,17 @@ describe("worker admission records", () => {
 		const plain = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Plain" });
 		expect(plain).toMatchObject({ kind: "record", record: { policy: { kind: "read" } } });
 		if (plain.kind === "record") expect(plain.record.policy.shell).toBeUndefined();
+	});
+
+	test("RF10: the approved snapshot is kept whole and validated; a bad selector or effort is refused, never truncated", async () => {
+		const entries = Array.from({ length: 65 }, (_, index) => ({ selector: `models/model-${index}`, effort: "low" }));
+		await admit({ approved: entries });
+		const binding = await readChildBinding({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(binding.kind === "bound" && binding.approved?.length).toBe(65);
+		expect(binding.kind === "bound" && binding.approved?.at(-1)?.selector).toBe("models/model-64");
+		await expect(admit({ childId: "BadEffort", approved: [{ selector: "models/x", effort: "not-an-effort" }] })).rejects.toThrow();
+		await expect(admit({ childId: "BadSelector", approved: [{ selector: "no-provider" }] })).rejects.toThrow();
+		await expect(admit({ childId: "TooMany", approved: Array.from({ length: 257 }, (_, index) => ({ selector: `models/m-${index}` })) })).rejects.toThrow();
 	});
 
 	test("an unrecorded child of the active managed run is denied, and a revoked run leaves unrelated work alone", async () => {

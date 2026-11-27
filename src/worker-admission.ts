@@ -12,11 +12,11 @@ import { link, lstat, mkdir, open, readFile, readdir, realpath, rm, stat, chmod 
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { sha256Hex } from "./config/canonical.ts";
-import { writeJsonAtomic } from "./fsutil.ts";
+import { serialized, writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
 import { assertSessionStoreSafe } from "./session-scope.ts";
-import type { RanModel } from "./types.ts";
+import { EFFORTS } from "./types.ts";
 
 export const WORKER_ADMISSION_SCHEMA = "storm.worker-admission/v1";
 const KEY = /^[0-9a-f]{64}$/;
@@ -26,6 +26,8 @@ const MAX_ID = 512;
 const MAX_PATHS = 256;
 const MAX_PATH = 1024;
 const MAX_RECORDS = 512;
+/** One worker's approved-model snapshot: a role's models plus a trial candidate. More is not a team this check can hold. */
+const MAX_APPROVED = 256;
 const ACTIVE_TTL_MS = 7 * 24 * 60 * 60_000;
 const CLOSED_TTL_MS = 24 * 60 * 60_000;
 const LOCK_RETRY_MS = 10;
@@ -120,6 +122,15 @@ function isPolicy(value: unknown): value is WorkerAdmissionPolicy {
 	return value.paths.every(item => typeof item === "string" && item.length <= MAX_PATH && normalizeScopePath(item) === item);
 }
 
+/** One approved model entry: `provider/id`, bounded and free of control characters, at a known effort when one is given. */
+function isApprovedEntry(value: unknown): value is { selector: string; effort?: (typeof EFFORTS)[number] } {
+	if (!isRecord(value) || typeof value.selector !== "string") return false;
+	const selector = value.selector;
+	const slash = selector.indexOf("/");
+	if (slash <= 0 || slash === selector.length - 1 || selector.length > MAX_ID || CONTROL_CHARS.test(selector)) return false;
+	return value.effort === undefined || (typeof value.effort === "string" && EFFORTS.includes(value.effort as (typeof EFFORTS)[number]));
+}
+
 function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (!isRecord(value) || value.schema !== WORKER_ADMISSION_SCHEMA) return false;
 	if (typeof value.key !== "string" || !KEY.test(value.key)) return false;
@@ -140,11 +151,7 @@ function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (value.revokedAt !== undefined && (typeof value.revokedAt !== "number" || !Number.isFinite(value.revokedAt))) return false;
 	if (value.endedAt !== undefined && (typeof value.endedAt !== "number" || !Number.isFinite(value.endedAt))) return false;
 	if (value.approved !== undefined) {
-		if (!Array.isArray(value.approved) || value.approved.length > 64) return false;
-		for (const entry of value.approved) {
-			if (!isRecord(entry) || typeof entry.selector !== "string" || entry.selector === "" || entry.selector.length > MAX_ID) return false;
-			if (entry.effort !== undefined && (typeof entry.effort !== "string" || entry.effort.length > 32)) return false;
-		}
+		if (!Array.isArray(value.approved) || value.approved.length > MAX_APPROVED || !value.approved.every(isApprovedEntry)) return false;
 	}
 	return true;
 }
@@ -279,6 +286,14 @@ async function prune(dir: string, now: number): Promise<void> {
 		await rm(path.join(dir, record.name), { force: true });
 	}
 	if (active > MAX_RECORDS) throw new Error("보관 중인 자식 권한 기록이 너무 많습니다");
+	// A stop directory belongs to one run; a run's own end removes it. A store left behind by a crash must not accumulate.
+	const stops = path.join(dir, "stops");
+	for (const name of await readdir(stops).catch(() => [] as string[])) {
+		const file = path.join(stops, name);
+		const info = await lstat(file).catch(() => undefined);
+		if (info === undefined || !info.isDirectory()) continue;
+		if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { recursive: true, force: true });
+	}
 }
 
 const RUN_MARKER_SCHEMA = "storm.worker-run/v1";
@@ -479,7 +494,10 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 		expiresAt: now + ACTIVE_TTL_MS,
 	};
 	if (input.lane !== undefined) record.lane = identity(input.lane, "레인 이름");
-	if (input.approved !== undefined) record.approved = input.approved.slice(0, 64).map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
+	if (input.approved !== undefined) {
+		if (input.approved.length > MAX_APPROVED || !input.approved.every(isApprovedEntry)) throw new Error("승인된 모델 목록이 올바르지 않거나 너무 많습니다");
+		record.approved = input.approved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
+	}
 	const file = admissionFile(dir, key);
 	await writeJsonAtomic(file, record);
 	await chmod(file, 0o600).catch(() => undefined);
@@ -786,83 +804,136 @@ export async function resolveWorkerAdmission(input: {
 	return { kind: "authorized", record, checkout: claimed.checkout };
 }
 
-// ── what a child on another thread reports back ─────────────────────────────────────────────────────────────────────────────
+// ── why a child on another thread was stopped ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * What a worker's own instance of Storm saw and the director's instance must still learn. omp runs the ninth and later concurrent
- * subagents on pooled threads, each with its own module state: the run is not in that thread's memory, so what the child's checks
- * decide (the model it ran on, why it was stopped) and what it spent cannot reach the director's thread through the ledger. The child
- * writes one small file per child under the profile's admission store (the place its authority already lives); the director's thread
- * reads them where it reads its notices and adds them to the run, once. Written only from a thread that has no run in memory.
+ * What a worker whose omp thread does not share the director's Storm instance still owes the director: why it was stopped.
+ * omp runs the ninth and later concurrent subagents on pooled threads, each with its own module state; a Storm worker found
+ * there stops before its first request (decision D5), and this one small file per child carries the sentence to the director's
+ * thread. It carries no spend and no model verdict: those cannot be established for a thread Storm does not own, and the worker
+ * never runs a request there. Every field is checked before it is trusted (filename hash, bounded identities, a known attempt,
+ * a finite time, a bounded one-line notice), and adoption deletes the file, so reading it twice changes nothing.
  */
-const REPORT_SCHEMA = "storm.child-report/v1";
-const MAX_REPORTS_PER_RUN = 512;
+const STOP_SCHEMA = "storm.child-stop/v1";
+const MAX_STOP_BYTES = 8 * 1024;
+const MAX_STOPS_PER_RUN = 1024;
+const MAX_NOTICE = 4_000;
 
-export interface ChildReport {
-	schema: typeof REPORT_SCHEMA;
+export interface ChildStop {
+	schema: typeof STOP_SCHEMA;
 	runId: string;
 	childId: string;
-	/** What the child's check read of its request's model, and the verdict: the last one wins, except that a mismatch stays. */
-	ran?: RanModel;
-	/** Why the child was stopped, for the director; present once. */
-	notice?: string;
-	/** What the child's own requests cost, cumulative per `provider/id` (USD). */
-	costByModel: Record<string, number>;
+	/** The admission attempt the stop belongs to; a newer attempt of the same child is a different record. */
+	attempt: string;
+	/** Why the worker was stopped, for the director. One line. */
+	notice: string;
 	at: number;
 }
 
-function reportDir(agentDir: string, runId: string): string {
-	return path.join(admissionsDir(agentDir), "reports", sha256Hex(`report\u0000${runId}`));
+function stopsRoot(agentDir: string): string {
+	return path.join(admissionsDir(agentDir), "stops");
 }
 
-function isReport(value: unknown): value is ChildReport {
-	if (!isRecord(value) || value.schema !== REPORT_SCHEMA) return false;
-	if (typeof value.runId !== "string" || typeof value.childId !== "string" || typeof value.at !== "number") return false;
-	if (!isRecord(value.costByModel) || !Object.values(value.costByModel).every(usd => typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) return false;
-	if (value.notice !== undefined && typeof value.notice !== "string") return false;
-	if (value.ran !== undefined) {
-		if (!isRecord(value.ran) || typeof value.ran.model !== "string") return false;
-		if (value.ran.verdict !== "verified" && value.ran.verdict !== "mismatch") return false;
-		if (value.ran.effort !== undefined && typeof value.ran.effort !== "string") return false;
-	}
-	return true;
+function stopsDir(agentDir: string, runId: string): string {
+	return path.join(stopsRoot(agentDir), sha256Hex(`stops\u0000${runId}`));
 }
 
-/** Publishes this child's report, whole and atomically. A failure is returned, not thrown: the caller decides what an unwritten report means. */
-export async function writeChildReport(agentDir: string, report: Omit<ChildReport, "schema" | "at">, now = Date.now()): Promise<boolean> {
+function stopFile(dir: string, childId: string): string {
+	return path.join(dir, `${sha256Hex(`child\u0000${childId}`)}.json`);
+}
+
+/** Whether the raw value is a stop this schema and run accept; the filename and the child's admission are checked by the caller. */
+function isChildStop(value: unknown, runId: string, now: number): value is ChildStop {
+	if (!isRecord(value) || value.schema !== STOP_SCHEMA) return false;
+	if (value.runId !== runId) return false;
+	if (typeof value.childId !== "string" || value.childId.trim() === "" || value.childId.length > MAX_ID || CONTROL_CHARS.test(value.childId)) return false;
+	if (typeof value.attempt !== "string" || !ATTEMPT.test(value.attempt)) return false;
+	if (typeof value.notice !== "string" || value.notice.trim() === "" || value.notice.length > MAX_NOTICE || CONTROL_CHARS.test(value.notice)) return false;
+	if (typeof value.at !== "number" || !Number.isFinite(value.at) || value.at <= 0) return false;
+	// A timestamp far outside this store's life is not a stop Storm wrote now; do not trust it as one.
+	return value.at <= now + 300_000 && value.at >= now - ACTIVE_TTL_MS;
+}
+
+async function readStopFile(file: string, runId: string, now: number): Promise<ChildStop | undefined> {
+	const info = await lstat(file).catch(() => undefined);
+	if (info === undefined || !info.isFile() || info.size > MAX_STOP_BYTES) return undefined;
+	let value: unknown;
 	try {
-		const dir = reportDir(agentDir, identity(report.runId, "실행 id"));
+		value = JSON.parse(await readFile(file, "utf8"));
+	} catch {
+		return undefined;
+	}
+	return isChildStop(value, runId, now) ? value : undefined;
+}
+
+/** Writes this child's stop, whole and atomically. A failure is returned, not thrown: the stop itself already happened. */
+export async function writeChildStop(agentDir: string, stop: Omit<ChildStop, "schema" | "at">, now = Date.now()): Promise<boolean> {
+	try {
+		const runId = identity(stop.runId, "실행 id");
+		const childId = identity(stop.childId, "자식 에이전트 id");
+		const dir = stopsDir(agentDir, runId);
 		await mkdir(dir, { recursive: true, mode: 0o700 });
-		const file = path.join(dir, `${sha256Hex(`child\u0000${identity(report.childId, "자식 에이전트 id")}`)}.json`);
-		await writeJsonAtomic(file, { schema: REPORT_SCHEMA, ...report, at: now } satisfies ChildReport);
-		await chmod(file, 0o600).catch(() => undefined);
+		const root = stopsRoot(agentDir);
+		const [realDir, realRoot] = await Promise.all([realpath(dir), realpath(root)]);
+		if (!realDir.startsWith(realRoot + path.sep)) throw new Error("자식 중지 기록이 프로필 밖으로 연결되어 있습니다");
+		await serialized(`child-stop\u0000${agentDir}\u0000${runId}\u0000${childId}`, async () => {
+			await writeJsonAtomic(stopFile(dir, childId), { schema: STOP_SCHEMA, ...stop, runId, childId, at: now } satisfies ChildStop);
+			await chmod(stopFile(dir, childId), 0o600).catch(() => undefined);
+		});
 		return true;
 	} catch {
 		return false;
 	}
 }
 
-/** Every report of one run that is a well-formed file Storm wrote for that run, at most `MAX_REPORTS_PER_RUN`. */
-export async function readChildReports(agentDir: string, runId: string): Promise<ChildReport[]> {
-	const dir = reportDir(agentDir, runId);
+/** Every well-formed stop of one run, filtered before any cap so an unreadable old file cannot starve a later one. */
+export async function readChildStops(agentDir: string, runId: string, now = Date.now()): Promise<ChildStop[]> {
+	const dir = stopsDir(agentDir, runId);
 	let names: string[];
 	try {
 		names = await readdir(dir);
 	} catch {
 		return [];
 	}
-	const out: ChildReport[] = [];
-	for (const name of names.slice(0, MAX_REPORTS_PER_RUN)) {
-		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
-		const read = await readRecordFile(path.join(dir, name));
-		if (read.kind === "value" && isReport(read.value) && read.value.runId === runId) out.push(read.value);
+	const candidates = names.filter(name => /^[0-9a-f]{64}\.json$/.test(name));
+	if (candidates.length > MAX_STOPS_PER_RUN) throw new Error("자식 중지 기록이 너무 많습니다");
+	const out: ChildStop[] = [];
+	for (const name of candidates) {
+		const stop = await readStopFile(path.join(dir, name), runId, now);
+		// The filename must be the child's own hash: a record renamed onto another child is not that child's stop.
+		if (stop === undefined || path.basename(stopFile(dir, stop.childId)) !== name) continue;
+		out.push(stop);
 	}
 	return out;
 }
 
+/** Deletes one adopted stop. Another stop for the same child (a newer attempt) is left for the next adoption. */
+export async function acknowledgeChildStop(agentDir: string, stop: ChildStop): Promise<void> {
+	try {
+		const dir = stopsDir(agentDir, stop.runId);
+		const file = stopFile(dir, stop.childId);
+		await serialized(`child-stop\u0000${agentDir}\u0000${stop.runId}\u0000${stop.childId}`, async () => {
+			const current = await readStopFile(file, stop.runId, Date.now());
+			if (current === undefined || current.attempt !== stop.attempt || current.at !== stop.at) return;
+			await rm(file, { force: true });
+		});
+	} catch {
+		// A stop that cannot be deleted is already recorded; the run-scoped cleanup below is the backstop.
+	}
+}
+
+/** Removes one run's stops (a finished run leaves nothing behind). Best effort: cleanup never fails the caller. */
+export async function clearChildStops(agentDir: string, runId: string): Promise<void> {
+	try {
+		await rm(stopsDir(agentDir, identity(runId, "실행 id")), { recursive: true, force: true });
+	} catch {
+		// A stale directory is pruned with the rest of the admission store.
+	}
+}
+
 /** The run a child on this thread belongs to, from its persisted admission when the thread's memory has no run for it. */
 export type ChildBinding =
-	| { kind: "bound"; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; createdAt: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
+	| { kind: "bound"; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; attempt: string; createdAt: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
 	| { kind: "unmanaged" }
 	| { kind: "unknown"; reason: string };
 
@@ -876,7 +947,7 @@ export async function readChildBinding(input: { agentDir: string; artifactRoot: 
 	if (read.kind === "invalid") return { kind: "unknown", reason: read.reason };
 	if (read.kind === "record") {
 		const { record } = read;
-		return { kind: "bound", runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, createdAt: record.createdAt, ...(record.approved === undefined ? {} : { approved: record.approved }) };
+		return { kind: "bound", runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, attempt: record.attempt, createdAt: record.createdAt, ...(record.approved === undefined ? {} : { approved: record.approved }) };
 	}
 	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 	if (artifactRoot === undefined) return { kind: "unmanaged" };
