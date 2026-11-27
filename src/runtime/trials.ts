@@ -77,3 +77,8 @@ export function trialCharge(agentId: string, selector: string, config: Pick<Stor
 export function resetTrialSpawns(): void {
 	routedAgents.clear();
 }
+
+/** A finished run's spawn keys leave the shared routing map: what they described ended with the run's record. */
+export function forgetTrialSpawns(scope: string, spawnKeys: readonly string[]): void {
+	for (const spawnKey of spawnKeys) routedAgents.delete(routedKey(scope, spawnKey));
+}

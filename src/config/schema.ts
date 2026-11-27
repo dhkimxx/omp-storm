@@ -58,6 +58,15 @@ const TRIAL_KEYS = ["id", "role", "model", "effort", "share", "maxSpawns", "star
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 // "provider/id" with an optional ":<suffix>"; the id may contain more '/' (aggregator routes).
 const MODEL_RE = /^[^\s/:]+\/[^\s]*[^\s/:]$/;
+/** One configured or admitted `provider/id` selector: the same rule both paths use. */
+export function validModelSelector(value: unknown): value is string {
+	return typeof value === "string" && MODEL_RE.test(value);
+}
+/**
+ * A role's model list is what the user approves; a bound is checked here, at approval, so an approved team never meets a
+ * surprise refusal later at spawn. It is far above any real fallback chain and keeps one admission file bounded.
+ */
+export const MAX_MODELS_PER_ROLE = 4096;
 // A portable resource key: ASCII only, no whitespace, no quoting; case-sensitive on purpose.
 const RESOURCE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+=#-]*$/;
 
@@ -378,8 +387,9 @@ export function validateConfig(value: unknown): ConfigValidation {
 			if (!Array.isArray(role.models) || role.models.length === 0) {
 				errors.push(`${path}.models: 모델이 하나 이상 있어야 합니다`);
 			} else {
+				if (role.models.length > MAX_MODELS_PER_ROLE) errors.push(`${path}.models: 한 역할의 모델은 ${MAX_MODELS_PER_ROLE}개 이하여야 합니다`);
 				role.models.forEach((m, i) => {
-					if (typeof m !== "string" || !MODEL_RE.test(m)) {
+					if (!validModelSelector(m)) {
 						errors.push(`${path}.models[${i}]: provider/id 형식이 아닙니다`);
 					}
 				});

@@ -428,6 +428,17 @@ export function markAgentsCleaned(ids: readonly string[], now: number, scope: st
 	}
 }
 
+/** A finished run's rows leave the shared ledger: what it described ended with its final record. */
+export function forgetRunAgents(runId: string, scope: string): void {
+	if (!validScope(scope)) return;
+	for (const [key, record] of agents) {
+		if (record.entry.runId === runId && record.scope === scope) {
+			agents.delete(key);
+			registryEntries.delete(key);
+		}
+	}
+}
+
 /** Tests only. */
 export function resetAgents(): void {
 	agents.clear();

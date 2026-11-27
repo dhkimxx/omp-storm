@@ -1024,6 +1024,11 @@ export type LaneAdmission = { ok: true; lane?: string } | { ok: false; code: Lan
 
 const liveLanes = sharedMap<string, WeakRef<RunLanes>>("storm.lanes.liveLanes");
 
+/** A finished run's key leaves the shared registry; the object itself goes with the controller that owned it. */
+export function forgetRunLanes(runId: string): void {
+	liveLanes.delete(runId);
+}
+
 /**
  * A child session loads the extension on its own and holds no run, yet its turn start is the fact that ends a follow-up's
  * admission window in the run's lanes. The newest lanes of the run id receive it; an unknown agent changes nothing.
