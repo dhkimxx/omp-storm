@@ -2236,6 +2236,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 * permission path never waits on disk; a lost write leaves the worker stopped all the same (fail closed).
 	 */
 	const stopDetachedChild = (ctx: ExtensionContext, binding: ChildBinding): void => {
+		// A worker whose run has already withdrawn its authority (its record carries `revokedAt`) and that is now woken
+		// on the director's thread is ordinary work: its writes still fail closed on that revoked record, and there is no
+		// live run whose state it could have lost. Stopping it would abort a turn the host legitimately started.
+		if (binding.kind === "bound" && binding.revokedAt !== undefined && threadPolicy.onHostMainThread()) return;
 		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
 		if (binding.kind === "bound") {
 			const reason: WorkerStopReason = threadPolicy.onHostMainThread() ? "state-not-shared" : "pooled-thread";

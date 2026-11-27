@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Real-host proof that a persisted lane admission enforces path scope in both same-thread and pooled children.
+ * Real-host proof that a persisted lane admission enforces path scope on the workers Storm lets run.
  *
- * Run twice with PROBE_MODE=authorized and PROBE_MODE=unauthorized on disposable dirs/ports. Nine concurrent
- * path-only workers force the host's default worker pool; the script reads the host's own worker-tagged log records,
- * then checks both the resulting files and the child transcripts. No worker-thread or isolation setting is disabled.
+ * Run twice with PROBE_MODE=authorized and PROBE_MODE=unauthorized on disposable dirs/ports. A Storm worker on a pooled
+ * thread stops before its first request (0.28.0, decisions D5/D7), so this suite takes the documented way out —
+ * `task.workerThreads: 0` — and all nine path-only children run on the director's thread. The pooled stop itself is
+ * proved by `hardening-pins`; here the script checks the resulting files and the child transcripts and that no child was
+ * placed on a pooled thread.
  */
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -86,7 +88,7 @@ function childTranscript(agentId: string): string | undefined {
 
 async function main(): Promise<void> {
 	writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, TEAM_PROVIDERS));
-	writeFileSync(join(env.agentDir, "config.yml"), `setupVersion: 3\ntask:\n  maxConcurrency: ${COUNT}\n`);
+	writeFileSync(join(env.agentDir, "config.yml"), `setupVersion: 3\ntask:\n  workerThreads: 0\n  maxConcurrency: ${COUNT}\n`);
 	const shadowDir = join(env.project, ".omp", "agents");
 	Bun.spawnSync(["mkdir", "-p", shadowDir]);
 	writeFileSync(join(shadowDir, "storm-implementer.md"), "---\nname: storm-implementer\ndescription: path-only worker authority\ntools: read, write, edit\n---\nPath-only worker.\n");
@@ -116,7 +118,7 @@ async function main(): Promise<void> {
 			const run = files.run(running.runId);
 			return run !== undefined && run.spawns.filter(spawn => spawn.outcome === "routed").length >= COUNT ? run : undefined;
 		}, 60_000, "nine routed children");
-		// The children hold their first reply five seconds; wait for the writes and for the host to flush its worker logs.
+		// The children hold their first reply five seconds; wait for the writes and for the host to flush the transcripts.
 		const expected = Array.from({ length: COUNT }, (_, i) => `${MODE === "authorized" ? "declared" : "outside"}-${i}.txt`);
 		await until(() => {
 			const present = expected.filter(name => existsSync(join(env.project, name)));
@@ -128,15 +130,15 @@ async function main(): Promise<void> {
 		} else {
 			check("no path-only child wrote outside its lane", present.length === 0, `outside=${present.join(",") || "none"}`);
 		}
-		// Worker tags are flushed when the host records the child session exit, slightly after the file lands.
-		const workers = await until(() => {
-			const found = Array.from({ length: COUNT }, (_, i) => ({ id: `L${i}`, worker: workerSession(`L${i}`) })).filter(item => item.worker !== undefined);
-			return found.length > 0 ? found : undefined;
-		}, 20_000, "a host worker-tagged child").catch(() => []);
-		check("the host ran at least one child on a pooled worker thread", workers.length > 0, JSON.stringify(workers));
-		const sameThread = Array.from({ length: COUNT }, (_, i) => `L${i}`).find(id => workerSession(id) === undefined);
-		check("a same-thread child also ran", sameThread !== undefined, sameThread ?? "");
-		for (const id of [sameThread, workers[0]?.id].filter((value): value is string => value !== undefined)) {
+		// A child's transcript is flushed when the host records its session exit, slightly after the file lands.
+		await until(() => {
+			const text = childTranscript(`L${COUNT - 1}`);
+			return text !== undefined && (MODE === "authorized" ? text.includes("storm child change") : text.includes("lane-scope")) ? text : undefined;
+		}, 20_000, "the last child's transcript").catch(() => undefined);
+		const pooledChildren = Array.from({ length: COUNT }, (_, i) => ({ id: `L${i}`, worker: workerSession(`L${i}`) })).filter(item => item.worker !== undefined);
+		check("no child was placed on a pooled worker thread", pooledChildren.length === 0, JSON.stringify(pooledChildren));
+		// The first and the last child: both sides of the host's eight-main-thread threshold, now all on the director's thread.
+		for (const id of ["L0", `L${COUNT - 1}`]) {
 			const text = childTranscript(id) ?? "";
 			if (MODE === "authorized") {
 				check(`${id}: its authorized write is in the transcript as a success`, text.includes("storm child change") && !text.includes("lane-scope"), text.slice(-800));

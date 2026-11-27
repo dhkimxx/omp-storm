@@ -5841,6 +5841,34 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 			await omp.emit("session_shutdown", {}, main);
 		});
 
+		test("D7: a worker of a finished run, woken on the main thread, is not stopped: its revoked admission is not lost state", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const runId = await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+			const worker = await startWorker(omp, child, main, "look", "storm-explorer");
+			// The run ended and withdrew the worker's authority; what remains on disk is a record naming that run.
+			await revokeWorkerAdmissions(project.env.agentDir, { runId, childId: "look" });
+			const spies = noRunInMemory();
+			try {
+				child.thinking.level = "low";
+				const woke = asking(worker, "a", "x");
+				await child.emit("before_agent_start", { systemPrompt: [] }, woke.ctx);
+				expect(woke.aborted()).toBe(0);
+				const request = asking(worker, "a", "x");
+				await child.emit("before_provider_request", { payload: {} }, request.ctx);
+				expect(request.aborted()).toBe(0);
+				// No sentence is owed and no stop is written: this worker's authority ended, it did not lose its state.
+				expect((await admissionOf("look")).stop).toBeUndefined();
+				const told = await omp.emit("context", { messages: [] }, main);
+				expect(JSON.stringify(told ?? "")).not.toContain(threadPolicy.workerStopNotice("storm-explorer", "state-not-shared"));
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+
 		test("RF3-11: a verified request of an earlier attempt stays historical, and a later attempt's stop names its own attempt", async () => {
 			await approve(TEAM);
 			const omp = fakeOmp(project);

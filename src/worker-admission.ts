@@ -901,7 +901,7 @@ export async function readWorkerStops(
 
 /** The run a child on this thread belongs to, from its persisted admission when the thread's memory has no run for it. */
 export type ChildBinding =
-	| { kind: "bound"; key: string; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; attempt: string; createdAt: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
+	| { kind: "bound"; key: string; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; attempt: string; createdAt: number; revokedAt?: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
 	| { kind: "unmanaged" }
 	| { kind: "unknown"; reason: string };
 
@@ -915,7 +915,7 @@ export async function readChildBinding(input: { agentDir: string; artifactRoot: 
 	if (read.kind === "invalid") return { kind: "unknown", reason: read.reason };
 	if (read.kind === "record") {
 		const { record } = read;
-		return { kind: "bound", key: read.key, runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, attempt: record.attempt, createdAt: record.createdAt, ...(record.approved === undefined ? {} : { approved: record.approved }) };
+		return { kind: "bound", key: read.key, runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, attempt: record.attempt, createdAt: record.createdAt, ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }), ...(record.approved === undefined ? {} : { approved: record.approved }) };
 	}
 	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 	if (artifactRoot === undefined) return { kind: "unmanaged" };
