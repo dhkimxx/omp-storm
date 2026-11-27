@@ -298,3 +298,29 @@ test("a follow-up whose call failed after the woken turn already started keeps i
 	other.releaseCall("f-2", new Set());
 	expect(other.assign({ agent: "storm-implementer", task: "other", name: "A2" }, plan(writer("A2")), team, { now: T0 + 1 }).ok).toBe(true);
 });
+
+test("a director path edit's hold is not a placement: no clock value lapses it, and it meets every writer that starts at any time", () => {
+	const p = plan(exclusive("X"), pathLane("A", "quick", ["a.ts"]), pathLane("B", "implementer", ["b.ts"]));
+	const work = new RunLanes("director-lifetime");
+	expect(work.commitWriter({ kind: "director-path", callId: "e1", paths: ["a.ts"], live: () => ({ ok: true }), now: T0 })).toEqual({ ok: true });
+	for (const now of [T0 + 1, T0 + PENDING_WRITE_MS - 1, T0 + PENDING_WRITE_MS, LATE, LATE * 1_000]) {
+		expect(refusedWrite(assign(work, p, "A", "storm-quick", now))).toBe(true);
+		expect(refusedWrite(assign(work, p, "X", "storm-implementer", now))).toBe(true);
+		expect(work.takeWriterFreed([], now)).toBe(false);
+	}
+	// Other files were never in its way, whenever they start.
+	expect(assign(work, p, "B", "storm-implementer", LATE * 1_000).ok).toBe(true);
+	// Only the end of the turn that made the call frees the files.
+	expect(work.releaseDirectorCalls(["e1"])).toBe(1);
+	expect(assign(work, p, "A", "storm-quick", LATE * 1_000 + 1).ok).toBe(true);
+});
+
+test("a worker's late admission is checked against a director edit made while its placement had lapsed, and the edit stays", () => {
+	const p = plan(pathLane("A", "quick", ["a.ts"]));
+	const work = new RunLanes("director-late");
+	const id = idOf(assign(work, p, "A", "storm-quick", T0));
+	expect(work.commitWriter({ kind: "director-path", callId: "e1", paths: ["a.ts"], live: () => ({ ok: true }), now: LATE })).toEqual({ ok: true });
+	const admitted = at(LATE, () => work.admitChecked({ spawnKey: id, agent: "storm-quick", outcome: "routed" }, { plan: p, config: team }));
+	expect(admitted).toMatchObject({ ok: false, code: "lane-write" });
+	expect(work.liveHolders(["director-path"])).toBe(1);
+});

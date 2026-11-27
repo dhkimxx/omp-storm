@@ -1562,6 +1562,8 @@ async function main(): Promise<void> {
 					plan([{ name: "scope", kind: "explore", results: [{ id: "scope-small", kind: "answer", criterion: "report notes/small.txt line 5 from source", path: "notes/small.txt", contains: "E2E-SMALL-5" }] }]),
 					{ task: ["storm-explorer"], as: "Reader", say: "E2E-CHILD-READ notes/big.ts,notes/big.txt,notes/small.txt E2E-CHILD-CLAIM E2E-SMALL-5 is line 5 of notes/small.txt (notes/small.txt:5)" },
 					{ edit: "director-check.txt", afterResult: "Reader0" },
+					// An address is still not a project file the table can name: refused with its cause (0.28.0 opens plain project paths only).
+					{ edit: "vault://director-check.md" },
 					{ read: "notes/big.ts" },
 					{ read: "notes/big.txt" },
 					{ read: "notes/big.txt:1-500" },
@@ -1576,7 +1578,8 @@ async function main(): Promise<void> {
 			const answerTo = (index: number) => results[index + 1] ?? "";
 			const director = mains(llm.all());
 			const resultOf = (path: string) => answerTo(director.findIndex(entry => entry.decision.tool === "read" && entry.decision.args?.path === path));
-			check("the director's file write is blocked with director-edit", !existsSync(directed) && run.blockedEdits === 1 && results.some(result => result.includes("[storm:director-edit]")), `blockedEdits=${run.blockedEdits}`);
+			// 0.28.0 (decision: the director's own edits during a run): a plain project file is written once no writer holds the tree; an address stays refused.
+			check("the director's own write of a project file passes (the run is open and the worker has ended), and a write to an address is blocked with director-edit", existsSync(directed) && run.blockedEdits === 1 && results.some(result => result.includes("[storm:director-edit]")), `file=${existsSync(directed)} blockedEdits=${run.blockedEdits}`);
 			check("a bare read of a large code file passes", resultOf("notes/big.ts") !== "" && !resultOf("notes/big.ts").includes("[storm:"), resultOf("notes/big.ts").slice(0, 80));
 			check("a bare read of large prose passes too (omp pages it)", resultOf("notes/big.txt").includes("E2E-EVIDENCE-2") && !resultOf("notes/big.txt").includes("[storm:"), resultOf("notes/big.txt").slice(0, 120));
 			const refused = resultOf("notes/big.txt:1-500");

@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lanePolicy } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
+import type { PlanLane } from "../src/types.ts";
 import {
 	endWorkerAdmission,
 	persistWorkerAdmission,
@@ -94,6 +96,26 @@ describe("worker admission records", () => {
 		const other = join(tmp, "other-target");
 		await mkdir(other);
 		expect(await resolve({ childCwd: other })).toMatchObject({ kind: "denied" });
+	});
+
+	test("a shell reader's admission carries the shell on a non-review read lane and reads back; a plain reader does not", async () => {
+		const explore: PlanLane = { name: "scout", kind: "explore", role: "explorer" };
+		const tools = ["read", "grep", "bash"];
+		const shellPolicy = lanePolicy({ lane: explore, tools, isolated: false, auto: false });
+		expect(shellPolicy).toMatchObject({ kind: "read", shell: true });
+		await admit({ lane: "scout", policy: shellPolicy });
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		expect(read).toMatchObject({ kind: "record", record: { lane: "scout", policy: { kind: "read", shell: true } } });
+		// The record is persisted as a file: a fresh read of it, after the process-local objects are gone, still has the shell.
+		const authorized = await resolve();
+		expect(authorized).toMatchObject({ kind: "authorized", record: { policy: { kind: "read", shell: true } } });
+
+		// A plain reader never gains the shell from a missing field.
+		const plainPolicy = lanePolicy({ lane: explore, tools: ["read", "grep"], isolated: false, auto: false });
+		await admit({ childId: "Plain", lane: "scout", policy: plainPolicy });
+		const plain = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Plain" });
+		expect(plain).toMatchObject({ kind: "record", record: { policy: { kind: "read" } } });
+		if (plain.kind === "record") expect(plain.record.policy.shell).toBeUndefined();
 	});
 
 	test("an unrecorded child of the active managed run is denied, and a revoked run leaves unrelated work alone", async () => {

@@ -12,7 +12,7 @@ import type { LaneKind, RoleId, RunRecord, StormConfig } from "../types.ts";
 import { END_STATUS } from "./rounds.ts";
 
 /** What a lane kind covers beyond its name, where the role alone does not say it. */
-const LANE_NOTE: Partial<Record<LaneKind, string>> = { run: "long builds, device runs, waiting, logs" };
+const LANE_NOTE: Partial<Record<LaneKind, string>> = { run: "builds, device runs, waits" };
 
 /** The agent doing a role's work in this team: the role's own, else its nearest usable stand-in's. */
 function agentFor(config: StormConfig, roleId: RoleId): string | undefined {
@@ -343,7 +343,20 @@ function historyBlock(history: { text: string; followUp?: boolean } | undefined)
  * means. Pinned by tests through this constant, not through its words.
  */
 export const DECIDE_BEFORE_STOP =
-	"Before stopping, check every lane and result against your evidence, or report the blocker. A refused call stays refused: read why, change it.";
+	"Before stopping, check each lane and result against evidence, or report the blocker. A refused call stays refused: read why, change it.";
+
+/**
+ * The run contract's rule about the director's own edits: path tools are open when Storm can order them against the
+ * team's writers; a refusal names the writer to wait for, so this line teaches the rule and not the exceptions. Pinned
+ * by tests through this constant, not through its words.
+ */
+export const DIRECTOR_EDIT_RULE =
+	"- Fix files yourself with edit/write.";
+
+/** The one line about routine work, only for a team that has a usable cheaper code role (`storm-quick`). */
+export function routineEditRule(agent: string): string {
+	return `- Routine, well-specified edits can go to cheaper \`${agent}\`.`;
+}
 
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
@@ -372,12 +385,14 @@ export function buildHandoff(input: {
 		return [`- ${role.agent}: ${roleTitle(id)}, up to ${max} ${max === 1 ? "worker" : "workers"}`];
 	});
 	const isolated = config.isolation === "isolated";
+	const quick = usableRole(config, "quick")?.agent;
 	const rules = [
-		"- Delegate all changes; your own file edits are blocked.",
+		DIRECTOR_EDIT_RULE,
+		...(quick ? [routineEditRule(quick)] : []),
 		`- Before spawning use \`storm plan\`; non-review lanes need \`results\`. Kinds: ${laneRoles(config)}.`,
 		"- Cite file:line or command/exit/log: results are read from it.",
 		isolated
-			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. For follow-up, a new agent reads `agent://<id>`."
+			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. Follow up: a new agent reads `agent://<id>`."
 			: "- Share this checkout, reviewer too. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
 		`- ${DECIDE_BEFORE_STOP}`,
 		"- Stage `storm brief` from evidence, 0-3 typed next; Storm reports after it settles.",
@@ -390,17 +405,17 @@ export function buildHandoff(input: {
 		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`; an open P0 blocks it${docsEnabled(config) ? ", doc findings included" : ""}.`;
 		rules.push(
 			input.maxRounds === undefined
-				? `${check} Without a verdict Storm sends you back.`
+				? `${check} Without one Storm sends you back.`
 				: input.maxRounds === 1
-					? `${check} Without a verdict the run ends unverified.`
-					: `${check} Without a verdict Storm sends you back, up to ${input.maxRounds} rounds in all.`,
+					? `${check} Without one the run ends unverified.`
+					: `${check} Without one Storm sends you back, up to ${input.maxRounds} rounds.`,
 		);
 	}
 	if (config.budget) {
 		// Spend is seen after it happens: once the observed total reaches the limit no new worker starts and no work message goes to an idle worker (a quiet
 		// progress note does), and under stop the director's turn is aborted. Work already running is not stopped, so the text claims no more than that.
 		const past = config.budget.onExceed === "stop" ? "no new work starts and your turn is aborted" : "no new work starts";
-		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; at that observed spend ${past}.`);
+		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} per run; at that observed spend ${past}.`);
 	}
 	const resume = input.resume ? resumeBlock(input.resume) : [];
 	const history = historyBlock(input.history);

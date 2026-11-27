@@ -15,7 +15,7 @@ const CONTROL_TOOLS: ReadonlySet<string> = new Set(CONTROL_TOOL_NAMES);
 /**
  * Whether the director's tool call can write the shared tree without naming where: a shell command, an `lsp` action that
  * edits or runs a build, omp's checkpoint or rewind tool, an MCP or any unknown tool. Reads and searches, path edits (the
- * director-edit rule decides those), Storm's own control tools and messages to agents do not. `planMode`: omp's plan mode is on,
+ * `decideDirectorCall` names their files or refuses, and the table orders them), Storm's own control tools and messages to agents do not. `planMode`: omp's plan mode is on,
  * so `bash propose <slug>` is its plan submission and no command (see `isPlanProposal`).
  */
 export function directorNeedsTree(toolName: string, input: unknown, planMode = false): boolean {

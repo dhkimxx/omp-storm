@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
-import { effectiveAgentTools, lanePolicy, shellReviewer, WHY_SHELL_REVIEWER } from "../policy/capability.ts";
+import { effectiveAgentTools, lanePolicy, shellReader, shellReaderWhy } from "../policy/capability.ts";
 import {
 	LANE_NEEDS,
 	MAX_LANES,
@@ -384,8 +384,8 @@ function writerOrderLine(config: StormConfig, plan: RunPlan, shadows: readonly S
 			auto,
 		});
 		if (policy.kind === "unknown") writers.push({ name: lane.name, exclusive: true, why: policy.reason });
-		// A review lane that may run commands is ordered like an exclusive writer, so the plan says it runs alone.
-		else if (shellReviewer(policy)) writers.push({ name: lane.name, exclusive: true, why: WHY_SHELL_REVIEWER });
+		// A read lane that may run commands (a review lane or any other) is ordered like an exclusive writer, so the plan says it runs alone.
+		else if (shellReader(policy)) writers.push({ name: lane.name, exclusive: true, why: shellReaderWhy(lane) });
 		else if (policy.kind === "paths") writers.push({ name: lane.name, exclusive: false, why: "" });
 	}
 	const serial = writers.filter(a =>

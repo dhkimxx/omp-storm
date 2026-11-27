@@ -12,9 +12,10 @@
  *   1. before any run: reads a project file, searches it, then tries to write a project file and to run a command;
  *   2. in a run it opened (plan, one explorer, then the same four calls while the run is open).
  *
- * The reads and the search return their content; the file write is refused naming the cause "a file written by the
- * director belongs to no lane" and the command is refused naming "it runs a command"; neither file exists afterwards;
- * the run still finishes with its result accepted.
+ * The reads and the search return their content. Before a run the file write is refused naming the cause "a file written by the
+ * director belongs to no lane"; during a run it passes (0.28.0: the director's own path edits are one more writer in the write
+ * table, and no worker holds the tree once the explorer's result is in). The command is refused in both, naming "it runs a
+ * command", and its file never exists. The run still finishes with its result accepted.
  *
  * Not fully runnable until `src/extension.ts` passes the supervisor scope and the new wrapper texts (P1-b report,
  * wiring notes 1 and 2): today a read is admitted by the director gate, but the refusal still opens with the old
@@ -58,14 +59,18 @@ function resultOf(main: readonly LlmEntry[], tool: string, nth = 0): string | un
 }
 
 /** The four calls and what the host answered: contents for the read and the search, a named cause for the two refusals. */
-function checkFour(label: string, main: readonly LlmEntry[], offset: { read: number; grep: number; write: number; bash: number }): void {
+function checkFour(label: string, main: readonly LlmEntry[], offset: { read: number; grep: number; write: number; bash: number }, editOpen: boolean): void {
 	const read = resultOf(main, "read", offset.read);
 	const found = resultOf(main, "grep", offset.grep);
 	const edit = resultOf(main, "write", offset.write);
 	const shell = resultOf(main, "bash", offset.bash);
 	check(`${label}: the read of a project file returns its content and is not refused`, read !== undefined && read.includes(FACT_LINE) && !read.includes("[storm:auto]"), read ?? "no result");
 	check(`${label}: the search returns the match and is not refused`, found !== undefined && found.includes("tracked_delta") && !found.includes("[storm:auto]"), found ?? "no result");
-	check(`${label}: writing a project file is refused, and the text says why: the director's file belongs to no lane`, edit !== undefined && edit.includes("[storm:auto]") && edit.includes(SUPERVISOR_REASONS.writeFiles), edit ?? "no result");
+	if (editOpen) {
+		check(`${label}: writing a project file passes (a run is open and no writer holds the tree)`, edit !== undefined && !edit.includes("[storm:"), edit ?? "no result");
+	} else {
+		check(`${label}: writing a project file is refused, and the text says why: the director's file belongs to no lane`, edit !== undefined && edit.includes("[storm:auto]") && edit.includes(SUPERVISOR_REASONS.writeFiles), edit ?? "no result");
+	}
 	check(`${label}: running a command is refused, and the text says why: it runs a command`, shell !== undefined && shell.includes("[storm:auto]") && shell.includes(SUPERVISOR_REASONS.toolRuns), shell ?? "no result");
 	check(`${label}: neither refusal calls the file write or the command a "project tool" (the old sentence is gone)`, ![edit, shell].some(text => text?.includes("프로젝트 도구")), JSON.stringify({ edit, shell }));
 }
@@ -82,7 +87,7 @@ async function main(): Promise<void> {
 			const before = files.runIds();
 			const llm = new LlmCursor(env);
 			await rpc.turn(scripted(READ, SEARCH, EDIT, SHELL));
-			checkFour("before a run", llm.of("main"), { read: 0, grep: 0, write: 0, bash: 0 });
+			checkFour("before a run", llm.of("main"), { read: 0, grep: 0, write: 0, bash: 0 }, false);
 			check("neither file was written", !existsSync(join(env.project, "direct-edit.txt")) && !existsSync(join(env.project, "direct-shell.txt")));
 			check("none of this opened a run", files.runIds().size === before.size);
 		});
@@ -94,8 +99,8 @@ async function main(): Promise<void> {
 			const llm = new LlmCursor(env);
 			await rpc.turn(scripted(plan, probe, READ, SEARCH, { wait: true }, EDIT, SHELL), 180_000);
 			const run = await files.finishedRun(before, 60_000);
-			checkFour("in a run", llm.of("main"), { read: 0, grep: 0, write: 0, bash: 0 });
-			check("neither file was written", !existsSync(join(env.project, "direct-edit.txt")) && !existsSync(join(env.project, "direct-shell.txt")));
+			checkFour("in a run", llm.of("main"), { read: 0, grep: 0, write: 0, bash: 0 }, true);
+			check("the director's write made its file and the command made none", existsSync(join(env.project, "direct-edit.txt")) && !existsSync(join(env.project, "direct-shell.txt")));
 			check(
 				"the run opened by the plan finished and its answer was accepted: the director's reads changed nothing in the record",
 				run.results?.some(row => row.id === "probe-answer" && row.state === "accepted") === true && run.spawns.filter(spawn => spawn.outcome !== "blocked").length === 1,

@@ -22,12 +22,13 @@
  *   E2E_PORT=18811 E2E_WORK=/tmp/storm-e2e-hardening-pins ./node_modules/.bin/bun scripts/e2e/hardening-pins.ts
  *   E2E_ONLY=credentials ... runs one scenario (it still approves its team first).
  */
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { APPROVE } from "../../src/proposals/present.ts";
 import { PINNED_NOTE_TAG } from "../../src/runtime/lanes.ts";
 import type { StormConfig } from "../../src/types.ts";
 import { contractPlan, requiredResult } from "./contract-fixture.ts";
-import { cancelAll, LlmCursor, type LlmEntry, modelId, modelsYml, prepare, price, startFakeLlm, type Step, Suite, TEAM_PROVIDERS } from "./harness.ts";
+import { cancelAll, choose, LlmCursor, type LlmEntry, modelId, modelsYml, prepare, price, startFakeLlm, type Step, Suite, TEAM_PROVIDERS } from "./harness.ts";
 import { installProfile, runRequest, Sessions, setOmpSettings } from "./phase1-kit.ts";
 import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 
@@ -208,12 +209,101 @@ async function aSwappedAnswerNeverReachesTheProvider(): Promise<void> {
 	});
 }
 
+/** The host's own tag for the thread a child ran on (`w1`, `w2`...): present only for a worker omp put on a pooled thread. */
+function pooledThreadOf(agentId: string): string | undefined {
+	const dir = join(dirname(env.agentDir), "logs");
+	if (!existsSync(dir)) return undefined;
+	for (const file of readdirSync(dir).filter(name => name.startsWith("omp.") && name.endsWith(".log"))) {
+		for (const line of readFileSync(join(dir, file), "utf8").split("\n")) {
+			if (!line.includes(agentId)) continue;
+			try {
+				const record = JSON.parse(line) as Record<string, unknown>;
+				const fileOf = typeof record.sessionFile === "string" ? basename(record.sessionFile) : undefined;
+				if (typeof record.thread === "string" && /^w\d+$/.test(record.thread) && (record.id === agentId || fileOf === `${agentId}.jsonl`)) return record.thread;
+			} catch {
+				// Not a JSON log line.
+			}
+		}
+	}
+	return undefined;
+}
+
+/**
+ * A hole of 0.27.0, seen on this host in the integration pass: omp runs the first eight concurrent subagents on the main thread and
+ * puts the next ones on pooled threads, each with its own module state. There the child's lookup of its run in memory found nothing,
+ * so the check of its own model before each request returned early and never ran: a worker that a later extension had put on a
+ * model outside the team made requests on it and was never stopped. Ten explorers in one call, every spawn answered with the
+ * outsider by a later extension: all ten must be stopped before any request is sent, each with its verdict on the spawn record,
+ * and the director told, whichever thread a worker landed on.
+ */
+async function aSwappedModelOnAPooledThreadIsStopped(): Promise<void> {
+	const COUNT = 10;
+	const sessions = new Sessions(env, OUTSIDER);
+	const swap = join(import.meta.dir, "swap-plugin.ts");
+	await suite.step("pooled: a team that may run twelve explorers is approved", async () => {
+		setOmpSettings(env, "task:\n  maxConcurrency: 12\n  workerThreads: 4\n");
+		writeFileSync(join(env.agentDir, "models.yml"), modelsYml(env.port, PROVIDERS_WITH_OUTSIDER));
+		await sessions.open(cancelAll, async (rpc, files) => {
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			files.editConfig(config => {
+				(config.roles.explorer as unknown as Record<string, unknown>).workers = { min: 1, max: 12 };
+			});
+			rpc.answer = choose(APPROVE);
+			await rpc.prompt("/storm");
+			rpc.answer = choose("자동 위임 끄기");
+			await rpc.prompt("/storm auto");
+			await rpc.turn("hello");
+			check("the twelve-wide team is approved", files.approvals().length >= 1, `approvals=${files.approvals().length}`);
+		});
+	}, 180_000);
+
+	await suite.step("pooled: ten workers, the ninth and tenth answered with a model outside the team: both are stopped before any request, on whatever thread they run", async () => {
+		// The first eight stay on the approved team and are held at their first reply (live together), so the last two are the ones omp puts on a pooled thread.
+		env.childEnv.SWAP_KEYS = "F8,F9";
+		await sessions.open(cancelAll, async (rpc, files) => {
+			const names = Array.from({ length: COUNT }, (_, index) => `F${index}`);
+			const lanes = names.map(name => ({ name, kind: "explore" as const, role: "explorer", goal: "read one file", results: [requiredResult(`${name.toLowerCase()}-answer`, "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE })] }));
+			const steps: Step[] = [
+				contractPlan(lanes, { contract: true, workers: { explorer: COUNT } }),
+				// Every child holds its first reply, so all ten are live together and the later ones land on pooled threads.
+				{ tasks: names.map(name => ({ name, agent: "storm-explorer", task: "Report from source", say: `E2E-CHILD-DELAY 6000 ${CITED}` })) },
+				{ wait: true },
+			];
+			const llm = new LlmCursor(env);
+			const before = files.runIds();
+			await rpc.prompt(runRequest(steps), 240_000);
+			const run = await files.finishedRun(before, 180_000);
+			const kids = llm.of("child");
+			const spawns = names.map(name => run.spawns.find(row => row.spawnKey === name && row.outcome !== "blocked"));
+			const pooled = names.filter(name => pooledThreadOf(name) !== undefined);
+			console.log(`HOST-FACT pooled: ${JSON.stringify({ pooledWorkers: pooled, ran: spawns.map(spawn => [spawn?.spawnKey, spawn?.ran?.verdict]), childRequests: kids.length })}`);
+			check("one of the swapped workers (the ninth or tenth) ran on a pooled thread", pooled.some(name => name === "F8" || name === "F9"), `pooled=${pooled.join(",") || "none"}`);
+			check("all ten spawns were routed", spawns.every(spawn => spawn !== undefined), JSON.stringify(spawns.map(spawn => spawn?.spawnKey)));
+			const outside = kids.filter(entry => entry.model.includes("outsider"));
+			check("no request on the outside model reached the provider: the swapped workers were stopped by the check in their own session first", outside.length === 0, JSON.stringify(outside.map(entry => [entry.model, entry.effort])));
+			check("the eight approved workers did run (their requests reached the provider)", kids.length >= 8, `child requests=${kids.length}`);
+			check("the swapped spawns' records carry the verdict mismatch with the outside model, the pooled one included", spawns.slice(8).every(spawn => spawn?.ran?.verdict === "mismatch" && spawn.ran.model === OUTSIDER), JSON.stringify(spawns.slice(8).map(spawn => [spawn?.spawnKey, spawn?.ran])));
+			check("the other eight are recorded as verified on the approved model", spawns.slice(0, 8).every(spawn => spawn?.ran?.verdict === "verified"), JSON.stringify(spawns.slice(0, 8).map(spawn => [spawn?.spawnKey, spawn?.ran?.verdict])));
+			const told = rpc.frames.filter(frame => frame.type === "message_end" && JSON.stringify(frame.message ?? {}).includes("워커를 멈췄습니다")).length;
+			check("the director was told the workers were stopped (at least one notice, as the notice of every stop reaches it)", told >= 1, `notices=${told}`);
+			check("the swapped workers' answers were not accepted: nothing ran to produce them", !run.results?.some(row => (row.id === "f8-answer" || row.id === "f9-answer") && row.state === "accepted"), JSON.stringify(run.results?.map(row => [row.id, row.state])));
+		}, ["-e", swap]);
+		delete env.childEnv.SWAP_KEYS;
+	}, 420_000);
+
+	await suite.step("pooled: every OMP session exited cleanly", async () => {
+		check("no session exited non-zero", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);
+	});
+}
+
 let code = 1;
 const server = await startFakeLlm(env);
 try {
 	await effortIsPinned();
 	await credentialsAreRequired();
 	await aSwappedAnswerNeverReachesTheProvider();
+	await aSwappedModelOnAPooledThreadIsStopped();
 } catch (error) {
 	suite.check("harness", false, error instanceof Error ? (error.stack ?? error.message) : String(error));
 } finally {

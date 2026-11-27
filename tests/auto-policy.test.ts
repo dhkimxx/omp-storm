@@ -10,7 +10,7 @@ import {
 	writeAutoDelegation,
 } from "../src/approval/auto.ts";
 import { READ_ONLY_TOOLS } from "../src/policy/capability.ts";
-import { CONTROL_TOOL_NAMES, isPlanProposal, SUPERVISOR_REASONS, type SupervisorScope, supervisorToolBlock } from "../src/policy/supervisor.ts";
+import { CONTROL_TOOL_NAMES, isPlanProposal, SUPERVISOR_REASONS, type SupervisorScope, supervisorRunToolBlock, supervisorToolBlock } from "../src/policy/supervisor.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 
 const root = realpathSync(mkdtempSync(join(tmpdir(), "storm-auto-policy-")));
@@ -420,5 +420,55 @@ describe("supervisor policy", () => {
 		}
 		// omp matches a scheme without case, so the spelling is the same handle.
 		expect(readPath("Agent://Impl")).toBeUndefined();
+	});
+});
+
+describe("supervisor policy during a run", () => {
+	const R = SUPERVISOR_REASONS;
+	const runWrite = (path: string, content = "x") => supervisorRunToolBlock("write", { path, content });
+
+	test("path edits pass to the run's write table; before a plan the same calls are still refused", () => {
+		for (const tool of ["edit", "ast_edit", "multi_edit", "apply_patch", "notebook_edit"]) {
+			expect(supervisorRunToolBlock(tool, {}), tool).toBeUndefined();
+			// The gate that applies before a run exists has not moved.
+			expect(supervisorToolBlock(tool, {}), tool).toContain(R.toolEdits);
+		}
+		for (const path of ["src/a.ts", "/tmp/x", "docs/new.md", "[src/a.ts#ABCD]"]) {
+			expect(runWrite(path), path).toBeUndefined();
+			expect(supervisorToolBlock("write", { path, content: "x" }), path).toBe(R.writeFiles);
+		}
+	});
+
+	test("a write that is not a plain project path stays refused with its own cause", () => {
+		for (const path of ["out://report.md", "vault://notes/x.md", "conflict://1", "Conflict://2", "cfg://settings/x", "[ssh://host/x#ABCD]", "/repo/ssh://host/x"]) {
+			expect(runWrite(path), path).toBe(R.writeFiles);
+		}
+		for (const path of ["ssh://host/etc/app.conf", "xd://edit", "proc://bg_1/kill", "mcp://server/tool"]) {
+			expect(runWrite(path), path).toBe(R.writeRemote);
+		}
+		for (const path of ["local://../secret.md", "local://plan.txt"]) expect(runWrite(path), path).toBe(R.writeLocalNote);
+	});
+
+	test("a write call that is malformed is refused, and messages and notes are judged as before", () => {
+		for (const input of [undefined, null, [], "x", { path: "src/a.ts" }, { path: "src/a.ts", content: 7 }, { path: "src/a.ts", content: "x", extra: true }, { path: 7, content: "x" }]) {
+			expect(supervisorRunToolBlock("write", input), JSON.stringify(input)).toBe(R.writeMalformed);
+		}
+		expect(runWrite("agent://Impl", "review src/a.ts")).toBeUndefined();
+		expect(runWrite("local://plan.md", "- step")).toBeUndefined();
+		expect(runWrite("agent://all")).toBe(R.messageBroadcast);
+		expect(runWrite("agent://Impl/model")).toBe(R.messageControl);
+	});
+
+	test("everything that is not a path edit is judged exactly as before", () => {
+		for (const tool of ["bash", "eval"]) expect(supervisorRunToolBlock(tool, {})).toBe(supervisorToolBlock(tool, {}));
+		for (const tool of ["stormx", "mcp__filesystem_read", "READ", " task", "constructor", "__proto__", ""]) {
+			expect(supervisorRunToolBlock(tool, {}), tool).toBe(supervisorToolBlock(tool, {}));
+		}
+		for (const tool of [...CONTROL_TOOL_NAMES, "grep", "glob", "lsp"]) {
+			expect(supervisorRunToolBlock(tool, { action: "hover" })).toBe(supervisorToolBlock(tool, { action: "hover" }));
+		}
+		expect(supervisorRunToolBlock("read", { path: "ssh://host/x" })).toBe(R.readRemote);
+		expect(supervisorRunToolBlock("bash", { command: "propose a" }, undefined, true)).toBeUndefined();
+		expect(supervisorRunToolBlock("bash", { command: "propose a" })).toContain(R.toolRuns);
 	});
 });

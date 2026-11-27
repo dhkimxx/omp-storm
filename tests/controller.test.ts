@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { configHash } from "../src/config/canonical.ts";
+import { DIRECTOR_DRAIN_WARNING, DIRECTOR_EDIT_ENDS, DIRECTOR_WRITE_ENDING } from "../src/runtime/arbiter.ts";
 import type { AttemptReport } from "../src/runtime/attempt-report.ts";
 import { tokens } from "../src/report/agents.ts";
 import { directorRead, noteChildRead } from "../src/policy/reads.ts";
@@ -4078,5 +4079,209 @@ describe("declared results", () => {
 		const second = missing.get("experiment")?.results[0];
 		expect(second).toMatchObject({ state: "unmet" });
 		expect(second?.reason).toContain("보존");
+	});
+});
+describe("the director's path edit and the run", () => {
+	const editOf = (h: FakeSession, callId: string, paths: string[], over: Partial<Parameters<NonNullable<ReturnType<FakeSession["controller"]["runLanes"]>>["commitWriter"]>[0]> = {}) => {
+		const lanes = h.controller.runLanes();
+		if (lanes === undefined) throw new Error("the run has no lane matcher");
+		return lanes.commitWriter({ kind: "director-path", callId, paths, live: h.controller.liveCheck(h.ctx), now: Date.now(), ...over });
+	};
+	const jobTeam = (ms: number): StormConfig => ({
+		...SESSION_TEAM,
+		jobs: [{ name: "experiment", argv: [process.execPath, "-e", `setTimeout(() => console.log("OK"), ${ms})`] }],
+	});
+	const jobPlan: RunPlan = {
+		submittedAt: "2026-11-20T09:00:00.000Z",
+		workers: {},
+		lanes: [{ name: "experiment", kind: "run", role: "quick", job: "experiment", results: [{ id: "experiment-outcome", kind: "answer", criterion: "record observed outcome", contains: "OK" }] }],
+	};
+
+	test("a job batch is refused while the director edits, in words that say so, and starts when the edit's turn is over", async () => {
+		const h = session({ config: jobTeam(10) });
+		await h.start({ task: "run the experiment" });
+		expect(await h.controller.setPlan(h.ctx, jobPlan)).toEqual({ ok: true });
+		const lanes = h.controller.runLanes()!;
+		expect(editOf(h, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		const refused = await h.controller.executeJobs(h.ctx, ["experiment"], () => true);
+		expect(refused.ok).toBe(false);
+		if (refused.ok) throw new Error("the batch started");
+		expect(refused.reason).toContain("[storm:job-wait]");
+		expect(refused.reason).toContain(DIRECTOR_EDIT_ENDS);
+		expect(lanes.liveHolders(["job", "fence"])).toBe(0);
+		expect(lanes.releaseDirectorCalls(["e1"])).toBe(1);
+		expect(await h.controller.executeJobs(h.ctx, ["experiment"], () => true)).toMatchObject({ ok: true });
+		await h.controller.finish("no-changes");
+	});
+
+	test("the job's entry exists before the batch's first await: an edit committed while its approval is read is refused, and the batch holds on", async () => {
+		let gate: Promise<void> = Promise.resolve();
+		let release = (): void => undefined;
+		let h: FakeSession;
+		h = session({ config: jobTeam(10), loadState: async () => (await gate, h.state) });
+		await h.start({ task: "run the experiment" });
+		expect(await h.controller.setPlan(h.ctx, jobPlan)).toEqual({ ok: true });
+		const lanes = h.controller.runLanes()!;
+		gate = new Promise<void>(resolve => (release = resolve));
+		const batch = h.controller.executeJobs(h.ctx, ["experiment"], () => true);
+		// Nothing has yielded to the batch yet: the table already has its entry.
+		expect(lanes.liveHolders(["job"])).toBe(1);
+		expect(editOf(h, "e1", ["src/a.ts"])).toMatchObject({ ok: false, code: "lane-write", holder: { kind: "job" } });
+		await Bun.sleep(20);
+		expect(editOf(h, "e1", ["src/a.ts"])).toMatchObject({ ok: false, holder: { kind: "job" } });
+		release();
+		expect(await batch).toMatchObject({ ok: true });
+		expect(lanes.liveHolders(["job", "fence"])).toBe(0);
+		expect(editOf(h, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		lanes.releaseDirectorCalls(["e1"]);
+		await h.controller.finish("no-changes");
+	});
+
+	/** A run whose gate wants required checks: the tree moved and a reviewer's verdict is in, so the next look runs the checks. */
+	function dueChecks(over: Partial<SessionOptions> = {}) {
+		const config: StormConfig = { ...SESSION_TEAM, requiredChecks: [{ name: "unit", argv: ["/bin/sh", "-c", "echo x >> check-count"] }] };
+		const agents: AgentEntry[] = [writer()];
+		let tree = treeOf("d0", "f0");
+		const h = session({ config, agents, tree: () => treeAt(tree), ...over });
+		const due = async (): Promise<string> => {
+			const runId = await h.start();
+			tree = treeOf("d1", "f0");
+			await h.turn();
+			agents.push(verdict(T0 + 1, true, treeFingerprint(tree)));
+			return runId;
+		};
+		return { h, due, count: () => Bun.file(path.join(root, "check-count")).exists() };
+	}
+
+	test("a look that finds the director editing runs no check and records nothing; the check runs at a look after the edit's turn", async () => {
+		const { h, due, count } = dueChecks();
+		const runId = await due();
+		expect(editOf(h, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		h.timers.fire();
+		await Bun.sleep(300);
+		expect(await count()).toBe(false);
+		expect(h.controller.active()?.checks).toBeUndefined();
+		expect(h.controller.runLanes()!.liveHolders(["check"])).toBe(0);
+		// The turn that made the edit ended: the next look asks again, and nothing was remembered as already looked at.
+		h.controller.runLanes()!.releaseDirectorCalls(["e1"]);
+		await h.turn();
+		h.timers.fire();
+		await until(count);
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
+	}, 20_000);
+
+	test("a required check holds its entry from the look that starts it, through the state it loads, and an edit then is refused", async () => {
+		let hold: Promise<void> = Promise.resolve();
+		let free = (): void => undefined;
+		let h!: FakeSession;
+		const rig = dueChecks({ loadState: async () => (await hold, h.state) });
+		h = rig.h;
+		const runId = await rig.due();
+		const lanes = h.controller.runLanes()!;
+		hold = new Promise<void>(resolve => (free = resolve));
+		h.timers.fire();
+		await until(() => lanes.liveHolders(["check"]) === 1);
+		// The check has not run a command: it is still reading the approval, and the table already says it owns the tree.
+		expect(await rig.count()).toBe(false);
+		expect(editOf(h, "e1", ["src/a.ts"])).toMatchObject({ ok: false, code: "lane-write", holder: { kind: "check" } });
+		free();
+		await until(async () => (await readRun(h.sessionDir, runId))?.endReason === "verified");
+		expect(lanes.liveHolders(["check", "fence"])).toBe(0);
+	}, 20_000);
+
+	test("a run that is told to finish while the director edits keeps its lease, record and table until that edit is released", async () => {
+		const h = session();
+		const runId = await h.start();
+		const lanes = h.controller.runLanes()!;
+		expect(editOf(h, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(await h.controller.finish("no-changes")).toBeUndefined();
+		expect(getLedgerRun(runId)?.closing).toBe(true);
+		expect(h.controller.phase()).toBe("stopping");
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
+		expect(h.leases.released).toEqual([]);
+		// Nothing releases it but its turn's end: not the timer of the drain, however often it fires, and not the run ending.
+		for (let i = 0; i < 5; i++) {
+			h.timers.fire();
+			await Bun.sleep(5);
+		}
+		expect(h.leases.released).toEqual([]);
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+		expect(await readRun(h.sessionDir, runId)).toMatchObject({ status: "running" });
+		// The table still orders every writer against it while the run drains.
+		expect(lanes.commitDirectorExec({ callId: "c1", now: Date.now() })).toMatchObject({ ok: false, reason: expect.stringContaining(DIRECTOR_EDIT_ENDS) });
+		// A new edit is not committed once the run is ending, though the older one is held.
+		expect(editOf(h, "e2", ["src/b.ts"], { live: h.controller.liveCheck(h.ctx) })).toMatchObject({ ok: false, code: "run-ending" });
+		lanes.releaseDirectorCalls(["e1"]);
+		h.timers.fire();
+		await until(async () => (await readRun(h.sessionDir, runId))?.status === "ended");
+		await until(() => h.leases.released.length === 1);
+		expect(h.leases.released).toEqual([runId]);
+		expect(getLedgerRun(runId)).toBeUndefined();
+	});
+
+	test("a run that waits only for the director's own edit says so in its drain warning, once; any other wait keeps the generic sentence", async () => {
+		const warned = (h: FakeSession) => h.notices.filter(notice => notice.level === "warning").map(notice => notice.text);
+		// The director's edit is what holds the run: the warning names that call, and says what ends the wait.
+		const held = session();
+		await held.start();
+		expect(editOf(held, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		await held.controller.finish("no-changes", held.ctx);
+		// The wait is shorter than the limit the warning is about: nothing is said yet.
+		for (let i = 0; i < 5; i++) held.timers.fire();
+		expect(warned(held)).toEqual([]);
+		for (let i = 0; i < 40; i++) held.timers.fire();
+		expect(warned(held)).toEqual([DIRECTOR_DRAIN_WARNING]);
+		for (let i = 0; i < 5; i++) held.timers.fire();
+		expect(warned(held)).toEqual([DIRECTOR_DRAIN_WARNING]);
+		held.controller.runLanes()!.releaseDirectorCalls(["e1"]);
+		held.timers.fire();
+		await until(() => held.leases.released.length === 1);
+		// A worker that does not settle is the generic wait: its warning does not claim the director's call.
+		const agents = [agentEntry({ id: "Impl", role: "implementer", state: "running" })];
+		const busy = session({ agents });
+		await busy.start();
+		await busy.controller.finish("interrupted", busy.ctx);
+		for (let i = 0; i < 45; i++) busy.timers.fire();
+		const generic = warned(busy);
+		expect(generic).toHaveLength(1);
+		expect(generic[0]).not.toBe(DIRECTOR_DRAIN_WARNING);
+		agents[0]!.state = "idle";
+		busy.timers.fire();
+		await until(() => busy.leases.released.length === 1);
+	});
+
+	test("the proof a caller captures says the run is live only while it is: this run, not ending, this session", async () => {
+		const h = session();
+		const before = h.controller.liveCheck(h.ctx);
+		expect(before()).toMatchObject({ ok: false });
+		const runId = await h.start();
+		expect(before()).toMatchObject({ ok: false });
+		const proof = h.controller.liveCheck(h.ctx);
+		expect(proof()).toEqual({ ok: true });
+		// Another session's handle is not the owner.
+		const stranger = { ...h.ctx, sessionManager: { ...(h.ctx as unknown as { sessionManager: object }).sessionManager, getSessionId: () => "someone-else" } } as unknown as ExtensionContext;
+		expect(h.controller.liveCheck(stranger)()).toMatchObject({ ok: false, reason: DIRECTOR_WRITE_ENDING });
+		expect(h.controller.liveCheck()()).toEqual({ ok: true });
+		await h.controller.finish("no-changes");
+		await until(async () => (await readRun(h.sessionDir, runId))?.status === "ended");
+		expect(proof()).toEqual({ ok: false, reason: DIRECTOR_WRITE_ENDING });
+		// A later run in the same session is another run: a proof captured for the first never commits for the second.
+		await h.start();
+		expect(proof()).toMatchObject({ ok: false });
+		expect(h.controller.liveCheck(h.ctx)()).toEqual({ ok: true });
+		await h.controller.finish("no-changes");
+	});
+
+	test("a run that is ending commits no edit, and a stopping run's abort signal alone is enough to refuse one", async () => {
+		const agents = [agentEntry({ id: "Impl", role: "implementer", state: "running" })];
+		const h = session({ agents });
+		await h.start();
+		const proof = h.controller.liveCheck(h.ctx);
+		expect(await h.controller.finish("interrupted")).toBeUndefined();
+		expect(editOf(h, "e1", ["a.ts"], { live: proof })).toMatchObject({ ok: false, code: "run-ending" });
+		expect(h.controller.runLanes()!.liveHolders(["director-path"])).toBe(0);
+		agents[0]!.state = "idle";
+		h.timers.fire();
+		await until(() => h.leases.released.length === 1);
 	});
 });

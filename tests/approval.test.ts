@@ -6,9 +6,10 @@ import * as path from "node:path";
 import { resolveRepo } from "../src/approval/repo.ts";
 import { findShadows, unapprovedShadows } from "../src/approval/shadow.ts";
 import { ApprovalStore } from "../src/approval/store.ts";
+import { effectiveAgentTools, lanePolicy, shellReader } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import { loadProjectState } from "../src/state.ts";
-import type { ApprovalRecord, Exec, RepoIdentity, ShadowInfo, StormConfig } from "../src/types.ts";
+import type { ApprovalRecord, Exec, PlanLane, RepoIdentity, ShadowInfo, StormConfig } from "../src/types.ts";
 import { DEAD_PROCESS, teamOf } from "./fixtures.ts";
 import { exec, git } from "./support.ts";
 import { TEAM_08, TEAM_08_HASH, writeStore08 } from "./team-08.ts";
@@ -368,6 +369,40 @@ describe("findShadows", () => {
 			["user", "storm-reviewer", path.join(user, "foo.md")],
 		]);
 		expect(shadows[1]?.sha256).toBe(new Bun.CryptoHasher("sha256").update(agent("storm-reviewer")).digest("hex"));
+	});
+
+	test("adding the shell to an approved definition changes its hash, so the approval no longer covers it and the lane policy changes with it", async () => {
+		const user = path.join(tmp, "user-agents");
+		const plugin = path.join(tmp, "plugin", "agents");
+		const cwd = path.join(tmp, "work");
+		for (const d of [user, plugin, cwd]) await mkdir(d, { recursive: true });
+		const file = path.join(user, "explorer.md");
+		const body = (tools: string) => `---\nname: storm-explorer\ndescription: x\ntools: ${tools}\n---\nbody\n`;
+		await writeFile(file, body("read, grep, find"));
+		const before = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		expect(before).toHaveLength(1);
+		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", target: "t", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: before } };
+		expect(unapprovedShadows(approval, before)).toEqual([]);
+		const explore: PlanLane = { name: "scout", kind: "explore", role: "explorer" };
+		const plain = lanePolicy({ lane: explore, tools: effectiveAgentTools("storm-explorer", before, plugin), isolated: false, auto: false });
+		expect(shellReader(plain)).toBe(false);
+
+		// The user adds the shell: the same file now hashes differently and is no longer covered by the approval.
+		await writeFile(file, body("read, grep, find, bash"));
+		const after = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		expect(after[0]?.sha256).not.toBe(before[0]?.sha256);
+		expect(unapprovedShadows(approval, after)).toHaveLength(1);
+		// Storm reads the tool list from the file; with the shell it is a shell reader, which only an approved file may be.
+		const shell = lanePolicy({ lane: explore, tools: effectiveAgentTools("storm-explorer", after, plugin), isolated: false, auto: false });
+		expect(shell).toMatchObject({ kind: "read", shell: true });
+
+		// Approving the new content covers it again; taking the shell out again returns to the first hash.
+		const reapproved: ApprovalRecord = { ...approval, scope: { shadowedAgents: after } };
+		expect(unapprovedShadows(reapproved, after)).toEqual([]);
+		await writeFile(file, body("read, grep, find"));
+		const back = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		expect(back[0]?.sha256).toBe(before[0]?.sha256);
+		expect(unapprovedShadows(reapproved, back)).toHaveLength(1);
 	});
 
 	test("plugin's own definitions are never shadows", async () => {

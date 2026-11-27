@@ -1,4 +1,5 @@
 import { findScopedSettings, type Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgExtensionHandlersToolCallTimeoutMs } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import {
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
@@ -109,6 +110,26 @@ export function liveTaskMaxConcurrency(): number | undefined {
 		return taskMaxConcurrencyOf(findScopedSettings());
 	} catch {
 		return undefined;
+	}
+}
+
+/** What omp uses when the setting is missing or not a positive finite number (its own `EXTENSION_HANDLER_TIMEOUT_MS`). */
+export const HOST_HANDLER_TIMEOUT_MS = 30_000;
+
+/**
+ * The time omp gives one extension `tool_call` handler before it blocks the call, as the host computes it: the setting
+ * `extensionHandlers.toolCallTimeoutMs` of the live session's settings when it is a positive finite number, else 30 s. The
+ * host's own handler keeps running after it blocks, so the director's path edit takes this as its deadline: a continuation
+ * that reaches the commit after the host already blocked the call must not leave a hold for a call that never ran. An
+ * uninitialised host reads as the default.
+ */
+export function liveToolCallTimeoutMs(): number {
+	try {
+		const settings = findScopedSettings();
+		const value = settings === undefined ? undefined : cfgExtensionHandlersToolCallTimeoutMs.get(settings);
+		return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : HOST_HANDLER_TIMEOUT_MS;
+	} catch {
+		return HOST_HANDLER_TIMEOUT_MS;
 	}
 }
 

@@ -311,6 +311,32 @@ export function isPlanProposal(toolName: string, input: unknown): boolean {
 }
 
 /**
+ * The same gate during a run: the director may also change project files itself with a path tool (`edit`, `ast_edit`,
+ * `write` to a plain path, or another tool of `PATH_WRITE_TOOLS`), so those pass here and go on to the run's write
+ * table, which orders them against every other writer (`decideDirectorCall` names the files, or refuses). Everything
+ * else is judged as `supervisorToolBlock` does; before a plan the caller keeps using that one, so an automatic
+ * director still changes no file before a run exists. A `write` whose path is an address (`vault://`, `conflict://`,
+ * `ssh://`, `xd://`, any scheme, one embedded in the path) stays refused.
+ */
+export function supervisorRunToolBlock(
+	toolName: string,
+	input: unknown,
+	scope?: SupervisorScopeSource,
+	planMode = false,
+): string | undefined {
+	if (typeof toolName !== "string" || !Object.hasOwn(PATH_WRITE_TOOLS, toolName)) {
+		return supervisorToolBlock(toolName, input, scope, planMode);
+	}
+	if (toolName !== "write") return undefined;
+	const detail = writeBlock(input);
+	if (detail !== SUPERVISOR_REASONS.writeFiles) return detail;
+	// `writeBlock` answers `writeFiles` for every path it does not recognise as a message or a note: only a plain path is a project file.
+	const parsed = exactWriteInput(input);
+	const plain = parsed !== undefined && leadingScheme(parsed.path) === undefined && !/[a-z][a-z0-9+.-]*:\/\//i.test(parsed.path);
+	return plain ? undefined : detail;
+}
+
+/**
  * The refusal for a main-session tool call under automatic supervision, or undefined to let it run. Exact tool
  * names only: no prefix matching, no prototype names, no fallback for malformed input. `scope` names the agents of
  * this session's runs, so a transcript read stays inside them; without it no transcript is read.

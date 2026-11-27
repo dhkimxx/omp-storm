@@ -1,18 +1,30 @@
 import { createHash } from "node:crypto";
 import { withJosa } from "../josa.ts";
 import { BUILTIN_AGENT_ROLES, ROLES } from "../roles.ts";
-import { scopesOverlap, shellReviewer, type LanePolicy, WHY_EXEC_WRITER, WHY_SHELL_REVIEWER, WHY_UNDECLARED_WRITER } from "../policy/capability.ts";
+import { scopesOverlap, shellReader, shellReaderWhy, type LanePolicy, WHY_EXEC_WRITER, WHY_UNDECLARED_WRITER } from "../policy/capability.ts";
 import { activeAgents, releaseWorkerSlot, reservedWorkers, reserveWorkerSlot } from "../policy/spawn.ts";
 import type {
 	AgentEntry,
+	HolderKind,
 	LaneNeed,
 	LaneResultKind,
+	LiveCheck,
 	PlanLane,
 	RunPlan,
 	RunResult,
 	SpawnRecord,
 	StormConfig,
 } from "../types.ts";
+import {
+	DIRECTOR_EDIT_RETRY,
+	DIRECTOR_EDITING,
+	DIRECTOR_WRITE_ENDING,
+	DIRECTOR_WRITE_LATE,
+	DIRECTOR_WRITE_NO_TARGET,
+	directorEditWait,
+	directorWriteConflict,
+	type HolderView,
+} from "./arbiter.ts";
 import { requirementConflictFromPlan } from "./requirements.ts";
 
 interface Assignment {
@@ -44,15 +56,45 @@ interface LaneHold {
 export type LaneBlockCode = "lane-dependency" | "lane-write" | "lane-capability" | "lane-job" | "lane-capacity" | "lane-busy";
 
 /**
- * Who holds an entry of the write table besides a worker (an entry with no kind). Every one of them can change the shared
- * tree without naming a path, so each is an `unknown` scope and conflicts with every other shared writer:
+ * Who holds an entry of the write table besides a worker (an entry with no kind); the type is in `types.ts`. Every kind but
+ * `director-path` can change the shared tree without naming a path, so it is an `unknown` scope and conflicts with every other
+ * shared writer:
+ * - `director-path`: the director's own path edit (`edit`, `write`, `ast_edit`). Its scope is the exact paths of the call, keyed by
+ *   the host's tool call id; it is released only by the end of the assistant turn that made the call (`releaseDirectorCalls`).
  * - `director-exec`: the director's own command (shell, an editing `lsp` action, MCP and unknown tools), from its call's
  *   start to the end of that call.
  * - `director-bg`: a command of the director that omp moved to the background; the host's own job table says when it ends.
  * - `job`, `check`: a host process Storm runs, a configured job or a required check.
  * - `fence`: one of those whose process end is not proven.
  */
-export type HolderKind = "director-exec" | "director-bg" | "job" | "check" | "fence";
+export type { HolderKind };
+
+/** The tool call id the table keys a director path edit by. */
+function directorKey(callId: string): string {
+	return `director:${callId}`;
+}
+
+/** One director path edit asking for the table (see `RunLanes.commitWriter`). */
+export interface CommitWriterRequest {
+	kind: "director-path";
+	/** The host's tool call id; it keys the entry and is the only thing that releases it. */
+	callId: string;
+	/** The exact workspace-relative paths the call writes. A directory scope is the directory's path. */
+	paths: readonly string[];
+	/** The caller's proof that the run it captured before its awaits is still the live one; evaluated inside the step. */
+	live: () => LiveCheck;
+	/** Absolute ms; the step refuses at or after it. */
+	deadline?: number;
+	now: number;
+	/** The host's agent list, applied to the table in the same step (a worker already settled does not hold the tree). */
+	agents?: readonly AgentEntry[] | undefined;
+}
+
+/** `lane-write`: another writer holds the tree. `run-ending`: `live` said no. `deadline`: the hook's time was up. `no-target`: nothing to bound. */
+export type CommitWriterResult =
+	| { ok: true }
+	| { ok: false; code: "lane-write"; reason: string; holder: HolderView }
+	| { ok: false; code: "run-ending" | "deadline" | "no-target"; reason: string };
 
 /** One row of the host's async job snapshot, as far as the arbiter reads it. */
 export interface HostJobRow {
@@ -109,7 +151,28 @@ export interface TaskPlacementOptions {
 	agents?: readonly AgentEntry[];
 	/** The host's tool-call id: its failure releases exactly the placements this call made. */
 	callId?: string;
+	/**
+	 * Text to append to one task item's assignment, decided per item from its lane (absent for an item that matches none) and
+	 * whether placement runs it in an isolated checkout. It is appended after the dependency note, to the item's `task` or, when
+	 * the item has `steps` (the host sends `steps` instead of `task`), to the first of them. It is called only for a batch that is
+	 * accepted: a refused call leaves every item untouched. Nothing returned, or an empty text, appends nothing.
+	 */
+	decorate?: (entry: { lane: PlanLane | undefined; isolated: boolean }) => string | undefined;
 	now?: number;
+}
+
+/**
+ * Appends a note to what a worker is told to do: the item's `steps` when it has them (the host sends `steps` instead of `task`,
+ * and its first element is the first prompt), else its `task`. An item with neither a usable `steps` nor a non-empty `task` is
+ * returned as it was: omp refuses it and there is no assignment to add to.
+ */
+function appendedAssignment(item: Record<string, unknown>, text: string): Record<string, unknown> {
+	const steps = item.steps;
+	if (Array.isArray(steps) && typeof steps[0] === "string" && steps[0].trim() !== "") {
+		return { ...item, steps: [`${steps[0].trimEnd()}\n\n${text}`, ...steps.slice(1)] };
+	}
+	if (typeof item.task === "string" && item.task.trim() !== "") return { ...item, task: `${item.task.trimEnd()}\n\n${text}` };
+	return item;
 }
 
 /** One required result of a prerequisite lane, as the run's own result ledger currently knows it. */
@@ -684,7 +747,7 @@ const WRITING_KINDS: Readonly<Record<string, true>> = { code: true, run: true };
  * a private checkout is private, canonical paths may run beside disjoint paths, and an unknown policy is exclusive.
  * Without a policy (legacy/manual callers) declared files narrow a shared write, a write-capable role or a
  * change/artifact obligation without files is unknown, and only a genuinely read-only role is parallel with writers.
- * A review lane that may run commands is ordered like an unknown writer (a command can change the tree). Automatic
+ * A read lane that may run commands (a review lane or any other) is ordered like an unknown writer (a command can change the tree). Automatic
  * delegation does not change any of this: the scope follows the agent's tools and the lane's declared files.
  */
 function writeScope(
@@ -696,7 +759,8 @@ function writeScope(
 ): WriteScope {
 	if (isolated) return { kind: "private" };
 	if (policy !== undefined) {
-		if (policy.kind === "read") return shellReviewer(policy) ? { kind: "unknown", why: WHY_SHELL_REVIEWER } : { kind: "read" };
+		// A read lane that may run commands is ordered like an unknown writer; its reason names a review lane or any other read lane.
+		if (policy.kind === "read") return shellReader(policy) ? { kind: "unknown", why: shellReaderWhy(lane) } : { kind: "read" };
 		if (policy.kind === "private") return { kind: "private" };
 		if (policy.kind === "unknown") return { kind: "unknown", why: policy.reason };
 		// A blocked lane is refused before any placement; if one ever gets here it is treated as an unbounded writer.
@@ -736,6 +800,8 @@ function conflictText(
 	other: string,
 	otherScope: WriteScope,
 	sameCall = false,
+	/** The other writer is the director's own path edit: it ends with the message that made it, not with a worker's end. */
+	directorEdit = false,
 ): string {
 	const who = lane === undefined ? `${agent} 직접 작업` : `'${lane.name}' 레인`;
 	const declared = (lane?.files?.length ?? 0) > 0;
@@ -757,7 +823,9 @@ function conflictText(
 	}
 	const next = sameCall
 		? "이 호출에는 쓰기 작업을 하나만 담고 나머지는 끝난 뒤 보내세요. 읽기 전용 레인은 함께 보내도 됩니다."
-		: `${withJosa(other, "이/가")} 끝난 뒤 같은 호출을 다시 보내세요. ${WRITE_ORDER_CHECK}`;
+		: directorEdit
+			? DIRECTOR_EDIT_RETRY
+			: `${withJosa(other, "이/가")} 끝난 뒤 같은 호출을 다시 보내세요. ${WRITE_ORDER_CHECK}`;
 	return `${head} ${next}`;
 }
 
@@ -769,6 +837,8 @@ function earlierWriter(lane: string | undefined): string {
 /** What one entry of the write table is, as a noun phrase a refusal names. */
 function heldBy(entry: { kind?: HolderKind; lane?: string }): string {
 	switch (entry.kind) {
+		case "director-path":
+			return DIRECTOR_EDITING;
 		case "director-exec":
 			return "감독이 실행 중인 명령";
 		case "director-bg":
@@ -785,7 +855,7 @@ function heldBy(entry: { kind?: HolderKind; lane?: string }): string {
 }
 
 /** The scope every non-worker holder has: it can change the shared tree anywhere. */
-function holderScope(kind: HolderKind): WriteScope {
+function holderScope(kind: Exclude<HolderKind, "director-path">): WriteScope {
 	return { kind: "unknown", why: kind === "director-exec" || kind === "director-bg" ? WHY_DIRECTOR_COMMAND : WHY_HOST_COMMAND };
 }
 
@@ -1162,12 +1232,21 @@ export class RunLanes {
 		// batch leaves no partial spawn, reservation or assignment behind.
 		const gate = this.#gate(placed, options);
 		if (!gate.ok) return gate;
+		// The caller's per-item text is asked for only now, for a call that is accepted, and before anything is reserved: a
+		// hook that fails costs the item its note, never a half-placed call.
+		const extras = placed.map(entry => {
+			try {
+				return options.decorate?.({ lane: entry.lane, isolated: entry.desired === true })?.trim();
+			} catch {
+				return undefined;
+			}
+		});
 		// A worker of this call that settles is free only when the call itself has ended (see `callEnded`).
 		if (options.callId !== undefined) this.#openCalls.add(options.callId);
 		const notes = gate.notes;
 		const now = options.now ?? Date.now();
 		const pinned = new Set<string>();
-		const mapped = placed.map(entry => {
+		const mapped = placed.map((entry, index) => {
 			// A caller's effort or model would outrank what the spawn hook answers with: the approved values stand.
 			let next = withoutPinnedFields(withIsolation(entry.item, entry.desired), pinned);
 			const placement = ++this.#placementSerial;
@@ -1180,9 +1259,10 @@ export class RunLanes {
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
 			const refs = entry.lane === undefined ? undefined : dependencyRefs(entry.lane, options.readiness);
-			if (refs !== undefined && typeof next.task === "string" && next.task.trim() !== "") {
-				next = { ...next, task: `${next.task.trimEnd()}\n\n${refs}` };
-			}
+			if (refs !== undefined) next = appendedAssignment(next, refs);
+			// The caller's own text for this item (the lane's result contract); it goes where the dependency note goes.
+			const extra = extras[index];
+			if (extra !== undefined && extra !== "") next = appendedAssignment(next, extra);
 			this.#reserveWrite(entry, now, placement, options.callId);
 			if (entry.lane !== undefined) {
 				const handle = typeof next.name === "string" ? next.name : undefined;
@@ -1307,7 +1387,7 @@ export class RunLanes {
 				if (key === bound?.key || key === ownKey || reservation.agentId === spawnKey) continue;
 				if (!scopesConflict(scope, reservation.scope)) continue;
 				const other = heldBy(reservation);
-				const reason = conflictText(lane, agent, scope, other, reservation.scope);
+				const reason = conflictText(lane, agent, scope, other, reservation.scope, false, reservation.kind === "director-path");
 				this.#releaseSpawn(spawnKey, laneName, "refused");
 				return { ok: false, code: "lane-write", reason };
 			}
@@ -1417,7 +1497,7 @@ export class RunLanes {
 			for (const reservation of this.#writes.values()) {
 				if (!scopesConflict(scope, reservation.scope)) continue;
 				const other = heldBy(reservation);
-				return { ok: false, code: "lane-write", retry: true, reason: conflictText(entry.lane, entry.agent, scope, other, reservation.scope) };
+				return { ok: false, code: "lane-write", retry: true, reason: conflictText(entry.lane, entry.agent, scope, other, reservation.scope, false, reservation.kind === "director-path") };
 			}
 		}
 		return { ok: true, notes };
@@ -1615,7 +1695,8 @@ export class RunLanes {
 		if (reservation === undefined && lane === undefined) {
 			// A placement that names a different handle than the host's id is another spawn's: only an unnamed one, or one
 			// whose handle omp's id is (with its `-2` duplicate suffix, under a nested parent's prefix), can be this child's.
-			const unbound = [...this.#writes].filter(([, item]) => item.agentId === undefined && handleMatches(item.name, agentId));
+			// Only a worker's placement can be adopted: a holder of another kind (a director edit, a job) never belongs to a spawn.
+			const unbound = [...this.#writes].filter(([, item]) => item.kind === undefined && item.agentId === undefined && handleMatches(item.name, agentId));
 			if (unbound.length === 1) {
 				key = unbound[0]![0];
 				reservation = unbound[0]![1];
@@ -1756,6 +1837,8 @@ export class RunLanes {
 		this.#pruneWrites(input.agents, input.now);
 		for (const reservation of this.#writes.values()) {
 			if (reservation.kind === "director-exec" || reservation.kind === "director-bg") continue;
+			// The director's own path edit holds until its message's calls are over; say so rather than "wait for it".
+			if (reservation.kind === "director-path") return { ok: false, reason: directorEditWait("감독의 명령") };
 			const other = heldBy(reservation);
 			return {
 				ok: false,
@@ -1778,6 +1861,7 @@ export class RunLanes {
 		this.#pruneWrites(input.agents, input.now);
 		for (const [key, reservation] of this.#writes) {
 			if (key === `${input.kind}:${input.key}`) continue;
+			if (reservation.kind === "director-path") return { ok: false, reason: directorEditWait(input.kind === "job" ? "정형 작업" : "필수 검사") };
 			const other = heldBy(reservation);
 			return {
 				ok: false,
@@ -1797,6 +1881,103 @@ export class RunLanes {
 	fenceHolder(kind: "job" | "check", key: string): void {
 		this.#writes.delete(`${kind}:${key}`);
 		this.#writes.set(`fence:${key}`, { scope: holderScope("fence"), kind: "fence", at: Date.now() });
+	}
+
+	/** What a refusal reads of one entry: its kind and, for a worker, its lane and how far it got. */
+	#view(reservation: WriteReservation): HolderView {
+		return {
+			...(reservation.kind === undefined ? {} : { kind: reservation.kind }),
+			...(reservation.lane === undefined ? {} : { lane: reservation.lane }),
+			...(reservation.agentId === undefined ? {} : { agentId: reservation.agentId }),
+			...(reservation.awaiting === true ? { awaiting: true } : {}),
+		};
+	}
+
+	/**
+	 * The one commit step of a director path edit, to be called after the caller's last `await` and with nothing that yields
+	 * between this call and the tool running. In this order, in one synchronous run: the caller's own proof that the run is still
+	 * the live one (`live`: the run object it captured is still the controller's, nothing is ending, the signal is not aborted, the
+	 * session and generation are unchanged); the hook's deadline, if it gave one; the table brought in line with the agent list and
+	 * the host's job rows; every live entry against the call's exact paths; and then the entry.
+	 *
+	 * An entry conflicts when it cannot be bounded (a worker with a shell or an unknown scope in any of its states, a placement or
+	 * a follow-up not yet started, a job, a check, a fence, the director's own command or its background command) or when it is a
+	 * worker whose files overlap these paths. A worker on other files does not, and neither does another path edit of the
+	 * director: it is the same actor, and omp runs its path tools one at a time.
+	 *
+	 * The entry is keyed by the tool call id and ends only with `releaseDirectorCalls`: never by a timer, a prune, the end of the
+	 * run or a switch of session. A refusal creates nothing; its `reason` is the sentence the director reads (the block code is
+	 * `director-write`, see `directorWriteBlock`). A caller that commits the same call twice keeps one entry holding both path lists.
+	 */
+	commitWriter(input: CommitWriterRequest): CommitWriterResult {
+		let proof: LiveCheck;
+		try {
+			proof = input.live();
+		} catch {
+			proof = { ok: false, reason: DIRECTOR_WRITE_ENDING };
+		}
+		if (!proof.ok) return { ok: false, code: "run-ending", reason: proof.reason };
+		if (input.deadline !== undefined && !(input.now < input.deadline)) return { ok: false, code: "deadline", reason: DIRECTOR_WRITE_LATE };
+		const paths = [...new Set(input.paths.filter(path => path !== ""))].sort();
+		if (paths.length === 0) return { ok: false, code: "no-target", reason: DIRECTOR_WRITE_NO_TARGET };
+		this.#pruneWrites(input.agents, input.now);
+		const scope: WriteScope = { kind: "paths", paths };
+		const own = directorKey(input.callId);
+		for (const [key, reservation] of this.#writes) {
+			if (key === own || reservation.kind === "director-path") continue;
+			if (!scopesConflict(scope, reservation.scope)) continue;
+			const holder = this.#view(reservation);
+			return { ok: false, code: "lane-write", reason: directorWriteConflict(holder), holder };
+		}
+		const existing = this.#writes.get(own);
+		const merged = existing?.scope.kind === "paths" ? [...new Set([...existing.scope.paths, ...paths])].sort() : paths;
+		this.#writes.set(own, { scope: { kind: "paths", paths: merged }, kind: "director-path", callId: input.callId, at: input.now });
+		return { ok: true };
+	}
+
+	/**
+	 * A director call that is already running turned out to write more than Storm was shown when it entered the table (an extension
+	 * loaded after Storm rewrote its arguments). It cannot be refused any more, so the files it really writes are held with it from now
+	 * on, whatever else holds them: a hold without the conflict loop, for a call that has started. `["."]` holds the whole tree.
+	 * Nothing happens for a call the table does not hold. Returns whether the entry was widened.
+	 */
+	widenDirectorCall(callId: string, paths: readonly string[]): boolean {
+		const key = directorKey(callId);
+		const existing = this.#writes.get(key);
+		if (existing === undefined || existing.kind !== "director-path" || existing.scope.kind !== "paths") return false;
+		existing.scope = { kind: "paths", paths: [...new Set([...existing.scope.paths, ...paths.filter(path => path !== "")])].sort() };
+		return true;
+	}
+
+	/** The paths an entry of the director's call holds now, or undefined when the table does not hold that call. */
+	directorCallPaths(callId: string): readonly string[] | undefined {
+		const held = this.#writes.get(directorKey(callId));
+		return held?.kind === "director-path" && held.scope.kind === "paths" ? held.scope.paths : undefined;
+	}
+
+	/**
+	 * The end of the assistant turn (or of the agent's run) that made these director tool calls: the one event that releases a
+	 * director path edit. The caller passes the ids contained in the payload of that very event (`directorCallIds`), so an old
+	 * loop's late end cannot release the hold of a newer turn; an id nobody holds changes nothing. Returns how many entries ended.
+	 */
+	releaseDirectorCalls(callIds: Iterable<string>): number {
+		let released = 0;
+		for (const callId of callIds) {
+			const key = directorKey(callId);
+			if (this.#writes.get(key)?.kind !== "director-path") continue;
+			this.#writes.delete(key);
+			released++;
+		}
+		return released;
+	}
+
+	/** The tool call ids of every director path edit the table holds now. */
+	directorCalls(): string[] {
+		const ids: string[] = [];
+		for (const reservation of this.#writes.values()) {
+			if (reservation.kind === "director-path" && reservation.callId !== undefined) ids.push(reservation.callId);
+		}
+		return ids;
 	}
 
 	/** Entries of the given kinds that are live now (after the host's job rows were applied). */
@@ -1989,7 +2170,7 @@ export class RunLanes {
 			if (!scopesConflict(scope, reservation.scope)) continue;
 			const other = heldBy(reservation);
 			const wake = input.progress === true ? " 이 진행 메모는 대기 중인 워커의 새 턴을 시작시킬 수 있어 보내지 않았습니다." : "";
-			return { ok: false, reason: `${conflictText(lane, input.agent, scope, other, reservation.scope)}${wake}`, code: "lane-write" };
+			return { ok: false, reason: `${conflictText(lane, input.agent, scope, other, reservation.scope, false, reservation.kind === "director-path")}${wake}`, code: "lane-write" };
 		}
 		const key = lane !== undefined ? `lane:${lane.name}` : `spawn:${input.agentId}`;
 		const existing = this.#writes.get(key);

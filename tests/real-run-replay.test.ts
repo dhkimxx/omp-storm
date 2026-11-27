@@ -26,6 +26,12 @@
  *                         (the real session's case): the lane starts with a note. The same five calls still meet the
  *                         running Body writer, so they are refused by the write order, with that cause named
  *
+ * Phase 2 (0.28.0) leaves that count where it was and adds what the session lacked, none of it a refusal of the 14: every
+ * implementer in this session has a shell, so the write order (G1) is unchanged and the same 10 of the 11 refusals in the window
+ * remain. What moves is around them. The director's own one-line fix, which the director could never make, is now an edit the
+ * write table takes or refuses by name (14:25:30: refused while Body, a shell writer, runs); a placed worker is told its lane's
+ * result contract (14:20:28); and the director's edit passes the supervisor gate during a run (14:25:04).
+ *
  * Tests assert behaviour: states, codes, which lanes a text names, what the ledger records. Set `REPLAY_TRANSCRIPT=1`
  * to print what Storm says at each moment.
  */
@@ -34,11 +40,12 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { lanePolicy, type LanePolicy, WHY_AUTO_WRITER, WHY_EXEC_WRITER } from "../src/policy/capability.ts";
-import { SUPERVISOR_REASONS, supervisorToolBlock } from "../src/policy/supervisor.ts";
+import { SUPERVISOR_REASONS, supervisorRunToolBlock, supervisorToolBlock } from "../src/policy/supervisor.ts";
 import { validatePlan } from "../src/plan/validate.ts";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { AttemptCollector } from "../src/runtime/attempt-collector.ts";
 import { ATTEMPT_REF } from "../src/runtime/attempt-report.ts";
+import { CONTRACT_TAG, laneContractText } from "../src/runtime/contract-text.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
 import { resetLedger } from "../src/runtime/ledger.ts";
 import { dependencyStart, RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
@@ -290,15 +297,25 @@ async function place(at: string, names: string[], isolationEnabled: boolean | un
 	clock.t = KST(at);
 	lastPlacedAt = at;
 	const readiness = needed(current).size === 0 ? undefined : await h.controller.laneReadiness(current, needed(current));
+	contractsGiven.clear();
 	return lanes.assign(taskCall(...names), current, h.config, {
 		host: { enabled: isolationEnabled },
 		policies: policiesOf(current),
+		// 0.28.0: each placed item carries its own lane's result contract (asked only for a call that is accepted).
+		decorate: ({ lane, isolated }) => {
+			const text = lane === undefined ? undefined : laneContractText(lane, { isolated });
+			if (lane !== undefined && text !== undefined) contractsGiven.set(lane.name, text);
+			return text;
+		},
 		...(readiness === undefined ? {} : { readiness }),
 		agents,
 		callId: `call-${at}`,
 		now: clock.t,
 	});
 }
+
+/** The contract block each item of the last placed call was given, by lane (cleared at every placement). */
+const contractsGiven = new Map<string, string>();
 
 /** Every refusal this replay met, by the real session's clock, for the count at the end. */
 const refusalsMet = new Map<string, string>();
@@ -468,7 +485,12 @@ describe("14:16 to 14:22: the plan step and the first refusals", () => {
 		await start("14:20:28", ["BuildGemmaBodyQat"]);
 		const body = agentOf("BuildGemmaBodyQat");
 		expect(body).toMatch(/-lane-1$/);
+		// 0.28.0: the accepted call's worker was told what Storm will judge it on: its lane's result and how.
+		expect(contractsGiven.get("BuildGemmaBodyQat")).toContain(CONTRACT_TAG);
+		expect(contractsGiven.get("BuildGemmaBodyQat")).toContain(BODY_RESULT.id);
 		const head = refused(await place("14:20:50", ["BuildGemmaQatHead"]));
+		// A refused call is never asked for a block: nothing of it was told to anyone.
+		expect([...contractsGiven.keys()]).toEqual([]);
 		say("14:20:50", "task call refused", head.reason);
 		expect(head.code).toBe("lane-write");
 		expect(head.reason).toContain("'BuildGemmaBodyQat' 레인");
@@ -529,10 +551,26 @@ describe("14:23 to 14:31: results of follow-ups reach the ledger, and the depend
 	test("14:25:04 the director's quiet progress note to the running implementer passes the director gate (it was refused as a project tool)", () => {
 		const note = { path: `agent://${agentOf("BuildGemmaBodyQat")}?progress`, content: "the head candidates are separate: no action needed" };
 		// The real refusal read "[storm:auto] … the main session does not use project tools"; a status note is a message.
-		expect(supervisorToolBlock("write", note)).toBeUndefined();
-		// What stays refused has its own cause: a file edit and a command are not notes.
-		expect(supervisorToolBlock("bash", { command: "ls" })).toContain(SUPERVISOR_REASONS.toolRuns);
+		expect(supervisorRunToolBlock("write", note)).toBeUndefined();
+		// What stays refused has its own cause: a command is not a note.
+		expect(supervisorRunToolBlock("bash", { command: "ls" })).toContain(SUPERVISOR_REASONS.toolRuns);
+		// 0.28.0: during a run a file edit is no longer refused by the gate; it goes on to the write table (the next test). Before a
+		// plan has opened a run the gate is unchanged: the director changes no file then.
+		expect(supervisorRunToolBlock("edit", { path: "a.ts" })).toBeUndefined();
 		expect(supervisorToolBlock("edit", { path: "a.ts" })).toContain(SUPERVISOR_REASONS.toolEdits);
+	});
+
+	test("14:25:30 (not in the real run) the director's own one-line fix meets the write order: refused while the shell writer runs, naming it", () => {
+		// Phase 2 (0.28.0): the director may fix a file itself during a run, as one more writer of the table that orders the three
+		// implementers. Body has a shell, so it cannot be bounded (G1): the edit is refused with the lane named, and nothing is held.
+		const edit = { kind: "director-path" as const, callId: "call-director-fix", paths: ["src/readme.md"], live: () => ({ ok: true as const }), now: clock.t, agents };
+		const refusal = lanes.commitWriter(edit);
+		expect(refusal.ok).toBe(false);
+		if (refusal.ok) return;
+		expect(refusal.code).toBe("lane-write");
+		expect(refusal.reason).toContain("'BuildGemmaBodyQat' 레인");
+		expect(lanes.directorCalls()).toEqual([]);
+		say("14:25:30", "the director's own edit refused", refusal.reason);
 	});
 
 	test("14:25:55 the explorer's answer is delivered; 14:26:51 the follow-up to it is delivered at 14:27:06 and is recorded", async () => {
@@ -764,7 +802,7 @@ describe("how many of the session's refusals are left", () => {
 		const line = (kind: string) => `${left.filter(item => item.kind === kind).length}/${REAL.filter(item => item.kind === kind).length}`;
 		say(
 			"summary",
-			"refusals of the real session left after phase 1 (window 14:18 to 14:54)",
+			"refusals of the real session left after phase 2 (window 14:18 to 14:54)",
 			`write order ${line("write order")}, prerequisite ${line("prerequisite")}, automatic ${line("automatic")}: ${left.length} of ${REAL.length} remain; gone: ${gone.map(item => item.at).join(", ")}`,
 		);
 	});

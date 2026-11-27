@@ -25,7 +25,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { contractPlan, requiredResult } from "./contract-fixture.ts";
-import { cancelAll, LlmCursor, prepare, startFakeLlm, type Step, Suite } from "./harness.ts";
+import { cancelAll, LlmCursor, prepare, startFakeLlm, type Step, StormFiles, Suite, until } from "./harness.ts";
 import { installProfile, runRequest, Sessions, setOmpSettings } from "./phase1-kit.ts";
 import { FACT_FILE, seedFact } from "./typed-fixture.ts";
 
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
 	await suite.step("approved team, automatic delegation off", async () => {
 		const { teams } = await sessions.approve("off");
 		check("the isolated profile has one approved team", teams === 1, `approvals=${teams}`);
-	}, 120_000);
+	}, 120_000, { always: true });
 
 	await suite.step("A: a worker's background command that ignores termination, then a second writer", async () => {
 		await sessions.open(cancelAll, async (rpc, files) => {
@@ -262,6 +262,76 @@ async function main(): Promise<void> {
 			check("the eval cell ran and its helper call was journaled as a completion entry", usage !== undefined && cell !== undefined, JSON.stringify({ usage: usage?.purpose, cell: cell !== undefined, rows: rows.map(row => row.type).slice(-12) }));
 			check("the entry is written no later than the cell's result", usageAt !== undefined && cellAt !== undefined && usageAt <= cellAt, JSON.stringify({ usageAt, cellAt }));
 			check("the run counted it, and the total is not marked a floor", (run.spend?.evalUsd ?? 0) > 0 && run.spend?.lowerBound !== true, JSON.stringify(run.spend ?? null));
+		});
+	}, 300_000);
+
+	await suite.step("H: with Storm loaded, the call ids of the turn end are the ids the hook saw, and the hook comes first, then the message's own end, then the execution", async () => {
+		const log = join(env.work, "edit-probe.jsonl");
+		env.childEnv.EDIT_PROBE_LOG = log;
+		try {
+			await sessions.open(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					contractPlan([{ name: "HA", kind: "code", role: "implementer", files: ["h-a.txt"], goal: "write h-a.txt", results: [changeFor("h-change", "h-a.txt")] }], { contract: true, workers: { implementer: 1 } }),
+					{ calls: [{ call: "write", args: { path: "h-1.txt", content: "one\n" } }, { call: "write", args: { path: "h-2.txt", content: "two\n" } }] },
+					{ call: "write", args: { path: "h-3.txt", content: "three\n" } },
+				];
+				const before = files.runIds();
+				await rpc.prompt(runRequest(steps), 120_000);
+				await files.finishedRun(before, 90_000);
+			}, ["-e", join(import.meta.dir, "edit-probe-plugin.ts")]);
+		} finally {
+			delete env.childEnv.EDIT_PROBE_LOG;
+		}
+		type Row = { ev: string; id?: string; ids?: string[]; resultIds?: string[]; tool?: string };
+		const rows = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Row) : [];
+		const hooked = rows.filter(row => row.ev === "tool_call" && row.tool === "write").map(row => row.id as string);
+		const ended = new Set(rows.filter(row => row.ev === "turn_end").flatMap(row => row.ids ?? []));
+		const resulted = new Set(rows.filter(row => row.ev === "turn_end").flatMap(row => row.resultIds ?? []));
+		fact("H", { hooked, turnEndIds: [...ended], turnEndResultIds: [...resulted] });
+		check("three director writes were hooked, with an id each", hooked.length === 3 && hooked.every(id => typeof id === "string" && id !== ""), JSON.stringify(hooked));
+		check("every id the hook saw is among the calls of a turn_end, and among that turn's results: the release by id has something to match", hooked.every(id => ended.has(id) && resulted.has(id)), JSON.stringify({ hooked, ended: [...ended], resulted: [...resulted] }));
+		// The order the whole release rests on (decision D2, amended): the hook of a message's calls, then the message's own end, then execution.
+		const order = hooked.map(id => ({ hook: rows.findIndex(row => row.ev === "tool_call" && row.id === id), end: rows.findIndex(row => row.ev === "message_end" && row.ids?.includes(id)), start: rows.findIndex(row => row.ev === "tool_execution_start" && row.id === id) }));
+		check("for every call: its hook came before its message's own message_end, and that before the call started", order.every(entry => entry.hook >= 0 && entry.end > entry.hook && entry.start > entry.end), JSON.stringify(order));
+	}, 240_000);
+
+	await suite.step("I: omp shuts down while the director's edit is held (an unclean turn): it exits cleanly, the run is left running, and the next start closes it", async () => {
+		const llm = new LlmCursor(env);
+		let runId: string | undefined;
+		let sessionId = "";
+		const closedAt = { before: 0, after: 0 };
+		await sessions.open(cancelAll, async (rpc, files) => {
+			sessionId = rpc.sessionId;
+			const steps: Step[] = [
+				contractPlan([{ name: "IA", kind: "code", role: "implementer", files: ["i-a.txt"], goal: "write i-a.txt", results: [changeFor("i-change", "i-a.txt")] }], { contract: true, workers: { implementer: 1 } }),
+				// The second call is refused (outside the tree): the message is unclean and its first edit stays held; the step after it is held at the provider.
+				{ calls: [{ call: "write", args: { path: "i-1.txt", content: "held\n" } }, { call: "write", args: { path: join(env.work, "i-outside.txt"), content: "x" } }] },
+				{ read: FACT_FILE, pauseMs: 8_000 },
+			];
+			const before = files.runIds();
+			rpc.send({ type: "prompt", message: runRequest(steps) });
+			await until(() => (llm.of("main").some(entry => entry.decision.tool === "read" && JSON.stringify(entry.decision.args ?? {}).includes(FACT_FILE)) ? true : undefined), 60_000, "the step after the unclean message");
+			await Bun.sleep(500);
+			rpc.send({ type: "abort" });
+			await Bun.sleep(1_500);
+			runId = files.runs().find(candidate => !before.has(candidate.runId))?.runId;
+			check("the run is still running with the director's edit held (no completed answer came)", runId !== undefined && files.run(runId)?.status === "running", String(runId));
+			closedAt.before = Date.now();
+		});
+		closedAt.after = Date.now();
+		const exit = sessions.exitCodes.at(-1);
+		const after = runId === undefined ? undefined : new StormFiles(env, sessionId).run(runId);
+		fact("I-shutdown", { exit, ms: closedAt.after - closedAt.before, status: after?.status, endReason: after?.endReason });
+		check("omp exited cleanly and promptly although the edit was held", exit === 0 && closedAt.after - closedAt.before < 20_000, `exit=${exit} ${closedAt.after - closedAt.before} ms`);
+		check("the held edit kept the run from writing its final record: it still says running", after?.status === "running", JSON.stringify({ status: after?.status, endReason: after?.endReason }));
+		await sessions.open(cancelAll, async (_rpc, files) => {
+			const swept = await until(() => {
+				const run = runId === undefined ? undefined : files.run(runId);
+				return run?.status === "stopped" ? run : undefined;
+			}, 30_000, "the run swept at the next start");
+			fact("I-restart", { status: swept.status, endReason: swept.endReason });
+			check("the next start closed that run: it says the host ended while it was going", swept.endReason === "host-ended", `${swept.status}/${swept.endReason}`);
+			check("and the director's file is in the tree (the edit that was held did run)", existsSync(join(env.project, "i-1.txt")), "");
 		});
 	}, 300_000);
 

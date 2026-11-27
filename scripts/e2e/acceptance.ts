@@ -51,6 +51,7 @@ import { answerReviewReceipt } from "../../src/runtime/answer-review.ts";
 import { reviewEvidenceOf } from "../../src/runtime/review.ts";
 import type { AgentEntry, RunRecord, RunSummary } from "../../src/types.ts";
 import { contractPlan, type ContractLane, type LaneResultKind, requiredResult } from "./contract-fixture.ts";
+import { FACT_CLAIM, FACT_FILE, FACT_LINE, seedFact } from "./typed-fixture.ts";
 import {
 	type Answer,
 	cancelAll,
@@ -94,6 +95,8 @@ interface Observation {
 }
 
 const env = prepare("storm-e2e-acceptance", 18781);
+// The tracked, typed answer fixture the 0.28.0 contract-delivery cases cite (committed, so the tree stays clean).
+seedFact(env.project);
 const suite = new Suite(`E2E acceptance (${mode})`, env);
 const check = suite.check.bind(suite);
 /** The one native session whose approved team every case resumes. */
@@ -783,6 +786,64 @@ async function main(): Promise<void> {
 	const qualitativeTarget = "acceptance-qualitative.md";
 	const qualitativeText = "The user report already records total 42; nothing needs rewriting, and this submission explains why.";
 	const qualitativeWrite = Buffer.from(`printf '%s\\n' '${qualitativeText}' > ${qualitativeTarget}`, "utf8").toString("base64");
+
+	if (CONTRACT) {
+		// 0.28.0: each worker is sent its lane's result contract. The child's own first message is what the fake provider logged.
+		const CITED_ANSWER = `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${FACT_CLAIM}`;
+		const contractLane = (name: string, id: string) => ({
+			name,
+			kind: "explore" as const,
+			goal: "Report the first line of the tracked answer file from source",
+			results: [requiredResult(id, "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE })],
+		});
+		const stepsRoute = (steps: Step[]): string => runRequest(steps, 1);
+		/** The first message a child of this run received from its parent: the assignment as it reached the model. */
+		const firstMessageOf = (llm: LlmCursor, marker: string): string => llm.of("child").find(entry => entry.lastUser.includes(marker))?.lastUser ?? "";
+		const delivered = (text: string, id: string): boolean => text.includes("[storm:계약]") && text.includes(id) && !text.includes(FACT_LINE);
+
+		await suite.step("T07: the lane's result contract reaches the child on a task item: its id is in the assignment, the literal the answer must match is not, and the cited answer is accepted", async () => {
+			const llm = new LlmCursor(env);
+			await session(cancelAll, async (rpc, files) => {
+				const steps: Step[] = [
+					planFor([contractLane("Cx", "cx-answer")], { explorer: 1 }),
+					{ tasks: [{ name: "Cx", agent: "storm-explorer", task: "Report from source (T07-TASK)", say: CITED_ANSWER }] },
+					{ wait: true },
+				];
+				const run = await runOf(rpc, files, stepsRoute(steps));
+				const text = firstMessageOf(llm, "T07-TASK");
+				observe("T07 task item", run, `contract=${text.includes("[storm:계약]")} id=${text.includes("cx-answer")} literalHidden=${!text.includes(FACT_LINE)}`);
+				check("T07: the child's assignment carries the [storm:계약] block with the result id", text.includes("[storm:계약]") && text.includes("cx-answer"), text.slice(0, 600));
+				check("T07: and never the literal the answer is matched against (it would let a worker copy it)", !text.includes(FACT_LINE), text.slice(0, 600));
+				check("T07: the block comes after the director's own text", text.indexOf("T07-TASK") >= 0 && text.indexOf("T07-TASK") < text.indexOf("[storm:계약]"), text.slice(0, 300));
+				check("T07: the child answered in the advertised form (path:line) and the unchanged evaluator accepted it", resultFor(run, "cx-answer")?.state === "accepted", JSON.stringify(runResults(run)));
+			});
+		});
+
+		await suite.step("T07: the contract reaches the child on an item with steps (omp's task.steps on): in the first step, with one step and with two", async () => {
+			// omp offers `steps` in place of `task` only when the user turned it on; the profile's settings are rewritten for this step and restored after.
+			writeFileSync(join(env.agentDir, "config.yml"), `${PROFILE_CONFIG}task:\n  steps: true\n`);
+			try {
+				for (const shape of [{ lane: "Cs1", id: "cs1-answer", steps: ["Report from source (T07-ONE)"] }, { lane: "Cs2", id: "cs2-answer", steps: ["Report from source (T07-TWO)", "Then summarize in one sentence."] }]) {
+					const llm = new LlmCursor(env);
+					await session(cancelAll, async (rpc, files) => {
+						const steps: Step[] = [
+							planFor([contractLane(shape.lane, shape.id)], { explorer: 1 }),
+							{ tasks: [{ name: shape.lane, agent: "storm-explorer", steps: shape.steps, say: CITED_ANSWER }] },
+							{ wait: true },
+						];
+						const run = await runOf(rpc, files, stepsRoute(steps));
+						const text = firstMessageOf(llm, shape.steps[0]?.includes("ONE") ? "T07-ONE" : "T07-TWO");
+						observe(`T07 ${shape.steps.length} step(s)`, run, `contract=${delivered(text, shape.id)}`);
+						check(`T07 (${shape.steps.length} step${shape.steps.length === 1 ? "" : "s"}): the first message the child got holds the contract block and the result id, and not the literal`, delivered(text, shape.id), text.slice(0, 700));
+						check(`T07 (${shape.steps.length} step${shape.steps.length === 1 ? "" : "s"}): the second step, when there is one, is not where it went`, shape.steps.length === 1 || !(llm.of("child").map(entry => entry.lastUser).find(user => user.includes("Then summarize")) ?? "").includes("[storm:계약]"), "");
+						check(`T07 (${shape.steps.length} step${shape.steps.length === 1 ? "" : "s"}): the cited answer was accepted`, resultFor(run, shape.id)?.state === "accepted", JSON.stringify(runResults(run)));
+					});
+				}
+			} finally {
+				writeFileSync(join(env.agentDir, "config.yml"), PROFILE_CONFIG);
+			}
+		});
+	}
 
 	await suite.step("T06: a qualitative submission stays reviewable without an independent verdict", async () => {
 		const targetPath = join(env.project, qualitativeTarget);

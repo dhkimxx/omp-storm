@@ -10,15 +10,28 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { uncertainCheckBlock } from "../src/runtime/checks.ts";
 import { hostJobRows } from "../src/runtime/host-jobs.ts";
-import { type HostJobRow, RunLanes } from "../src/runtime/lanes.ts";
+import {
+	DIRECTOR_EDIT_ENDS,
+	DIRECTOR_EDITING,
+	DIRECTOR_WRITE_ENDING,
+	DIRECTOR_WRITE_LATE,
+	DIRECTOR_WRITE_LEAD,
+	DIRECTOR_WRITE_NO_TARGET,
+	completedAssistantMessage,
+	directorCallIds,
+	directorTurnClean,
+	holderPhrase,
+} from "../src/runtime/arbiter.ts";
+import { type CommitWriterRequest, type HostJobRow, PENDING_WRITE_MS, RunLanes } from "../src/runtime/lanes.ts";
+import { type LanePolicy, pathsOverlap, scopesOverlap, WHY_SHELL_READER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { resetLedger } from "../src/runtime/ledger.ts";
 import { readRun } from "../src/runtime/run.ts";
 import { treeFingerprint } from "../src/runtime/rounds.ts";
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
-import type { AgentEntry, RunPlan, StormConfig } from "../src/types.ts";
+import type { AgentEntry, LiveCheck, RunPlan, StormConfig } from "../src/types.ts";
 import { fakeSession, SESSION_TEAM, type SessionOptions, until } from "./fake-session.ts";
-import { agentEntry, treeOf } from "./fixtures.ts";
+import { agentEntry, teamOf, treeOf } from "./fixtures.ts";
 
 let root: string;
 beforeEach(async () => {
@@ -332,4 +345,601 @@ describe("through the run controller", () => {
 		await h.controller.finish("no-changes");
 		expect(runId).toBeDefined();
 	}, 15_000);
+
+	test("a job batch that runs refuses a director edit; the edit that came first refuses the batch; a fence keeps refusing the edit until its proven end", async () => {
+		const stuck = stuckGroup();
+		try {
+			const h = session({
+				config: { ...SESSION_TEAM, jobs: [{ name: "experiment", argv: ["/bin/sh", "-c", "sleep 30 >/dev/null 2>&1 & echo OK; exit 0"] }] },
+				asyncJobs: snapshot,
+			});
+			await h.start({ task: "run the experiment" });
+			expect(await h.controller.setPlan(h.ctx, jobPlan)).toEqual({ ok: true });
+			const lanes = h.controller.runLanes()!;
+			const edit = (callId: string) => lanes.commitWriter({ kind: "director-path", callId, paths: ["src/a.ts"], live: h.controller.liveCheck(h.ctx), now: T0 });
+			// The edit first: the batch is not started, nothing is left in the table, and the director is told whose files hold it.
+			expect(edit("e1")).toEqual({ ok: true });
+			const early = await h.controller.executeJobs(h.ctx, ["experiment"], () => true);
+			expect(early.ok).toBe(false);
+			if (!early.ok) expect(early.reason).toContain("[storm:job-wait]");
+			expect(lanes.liveHolders(["job", "fence"])).toBe(0);
+			lanes.releaseDirectorCalls(["e1"]);
+			// The batch first: its processes are not proven gone, so it fences the tree, and the edit meets the fence.
+			expect(await h.controller.executeJobs(h.ctx, ["experiment"], () => true)).toMatchObject({ ok: true });
+			expect(lanes.liveHolders(["fence"])).toBe(1);
+			const fenced = edit("e2");
+			expect(fenced).toMatchObject({ ok: false, code: "lane-write", holder: { kind: "fence" } });
+			if (!fenced.ok) expect(fenced.reason).toContain(holderPhrase({ kind: "fence" }));
+			stuck.release();
+			await until(() => lanes.liveHolders(["fence"]) === 0);
+			expect(edit("e2")).toEqual({ ok: true });
+			lanes.releaseDirectorCalls(["e2"]);
+			await h.controller.finish("no-changes");
+		} finally {
+			stuck.restore();
+		}
+	}, 30_000);
+
+	test("a required check that is running refuses a director edit, and its fence refuses it until the proven end", async () => {
+		const stuck = stuckGroup();
+		try {
+			const config: StormConfig = { ...SESSION_TEAM, requiredChecks: [{ name: "unit", argv: ["/bin/sh", "-c", "sleep 30 >/dev/null 2>&1 & exit 0"] }] };
+			const agents: AgentEntry[] = [writer()];
+			let tree = treeOf("d0", "f0");
+			const h = session({ config, agents, tree: () => treeAt(tree), asyncJobs: snapshot });
+			await h.start();
+			const lanes = h.controller.runLanes()!;
+			const edit = (callId: string) => lanes.commitWriter({ kind: "director-path", callId, paths: ["src/a.ts"], live: h.controller.liveCheck(h.ctx), now: T0 });
+			tree = treeOf("d1", "f0");
+			await h.turn();
+			agents.push({ ...agentEntry({ id: "Rev", name: "storm-reviewer", role: "reviewer", lastVerdict: { at: T0 + 1, correct: true, tree: treeFingerprint(tree) } }), reviewLog: [{ at: T0 + 1, correct: true, findings: [], tree: treeFingerprint(tree) }] } as AgentEntry);
+			h.timers.fire();
+			await until(() => lanes.liveHolders(["check", "fence"]) === 1);
+			expect(edit("e1")).toMatchObject({ ok: false, code: "lane-write" });
+			await until(() => lanes.liveHolders(["fence"]) === 1);
+			expect(edit("e1")).toMatchObject({ ok: false, holder: { kind: "fence" } });
+			stuck.release();
+			await until(() => lanes.liveHolders(["fence"]) === 0);
+			expect(edit("e1")).toEqual({ ok: true });
+			lanes.releaseDirectorCalls(["e1"]);
+			await h.controller.finish("interrupted");
+		} finally {
+			stuck.restore();
+		}
+	}, 30_000);
+});
+
+// ── The director's path edit as one more entry in the table ──────────────────────────────────────────────────────────────
+
+const TEAM = teamOf({ quick: "fake/quick", implementer: "fake/dev", explorer: "fake/look", reviewer: "fake/rev" });
+const PLAN: RunPlan = {
+	lanes: [
+		{ name: "X", kind: "code", role: "implementer", goal: "exec writer" },
+		{ name: "A", kind: "code", role: "implementer", files: ["src/a.ts"], goal: "a" },
+		{ name: "B", kind: "code", role: "quick", files: ["src/b.ts"], goal: "b" },
+		{ name: "S", kind: "explore", role: "explorer", goal: "reads and runs commands" },
+		{ name: "R", kind: "explore", role: "explorer", goal: "only reads" },
+	],
+	workers: { implementer: 2, quick: 1, explorer: 2 },
+	submittedAt: "2026-11-20T09:00:00.000Z",
+};
+const POLICIES = new Map<string, LanePolicy>([
+	["X", { kind: "unknown", reason: "임의 실행 도구가 있음" }],
+	["A", { kind: "paths", paths: ["src/a.ts"], reason: "paths" }],
+	["B", { kind: "paths", paths: ["src/b.ts"], reason: "paths" }],
+	["S", { kind: "read", reason: "읽기와 셸 실행만 하는 읽기 레인", shell: true }],
+	["R", { kind: "read", reason: "읽기 전용" }],
+]);
+const AGENT_OF: Record<string, string> = { X: "storm-implementer", A: "storm-implementer", B: "storm-quick", S: "storm-explorer", R: "storm-explorer" };
+const LIVE: () => LiveCheck = () => ({ ok: true });
+
+const put = (lanes: RunLanes, name: string, over: { now?: number; callId?: string; agents?: AgentEntry[] } = {}) =>
+	lanes.place({ agent: AGENT_OF[name]!, name, task: `do ${name}` }, PLAN, TEAM, { policies: POLICIES, now: over.now ?? T0, ...(over.callId === undefined ? {} : { callId: over.callId }), ...(over.agents === undefined ? {} : { agents: over.agents }) });
+const auto = (lanes: RunLanes, name: string) =>
+	lanes.assign({ agent: AGENT_OF[name]!, name, task: `do ${name}` }, PLAN, TEAM, { policies: POLICIES, now: T0 });
+const admit = (lanes: RunLanes, name: string) => lanes.admitChecked({ spawnKey: name, agent: AGENT_OF[name]!, outcome: "routed" }, { plan: PLAN, config: TEAM });
+const runningAgent = (id: string): AgentEntry => agentEntry({ id, name: AGENT_OF[id]!, state: "running", requests: 2, lastActivityAt: T0 + 5 });
+const idleAgent = (id: string): AgentEntry => agentEntry({ id, name: AGENT_OF[id]!, state: "idle", requests: 2, lastActivityAt: T0 + 5 });
+const edit = (lanes: RunLanes, callId: string, paths: string[], over: Partial<CommitWriterRequest> = {}) =>
+	lanes.commitWriter({ kind: "director-path", callId, paths, live: LIVE, now: T0, ...over });
+const followUp = (lanes: RunLanes, name: string, over: Partial<Parameters<RunLanes["checkFollowUp"]>[0]> = {}) =>
+	lanes.checkFollowUp({
+		agentId: name,
+		agent: AGENT_OF[name]!,
+		role: PLAN.lanes.find(lane => lane.name === name)!.role,
+		lane: PLAN.lanes.find(lane => lane.name === name)!,
+		policy: POLICIES.get(name)!,
+		isolated: false,
+		agents: [idleAgent(name)],
+		now: T0,
+		...over,
+	});
+const refusal = (placed: ReturnType<RunLanes["place"]>): string => (placed.ok ? "" : placed.reason);
+
+describe("two spellings of one file are one file for the table", () => {
+	test("a new file spelled with another case or another Unicode form is ordered against the worker that holds it, and the director's edit against it", () => {
+		const lanes = table({ current: [] });
+		// The path-only lane A holds src/a.ts; the director spells it with capitals: on the default macOS volume it is the same file.
+		expect(put(lanes, "A")).toMatchObject({ ok: true });
+		expect(edit(lanes, "e1", ["src/A.TS"])).toMatchObject({ ok: false, code: "lane-write" });
+		expect(edit(lanes, "e2", ["src/c.ts"])).toEqual({ ok: true });
+		// And the other way: a lane placed beside the director's edit of a file it spells differently is refused.
+		lanes.releaseDirectorCalls(["e2"]);
+		const second = table({ current: [] });
+		expect(edit(second, "e3", ["SRC/B.TS"])).toEqual({ ok: true });
+		expect(put(second, "B")).toMatchObject({ ok: false, code: "lane-write" });
+	});
+
+	test("the guard of a worker's own scope stays exact: folding is the table's, not the scope's", () => {
+		expect(pathsOverlap("src/a.ts", "src/A.TS")).toBe(false);
+		expect(scopesOverlap(["src/a.ts"], ["src/A.TS"])).toBe(true);
+		expect(scopesOverlap(["résumé.md"], ["résumé.md"])).toBe(true);
+		expect(scopesOverlap(["src/a.ts"], ["src/b.ts"])).toBe(false);
+	});
+});
+
+describe("a director path edit and the writers of the table", () => {
+	test("an edit refuses a placement that cannot be bounded and one whose files overlap, and lets a path worker on other files start", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		const execWriter = put(lanes, "X");
+		expect(execWriter).toMatchObject({ ok: false, code: "lane-write", retry: true });
+		expect(refusal(execWriter)).toContain(DIRECTOR_EDITING);
+		expect(refusal(execWriter)).toContain(DIRECTOR_EDIT_ENDS);
+		const overlapping = put(lanes, "A");
+		expect(overlapping).toMatchObject({ ok: false, code: "lane-write" });
+		expect(refusal(overlapping)).toContain(DIRECTOR_EDITING);
+		// A shell reader is a writer for ordering.
+		expect(put(lanes, "S")).toMatchObject({ ok: false, code: "lane-write" });
+		// Other files, and a lane that only reads, are not in its way.
+		expect(put(lanes, "B").ok).toBe(true);
+		expect(put(lanes, "R").ok).toBe(true);
+		// Nothing of a refused call was reserved: when the edit is over the lane places.
+		expect(lanes.releaseDirectorCalls(["e1"])).toBe(1);
+		expect(put(lanes, "A").ok).toBe(true);
+	});
+
+	test("an edit on a directory conflicts with a worker on a file inside it, and the other way round", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src"])).toEqual({ ok: true });
+		expect(put(lanes, "A")).toMatchObject({ ok: false, code: "lane-write" });
+		expect(put(lanes, "B")).toMatchObject({ ok: false, code: "lane-write" });
+		lanes.releaseDirectorCalls(["e1"]);
+		expect(put(lanes, "A").ok).toBe(true);
+		expect(edit(lanes, "e2", ["src/nested/deep.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e3", ["src"])).toMatchObject({ ok: false, code: "lane-write" });
+	});
+
+	describe("each state of a worker refuses the edit", () => {
+		const states: { state: string; arrange: (lanes: RunLanes, name: string) => AgentEntry[]; phrase: string }[] = [
+			{ state: "placed, not yet a spawn", arrange: (lanes, name) => (put(lanes, name), []), phrase: "배치(시작 전)" },
+			{ state: "admitted, not yet seen running", arrange: (lanes, name) => (put(lanes, name), admit(lanes, name), []), phrase: "레인 워커" },
+			{
+				state: "running",
+				arrange: (lanes, name) => (put(lanes, name), admit(lanes, name), lanes.agentStarted(name), [runningAgent(name)]),
+				phrase: "레인 워커",
+			},
+			{
+				state: "a follow-up admitted whose turn has not started",
+				arrange: (lanes, name) => {
+					put(lanes, name);
+					admit(lanes, name);
+					lanes.agentStarted(name);
+					lanes.releaseAgent(name);
+					expect(followUp(lanes, name).ok).toBe(true);
+					return [idleAgent(name)];
+				},
+				phrase: "후속 작업(시작 전)",
+			},
+		];
+		for (const { state, arrange, phrase } of states) {
+			test(`${state}: an exec worker and a shell reader refuse every edit`, () => {
+				for (const name of ["X", "S"]) {
+					const lanes = table({ current: [] });
+					const agents = arrange(lanes, name);
+					const refused = edit(lanes, "e1", ["docs/other.md"], { agents });
+					expect(refused).toMatchObject({ ok: false, code: "lane-write", holder: { lane: name } });
+					if (!refused.ok) expect(refused.reason).toContain(DIRECTOR_WRITE_LEAD);
+					if (!refused.ok) expect(refused.reason).toContain(phrase);
+					expect(lanes.liveHolders(["director-path"])).toBe(0);
+				}
+			});
+			test(`${state}: a path worker refuses an edit of its files and lets one on other files through`, () => {
+				const lanes = table({ current: [] });
+				const agents = arrange(lanes, "A");
+				expect(edit(lanes, "e1", ["src/a.ts"], { agents })).toMatchObject({ ok: false, code: "lane-write", holder: { lane: "A" } });
+				expect(edit(lanes, "e2", ["src/other.ts"], { agents })).toEqual({ ok: true });
+			});
+		}
+	});
+
+	test("a worker whose turn settled and was reaped no longer holds the tree", () => {
+		const lanes = table({ current: [] });
+		put(lanes, "X");
+		admit(lanes, "X");
+		lanes.agentStarted("X");
+		expect(edit(lanes, "e1", ["a.ts"], { agents: [runningAgent("X")] })).toMatchObject({ ok: false });
+		lanes.releaseAgent("X");
+		expect(edit(lanes, "e1", ["a.ts"], { agents: [idleAgent("X")] })).toEqual({ ok: true });
+	});
+
+	test("[edit, task] and [task, edit] have opposite winners", () => {
+		const first = table({ current: [] });
+		expect(edit(first, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(put(first, "A")).toMatchObject({ ok: false, code: "lane-write" });
+		const second = table({ current: [] });
+		expect(put(second, "A").ok).toBe(true);
+		const refused = edit(second, "e1", ["src/a.ts"]);
+		expect(refused).toMatchObject({ ok: false, code: "lane-write", holder: { lane: "A" } });
+		// The same through automatic delegation.
+		const viaAuto = table({ current: [] });
+		expect(edit(viaAuto, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(auto(viaAuto, "A")).toMatchObject({ ok: false, code: "lane-write" });
+		const autoFirst = table({ current: [] });
+		expect(auto(autoFirst, "X").ok).toBe(true);
+		expect(edit(autoFirst, "e1", ["anything.md"])).toMatchObject({ ok: false, code: "lane-write", holder: { lane: "X" } });
+	});
+
+	test("a batch with one conflicting item is refused whole and reserves nothing", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		const batch = lanes.place({ tasks: [{ agent: "storm-quick", name: "B", task: "b" }, { agent: "storm-implementer", name: "A", task: "a" }] }, PLAN, TEAM, { policies: POLICIES, now: T0 });
+		expect(batch).toMatchObject({ ok: false, code: "lane-write" });
+		lanes.releaseDirectorCalls(["e1"]);
+		expect(put(lanes, "B").ok).toBe(true);
+	});
+
+	test("a placement made before the edit still admits; one that lapsed meets the edit at its late admission and is refused", () => {
+		const lanes = table({ current: [] });
+		const placed = put(lanes, "A");
+		expect(placed.ok).toBe(true);
+		// The edit is on other files, so both are bounded and both run.
+		expect(edit(lanes, "e1", ["src/other.ts"])).toEqual({ ok: true });
+		expect(admit(lanes, "A")).toMatchObject({ ok: true, lane: "A" });
+
+		// A placement whose pending window ran out (nothing wrote behind it) lapses; the director may then take its file.
+		const late = table({ current: [] });
+		expect(put(late, "A").ok).toBe(true);
+		const far = T0 + PENDING_WRITE_MS + 1_000;
+		expect(edit(late, "e1", ["src/a.ts"], { now: far })).toEqual({ ok: true });
+		const admitted = admit(late, "A");
+		expect(admitted).toMatchObject({ ok: false, code: "lane-write" });
+		if (!admitted.ok) expect(admitted.reason).toContain(DIRECTOR_EDITING);
+		// The edit is still held, and the refused spawn left nothing behind.
+		expect(late.liveHolders(["director-path"])).toBe(1);
+		late.releaseDirectorCalls(["e1"]);
+		expect(put(late, "A").ok).toBe(true);
+	});
+
+	test("a late admission of an exec worker that is not planned is refused by an edit as well", () => {
+		const lanes = table({ current: [] });
+		expect(put(lanes, "X").ok).toBe(true);
+		const far = T0 + PENDING_WRITE_MS + 1_000;
+		expect(edit(lanes, "e1", ["src/a.ts"], { now: far })).toEqual({ ok: true });
+		expect(admit(lanes, "X")).toMatchObject({ ok: false, code: "lane-write" });
+	});
+
+	test("a work follow-up and a progress note that may wake a worker are refused by an edit, and each refuses the edit when it came first", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		const work = followUp(lanes, "X");
+		expect(work).toMatchObject({ ok: false, code: "lane-write" });
+		if (!work.ok) expect(work.reason).toContain(DIRECTOR_EDITING);
+		const note = followUp(lanes, "A", { progress: true });
+		expect(note).toMatchObject({ ok: false, code: "lane-write" });
+		// A path worker on other files is let through.
+		expect(followUp(lanes, "B").ok).toBe(true);
+
+		const other = table({ current: [] });
+		expect(followUp(other, "A").ok).toBe(true);
+		expect(edit(other, "e1", ["src/a.ts"], { agents: [idleAgent("A")] })).toMatchObject({ ok: false, holder: { lane: "A", awaiting: true } });
+		// A note to a worker that is running joins its open turn: the worker's own entry keeps refusing the edit.
+		const running = table({ current: [] });
+		put(running, "X");
+		admit(running, "X");
+		running.agentStarted("X");
+		expect(followUp(running, "X", { progress: true, agents: [runningAgent("X")] }).ok).toBe(true);
+		expect(edit(running, "e1", ["a.md"], { agents: [runningAgent("X")] })).toMatchObject({ ok: false, holder: { lane: "X" } });
+	});
+
+	test("a follow-up that failed its preflight leaves no hold behind for the edit to meet", () => {
+		const lanes = table({ current: [] });
+		const gate = followUp(lanes, "X");
+		if (!gate.ok) throw new Error("not admitted");
+		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent("X")] })).toMatchObject({ ok: false });
+		lanes.finishFollowUp(gate.token, false);
+		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent("X")] })).toEqual({ ok: true });
+	});
+
+	test("a reservation placed by a call that failed is gone, and does not keep refusing the edit", () => {
+		const lanes = table({ current: [] });
+		expect(put(lanes, "X", { callId: "t1" }).ok).toBe(true);
+		expect(edit(lanes, "e1", ["a.md"])).toMatchObject({ ok: false });
+		lanes.releaseCall("t1");
+		expect(edit(lanes, "e1", ["a.md"])).toEqual({ ok: true });
+	});
+
+	test("two edits of the director never refuse each other, overlapping or not", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e2", ["src/a.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e3", ["src"])).toEqual({ ok: true });
+		expect(lanes.liveHolders(["director-path"])).toBe(3);
+	});
+
+	test("committing the same call twice keeps one entry that holds both lists of paths", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e1", ["src/b.ts"])).toEqual({ ok: true });
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+		expect(put(lanes, "A")).toMatchObject({ ok: false });
+		expect(put(lanes, "B")).toMatchObject({ ok: false });
+	});
+
+	test("an edit that names no path is refused: nothing can be bounded", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", [])).toMatchObject({ ok: false, code: "no-target", reason: DIRECTOR_WRITE_NO_TARGET });
+		expect(edit(lanes, "e1", [""])).toMatchObject({ ok: false, code: "no-target" });
+		expect(lanes.liveHolders(["director-path"])).toBe(0);
+	});
+});
+
+describe("a director path edit and the host's own writers", () => {
+	test("a job, a check, a fence and the director's command each refuse the edit, in words the director can act on", () => {
+		const rows = { current: [] as readonly HostJobRow[] | undefined };
+		const lanes = table(rows);
+		expect(lanes.commitHolder({ kind: "job", key: "b1", now: T0 })).toEqual({ ok: true });
+		const job = edit(lanes, "e1", ["src/a.ts"]);
+		expect(job).toMatchObject({ ok: false, code: "lane-write", holder: { kind: "job" } });
+		if (!job.ok) expect(job.reason).toContain(holderPhrase({ kind: "job" }));
+		if (!job.ok) expect(job.reason).toContain(DIRECTOR_WRITE_LEAD);
+		lanes.fenceHolder("job", "b1");
+		const fenced = edit(lanes, "e1", ["src/a.ts"]);
+		expect(fenced).toMatchObject({ ok: false, holder: { kind: "fence" } });
+		if (!fenced.ok) expect(fenced.reason).toContain(holderPhrase({ kind: "fence" }));
+		lanes.releaseHolder("fence", "b1");
+
+		expect(lanes.commitHolder({ kind: "check", key: "k1", now: T0 })).toEqual({ ok: true });
+		const check = edit(lanes, "e1", ["src/a.ts"]);
+		expect(check).toMatchObject({ ok: false, holder: { kind: "check" } });
+		if (!check.ok) expect(check.reason).toContain(holderPhrase({ kind: "check" }));
+		lanes.releaseHolder("check", "k1");
+
+		expect(exec(lanes, "c1")).toEqual({ ok: true });
+		const command = edit(lanes, "e1", ["src/a.ts"]);
+		expect(command).toMatchObject({ ok: false, holder: { kind: "director-exec" } });
+		if (!command.ok) expect(command.reason).toContain(holderPhrase({ kind: "director-exec" }));
+		// ...and the command sent to the background is the same refusal for as long as the host shows it running.
+		rows.current = [bg("job_1")];
+		lanes.callEnded("c1");
+		expect(edit(lanes, "e1", ["src/a.ts"])).toMatchObject({ ok: false, holder: { kind: "director-bg" } });
+		rows.current = [];
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+	});
+
+	test("a director command that cannot be seen to have ended keeps refusing the edit: the host's rows are the receipt", () => {
+		const rows = { current: [] as readonly HostJobRow[] | undefined };
+		const lanes = table(rows);
+		expect(exec(lanes, "c1")).toEqual({ ok: true });
+		rows.current = undefined;
+		lanes.callEnded("c1");
+		expect(edit(lanes, "e1", ["a.md"])).toMatchObject({ ok: false, holder: { kind: "director-exec" } });
+	});
+
+	test("an edit refuses a job batch, a check and a command of the director, each saying the director is editing files itself", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		const job = lanes.commitHolder({ kind: "job", key: "b1", now: T0 });
+		expect(job).toMatchObject({ ok: false, reason: expect.stringContaining(DIRECTOR_EDIT_ENDS) });
+		expect(lanes.commitHolder({ kind: "check", key: "k1", now: T0 })).toMatchObject({ ok: false, reason: expect.stringContaining(DIRECTOR_EDIT_ENDS) });
+		expect(exec(lanes, "c1")).toMatchObject({ ok: false, reason: expect.stringContaining(DIRECTOR_EDIT_ENDS) });
+		expect(lanes.liveHolders(["job", "check", "director-exec"])).toBe(0);
+		lanes.releaseDirectorCalls(["e1"]);
+		expect(lanes.commitHolder({ kind: "job", key: "b1", now: T0 })).toEqual({ ok: true });
+	});
+
+	test("the other order: a job, a check or a command that came first holds the tree, and the edit is refused", () => {
+		for (const start of [
+			(lanes: RunLanes) => lanes.commitHolder({ kind: "job", key: "b1", now: T0 }),
+			(lanes: RunLanes) => lanes.commitHolder({ kind: "check", key: "k1", now: T0 }),
+			(lanes: RunLanes) => exec(lanes, "c1"),
+		]) {
+			const lanes = table({ current: [] });
+			expect(start(lanes)).toEqual({ ok: true });
+			expect(edit(lanes, "e1", ["docs/readme.md"])).toMatchObject({ ok: false, code: "lane-write" });
+		}
+	});
+});
+
+describe("the release of a director path edit", () => {
+	const callOf = (id: string) => ({ type: "toolCall", id, name: "edit", arguments: {} });
+	const assistant = (...ids: string[]) => ({ role: "assistant", content: [{ type: "text", text: "ok" }, ...ids.map(callOf)] });
+	const turnEnd = (...ids: string[]) => ({ type: "turn_end", message: assistant(...ids), toolResults: ids.map(toolCallId => ({ role: "toolResult", toolCallId, content: [] })) });
+	const agentEnd = (...turns: string[][]) => ({
+		type: "agent_end",
+		messages: turns.flatMap(ids => [assistant(...ids), ...ids.map(toolCallId => ({ role: "toolResult", toolCallId, content: [] }))]),
+	});
+
+	test("the ids of a turn's end and of an agent's end are the calls their own payload contains", () => {
+		expect([...directorCallIds(turnEnd("a", "b"))].sort()).toEqual(["a", "b"]);
+		expect([...directorCallIds(agentEnd(["a"], ["b", "c"]))].sort()).toEqual(["a", "b", "c"]);
+		// A payload that cannot be read names nothing, so nothing is released by it.
+		for (const payload of [undefined, null, 3, "turn_end", {}, { message: "x" }, { messages: [null, 4, { role: "assistant", content: "text" }] }, { message: { content: [{ type: "toolCall" }] } }]) {
+			expect(directorCallIds(payload).size).toBe(0);
+		}
+	});
+
+	test("only the ids the payload contains are released: another turn's end leaves the entry, and two turns release independently", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e2", ["src/b.ts"])).toEqual({ ok: true });
+		// An old loop's late agent_end names calls of its own turns only.
+		expect(lanes.releaseDirectorCalls(directorCallIds(agentEnd(["old-1"], ["old-2"])))).toBe(0);
+		expect(lanes.liveHolders(["director-path"])).toBe(2);
+		expect(lanes.releaseDirectorCalls(directorCallIds(turnEnd("e1")))).toBe(1);
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+		expect(put(lanes, "A").ok).toBe(true);
+		expect(put(lanes, "B")).toMatchObject({ ok: false });
+		expect(lanes.releaseDirectorCalls(directorCallIds(agentEnd(["e2"])))).toBe(1);
+		expect(lanes.liveHolders(["director-path"])).toBe(0);
+		// Releasing twice, or an id that never had an entry, does nothing.
+		expect(lanes.releaseDirectorCalls(["e1", "e2", "nobody"])).toBe(0);
+	});
+
+	test("nothing but the release ends the entry: not the call's end, a failed call, a settled worker, a prune at any time, a host row or a freed-place read", () => {
+		const rows = { current: [] as readonly HostJobRow[] | undefined };
+		const lanes = table(rows);
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		lanes.callEnded("e1");
+		lanes.releaseCall("e1");
+		lanes.releaseCall("e1", new Set(["e1"]));
+		lanes.cancel("e1", undefined);
+		lanes.releaseAgent("e1");
+		rows.current = [bg("job_1")];
+		rows.current = [];
+		expect(lanes.takeWriterFreed([], T0 + 10 * 365 * 24 * 3_600_000)).toBe(false);
+		expect(lanes.laneBusy("A", [], T0 + 10 * 365 * 24 * 3_600_000)).toBe(false);
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+		expect(put(lanes, "A", { now: T0 + 10 * 365 * 24 * 3_600_000 })).toMatchObject({ ok: false, code: "lane-write" });
+		expect(lanes.releaseDirectorCalls(["e1"])).toBe(1);
+	});
+
+	test("an unplanned spawn's admission and its settling never adopt or release a director edit or a job", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(lanes.commitHolder({ kind: "job", key: "b1", now: T0 })).toMatchObject({ ok: false });
+		// A spawn the plan never placed (a worker named by nobody) is admitted and then settles.
+		expect(lanes.admitChecked({ spawnKey: "stray", agent: "storm-implementer", outcome: "routed" })).toMatchObject({ ok: true });
+		lanes.agentStarted("stray");
+		lanes.releaseAgent("stray");
+		lanes.cancel("stray", undefined);
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+		lanes.releaseDirectorCalls(["e1"]);
+		expect(lanes.commitHolder({ kind: "job", key: "b1", now: T0 })).toEqual({ ok: true });
+		lanes.admitChecked({ spawnKey: "stray-2", agent: "storm-implementer", outcome: "routed" });
+		lanes.releaseAgent("stray-2");
+		expect(lanes.liveHolders(["job"])).toBe(1);
+	});
+});
+
+describe("the one commit step", () => {
+	test("the caller's proof is asked first: a run that is no longer the live one commits nothing, whatever else is true", () => {
+		const lanes = table({ current: [] });
+		const asked: string[] = [];
+		const gone = (): LiveCheck => (asked.push("live"), { ok: false, reason: DIRECTOR_WRITE_ENDING });
+		const refused = edit(lanes, "e1", ["a.ts"], { live: gone, deadline: T0 - 1 });
+		expect(refused).toEqual({ ok: false, code: "run-ending", reason: DIRECTOR_WRITE_ENDING });
+		expect(asked).toEqual(["live"]);
+		expect(lanes.liveHolders(["director-path"])).toBe(0);
+		// A conflicting writer does not change which refusal comes first.
+		put(lanes, "X");
+		expect(edit(lanes, "e2", ["a.ts"], { live: gone })).toMatchObject({ ok: false, code: "run-ending" });
+		// A proof that throws is a proof that failed.
+		const thrown = edit(lanes, "e3", ["a.ts"], { live: () => { throw new Error("ctx is stale"); } });
+		expect(thrown).toMatchObject({ ok: false, code: "run-ending" });
+		expect(lanes.liveHolders(["director-path"])).toBe(0);
+	});
+
+	test("the proof is read inside the step, at the moment of the commit, not when the caller built it", () => {
+		const lanes = table({ current: [] });
+		const state = { ending: false };
+		const live = (): LiveCheck => (state.ending ? { ok: false, reason: DIRECTOR_WRITE_ENDING } : { ok: true });
+		expect(edit(lanes, "e1", ["a.ts"], { live })).toEqual({ ok: true });
+		state.ending = true;
+		expect(edit(lanes, "e2", ["b.ts"], { live })).toMatchObject({ ok: false, code: "run-ending" });
+		expect(lanes.liveHolders(["director-path"])).toBe(1);
+	});
+
+	test("a deadline at or before now commits nothing; one still ahead does, and a conflict comes after the deadline", () => {
+		const lanes = table({ current: [] });
+		expect(edit(lanes, "e1", ["a.ts"], { deadline: T0 })).toEqual({ ok: false, code: "deadline", reason: DIRECTOR_WRITE_LATE });
+		expect(edit(lanes, "e1", ["a.ts"], { deadline: T0 - 5 })).toMatchObject({ ok: false, code: "deadline" });
+		expect(lanes.liveHolders(["director-path"])).toBe(0);
+		put(lanes, "X");
+		expect(edit(lanes, "e2", ["a.ts"], { deadline: T0 })).toMatchObject({ ok: false, code: "deadline" });
+		expect(edit(lanes, "e2", ["a.ts"], { deadline: T0 + 1 })).toMatchObject({ ok: false, code: "lane-write" });
+		const free = table({ current: [] });
+		expect(edit(free, "e1", ["a.ts"], { deadline: T0 + 1 })).toEqual({ ok: true });
+	});
+
+	test("the step does not yield: nothing between the proof and the entry can run, so two edits and a worker see each other in either order", () => {
+		const lanes = table({ current: [] });
+		const order: string[] = [];
+		// The proof itself places a worker; whatever it did is seen by the conflict loop that follows in the same step.
+		const live = (): LiveCheck => {
+			order.push(put(lanes, "A").ok ? "placed" : "refused");
+			return { ok: true };
+		};
+		expect(edit(lanes, "e1", ["src/a.ts"], { live })).toMatchObject({ ok: false, code: "lane-write" });
+		expect(order).toEqual(["placed"]);
+	});
+
+	test("an unreadable agent list does not free a worker: the entry of an admitted worker holds until an event", () => {
+		const lanes = table({ current: [] });
+		put(lanes, "X");
+		admit(lanes, "X");
+		expect(edit(lanes, "e1", ["a.md"])).toMatchObject({ ok: false });
+		expect(edit(lanes, "e1", ["a.md"], { agents: [] })).toMatchObject({ ok: false });
+	});
+});
+
+describe("a read lane that can run a shell, in the table", () => {
+	test("its reason names a read lane, or a review lane, and it is ordered like an exec writer against a director edit", () => {
+		const lanes = table({ current: [] });
+		expect(put(lanes, "S").ok).toBe(true);
+		expect(edit(lanes, "e1", ["anything.md"])).toMatchObject({ ok: false, holder: { lane: "S" } });
+		const other = table({ current: [] });
+		expect(put(other, "X").ok).toBe(true);
+		const refused = put(other, "S");
+		expect(refused).toMatchObject({ ok: false, code: "lane-write" });
+		expect(refusal(refused)).toContain(WHY_SHELL_READER);
+		expect(refusal(refused)).not.toContain(WHY_SHELL_REVIEWER);
+		const review: RunPlan = { ...PLAN, lanes: [...PLAN.lanes, { name: "Rv", kind: "review", role: "reviewer", goal: "review" }] };
+		const reviewed = other.place({ agent: "storm-reviewer", name: "Rv", task: "review" }, review, TEAM, {
+			policies: new Map([...POLICIES, ["Rv", { kind: "read" as const, reason: "x", shell: true as const }]]),
+			now: T0,
+		});
+		expect(refusal(reviewed)).toContain(WHY_SHELL_REVIEWER);
+		// A read lane without a shell reserves nothing and is never refused.
+		expect(put(other, "R").ok).toBe(true);
+	});
+});
+
+describe("when a turn is clean, when a request completed, and which calls the table holds (decision D2)", () => {
+	const message = (...calls: Array<{ id: string; name?: string }>) => ({
+		role: "assistant",
+		stopReason: "toolUse",
+		content: [{ type: "text", text: "go" }, ...calls.map(call => ({ type: "toolCall", id: call.id, name: call.name ?? "edit", arguments: {} }))],
+	});
+	const result = (toolCallId: string, isError: unknown) => ({ role: "toolResult", toolCallId, toolName: "edit", isError, content: [] });
+
+	test("a turn is clean only when every file-writing call of its message has a result that is plainly not an error", () => {
+		expect(directorTurnClean({ message: message({ id: "a" }, { id: "b", name: "write" }), toolResults: [result("a", false), result("b", false)] })).toBe(true);
+		// An error, a missing result, an unreadable flag: each is unclean (omp may still be committing what an aborted call wrote).
+		expect(directorTurnClean({ message: message({ id: "a" }, { id: "b" }), toolResults: [result("a", false), result("b", true)] })).toBe(false);
+		expect(directorTurnClean({ message: message({ id: "a" }), toolResults: [] })).toBe(false);
+		expect(directorTurnClean({ message: message({ id: "a" }), toolResults: [result("a", undefined)] })).toBe(false);
+		expect(directorTurnClean({ message: message({ id: "a" }), toolResults: [{ role: "toolResult", content: [] }] })).toBe(false);
+		// A call that is no file write does not make the turn unclean: a failed `bash` or `read` is not what this holds for.
+		expect(directorTurnClean({ message: message({ id: "a" }, { id: "r", name: "read" }, { id: "s", name: "bash" }), toolResults: [result("a", false), result("r", true), result("s", true)] })).toBe(true);
+		// A payload that cannot be read is never clean.
+		for (const payload of [undefined, null, 3, {}, { message: "x" }, { message: { content: "x" } }]) expect(directorTurnClean(payload)).toBe(false);
+	});
+
+	test("a request completed unless its stop reason says aborted or error; only an assistant message can be one", () => {
+		for (const stopReason of [undefined, "stop", "toolUse", "length"]) expect(completedAssistantMessage({ role: "assistant", ...(stopReason === undefined ? {} : { stopReason }) }), String(stopReason)).toBe(true);
+		for (const stopReason of ["aborted", "error"]) expect(completedAssistantMessage({ role: "assistant", stopReason }), stopReason).toBe(false);
+		for (const other of [{ role: "user" }, { role: "toolResult" }, { role: "custom", customType: "async-result" }, null, undefined, "assistant", 3]) expect(completedAssistantMessage(other)).toBe(false);
+	});
+
+	test("the table lists the calls of the director edits it holds, and only those", () => {
+		const lanes = table({ current: [] });
+		expect(lanes.directorCalls()).toEqual([]);
+		expect(edit(lanes, "e1", ["src/a.ts"])).toEqual({ ok: true });
+		expect(edit(lanes, "e2", ["src/b.ts"])).toEqual({ ok: true });
+		expect(put(lanes, "A")).toMatchObject({ ok: false });
+		expect(lanes.directorCalls().sort()).toEqual(["e1", "e2"]);
+		lanes.releaseDirectorCalls(["e1"]);
+		expect(lanes.directorCalls()).toEqual(["e2"]);
+	});
 });

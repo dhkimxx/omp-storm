@@ -207,7 +207,15 @@ function effortRank(effort: string): number {
  * entry that has one, is a mismatch. An entry with no approved effort constrains the model only.
  */
 export function checkChildModel(config: StormConfig, agent: string, observed: ChildObservation, trial?: { model: string; effort?: Effort }): ChildCheck {
-	const approved = approvedEntries(config, agent, trial);
+	return checkChildModelAgainst(approvedEntries(config, agent, trial), observed);
+}
+
+/**
+ * The same check against entries already decided: a worker on another thread reads them from its persisted admission, where the
+ * parent wrote what the child's role (and its trial, when it is one) approves, because the team's config is not enough there to
+ * tell which trial a spawn belongs to.
+ */
+export function checkChildModelAgainst(approved: readonly ApprovedEntry[], observed: ChildObservation): ChildCheck {
 	const label = observed.effort === undefined ? selectorOf(observed) : `${selectorOf(observed)}:${observed.effort}`;
 	if (approved.length === 0) return { ok: false, reason: "no-role", observed: label, approved: [] };
 	const ranSelector = selectorOf(observed);

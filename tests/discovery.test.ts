@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { collectModels, toModelInfo } from "../src/discovery/models.ts";
 import { exhaustedLimit, parseUsageJson, readQuota } from "../src/discovery/quota.ts";
-import { parseConfigList, readExplicitSettings, liveTaskMaxConcurrency, taskMaxConcurrencyOf } from "../src/discovery/settings.ts";
+import { HOST_HANDLER_TIMEOUT_MS, liveTaskMaxConcurrency, liveToolCallTimeoutMs, parseConfigList, readExplicitSettings, taskMaxConcurrencyOf } from "../src/discovery/settings.ts";
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Exec } from "../src/types.ts";
 
@@ -278,6 +278,19 @@ describe("parseConfigList", () => {
 		expect(live({})).toBe(32);
 		// No settings instance is unknown, never a Storm-invented number.
 		expect(taskMaxConcurrencyOf(undefined)).toBeUndefined();
+	});
+
+	test("the hook limit is omp's own setting, normalised as omp does: a positive finite number, else thirty seconds", () => {
+		const live = (overrides: Record<string, unknown>): number => withActiveSettings(Settings.isolated(overrides), liveToolCallTimeoutMs);
+		expect(live({ "extensionHandlers.toolCallTimeoutMs": 3_000 })).toBe(3_000);
+		expect(live({ "extensionHandlers.toolCallTimeoutMs": 90_000 })).toBe(90_000);
+		expect(live({})).toBe(HOST_HANDLER_TIMEOUT_MS);
+		// Values the host does not use as a limit fall back to its default the same way.
+		for (const bad of [0, -5]) {
+			expect(live({ "extensionHandlers.toolCallTimeoutMs": bad }), String(bad)).toBe(HOST_HANDLER_TIMEOUT_MS);
+		}
+		// No settings in scope (a bare host) reads as the default, never as zero.
+		expect(liveToolCallTimeoutMs()).toBe(HOST_HANDLER_TIMEOUT_MS);
 	});
 
 	test("command failure gives empty defaults", async () => {

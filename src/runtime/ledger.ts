@@ -99,6 +99,32 @@ export function startLedgerRun(init: {
 	return run;
 }
 
+/**
+ * A run as a child on another host thread knows it: named by the child's persisted admission, in no map. It carries what the
+ * child's own hooks read (ids, work tree, session store), never the director's spend or plan: nothing a hook writes into it is
+ * seen by any other thread, which is why such a child reports through `writeChildReport` instead.
+ */
+export function detachedLedgerRun(init: { runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactsDir?: string; startedAt: number }): LedgerRun {
+	return {
+		runId: init.runId,
+		sessionId: init.sessionId,
+		sessionDir: init.sessionDir,
+		repoId: init.repoId,
+		root: init.root,
+		startedAt: init.startedAt,
+		...(init.artifactsDir === undefined ? {} : { artifactsDir: init.artifactsDir }),
+		costUsd: 0,
+		costByModel: {},
+		treeCostUsd: 0,
+		evalCostUsd: 0,
+		evalCostBySource: {},
+		evalUnread: new Set(),
+		warned: false,
+		exceeded: false,
+		closing: false,
+	};
+}
+
 /** The run owned by this profile/session directory; a different session in the same worktree is a different run. */
 export function activeLedgerRun(sessionDir: string): LedgerRun | undefined {
 	return sessions.get(sessionDir);

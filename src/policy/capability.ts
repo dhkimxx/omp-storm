@@ -103,18 +103,22 @@ export const WHY_EXEC_WRITER = "임의 실행 도구가 있음";
 export const WHY_UNDECLARED_WRITER = "파일 목록이 없음";
 /** A reviewer that may run commands can change files like any shell worker, so it is ordered like a writer. */
 export const WHY_SHELL_REVIEWER = "리뷰어가 셸 명령을 실행할 수 있음";
+/** The same for any other read lane (explore, design, answer-only) whose agent definition lists a shell. */
+export const WHY_SHELL_READER = "읽기 레인 워커가 셸 명령을 실행할 수 있음";
 
 /**
- * The one tool, besides the read-only ones, a review lane may carry: `bash`, so the reviewer can run the project's
- * checks itself. Path-write tools (`write`, `edit`, ...), `eval`, `lsp` and every other tool stay refused to it.
+ * The one tool, besides the read-only ones, a read lane may carry: `bash`, so the worker can run read commands such as
+ * `git log` or the project's checks itself. Path-write tools (`write`, `edit`, ...), `eval`, `lsp` and every other tool
+ * stay refused to it.
  */
-export const REVIEW_SHELL_TOOLS: Readonly<Record<string, true>> = { bash: true };
+export const READ_SHELL_TOOLS: Readonly<Record<string, true>> = { bash: true };
 
 export type LanePolicy =
 	/**
-	 * `shell` marks a review lane whose agent may also run commands. It reads and runs commands but never edits or writes
-	 * with path tools. Because a command can change the tree, such a lane is ordered like a shared writer (see
-	 * `shellReviewer` and `writeScope` in lanes.ts); a read lane without `shell` reserves nothing.
+	 * `shell` marks a read lane whose agent may also run commands (any read-intent lane, not only a review lane). It
+	 * reads and runs commands but never edits or writes with path tools. Because a command can change the tree, such a
+	 * lane is ordered like a shared writer (see `shellReader` and `writeScope` in lanes.ts); a read lane without
+	 * `shell` reserves nothing.
 	 */
 	| { kind: "read"; reason: string; shell?: true }
 	| { kind: "private"; reason: string }
@@ -142,29 +146,36 @@ export function reviewLane(lane: PlanLane): boolean {
 	return lane.kind === "review" || lane.role === "reviewer";
 }
 
-/** Whether the list is read-only tools plus only the review shell (`bash`), and has at least one shell tool. */
-function readOnlyWithReviewShell(tools: readonly string[] | undefined): boolean {
+/** Whether the list is read-only tools plus only the shell (`bash`), and has at least one shell tool. */
+function readOnlyWithShell(tools: readonly string[] | undefined): boolean {
 	if (tools === undefined) return false;
 	let shell = false;
 	for (const raw of tools) {
 		const name = raw.trim();
 		if (!name || READ_ONLY_TOOLS[name] === true) continue;
-		if (REVIEW_SHELL_TOOLS[name] !== true) return false;
+		if (READ_SHELL_TOOLS[name] !== true) return false;
 		shell = true;
 	}
 	return shell;
 }
 
-/** Whether a policy is a review lane that may run commands: it reads, never writes with path tools, and is ordered like a writer. */
-export function shellReviewer(policy: LanePolicy | undefined): boolean {
+/** Whether a policy is a read lane that may run commands: it reads, never writes with path tools, and is ordered like a writer. */
+export function shellReader(policy: LanePolicy | undefined): boolean {
 	return policy?.kind === "read" && policy.shell === true;
+}
+
+/** Why a shell reader is ordered like a writer, for a refusal or a plan line: names the review lane when it is one. */
+export function shellReaderWhy(lane: PlanLane | undefined): string {
+	return lane !== undefined && reviewLane(lane) ? WHY_SHELL_REVIEWER : WHY_SHELL_READER;
 }
 
 /**
  * The one classification used by admission and runtime enforcement. A read-only intent is enforced at the tool
  * boundary, so a `bash`-capable agent definition does not make a review/architecture lane a writer: it is refused.
- * The one exception is a review lane whose only extra tool is `bash` (`read` with `shell`). A writable intent needs
- * path-only tools to be scoped; exec/unknown tools are an unknown writer. Automatic delegation changes none of this.
+ * The one exception is a read-intent lane (review, explore, design or answer-only) whose only extra tool is `bash`
+ * (`read` with `shell`): the shell is the user's own definition's, and the lane is then ordered like a writer. A
+ * writable intent needs path-only tools to be scoped; exec/unknown tools are an unknown writer. Automatic delegation
+ * changes none of this.
  */
 export function lanePolicy(input: LanePolicyInput): LanePolicy {
 	const { lane, tools } = input;
@@ -172,8 +183,8 @@ export function lanePolicy(input: LanePolicyInput): LanePolicy {
 	if (lane === undefined) return { kind: "unknown", reason: "계획에 없는 작업이라 쓰기 범위를 알 수 없습니다" };
 	if (readOnlyIntent(lane)) {
 		const capability = toolCapability(tools);
-		if (!capability.readOnly && reviewLane(lane) && readOnlyWithReviewShell(tools)) {
-			return { kind: "read", reason: "읽기와 셸 실행만 하는 리뷰 레인", shell: true };
+		if (!capability.readOnly && readOnlyWithShell(tools)) {
+			return { kind: "read", reason: reviewLane(lane) ? "읽기와 셸 실행만 하는 리뷰 레인" : "읽기와 셸 실행만 하는 읽기 레인", shell: true };
 		}
 		if (!capability.readOnly) {
 			return {
@@ -265,8 +276,16 @@ export function pathsOverlap(a: string, b: string): boolean {
 	return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
+/**
+ * The write table's comparison of two scopes: two writers must be ordered when their files could be one file. On the default macOS
+ * volume and on Windows `src/NEW.ts` and `src/new.ts` are one file, and so are the NFD and NFC spellings of one name, so both
+ * sides are compared in NFC with the case folded. It costs a rare over-refusal on a case-sensitive volume (two files whose names
+ * differ only by case are ordered) and needs no probe of the volume. Only the table uses this: whether one file lies inside a
+ * worker's declared scope (`pathsOverlap`) stays exact, because folding there would let a worker write another file.
+ */
 export function scopesOverlap(a: readonly string[], b: readonly string[]): boolean {
-	return a.some(left => b.some(right => pathsOverlap(left, right)));
+	const fold = (scope: string): string => scope.normalize("NFC").toLowerCase();
+	return a.some(left => b.some(right => pathsOverlap(fold(left), fold(right))));
 }
 
 /**

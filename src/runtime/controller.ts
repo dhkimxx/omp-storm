@@ -23,6 +23,7 @@ import type { RunRequestResult } from "../tool/host.ts";
 import type {
 	AgentEntry,
 	CloseoutFacts,
+	LiveCheck,
 	PlanLane,
 	PlanLaneResult,
 	RanModel,
@@ -42,6 +43,7 @@ import type {
 	UnplannedDelivery,
 	UiPort,
 } from "../types.ts";
+import { DIRECTOR_DRAIN_WARNING, DIRECTOR_WRITE_ENDING, directorEditWait } from "./arbiter.ts";
 import { ATTEMPT_REF, attemptUsable, type AttemptReport } from "./attempt-report.ts";
 import {
 	excludeProblem,
@@ -1371,6 +1373,23 @@ export class RunController {
 	}
 
 	/**
+	 * Captures the run (and the session asking) before a caller's awaits and returns the proof its synchronous commit step runs
+	 * after them (`RunLanes.commitWriter`'s `live`): the run object is still this controller's, it is not ending, its signal is not
+	 * aborted, no start or finish has happened since, and the session is still the one that owns the run. With no run to capture
+	 * the proof is a refusal. The check reads live state each time it is called and never yields.
+	 */
+	liveCheck(ctx?: ExtensionContext): () => LiveCheck {
+		const own = this.#own;
+		const generation = this.#generation;
+		return () => {
+			if (own === undefined || this.#own !== own || this.#generation !== generation) return { ok: false, reason: DIRECTOR_WRITE_ENDING };
+			if (own.ending !== undefined || own.abort.signal.aborted) return { ok: false, reason: DIRECTOR_WRITE_ENDING };
+			if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) return { ok: false, reason: DIRECTOR_WRITE_ENDING };
+			return { ok: true };
+		};
+	}
+
+	/**
 	 * Current facts for the prerequisite edges of a task/follow-up admission. It reads the run's own result ledger and
 	 * re-locates every accepted result at its current source: an isolated artifact only from its verified retained
 	 * source, shared content only from the current parent. A director's "applied" claim is never proof, and only the
@@ -1954,6 +1973,11 @@ export class RunController {
 		own.record.unplannedCount = (own.record.unplannedCount ?? 0) + 1;
 		own.notices.push(unplannedNotice(entry));
 		this.#scheduleFlush(own);
+	}
+
+	/** Something the director should read at its next request (the one place a hook that already answered can still tell it something). */
+	noteDirector(text: string): void {
+		this.#own?.notices.push(text);
 	}
 
 	/**
@@ -3153,6 +3177,19 @@ export class RunController {
 		return this.#upgradeLease(own);
 	}
 
+	/**
+	 * Only the target's write lease, for a caller whose own step then asks the run's write table (`RunLanes.commitWriter`): a job
+	 * batch or a fence is an entry of that table and refuses there, by name, instead of by the generic gate of `ensureWrite`.
+	 */
+	async ensureLease(ctx?: ExtensionContext): Promise<{ ok: true } | { ok: false; reason: string }> {
+		const own = this.#own;
+		if (own === undefined) return { ok: false, reason: "진행 중인 Storm 실행이 없어 쓰기 권한을 확인하지 못했습니다." };
+		if (ctx !== undefined && closeoutSessionId(ctx) !== own.sessionId) {
+			return { ok: false, reason: "다른 세션이 시작한 실행의 쓰기 권한은 빌려올 수 없습니다." };
+		}
+		return this.#upgradeLease(own);
+	}
+
 	jobGate(): string | undefined {
 		return this.#own?.jobFence ?? (this.#own?.jobBatch === true
 			? "[storm:job-wait] 정형 작업이 끝난 다음 실행하세요." : undefined);
@@ -3171,6 +3208,8 @@ export class RunController {
 			return { ok: false, reason: "현재 대화의 실행 계획에서만 정형 작업을 시작할 수 있습니다." };
 		}
 		if (own.jobFence !== undefined) return { ok: false, reason: own.jobFence };
+		// The director's own path edit holds its files until its message's calls are over; the refusal says so instead of naming a worker.
+		if (own.lanes.liveHolders(["director-path"]) > 0) return { ok: false, reason: `[storm:job-wait] ${directorEditWait("정형 작업")}` };
 		if (reservedWorkers(own.record.runId).length > 0 || this.#hasLiveWork(own)) {
 			return { ok: false, reason: "[storm:job-wait] 실행 중인 워커·검사·정형 작업이 끝난 뒤 호출하세요. 팀 변경은 필요하지 않습니다." };
 		}
@@ -4449,8 +4488,11 @@ export class RunController {
 			own.drainWarned = true;
 			const ctx = own.finishCtx;
 			if (ctx) {
+				// The director's own edit has no other end than the message that follows it: say that call is what is waited for.
 				this.deps.ui(ctx).notify(
-					"Storm 실행이 소유한 작업이 제한 시간 안에 끝나지 않습니다. 실행 범위·잠금·회계를 유지한 채 작업이 끝날 때까지 기다립니다.",
+					own.lanes.liveHolders(["director-path"]) > 0
+						? DIRECTOR_DRAIN_WARNING
+						: "Storm 실행이 소유한 작업이 제한 시간 안에 끝나지 않습니다. 실행 범위·잠금·회계를 유지한 채 작업이 끝날 때까지 기다립니다.",
 					"warning",
 				);
 			}
@@ -4571,6 +4613,9 @@ export class RunController {
 	#hasLiveWork(own: OwnRun): boolean {
 		if (own.jobBatch === true) return true;
 		if (own.checking !== undefined) return true;
+		// A director path edit is released only by the end of its turn, never by the run ending: the run keeps its lease, scope and
+		// table until then, so the edit still meets every writer that starts in between.
+		if (own.lanes.liveHolders(["director-path"]) > 0) return true;
 		// A settlement already inside `settleAttempt` has left `attempts` for `settling`; the record it will write is
 		// current evidence, so finalization must wait for it instead of judging the previous accepted row.
 		if (own.settling.size > 0) return true;
@@ -4722,7 +4767,7 @@ export class RunController {
 		if (this.#own !== own) return undefined;
 		// A settlement that entered `settleAttempt` after the caller's live-work check is still current evidence. Keep the
 		// run stopping and let the drain timer retry; the final record never lands on top of a record still being written.
-		if (own.settling.size > 0) {
+		if (own.settling.size > 0 || own.lanes.liveHolders(["director-path"]) > 0) {
 			this.#deferFinalize(own);
 			return undefined;
 		}

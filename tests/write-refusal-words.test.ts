@@ -5,7 +5,7 @@
  * inserted name; not whole sentences.
  */
 import { describe, expect, test } from "bun:test";
-import { lanePolicy, type LanePolicy, shellReviewer, WHY_AUTO_WRITER, WHY_EXEC_WRITER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
+import { lanePolicy, type LanePolicy, shellReader, WHY_AUTO_WRITER, WHY_EXEC_WRITER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
 import { RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
@@ -219,7 +219,7 @@ describe("a reviewer that may run commands is ordered like a writer", () => {
 		test(`${auto ? "automatic" : "manual"}: a live shell reviewer holds back a writer, and a live writer holds back the reviewer`, () => {
 			const plan = reviewPlan();
 			const map = policies(plan, ["read", "grep", "bash"], auto);
-			expect(shellReviewer(map.get(REVIEW))).toBe(true);
+			expect(shellReader(map.get(REVIEW))).toBe(true);
 			// A writer starts beside nothing; the reviewer is refused while it runs, and says why.
 			const writer = new RunLanes(`run-rw-${auto}`);
 			expect(place(writer, call(BODY), plan, map).ok).toBe(true);
@@ -242,7 +242,7 @@ describe("a reviewer that may run commands is ordered like a writer", () => {
 		test(`${auto ? "automatic" : "manual"}: a reviewer without a shell reserves nothing and starts beside a writer`, () => {
 			const plan = reviewPlan();
 			const map = policies(plan, ["read", "grep"], auto);
-			expect(shellReviewer(map.get(REVIEW))).toBe(false);
+			expect(shellReader(map.get(REVIEW))).toBe(false);
 			const work = new RunLanes(`run-plain-${auto}`);
 			expect(place(work, call(BODY), plan, map).ok).toBe(true);
 			expect(place(work, review(), plan, map).ok).toBe(true);

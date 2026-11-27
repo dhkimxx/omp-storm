@@ -16,6 +16,7 @@ import { writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
 import { assertSessionStoreSafe } from "./session-scope.ts";
+import type { RanModel } from "./types.ts";
 
 export const WORKER_ADMISSION_SCHEMA = "storm.worker-admission/v1";
 const KEY = /^[0-9a-f]{64}$/;
@@ -64,6 +65,12 @@ export interface WorkerAdmissionRecord {
 	revokedAt?: number;
 	/** Set when the child's own settled turn ends; a follow-up admission opens a new attempt. */
 	endedAt?: number;
+	/**
+	 * The models (and efforts) the team approves for what this worker runs as (its role's entries, plus its trial's candidate), written at
+	 * admission for a worker on another thread, which can read only disk. Absent in records written before it existed, or when the parent
+	 * could not name them: a worker whose run is not in its thread's memory and whose record lacks them is stopped, never let through.
+	 */
+	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
 }
 
 export interface WorkerAdmissionInput {
@@ -78,6 +85,8 @@ export interface WorkerAdmissionInput {
 	targetRoot: string;
 	lane?: string;
 	policy: LanePolicy;
+	/** See `WorkerAdmissionRecord.approved`. */
+	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
 }
 
 export type WorkerAdmissionRead =
@@ -130,6 +139,13 @@ function isAdmission(value: unknown): value is WorkerAdmissionRecord {
 	if (value.lane !== undefined && (typeof value.lane !== "string" || value.lane.length > MAX_ID)) return false;
 	if (value.revokedAt !== undefined && (typeof value.revokedAt !== "number" || !Number.isFinite(value.revokedAt))) return false;
 	if (value.endedAt !== undefined && (typeof value.endedAt !== "number" || !Number.isFinite(value.endedAt))) return false;
+	if (value.approved !== undefined) {
+		if (!Array.isArray(value.approved) || value.approved.length > 64) return false;
+		for (const entry of value.approved) {
+			if (!isRecord(entry) || typeof entry.selector !== "string" || entry.selector === "" || entry.selector.length > MAX_ID) return false;
+			if (entry.effort !== undefined && (typeof entry.effort !== "string" || entry.effort.length > 32)) return false;
+		}
+	}
 	return true;
 }
 
@@ -463,6 +479,7 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 		expiresAt: now + ACTIVE_TTL_MS,
 	};
 	if (input.lane !== undefined) record.lane = identity(input.lane, "레인 이름");
+	if (input.approved !== undefined) record.approved = input.approved.slice(0, 64).map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
 	const file = admissionFile(dir, key);
 	await writeJsonAtomic(file, record);
 	await chmod(file, 0o600).catch(() => undefined);
@@ -767,4 +784,110 @@ export async function resolveWorkerAdmission(input: {
 	const claimed = await claimWorkerAdmission(input.agentDir, read.key, record, input.childSessionId, input.childCwd);
 	if (!claimed.ok) return { kind: "denied", reason: claimed.reason };
 	return { kind: "authorized", record, checkout: claimed.checkout };
+}
+
+// ── what a child on another thread reports back ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * What a worker's own instance of Storm saw and the director's instance must still learn. omp runs the ninth and later concurrent
+ * subagents on pooled threads, each with its own module state: the run is not in that thread's memory, so what the child's checks
+ * decide (the model it ran on, why it was stopped) and what it spent cannot reach the director's thread through the ledger. The child
+ * writes one small file per child under the profile's admission store (the place its authority already lives); the director's thread
+ * reads them where it reads its notices and adds them to the run, once. Written only from a thread that has no run in memory.
+ */
+const REPORT_SCHEMA = "storm.child-report/v1";
+const MAX_REPORTS_PER_RUN = 512;
+
+export interface ChildReport {
+	schema: typeof REPORT_SCHEMA;
+	runId: string;
+	childId: string;
+	/** What the child's check read of its request's model, and the verdict: the last one wins, except that a mismatch stays. */
+	ran?: RanModel;
+	/** Why the child was stopped, for the director; present once. */
+	notice?: string;
+	/** What the child's own requests cost, cumulative per `provider/id` (USD). */
+	costByModel: Record<string, number>;
+	at: number;
+}
+
+function reportDir(agentDir: string, runId: string): string {
+	return path.join(admissionsDir(agentDir), "reports", sha256Hex(`report\u0000${runId}`));
+}
+
+function isReport(value: unknown): value is ChildReport {
+	if (!isRecord(value) || value.schema !== REPORT_SCHEMA) return false;
+	if (typeof value.runId !== "string" || typeof value.childId !== "string" || typeof value.at !== "number") return false;
+	if (!isRecord(value.costByModel) || !Object.values(value.costByModel).every(usd => typeof usd === "number" && Number.isFinite(usd) && usd >= 0)) return false;
+	if (value.notice !== undefined && typeof value.notice !== "string") return false;
+	if (value.ran !== undefined) {
+		if (!isRecord(value.ran) || typeof value.ran.model !== "string") return false;
+		if (value.ran.verdict !== "verified" && value.ran.verdict !== "mismatch") return false;
+		if (value.ran.effort !== undefined && typeof value.ran.effort !== "string") return false;
+	}
+	return true;
+}
+
+/** Publishes this child's report, whole and atomically. A failure is returned, not thrown: the caller decides what an unwritten report means. */
+export async function writeChildReport(agentDir: string, report: Omit<ChildReport, "schema" | "at">, now = Date.now()): Promise<boolean> {
+	try {
+		const dir = reportDir(agentDir, identity(report.runId, "실행 id"));
+		await mkdir(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, `${sha256Hex(`child\u0000${identity(report.childId, "자식 에이전트 id")}`)}.json`);
+		await writeJsonAtomic(file, { schema: REPORT_SCHEMA, ...report, at: now } satisfies ChildReport);
+		await chmod(file, 0o600).catch(() => undefined);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Every report of one run that is a well-formed file Storm wrote for that run, at most `MAX_REPORTS_PER_RUN`. */
+export async function readChildReports(agentDir: string, runId: string): Promise<ChildReport[]> {
+	const dir = reportDir(agentDir, runId);
+	let names: string[];
+	try {
+		names = await readdir(dir);
+	} catch {
+		return [];
+	}
+	const out: ChildReport[] = [];
+	for (const name of names.slice(0, MAX_REPORTS_PER_RUN)) {
+		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+		const read = await readRecordFile(path.join(dir, name));
+		if (read.kind === "value" && isReport(read.value) && read.value.runId === runId) out.push(read.value);
+	}
+	return out;
+}
+
+/** The run a child on this thread belongs to, from its persisted admission when the thread's memory has no run for it. */
+export type ChildBinding =
+	| { kind: "bound"; runId: string; sessionId: string; sessionDir: string; repoId: string; root: string; artifactRoot: string; createdAt: number; approved?: ReadonlyArray<{ selector: string; effort?: string }> }
+	| { kind: "unmanaged" }
+	| { kind: "unknown"; reason: string };
+
+/**
+ * Whom a child answers to, read from disk: its admission record names the run (and the session and the work tree), and a live run
+ * marker for its parent with no record of it means a managed child whose run cannot be named, which is unknown (never unmanaged).
+ * `unmanaged` only when neither exists, or the run's marker is closed: ordinary native work.
+ */
+export async function readChildBinding(input: { agentDir: string; artifactRoot: string | undefined; parentId: string | undefined; childId: string; now?: number }): Promise<ChildBinding> {
+	const read = await readWorkerAdmission(input);
+	if (read.kind === "invalid") return { kind: "unknown", reason: read.reason };
+	if (read.kind === "record") {
+		const { record } = read;
+		return { kind: "bound", runId: record.runId, sessionId: record.sessionId, sessionDir: record.sessionDir, repoId: record.repoId, root: record.targetRoot, artifactRoot: record.artifactRoot, createdAt: record.createdAt, ...(record.approved === undefined ? {} : { approved: record.approved }) };
+	}
+	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
+	if (artifactRoot === undefined) return { kind: "unmanaged" };
+	const now = input.now ?? Date.now();
+	if (input.parentId === undefined) {
+		return (await hasActiveWorkerRun(input.agentDir, artifactRoot, now)) ? { kind: "unknown", reason: "관리 실행 중인 트리의 부모를 특정하지 못한 자식입니다" } : { kind: "unmanaged" };
+	}
+	const marker = await readWorkerRunMarker(input.agentDir, artifactRoot, input.parentId);
+	if (marker.kind === "invalid") return { kind: "unknown", reason: marker.reason };
+	if (marker.kind === "record" && marker.marker.revokedAt === undefined && marker.marker.expiresAt > now) {
+		return { kind: "unknown", reason: "관리 실행의 자식인데 그 워커의 승인 기록이 없습니다" };
+	}
+	return { kind: "unmanaged" };
 }

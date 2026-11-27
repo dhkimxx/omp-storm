@@ -101,6 +101,11 @@ export interface ScriptedTask {
 	name?: string;
 	agent: string;
 	task?: string;
+	/**
+	 * The item's assignment as `steps` (omp takes them instead of `task` only when the user turned on `task.steps`). The child marker and
+	 * `say` go on the first step, as Storm's own additions do.
+	 */
+	steps?: string[];
 	/** Appended to this item's assignment, e.g. an E2E-CHILD directive. */
 	say?: string;
 	/**
@@ -148,6 +153,12 @@ export type Step = (
 	| { ifAskApproved: string }
 	| { wait: true; releaseChildren?: string[] }
 	| { awaitChild: true }
+	/**
+	 * Several calls in ONE assistant message, in this order (each sub-step is a call step: `tasks`, `task`, `edit`, `bash`,
+	 * `call`, `read`, `storm`, `wait`). The host prepares them in call order and runs them after the last hook returned. A
+	 * script counts the message as one step, and every call's answer is in `LlmEntry.trailingResults` of the next request.
+	 */
+	| { calls: Step[] }
 ) & {
 	after?: string;
 	afterResult?: string;
@@ -177,7 +188,7 @@ interface ChatRequest {
 }
 type Decision = (
 	| { kind: "text"; text: string; awaitChild?: boolean }
-	| { kind: "tool"; name: string; args: Record<string, unknown> }
+	| { kind: "tool"; name: string; args: Record<string, unknown>; more?: Array<{ kind: "tool"; name: string; args: Record<string, unknown> }> }
 ) & { awaitChildren?: string[]; releaseChildren?: string[]; releaseFile?: string; pauseMs?: number; waitFile?: string };
 /** Who a request is from: the main session, a spawned child, Storm's router, a compaction, or omp's own auxiliary calls. */
 export type Who = "main" | "child" | "route" | "compaction" | "side";
@@ -228,6 +239,11 @@ export interface LlmEntry {
 	lastTool: string;
 	/** The last tool result in the request, wherever it sits (a note message may follow it), cut. */
 	lastToolResult: string;
+	/**
+	 * Every tool result after the newest assistant message, in order, each cut to 1,000 chars: the answers to the calls of one
+	 * assistant message that carried several (`calls` step), which `lastTool` and `lastToolResult` cannot tell apart.
+	 */
+	trailingResults: string[];
 	/** What extensions added to a compaction request (`<additional-context>`), verbatim. */
 	compactionContext: string;
 	/**
@@ -235,7 +251,8 @@ export interface LlmEntry {
 	 * Storm's own wording (`answerReviewPacket`), with the answer exactly as quoted between `<<<` and `>>>`.
 	 */
 	reviewPacket?: ReviewPacket;
-	decision: { tool?: string; args?: Record<string, unknown>; text?: string };
+	/** `all` lists every call of an assistant message that carried several (the first one is also `tool`/`args`). */
+	decision: { tool?: string; args?: Record<string, unknown>; text?: string; all?: Array<{ tool: string; args: Record<string, unknown> }> };
 }
 
 /** One scoped answer-review subject as Storm spelled it: result id, receipt and citation anchor. */
@@ -432,11 +449,12 @@ function taskCall(tools: Tool[] | undefined, agents: string[], prefix = "W", say
 function taskItemsCall(tools: Tool[] | undefined, items: ScriptedTask[], context: string): Decision {
 	const batch = Boolean(schemaOf(tools, "task")?.properties?.tasks);
 	const item = (script: ScriptedTask, index: number) => {
-		const task = `${script.task ?? "Reply with OK"} (${CHILD_MARK} ${index})${script.say ? ` ${script.say}` : ""}`;
+		const marked = (text: string): string => `${text} (${CHILD_MARK} ${index})${script.say ? ` ${script.say}` : ""}`;
+		const assignment = script.steps !== undefined && script.steps.length > 0 ? { steps: script.steps.map((step, at) => (at === 0 ? marked(step) : step)) } : { task: marked(script.task ?? "Reply with OK") };
 		return {
 			name: script.name ?? `W${index}`,
 			agent: script.agent,
-			task,
+			...assignment,
 			solutionSpace: script.solutionSpace ?? "e2e: fixed reply",
 			...(script.isolated === true ? { isolated: true } : {}),
 			...(script.effort !== undefined ? { effort: script.effort } : {}),
@@ -573,6 +591,13 @@ async function hold(open: () => boolean): Promise<boolean> {
 }
 
 function stepCall(step: Step, tools: Tool[] | undefined): Decision {
+	if ("calls" in step) {
+		const decisions = step.calls.map(sub => stepCall(sub, tools));
+		const first = decisions[0];
+		const tools_ = decisions.filter((decision): decision is Extract<Decision, { kind: "tool" }> => decision.kind === "tool");
+		if (first === undefined || first.kind !== "tool" || tools_.length !== decisions.length) throw new Error("a `calls` step holds only call steps");
+		return { ...first, more: tools_.slice(1).map(({ kind, name, args }) => ({ kind, name, args })) };
+	}
 	if ("storm" in step) return extensionCall(tools, "storm", step.storm);
 	if ("task" in step) return taskCall(tools, step.task, step.as, step.say, step.isolated);
 	if ("tasks" in step) {
@@ -784,12 +809,16 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 		lastTool: last?.role === "tool" ? last.text.slice(0, 1_000) : "",
 		// omp adds a tool's `additionalContext` as a user message after the result, so the result is not always last.
 		lastToolResult: messages.findLast(entry => entry.role === "tool")?.text.slice(0, 1_000) ?? "",
+		trailingResults: messages.slice(messages.findLastIndex(entry => entry.role === "assistant") + 1).filter(entry => entry.role === "tool").map(entry => entry.text.slice(0, 1_000)),
 		compactionContext: who === "compaction"
 			? (users.at(-1)?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ??
 				users.at(-1)?.text.match(/Additional focus: ([\s\S]*?)<\/instruction>/)?.[1] ?? "")
 			: "",
 		...(packet === undefined ? {} : { reviewPacket: { id: packet.id, receipt: packet.receipt, citation: packet.citation, answer: packet.answer } }),
-		decision: decision.kind === "tool" ? { tool: decision.name, args: decision.args } : { text: decision.text.slice(0, 200) },
+		decision:
+			decision.kind === "tool"
+				? { tool: decision.name, args: decision.args, ...(decision.more === undefined ? {} : { all: [decision, ...decision.more].map(call => ({ tool: call.name, args: call.args })) }) }
+				: { text: decision.text.slice(0, 200) },
 	};
 	appendFileSync(LOG, `${JSON.stringify(entry)}\n`);
 }
@@ -814,7 +843,7 @@ function usageOf(model: string): { prompt_tokens: number; completion_tokens: num
 	return { prompt_tokens: prompt, completion_tokens: 10, total_tokens: prompt + 10 };
 }
 
-function toolCallOf(decision: Extract<Decision, { kind: "tool" }>): Record<string, unknown> {
+function toolCallOf(decision: { name: string; args: Record<string, unknown> }): Record<string, unknown> {
 	return { id: `call_${crypto.randomUUID().slice(0, 8)}`, type: "function", function: { name: decision.name, arguments: JSON.stringify(decision.args) } };
 }
 
@@ -828,7 +857,8 @@ function stream(model: string, decision: Decision): Response {
 				send(chunk(id, model, { content: decision.text }, null));
 				send(chunk(id, model, {}, "stop"));
 			} else {
-				send(chunk(id, model, { role: "assistant", content: null, tool_calls: [{ index: 0, ...toolCallOf(decision) }] }, null));
+				const calls = [decision, ...(decision.more ?? [])];
+				send(chunk(id, model, { role: "assistant", content: null, tool_calls: calls.map((call, index) => ({ index, ...toolCallOf(call) })) }, null));
 				send(chunk(id, model, {}, "tool_calls"));
 			}
 			send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model, choices: [], usage: usageOf(model) })}\n\n`);
@@ -840,7 +870,7 @@ function stream(model: string, decision: Decision): Response {
 }
 
 function completion(model: string, decision: Decision): Response {
-	const message = decision.kind === "text" ? { role: "assistant", content: decision.text } : { role: "assistant", content: null, tool_calls: [toolCallOf(decision)] };
+	const message = decision.kind === "text" ? { role: "assistant", content: decision.text } : { role: "assistant", content: null, tool_calls: [decision, ...(decision.more ?? [])].map(toolCallOf) };
 	return Response.json({
 		id: `chatcmpl-${crypto.randomUUID()}`,
 		object: "chat.completion",

@@ -14,7 +14,7 @@ import { resolveRepo } from "./approval/repo.ts";
 import { isRecord } from "./config/schema.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
-import { liveIsolationSettings, liveTaskMaxConcurrency, readExplicitSettings } from "./discovery/settings.ts";
+import { liveIsolationSettings, liveTaskMaxConcurrency, liveToolCallTimeoutMs, readExplicitSettings } from "./discovery/settings.ts";
 import {
 	agentsFlow,
 	approveAndSave,
@@ -30,7 +30,7 @@ import {
 } from "./flows.ts";
 import { serialized } from "./fsutil.ts";
 import { execPort, ompBinary } from "./omp.ts";
-import { changesFiles, pathOf } from "./policy/director.ts";
+import { directorFileChange, pathOf } from "./policy/director.ts";
 import {
 	DIRECTOR_CONTROL_REASON,
 	DIRECTOR_SERVICE_REASON,
@@ -38,7 +38,7 @@ import {
 	startsService,
 	WORKER_SERVICE_REASON,
 } from "./policy/director-exec.ts";
-import { checkChildModel, modelMismatchNotice, probeCredentialsDetailed, roleOfAgent, selectorOf, teamSelectors, withinDeadline } from "./policy/model-check.ts";
+import { approvedEntries, checkChildModel, checkChildModelAgainst, modelMismatchNotice, probeCredentialsDetailed, roleOfAgent, selectorOf, teamSelectors, withinDeadline } from "./policy/model-check.ts";
 import { docPromptFor } from "./policy/docs.ts";
 import { agentControlTarget, deliveredFollowUp, deliveryOutcome, deliveryWokeTurn, followUpAgent, followUpFailureNote, followUpProgress, followUpTarget } from "./policy/followup.ts";
 import {
@@ -49,7 +49,7 @@ import {
 	readOnlyIntent,
 	readOnlyTool,
 	reviewLane,
-	shellReviewer,
+	shellReader,
 	targetWithinScope,
 	toolWriteTargets,
 	type LanePolicy,
@@ -73,8 +73,8 @@ import {
 	type WorkerSlot,
 	workerSlot,
 } from "./policy/spawn.ts";
-import { supervisorToolBlock, type SupervisorScope, type SupervisorScopeSource } from "./policy/supervisor.ts";
-import { decideToolCall } from "./policy/toolcall.ts";
+import { supervisorRunToolBlock, supervisorToolBlock, type SupervisorScope, type SupervisorScopeSource } from "./policy/supervisor.ts";
+import { decideDirectorCall } from "./policy/toolcall.ts";
 import { PACKAGE_JSON, ROLE_AGENT_PREFIX, ROLES, STORM_VERSION } from "./roles.ts";
 import {
 	listAgents,
@@ -89,13 +89,26 @@ import {
 	noteVerdictTree,
 	registryAgentIds,
 } from "./runtime/agents.ts";
+import {
+	DIRECTOR_REWRITTEN,
+	DIRECTOR_WRITE_ENDING,
+	DIRECTOR_WRITE_MOVED,
+	DIRECTOR_WRITE_NO_CALL,
+	DIRECTOR_WRITE_NO_TARGET,
+	completedAssistantMessage,
+	directorCallIds,
+	directorTurnClean,
+	directorWriteBlock,
+	isAssistantMessage,
+} from "./runtime/arbiter.ts";
 import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
+import { laneContract } from "./runtime/contract-text.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector, type AttemptHostJob } from "./runtime/attempt-collector.ts";
 import { noteRunNotice, noteRunRan, noteRunSpawn, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
 import { broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, taskLaneProblem, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
-import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
+import { bindLedgerChild, anyLedgerRun, detachedLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { mayMakeSideCalls, settleSideSpend } from "./runtime/side-spend.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { closeoutHandoff, closeoutSessionId, resetCloseoutChoices, takeCloseoutChoice } from "./runtime/closeout.ts";
@@ -115,6 +128,7 @@ import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type P
 import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
 import type {
+	Effort,
 	ExplicitSettings,
 	Exec,
 	InfoTone,
@@ -138,9 +152,12 @@ import {
 	activeWorkerRunInTree,
 	endWorkerAdmission,
 	persistWorkerAdmission,
+	readChildBinding,
+	readChildReports,
 	readWorkerAdmission,
 	resolveWorkerAdmission,
 	revokeWorkerAdmissions,
+	writeChildReport,
 	type WorkerAdmissionRecord,
 } from "./worker-admission.ts";
 
@@ -305,8 +322,8 @@ interface AutoStatus {
 const AUTO_INSTRUCTION = `<storm-auto>
 This session delegates project work automatically.
 - General conversation needs no tools: answer directly.
-- Inspection, verification or file changes belong to the approved team: a storm plan opens this request's run; size it to the request. Use task for work lanes, storm execute for approved jobs. While workers run, end your turn: their results wake you. Do not ask the user whom to spawn.
-- You may read and search yourself. Edits, shell and MCP are the team's; you write only local://<name>.md and agent://<id> (?progress for a quiet note).
+- Inspection, verification and larger changes belong to the approved team: a storm plan opens this request's run; size it to the request. Use task for work lanes, storm execute for approved jobs. While workers run, end your turn: their results wake you. Do not ask the user whom to spawn.
+- Read and search yourself; once the run is open, edit/write files. Shell, eval and MCP are the team's; notes go to local://<name>.md, messages to agent://<id> (?progress for a quiet note).
 - Finish every declared result, even without edits. With a reviewer, verification needs the reviewer to accept the current tree.
 - A resent refused call is refused again: read its reason. Run questions go to storm status, not a new plan.
 </storm-auto>`;
@@ -753,6 +770,26 @@ export default function storm(pi: ExtensionAPI): void {
 	 * mutable session manager is never reread later as authority.
 	 */
 	let sessionGeneration = 0;
+	/**
+	 * The director's own path edits that hold the run's write table, by the host's tool call id, with what a switch of conversation
+	 * needs to know about each call: whether the host started it, whether its result was seen, and whether the `message_end` of the
+	 * message that carries the call was handled (`seen`). An entry leaves with its release (`releaseDirectorHolds`); the table's own
+	 * entry is the hold, this is only the host's side of the story.
+	 */
+	const directorHolds = new Map<string, { runId: string; root: string; started: boolean; resulted: boolean; seen: boolean }>();
+	/** Calls whose hold this very hook committed: its answer is final and waits for nothing more (no await after the commit). */
+	const committedHere = new Set<string>();
+	/**
+	 * The digest of the result-contract block (`laneContract`) a worker was last sent, so a work follow-up repeats the block only
+	 * when the worker has not been sent the current one. In memory: unknown means send again. `placed` is the digest of the lane's
+	 * block at its latest placement (copied to the worker when the host allocates its spawn), `sent` is by run and worker id, and
+	 * `pending` holds a follow-up's digest until its call is known to have been delivered.
+	 */
+	const contractDigests = {
+		placed: new Map<string, string>(),
+		sent: new Map<string, string>(),
+		pending: new Map<string, { key: string; digest: string }>(),
+	};
 	/** The authoritative native main-session id; a child's own id is never a Storm session. */
 	const mainSessionId = (ctx: ExtensionContext): string | undefined =>
 		ctx.agent.kind === "main" ? closeoutSessionId(ctx) : undefined;
@@ -1055,7 +1092,14 @@ export default function storm(pi: ExtensionAPI): void {
 		childId: string;
 		lane?: PlanLane;
 		authority: AgentAuthority;
+		/** The team's config and the agent's name: what the worker's role (and trial) approves travels with its admission (a pooled thread reads only disk). */
+		config?: StormConfig;
+		agent?: string;
 	}): Promise<void> => {
+		const spawn = runSpawns(input.run.runId).findLast(item => item.spawnKey === input.childId && item.outcome !== "blocked");
+		const trial = spawn?.trialId === undefined ? undefined : input.config?.trials?.find(item => item.id === spawn.trialId);
+		const agentName = spawn?.agent ?? input.agent;
+		const approved = input.config === undefined || agentName === undefined ? undefined : approvedEntries(input.config, agentName, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
 		// Through the same key a reservation's end revokes under: an older end never interleaves with this newer write.
 		await serialized(admissionKey(input.run.runId, input.childId), () =>
 			persistWorkerAdmission({
@@ -1070,6 +1114,7 @@ export default function storm(pi: ExtensionAPI): void {
 				targetRoot: input.run.root,
 				...(input.lane === undefined ? {} : { lane: input.lane.name }),
 				policy: input.authority.policy,
+				...(approved === undefined || approved.length === 0 ? {} : { approved }),
 			}),
 		);
 	};
@@ -1234,6 +1279,14 @@ export default function storm(pi: ExtensionAPI): void {
 	// The host's ask tool is the one real form-open signal a host emits: execution starts before the form waits and
 	// ends when it is answered, cancelled or fails. A host with no UI cannot show the form, so it claims no wait.
 	pi.on("tool_execution_start", (event, ctx) => {
+		// The host began running a director path edit: only a result or the end of a later message tells that it is over.
+		if (ctx.agent.kind === "main") {
+			const hold = directorHolds.get(event.toolCallId);
+			if (hold !== undefined) {
+				hold.started = true;
+				widenToWhatRuns(event, ctx, hold.root);
+			}
+		}
 		// A synchronous wait is the one mid-run tool call that can outlast the plan: if the context crossed 70% of its window
 		// since then, this boundary starts the automatic run's next background checkpoint. A manual run's wait tool
 		// adds nothing; its async wait uses the same handoff directly.
@@ -1689,6 +1742,8 @@ export default function storm(pi: ExtensionAPI): void {
 								childId: spawnKey,
 								...(lane === undefined ? {} : { lane }),
 								authority: authority.authority,
+								config,
+								agent: event.agent,
 							});
 						} catch {
 							return ledgerBlock("자식 실행 권한을 프로필에 저장하지 못해 스폰을 허용하지 않았습니다. 프로필 경로와 권한을 확인하세요.", current, now);
@@ -1709,6 +1764,9 @@ export default function storm(pi: ExtensionAPI): void {
 								startedAt: Date.now(),
 							});
 							if (!admitted.ok) return ledgerBlock(admitted.reason, current, Date.now());
+							// The worker's assignment carried this lane's contract block when its task call was placed.
+							const delivered = contractDigests.placed.get(`${current.runId}\0${lane.name}`);
+							if (delivered !== undefined) contractDigests.sent.set(`${current.runId}\0${spawnKey}`, delivered);
 						}
 					}
 				}
@@ -1784,7 +1842,38 @@ export default function storm(pi: ExtensionAPI): void {
 		return observing;
 	};
 
+	// The end of the director's turn is what releases its path edits (decision D2). Positive events only: no timer, never the end
+	// of one call (a formatter writes an earlier call's file during a later call of the same message), never `agent_end` (it
+	// carries the whole history and can arrive twice), never a prune or the run's end.
+	// 1. A clean turn (every edit and write call of the message ended without an error): the calls this event names.
+	// 2. An unclean one (any of them was refused, blocked, failed or aborted): kept, because the host may still be committing
+	//    what an aborted call wrote. The next completed assistant message of this conversation ends them (below).
+	pi.on("turn_end", (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		const held = [...directorCallIds(event)].filter(id => directorHolds.has(id));
+		if (held.length === 0 || !directorTurnClean(event)) return;
+		releaseDirectorHolds(held);
+	});
+
 	pi.on("message_end", async (event, ctx) => {
+		// 3. The backstop for all of it. On the host (19.2.1) the hooks of a message's calls run first, then that message's own
+		//    `message_end` comes, then its calls execute: so this event must never free the holds of the message it ends. A
+		//    hold is `seen` once the `message_end` of the message carrying its call was handled; a completed assistant message
+		//    after that one means the loop made and finished another request, which it does only after the earlier batch is over
+		//    (the host hands one extension its events in the order it emitted them). Only such a hold is released here.
+		if (ctx.agent.kind === "main" && isAssistantMessage(event.message)) {
+			const own = directorCallIds({ message: event.message });
+			if (completedAssistantMessage(event.message)) {
+				const older = [...directorHolds].filter(([id, hold]) => hold.seen && !own.has(id)).map(([id]) => id);
+				// A table entry this handler never heard of (a restart of the handler's state) is older than this message too.
+				const unknown = (runs.runLanes()?.directorCalls() ?? []).filter(id => !directorHolds.has(id) && !own.has(id));
+				releaseDirectorHolds([...older, ...unknown]);
+			}
+			for (const id of own) {
+				const hold = directorHolds.get(id);
+				if (hold !== undefined) hold.seen = true;
+			}
+		}
 		// A finished background task is a custom `async-result` message on the parent, not an assistant turn. Observe it
 		// before the usage guard, which has no usage to read for that message.
 		if (ctx.agent.kind === "main") {
@@ -1794,6 +1883,16 @@ export default function storm(pi: ExtensionAPI): void {
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
 		const ledger = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
+		if (ctx.agent.kind === "sub" && ledger === undefined) {
+			// A pooled thread has no run in memory: what the request cost is published for the director's thread to add to the run.
+			if (usage.usd <= 0) return;
+			const bound = await pooledRun(ctx);
+			if (bound.kind !== "run") return;
+			await publishChildReport(ctx, bound.ledger, report => {
+				report.costByModel[usage.selector] = (report.costByModel[usage.selector] ?? 0) + usage.usd;
+			});
+			return;
+		}
 		if (ctx.agent.kind === "sub") {
 			// A bare child has no attested Storm owner: its own native session is never substituted.
 			if (ledger === undefined) return;
@@ -1960,10 +2059,15 @@ export default function storm(pi: ExtensionAPI): void {
 			if (additions.length === 0 && kept.length === event.systemPrompt.length) return undefined;
 			return { systemPrompt: [...kept, ...additions] };
 		}
-		const ledger = childLedger(ctx);
 		// A child has no Storm session of its own: only the run its parent admitted supplies an owner. Without one
-		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd.
-		if (ledger === undefined) return undefined;
+		// there is no ledger write, no docs and no reviewer identity — never a fallback to the child's session or cwd. On a pooled
+		// thread the run is not in memory and its persisted admission names it (the docs and the reviewer's baseline are files).
+		let ledger = childLedger(ctx);
+		if (ledger === undefined) {
+			const bound = await pooledRun(ctx);
+			if (bound.kind !== "run") return undefined;
+			ledger = bound.ledger;
+		}
 		const { id, name } = ctx.agent;
 		const artifacts = artifactsOf(ctx);
 		childWorkTrees.set(reviewerBaselineKey(artifacts, id), ctx.cwd);
@@ -1993,11 +2097,95 @@ export default function storm(pi: ExtensionAPI): void {
 	 */
 	/** The check of a child's request must answer well inside omp's own budget for a handler (30 s): past it omp sends the request unchecked. */
 	const CHILD_CHECK_MS = 10_000;
+	/**
+	 * A child on a pooled thread has no run in this thread's memory, so what it decides from the run is read from disk (its persisted
+	 * admission names the run) and what the director must learn is published (`writeChildReport`), because nothing a hook writes into
+	 * this thread's ledger is seen by the director's thread. `childReports` is this thread's cumulative copy of what it published.
+	 */
+	const childReports = new Map<string, { runId: string; childId: string; ran?: RanModel; notice?: string; costByModel: Record<string, number> }>();
+	/** Whether this run lives in this thread's memory: a child of a run that does not reports through the profile store instead. */
+	const detachedLedgers = new WeakSet<LedgerRun>();
+	const detached = (ledger: LedgerRun): boolean => detachedLedgers.has(ledger);
+	const publishChildReport = async (ctx: ExtensionContext, ledger: LedgerRun, change: (report: { ran?: RanModel; notice?: string; costByModel: Record<string, number> }) => void): Promise<void> => {
+		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
+		const report = childReports.get(key) ?? { runId: ledger.runId, childId: ctx.agent.id, costByModel: {} };
+		change(report);
+		childReports.set(key, report);
+		const written = await writeChildReport(workerAdmissionAgentDir(), report);
+		// A report that could not be written is a verdict the director will never read: the worker's own guard still stops it (fail closed).
+		if (!written && report.notice !== undefined) stoppedChildren.set(key, report.notice);
+	};
+	/** The run of this child when this thread's memory has none: from its persisted admission. `unknown` is a managed child whose run cannot be named. */
+	const pooledRun = async (ctx: ExtensionContext): Promise<{ kind: "run"; ledger: LedgerRun; approved?: ReadonlyArray<{ selector: string; effort?: string }> } | { kind: "none" } | { kind: "unknown"; reason: string }> => {
+		try {
+			const bound = await readChildBinding({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id });
+			if (bound.kind === "unmanaged") return { kind: "none" };
+			if (bound.kind === "unknown") return bound;
+			const ledger = detachedLedgerRun({ runId: bound.runId, sessionId: bound.sessionId, sessionDir: bound.sessionDir, repoId: bound.repoId, root: bound.root, artifactsDir: bound.artifactRoot, startedAt: bound.createdAt });
+			detachedLedgers.add(ledger);
+			return { kind: "run", ledger, ...(bound.approved === undefined ? {} : { approved: bound.approved }) };
+		} catch {
+			return { kind: "unknown", reason: "자식 실행 기록을 읽지 못했습니다" };
+		}
+	};
+	/** What the director's thread already took from each child's report, by run and child: a report is cumulative, so only the difference is new. */
+	const adoptedReports = new Map<string, { ran?: string | undefined; noticed: boolean; costByModel: Record<string, number> }>();
+	/**
+	 * Takes what children on pooled threads published (see `publishChildReport`) into this thread's run: the verdict of their model
+	 * check goes on the spawn's record, a stop is told to the director once, and what they spent counts against the budget. Only a
+	 * report of a child this run admitted counts (its persisted admission names this run); the rest is ignored.
+	 */
+	const adoptChildReports = async (ctx: ExtensionContext, runId: string): Promise<void> => {
+		if (getLedgerRun(runId) === undefined) return;
+		let reports: Awaited<ReturnType<typeof readChildReports>>;
+		try {
+			reports = await readChildReports(workerAdmissionAgentDir(), runId);
+		} catch {
+			return;
+		}
+		for (const report of reports) {
+			const key = `${runId}\0${report.childId}`;
+			const seen: { ran?: string | undefined; noticed: boolean; costByModel: Record<string, number> } = adoptedReports.get(key) ?? { noticed: false, costByModel: {} };
+			const ranKey = report.ran === undefined ? undefined : `${report.ran.model}:${report.ran.effort ?? ""}:${report.ran.verdict}`;
+			const newCost = Object.entries(report.costByModel).some(([model, usd]) => usd > (seen.costByModel[model] ?? 0));
+			if (ranKey === seen.ran && (report.notice === undefined || seen.noticed) && !newCost) continue;
+			try {
+				const read = await readWorkerAdmission({ agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.id, childId: report.childId });
+				if (read.kind !== "record" || read.record.runId !== runId) continue;
+			} catch {
+				continue;
+			}
+			if (report.ran !== undefined && ranKey !== seen.ran) {
+				noteRunRan(runId, report.childId, report.ran);
+				seen.ran = ranKey;
+			}
+			if (report.notice !== undefined && !seen.noticed) {
+				noteRunNotice(runId, report.notice);
+				seen.noticed = true;
+			}
+			for (const [model, usd] of Object.entries(report.costByModel)) {
+				const delta = usd - (seen.costByModel[model] ?? 0);
+				if (delta <= 0) continue;
+				recordCost(runId, model, delta);
+				seen.costByModel[model] = usd;
+			}
+			touchRun(runId);
+			adoptedReports.set(key, seen);
+		}
+	};
+
 	/** Stops a managed child: its later calls are refused, the director is told, its persisted authority ends, and its request is aborted. */
 	const stopChild = (ctx: ExtensionContext, ledger: LedgerRun, key: string, notice: string, ran?: RanModel): void => {
 		stoppedChildren.set(key, notice);
 		if (ran !== undefined) noteRunRan(ledger.runId, ctx.agent.id, ran);
 		noteRunNotice(ledger.runId, notice);
+		// On a pooled thread the two lines above reached no one: the director's thread reads what the child publishes.
+		if (detached(ledger)) {
+			void publishChildReport(ctx, ledger, report => {
+				report.notice = notice;
+				if (ran !== undefined) report.ran = ran;
+			});
+		}
 		// A child on another thread cannot see this map: its persisted authority is revoked so its next write fails closed.
 		void serialized(admissionKey(ledger.runId, ctx.agent.id), async () => {
 			try {
@@ -2010,10 +2198,24 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 	pi.on("before_provider_request", async (_event, ctx) => {
 		if (ctx.agent.kind !== "sub") return undefined;
-		const ledger = childLedger(ctx);
+		let ledger = childLedger(ctx);
+		let pooledApproved: ReadonlyArray<{ selector: string; effort?: string }> | undefined;
 		const model = ctx.model;
-		if (ledger === undefined || model === undefined) return undefined;
 		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
+		if (ledger === undefined) {
+			// This thread's memory has no run for the child (a pooled thread). Its persisted admission says which run it belongs to;
+			// a managed child whose run cannot be named is stopped, never let through unchecked.
+			const bound = await pooledRun(ctx);
+			if (bound.kind === "none") return undefined;
+			if (bound.kind === "unknown") {
+				stoppedChildren.set(key, `[storm:model-mismatch] 이 워커가 어느 실행에 속하는지 확인하지 못해 팀이 승인한 모델인지 검사할 수 없었고, 그래서 멈췄습니다(${bound.reason}). 지금까지의 결과를 감독에게 보고하세요.`);
+				ctx.abort();
+				return undefined;
+			}
+			ledger = bound.ledger;
+			pooledApproved = bound.approved;
+		}
+		if (model === undefined) return undefined;
 		if (stoppedChildren.has(key)) {
 			ctx.abort();
 			return undefined;
@@ -2047,8 +2249,15 @@ export default function storm(pi: ExtensionAPI): void {
 					return undefined;
 				}
 			};
+			// On a pooled thread the spawn records (and so the trial) are not here: the parent wrote what the worker's role and trial
+			// approve into its admission. A worker whose admission has none of them cannot be checked, and is stopped.
+			const observed = { provider: model.provider, id: model.id, resolve, ...(effort === undefined ? {} : { effort }) };
 			const check: ReturnType<typeof checkChildModel> =
-				config === undefined
+				detached(ledger)
+					? pooledApproved === undefined || pooledApproved.length === 0
+						? { ok: false, reason: "unchecked", observed: selector, approved: [] }
+						: checkChildModelAgainst(pooledApproved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort as Effort }) })), observed)
+					: config === undefined
 					? { ok: false, reason: "unchecked", observed: selector, approved: [] }
 					: checkChildModel(config, agent, { provider: model.provider, id: model.id, resolve, ...(effort === undefined ? {} : { effort }) }, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
 			const ran = { model: selector, ...(effort === undefined ? {} : { effort }) };
@@ -2057,6 +2266,7 @@ export default function storm(pi: ExtensionAPI): void {
 				if (lastRan.get(key) !== seen) {
 					lastRan.set(key, seen);
 					noteRunRan(ledger.runId, ctx.agent.id, { ...ran, verdict: "verified" });
+					if (detached(ledger)) await publishChildReport(ctx, ledger, report => { if (report.ran?.verdict !== "mismatch") report.ran = { ...ran, verdict: "verified" }; });
 				}
 				return undefined;
 			}
@@ -2101,7 +2311,105 @@ export default function storm(pi: ExtensionAPI): void {
 	};
 
 	// Director mode: blocking the call instead of swapping the tool list keeps the main session's prompt cache intact.
+	/**
+	 * Another extension, loaded after Storm, may rewrite a call's arguments after Storm's hook answered. When the host starts the call
+	 * its arguments are final: if they name files the hold does not cover (or cannot be read at all), the files it really writes are
+	 * held from now on (the whole tree when they cannot be named) and the director is told. The call cannot be refused any more, so a
+	 * writer that already held those files is not stopped: that is the stated limit (docs/design.md).
+	 */
+	const widenToWhatRuns = (event: { toolName: string; toolCallId: string; args?: unknown }, ctx: ExtensionContext, root: string): void => {
+		const lanes = runs.runLanes();
+		const held = lanes?.directorCallPaths(event.toolCallId);
+		if (lanes === undefined || held === undefined) return;
+		const real = decideDirectorCall({ toolName: event.toolName, input: event.args, cwd: ctx.cwd, root });
+		const covered = (path: string): boolean => held.some(scope => scope === "." || path === scope || path.startsWith(`${scope}/`));
+		if (real.kind === "director-path" && real.paths.every(covered)) return;
+		const extra = real.kind === "director-path" ? real.paths.filter(path => !covered(path)) : ["."];
+		if (!lanes.widenDirectorCall(event.toolCallId, extra)) return;
+		runs.noteDirector(`[storm:director-edit] ${DIRECTOR_REWRITTEN}`);
+	};
+
+	/** Ends the holds of these director calls in the run's write table and forgets them here. Idempotent; an id nobody holds changes nothing. */
+	const releaseDirectorHolds = (ids: Iterable<string>): void => {
+		const released = [...ids];
+		for (const id of released) directorHolds.delete(id);
+		if (released.length > 0) runs.runLanes()?.releaseDirectorCalls(released);
+	};
+
+	/**
+	 * The director's own change of a project file during a run (the main session's hook, a path tool with a plain path). It is one
+	 * more writer in the run's write table, and it enters last:
+	 * 1. The call is classified and its targets are named from the call itself (`decideDirectorCall`); a call whose files cannot be
+	 *    named, or that leaves the work tree, is refused here with its cause. Nothing is held yet.
+	 * 2. The write lease is taken, and then the same wait every writer meets for the authority of a worker that ended (it is withdrawn
+	 *    before this call may write beside what that worker held). Both are awaits, so the run's liveness is captured before them.
+	 * 3. The targets are computed again: a link or a file may have changed during those waits, and the table must hold what the call
+	 *    will write now, not what it would have written earlier.
+	 * 4. In one synchronous step, `commitWriter` checks that the run is still this session's and not ending, that the host's own limit
+	 *    for this hook (`extensionHandlers.toolCallTimeoutMs`, less a margin) is not reached, and that no writer that cannot be
+	 *    bounded, and no worker on the same files, holds the tree; then it enters the call. Nothing awaits between that step and the
+	 *    answer, so the call that runs is the call that was entered.
+	 * The hold ends only by `turn_end`, the next completed assistant message, or the switch rules (see those handlers).
+	 */
+	const directorPathEdit = async (
+		event: ToolCallEvent,
+		ctx: ExtensionContext,
+		run: { runId: string; root: string; scope: string; generation: number; mainId: string; hookStart: number },
+	): Promise<ToolCallEventResult | undefined> => {
+		const judge = () =>
+			decideDirectorCall({
+				toolName: event.toolName,
+				input: event.input,
+				cwd: ctx.cwd,
+				root: run.root,
+				...(event.parentToolCallId === undefined ? {} : { parentToolCallId: event.parentToolCallId }),
+			});
+		const refused = (block: Parameters<typeof blockText>[0]): ToolCallEventResult => {
+			runs.noteBlockedEdit();
+			return { block: true, reason: blockText(block) };
+		};
+		const moved = (): boolean => run.generation !== sessionGeneration || mainSessionId(ctx) !== run.mainId;
+		const first = judge();
+		if (first.kind === "block") return refused(first.block);
+		// A call the caller classified as a file change is never "allowed" unjudged: no names, no hold, no run.
+		if (first.kind === "allow") return refused(directorWriteBlock(DIRECTOR_WRITE_NO_TARGET));
+		const callId = event.toolCallId;
+		if (typeof callId !== "string" || callId === "") return refused(directorWriteBlock(DIRECTOR_WRITE_NO_CALL));
+		// What the commit's proof compares against is read before the first await.
+		const proof = runs.liveCheck(ctx);
+		const lease = await runs.ensureLease(ctx);
+		if (!lease.ok) return { block: true, reason: `[storm:lease] ${lease.reason}` };
+		if (moved()) return refused(directorWriteBlock(DIRECTOR_WRITE_MOVED));
+		// The same wait every writer meets: a worker that ended may still hold authority in the persisted record until its revoke lands.
+		const unsettled = await settleEndRevokes(run.runId);
+		if (unsettled !== undefined) return { block: true, reason: unsettled };
+		if (moved()) return refused(directorWriteBlock(DIRECTOR_WRITE_MOVED));
+		const second = judge();
+		if (second.kind === "block") return refused(second.block);
+		if (second.kind === "allow") return refused(directorWriteBlock(DIRECTOR_WRITE_NO_TARGET));
+		const lanes = runs.runLanes();
+		if (lanes === undefined || lanes.runId !== run.runId) return refused(directorWriteBlock(DIRECTOR_WRITE_ENDING));
+		// From the host's own limit for this hook: its handler is blocked at `timeout`, and what it does after is ignored by the host.
+		const timeout = liveToolCallTimeoutMs();
+		const now = Date.now();
+		const committed = lanes.commitWriter({
+			kind: "director-path",
+			callId,
+			paths: second.paths,
+			live: () => (moved() ? { ok: false, reason: DIRECTOR_WRITE_ENDING } : proof()),
+			deadline: run.hookStart + timeout - Math.min(2_000, timeout / 2),
+			now,
+			agents: listAgents({ runId: run.runId, scope: run.scope }),
+		});
+		if (!committed.ok) return refused(directorWriteBlock(committed.reason));
+		directorHolds.set(callId, { runId: run.runId, root: run.root, started: false, resulted: false, seen: false });
+		committedHere.add(callId);
+		return undefined;
+	};
+
 	const guardToolCall = async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+		// The host's budget for this hook starts about now (see `directorPathEdit`).
+		const hookStart = Date.now();
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
 			const boundRunId = ledger?.runId;
@@ -2177,9 +2485,10 @@ export default function storm(pi: ExtensionAPI): void {
 						};
 					}
 				}
-				// A review lane approved with a shell may also run commands (`bash`) and nothing else beyond reading: no path
-				// write, no eval. Its lane is ordered like a shared writer where it is placed, so no other writer runs with it.
-				if (policy.kind === "read" && !readOnlyTool(event.toolName) && !(shellReviewer(policy) && event.toolName === "bash")) {
+				// A read lane approved with a shell (a review lane or any other) may also run commands (`bash`) and nothing else
+				// beyond reading: no path write, no eval. Its lane is ordered like a shared writer where it is placed, so no other
+				// writer runs with it.
+				if (policy.kind === "read" && !readOnlyTool(event.toolName) && !(shellReader(policy) && event.toolName === "bash")) {
 					return {
 						block: true,
 						reason: policy.shell === true
@@ -2189,8 +2498,8 @@ export default function storm(pi: ExtensionAPI): void {
 				}
 				// A service (`bash` with a `name`) lives in omp's daemon: it is no job of this session, the worker's turn does not wait
 				// for it, and it keeps writing after the reservation behind this worker is freed. A worker that is ordered against
-				// the other writers of the tree (an exec-capable lane, a reviewer with a shell) must not start one.
-				if (startsService(event.toolName, event.input) && (policy.kind === "unknown" || shellReviewer(policy))) {
+				// the other writers of the tree (an exec-capable lane, a read lane with a shell) must not start one.
+				if (startsService(event.toolName, event.input) && (policy.kind === "unknown" || shellReader(policy))) {
 					return { block: true, reason: `[storm:lane-service] ${whoTopic} 서비스를 시작할 수 없습니다. ${WORKER_SERVICE_REASON}` };
 				}
 				if (policy.kind === "private" && pathWriteTool(event.toolName) && !readOnlyTool(event.toolName)) {
@@ -2255,11 +2564,12 @@ export default function storm(pi: ExtensionAPI): void {
 		if (mainId === undefined) {
 			return { block: true, reason: "[storm:session] 이 세션의 id를 확인하지 못해 Storm 실행 도구를 막았습니다. 새 대화에서 다시 시도하세요." };
 		}
-		// Automatic delegation keeps the supervisor gate during the run too: it refuses what edits files, starts a command,
-		// has unknown effects or reads something that is not a plain read, each with its own cause. Reads and searches,
-		// task, and the typed messages and notes stay open. The edit check (`director-edit`) still runs after it.
+		// Automatic delegation keeps the supervisor gate during the run too: it refuses what starts a command, has unknown
+		// effects or reads something that is not a plain read, each with its own cause. Reads and searches, task, the typed
+		// messages and notes stay open, and so do the path tools that change project files: they go on to the director's
+		// own edit rule below, which names the files or refuses. (Before the run the gate above refuses them.)
 		if (autoOn) {
-			const strict = supervisorToolBlock(event.toolName, event.input, supervisorScope(ctx), planModeOn(ctx));
+			const strict = supervisorRunToolBlock(event.toolName, event.input, supervisorScope(ctx), planModeOn(ctx));
 			if (strict !== undefined) return { block: true, reason: autoRunRefusal(strict) };
 		}
 		// An eval turn can start several children without a native task batch; during a run every worker must come
@@ -2309,12 +2619,10 @@ export default function storm(pi: ExtensionAPI): void {
 			const taken = lanes.commitDirectorExec({ callId: event.toolCallId, agents: listAgents({ runId, scope: runScope }), now: Date.now() });
 			if (!taken.ok) return { block: true, reason: `[storm:director-exec] ${taken.reason}` };
 		}
-		const block = decideToolCall({ toolName: event.toolName, input: event.input, cwd: ctx.cwd, runId, config, agents: listAgents({ scope: runScope }) });
-		if (block) {
-			if (block.code === "director-edit") runs.noteBlockedEdit();
-			else if (block.code === "read-large") runs.noteBlockedRead();
-			else runs.noteBlockedFollowUp();
-			return { block: true, reason: blockText(block) };
+		// The director's own change of a project file: a path tool whose exact targets Storm names and commits to the run's write
+		// table as the last step before the call runs, or a refusal with its cause. Every other file change stays refused.
+		if (directorFileChange(event.toolName, event.input) !== undefined) {
+			return directorPathEdit(event, ctx, { runId, root: runLedger?.root ?? ctx.cwd, scope: runScope, generation, mainId, hookStart });
 		}
 		// Every native task call is placed before omp allocates its spawn id: auto direction also reserves a lane name,
 		// manual direction keeps the caller's handle. The plan decides isolation for both; a direct isolated claim
@@ -2360,6 +2668,13 @@ export default function storm(pi: ExtensionAPI): void {
 					...(host === undefined ? {} : { host }),
 					...(readiness === undefined ? {} : { readiness }),
 					...(policyView === undefined || !policyView.ok ? {} : { policies: policyView.policies, canonicalFiles: policyView.canonicalFiles }),
+					// Each item's own lane's result contract: what Storm will judge, and how. Per item, because isolation is.
+					decorate: ({ lane, isolated }: { lane: PlanLane | undefined; isolated: boolean }): string | undefined => {
+						const contract = lane === undefined ? undefined : laneContract(lane, { isolated });
+						if (lane === undefined || contract === undefined) return undefined;
+						contractDigests.placed.set(`${runId}\0${lane.name}`, contract.digest);
+						return contract.text;
+					},
 					agents: listAgents({ runId, scope: runScope }),
 					...(typeof event.toolCallId === "string" ? { callId: event.toolCallId } : {}),
 					now: Date.now(),
@@ -2544,7 +2859,7 @@ export default function storm(pi: ExtensionAPI): void {
 			// admission its last turn ended, so it can read and yield but never write or run a command.
 			if (!quietWake && lane !== undefined && authority !== undefined) {
 				try {
-					await persistChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority });
+					await persistChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, lane, authority, config, agent: followAgent.name });
 				} catch {
 					followLanes.finishFollowUp(followToken, false);
 					return { block: true, reason: "[storm:authority] 후속 작업의 자식 실행 권한을 저장하지 못해 전달하지 않았습니다. 프로필 경로와 권한을 확인하세요." };
@@ -2599,22 +2914,36 @@ export default function storm(pi: ExtensionAPI): void {
 			}
 		}
 		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
-		// A work-bearing follow-up that wakes the approved reviewer carries the next unsent batch of answer packets in that
-		// one message, so a resumed reviewer session judges exact submissions too. A progress note stays a quiet note.
-		if (!progress && followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
-			const content = (event.input as { content?: unknown }).content;
-			if (typeof content === "string" && content.trim() !== "") {
-				const packets = runs.takeAnswerReviewBatch();
-				if (packets !== undefined) return { input: { ...event.input, content: `${content.trimEnd()}\n\n${packets}` } };
+		const message = (event.input as { content?: unknown }).content;
+		let content = typeof message === "string" && message.trim() !== "" ? message : undefined;
+		// A work follow-up is new work under its lane's result contract: it carries the block again when the worker has not been
+		// sent the current one (a replan gave the lane results, or Storm restarted and no longer knows what it sent). A progress note
+		// is a quiet note and carries nothing.
+		if (content !== undefined && !progress && followAgent !== undefined && followLane !== undefined) {
+			const contract = laneContract(followLane, { isolated: followLane.isolationReason !== undefined || config.isolation === "isolated" });
+			const sentKey = `${runId}\0${followAgent.id}`;
+			if (contract !== undefined && contractDigests.sent.get(sentKey) !== contract.digest) {
+				content = `${content.trimEnd()}\n\n${contract.text}`;
+				// Counted as sent only when the call is known to have been delivered (its result, below).
+				if (typeof event.toolCallId === "string") contractDigests.pending.set(`${runId}\0${event.toolCallId}`, { key: sentKey, digest: contract.digest });
 			}
 		}
-		return undefined;
+		// A work-bearing follow-up that wakes the approved reviewer carries the next unsent batch of answer packets in that
+		// one message, so a resumed reviewer session judges exact submissions too. A progress note stays a quiet note.
+		if (content !== undefined && !progress && followAgent !== undefined && followAgent.name === approvedReviewer(config)) {
+			const packets = runs.takeAnswerReviewBatch();
+			if (packets !== undefined) content = `${content.trimEnd()}\n\n${packets}`;
+		}
+		return content !== undefined && content !== message ? { input: { ...event.input, content } } : undefined;
 	};
 	// A refused `task` call is not blocked: a block ends the call with `details: {}`, which omp's task view cannot draw
 	// (see task-refusal.ts). The call runs into omp's own rejection of a stale field and `tool_result` swaps in Storm's
 	// reason. Every other tool keeps the plain block: its view draws that result.
 	pi.on("tool_call", async (event, ctx) => {
 		let verdict = await guardToolCall(event, ctx);
+		// The director's path edit made that wait before its commit (it must be the last step), and nothing may wait after it.
+		const committed = ctx.agent.kind === "main" && typeof event.toolCallId === "string" && committedHere.delete(event.toolCallId);
+		if (committed) return verdict;
 		// A call that may start a writer (everything but a read) answers only after the authority of any worker whose place
 		// this call's placement took has really been withdrawn (R-final N4), and fails closed when it could not be.
 		if (verdict?.block !== true && ctx.agent.kind === "main" && !readOnlyTool(event.toolName)) {
@@ -2714,7 +3043,7 @@ export default function storm(pi: ExtensionAPI): void {
 				if (verdictOf(event.input) !== undefined) await bindReviewerVerdict(exec, ctx, ledger, now);
 			}
 			// The review gate reads what the team changed; a file-changing call that failed changed nothing.
-			if (!event.isError && changesFiles(event.toolName, event.input)) noteAgentChange(ctx.agent.id, now, ledger.sessionDir);
+			if (!event.isError && directorFileChange(event.toolName, event.input) !== undefined) noteAgentChange(ctx.agent.id, now, ledger.sessionDir);
 			return undefined;
 		}
 		const runId = runs.runId();
@@ -2801,7 +3130,22 @@ export default function storm(pi: ExtensionAPI): void {
 	// inner handler, whose failure path drops it) and, for a message to a worker whose records Storm has cleaned and that
 	// omp failed to deliver, why it failed and where the result still is. omp adds `additionalContext` to any tool's result.
 	pi.on("tool_result", async (event, ctx) => {
+		// The host's result of a director path edit: after a switch of conversation this is the one sign that the call ended (it
+		// comes with an aborted call's error too). Noted before anything awaits.
+		if (ctx.agent.kind === "main") {
+			const hold = typeof event.toolCallId === "string" ? directorHolds.get(event.toolCallId) : undefined;
+			if (hold !== undefined) hold.resulted = true;
+		}
 		const runId = ctx.agent.kind === "main" ? runs.runId() : undefined;
+		// A follow-up that carried a result contract was delivered: its worker has now been sent it.
+		if (runId !== undefined && typeof event.toolCallId === "string") {
+			const pendingKey = `${runId}\0${event.toolCallId}`;
+			const pending = contractDigests.pending.get(pendingKey);
+			if (pending !== undefined) {
+				contractDigests.pending.delete(pendingKey);
+				if (!event.isError) contractDigests.sent.set(pending.key, pending.digest);
+			}
+		}
 		const noteKey = runId !== undefined && typeof event.toolCallId === "string" ? `${runId}\0${event.toolCallId}` : undefined;
 		const started = noteKey === undefined ? undefined : startNotes.get(noteKey);
 		if (noteKey !== undefined) startNotes.delete(noteKey);
@@ -2815,6 +3159,7 @@ export default function storm(pi: ExtensionAPI): void {
 			if (cleaned !== undefined) parts.push(cleaned);
 		}
 		if (event.toolName === "wait" || event.toolName === "task") {
+			if (runId !== undefined) await adoptChildReports(ctx, runId);
 			const notice = await runs.noticesForDirector();
 			if (notice !== undefined) parts.push(notice);
 		}
@@ -2845,6 +3190,7 @@ export default function storm(pi: ExtensionAPI): void {
 			await Promise.race([Promise.allSettled(arrived), limit]);
 			clearTimeout(timer);
 		}
+		await adoptChildReports(ctx, runId);
 		const notice = await runs.noticesForDirector();
 		if (notice === undefined) return undefined;
 		return { messages: [...event.messages, { role: "developer", content: [{ type: "text", text: notice }], attribution: "agent", timestamp: Date.now() }] };
@@ -2963,6 +3309,10 @@ export default function storm(pi: ExtensionAPI): void {
 		followDispatches.clear();
 		followWakeCalls.clear();
 		startNotes.clear();
+		// What a worker of the old conversation was sent is not known to the next: unknown means a follow-up sends it again.
+		contractDigests.placed.clear();
+		contractDigests.sent.clear();
+		contractDigests.pending.clear();
 		liveStatus.beginSession();
 		openWaits.clear();
 		resetCloseoutChoices(ctx);
@@ -2980,6 +3330,13 @@ export default function storm(pi: ExtensionAPI): void {
 			return;
 		}
 		sessionGeneration++;
+		// The host reports the switch after it awaited the old loop's abort and delivers nothing more of that loop: no `turn_end`, no
+		// `tool_execution_end`. So the director's path edits of the old conversation end here when nothing can still be writing for
+		// them: a call that never started (omp aborted the batch before it ran, and a hook still pending never executes) and one
+		// whose result was seen (it ended, aborted or not). Any other is kept, failing closed: the run then cannot finish and says
+		// which call it waits for (`DIRECTOR_DRAIN_WARNING`). Residual, stated: a commit still in flight when the host reports
+		// the old loop aborted (omp gives an extension no receipt for it after an abort).
+		releaseDirectorHolds([...directorHolds].filter(([, hold]) => !hold.started || hold.resulted).map(([id]) => id));
 		forgetConversation(ctx);
 		const active = getLedgerRun(runs.runId());
 		if (active !== undefined) await revokeWorkerAdmissionsFor({ runId: active.runId });
@@ -3002,6 +3359,7 @@ export default function storm(pi: ExtensionAPI): void {
 			agentAuthorities.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			stoppedChildren.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			lastRan.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
+			childReports.delete(authorityKey(artifactsOf(ctx), ctx.agent.id));
 			const key = reviewerBaselineKey(artifactsOf(ctx), ctx.agent.id);
 			reviewerBaselines.delete(key);
 			childWorkTrees.delete(key);

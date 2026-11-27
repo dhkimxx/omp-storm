@@ -611,7 +611,22 @@ export type SpawnBlockCode =
 	| "internal";
 
 /** Why Storm refused a director's tool call during a run. */
-export type ToolBlockCode = "director-edit" | "read-large" | "followup-cleaned";
+export type ToolBlockCode = "director-edit" | "director-write" | "read-large" | "followup-cleaned";
+
+/**
+ * Who holds an entry of the run's write table. An entry with no kind is a worker's reservation. Every kind but `director-path`
+ * can change the shared tree without naming a path (an `unknown` scope); a `director-path` entry names the exact paths of one
+ * director tool call and is ordered by them.
+ * - `director-path`: the director's own path edit (`edit`, `write`, `ast_edit`), from the commit before the call runs to the
+ *   end of the assistant turn that made the call.
+ * - `director-exec`, `director-bg`: the director's own command, in the foreground or sent to the background.
+ * - `job`, `check`: a host process Storm runs, a configured job or a required check.
+ * - `fence`: one of those whose process end is not proven.
+ */
+export type HolderKind = "director-path" | "director-exec" | "director-bg" | "job" | "check" | "fence";
+
+/** What a caller proves, in the synchronous step that commits a writer, about the run it acts for. */
+export type LiveCheck = { ok: true } | { ok: false; reason: string };
 
 /** A refusal: the stable code and the sentence that teaches the model what to do instead. */
 export interface Block<Code extends string = SpawnBlockCode | ToolBlockCode> {

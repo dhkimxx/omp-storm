@@ -1116,3 +1116,105 @@ test("agent://all is refused only when waking every idle worker would pass omp's
 	// Nobody to wake: the running worker alone is within any ceiling it already fits.
 	expect(broadcastBlock({ runId, agents: [agents[3]!], maxConcurrency: 1 })).toBeUndefined();
 });
+
+// ── Per-item text at placement (`decorate`) ──────────────────────────────────────────────────────────────────────────────
+
+type DecorateEntry = Parameters<NonNullable<NonNullable<Parameters<RunLanes["place"]>[3]>["decorate"]>>[0];
+const decorateWith = (text: (entry: DecorateEntry) => string | undefined) => {
+	const seen: DecorateEntry[] = [];
+	return { seen, decorate: (entry: DecorateEntry) => (seen.push(entry), text(entry)) };
+};
+const stepped = (item: Record<string, unknown>): string[] => item.steps as string[];
+
+test("decorate: each item of an accepted call gets its own text, from its own lane, after the dependency note", () => {
+	const consumerPlan = plan(producer, consumer("result"), { name: "other", kind: "explore", role: "explorer", results: [{ id: "o1", kind: "answer", criterion: "report" }] });
+	for (const rewriteNames of [false, true]) {
+		const work = new RunLanes(`run-decorate-${rewriteNames}`);
+		const { seen, decorate } = decorateWith(({ lane }) => `[contract:${lane?.name}]`);
+		const placed = work.place(
+			{ tasks: [{ agent: "storm-explorer", name: "consumer", task: "Compare" }, { agent: "storm-explorer", name: "other", task: "Report" }] },
+			consumerPlan,
+			team,
+			{ readiness: readinessOf("accepted"), decorate, rewriteNames },
+		);
+		expect(placed.ok).toBe(true);
+		if (!placed.ok) continue;
+		const [first, second] = placed.input.tasks as Record<string, unknown>[];
+		// The dependency note keeps its place and the contract follows it.
+		expect(String(first!.task)).toMatch(/^Compare\n\n\[storm:dep\] .*r1=accepted@01234567 out\.txt\n\n\[contract:consumer\]$/s);
+		expect(String(second!.task)).toBe("Report\n\n[contract:other]");
+		expect(seen.map(entry => entry.lane?.name)).toEqual(["consumer", "other"]);
+		expect(seen.every(entry => entry.isolated === false)).toBe(true);
+	}
+});
+
+test("decorate: an item with steps gets the text on its first step, and the dependency note goes the same way", () => {
+	const work = new RunLanes("run-steps");
+	const consumerPlan = plan(producer, consumer("result"));
+	const { decorate } = decorateWith(() => "CONTRACT");
+	const placed = work.place({ agent: "storm-explorer", name: "consumer", steps: ["first stage", "second stage"] }, consumerPlan, team, { readiness: readinessOf("accepted"), decorate });
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	expect(placed.input.task).toBeUndefined();
+	const steps = stepped(placed.input);
+	expect(steps).toHaveLength(2);
+	expect(steps[0]).toMatch(/^first stage\n\n\[storm:dep\] .*\n\nCONTRACT$/s);
+	expect(steps[1]).toBe("second stage");
+	// Without a dependency note the text alone is delivered, still on the first step.
+	const plain = new RunLanes("run-steps-2").place({ agent: "storm-explorer", name: "other", steps: ["only stage"] }, plan({ name: "other", kind: "explore", role: "explorer" }), team, { decorate });
+	expect(plain.ok && stepped(plain.input)).toEqual(["only stage\n\nCONTRACT"]);
+});
+
+test("decorate: the input the caller sent is not changed", () => {
+	const work = new RunLanes("run-pure");
+	const call = { agent: "storm-explorer", name: "other", task: "Report" };
+	const placed = work.place(call, plan({ name: "other", kind: "explore", role: "explorer" }), team, { decorate: () => "CONTRACT" });
+	expect(placed.ok && placed.input.task).toBe("Report\n\nCONTRACT");
+	expect(call.task).toBe("Report");
+});
+
+test("decorate: it learns whether the item is placed in an isolated checkout, and an unplanned item has no lane", () => {
+	const isolatedTeam = { ...team, isolation: "isolated" as const };
+	const p = plan({ name: "lab", kind: "code", role: "implementer", files: ["lab.ts"] });
+	const { seen, decorate } = decorateWith(({ isolated }) => (isolated ? "ISOLATED" : "SHARED"));
+	const placed = new RunLanes("run-iso").place({ agent: "storm-implementer", name: "lab", task: "Try" }, p, isolatedTeam, { host: { enabled: true, apply: false }, decorate });
+	expect(placed.ok && placed.input.task).toBe("Try\n\nISOLATED");
+	expect(seen).toEqual([{ lane: p.lanes[0], isolated: true }]);
+	const shared = new RunLanes("run-shared").place({ agent: "storm-implementer", name: "lab", task: "Try" }, p, team, { decorate });
+	expect(shared.ok && shared.input.task).toBe("Try\n\nSHARED");
+	// A direct task that matches no lane still asks, with no lane, and may answer nothing.
+	const unplanned = decorateWith(({ lane }) => (lane === undefined ? undefined : "NEVER"));
+	const direct = new RunLanes("run-direct").place({ agent: "storm-implementer", task: "Do it" }, undefined, team, { decorate: unplanned.decorate });
+	expect(direct.ok && direct.input.task).toBe("Do it");
+	expect(unplanned.seen).toEqual([{ lane: undefined, isolated: false }]);
+});
+
+test("decorate: a refused call is asked about nothing and none of its items is touched", () => {
+	const p = plan({ name: "api", kind: "code", role: "implementer", files: ["shared.ts"] }, { name: "view", kind: "code", role: "implementer", files: ["shared.ts"] });
+	const { seen, decorate } = decorateWith(() => "CONTRACT");
+	const input = { tasks: [{ agent: "storm-implementer", name: "api", task: "A" }, { agent: "storm-implementer", name: "view", task: "B" }] };
+	const refused = new RunLanes("run-refused").place(input, p, team, { decorate });
+	expect(refused).toMatchObject({ ok: false, code: "lane-write" });
+	expect(seen).toEqual([]);
+	expect(input.tasks.map(item => item.task)).toEqual(["A", "B"]);
+	// A call refused for a prerequisite or a busy lane is the same.
+	const busy = new RunLanes("run-busy");
+	expect(busy.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { decorate }).ok).toBe(true);
+	// The accepted call is asked once; only the refused ones are not.
+	expect(seen).toHaveLength(1);
+	seen.length = 0;
+	expect(busy.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { decorate })).toMatchObject({ ok: false, code: "lane-busy" });
+	expect(seen).toEqual([]);
+});
+
+test("decorate: nothing, an empty text, an item with nothing to append to, or a hook that fails leaves the item as it was and still places it", () => {
+	const p = plan({ name: "other", kind: "explore", role: "explorer" });
+	const place = (decorate: () => string | undefined, item: Record<string, unknown> = { agent: "storm-explorer", name: "other", task: "Report" }) =>
+		new RunLanes(`run-quiet-${Math.random()}`).place(item, p, team, { decorate });
+	expect(place(() => undefined).ok && (place(() => undefined) as { input: Record<string, unknown> }).input.task).toBe("Report");
+	expect((place(() => "   ") as { input: Record<string, unknown> }).input.task).toBe("Report");
+	expect((place(() => { throw new Error("boom"); }) as { input: Record<string, unknown> }).input.task).toBe("Report");
+	// No `task` and no `steps`: omp refuses the item itself; there is nothing to append to and nothing is invented.
+	const bare = place(() => "CONTRACT", { agent: "storm-explorer", name: "other" });
+	expect(bare.ok && Object.hasOwn(bare.input, "task")).toBe(false);
+});

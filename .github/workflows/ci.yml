@@ -25,6 +25,9 @@ jobs:
   # `e2e-guarantees` 4 min 14 s (unplanned 15, early start 7, director reads 7, pins 13, writers 62, host facts 150) and
   # `e2e-tui` 3 min 12 s (TUI 180, plan mode 12). The same steps took 1.15 to 1.4 times as long on the ubuntu runner in the
   # 0.26.0 run, so about 9, 6 and 4 minutes plus about 1 min 30 s of setup each: every job fits its 20 minutes with room.
+  # 0.28.0 added three steps to `e2e-guarantees` (director edit 110 s, read lane with a shell 21 s, Storm installed with no
+  # node_modules 5 s; measured on macOS with other suites running beside them, so an upper bound) and grew host facts (about
+  # 155 s) and the pins (about 26 s). That job is now about 7 min on this machine, so about 10 min on ubuntu plus setup: it fits.
   # Each job keeps the limit as a guard against a hung scenario, not as a budget; replace these figures with the first CI run's.
   e2e:
     runs-on: ubuntu-latest
@@ -113,6 +116,18 @@ jobs:
       # child behind, a woken worker's authority, the director's background command, a synchronous call, eval's journal.
       - name: E2E (host facts the write order leans on)
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-host-facts" node_modules/.bin/bun scripts/e2e/host-facts.ts
+      # 0.28.0. The director edits files itself during a run, in one table with every other writer: passes with no writer, refused
+      # beside a shell worker, a job or a check and the reverse, both orders in one message, a path-only worker on other files and
+      # on the same one, outside the tree and under .git, an unclean turn's hold, a conversation switch (about 2 min).
+      - name: E2E (the director edits files itself)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-director-edit" node_modules/.bin/bun scripts/e2e/director-edit.ts
+      # A read lane whose agent definition has a shell runs commands and is ordered like a writer (about 20 s).
+      - name: E2E (a read lane with a shell)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-read-shell" node_modules/.bin/bun scripts/e2e/read-shell.ts
+      # The release gate of 0.28.0: Storm copied into a folder with no node_modules, on the pinned omp, and a director edit that
+      # goes through the target reader (native parser and the host's internal subpaths). Linux shows it here (about 5 s).
+      - name: E2E (Storm installed with no node_modules)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-plugin-layout" node_modules/.bin/bun scripts/e2e/plugin-layout.ts
       - name: Upload the work dirs
         if: failure()
         uses: actions/upload-artifact@v4

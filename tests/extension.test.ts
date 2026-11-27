@@ -4,7 +4,8 @@
  * separately and share its module state.
  */
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test, vi } from "bun:test";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { appendFile, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { AgentRegistry, type CompactOptions, type ExtensionAPI, type ExtensionContext, type ExtensionUiFactory, type ExtensionUiHost } from "@oh-my-pi/pi-coding-agent";
@@ -15,20 +16,25 @@ import { writeConfig } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
 import storm from "../src/extension.ts";
 import { approveAndSave } from "../src/flows.ts";
+import { WHY_SHELL_READER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
+import { DIRECTOR_EDIT_LEAD } from "../src/policy/director.ts";
 import { docPromptFor } from "../src/policy/docs.ts";
 import { SUPERVISOR_REASONS } from "../src/policy/supervisor.ts";
+import { DIRECTOR_EDIT_ENDS, DIRECTOR_EDITING, DIRECTOR_REWRITTEN, DIRECTOR_WRITE_LATE, DIRECTOR_WRITE_LEAD, holderPhrase } from "../src/runtime/arbiter.ts";
 import { APPROVE } from "../src/proposals/present.ts";
 import { modelMismatchNotice } from "../src/policy/model-check.ts";
 import { listAgents, markAgentsCleaned, noteAgentEnd, resetAgents } from "../src/runtime/agents.ts";
 import * as closeoutModule from "../src/runtime/closeout.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
+import { CONTRACT_TAG, ISOLATED_SCOPE } from "../src/runtime/contract-text.ts";
 import { CONTINUE_SAME_TURN, RunController, runSpawns } from "../src/runtime/controller.ts";
+import * as ledgerModule from "../src/runtime/ledger.ts";
 import { activeLedgerRun, bindLedgerChild, getLedgerRun, resetLedger, spendNote } from "../src/runtime/ledger.ts";
 import { DISCARDED_TURN_PURPOSE } from "../src/runtime/side-spend.ts";
 import { processKey } from "../src/runtime/janitor.ts";
 import { LEDGER_READY_LEAD, noteLaneAgentEnd, onLaneReservationEnd, type ReservationEnd, WRITER_FREED_LEAD } from "../src/runtime/lanes.ts";
 import { endLabel, ROUND_DELAY_MS } from "../src/runtime/rounds.ts";
-import { lastRun, readRun, writeRun } from "../src/runtime/run.ts";
+import { DIRECTOR_EDIT_RULE, lastRun, readRun, writeRun } from "../src/runtime/run.ts";
 import { CONTINUATION_HEAD, EARLIER_REQUEST_MARKER, noteResumePointer } from "../src/runtime/resume.ts";
 import { readTrialStates } from "../src/runtime/state-files.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
@@ -375,7 +381,7 @@ describe("a run through the hooks", () => {
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
 		const impl = child.ctx(sub("Impl"));
-		const edit = { toolName: "edit", input: { path: "src/a.ts" } };
+		const edit = { toolName: "edit", toolCallId: "edit-1", input: { path: "src/a.ts" } };
 
 		// Before a run the main session is an ordinary one.
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
@@ -386,10 +392,17 @@ describe("a run through the hooks", () => {
 		const runId = activeLedgerRun((await loadProjectState(project.env)).sessionDir)?.runId;
 		expect(runId).toBeDefined();
 
-		// The director does not edit, notes and control stay open, and a subagent edits freely.
-		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("director-edit");
+		// The director edits a file it can name while nothing else writes; a change it cannot name is refused (and counted), notes
+		// and control stay open, and a subagent edits freely.
+		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write-2", input: { path: "vault://x.md", content: "x" } }, main))).toBe("director-edit");
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "local://notes.md" } }, main))).toBe("pass");
 		expect(verdict(await child.emit("tool_call", edit, impl))).toBe("pass");
+		// The host's order: the hooks of a message's calls, then that message's own `message_end`, then its calls run. The edit's
+		// message is over when the director's NEXT request completes (its refused sibling made the turn unclean).
+		const callBlocks = ["edit-1", "write-2"].map(id => ({ type: "toolCall", id, name: "edit", arguments: {} }));
+		await omp.emit("message_end", { message: { role: "assistant", stopReason: "toolUse", content: callBlocks } }, main);
+		await omp.emit("message_end", { message: { role: "assistant", stopReason: "toolUse", content: [] } }, main);
 
 		// Spawns wait for a plan, then follow it.
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl"), main))).toBe("no-plan");
@@ -524,7 +537,7 @@ describe("a run through the hooks", () => {
 		expect(await omp.emit("tool_result", hostResult, main)).toBeUndefined();
 
 		// A refusal of any other tool stays the plain block its view draws.
-		const readBlock = await omp.emit("tool_call", { toolName: "edit", toolCallId: "refused-2", input: { path: "src/a.ts" } }, main);
+		const readBlock = await omp.emit("tool_call", { toolName: "write", toolCallId: "refused-2", input: { path: "vault://x.md", content: "x" } }, main);
 		expect(readBlock).toMatchObject({ block: true });
 
 		// A call without a host id cannot be matched to its result: it is blocked as before, never half-refused.
@@ -2296,13 +2309,14 @@ describe("what the wiring adds around a run", () => {
 		const omp = fakeOmp(project);
 		const child = fakeOmp(project);
 		const main = omp.ctx(MAIN);
-		const edit = { toolName: "edit", input: { path: "src/a.ts" } };
+		// A file change the director cannot name is refused only while the run directs the session.
+		const change = { toolName: "write", toolCallId: "w-1", input: { path: "vault://x.md", content: "x" } };
 		await omp.command("task", main);
 		// A subagent's own session switching is not the run's business.
 		await child.emit("session_switch", { reason: "new" }, child.ctx(sub("Impl")));
-		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("director-edit");
+		expect(verdict(await omp.emit("tool_call", change, main))).toBe("director-edit");
 		await omp.emit("session_switch", { reason: "new" }, main);
-		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", change, main))).toBe("pass");
 		expect(activeLedgerRun((await loadProjectState(project.env)).sessionDir)).toBeUndefined();
 		expect(await lastRun(project.sessionDir)).toMatchObject({ status: "stopped", endReason: "shutdown" });
 	});
@@ -3459,12 +3473,14 @@ describe("native attempt evidence through the extension hooks", () => {
 		expect(runId).toBeDefined();
 		if (runId === undefined) return;
 
-		// The explorer's own task is never given a packet.
-		expect(await omp.emit("tool_call", {
+		// The explorer's own task is never given a packet: it gets its lane's result contract and nothing about a submission.
+		const explorerTask = ((await omp.emit("tool_call", {
 			toolName: "task",
 			toolCallId: "call_3",
 			input: { agent: "storm-explorer", name: "look", task: "Read notes.md" },
-		}, main)).toBeUndefined();
+		}, main)) as { input: { task: string } }).input.task;
+		expect(explorerTask.startsWith("Read notes.md\n\n[storm:계약]")).toBe(true);
+		expect(explorerTask).not.toContain("[storm:answer-review]");
 		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-explorer", "look"), main))).toBe("route:a/x:low,b/z:low");
 		// Prose that repeats the cited number is a reviewable submission, not a machine acceptance.
 		const answer = "the total is 42, see notes.md:1";
@@ -5154,9 +5170,11 @@ describe("hardening through the hooks: write order (G1)", () => {
 		await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
 		await startWorker(omp, child, main, "A");
 		const write = (path: string, callId: string) => ({ toolName: "write", toolCallId: callId, input: { path, content: "x" } });
-		for (const [at, path] of ["a.txt", "conflict://1", "conflict://*", "Conflict://1", "vault://notes/x.md"].entries()) {
+		for (const [at, path] of ["conflict://1", "conflict://*", "Conflict://1", "vault://notes/x.md"].entries()) {
 			expect(verdict(await omp.emit("tool_call", write(path, `f-${at}`), main)), path).toBe("director-edit");
 		}
+		// A project path is a file the table can order: while the lane's worker (a shell writer) runs, it is refused by the table.
+		expect(verdict(await omp.emit("tool_call", write("a.txt", "f-a"), main))).toBe("director-write");
 		for (const [at, path] of ["local://notes.md", "cfg://settings/task.maxConcurrency"].entries()) {
 			expect(verdict(await omp.emit("tool_call", write(path, `o-${at}`), main)), path).not.toBe("director-edit");
 		}
@@ -5529,6 +5547,121 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		await omp.emit("session_shutdown", {}, main);
 	});
 
+	// 0.27.0 hole (found on the real host, a worker past the eighth runs on a pooled thread with its own module state): the thread has
+	// no run in memory, so the child's lookup of its run found nothing and the check of its own model returned early, unchecked. The run
+	// is now read from the child's persisted admission, and what the child decides is published for the director's thread.
+	describe("a worker on a pooled thread: no run in this thread's memory", () => {
+		/** The child's lookups of its run find nothing, as on a pooled thread; the persisted admission is what remains. */
+		const pooled = () => [
+			spyOn(ledgerModule, "ledgerRunForLineage").mockImplementation(() => undefined),
+			spyOn(ledgerModule, "ledgerRunForChild").mockImplementation(() => undefined),
+			spyOn(ledgerModule, "ledgerRunForTree").mockImplementation(() => undefined),
+		];
+
+		test("a worker on a model the team did not approve is stopped before its request, its verdict reaches the director's record, and the director is told", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			const worker = await startWorker(omp, child, main, "A");
+			const spies = pooled();
+			try {
+				child.thinking.level = "high";
+				const outsider = asking(worker, "fake9", "outsider-z");
+				await child.emit("before_provider_request", { payload: {} }, outsider.ctx);
+				expect(outsider.aborted()).toBe(1);
+				// It only reports from now on, and its authority is revoked on disk.
+				expect(verdict(await child.emit("tool_call", { toolName: "bash", input: { command: "touch a.txt" } }, worker))).toBe("model-mismatch");
+				// The director's thread reads what the child published at its next request.
+				const told = (await omp.emit("context", { messages: [] }, main)) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
+				expect(told?.messages.at(-1)?.content[0]?.text).toContain("워커를 멈췄습니다");
+				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toMatchObject({ model: "fake9/outsider-z", verdict: "mismatch" });
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("an approved model passes and is recorded as verified; what the worker's requests cost is added to the run once", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			const worker = await startWorker(omp, child, main, "A");
+			const spies = pooled();
+			try {
+				child.thinking.level = "low";
+				const fine = asking(worker, "a", "i");
+				await child.emit("before_provider_request", { payload: {} }, fine.ctx);
+				expect(fine.aborted()).toBe(0);
+				await child.emit("message_end", assistant("a", "i", 1_000, 0.5), worker);
+				await child.emit("message_end", assistant("a", "i", 1_000, 0.25), worker);
+				await omp.emit("context", { messages: [] }, main);
+				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toMatchObject({ model: "a/i", verdict: "verified" });
+				expect(getLedgerRun(runId)?.costUsd).toBeCloseTo(0.75, 6);
+				// Read again, nothing new: the same spend is not counted twice.
+				await omp.emit("context", { messages: [] }, main);
+				expect(getLedgerRun(runId)?.costUsd).toBeCloseTo(0.75, 6);
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a pooled worker whose admission names no approved models (an old record) cannot be checked, and is stopped with that cause", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const runId = await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			const worker = await startWorker(omp, child, main, "A");
+			const real = admissionModule.readChildBinding;
+			const spies = [
+				...pooled(),
+				spyOn(admissionModule, "readChildBinding").mockImplementation(async input => {
+					const bound = await real(input);
+					if (bound.kind !== "bound") return bound;
+					const { approved: _dropped, ...rest } = bound;
+					return rest;
+				}),
+			];
+			try {
+				child.thinking.level = "low";
+				const fine = asking(worker, "a", "i");
+				await child.emit("before_provider_request", { payload: {} }, fine.ctx);
+				expect(fine.aborted()).toBe(1);
+				const told = (await omp.emit("context", { messages: [] }, main)) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
+				expect(told?.messages.at(-1)?.content[0]?.text).toContain("팀 설정을 시간 안에 읽지 못했거나");
+				expect(runSpawns(runId).find(spawn => spawn.spawnKey === "A")?.ran).toBeUndefined();
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a managed child whose run cannot be named is stopped with the cause, not let through unchecked; an unrelated native child is untouched", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			// A worker is admitted (it writes the run's marker for its parent); the stray child below has no record.
+			await startWorker(omp, child, main, "A");
+			const spies = pooled();
+			try {
+				// No admission record for this child, while the run's marker for its parent is live.
+				const stray = asking(child.ctx(sub("Stray", "storm-implementer")), "a", "i");
+				await child.emit("before_provider_request", { payload: {} }, stray.ctx);
+				expect(stray.aborted()).toBe(1);
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+	});
+
 	// R-G234 H1 (decision): the promise about approved models is about the model and effort a worker's own loop runs on. A tool
 	// that makes a model request of its own on one of omp's auxiliary roles (`magic` edit, `find`'s judge, a search, a repair) is
 	// the user's own omp configuration: not refused, and its spend is counted (tests/run-spend.test.ts).
@@ -5687,5 +5820,1004 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		await child.emit("session_shutdown", {}, withFile);
 		expect(getLedgerRun(runId)?.evalUnread.size).toBe(0);
 		await omp.emit("session_shutdown", {}, main);
+	});
+});
+
+/**
+ * Phase 2 (0.28.0) through the hooks: the director's own path edits in the run's write table, read lanes that carry a shell, and the
+ * result contract in each worker's assignment. Each refusal here fails on the extension as it was before the wiring (which refused
+ * every director edit as `director-edit` and had none of the rest).
+ */
+describe("phase 2 through the hooks: the director's path edits", () => {
+	const openRun = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, plan: object): Promise<string> => {
+		await omp.command("manual task", main);
+		expect(await omp.tool({ action: "plan", plan }, main)).toBe("ok");
+		return activeLedgerRun(project.sessionDir)?.runId as string;
+	};
+	const writerLane = (name: string, file: string) => ({ name, kind: "code" as const, role: "implementer", files: [file], goal: `Write ${file}`, results: changeFor(`${name}-change`) });
+	const taskCall = (name: string, callId: string, agent = "storm-implementer") => ({ toolName: "task", toolCallId: callId, input: { agent, name, task: `work ${name}` } });
+	const startWorker = async (omp: ReturnType<typeof fakeOmp>, child: ReturnType<typeof fakeOmp>, main: ExtensionContext, name: string, callId?: string, agent = "storm-implementer"): Promise<ExtensionContext> => {
+		const call = taskCall(name, callId ?? `call-${name}`, agent);
+		expect(verdict(await omp.emit("tool_call", call, main))).toBe("pass");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf(agent, name), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub(name, agent));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		return worker;
+	};
+	const bash = (callId: string, input: Record<string, unknown> = { command: "git status" }) => ({ toolName: "bash", toolCallId: callId, input });
+	const ended = (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, toolName: string, callId: string) =>
+		omp.emit("tool_execution_end", { toolName, toolCallId: callId, isError: false }, main);
+	const reasonOf = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, call: { toolName: string; toolCallId: string; input: unknown }): Promise<string> => {
+		const result = (await omp.emit("tool_result", { ...call, isError: true, content: [] }, main)) as { content?: Array<{ text?: string }> } | undefined;
+		return result?.content?.[0]?.text ?? "";
+	};
+	const edit = (callId: string, file = "d.txt") => ({ toolName: "edit", toolCallId: callId, input: { path: file, old_string: "a", new_string: "b" } });
+	/** The text of a refused director call (a plain block). */
+	const refusal = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, call: object): Promise<{ code: string; reason: string }> => {
+		const answer = (await omp.emit("tool_call", call, main)) as { block?: boolean; reason?: string } | undefined;
+		expect(answer?.block).toBe(true);
+		return { code: verdict(answer), reason: answer?.reason ?? "" };
+	};
+	/** What the host sends when a message's tool batch is over: its calls and each call's result. */
+	const turnEndOf = (calls: Array<{ id: string; name?: string; error?: boolean }>) => ({
+		message: { role: "assistant", stopReason: "toolUse", content: calls.map(entry => ({ type: "toolCall", id: entry.id, name: entry.name ?? "edit", arguments: {} })) },
+		toolResults: calls.map(entry => ({ role: "toolResult", toolCallId: entry.id, toolName: entry.name ?? "edit", isError: entry.error === true, content: [] })),
+	});
+	/**
+	 * An assistant message's own `message_end`. The host emits it AFTER the `tool_call` hooks of the message's calls and BEFORE any of them
+	 * executes (omp 19.2.1, pi-agent-core agent-loop `prepareToolCallDispatch` then `message_end`; the V log of fact 1): `ids` are
+	 * those calls. A test that emits it with no ids stands for the NEXT request's message, which carries other calls or none.
+	 */
+	const assistantEnd = (stopReason?: string, ids: readonly string[] = []) => ({
+		message: {
+			role: "assistant",
+			content: ids.map(id => ({ type: "toolCall", id, name: "edit", arguments: {} })),
+			...(stopReason === undefined ? {} : { stopReason }),
+		},
+	});
+	let probes = 0;
+	/** Whether a director path edit holds the table now: the director's own command is refused beside it, and only beside it. */
+	const holds = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext): Promise<boolean> => {
+		const id = `probe-${++probes}`;
+		const answer = verdict(await omp.emit("tool_call", bash(id), main));
+		if (answer === "pass") {
+			await ended(omp, main, "bash", id);
+			return false;
+		}
+		expect(answer).toBe("director-exec");
+		return true;
+	};
+
+	test("an edit beside nothing passes and holds its entry: no writer that cannot be bounded starts beside it until its turn ends", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+		expect(await holds(omp, main)).toBe(false);
+		expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+		expect(await holds(omp, main)).toBe(true);
+		// A worker that may run commands is refused the tree, and told the director is editing; no worker is named.
+		const placement = taskCall("A", "a-1");
+		expect(verdict(await omp.emit("tool_call", placement, main))).toBe("lane-write");
+		const reason = await reasonOf(omp, main, placement);
+		expect(reason).toContain(DIRECTOR_EDITING);
+		// The call and its result are not the end: omp can still be writing this call's file during a later call of the message.
+		await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1" }, main);
+		await omp.emit("tool_result", { ...edit("e-1"), isError: false, content: [] }, main);
+		await ended(omp, main, "edit", "e-1");
+		expect(await holds(omp, main)).toBe(true);
+		// The turn's end, with every call of the message done without an error, is.
+		await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+		expect(await holds(omp, main)).toBe(false);
+		expect(verdict(await omp.emit("tool_call", taskCall("A", "a-2"), main))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a call the extension cannot bound is refused with its cause, and holds nothing", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+		for (const [callId, call] of [
+			["x-1", edit("x-1", "../outside.txt")],
+			["x-2", edit("x-2", ".git/config")],
+			["x-3", { toolName: "write", toolCallId: "x-3", input: { path: "vault://notes/x.md", content: "x" } }],
+			["x-4", { toolName: "edit", toolCallId: "x-4", input: { input: "nothing a parser reads" } }],
+			["x-5", { ...edit("x-5"), parentToolCallId: "eval-call" }],
+		] as const) {
+			const refused = await refusal(omp, main, call);
+			expect(refused.code, callId).toBe("director-edit");
+			expect(refused.reason, callId).toContain(DIRECTOR_EDIT_LEAD);
+		}
+		// A host that gave the call no id cannot have it released: the edit is refused rather than held for ever.
+		expect((await refusal(omp, main, { toolName: "edit", input: edit("x").input })).code).toBe("director-write");
+		expect(await holds(omp, main)).toBe(false);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("beside a placed writer, a running one and one whose follow-up is admitted and not yet started, the edit is refused naming the holder", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, {
+			lanes: [writerLane("A", "a.txt"), writerLane("H0", "h.txt")],
+			workers: { implementer: 2 },
+		});
+		// Placed: its task call passed, its spawn has not been allocated.
+		expect(verdict(await omp.emit("tool_call", taskCall("A", "a-1"), main))).toBe("pass");
+		const placed = await refusal(omp, main, edit("e-1"));
+		expect(placed.code).toBe("director-write");
+		expect(placed.reason).toContain(DIRECTOR_WRITE_LEAD);
+		expect(placed.reason).toContain(holderPhrase({ lane: "A" }));
+		// Running: its worker started.
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "A"), main))).toMatch(/^route:/);
+		const worker = child.ctx(sub("A"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+		const running = await refusal(omp, main, edit("e-2"));
+		expect(running.code).toBe("director-write");
+		expect(running.reason).toContain(holderPhrase({ lane: "A", agentId: "A" }));
+		// The worker settles; its sibling H0 runs and settles, then a work follow-up is admitted and its turn has not started.
+		await child.emit("agent_end", {}, worker);
+		await ended(omp, main, "task", "a-1");
+		const holder = await startWorker(omp, child, main, "H0");
+		await child.emit("agent_end", {}, holder);
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "f-1", input: { path: "agent://H0", content: "more work" } }, main))).toBe("pass");
+		const awaiting = await refusal(omp, main, edit("e-3"));
+		expect(awaiting.code).toBe("director-write");
+		expect(awaiting.reason).toContain(holderPhrase({ lane: "H0", agentId: "H0", awaiting: true }));
+		// Its turn starts and ends: the tree is free and the refusals left nothing behind.
+		await child.emit("agent_start", {}, holder);
+		await child.emit("agent_end", {}, holder);
+		await ended(omp, main, "task", "call-H0");
+		await ended(omp, main, "write", "f-1");
+		expect(verdict(await omp.emit("tool_call", edit("e-4"), main))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	}, 20_000);
+
+	for (const order of ["edit then task", "task then edit"] as const) {
+		test(`in one message [${order.replace(" then ", ", ")}] the two calls give opposite winners`, async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			if (order === "edit then task") {
+				// The hooks of one message run in call order and before any call executes: the edit holds the table first.
+				expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+				const placement = taskCall("A", "a-1");
+				expect(verdict(await omp.emit("tool_call", placement, main))).toBe("lane-write");
+				expect(await reasonOf(omp, main, placement)).toContain(DIRECTOR_EDITING);
+			} else {
+				expect(verdict(await omp.emit("tool_call", taskCall("A", "a-1"), main))).toBe("pass");
+				const refused = await refusal(omp, main, edit("e-1"));
+				expect(refused.code).toBe("director-write");
+				expect(refused.reason).toContain(holderPhrase({ lane: "A" }));
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+	}
+
+	test("a path-only worker on other files does not refuse the edit, and one on the same file or its directory does", async () => {
+		await pathOnlyImplementer();
+		await approveShadows(TEAM);
+		await mkdir(path.join(project.root, "held"), { recursive: true });
+		await mkdir(path.join(project.root, "free"), { recursive: true });
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, {
+			lanes: [
+				{ name: "P", kind: "code", role: "implementer", files: ["held/e.txt"], goal: "Write one file", results: changeFor("p-change") },
+				{ name: "D", kind: "code", role: "implementer", files: ["held/dir"], goal: "Write a directory", results: changeFor("d-change") },
+			],
+			workers: { implementer: 2 },
+		});
+		await startWorker(omp, child, main, "P");
+		// Both are bounded: the director's edit of another file runs beside the worker, and is held like any other.
+		expect(verdict(await omp.emit("tool_call", edit("e-1", "free/f.txt"), main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", edit("e-2", "held/other.txt"), main))).toBe("pass");
+		// The same file is the worker's.
+		const same = await refusal(omp, main, edit("e-3", "held/e.txt"));
+		expect(same.code).toBe("director-write");
+		expect(same.reason).toContain(holderPhrase({ lane: "P", agentId: "P" }));
+		// A directory the worker holds covers what is under it.
+		await omp.emit("turn_end", turnEndOf([{ id: "e-1" }, { id: "e-2" }]), main);
+		await startWorker(omp, child, main, "D");
+		const below = await refusal(omp, main, edit("e-4", "held/dir/deep/x.txt"));
+		expect(below.code).toBe("director-write");
+		expect(below.reason).toContain(holderPhrase({ lane: "D", agentId: "D" }));
+		// And the other way: a path-only worker whose files are under the director's own held file is refused its place.
+		expect(verdict(await omp.emit("tool_call", edit("e-5", "free/f.txt"), main))).toBe("pass");
+		await omp.emit("session_shutdown", {}, main);
+	}, 20_000);
+
+	test("a read lane without a shell runs beside the edit, and one with a shell does not (it is ordered like a writer)", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, {
+			lanes: [
+				{ name: "E0", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("e0-answer") },
+				{ name: "R0", kind: "review", role: "reviewer", goal: "Review the tree" },
+			],
+			workers: { explorer: 1, reviewer: 1 },
+		});
+		expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+		expect(verdict(await omp.emit("tool_call", taskCall("E0", "t-1", "storm-explorer"), main))).toBe("pass");
+		// The shipped reviewer carries a shell: it cannot start while the director edits.
+		const review = taskCall("R0", "t-2", "storm-reviewer");
+		expect(verdict(await omp.emit("tool_call", review, main))).toBe("lane-write");
+		expect(await reasonOf(omp, main, review)).toContain(DIRECTOR_EDITING);
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	/** A run with one writer lane, and the director's edit `e-1` passed and held. */
+	const heldEdit = async (): Promise<{ omp: ReturnType<typeof fakeOmp>; main: ExtensionContext }> => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+		expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+		expect(await holds(omp, main)).toBe(true);
+		return { omp, main };
+	};
+
+	describe("release (decision D2)", () => {
+		test("nothing but the end of a turn releases it: not a call's end, a result, an old loop's agent end, another turn's ids, a prune or the run's end", async () => {
+			const { omp, main } = await heldEdit();
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1" }, main);
+			await omp.emit("tool_result", { ...edit("e-1"), isError: false, content: [] }, main);
+			await omp.emit("tool_execution_end", { toolName: "edit", toolCallId: "e-1", isError: false }, main);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("tool_execution_end", { toolName: "edit", toolCallId: "e-1", isError: true }, main);
+			expect(await holds(omp, main)).toBe(true);
+			// An agent end carries the whole history, this call's id included: it is no proof (it can arrive twice per prompt).
+			await omp.emit("agent_end", { willContinue: true, messages: [turnEndOf([{ id: "e-1" }]).message] }, main);
+			expect(await holds(omp, main)).toBe(true);
+			// A turn that names other calls releases those and nothing of this one.
+			await omp.emit("turn_end", turnEndOf([{ id: "other-call" }]), main);
+			expect(await holds(omp, main)).toBe(true);
+			// A turn of a subagent is not the director's.
+			const child = fakeOmp(project);
+			await child.emit("turn_end", turnEndOf([{ id: "e-1" }]), child.ctx(sub("Impl")));
+			expect(await holds(omp, main)).toBe(true);
+			// No time passes it: the table is never pruned of this kind of entry (thirty minutes on).
+			setSystemTime(new Date(Date.now() + 30 * 60_000));
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("the host's order: the hook, then the SAME message's own message_end, then the call runs: the hold survives that message_end and every writer is refused while the call runs", async () => {
+			const { omp, main } = await heldEdit();
+			// The message that carries the call ends (a completed one: toolUse) before any of its calls executes.
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1" }, main);
+			// While the call runs: a writer that may run commands is refused the tree, naming the director's edit, and so is the director's command.
+			const placement = taskCall("A", "a-1");
+			expect(verdict(await omp.emit("tool_call", placement, main))).toBe("lane-write");
+			expect(await reasonOf(omp, main, placement)).toContain(DIRECTOR_EDITING);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("tool_result", { ...edit("e-1"), isError: false, content: [] }, main);
+			await ended(omp, main, "edit", "e-1");
+			expect(await holds(omp, main)).toBe(true);
+			// Only the turn's end, clean, frees it.
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			expect(verdict(await omp.emit("tool_call", taskCall("A", "a-2"), main))).toBe("pass");
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("an extension that rewrote the call after Storm's hook: when the call starts with other files than were held, those are held too, the whole tree when they cannot be named, and the director is told (reviewer question 1)", async () => {
+			const { omp, main } = await heldEdit();
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
+			// The files the call really writes (its final arguments at the start of execution) are other files than the held one.
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1", args: { path: "a.txt", old_string: "a", new_string: "b" } }, main);
+			// A worker whose lane declares a.txt is refused beside the call now (before, only d.txt was held).
+			const placement = taskCall("A", "a-1");
+			expect(verdict(await omp.emit("tool_call", placement, main))).toBe("lane-write");
+			// The director reads it at its next request.
+			const next = (await omp.emit("context", { messages: [{ role: "user", content: [{ type: "text", text: "go" }] }] }, main)) as { messages?: Array<{ content?: Array<{ text?: string }> }> } | undefined;
+			expect(JSON.stringify(next?.messages ?? [])).toContain(DIRECTOR_REWRITTEN.slice(0, 20));
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			// A call whose final arguments cannot be named holds the whole tree.
+			expect(verdict(await omp.emit("tool_call", edit("e-2", "d2.txt"), main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-2"]), main);
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-2", args: { path: "../outside.txt", old_string: "a", new_string: "b" } }, main);
+			expect(verdict(await omp.emit("tool_call", taskCall("A", "a-2"), main))).toBe("lane-write");
+			await omp.emit("turn_end", turnEndOf([{ id: "e-2" }]), main);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("the host's order, an unclean turn: the message's own end frees nothing, the turn's end keeps it, and the next completed message (other calls) ends it", async () => {
+			const { omp, main } = await heldEdit();
+			const refused = await refusal(omp, main, { toolName: "write", toolCallId: "e-2", input: { path: "vault://x.md", content: "x" } });
+			expect(refused.code).toBe("director-edit");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1", "e-2"]), main);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1" }, main);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }, { id: "e-2", name: "write", error: true }]), main);
+			expect(await holds(omp, main)).toBe(true);
+			// The next request's message carries calls of its own: its hooks ran first, so its own hold (e-3) must survive its own end.
+			expect(verdict(await omp.emit("tool_call", edit("e-3", "d3.txt"), main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-3"]), main);
+			// e-1 is older than that message: gone. e-3 is that message's own: held.
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-3" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a job asked for by a later call of the same message, after the message's own message_end, still meets the hold", async () => {
+			await approve({ ...TEAM, jobs: [{ name: "experiment", argv: [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(path.join(project.tmp, "job-host-order"))}, "1")`] }] });
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [{ name: "experiment", kind: "run" as const, job: "experiment", results: [{ id: "experiment-outcome", kind: "answer" as const, criterion: "record the observed outcome", contains: "OK" }] }] });
+			expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1", "j-1"]), main);
+			const refused = await omp.toolReply({ action: "execute", lanes: ["experiment"] }, main);
+			expect(refused.text).toContain("[storm:job-wait]");
+			expect(existsSync(path.join(project.tmp, "job-host-order"))).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("a clean turn releases the holders whose ids it carries: two edits of one message end together, an edit of a later message does not", async () => {
+			const { omp, main } = await heldEdit();
+			expect(verdict(await omp.emit("tool_call", edit("e-2", "d2.txt"), main))).toBe("pass");
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			// e-2 belongs to another turn: still held.
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-2" }]), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("an unclean turn keeps its holders until the next completed assistant message; an aborted or failed one does not release", async () => {
+			const { omp, main } = await heldEdit();
+			// A second edit of the message was refused: the turn is not clean (omp may still be committing what an aborted call wrote).
+			const refused = await refusal(omp, main, { toolName: "write", toolCallId: "e-2", input: { path: "vault://x.md", content: "x" } });
+			expect(refused.code).toBe("director-edit");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1", "e-2"]), main);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }, { id: "e-2", name: "write", error: true }]), main);
+			expect(await holds(omp, main)).toBe(true);
+			// Other messages and requests that did not complete prove nothing.
+			await omp.emit("message_end", { message: { role: "user", content: [] } }, main);
+			await omp.emit("message_end", { message: { role: "toolResult", toolCallId: "e-1", content: [] } }, main);
+			await omp.emit("message_end", assistantEnd("aborted"), main);
+			expect(await holds(omp, main)).toBe(true);
+			await omp.emit("message_end", assistantEnd("error"), main);
+			expect(await holds(omp, main)).toBe(true);
+			// A completed request: the loop made it after the tool batch was over.
+			await omp.emit("message_end", assistantEnd("toolUse"), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("each failed call of a message makes the turn unclean: an error result of the edit itself, or a call the host never ran", async () => {
+			for (const failed of [{ id: "e-1", error: true }, { id: "e-1", missing: true }]) {
+				const { omp, main } = await heldEdit();
+				await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
+				const event = failed.missing === true ? { ...turnEndOf([{ id: "e-1" }]), toolResults: [] } : turnEndOf([failed]);
+				await omp.emit("turn_end", event, main);
+				expect(await holds(omp, main), JSON.stringify(failed)).toBe(true);
+				await omp.emit("message_end", assistantEnd(), main);
+				expect(await holds(omp, main), JSON.stringify(failed)).toBe(false);
+				await omp.emit("session_shutdown", {}, main);
+				await shutdownFakeSessions();
+			}
+		});
+
+		test("the backstop: a completed assistant message releases every hold committed before it, whatever happened to the turn's own end", async () => {
+			const { omp, main } = await heldEdit();
+			expect(verdict(await omp.emit("tool_call", edit("e-2", "d2.txt"), main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1", "e-2"]), main);
+			// The message's own end freed nothing: its calls are about to run.
+			expect(await holds(omp, main)).toBe(true);
+			// No `turn_end` ever came. The next request of the director ends in a message with no stop reason named: completed.
+			await omp.emit("message_end", assistantEnd(), main);
+			expect(await holds(omp, main)).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		/** An edit that the host started (or not) and whose result it did (or did not) report, then the conversation switches. */
+		const switched = async (seen: { started: boolean; resulted: boolean }) => {
+			const { omp, main } = await heldEdit();
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
+			if (seen.started) await omp.emit("tool_execution_start", { toolName: "edit", toolCallId: "e-1" }, main);
+			if (seen.resulted) await omp.emit("tool_result", { ...edit("e-1"), isError: true, content: [] }, main);
+			const sessionDir = project.sessionDir;
+			omp.setSessionId("session-after-the-switch");
+			await omp.emit("session_switch", { reason: "new" }, main);
+			return { omp, main, finalized: async () => (await lastRun(sessionDir))?.status === "stopped" && activeLedgerRun(sessionDir) === undefined };
+		};
+
+		test("a switch releases the hold of a call that never started: omp aborted the batch before it ran, so the run ends", async () => {
+			const { omp, main, finalized } = await switched({ started: false, resulted: false });
+			expect(await finalized()).toBe(true);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a switch releases the hold of a call whose result was seen, aborted or not: it ended", async () => {
+			const { omp, main, finalized } = await switched({ started: true, resulted: true });
+			expect(await finalized()).toBe(true);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("a switch keeps the hold of a call that started and has no result: the run cannot finish, and the next completed message ends the wait", async () => {
+			const { omp, main, finalized } = await switched({ started: true, resulted: false });
+			// Fail closed: the host may still be committing what that call writes, and nothing else tells that it is not.
+			await Bun.sleep(1_300);
+			expect(await finalized()).toBe(false);
+			expect(activeLedgerRun(project.sessionDir)).toBeDefined();
+			// The director's next completed answer (the loop made another request) ends the wait, and the run finishes at its next look.
+			await omp.emit("message_end", assistantEnd("stop"), main);
+			await until(finalized);
+			expect(await lastRun(project.sessionDir)).toMatchObject({ status: "stopped", endReason: "shutdown" });
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+	});
+
+	describe("the hook's own time and what it computes", () => {
+		/** A run with a worker that just settled and whose revoke the test holds back: any writer's hook waits for it. */
+		const slowRevoke = async (lanes: object[], settle = "A") => {
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes, workers: { implementer: lanes.length } });
+			const workers = new Map<string, ExtensionContext>();
+			for (const lane of lanes as Array<{ name: string }>) workers.set(lane.name, await startWorker(omp, child, main, lane.name));
+			const gate = Promise.withResolvers<void>();
+			const real = revokeWorkerAdmissions;
+			const slow = spyOn(admissionModule, "revokeWorkerAdmissions").mockImplementation(async (...args: Parameters<typeof real>) => {
+				await gate.promise;
+				return real(...args);
+			});
+			await child.emit("agent_end", {}, workers.get(settle) as ExtensionContext);
+			await ended(omp, main, "task", `call-${settle}`);
+			return { omp, main, gate, slow };
+		};
+
+		test("a commit that comes after the host's own limit for the hook is refused, and holds nothing", async () => {
+			await approve(TEAM);
+			const { omp, main, gate, slow } = await slowRevoke([writerLane("A", "a.txt")]);
+			try {
+				const t0 = Date.now();
+				setSystemTime(new Date(t0));
+				const waiting = omp.emit("tool_call", edit("e-1"), main);
+				await Bun.sleep(50);
+				// The host blocks a handler after 30 s; Storm's commit leaves a margin for its own answer.
+				setSystemTime(new Date(t0 + 29_000));
+				gate.resolve();
+				const answer = (await waiting) as { block?: boolean; reason?: string };
+				expect(verdict(answer)).toBe("director-write");
+				expect(answer.reason).toContain(DIRECTOR_WRITE_LATE);
+				expect(await holds(omp, main)).toBe(false);
+				// The same edit sent again, in time, passes.
+				expect(verdict(await omp.emit("tool_call", edit("e-2"), main))).toBe("pass");
+			} finally {
+				slow.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		// The same four seconds of waiting: inside omp's default thirty, and past a configured five (less its margin).
+		for (const [timeoutMs, expected] of [[undefined, "pass"], [5_000, "director-write"]] as const) {
+			test(`the limit is the host's setting (${timeoutMs ?? "default 30000"} ms): a delay of four seconds is ${expected === "pass" ? "in time" : "too late"}`, async () => {
+				await approve(TEAM);
+				const { omp, main, gate, slow } = await slowRevoke([writerLane("A", "a.txt")]);
+				try {
+					const run = async (): Promise<string> => {
+						const t0 = Date.now();
+						setSystemTime(new Date(t0));
+						const waiting = omp.emit("tool_call", edit("e-1"), main);
+						await Bun.sleep(50);
+						setSystemTime(new Date(t0 + 4_000));
+						gate.resolve();
+						return verdict(await waiting);
+					};
+					expect(await (timeoutMs === undefined ? run() : withActiveSettings(Settings.isolated({ "extensionHandlers.toolCallTimeoutMs": timeoutMs }), run))).toBe(expected);
+				} finally {
+					slow.mockRestore();
+				}
+				await omp.emit("session_shutdown", {}, main);
+			}, 20_000);
+		}
+
+		test("targets that changed during the lease wait are computed again: a link swapped to point outside the tree is refused, and holds nothing", async () => {
+			await approve(TEAM);
+			await mkdir(path.join(project.root, "inner"), { recursive: true });
+			const outside = path.join(project.tmp, "outside-dir");
+			await mkdir(outside, { recursive: true });
+			await symlink("inner", path.join(project.root, "link"));
+			const { omp, main, gate, slow } = await slowRevoke([writerLane("A", "a.txt")]);
+			try {
+				const waiting = omp.emit("tool_call", edit("e-1", "link/x.txt"), main);
+				await Bun.sleep(50);
+				await rm(path.join(project.root, "link"));
+				await symlink(outside, path.join(project.root, "link"));
+				gate.resolve();
+				const answer = (await waiting) as { block?: boolean; reason?: string };
+				expect(verdict(answer)).toBe("director-edit");
+				expect(answer.reason).toContain(DIRECTOR_EDIT_LEAD);
+				expect(await holds(omp, main)).toBe(false);
+			} finally {
+				slow.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("a link swapped to a name another worker holds meets that worker: the table holds what the call writes now", async () => {
+			await pathOnlyImplementer();
+			await approveShadows(TEAM);
+			for (const dir of ["free", "held"]) await mkdir(path.join(project.root, dir), { recursive: true });
+			await symlink("free", path.join(project.root, "link"));
+			const lane = (name: string, file: string) => ({ name, kind: "code" as const, role: "implementer", files: [file], goal: `Write ${file}`, results: changeFor(`${name}-change`) });
+			const { omp, main, gate, slow } = await slowRevoke([lane("A", "a.txt"), lane("B", "held")]);
+			try {
+				const waiting = omp.emit("tool_call", edit("e-1", "link/f.txt"), main);
+				await Bun.sleep(50);
+				await rm(path.join(project.root, "link"));
+				await symlink("held", path.join(project.root, "link"));
+				gate.resolve();
+				const answer = (await waiting) as { block?: boolean; reason?: string };
+				expect(verdict(answer)).toBe("director-write");
+				expect(answer.reason).toContain(holderPhrase({ lane: "B", agentId: "B" }));
+			} finally {
+				slow.mockRestore();
+			}
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		// Not observable from outside: a wait between the commit and the answer would let another writer start in the gap and the call
+		// run beside it. The two places that could add one are read here, so a later edit that does fails this test.
+		test("nothing awaits between the commit and the answer: the commit ends the director's branch and its wrapper makes no second wait", async () => {
+			const source = await Bun.file(path.join(import.meta.dir, "..", "src", "extension.ts")).text();
+			const branchAt = source.indexOf("const directorPathEdit = async");
+			expect(branchAt).toBeGreaterThan(0);
+			const branch = source.slice(branchAt, source.indexOf("const guardToolCall = async", branchAt));
+			const commitAt = branch.indexOf("lanes.commitWriter(");
+			expect(commitAt).toBeGreaterThan(0);
+			expect(branch.slice(commitAt)).not.toMatch(/\bawait\b/);
+			// Before it, in this order: the lease, the wait for withdrawn authority, and the targets computed again.
+			const before = branch.slice(0, commitAt);
+			const order = ["runs.ensureLease(", "settleEndRevokes(", "judge()"].map(step => before.lastIndexOf(step));
+			expect(order.every(at => at > 0)).toBe(true);
+			expect([...order].sort((a, b) => a - b)).toEqual(order);
+			// The wrapper answers a committed call before its own wait for revokes.
+			const wrapperAt = source.indexOf('pi.on("tool_call", async (event, ctx) => {');
+			const wrapper = source.slice(wrapperAt, wrapperAt + 1_500);
+			expect(wrapper.indexOf("committedHere.delete(")).toBeGreaterThan(0);
+			expect(wrapper.indexOf("committedHere.delete(")).toBeLessThan(wrapper.indexOf("settleEndRevokes("));
+		});
+
+		test("a revoke that cannot land refuses the edit: a writer is not entered beside a worker whose authority could not be withdrawn", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [writerLane("A", "a.txt")], workers: { implementer: 1 } });
+			const worker = await startWorker(omp, child, main, "A");
+			const failing = spyOn(admissionModule, "revokeWorkerAdmissions").mockRejectedValue(new Error("store unreadable"));
+			try {
+				await child.emit("agent_end", {}, worker);
+				await ended(omp, main, "task", "call-A");
+				expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("revoke");
+			} finally {
+				failing.mockRestore();
+			}
+			// Nothing was held by the refused edit; once the record store answers, the next edit is entered.
+			expect(await holds(omp, main)).toBe(false);
+			expect(verdict(await omp.emit("tool_call", edit("e-2"), main))).toBe("pass");
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+	});
+
+	describe("the host processes Storm runs: a job and a required check, in both orders", () => {
+		// Markers go outside the tree: a file the check wrote into it would move the very tree the verdict was bound to.
+		const marker = (name: string): string => path.join(project.tmp, name);
+		const started = async (name: string): Promise<boolean> => existsSync(marker(name));
+		/** Polls with real sleeps: a tight loop of `setImmediate` starves the timers a check's runner waits on. */
+		const eventually = async (done: () => Promise<boolean>): Promise<void> => {
+			for (let tries = 0; tries < 400; tries++) {
+				if (await done()) return;
+				await Bun.sleep(25);
+			}
+			throw new Error("the condition never held");
+		};
+		/** A job that says it started, stays for `ms`, and answers its marker. */
+		const slowJob = (ms: number) => ({ name: "experiment", argv: [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker("job-started"))}, "1"); setTimeout(() => console.log("OK"), ${ms})`] });
+		const jobPlan = {
+			lanes: [{ name: "experiment", kind: "run" as const, job: "experiment", results: [{ id: "experiment-outcome", kind: "answer" as const, criterion: "record the observed outcome", contains: "OK" }] }],
+		};
+
+		test("an edit during a job is refused naming the job, and passes once the job ends", async () => {
+			await approve({ ...TEAM, jobs: [slowJob(1_200)] });
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, jobPlan);
+			const running = omp.toolReply({ action: "execute", lanes: ["experiment"] }, main);
+			await until(() => started("job-started"));
+			const refused = await refusal(omp, main, edit("e-1"));
+			expect(refused.code).toBe("director-write");
+			expect(refused.reason).toContain(holderPhrase({ kind: "job" }));
+			expect((await running).outcome).toBe("ok");
+			expect(verdict(await omp.emit("tool_call", edit("e-2"), main))).toBe("pass");
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("a job asked for while the director's edit is held does not start, and says the edit is what it waits for; it starts once the turn is over", async () => {
+			await approve({ ...TEAM, jobs: [slowJob(100)] });
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, jobPlan);
+			expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+			const refused = await omp.toolReply({ action: "execute", lanes: ["experiment"] }, main);
+			expect(refused.text).toContain("[storm:job-wait]");
+			expect(refused.text).toContain(DIRECTOR_EDIT_ENDS);
+			expect(await started("job-started")).toBe(false);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			expect((await omp.toolReply({ action: "execute", lanes: ["experiment"] }, main)).outcome).toBe("ok");
+			expect(await started("job-started")).toBe(true);
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		/** A run whose next look runs the required check: a worker changed the tree and the reviewer's verdict on it is in. */
+		const dueCheck = async (check: { name: string; argv: string[] }) => {
+			await gitRepo(project.root);
+			await approve({ ...TEAM, requiredChecks: [check] });
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("fix the file", main);
+			const runId = activeLedgerRun(project.sessionDir)?.runId;
+			admitChild(runId, "Impl");
+			admitChild(runId, "Rev");
+			const impl = child.ctx(sub("Impl"));
+			const rev = child.ctx(sub("Rev", "storm-reviewer"));
+			const at = Date.now();
+			setSystemTime(new Date(at));
+			await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+			await writeFile(path.join(project.root, ".keep"), "a change\n");
+			await child.emit("tool_result", { toolName: "edit", input: { path: ".keep" }, isError: false, content: [] }, impl);
+			await child.emit("before_agent_start", { systemPrompt: [] }, rev);
+			setSystemTime(new Date(at + 1_000));
+			await child.emit("tool_result", { toolName: "yield", input: { data: { overall_correctness: "correct" } }, isError: false, content: [] }, rev);
+			await child.emit("agent_end", {}, rev);
+			await child.emit("agent_end", {}, impl);
+			return { omp, main, runId: runId as string };
+		};
+		const check = (ms: number) => ({ name: "unit", argv: [process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker("check-started"))}, "1"); setTimeout(() => {}, ${ms})`] });
+
+		test("an edit while the required check runs is refused naming the check, and passes once it has ended", async () => {
+			const { omp, main, runId } = await dueCheck(check(1_000));
+			await omp.emit("agent_start", {}, main);
+			const look = omp.emit("agent_end", {}, main);
+			await eventually(() => started("check-started"));
+			const refused = await refusal(omp, main, edit("e-1"));
+			expect(refused.code).toBe("director-write");
+			expect(refused.reason).toContain(holderPhrase({ kind: "check" }));
+			await look;
+			await eventually(async () => (await readRun(project.sessionDir, runId))?.endReason === "verified");
+			expect(verdict(await omp.emit("tool_call", edit("e-2"), main))).toBe("pass");
+			await omp.emit("session_shutdown", {}, main);
+		}, 30_000);
+
+		test("a look that finds the edit held runs no check and records nothing; the check runs at a look after the edit's turn", async () => {
+			const { omp, main, runId } = await dueCheck(check(50));
+			// The run's session is the one that edits: this edit is held until its message ends.
+			expect(verdict(await omp.emit("tool_call", edit("e-1", "notes.txt"), main))).toBe("pass");
+			await omp.emit("agent_start", {}, main);
+			await omp.emit("agent_end", { willContinue: false }, main);
+			await Bun.sleep(300);
+			expect(await started("check-started")).toBe(false);
+			// The turn that made the edit ended: the next look asks again, and nothing was remembered as already looked at.
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			await omp.emit("agent_start", {}, main);
+			await omp.emit("agent_end", {}, main);
+			await eventually(() => started("check-started"));
+			await eventually(async () => (await readRun(project.sessionDir, runId))?.endReason === "verified");
+			await omp.emit("session_shutdown", {}, main);
+		}, 30_000);
+
+		test("a later look is guaranteed: the run's own round timer asks again, so the release of the edit's hold, the last host event, still ends in the skipped check (reviewer question 4)", async () => {
+			const { omp, main, runId } = await dueCheck(check(50));
+			expect(verdict(await omp.emit("tool_call", edit("e-1", "notes.txt"), main))).toBe("pass");
+			await omp.emit("message_end", assistantEnd("toolUse", ["e-1"]), main);
+			await omp.emit("agent_start", {}, main);
+			await omp.emit("agent_end", { willContinue: false }, main);
+			await Bun.sleep(300);
+			expect(await started("check-started")).toBe(false);
+			// The last event of the idle run is the release: no `agent_start` or `agent_end` follows it.
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			await eventually(() => started("check-started"));
+			await eventually(async () => (await readRun(project.sessionDir, runId))?.endReason === "verified");
+			await omp.emit("session_shutdown", {}, main);
+		}, 30_000);
+	});
+
+	describe("under automatic delegation", () => {
+		test("a plan opens the director's own edits: refused before it as before, passed and ordered by the table during the run", async () => {
+			await approve(TEAM);
+			await enableAuto();
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.emit("session_start", {}, main);
+			await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: [] }, main);
+			// Before a plan nothing changes: no file is edited yet, with the supervisor's own cause.
+			const before = await refusal(omp, main, edit("e-0"));
+			expect(before.code).toBe("auto");
+			expect(before.reason).toContain(SUPERVISOR_REASONS.toolEdits);
+			expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "w-0", input: { path: "src/a.ts", content: "x" } }, main))).toBe("auto");
+			expect((await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main)).outcome).toBe("ok");
+			// During the run: a command is still the team's; an edit is the director's to make when the table is free.
+			expect(verdict(await omp.emit("tool_call", bash("b-1"), main))).toBe("auto");
+			expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+			// It holds the tree: the lane's worker (a shell writer) is refused the place, with the director named.
+			const task = { toolName: "task", toolCallId: "t-1", input: { agent: "storm-implementer", task: "fix" } };
+			expect(verdict(await omp.emit("tool_call", task, main))).toBe("lane-write");
+			expect(await reasonOf(omp, main, task)).toContain(DIRECTOR_EDITING);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			const assigned = (await omp.emit("tool_call", { ...task, toolCallId: "t-2" }, main)) as { input: { name: string } };
+			expect(assigned.input.name).toContain("-lane-1");
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", assigned.input.name), main))).toMatch(/^route:/);
+			await child.emit("before_agent_start", { systemPrompt: [] }, child.ctx(sub(assigned.input.name)));
+			// And now the worker holds it: the edit is refused naming the lane, not the director's own hold.
+			const during = await refusal(omp, main, edit("e-2"));
+			expect(during.code).toBe("director-write");
+			expect(during.reason).toContain(`'${fixLane.name}' 레인`);
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("what the director is told: the instruction no longer says edits are the team's, the run contract names the edit rule", async () => {
+			await approve({ ...TEAM, roles: { ...TEAM.roles, quick: { agent: "storm-quick", models: ["a/q"], workers: { min: 1, max: 1 } } } });
+			await enableAuto();
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.emit("session_start", {}, main);
+			const started = (await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix the login bug", systemPrompt: ["base"] }, main)) as { systemPrompt: string[] };
+			const text = started.systemPrompt.slice(1).join("\n");
+			expect(text).toContain("<storm-auto>");
+			expect(text).not.toMatch(/Edits[^.]*are the team's/);
+			expect(text).not.toMatch(/file changes belong/i);
+			expect(text).toContain("edit/write");
+			// What stays the team's is said: a command, eval and an MCP tool.
+			expect(text).toMatch(/Shell, eval and MCP are the team's/);
+			// The manual director's run contract carries the same rule as one constant, and not the old refusal.
+			await omp.command("fix the file", main);
+			const handoff = omp.sent.at(-1) ?? "";
+			expect(handoff).toContain(DIRECTOR_EDIT_RULE);
+			expect(handoff).not.toContain("your own file edits are blocked");
+			await omp.emit("session_shutdown", {}, main);
+		});
+	});
+
+	describe("the result contract in the assignment", () => {
+		const resultLane = (name: string, over: Record<string, unknown> = {}) => ({
+			name,
+			kind: "code" as const,
+			role: "implementer",
+			files: [`${name}.txt`],
+			goal: `Write ${name}.txt`,
+			results: [{ id: `${name}-change`, kind: "change" as const, criterion: `${name}.txt holds the new text`, contains: "new text" }],
+			...over,
+		});
+
+		test("a task item of a lane with declared results carries the lane's block after its own text; a lane with none carries nothing", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, {
+				lanes: [resultLane("A"), { name: "R0", kind: "review", role: "reviewer", goal: "Review the tree" }],
+				workers: { implementer: 1, reviewer: 1 },
+			});
+			const placed = (await omp.emit("tool_call", taskCall("A", "a-1"), main)) as { input: { task: string } };
+			expect(placed.input.task.startsWith("work A\n\n")).toBe(true);
+			expect(placed.input.task).toContain(CONTRACT_TAG);
+			expect(placed.input.task).toContain("A-change");
+			expect(placed.input.task).toContain("A.txt");
+			// The text the worker's result is judged by is the lane's own: nothing of another lane's.
+			expect(placed.input.task).not.toContain("R0");
+			await omp.emit("tool_execution_end", { toolName: "task", toolCallId: "a-1", isError: true }, main);
+			// A review lane declares no results: its task goes out as the director wrote it.
+			const review = await omp.emit("tool_call", taskCall("R0", "r-1", "storm-reviewer"), main);
+			expect(review === undefined || !String((review as { input?: { task?: unknown } }).input?.task ?? "").includes(CONTRACT_TAG)).toBe(true);
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("an item with steps carries the block on its first step, where omp sends it to the worker, and no task text is invented", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes: [resultLane("A")], workers: { implementer: 1 } });
+			const answer = (await omp.emit("tool_call", { toolName: "task", toolCallId: "a-1", input: { agent: "storm-implementer", name: "A", steps: ["first step", "second step"] } }, main)) as { input: { steps: string[]; task?: string } };
+			expect(answer.input.steps[0]?.startsWith("first step\n\n")).toBe(true);
+			expect(answer.input.steps[0]).toContain(CONTRACT_TAG);
+			expect(answer.input.steps[1]).toBe("second step");
+			expect(answer.input).not.toHaveProperty("task");
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("each item of a mixed batch carries its own lane's block: the shared item's files, the isolated item's own checkout", async () => {
+			await approve(TEAM);
+			installOmpSettings({ "task.isolation.enabled": true, "task.isolation.apply": false });
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, {
+				lanes: [resultLane("core"), resultLane("probe", { files: undefined, isolationReason: "keep the experimental result outside the tree" }), { name: "look", kind: "explore", role: "explorer", goal: "Read", results: answerFor("look-answer") }],
+				workers: { implementer: 2, explorer: 1 },
+			});
+			const batch = (await omp.emit("tool_call", {
+				toolName: "task",
+				toolCallId: "batch-1",
+				input: {
+					tasks: [
+						{ agent: "storm-implementer", name: "core", task: "work core" },
+						{ agent: "storm-implementer", name: "probe", task: "work probe" },
+						{ agent: "storm-explorer", name: "look", task: "look around" },
+					],
+				},
+			}, main)) as { input: { tasks: Array<{ name: string; task: string }> } };
+			const [core, probe, look] = batch.input.tasks;
+			expect(core?.task).toContain("core-change");
+			expect(core?.task).toContain("core.txt");
+			expect(core?.task).not.toContain(ISOLATED_SCOPE);
+			expect(probe?.task).toContain("probe-change");
+			expect(probe?.task).toContain(ISOLATED_SCOPE);
+			// The third item's block is its own: an answer, with no write scope of a writer in it.
+			expect(look?.task).toContain("look-answer");
+			expect(look?.task).not.toContain("core-change");
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("a work follow-up carries the block again only when the worker has not been sent the current one", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			// A review lane declares no results, so its worker is sent no contract with its assignment.
+			const lane = { name: "R0", kind: "review" as const, role: "reviewer", goal: "Review the tree" };
+			await openRun(omp, main, { lanes: [lane], workers: { reviewer: 1 } });
+			const worker = await startWorker(omp, child, main, "R0", "call-R0", "storm-reviewer");
+			await child.emit("agent_end", {}, worker);
+			await ended(omp, main, "task", "call-R0");
+			const followUp = async (callId: string, over: { isError?: boolean; progress?: boolean } = {}): Promise<string> => {
+				const call = { toolName: "write", toolCallId: callId, input: { path: `agent://R0${over.progress === true ? "?progress" : ""}`, content: "more work" } };
+				const answer = (await omp.emit("tool_call", call, main)) as { input?: { content?: string }; block?: boolean; reason?: string } | undefined;
+				expect(answer?.block, answer?.reason).not.toBe(true);
+				const content = answer?.input?.content ?? "more work";
+				const sent = { ...call, input: { ...call.input, content } };
+				await omp.emit("tool_result", { ...sent, isError: over.isError === true, content: [] }, main);
+				if (over.progress !== true) {
+					await child.emit("agent_start", {}, worker);
+					await child.emit("agent_end", {}, worker);
+				}
+				await ended(omp, main, "write", callId);
+				return content;
+			};
+			// No contract, nothing to repeat.
+			expect(await followUp("f-1")).toBe("more work");
+			// A replan gives the lane its first results: the worker has not been sent them.
+			expect(await omp.tool({ action: "plan", plan: { lanes: [{ ...lane, results: answerFor("r0-answer") }], workers: { reviewer: 1 } } }, main)).toBe("ok");
+			// A quiet progress note is no work: it carries nothing.
+			expect(await followUp("f-quiet", { progress: true })).toBe("more work");
+			// The first work follow-up after it carries the block; a delivery that failed does not count as sent.
+			const carried = await followUp("f-2", { isError: true });
+			expect(carried.startsWith("more work\n\n")).toBe(true);
+			expect(carried).toContain(CONTRACT_TAG);
+			expect(carried).toContain("r0-answer");
+			expect(await followUp("f-3")).toContain(CONTRACT_TAG);
+			// Delivered: the next one repeats nothing.
+			expect(await followUp("f-4")).toBe("more work");
+			await omp.emit("session_shutdown", {}, main);
+		}, 30_000);
+	});
+
+	describe("the follow-up of a worker that was sent its contract", () => {
+		test("a work follow-up to a worker that got the block with its assignment repeats nothing", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			const lane = { name: "A", kind: "code" as const, role: "implementer", files: ["a.txt"], goal: "Write a.txt", results: changeFor("A-change") };
+			await openRun(omp, main, { lanes: [lane], workers: { implementer: 1 } });
+			const placed = (await omp.emit("tool_call", taskCall("A", "a-1"), main)) as { input: { task: string } };
+			expect(placed.input.task).toContain(CONTRACT_TAG);
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", "A"), main))).toMatch(/^route:/);
+			const worker = child.ctx(sub("A"));
+			await child.emit("before_agent_start", { systemPrompt: [] }, worker);
+			await child.emit("agent_end", {}, worker);
+			await ended(omp, main, "task", "a-1");
+			// Sent with the assignment: the follow-up is passed on as the director wrote it.
+			expect(await omp.emit("tool_call", { toolName: "write", toolCallId: "f-1", input: { path: "agent://A", content: "also fix the header" } }, main)).toBeUndefined();
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+	});
+
+	describe("read lanes with a shell", () => {
+		/** An approved project definition of the explorer whose tools list a shell: the only way a read lane gets one. */
+		const shellExplorer = async (): Promise<void> => {
+			const dir = path.join(project.root, ".omp", "agents");
+			await mkdir(dir, { recursive: true });
+			await writeFile(path.join(dir, "storm-explorer.md"), "---\nname: storm-explorer\ndescription: reads and runs commands\ntools: read, grep, find, bash\n---\nRead the project and run read commands.\n");
+			await approveShadows(TEAM);
+		};
+		const lanes = [
+			{ name: "E0", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("e0-answer") },
+			writerLane("W0", "a.txt"),
+		];
+
+		test("the plan reply says any read lane with a shell runs with the writers, in words that are not the reviewer's", async () => {
+			await shellExplorer();
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("manual task", main);
+			const reply = await omp.toolReply({ action: "plan", plan: { lanes, workers: { explorer: 1, implementer: 1 } } }, main);
+			expect(reply.outcome).toBe("ok");
+			const order = reply.text.split("\n").find(line => line.startsWith("- 쓰기 순서"));
+			expect(order).toBeDefined();
+			expect(order).toContain("E0");
+			expect(order).toContain(WHY_SHELL_READER);
+			expect(order).not.toContain(WHY_SHELL_REVIEWER);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("without the shell in its definition the same lane is a plain reader: no order line, and it runs beside a writer", async () => {
+			await approve(TEAM);
+			const omp = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await omp.command("manual task", main);
+			const reply = await omp.toolReply({ action: "plan", plan: { lanes, workers: { explorer: 1, implementer: 1 } } }, main);
+			expect(reply.text.split("\n").some(line => line.includes("E0") && line.startsWith("- 쓰기 순서"))).toBe(false);
+			await omp.emit("session_shutdown", {}, main);
+		});
+
+		test("its shell passes; starting a named service and every path write are refused as for the reviewer; the reason names a read lane", async () => {
+			await shellExplorer();
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes, workers: { explorer: 1, implementer: 1 } });
+			const worker = await startWorker(omp, child, main, "E0", "call-E0", "storm-explorer");
+			const run = (toolName: string, input: unknown) => child.emit("tool_call", { toolName, toolCallId: `w-${++probes}`, input }, worker);
+			expect(verdict(await run("bash", { command: "git log -1" }))).toBe("pass");
+			expect(verdict(await run("read", { path: "a.txt" }))).toBe("pass");
+			// A service lives in omp's daemon, beyond this worker's turn: refused as for any worker ordered like a writer.
+			expect(verdict(await run("bash", { command: "npm run dev", name: "dev" }))).toBe("lane-service");
+			// A path write, an eval cell and a nested task are not what a read lane may do.
+			for (const [tool, input] of [["edit", { path: "a.txt", old_string: "a", new_string: "b" }], ["write", { path: "a.txt", content: "x" }], ["eval", { code: "1" }], ["task", { agent: "storm-implementer", task: "x" }]] as const) {
+				expect(verdict(await run(tool, input)), tool).toMatch(/^lane-(capability|nested)$/);
+			}
+			const refused = (await run("write", { path: "a.txt", content: "x" })) as { reason: string };
+			expect(refused.reason).toContain("읽기와 셸 실행만");
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
+
+		test("it is ordered like a writer in both directions: a writer is refused while it runs, and it is refused while a writer or the director's edit holds the tree", async () => {
+			await shellExplorer();
+			const omp = fakeOmp(project);
+			const child = fakeOmp(project);
+			const main = omp.ctx(MAIN);
+			await openRun(omp, main, { lanes, workers: { explorer: 1, implementer: 1 } });
+			// The director's edit holds the tree: the shell reader is refused, naming the edit.
+			expect(verdict(await omp.emit("tool_call", edit("e-1"), main))).toBe("pass");
+			const blocked = taskCall("E0", "t-1", "storm-explorer");
+			expect(verdict(await omp.emit("tool_call", blocked, main))).toBe("lane-write");
+			expect(await reasonOf(omp, main, blocked)).toContain(DIRECTOR_EDITING);
+			await omp.emit("turn_end", turnEndOf([{ id: "e-1" }]), main);
+			// It runs; the writer lane is refused, naming the reader and why.
+			await startWorker(omp, child, main, "E0", "call-E0", "storm-explorer");
+			const writer = taskCall("W0", "t-2");
+			expect(verdict(await omp.emit("tool_call", writer, main))).toBe("lane-write");
+			expect(await reasonOf(omp, main, writer)).toContain("'E0' 레인");
+			// And the director's own edit is refused beside it.
+			const refused = await refusal(omp, main, edit("e-2"));
+			expect(refused.code).toBe("director-write");
+			expect(refused.reason).toContain(holderPhrase({ lane: "E0", agentId: "E0" }));
+			await omp.emit("session_shutdown", {}, main);
+		}, 20_000);
 	});
 });
