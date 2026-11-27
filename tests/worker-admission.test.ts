@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sessionStoreDir } from "../src/session-scope.ts";
 import {
+	endWorkerAdmission,
 	persistWorkerAdmission,
 	readWorkerAdmission,
 	resolveWorkerAdmission,
@@ -121,6 +122,41 @@ describe("worker admission records", () => {
 		const moved = join(tmp, "moved-checkout");
 		await mkdir(moved);
 		expect(await resolve({ childCwd: moved })).toMatchObject({ kind: "denied" });
+	});
+
+	test("the child's settled turn closes the attempt it claimed, so the same session cannot write again until a follow-up reopens it", async () => {
+		await admit({ lane: "L1" });
+		expect(await resolve()).toMatchObject({ kind: "authorized" });
+		const read = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (read.kind !== "record") throw new Error("no record");
+		// A claim now exists for this attempt: closing must still find the session that made it.
+		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
+		expect(await resolve()).toMatchObject({ kind: "denied" });
+		// Another session cannot close it, and a stale attempt closes nothing of a newer one.
+		await admit({ lane: "L1" });
+		expect(await resolve()).toMatchObject({ kind: "authorized" });
+		expect(await endWorkerAdmission(agentDir, read.key, read.record.attempt, "child-session")).toBe(true);
+		expect(await resolve()).toMatchObject({ kind: "authorized" });
+		const fresh = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (fresh.kind !== "record") throw new Error("no record");
+		expect(await endWorkerAdmission(agentDir, fresh.key, fresh.record.attempt, "other-session")).toBe(false);
+		expect(await resolve()).toMatchObject({ kind: "authorized" });
+	});
+
+	test("a reservation that ended revokes exactly that child's authority from before the moment it ended", async () => {
+		await admit({ childId: "A" });
+		await admit({ childId: "B" });
+		expect(await resolve({ childId: "A", childSessionId: "sa" })).toMatchObject({ kind: "authorized" });
+		const ended = Date.now() + 1;
+		expect(await revokeWorkerAdmissions(agentDir, { runId, childId: "A", createdBefore: ended })).toBe(1);
+		expect(await resolve({ childId: "A", childSessionId: "sa" })).toMatchObject({ kind: "denied" });
+		// Another child of the same run is untouched.
+		expect(await resolve({ childId: "B", childSessionId: "sb" })).toMatchObject({ kind: "authorized" });
+		// A newer attempt of A, written after that moment, is not revoked by the late event.
+		const stale = Date.now() - 10_000;
+		await admit({ childId: "A" });
+		expect(await revokeWorkerAdmissions(agentDir, { runId, childId: "A", createdBefore: stale })).toBe(0);
+		expect(await resolve({ childId: "A", childSessionId: "sa2" })).toMatchObject({ kind: "authorized" });
 	});
 
 	test("a path that becomes a symlink escape during the run no longer matches its canonical scope", async () => {

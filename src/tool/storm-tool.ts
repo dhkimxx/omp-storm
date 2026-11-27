@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
 import { isRecord, MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
-import { effectiveAgentTools, lanePolicy } from "../policy/capability.ts";
+import { effectiveAgentTools, lanePolicy, shellReviewer, WHY_SHELL_REVIEWER } from "../policy/capability.ts";
 import {
 	LANE_NEEDS,
 	MAX_LANES,
@@ -42,6 +42,7 @@ import {
 import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, ShadowInfo, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
 import type { ContinuedRun, StormToolHost } from "./host.ts";
+import { renderPlanView } from "./plan-view.ts";
 
 type Zod = ExtensionAPI["zod"];
 /** The parsed shape is checked against `StormToolInput` where the schema is built. */
@@ -70,11 +71,11 @@ const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../../agents/", import.meta.url
 
 const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
 - run {task}: queue the request verbatim, then end the turn.
-- plan {plan}: before work; it opens this request's run. Non-review lanes need results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
+- plan {plan}: opens this request's run, which spawns need. Non-review lanes need results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
 - execute {lanes}: planned job lanes, not AI workers; exit and an exact stdout marker prove execution only.
-- brief {brief}: stages result, verification, remaining? and 0-3 next, best first: resume, run {task} for new scope, user {text} for the user; never verifies or ends the run. Skip trivial.
-- status: team, approval, runs and approved job names.
-- continue: when status shows an interrupted run and the user asked to go on, not new work; plan's rules, results carried.
+- brief {brief}: stages result, verification, remaining? and 0-3 next, best first: resume, run {task} for new scope, user {text} for the user; never verifies or ends the run.
+- status: team, approval, runs, approved job names and this run's plan with each result's state.
+- continue: reopens an interrupted run once the user asked to go on; plan's rules, results carried.
 - agents: existing workers and follow-up allowance.
 Team changes: /storm.`;
 
@@ -231,11 +232,11 @@ const rejected = (text: string): StormToolReply => ({ outcome: "rejected", text 
  * reported. `run` would queue a second handoff instead of binding the plan before the turn's first spawn.
  */
 const AUTO_RUN_REJECTED =
-	"자동 위임에서는 run으로 실행을 예약하지 않습니다. 이번 사용자 요청의 계획을 plan으로 제출하세요. 계획이 같은 턴에서 실행을 열고, 그 범위 안에서 승인된 워커를 스폰할 수 있습니다.";
+	"run은 턴이 끝난 뒤 시작할 실행을 예약하는데, 자동 위임에서는 이번 턴이 실행의 첫 라운드라 예약하지 않았습니다. 이번 사용자 요청의 계획을 plan으로 제출하세요. 계획이 같은 턴에서 실행을 열고, 그 범위 안에서 승인된 워커를 스폰할 수 있습니다.";
 const AUTO_NO_TASK =
 	"자동 위임에서 실행을 열 사용자 요청을 찾지 못했습니다. 계획을 저장하지 않았습니다. 사용자에게 요청을 새로 입력해 달라고 안내하세요. 사진이나 첨부만 있고 글이 없는 요청은 실행으로 열 수 없습니다.";
 const BRIEF_INVALID =
-	"마무리 보고가 올바르지 않습니다. result(결과)와 verification(검증 근거)을 증거 위치와 함께 한 줄씩 적고, next는 서로 다른 0~3개로 다시 제출하세요. 이어 가기는 {kind:\"resume\"}, 새 범위 작업은 {kind:\"run\", task}, 사용자가 직접 할 일은 {kind:\"user\", text}입니다. 단순 조회에는 쓰지 않습니다.";
+	"마무리 보고가 올바르지 않습니다. result(결과)와 verification(검증 근거)을 증거 위치와 함께 한 줄씩 적고, next는 서로 다른 0~3개로 다시 제출하세요. 이어 가기는 {kind:\"resume\"}, 새 범위 작업은 {kind:\"run\", task}, 사용자가 직접 할 일은 {kind:\"user\", text}입니다.";
 const BRIEF_NO_HOST =
 	"이 호스트에서는 마무리 보고를 준비할 수 없습니다. 보고 내용은 응답에 직접 적고, 실행 종료는 Storm에 맡기세요.";
 const BRIEF_STAGED =
@@ -303,8 +304,13 @@ async function loadCurrent(host: StormToolHost): Promise<Current | StormToolRepl
 export async function runStormTool(host: StormToolHost, params: StormToolInput, signal?: AbortSignal): Promise<StormToolReply> {
 	switch (params.action) {
 		// Quota is left out: reading it costs seconds, and `/storm status` shows it.
-		case "status":
-			return { outcome: "ok", text: await host.statusText({ quota: false }) };
+		case "status": {
+			const text = await host.statusText({ quota: false });
+			// The plan in force, as submitted, with the states Storm holds: the director's own plan, without a worker.
+			const view = host.planView?.();
+			const plan = view === undefined ? undefined : renderPlanView(view);
+			return { outcome: "ok", text: plan === undefined ? text : `${text}\n\n${plan}` };
+		}
 		case "agents": {
 			const rows = agentRows(host.runtime.agents());
 			return { outcome: "ok", text: renderAgentRows(rows, host.now()) };
@@ -378,6 +384,8 @@ function writerOrderLine(config: StormConfig, plan: RunPlan, shadows: readonly S
 			auto,
 		});
 		if (policy.kind === "unknown") writers.push({ name: lane.name, exclusive: true, why: policy.reason });
+		// A review lane that may run commands is ordered like an exclusive writer, so the plan says it runs alone.
+		else if (shellReviewer(policy)) writers.push({ name: lane.name, exclusive: true, why: WHY_SHELL_REVIEWER });
 		else if (policy.kind === "paths") writers.push({ name: lane.name, exclusive: false, why: "" });
 	}
 	const serial = writers.filter(a =>

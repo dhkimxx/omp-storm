@@ -6,64 +6,122 @@
  * (main versus subagent, active run, which tools the host enabled), so this module stays pure and always refuses
  * unknown tools by default, active run or not.
  *
- * Allowed: Storm's orchestration controls, delegation through `task`, the user question/todo/wait tools, and typed
- * agent or local messages. Everything else is refused, including every file tool, generic shell/eval, remote and
- * device paths, MCP tools and unknown names. A read of an agent handle is limited to its summary/artifact, a typed
- * JSON field, or an explicitly bounded line range; a transcript is not read. Malformed input fails closed.
+ * Allowed: Storm's orchestration controls, delegation through `task`, the user question/todo/wait tools, omp's own
+ * plan-mode exit (`propose`), every tool that only reads or searches (the worker gate's `READ_ONLY_TOOLS`, plus the
+ * reading actions of `lsp`), reads of project files, web pages, `agent://` handles, `local://` notes, `skill://`,
+ * `rule://`, `help://` and the transcripts (`history://`) of this run's own agents, and typed messages
+ * (`write agent://<id>` with or without `?progress`, `write local://<name>.md`).
+ * Refused, each with its cause: editing or writing project files, shell and eval, MCP and unknown tools, and any read
+ * that is not a plain read (a remote host, another omp instance, another session's transcripts, a path that starts
+ * a process). Context size is never a cause here: Storm compacts instead of refusing. Malformed input fails closed.
  */
-const CONTROL_TOOLS: Record<string, true> = { storm: true, task: true, ask: true, todo: true, wait: true };
+import { type AgentAddress, agentAddress, handleAddress } from "./agent-address.ts";
+import { PATH_WRITE_TOOLS, READ_ONLY_TOOLS } from "./capability.ts";
 
-/** Most lines one supervisor read of an agent handle may ask for, matching director-mode reads. */
-const MAX_AGENT_READ_LINES = 400;
-const MAX_JSON_PATH_SEGMENTS = 8;
+/** Tools that orchestrate the run or talk to the user; `propose` leaves omp's own plan mode and nothing else. */
+export const CONTROL_TOOL_NAMES = ["storm", "task", "ask", "todo", "wait", "propose"] as const;
+const CONTROL_TOOLS: Record<string, true> = Object.fromEntries(CONTROL_TOOL_NAMES.map(name => [name, true]));
+
+/** `lsp` actions that only ask a language server a question. `rename*`, `code_actions`, `reload` and `request` are out. */
+const LSP_READ_ACTIONS: Record<string, true> = {
+	definition: true,
+	references: true,
+	hover: true,
+	symbols: true,
+	type_definition: true,
+	implementation: true,
+	status: true,
+	capabilities: true,
+	diagnostics: true,
+};
+
+/** URL schemes `read` may open besides plain paths: pages, the run's own handles, notes and documentation. */
+const READ_SCHEMES: Record<string, true> = {
+	http: true,
+	https: true,
+	agent: true,
+	local: true,
+	history: true,
+	skill: true,
+	rule: true,
+	help: true,
+};
+
 const MAX_LOCAL_PATH_LENGTH = 180;
 const MAX_LOCAL_PATH_SEGMENTS = 4;
 
 const AGENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const JSON_PATH_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$/;
 const LOCAL_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 const TOOL_NAME = /^[A-Za-z0-9_.-]{1,64}$/;
+/** A scheme at the start of a path: `x://`, omp's single-slash alias `x:/`, or an opaque `x:rest` (MCP resources). */
+const LEADING_SCHEME = /^([a-z][a-z0-9+.-]*):(?:\/\/?|(?=.))/i;
+/** omp opens a PDF page as an image (`doc.pdf:p1.png`) through a headless browser: that is a process, not a read. */
+const PDF_PAGE_IMAGE = /\.pdf:(?:p|page[-_]?)\d+(?:[-_].*)?\.png$/i;
+/** A read-tool selector tail (`Makefile:12`, `notes:raw`), which is not a scheme. */
+const SELECTOR_CHAIN = /^(?:raw|conflicts|-?\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*)(?::(?:raw|conflicts|-?\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*))*(?:;|$)/i;
 
-const READ_FILE_REASON =
-	"감독 모드에서는 파일·원격·장치 경로를 직접 읽지 않습니다. 필요한 파일은 task 로 서브에이전트가 읽게 하고 근거 위치를 받으세요. 에이전트 결과는 read agent://<id> 산출물이나 read agent://<id>/<field> 로 확인하세요.";
-const HISTORY_REASON =
-	"history:// 는 에이전트 트랜스크립트라 감독 모드에서 읽지 않습니다. read agent://<id> 산출물이나 read agent://<id>/<field> 를 쓰고, 더 필요하면 task 로 요약을 맡기세요.";
-const LOCAL_READ_REASON =
-	"local:// 노트도 감독 모드에서는 직접 읽지 않습니다. 필요한 내용은 task 로 확인하게 하고, 새 메모는 write local://<name>.md 로 남기세요.";
-const AGENT_PATH_REASON =
-	"agent:// 경로가 올바르지 않습니다. agent://<id> 또는 agent://<id>/<field> 형태만 읽고, 핸들이 없으면 task 로 결과 요약을 받으세요.";
-const AGENT_LIMIT_REASON = `agent:// 읽기는 한 번에 ${MAX_AGENT_READ_LINES}줄까지만 허용됩니다. agent://<id>:1-${MAX_AGENT_READ_LINES} 처럼 줄 범위를 좁히거나 agent://<id>/<field> 로 필요한 값만 읽으세요.`;
-const WRITE_FILE_REASON =
-	"감독 모드에서는 파일에 직접 쓰지 않습니다. 파일 변경은 task 로 구현 에이전트에 맡기고, 메모는 write local://<name>.md 로 남기세요.";
-const WRITE_REMOTE_REASON =
-	"감독 모드에서는 ssh://, xd://, proc://, MCP 같은 원격·장치·프로세스 경로에 쓰지 않습니다. 작업은 task 로 위임하세요.";
-const AGENT_MESSAGE_REASON =
-	"에이전트 메시지는 write agent://<id> 와 비어 있지 않은 content 가 필요합니다. agent://all 이나 파일 경로로 보내지 마세요.";
-const LOCAL_NOTE_REASON =
-	"local:// 메모는 .md 파일과 비어 있지 않은 문자열 content 가 필요합니다. 파일 변경은 task 로 맡기세요.";
-const MALFORMED_READ_REASON =
-	"read 입력은 path 문자열 하나여야 합니다. 파일은 읽지 말고, 에이전트 결과는 agent://<id> 또는 agent://<id>/<field> 로 확인하세요.";
-const MALFORMED_WRITE_REASON =
-	"write 입력은 path 와 content 문자열만 있어야 합니다. write agent://<id> 또는 write local://<name>.md 만 허용됩니다.";
-const MISSING_TOOL_REASON =
-	"도구 이름이 없어 감독 모드에서 막았습니다. 작업은 task 로 위임하고, 진행·질문·대기는 todo·ask·wait, 실행 제어는 storm 으로 하세요.";
+/** Every refusal the supervisor gate can give, by cause. Tests import these instead of quoting sentences. */
+export const SUPERVISOR_REASONS = {
+	readMalformed: "read 입력은 path 문자열 하나여야 하는데 그렇지 않아 막았습니다.",
+	readRemote:
+		"ssh:// 읽기는 원격 호스트에 접속하는 프로세스를 띄우고, mcp:// 같은 외부 리소스는 읽기 전용인지 확인할 수 없어 감독이 직접 읽지 않습니다. 필요하면 task 로 워커에게 맡기세요.",
+	readEmbedded:
+		"경로 안에 scheme:// 주소가 섞여 있어 omp 가 어디를 읽을지(원격 호스트일 수도 있음) 확정할 수 없어 막았습니다. 파일 경로나 http(s):// 주소 하나만 쓰세요.",
+	readProcess:
+		"PDF 쪽 이미지(.pdf:p1.png)는 브라우저 프로세스를 띄워 만들어서 읽기로 보지 않습니다. 텍스트는 파일 경로 그대로 읽으세요.",
+	readOtherInstance:
+		"agent://peers 와 숫자 주소는 같은 프로젝트의 다른 omp 인스턴스 데이터를 읽는 경로라 이 세션의 실행으로 한정할 수 없어 읽지 않습니다. 이 실행 워커의 id 로 읽으세요.",
+	readAgentPath: "agent:// 주소의 id 형식이 올바르지 않습니다. agent://<id> 또는 agent://<id>/<field> 로 읽으세요.",
+	readAgentScope:
+		"agent:// 는 이 프로세스의 다른 세션이 띄운 에이전트의 출력까지 읽을 수 있어, 이 세션의 실행에서 시작된 에이전트의 id 만 읽습니다. 이 실행의 워커 id 는 storm status/agents 로 확인하세요.",
+	readHistoryScope:
+		"history:// 는 이 세션 밖의 에이전트 기록과 디스크의 다른 세션 기록까지 열 수 있어, 이 실행에서 시작된 에이전트의 id 만 읽습니다. 이 실행의 워커 id 는 storm status/agents 로 확인하세요.",
+	writeMalformed: "write 입력은 path 와 content 문자열만 있어야 하는데 그렇지 않아 막았습니다.",
+	writeFiles:
+		"감독이 쓴 파일은 어느 레인의 결과도 아니고 쓰는 워커와 순서가 보장되지 않아 막혀 있습니다. 파일 변경은 task 로 구현 워커에 맡기세요.",
+	writeRemote:
+		"ssh://, xd://, proc://, mcp:// 쓰기는 원격 파일을 바꾸거나 명령을 실행할 수 있어 감독이 직접 하지 않습니다. 작업은 task 로 맡기세요.",
+	writeLocalNote: "local:// 메모는 .md 파일 이름(영문·숫자·._-, 4단계 이내)과 문자열 content 만 받아 이 쓰기를 막았습니다.",
+	messageBroadcast:
+		"agent://all 은 모든 워커를 한꺼번에 깨울 수 있어 보내지 않습니다. agent://<id> 로 워커 한 명에게 보내세요.",
+	messageOtherAddress:
+		"agent://parent, agent://peers, 숫자 주소는 이 실행의 워커가 아니라 부모나 다른 omp 인스턴스로 가는 주소라 막았습니다. 이 실행 워커의 id 로 보내세요.",
+	messageControl:
+		"에이전트의 모델·추론 강도는 사용자가 승인한 설정이라 감독이 바꾸지 않습니다. 본문만 agent://<id> 로 보내세요.",
+	messageAddress: "agent:// 주소가 올바르지 않습니다. agent://<id> 또는 조용한 알림용 agent://<id>?progress 로 보내세요.",
+	messageEmpty: "agent:// 메시지에 내용이 없어 보내지 않았습니다.",
+	lspMutating:
+		"이 lsp 동작은 이름 변경·코드 액션 적용·서버 재시작·원시 요청처럼 작업 트리를 바꾸거나 서버를 다시 띄울 수 있어 막았습니다. 정의·참조·hover·심볼·진단 같은 조회는 쓸 수 있습니다.",
+	lspWorkspaceDiagnostics:
+		"lsp diagnostics 의 file:\"*\" 는 프로젝트의 빌드 명령(cargo, tsc 등)을 실행해 막았습니다. 파일이나 글롭을 지정하세요.",
+	lspMalformed: "lsp 입력에 action 문자열이 없어 막았습니다.",
+	toolEdits: "파일을 바꾸므로 자동 위임 중 감독이 직접 쓰지 않습니다. 파일 변경은 task 로 구현 워커에 맡기세요.",
+	toolRuns: "명령을 실행하므로 자동 위임 중 감독이 직접 쓰지 않습니다. 실행은 task 로 맡기거나 승인된 정형 작업을 storm execute 로 돌리세요.",
+	toolUnknown: "읽기 전용인지 확인할 수 없어(MCP·확장 도구 포함) 자동 위임 중 감독이 직접 쓰지 않습니다.",
+	toolMissing: "도구 이름이 없어 막았습니다.",
+} as const;
 
-interface AgentTarget {
-	/** The agent id, with no JSON path or selector. */
-	id: string;
-	/** `agent://<id>/<field>` segments after the id. */
-	field: string[];
-	/** A trailing `:1-40`-style selector, if the call has one. */
-	selector: string | undefined;
+/** What the gate may know beyond one call: the ids of the agents this session's runs started. */
+export interface SupervisorScope {
+	/** `history://<id>` is read only for these ids (compared without case). Absent: no transcript is read. */
+	agentIds?: readonly string[];
+	/**
+	 * The ids of every agent the host's registry lists, of any session. `history://current` is the caller's own branch
+	 * only while none of them is named `current`; absent, none is known to be.
+	 */
+	hostAgentIds?: readonly string[];
 }
+
+/** The scope itself, or a function that builds it when a transcript read needs it. */
+export type SupervisorScopeSource = SupervisorScope | (() => SupervisorScope);
 
 /** A path exactly as the tool received it: no surrounding whitespace, no control characters. */
 function isExactPath(value: unknown): value is string {
 	return (
 		typeof value === "string" &&
 		value.length > 0 &&
-		value.length <= 512 &&
+		value.length <= 2048 &&
 		value.trim() === value &&
 		!CONTROL_CHARS.test(value)
 	);
@@ -92,92 +150,110 @@ function exactWriteInput(input: unknown): { path: string; content: string } | un
 	return { path, content };
 }
 
+/** The scheme omp would route this path to, or undefined for a plain file path. */
+function leadingScheme(path: string): string | undefined {
+	const match = LEADING_SCHEME.exec(path);
+	if (match === null) return undefined;
+	const scheme = match[1].toLowerCase();
+	// A drive letter (`C:/x`) is a path.
+	if (scheme.length === 1) return undefined;
+	if (path.startsWith(`${match[1]}:/`)) return scheme;
+	// An opaque `scheme:rest` is an MCP resource, unless it is a file name with an extension or a selector tail.
+	const rest = path.slice(match[1].length + 1);
+	if (scheme.includes(".") || SELECTOR_CHAIN.test(rest)) return undefined;
+	return scheme;
+}
+
 /**
- * Parses `agent://<id>[/<field>[/…]][:<selector>]`. Ids are ASCII and bounded; `all`, `parent`, `peers` and numeric
- * ids are refused because the host treats them as broadcast, parent or cross-instance addresses. A JSON path and a
- * line selector cannot be combined (the host refuses that too). Existence, ownership and run membership are the
- * caller's verification; this grammar only decides which kinds of handle/path the policy can trust.
+ * `<id>` of `<scheme>://<id>[/…][?…][:…]`, read by the one function that reads every agent address (decoded, as omp
+ * does); a read-tool selector after the id (`agent://<id>:1-40`) is not part of it.
  */
-function parseAgentTarget(rest: string): AgentTarget | undefined {
-	if (rest.length === 0) return undefined;
-	const colon = rest.indexOf(":");
-	const selector = colon < 0 ? undefined : rest.slice(colon + 1);
-	const base = colon < 0 ? rest : rest.slice(0, colon);
-	if (selector !== undefined && (selector.length === 0 || selector.includes(":"))) return undefined;
-	const parts = base.split("/");
-	if (parts.length === 0 || parts.some(part => part.length === 0)) return undefined;
-	const id = parts[0];
-	if (!AGENT_ID.test(id)) return undefined;
+function handleId(path: string, scheme: "agent" | "history"): string {
+	return (handleAddress(path, scheme)?.id ?? "").split(":", 1)[0] ?? "";
+}
+
+function isOtherInstanceId(id: string): boolean {
 	const lower = id.toLowerCase();
-	if (lower === "all" || lower === "parent" || lower === "peers" || /^\d+$/.test(id)) return undefined;
-	const field = parts.slice(1);
-	if (field.length > MAX_JSON_PATH_SEGMENTS || !field.every(part => JSON_PATH_SEGMENT.test(part))) return undefined;
-	return { id, field, selector };
+	return lower === "peers" || /^\d+$/.test(id);
 }
 
-/** A selector is bounded when every range is finite and the total is at most one director page. */
-function boundedLineSelector(selector: string): boolean {
-	if (selector.length === 0 || selector.length > 200) return false;
-	let lines = 0;
-	for (const part of selector.split(",")) {
-		let count: number;
-		const single = /^(\d+)$/.exec(part);
-		const range = /^(\d+)-(\d+)$/.exec(part);
-		const span = /^(\d+)\+(\d+)$/.exec(part);
-		const tail = /^-(\d+)$/.exec(part);
-		if (single) {
-			const line = Number(single[1]);
-			if (!Number.isSafeInteger(line) || line < 1) return false;
-			count = 1;
-		} else if (range) {
-			const start = Number(range[1]);
-			const end = Number(range[2]);
-			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) return false;
-			count = end - start + 1;
-		} else if (span) {
-			const start = Number(span[1]);
-			const amount = Number(span[2]);
-			if (!Number.isSafeInteger(start) || !Number.isSafeInteger(amount) || start < 1 || amount < 1) return false;
-			count = amount;
-		} else if (tail) {
-			const amount = Number(tail[1]);
-			if (!Number.isSafeInteger(amount) || amount < 1) return false;
-			count = amount;
-		} else return false;
-		lines += count;
-		if (lines > MAX_AGENT_READ_LINES) return false;
+function readHistory(path: string, scope: SupervisorScopeSource | undefined): string | undefined {
+	const id = handleId(path, "history");
+	const lower = id.toLowerCase();
+	// With no scope at all (a caller that does not hold reads to a session) the session's own branch is let through.
+	if (lower === "current" && scope === undefined) return undefined;
+	// A getter is called only for a transcript read, so a caller can look the ledger up lazily.
+	const given = typeof scope === "function" ? scope() : scope;
+	const known = given?.agentIds ?? [];
+	if (lower === "current" && !known.some(candidate => candidate.toLowerCase() === lower)) {
+		// omp serves `history://current` from the caller's own branch only while no agent of the process is named
+		// `current`; one that is not this session's would be read instead (`internal-urls/history-protocol.ts`).
+		const named = given?.hostAgentIds?.some(candidate => candidate.toLowerCase() === lower) ?? false;
+		return named ? SUPERVISOR_REASONS.readHistoryScope : undefined;
 	}
-	return lines > 0;
+	return id !== "" && known.some(candidate => candidate.toLowerCase() === lower)
+		? undefined
+		: SUPERVISOR_REASONS.readHistoryScope;
 }
 
 /**
- * Reads are allowed only from an agent handle: the bare handle is the published summary/artifact (one omp page), a
- * JSON path extracts one value, and a line selector is allowed up to one director page. Transcripts, local notes and
- * every other path are refused.
+ * Reads are plain reads: project files and directories, web pages, the run's own `agent://` handles, `local://` notes,
+ * documentation schemes and this run's own transcripts. A path that reaches a remote host, another omp instance or
+ * another session, or that makes omp start a process, is refused with that cause. How much a read returns is the
+ * host's paging and Storm's compaction, not a refusal.
  */
-function readBlock(input: unknown): string | undefined {
+function readBlock(input: unknown, scope: SupervisorScopeSource | undefined): string | undefined {
 	const path = exactReadPath(input);
-	if (path === undefined) return MALFORMED_READ_REASON;
-	if (path.startsWith("agent://")) {
-		const target = parseAgentTarget(path.slice("agent://".length));
-		if (target === undefined) return AGENT_PATH_REASON;
-		if (target.field.length > 0 && target.selector !== undefined) return AGENT_PATH_REASON;
-		if (target.selector !== undefined && !boundedLineSelector(target.selector)) return AGENT_LIMIT_REASON;
+	if (path === undefined) return SUPERVISOR_REASONS.readMalformed;
+	const scheme = leadingScheme(path);
+	if (scheme === undefined) {
+		// omp also routes a scheme written in the middle of a path (`/repo/ssh://host/x`): none may appear in a plain path.
+		if (/[a-z][a-z0-9+.-]*:\/\//i.test(path)) return SUPERVISOR_REASONS.readEmbedded;
+		return PDF_PAGE_IMAGE.test(path) ? SUPERVISOR_REASONS.readProcess : undefined;
+	}
+	if (READ_SCHEMES[scheme] !== true) return SUPERVISOR_REASONS.readRemote;
+	// The handle schemes are judged by their id: only the hierarchical spelling puts it where `handleId` looks.
+	if ((scheme === "agent" || scheme === "history") && path.slice(scheme.length, scheme.length + 3) !== "://") {
+		return SUPERVISOR_REASONS.readAgentPath;
+	}
+	if (scheme === "agent") {
+		// The id is read the way omp reads it (decoded): omp resolves `agent://<id>` across every active session of the process,
+		// so with a scope given the handle must be an agent of this session's runs, like a transcript.
+		const id = handleId(path, "agent");
+		if (!AGENT_ID.test(id)) return SUPERVISOR_REASONS.readAgentPath;
+		if (isOtherInstanceId(id)) return SUPERVISOR_REASONS.readOtherInstance;
+		if (scope !== undefined) {
+			const known = (typeof scope === "function" ? scope() : scope).agentIds;
+			if (known !== undefined && !known.some(candidate => candidate.toLowerCase() === id.toLowerCase())) return SUPERVISOR_REASONS.readAgentScope;
+		}
 		return undefined;
 	}
-	if (path.startsWith("history://")) return HISTORY_REASON;
-	if (path.startsWith("local://")) return LOCAL_READ_REASON;
-	return READ_FILE_REASON;
+	if (scheme === "history") return readHistory(path, scope);
+	return undefined;
+}
+
+/** `agent://<id>` or `agent://<id>?progress`, nothing else: no JSON path, selector, model/effort control or other query. */
+function messageBlock(address: AgentAddress, content: string): string | undefined {
+	const id = address.id;
+	if (!AGENT_ID.test(id)) return SUPERVISOR_REASONS.messageAddress;
+	const lower = id.toLowerCase();
+	if (lower === "all") return SUPERVISOR_REASONS.messageBroadcast;
+	if (lower === "parent" || isOtherInstanceId(id)) return SUPERVISOR_REASONS.messageOtherAddress;
+	if (address.segments.length > 0) {
+		const field = address.segments[0]?.toLowerCase();
+		return address.segments.length === 1 && (field === "model" || field === "effort")
+			? SUPERVISOR_REASONS.messageControl
+			: SUPERVISOR_REASONS.messageAddress;
+	}
+	if (address.query !== "" && address.query !== "progress") return SUPERVISOR_REASONS.messageAddress;
+	return content.trim() === "" ? SUPERVISOR_REASONS.messageEmpty : undefined;
 }
 
 function writeBlock(input: unknown): string | undefined {
 	const parsed = exactWriteInput(input);
-	if (parsed === undefined) return MALFORMED_WRITE_REASON;
-	if (parsed.path.startsWith("agent://")) {
-		const target = parseAgentTarget(parsed.path.slice("agent://".length));
-		if (target === undefined || target.field.length > 0 || target.selector !== undefined) return AGENT_MESSAGE_REASON;
-		return parsed.content.trim() === "" ? AGENT_MESSAGE_REASON : undefined;
-	}
+	if (parsed === undefined) return SUPERVISOR_REASONS.writeMalformed;
+	const address = agentAddress(parsed.path);
+	if (address !== undefined) return messageBlock(address, parsed.content);
 	if (parsed.path.startsWith("local://")) {
 		const rest = parsed.path.slice("local://".length);
 		const segments = rest.split("/");
@@ -189,8 +265,7 @@ function writeBlock(input: unknown): string | undefined {
 			segments.every(segment => LOCAL_PATH_SEGMENT.test(segment)) &&
 			last !== undefined &&
 			/\.md$/i.test(last);
-		if (!valid) return LOCAL_NOTE_REASON;
-		return undefined;
+		return valid ? undefined : SUPERVISOR_REASONS.writeLocalNote;
 	}
 	if (
 		parsed.path.startsWith("ssh://") ||
@@ -198,21 +273,64 @@ function writeBlock(input: unknown): string | undefined {
 		parsed.path.startsWith("proc://") ||
 		parsed.path.startsWith("mcp://")
 	) {
-		return WRITE_REMOTE_REASON;
+		return SUPERVISOR_REASONS.writeRemote;
 	}
-	return WRITE_FILE_REASON;
+	return SUPERVISOR_REASONS.writeFiles;
+}
+
+function lspBlock(input: unknown): string | undefined {
+	if (typeof input !== "object" || input === null || Array.isArray(input)) return SUPERVISOR_REASONS.lspMalformed;
+	const record = input as Record<string, unknown>;
+	const action = record.action;
+	if (typeof action !== "string") return SUPERVISOR_REASONS.lspMalformed;
+	if (!Object.hasOwn(LSP_READ_ACTIONS, action) || LSP_READ_ACTIONS[action] !== true) return SUPERVISOR_REASONS.lspMutating;
+	if (action === "diagnostics" && typeof record.file === "string" && record.file.trim() === "*") {
+		return SUPERVISOR_REASONS.lspWorkspaceDiagnostics;
+	}
+	return undefined;
+}
+
+/** Whether an `lsp` call only asks a language server a question (workspace diagnostics runs the project's build command). */
+export function lspReadsOnly(input: unknown): boolean {
+	return lspBlock(input) === undefined;
+}
+
+/**
+ * Whether a call has the shape of omp's plan submission in the form omp 19.2.1 gives the model while `bash` is enabled: the
+ * tool `propose` is then not on the list and the model runs the command `propose <slug>` with `bash` (seen on the real host:
+ * a direct `propose` call answers "Tool propose not found"). omp's tool-command host runs it as the tool, in no shell and no
+ * process, but only while omp's plan mode is on (`specialToolApplies`, `tools/index.ts`); with it off the same line goes to
+ * the shell like any command, and a program named `propose` on the PATH would run. So the shape is no proof by itself: the
+ * caller lets it through only when it also knows plan mode is on. Only this exact shape qualifies (one word, one slug of
+ * omp's own slug characters, no other argument).
+ */
+export function isPlanProposal(toolName: string, input: unknown): boolean {
+	if (toolName !== "bash" || typeof input !== "object" || input === null || Array.isArray(input)) return false;
+	const record = input as Record<string, unknown>;
+	return Object.keys(record).length === 1 && typeof record.command === "string" && /^propose[ \t]+[A-Za-z0-9_-]{1,80}$/.test(record.command);
 }
 
 /**
  * The refusal for a main-session tool call under automatic supervision, or undefined to let it run. Exact tool
- * names only: no prefix matching, no prototype names, no fallback for malformed input. `storm`, `task`, `ask`,
- * `todo` and `wait` are controls; `read` and `write` are admitted only for the typed agent/local paths above.
+ * names only: no prefix matching, no prototype names, no fallback for malformed input. `scope` names the agents of
+ * this session's runs, so a transcript read stays inside them; without it no transcript is read.
  */
-export function supervisorToolBlock(toolName: string, input: unknown): string | undefined {
-	if (typeof toolName !== "string" || toolName.length === 0) return MISSING_TOOL_REASON;
+export function supervisorToolBlock(
+	toolName: string,
+	input: unknown,
+	scope?: SupervisorScopeSource,
+	/** omp's plan mode is on right now: only then is `bash propose <slug>` omp's plan submission and not a shell command. */
+	planMode = false,
+): string | undefined {
+	if (typeof toolName !== "string" || toolName.length === 0) return SUPERVISOR_REASONS.toolMissing;
 	if (Object.hasOwn(CONTROL_TOOLS, toolName)) return undefined;
-	if (toolName === "read") return readBlock(input);
+	if (toolName === "read") return readBlock(input, scope);
 	if (toolName === "write") return writeBlock(input);
+	if (toolName === "lsp") return lspBlock(input);
+	if (Object.hasOwn(READ_ONLY_TOOLS, toolName) && READ_ONLY_TOOLS[toolName] === true) return undefined;
 	const shown = TOOL_NAME.test(toolName) ? toolName : "알 수 없는";
-	return `${shown} 도구는 감독 모드에서 허용되지 않습니다. 작업은 task 로 위임하고, 진행·질문·대기는 todo·ask·wait, 실행 제어는 storm 으로 하세요.`;
+	if (planMode && isPlanProposal(toolName, input)) return undefined;
+	if (toolName === "bash" || toolName === "eval") return `${shown} 도구는 ${SUPERVISOR_REASONS.toolRuns}`;
+	if (Object.hasOwn(PATH_WRITE_TOOLS, toolName)) return `${shown} 도구는 ${SUPERVISOR_REASONS.toolEdits}`;
+	return `${shown} 도구는 ${SUPERVISOR_REASONS.toolUnknown}`;
 }

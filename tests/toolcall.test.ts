@@ -34,57 +34,44 @@ beforeEach(() => {
 afterEach(() => clearRunReads(RUN));
 
 describe("decideToolCall", () => {
-	const big = [agent({ contextTokens: 500_000 })];
 	const cleaned = [agent({ cleanedAt: 1 })];
 
-	test("each rule answers with its own code", () => {
+	test("a file change by the director is the one thing it refuses", () => {
 		expect(code("edit", { path: "src/a.ts" })).toBe("director-edit");
 		expect(code("write", { path: "src/a.ts", content: "x" })).toBe("director-edit");
-		expect(code("read", { path: "notes.md:1-5000" })).toBe("read-large");
-		expect(code("write", { path: "agent://Impl", content: "more" }, big)).toBeUndefined();
-		expect(code("write", { path: "agent://Impl", content: "more" }, cleaned)).toBe("followup-cleaned");
-	});
-
-	test("the edit rule comes first: a file write is an edit even when a cleaned agent and an indexed file are in play", () => {
-		// Writing the very file a subagent read, with a cleaned agent in the ledger: still the edit rule.
+		// A file write is an edit even when the file is one a subagent read and the agent is cleaned.
 		expect(code("write", { path: "notes.md", content: "x" }, cleaned)).toBe("director-edit");
 		expect(code("write", { path: "ssh://box/agent://Impl", content: "x" }, cleaned)).toBe("director-edit");
 		expect(code("edit", { path: "agent://Impl" }, cleaned)).toBe("director-edit");
 	});
 
-	test("the read rule comes before the follow-up rule and never sees writes", () => {
-		// A read of an agent handle is no file read and no follow-up, cleaned agent or not.
+	test("a large read of a file a subagent of the run read runs: context size is compacted, not refused", () => {
+		// The same call the old read rule refused with `read-large`.
+		expect(code("read", { path: "notes.md:1-5000" })).toBeUndefined();
+		expect(code("read", { path: "notes.md:1-401:raw" })).toBeUndefined();
+		expect(code("read", { path: "notes.md" })).toBeUndefined();
 		expect(code("read", { path: "agent://Impl" }, cleaned)).toBeUndefined();
-		// A read of the indexed file is judged by the read rule only.
-		expect(code("read", { path: "notes.md:1-50" }, cleaned)).toBeUndefined();
-		// One page of omp's, whatever the file's size.
-		expect(code("read", { path: "notes.md:raw" }, cleaned)).toBeUndefined();
-		expect(code("read", { path: "notes.md:1-401:raw" }, cleaned)).toBe("read-large");
+		expect(code("read", {}, cleaned)).toBeUndefined();
+		expect(code("read", { path: 7 }, cleaned)).toBeUndefined();
 	});
 
-	test("the read rule's reason follows the team's isolation", () => {
-		const reason = (isolation: StormConfig["isolation"]) =>
-			decideToolCall({ ...call("read", { path: "notes.md:1-5000" }), config: { ...config, isolation } })?.reason ?? "";
-		expect(reason("shared")).toContain("write agent://");
-		expect(reason("isolated")).not.toContain("write agent://");
-	});
-
-	test("the follow-up rule sees every ledger agent, whichever run started it", () => {
-		expect(code("write", { path: "agent://Impl", content: "more" }, [agent({ runId: "run-earlier", cleanedAt: 1 })])).toBe("followup-cleaned");
-		expect(code("write", { path: "agent://Impl", content: "more" }, [agent()])).toBeUndefined();
-		expect(code("write", { path: "agent://Unknown", content: "more" }, cleaned)).toBeUndefined();
+	test("a follow-up to a cleaned agent runs, whichever run started it: omp answers it", () => {
+		// The same calls the old follow-up rule refused with `followup-cleaned`.
+		expect(code("write", { path: "agent://Impl", content: "more" }, cleaned)).toBeUndefined();
+		expect(code("write", { path: "agent://Impl", content: "more" }, [agent({ runId: "run-earlier", cleanedAt: 1 })])).toBeUndefined();
+		expect(code("write", { path: "agent://Impl?progress", content: "more" }, cleaned)).toBeUndefined();
+		expect(code("write", { path: "agent://Impl", content: "more" }, [agent({ contextTokens: 500_000 })])).toBeUndefined();
 	});
 
 	test("everything else runs: notes, control, searches, shell, spawns", () => {
 		expect(code("write", { path: "local://plan.md", content: "x" }, cleaned)).toBeUndefined();
 		expect(code("write", { path: "proc://bg_1/kill", content: "" }, cleaned)).toBeUndefined();
 		for (const tool of ["grep", "glob", "bash", "eval", "task", "storm", "lsp"]) expect(code(tool, {}, cleaned)).toBeUndefined();
-		expect(code("read", {}, cleaned)).toBeUndefined();
-		expect(code("read", { path: 7 }, cleaned)).toBeUndefined();
 	});
 
-	test("the text for the model starts with the code", () => {
+	test("the text for the model starts with the code and names the cause", () => {
 		const block = decideToolCall(call("edit", { path: "src/a.ts" }));
 		expect(block && blockText(block).startsWith("[storm:director-edit] ")).toBe(true);
+		expect(block?.reason).toContain("레인");
 	});
 });

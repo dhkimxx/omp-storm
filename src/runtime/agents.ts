@@ -387,6 +387,21 @@ function descends(record: AgentRecord, ancestorId: string): boolean {
 }
 
 /**
+ * The ids of every agent the process-global registry lists, whatever session or run started it. Not the ledger: a
+ * session never started the agents it cannot see here, and this answers only "is some agent called X" (omp resolves
+ * `history://current` to that agent instead of the caller's own branch when one is). Unreadable registry: undefined.
+ */
+export function registryAgentIds(): string[] | undefined {
+	try {
+		return AgentRegistry.global()
+			.list()
+			.map(ref => ref.id);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Copies, oldest first. `ancestorId` follows parent links only inside the entry's own attested scope. Without `scope`
  * this is the intentionally global janitor inventory; it must not authorize an action.
  */

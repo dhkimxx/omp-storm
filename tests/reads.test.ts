@@ -5,20 +5,18 @@ import { join } from "node:path";
 import {
 	clearRunReads,
 	directorRead,
-	MAX_RANGE_LINES,
 	PAGE_LINES,
 	noteChildRead,
 	openRunReads,
 	readTarget,
-	SMALL_FILE_BYTES,
 } from "../src/policy/reads.ts";
 
 const CWD = "/work/repo";
 
-/** Real files of known sizes: the policy stats what the director asks for. */
+/** Real files of known sizes: the index stats what the director reads to tell a file from a directory. */
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "storm-reads-")));
 const BIG = "x".repeat(79) + "\n";
-const big = BIG.repeat(Math.ceil((SMALL_FILE_BYTES + 1) / BIG.length));
+const big = BIG.repeat(Math.ceil((16 * 1024 + 1) / BIG.length));
 const files = {
 	"big.ts": big,
 	"big.md": big,
@@ -26,7 +24,6 @@ const files = {
 	"big.log": big,
 	"big": big,
 	"small.md": "short\n",
-	"edge.md": "y".repeat(SMALL_FILE_BYTES),
 	"huge.ts": "z".repeat(2 * 1024 * 1024 + 1),
 };
 for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
@@ -71,20 +68,18 @@ describe("readTarget", () => {
 		expect(readTarget("a.ts:12abc", CWD)?.key).toBe("/work/repo/a.ts:12abc");
 	});
 
-	test("ssh paths keep host and port and have no size; a trailing slash is a directory", () => {
+	test("ssh paths keep host and port; a trailing slash is a directory", () => {
 		expect(readTarget("ssh://box/etc/app.conf:10-20", CWD)).toMatchObject({ key: "ssh://box/etc/app.conf", remote: true, lines: 11, dir: false });
 		expect(readTarget("ssh://box:2222/etc/app.conf", CWD)?.key).toBe("ssh://box:2222/etc/app.conf");
-		expect(readTarget("ssh://box:2222/etc/app.conf", CWD)?.bytes).toBeUndefined();
 		expect(readTarget("ssh://box:2222", CWD)?.dir).toBe(true);
 		expect(readTarget("ssh://box/etc/", CWD)?.dir).toBe(true);
 	});
 
-	test("local files carry their size, directories are listings, missing files have neither", () => {
-		expect(readTarget("small.md", dir)).toMatchObject({ bytes: 6, dir: false, remote: false });
+	test("local files are files, directories are listings, missing files are neither", () => {
+		expect(readTarget("small.md", dir)).toMatchObject({ dir: false, remote: false });
 		expect(readTarget("sub", dir)?.dir).toBe(true);
 		expect(readTarget("sub/", dir)?.dir).toBe(true);
 		expect(readTarget("nope.ts", dir)).toMatchObject({ dir: false });
-		expect(readTarget("nope.ts", dir)?.bytes).toBeUndefined();
 	});
 
 	test("internal and remote schemes are exempt", () => {
@@ -94,18 +89,28 @@ describe("readTarget", () => {
 	});
 });
 
-describe("director reads by size", () => {
+describe("director reads are indexed, never refused", () => {
 	const RUN = "run-reads";
 	beforeEach(() => openRunReads(RUN));
 	afterEach(() => clearRunReads(RUN));
 
 	const childRead = (path: string, agent = "Scout") => noteChildRead(RUN, agent, path, dir);
 	const read = (path: string) => directorRead({ runId: RUN, path, cwd: dir });
-	const code = (path: string) => read(path)?.block?.code;
 
-	test("a file no subagent of the run read passes at any size and is not indexed", () => {
+	test("a file no subagent of the run read is not indexed", () => {
 		for (const p of ["big.md", "big.md:raw", "big.md:1-5000", "big.log", "ssh://box/var/log/app.log"]) {
 			expect(read(p)).toEqual({ indexed: false });
+		}
+	});
+
+	test("a wide read of a file a subagent read is classified, with no block: the old `read-large` refusal is gone", () => {
+		childRead("big.md");
+		childRead("big.ts");
+		childRead("ssh://box/var/log/app.log:1-20");
+		for (const p of ["big.md:1-401", "big.md:1-99999", "big.md:1+401:raw", "big.md:1-300,500-600", "big.ts:1-99999", "ssh://box/var/log/app.log:1-401"]) {
+			const result = read(p);
+			expect(result).toEqual({ indexed: true });
+			expect(result).not.toHaveProperty("block");
 		}
 	});
 
@@ -123,49 +128,19 @@ describe("director reads by size", () => {
 		}
 	});
 
-	test("the selector's case does not get a wide range past the limit, nor past the index", () => {
+	test("the selector's case does not hide a file from the index", () => {
 		childRead("big.md:Raw");
-		expect(code("big.md:RAW:1-5000")).toBe("read-large");
-		expect(code("big.md:Raw:1-5000")).toBe("read-large");
+		expect(read("big.md:RAW:1-5000")).toEqual({ indexed: true });
 		expect(read("big.md:RAW:1-10")).toEqual({ indexed: true });
 	});
 
-	test("a small file passes whole, raw or not; the limit is inclusive", () => {
-		childRead("small.md");
-		childRead("edge.md");
-		for (const p of ["small.md", "small.md:raw", "edge.md", "edge.md:raw"]) expect(read(p)).toEqual({ indexed: true });
-	});
-
-	test("a range passes up to the line limit and is refused past it, counting all its ranges", () => {
-		childRead("big.md");
-		expect(MAX_RANGE_LINES).toBe(400);
-		expect(code(`big.md:1-${MAX_RANGE_LINES}`)).toBeUndefined();
-		expect(code(`big.md:1-${MAX_RANGE_LINES + 1}`)).toBe("read-large");
-		expect(code("big.md:1-99999")).toBe("read-large");
-		expect(code("big.md:1+401:raw")).toBe("read-large");
-		expect(code("big.md:1-300,500-600")).toBe("read-large");
-		expect(code("big.md:1-200,500-600")).toBeUndefined();
-		expect(code("big.md:-400")).toBeUndefined();
-		// A page past explicit ranges counts with them.
-		expect(code("big.md:1-150,500-")).toBe("read-large");
-		expect(code("big.md:1-100,500-")).toBeUndefined();
-		// The file's kind does not matter: a wide range of code is as large as one of prose.
-		childRead("big.ts");
-		expect(code("big.ts:1-99999")).toBe("read-large");
-		// A small file bounds any range: nothing it returns is a lot.
-		childRead("small.md");
-		expect(code("small.md:1-99999")).toBeUndefined();
-	});
-
-	test("ssh targets have no known size: only a wide range is refused", () => {
+	test("another host's file of the same path is another file", () => {
 		childRead("ssh://box/var/log/app.log:1-20");
-		for (const selector of ["", ":raw", ":100-", ":100-200"]) expect(code(`ssh://box/var/log/app.log${selector}`)).toBeUndefined();
-		expect(code("ssh://box/var/log/app.log:1-401")).toBe("read-large");
-		// Another host's file of the same path is another file.
+		expect(read("ssh://box/var/log/app.log")).toEqual({ indexed: true });
 		expect(read("ssh://other/var/log/app.log")).toEqual({ indexed: false });
 	});
 
-	test("a file that is gone, a directory and an exempt path are never refused", () => {
+	test("a file that is gone, a directory and an exempt path are classified without a block", () => {
 		childRead("gone.md");
 		expect(read("gone.md")).toEqual({ indexed: true });
 		childRead("sub");
@@ -174,23 +149,6 @@ describe("director reads by size", () => {
 		expect(read("agent://Scout")).toBeUndefined();
 		expect(directorRead({ runId: RUN, path: 42, cwd: dir })).toBeUndefined();
 		expect(directorRead({ runId: RUN, path: undefined, cwd: dir })).toBeUndefined();
-	});
-
-	test("the reason names the readers, at most three, and the lines asked for", () => {
-		for (const id of ["A", "B", "C", "D", "E"]) childRead("big.md", id);
-		const why = read("big.md:1-1234")?.block?.reason ?? "";
-		for (const id of ["A", "B", "C"]) expect(why).toContain(`agent://${id}`);
-		expect(why).not.toContain("agent://D");
-		expect(why).toContain("1234");
-		expect(why).toContain(String(MAX_RANGE_LINES));
-	});
-
-	test("an isolated team is not sent to ask the subagent: its agents take no messages", () => {
-		childRead("big.md");
-		const why = (isolated: boolean) => directorRead({ runId: RUN, path: "big.md:1-999", cwd: dir, isolated })?.block?.reason ?? "";
-		expect(why(false)).toContain("write agent://");
-		expect(why(true)).not.toContain("write agent://");
-		expect(why(true)).toContain("agent://");
 	});
 
 	test("the index is per run and closes with it", () => {

@@ -902,7 +902,8 @@ async function main(): Promise<void> {
 			check("every card row fits 60 columns", region.length > 2 && cardRows(shown).every(row => Bun.stringWidth(row) <= columns), cardRows(shown).find(row => Bun.stringWidth(row) > columns) ?? `rows=${region.length}`);
 			check(
 				"the card distinguishes the accepted result from the unfinished run and the residual risk",
-				/수용\s*1\/1/u.test(shown) && region.some(row => row.includes("주의") && row.includes("검증되지 않은")),
+				// The header row may wrap at 60 columns (it names the spend), so the painted rows are read, not the byte stream.
+				/수용\s*1\/1/u.test(region.join(" ")) && region.some(row => row.includes("주의") && row.includes("검증되지 않은")),
 				region.join("\n"),
 			);
 			const sessionFile = sessionFileIn(resume.dir, resume.id);

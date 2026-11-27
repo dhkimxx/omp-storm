@@ -237,7 +237,7 @@ test("S3/M1: a removed lane's reviewable row asks for a same-id replan, never a 
 	await until(() => h.sent.length > 1);
 	const message = h.sent.at(-1) ?? "";
 	expect(message).toContain("submitted");
-	expect(message).toContain("replan it onto an approved lane");
+	expect(message).toContain("Replan it onto an approved lane");
 	expect(message).toContain("same id");
 	expect(message).toContain("scope change");
 	expect(message).not.toContain("judge the submitted");
@@ -276,7 +276,7 @@ test("S3/M1: the replan remedy is honored over review for a requirement without 
 			resultRemedy: "replan",
 		},
 	});
-	expect(message).toContain("replan it onto an approved lane");
+	expect(message).toContain("Replan it onto an approved lane");
 	expect(message).toContain("same id");
 	expect(message).not.toContain("judge the submitted");
 });

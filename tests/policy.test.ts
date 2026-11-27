@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { deliveredFollowUp, followUpAgent, followUpBlock, followUpProgress } from "../src/policy/followup.ts";
+import { deliveredFollowUp, followUpAgent, followUpFailureNote, followUpProgress } from "../src/policy/followup.ts";
 import {
 	activeAgents,
 	blockedSpawn,
+	APPROVAL_CHECK,
 	approvedSelectors,
+	BUDGET_CHECK,
 	decideSpawn,
 	failClosed,
 	orderByQuota,
@@ -221,13 +223,15 @@ describe("decideSpawn: trials", () => {
 });
 
 describe("decideSpawn: other agents during a run", () => {
-	test("a mapped built-in passes an approved model untouched; an unmapped native agent is refused", () => {
+	test("a mapped built-in is answered explicitly: exactly an approved entry is honoured, anything else gets the role's list; an unmapped native agent is refused", () => {
 		const scout = decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), inRun({ plan: FULL_PLAN }));
-		expect(scout.decision).toBeUndefined();
-		expect(scout.record).toMatchObject({ outcome: "allowed", role: "explorer" });
+		// The answer is never "no opinion": omp's own patterns do not run.
+		expect(models(scout.decision)).toEqual(["google/gemini-flash"]);
+		expect(scout.record).toMatchObject({ outcome: "allowed", role: "explorer", models: ["google/gemini-flash"] });
+		// An approved model with an effort the team did not approve is not the approved entry.
 		const reviewer = decideSpawn(ev("reviewer", ["anthropic/claude-x:max"], "lane"), state(), inRun({ plan: FULL_PLAN }));
-		expect(reviewer.decision).toBeUndefined();
-		expect(reviewer.record?.outcome).toBe("allowed");
+		expect(models(reviewer.decision)).toEqual(["openai/gpt-5.2:high", "anthropic/claude-x:low", "openrouter/qwen/qwen3:high"]);
+		expect(reviewer.record?.outcome).toBe("substituted");
 		// No role mapping means no lane, cap or capability decision: never an ordinary spawn during a run.
 		for (const agent of ["custom", "sonic"]) {
 			expect(code(decideSpawn(ev(agent, ["anthropic/claude-x:max"]), state(), inRun({ plan: FULL_PLAN })))).toBe("unmapped-agent");
@@ -321,11 +325,13 @@ describe("decideSpawn: other agents during a run", () => {
 		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state({ shadows: [shadow] }), inRun({ plan: FULL_PLAN })))).toBe("shadow");
 	});
 
-	test("a built-in agent mapped to a role counts against that role's cap, whatever model it asked for", () => {
+	test("a built-in agent mapped to a role takes that role's slot and meets omp's ceiling, whatever model it asked for", () => {
 		const capPlan = { ...FULL_PLAN, workers: { explorer: 1, reviewer: 2 } };
-		const full = inRun({ plan: capPlan, active: { total: 1, byRole: { explorer: 1 } } });
-		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), full))).toBe("role-cap");
-		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), full))).toBe("role-cap");
+		// The plan's one explorer is live: the plan's count no longer refuses a second, omp's ceiling does.
+		const full = inRun({ plan: capPlan, active: { total: 1, byRole: { explorer: 1 } } }, { maxConcurrency: 1 });
+		expect(code(decideSpawn(ev("scout", ["x/unknown"], "look"), state(), full))).toBe("parallelism");
+		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), full))).toBe("parallelism");
+		expect(code(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), inRun({ plan: capPlan, active: { total: 1, byRole: { explorer: 1 } } })))).toBeUndefined();
 		// With a slot free it runs, and its record names the role so it takes the slot.
 		const free = inRun({ plan: capPlan, active: { total: 0, byRole: {} } });
 		expect(decideSpawn(ev("scout", ["google/gemini-flash"], "look"), state(), free).record).toMatchObject({ outcome: "allowed", role: "explorer" });
@@ -361,7 +367,7 @@ describe("decideSpawn: role states", () => {
 		expect(borrowed.record?.trialId).toBeUndefined();
 	});
 
-	test("a stand-in spawn counts against the role it asked for", () => {
+	test("a stand-in spawn counts against the role it asked for, under omp's ceiling", () => {
 		const plan: RunPlan = {
 			...PLAN,
 			lanes: [
@@ -371,20 +377,24 @@ describe("decideSpawn: role states", () => {
 			workers: { quick: 1, implementer: 2 },
 		};
 		const busy = inRun({ plan, active: { total: 1, byRole: { quick: 1 } } });
-		expect(code(decideSpawn(ev("storm-quick", [], "quick"), withConfig(team), busy))).toBe("role-cap");
+		expect(code(decideSpawn(ev("storm-quick", [], "quick"), withConfig(team), busy))).toBeUndefined();
 		expect(code(decideSpawn(ev("storm-implementer", [], "impl"), withConfig(team), busy))).toBeUndefined();
+		const record = decideSpawn(ev("storm-quick", [], "quick"), withConfig(team), busy).record;
+		expect(record).toMatchObject({ outcome: "substituted" });
 	});
 });
 
 describe("decideSpawn: run plan and live caps", () => {
-	test("order of the run checks: budget, then plan, then role, then the native ceiling", () => {
+	test("order of the run checks: budget, then plan, then the role's lane, then the native ceiling", () => {
 		const spent = { costUsd: 9, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
 		const { plan: _plan, ...noPlan } = inRun().run as Run;
 		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: { ...noPlan, ...spent } })))).toBe("budget");
 		expect(code(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: noPlan })))).toBe("no-plan");
 		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), runtime({ run: noPlan })))).toBe("no-plan");
 		const full = { total: 2, byRole: { reviewer: 2 } };
-		expect(code(decideSpawn(ev("storm-reviewer"), state(), inRun({ active: full }, { maxConcurrency: 2 })))).toBe("role-cap");
+		// The plan's worker count for the role is no limit: two live reviewers against a plan of one never blocked by role.
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), inRun({ active: full }, { maxConcurrency: 8 })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), state(), inRun({ active: full }, { maxConcurrency: 2 })))).toBe("parallelism");
 		expect(code(decideSpawn(ev("storm-explorer"), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 })))).toBe("parallelism");
 		// An unmapped native agent is refused before the native ceiling check.
 		expect(code(decideSpawn(ev("custom", ["openai/gpt-5.2"]), state(), inRun({ plan: FULL_PLAN, active: full }, { maxConcurrency: 2 })))).toBe("unmapped-agent");
@@ -411,11 +421,24 @@ describe("decideSpawn: run plan and live caps", () => {
 		expect(code(decideSpawn(ev("storm-explorer"), state(), runtime()))).toBeUndefined();
 	});
 
-	test("the role cap is the plan's workers for the role", () => {
+	test("the plan's workers for a role are a planning figure: a live worker of the role never blocks another; omp's ceiling does", () => {
 		const plan: RunPlan = { ...PLAN, workers: { reviewer: 1, explorer: 1 } };
 		const wide = withConfig(config);
-		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { reviewer: 1 } } }, { maxConcurrency: 8 })))).toBe("role-cap");
+		const live = { total: 1, byRole: { reviewer: 1 } };
+		// One reviewer is live against a plan of one: this was `role-cap`.
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: live }, { maxConcurrency: 8 })))).toBeUndefined();
+		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: live }, { maxConcurrency: 1 })))).toBe("parallelism");
 		expect(code(decideSpawn(ev("storm-reviewer", [], "lane"), wide, inRun({ plan, active: { total: 1, byRole: { explorer: 1 } } }, { maxConcurrency: 8 })))).toBeUndefined();
+		// A mapped built-in agent takes the same rule as its role's storm-* agent.
+		expect(code(decideSpawn(ev("reviewer", ["openai/gpt-5.2"], "lane"), wide, inRun({ plan, active: live }, { maxConcurrency: 8 })))).toBeUndefined();
+	});
+
+	test("a refusal over the approval or the budget tells the director not to send the call again", () => {
+		const text = (outcome: SpawnOutcome): string => (outcome.decision !== undefined && "block" in outcome.decision ? outcome.decision.reason : "");
+		expect(text(decideSpawn(ev("storm-reviewer"), { config: { status: "missing", path: "/r/.omp/storm/config.json" }, approval: undefined, shadows: [] }, runtime()))).toContain(APPROVAL_CHECK);
+		const spent = { costUsd: 9, budget: { perRunUsd: 5, onExceed: "block-spawns" as const } };
+		const { plan: _plan, ...noPlan } = inRun().run as Run;
+		expect(text(decideSpawn(ev("storm-reviewer"), state(), runtime({ run: { ...noPlan, ...spent } })))).toContain(BUDGET_CHECK);
 	});
 });
 
@@ -558,39 +581,38 @@ describe("activeAgents", () => {
 
 describe("follow-ups", () => {
 	const write = (id: string) => ({ path: `agent://${id}`, content: "fix the findings" });
-	const blockOf = (agents: AgentEntry[], id = "Rev") => followUpBlock("write", write(id), agents)?.code;
+	// Storm no longer refuses any follow-up; after omp fails to deliver one, this is the cause it adds.
+	const noteOf = (agents: AgentEntry[], id = "Rev") => followUpFailureNote("write", write(id), agents);
 
-	test("context size never refuses a follow-up, however far past the old 200k cap", () => {
-		expect(blockOf([ledgerAgent({ contextTokens: 199_999 })])).toBeUndefined();
-		expect(blockOf([ledgerAgent({ contextTokens: 200_000 })])).toBeUndefined();
-		expect(blockOf([ledgerAgent({ contextTokens: 900_000 })])).toBeUndefined();
-		expect(blockOf([ledgerAgent({ contextTokens: 95_000, model: "mistral/small-100k" })])).toBeUndefined();
-	});
-
-	test("agents of earlier runs and agents no run started take follow-ups too", () => {
-		expect(blockOf([ledgerAgent({ runId: "run-0", contextTokens: 400_000 })])).toBeUndefined();
+	test("context size, run and state never explain a failure: only a cleanup does", () => {
+		expect(noteOf([ledgerAgent({ contextTokens: 199_999 })])).toBeUndefined();
+		expect(noteOf([ledgerAgent({ contextTokens: 900_000 })])).toBeUndefined();
+		expect(noteOf([ledgerAgent({ contextTokens: 95_000, model: "mistral/small-100k" })])).toBeUndefined();
+		expect(noteOf([ledgerAgent({ runId: "run-0", contextTokens: 400_000 })])).toBeUndefined();
 		const { runId: _runId, ...noRun } = ledgerAgent({ contextTokens: 400_000 });
-		expect(blockOf([noRun])).toBeUndefined();
+		expect(noteOf([noRun])).toBeUndefined();
 	});
 
-	test("a cleaned agent takes none, whatever its context", () => {
-		expect(blockOf([ledgerAgent({ contextTokens: 10, cleanedAt: NOW })])).toBe("followup-cleaned");
-		expect(blockOf([ledgerAgent({ contextTokens: 900_000, cleanedAt: NOW })])).toBe("followup-cleaned");
+	test("a cleaned agent's failure is explained, whatever its context or run", () => {
+		expect(noteOf([ledgerAgent({ contextTokens: 10, cleanedAt: NOW })])).toBeDefined();
+		expect(noteOf([ledgerAgent({ contextTokens: 900_000, cleanedAt: NOW })])).toBeDefined();
+		expect(noteOf([ledgerAgent({ runId: "run-0", cleanedAt: NOW })])).toBeDefined();
 	});
 
-	test("the reason names the handle a fresh agent reads", () => {
-		const block = followUpBlock("write", write("Rev"), [ledgerAgent({ cleanedAt: NOW })]);
-		expect(block?.reason).toContain("agent://Rev");
-		expect(block?.reason).toContain("storm-reviewer");
+	test("the note names the cause and the handle a fresh agent reads", () => {
+		const note = noteOf([ledgerAgent({ cleanedAt: NOW })]);
+		expect(note).toContain("agent://Rev");
+		expect(note).toContain("storm-reviewer");
+		expect(note).toContain("정리");
 	});
 
-	test("other tools, other paths and unknown agents pass; ids match as omp resolves them", () => {
+	test("other tools, other paths and unknown agents have no note; ids match as omp resolves them", () => {
 		const cleaned = [ledgerAgent({ cleanedAt: NOW })];
-		expect(followUpBlock("read", write("Rev"), cleaned)).toBeUndefined();
-		expect(followUpBlock("write", { path: "local://notes.md", content: "x" }, cleaned)).toBeUndefined();
-		expect(blockOf(cleaned, "Nobody")).toBeUndefined();
-		expect(blockOf(cleaned, "rev")).toBe("followup-cleaned");
-		expect(followUpBlock("write", { path: "agent://Rev?progress", content: "x" }, cleaned)?.code).toBe("followup-cleaned");
+		expect(followUpFailureNote("read", write("Rev"), cleaned)).toBeUndefined();
+		expect(followUpFailureNote("write", { path: "local://notes.md", content: "x" }, cleaned)).toBeUndefined();
+		expect(noteOf(cleaned, "Nobody")).toBeUndefined();
+		expect(noteOf(cleaned, "rev")).toBeDefined();
+		expect(followUpFailureNote("write", { path: "agent://Rev?progress", content: "x" }, cleaned)).toBeDefined();
 		expect(followUpAgent([ledgerAgent({ id: "rev" }), ledgerAgent({ id: "Rev" })], "Rev")?.id).toBe("Rev");
 	});
 

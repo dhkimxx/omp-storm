@@ -373,7 +373,7 @@ export interface SessionOptions {
 	live?: (ctx: ExtensionContext, run: RunRecord | undefined) => void;
 	/** Lease acquisition. Defaults to a realistic in-memory lease: tests never touch the real lock directory. */
 	lease?: (input: AcquireRunLeaseInput, deps?: LeaseDeps) => Promise<AcquireRunLeaseResult>;
-	/** What the fake main session reports as its running and recent async jobs. */
+	/** What the fake main session reports as its running and recent async jobs (default: omp's snapshot with no jobs, as on the pinned host; `null` models a host that cannot show them). */
 	asyncJobs?: () => AsyncJobSnapshot | null;
 	now?: () => number;
 }
@@ -485,7 +485,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		hasPendingMessages: () => hold.pending,
 		ui: { getEditorText: () => hold.editor },
 		getContextUsage: () => opts.usage,
-		...(!opts.asyncJobs ? {} : { getAsyncJobSnapshot: opts.asyncJobs }),
+		getAsyncJobSnapshot: opts.asyncJobs ?? (() => ({ running: [], recent: [], delivery: {} }) as unknown as AsyncJobSnapshot),
 		compact: async (instructions: string) => {
 			ui.events.push("compact");
 			await opts.compact?.(instructions);

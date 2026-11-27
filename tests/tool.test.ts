@@ -203,6 +203,34 @@ describe("read actions", () => {
 		}
 	});
 
+	test("status hands the director its own plan back, with lanes, goals, results and their states", async () => {
+		const plan: RunPlan = {
+			submittedAt: "2026-11-27T01:00:00.000Z",
+			workers: { implementer: 1, explorer: 1 },
+			lanes: [
+				{ name: "core", kind: "code", role: "implementer", goal: "make the parser total", files: ["src/a.ts"], progress: "half done", results: [{ id: "core-change", kind: "change", criterion: "src/a.ts carries the change", path: "src/a.ts", contains: "export const total" }] },
+				{ name: "scan", kind: "explore", role: "explorer", dependsOn: [{ lane: "core", need: "result" }], results: [{ id: "scan-answer", kind: "answer", criterion: "the scan reports the tree" }] },
+			],
+		};
+		const results = [{ id: "core-change", lane: "core", state: "reviewable" as const }, { id: "scan-answer", lane: "scan", state: "pending" as const, reason: "no attempt yet" }];
+		const f = fakeHost();
+		const host: StormToolHost = { ...f.host, planView: () => ({ runId: "run-1", plan, results }) };
+		const reply = await runStormTool(host, { action: "status" });
+		expect(reply.outcome).toBe("ok");
+		// The status text stands first and the plan follows it.
+		expect(reply.text.startsWith(STATUS_TEXT)).toBe(true);
+		for (const piece of ["run-1", "core", "make the parser total", "src/a.ts", "half done", "core-change", "src/a.ts carries the change", "export const total", "검토 가능", "scan-answer", "대기", "no attempt yet", "core(result)"]) {
+			expect(reply.text).toContain(piece);
+		}
+	});
+
+	test("status without a plan in force, or on a host with no plan view, is the status text alone", async () => {
+		const f = fakeHost();
+		expect(await runStormTool({ ...f.host, planView: () => undefined }, { action: "status" })).toEqual({ outcome: "ok", text: STATUS_TEXT });
+		expect(await runStormTool({ ...f.host, planView: () => ({ runId: "run-1" }) }, { action: "status" })).toEqual({ outcome: "ok", text: STATUS_TEXT });
+		expect(await runStormTool(f.host, { action: "status" })).toEqual({ outcome: "ok", text: STATUS_TEXT });
+	});
+
 	test("agents returns the subagent table and nothing else", async () => {
 		const agents = [agentEntry({ id: "Imp1" }), agentEntry({ id: "Full", contextTokens: 250_000 }), agentEntry({ id: "Gone", cleanedAt: NOW })];
 		const f = fakeHost({ agents });
@@ -815,5 +843,14 @@ describe("continue: the director continues an interrupted run", () => {
 		const tool = createStormTool(zod, () => fakeHost().host);
 		expect(tool.description).toContain("continue");
 		expect(tool.description.length).toBeLessThanOrEqual(900);
+	});
+
+	test("the description says what status returns and gives no instruction a guarantee does not need", () => {
+		const tool = createStormTool(zod, () => fakeHost().host);
+		expect(tool.description).toContain("this run's plan");
+		// These once told the model how to work; no rule behind them.
+		expect(tool.description).not.toContain("Skip trivial");
+		expect(tool.description).not.toContain("not new work");
+		expect(tool.description).not.toContain("before work");
 	});
 });

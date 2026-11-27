@@ -114,12 +114,20 @@ describe("one authoritative worker accounting", () => {
 		releaseWorkerSlot(RUN, "Scout");
 	});
 
-	test("role saturation blocks a fresh start and release lets it retry", () => {
+	test("the plan's worker count for a role is no limit: a second worker of a full role starts, omp's ceiling is the limit", () => {
 		reserveWorkerSlot({ runId: RUN, key: "Impl", role: "implementer", now: NOW });
 		const full = runtime(plan(), { run: { ...runtime(plan()).run!, active: activeAgents([], [], NOW, reservedWorkers(RUN)) } });
-		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, full))).toBe("role-cap");
+		// The plan asks for one implementer and one is live: it was a refusal (`role-cap`), it is not one now.
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, full))).toBeUndefined();
+		// omp's own ceiling still counts the same live worker.
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, { ...full, maxConcurrency: 1 }))).toBe("parallelism");
 		releaseWorkerSlot(RUN, "Impl");
-		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, runtime(plan())))).toBeUndefined();
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl2"), { config: load, approval, shadows: [] }, runtime(plan(), { maxConcurrency: 1 })))).toBeUndefined();
+	});
+
+	test("a role the plan has no lane for still cannot spawn", () => {
+		const reviewOnly = plan({ explorer: 1 });
+		expect(codeOf(decideSpawn(event("storm-implementer", "Impl"), { config: load, approval, shadows: [] }, runtime(reviewOnly)))).toBe("role-not-in-plan");
 	});
 });
 
@@ -160,26 +168,42 @@ describe("reactivations use the same slots as fresh starts", () => {
 		expect(reservedWorkers(RUN)).toHaveLength(1);
 	});
 
-	test("role saturation blocks a reactivation, while a running worker stays one slot", () => {
+	test("the plan's role count never refuses a reactivation, and a running worker stays one slot", () => {
 		const lanes = work();
-		const occupied = follow(lanes, "Impl");
-		expect(occupied.ok).toBe(true);
-		if (occupied.ok) lanes.finishFollowUp(occupied.token, true);
-		const blocked = follow(lanes, "Other", [agentEntry({ id: "Other", state: "idle" })]);
-		expect(blocked.ok).toBe(false);
-		if (!blocked.ok) {
-			expect(blocked.code).toBe("lane-capacity");
-			expect(blocked.retry).toBe(true);
-		}
-		// A note to the already running worker is not another slot and is not refused by the cap.
-		const running = [agentEntry({ id: "Impl", state: "running" })];
-		const note = follow(lanes, "Impl", running);
+		// The plan asks for one explorer, over two lanes: a second reactivation was a `lane-capacity` refusal.
+		const two: RunPlan = {
+			lanes: [{ name: "look", kind: "explore", role: "explorer" }, { name: "look2", kind: "explore", role: "explorer" }],
+			workers: { explorer: 1 },
+			submittedAt: "2026-11-23T00:00:00.000Z",
+		};
+		const wake = (id: string, lane: PlanLane, state: "idle" | "running" = "idle") =>
+			lanes.checkFollowUp({
+				runId: RUN,
+				agentId: id,
+				agent: "storm-explorer",
+				role: "explorer",
+				lane,
+				plan: two,
+				config: team,
+				isolated: false,
+				agents: [agentEntry({ id, state })],
+				now: NOW,
+			});
+		const first = wake("Scout", two.lanes[0]!);
+		expect(first.ok && first.reserved).toBe(true);
+		if (first.ok) lanes.finishFollowUp(first.token, true);
+		const second = wake("Scout2", two.lanes[1]!);
+		expect(second.ok && second.reserved).toBe(true);
+		if (second.ok) lanes.finishFollowUp(second.token, true);
+		expect(reservedWorkers(RUN)).toHaveLength(2);
+		// A note to an already running worker is not another slot.
+		const note = wake("Scout", two.lanes[0]!, "running");
 		expect(note.ok).toBe(true);
 		if (note.ok) {
 			expect(note.reserved).toBeUndefined();
 			lanes.finishFollowUp(note.token, true);
 		}
-		expect(activeAgents([], running, NOW, reservedWorkers(RUN))).toEqual({ total: 1, byRole: { implementer: 1 } });
+		expect(reservedWorkers(RUN)).toHaveLength(2);
 	});
 
 	test("total saturation blocks a reactivation too, and release lets it retry", () => {

@@ -5,8 +5,8 @@
  * inserted name; not whole sentences.
  */
 import { describe, expect, test } from "bun:test";
-import { lanePolicy, type LanePolicy, WHY_AUTO_WRITER, WHY_EXEC_WRITER } from "../src/policy/capability.ts";
-import { RunLanes } from "../src/runtime/lanes.ts";
+import { lanePolicy, type LanePolicy, shellReviewer, WHY_AUTO_WRITER, WHY_EXEC_WRITER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
+import { RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
 
@@ -62,14 +62,16 @@ function refusal(placed: ReturnType<RunLanes["place"]>) {
 }
 
 describe("a batch of writers that cannot run together", () => {
-	test("automatic delegation: the declared lane is told its files do not narrow it, and why", () => {
+	test("automatic delegation with bash-capable workers: the declared lane is told its files do not narrow it, and why (the tool)", () => {
 		const plan = directorPlan();
 		const work = new RunLanes("run-a");
 		const placed = refusal(work.assign(call(BODY, HEAD, RAM, SCOUT), plan, team, { policies: policiesOf(plan, BASH_TOOLS, true) }));
 		expect(placed.code).toBe("lane-write");
 		expect(placed.reason).toContain(`'${BODY}' 레인`);
 		expect(placed.reason).toContain(`'${HEAD}' 레인`);
-		expect(placed.reason).toContain(WHY_AUTO_WRITER);
+		// The cause is the worker's shell, not the mode: automatic delegation is no longer a reason of its own.
+		expect(placed.reason).toContain(WHY_EXEC_WRITER);
+		expect(placed.reason).not.toContain(WHY_AUTO_WRITER);
 		// The lane declared files: the old text called its scope undeclared.
 		expect(placed.reason).not.toContain("선언되지 않은");
 		expect(placed.reason).not.toContain("겹칩니다");
@@ -94,6 +96,12 @@ describe("a batch of writers that cannot run together", () => {
 		const policies = policiesOf(plan, BASH_TOOLS, true);
 		expect(new RunLanes("run-c").assign(call(BODY, SCOUT), plan, team, { policies }).ok).toBe(true);
 		expect(new RunLanes("run-d").assign(call(BODY, HEAD), plan, team, { policies }).ok).toBe(false);
+	});
+
+	test("path-only workers on separate directories start together under automatic delegation too", () => {
+		const plan = directorPlan();
+		const placed = new RunLanes("run-e-auto").assign(call(BODY, HEAD, RAM, SCOUT), plan, team, { policies: policiesOf(plan, PATH_TOOLS, true) });
+		expect(placed.ok).toBe(true);
 	});
 
 	test("path-only workers on separate directories still start together in manual direction", () => {
@@ -122,9 +130,11 @@ describe("a single writer refused beside the one already running", () => {
 		expect(placed.retry).toBe(true);
 		expect(placed.reason).toContain(`'${BODY}' 레인`);
 		expect(placed.reason).toContain(`'${HEAD}' 레인`);
-		expect(placed.reason).toContain(WHY_AUTO_WRITER);
+		expect(placed.reason).toContain(WHY_EXEC_WRITER);
 		expect(placed.reason).not.toContain("선언되지 않은");
 		expect(placed.reason).not.toContain("isolationReason");
+		// What to check before the same call goes again: that the earlier writer has finished, not the call text.
+		expect(placed.reason).toContain(WRITE_ORDER_CHECK);
 	});
 
 	test("a lane that declared nothing is still told the scope is unknown, without claiming files", () => {
@@ -173,4 +183,69 @@ describe("an isolated lane while omp isolation is off (14:22:17)", () => {
 		// The old closing advice made a file list read as the basis of sequencing.
 		expect(placed.reason).not.toContain("파일 범위를 나눈");
 	});
+});
+
+describe("a reviewer that may run commands is ordered like a writer", () => {
+	const REVIEW = "FinalReview";
+	const reviewPlan = (): RunPlan => ({
+		lanes: [
+			implementer(BODY, [DIR("gemma4-body-qat")]),
+			implementer(HEAD, [DIR("gemma4-head-qat")]),
+			{ name: SCOUT, kind: "explore", role: "explorer", goal: "trace the producer" },
+			{ name: REVIEW, kind: "review", role: "reviewer", goal: "review the integrated change" },
+		],
+		workers: { implementer: 2, explorer: 1, reviewer: 1 },
+		submittedAt: "2026-01-01T00:00:00Z",
+	});
+	const reviewTeam = teamOf({ implementer: "fake/dev", explorer: "fake/look", reviewer: "fake/rev" });
+	const policies = (plan: RunPlan, reviewerTools: readonly string[], auto: boolean): Map<string, LanePolicy> =>
+		new Map(
+			plan.lanes.map(lane => [
+				lane.name,
+				lanePolicy({
+					lane,
+					tools: lane.role === "explorer" ? READ_TOOLS : lane.role === "reviewer" ? reviewerTools : PATH_TOOLS,
+					isolated: false,
+					auto,
+				}),
+			]),
+		);
+	const review = () => ({ tasks: [{ agent: "storm-reviewer", name: REVIEW, task: "review" }] });
+
+	for (const auto of [false, true]) {
+		const place = (work: RunLanes, input: unknown, plan: RunPlan, map: Map<string, LanePolicy>) =>
+			auto ? work.assign(input, plan, reviewTeam, { policies: map }) : work.place(input, plan, reviewTeam, { policies: map });
+
+		test(`${auto ? "automatic" : "manual"}: a live shell reviewer holds back a writer, and a live writer holds back the reviewer`, () => {
+			const plan = reviewPlan();
+			const map = policies(plan, ["read", "grep", "bash"], auto);
+			expect(shellReviewer(map.get(REVIEW))).toBe(true);
+			// A writer starts beside nothing; the reviewer is refused while it runs, and says why.
+			const writer = new RunLanes(`run-rw-${auto}`);
+			expect(place(writer, call(BODY), plan, map).ok).toBe(true);
+			const refused = refusal(place(writer, review(), plan, map) as ReturnType<RunLanes["place"]>);
+			expect(refused.code).toBe("lane-write");
+			expect(refused.reason).toContain(WHY_SHELL_REVIEWER);
+			expect(refused.reason).toContain(`'${BODY}' 레인`);
+			expect(refused.reason).toContain(WRITE_ORDER_CHECK);
+			// The other way round: a live reviewer holds back even a path-only writer on files it never names.
+			const reviewer = new RunLanes(`run-wr-${auto}`);
+			expect(place(reviewer, review(), plan, map).ok).toBe(true);
+			const held = refusal(place(reviewer, call(HEAD), plan, map) as ReturnType<RunLanes["place"]>);
+			expect(held.code).toBe("lane-write");
+			expect(held.reason).toContain(`'${REVIEW}' 레인`);
+			expect(held.retry).toBe(true);
+			// An explorer has no shell: it runs beside the reviewer.
+			expect(place(reviewer, call(SCOUT), plan, map).ok).toBe(true);
+		});
+
+		test(`${auto ? "automatic" : "manual"}: a reviewer without a shell reserves nothing and starts beside a writer`, () => {
+			const plan = reviewPlan();
+			const map = policies(plan, ["read", "grep"], auto);
+			expect(shellReviewer(map.get(REVIEW))).toBe(false);
+			const work = new RunLanes(`run-plain-${auto}`);
+			expect(place(work, call(BODY), plan, map).ok).toBe(true);
+			expect(place(work, review(), plan, map).ok).toBe(true);
+		});
+	}
 });

@@ -34,6 +34,11 @@ export interface WorkerAdmissionPolicy {
 	/** Canonical workspace-relative scopes for `paths`; empty for every other kind. */
 	paths: readonly string[];
 	reason: string;
+	/**
+	 * A review lane approved to run commands (`bash`) as well as read. Absent in every record written before it existed,
+	 * which then reads as a plain reader: the shell is refused, never granted by a missing field.
+	 */
+	shell?: true;
 }
 
 /** The exact authority one admitted worker may exercise on the target. */
@@ -102,6 +107,7 @@ function isPolicy(value: unknown): value is WorkerAdmissionPolicy {
 	if (!["read", "private", "paths", "unknown", "blocked"].includes(String(value.kind))) return false;
 	if (typeof value.reason !== "string" || value.reason.length > 2_000) return false;
 	if (!Array.isArray(value.paths) || value.paths.length > MAX_PATHS) return false;
+	if (value.shell !== undefined && value.shell !== true) return false;
 	return value.paths.every(item => typeof item === "string" && item.length <= MAX_PATH && normalizeScopePath(item) === item);
 }
 
@@ -201,7 +207,7 @@ function policyOf(policy: LanePolicy): WorkerAdmissionPolicy {
 			: [];
 	if (policy.kind === "paths" && paths.length === 0) throw new Error("경로 레인의 쓰기 범위가 비어 있습니다");
 	if (paths.length > MAX_PATHS || paths.some(item => item.length > MAX_PATH)) throw new Error("쓰기 범위가 너무 큽니다");
-	return { kind: policy.kind, paths, reason: policy.reason.slice(0, 2_000) };
+	return { kind: policy.kind, paths, reason: policy.reason.slice(0, 2_000), ...(policy.kind === "read" && policy.shell === true ? { shell: true as const } : {}) };
 }
 
 async function readRecordFile(file: string): Promise<{ kind: "missing" } | { kind: "invalid"; reason: string } | { kind: "value"; value: unknown }> {
@@ -585,7 +591,19 @@ async function rewriteRecord(file: string, change: (record: WorkerAdmissionRecor
 /** Parent-side revocation for one run, one session, or one exact attempt. Closed records remain as tombstones. */
 export async function revokeWorkerAdmissions(
 	agentDir: string,
-	match: { runId?: string; sessionId?: string; key?: string; attempt?: string },
+	match: {
+		runId?: string;
+		sessionId?: string;
+		key?: string;
+		attempt?: string;
+		/** One child of the run: what the end of that worker's write reservation revokes. The run marker stays. */
+		childId?: string;
+		/**
+		 * Only a record written before this moment. The end of a reservation is observed after the fact, so a follow-up
+		 * that already reopened the same child with a newer attempt must not be closed by the older worker's end.
+		 */
+		createdBefore?: number;
+	},
 	now = Date.now(),
 ): Promise<number> {
 	const dir = admissionsDir(agentDir);
@@ -606,14 +624,17 @@ export async function revokeWorkerAdmissions(
 		if (match.sessionId !== undefined && record.sessionId !== match.sessionId) continue;
 		if (match.key !== undefined && record.key !== match.key) continue;
 		if (match.attempt !== undefined && record.attempt !== match.attempt) continue;
+		if (match.childId !== undefined && record.childId !== match.childId) continue;
+		if (match.createdBefore !== undefined && record.createdAt >= match.createdBefore) continue;
 		if (record.revokedAt !== undefined) continue;
 		if (await rewriteRecord(file, value => ({ ...value, revokedAt: now }))) count++;
 	}
 	// A run marker must close too: otherwise a child that never received a record in this run would still look
 	// managed while a finished run blocks it forever, or an unrecorded child would lose the managed marker. An exact
-	// key/attempt revocation is for one child, not the run marker.
+	// key/attempt/child revocation is for one child, not the run marker.
 	const root = runsDir(dir);
-	const markers = match.key === undefined && match.attempt === undefined ? await readdir(root).catch(() => [] as string[]) : [];
+	const forOneChild = match.key !== undefined || match.attempt !== undefined || match.childId !== undefined || match.createdBefore !== undefined;
+	const markers = forOneChild ? [] : await readdir(root).catch(() => [] as string[]);
 	for (const name of markers) {
 		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
 		const file = path.join(root, name);
@@ -653,7 +674,8 @@ export async function endWorkerAdmission(
 		if (!claim.isFile()) return false;
 		try {
 			const value: unknown = JSON.parse(await readFile(claimPath, "utf8"));
-			if (!isRecord(value) || value.schema !== "storm.worker-claim/v1" || value.session !== sha256Hex(`claim\u0000${session}`)) return false;
+			// The same digest `claimWorkerAdmission` wrote: a different one here never matched, so a claimed attempt was never closed.
+			if (!isRecord(value) || value.schema !== "storm.worker-claim/v1" || value.session !== sha256Hex(session)) return false;
 		} catch {
 			return false;
 		}

@@ -1,8 +1,9 @@
 import { unapprovedShadows } from "../approval/shadow.ts";
 import { shortHash } from "../config/canonical.ts";
-import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES, roleTitle, workerRange } from "../roles.ts";
+import { BUILTIN_AGENT_ROLES, ROLE_AGENT_PREFIX, ROLE_STAND_INS, ROLES, roleTitle } from "../roles.ts";
 import { activeTrialFor, shouldRouteToTrial } from "../runtime/trials.ts";
 import { formatModelEntry, parseModelEntry } from "../selector.ts";
+import { type ApprovedEntry, entryPattern, exactEntries, hasCredentials, roleEntries } from "./model-check.ts";
 import type {
 	AgentEntry,
 	ApprovalRecord,
@@ -37,9 +38,14 @@ export function stripEffort(pattern: string): string {
 	return parseModelEntry(pattern).selector;
 }
 
-/** omp model patterns take thinking effort as a ":<level>" suffix on the id part; any existing suffix wins. */
+/**
+ * omp model patterns take thinking effort as a ":<level>" suffix on the id part. An id that itself contains a colon
+ * (`x:thinking`) takes it too: omp tries the whole pattern as a literal id first and only then splits the last known level
+ * off, so `x:thinking:low` is the model `x:thinking` at `low`. The answer therefore always carries the approved effort.
+ */
 export function withEffort(selector: string, effort: Effort | undefined): string {
-	if (!effort || selector.slice(selector.lastIndexOf("/") + 1).includes(":")) return selector;
+	// An entry that carries its own effort keeps it (it wins over the role's).
+	if (!effort || parseModelEntry(selector).effort !== undefined) return selector;
 	return formatModelEntry({ selector, effort });
 }
 
@@ -65,6 +71,10 @@ export function orderByQuota(models: readonly string[], marks: readonly QuotaMar
 	return [...fresh, ...models.filter(m => marked.has(providerKey(m)))];
 }
 
+/** What a refusal over the team's approval or the run budget tells the director before it sends the same call again. */
+export const APPROVAL_CHECK = "설정과 승인은 사용자만 바꿀 수 있어 그 전에는 같은 호출을 다시 보내도 막히니, 다시 보내지 말고 사용자에게 알리세요.";
+export const BUDGET_CHECK = "예산은 사용자가 정하므로 늘어나기 전에는 같은 스폰을 다시 보내도 막힙니다.";
+
 export type TeamGate =
 	| { ok: false; block: SpawnBlock }
 	| { ok: true; config: StormConfig; hash: string; approval: ApprovalRecord };
@@ -73,17 +83,17 @@ export type TeamGate =
 export function teamGate(state: Pick<SpawnState, "config" | "approval">): TeamGate {
 	const load = state.config;
 	if (load.status === "missing") {
-		return { ok: false, block: { code: "no-config", reason: "팀 설정이 없습니다. /storm 으로 팀을 설정하세요." } };
+		return { ok: false, block: { code: "no-config", reason: `팀 설정이 없습니다. /storm 으로 팀을 설정하세요. ${APPROVAL_CHECK}` } };
 	}
 	if (load.status === "invalid") {
-		return { ok: false, block: { code: "no-config", reason: `팀 설정 오류: ${load.errors[0] ?? "알 수 없는 오류"}. /storm 으로 확인하세요.` } };
+		return { ok: false, block: { code: "no-config", reason: `팀 설정 오류: ${load.errors[0] ?? "알 수 없는 오류"}. /storm 으로 확인하세요. ${APPROVAL_CHECK}` } };
 	}
 	const approval = state.approval;
 	// An approval for another hash must never authorize the current file.
 	if (!approval || approval.configHash !== load.hash) {
 		return {
 			ok: false,
-			block: { code: "unapproved", reason: `승인되지 않은 팀 설정입니다(${shortHash(load.hash)}). /storm 으로 승인하세요.` },
+			block: { code: "unapproved", reason: `승인되지 않은 팀 설정입니다(${shortHash(load.hash)}). /storm 으로 승인하세요. ${APPROVAL_CHECK}` },
 		};
 	}
 	return { ok: true, config: load.config, hash: load.hash, approval };
@@ -92,7 +102,7 @@ export function teamGate(state: Pick<SpawnState, "config" | "approval">): TeamGa
 /** A shadowing role definition the approval does not cover; `agent` narrows the check to that agent's definition. */
 export function shadowBlock(state: Pick<SpawnState, "approval" | "shadows">, agent?: string): SpawnBlock | undefined {
 	const shadow = unapprovedShadows(state.approval, state.shadows).find(s => agent === undefined || s.agent === agent);
-	return shadow && { code: "shadow", reason: `승인되지 않은 역할 정의가 있습니다: ${shadow.path}. /storm 으로 확인하세요.` };
+	return shadow && { code: "shadow", reason: `승인되지 않은 역할 정의가 있습니다: ${shadow.path}. /storm 으로 확인하세요. ${APPROVAL_CHECK}` };
 }
 
 function budgetBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
@@ -100,7 +110,21 @@ function budgetBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 	if (!run?.budget || run.costUsd < run.budget.perRunUsd) return undefined;
 	return {
 		code: "budget",
-		reason: `실행 예산(${formatUsd(run.budget.perRunUsd)})을 넘어(누계 ${formatUsd(run.costUsd)}) 새 스폰을 막았습니다. 이미 도는 서브에이전트의 결과로 마무리하세요.`,
+		reason: `실행 예산(${formatUsd(run.budget.perRunUsd)})을 넘어(누계 ${formatUsd(run.costUsd)}) 새 스폰을 막았습니다. 이미 도는 서브에이전트의 결과로 마무리하세요. ${BUDGET_CHECK}`,
+	};
+}
+
+/**
+ * The refusal of a message that carries work to a worker the director would put back to work once the run's observed spend
+ * reached its budget (`onExceed: block-spawns`): that is new spending as much as a new spawn is. A quiet `?progress` note starts
+ * no work the director asked for and is not held here, and a worker already running is left to finish. Undefined while under
+ * the limit or with no budget.
+ */
+export function followUpBudgetBlock(run: { budget?: { perRunUsd: number } | undefined; costUsd: number } | undefined): SpawnBlock | undefined {
+	if (!run?.budget || run.costUsd < run.budget.perRunUsd) return undefined;
+	return {
+		code: "budget",
+		reason: `실행 예산(${formatUsd(run.budget.perRunUsd)})을 넘어(누계 ${formatUsd(run.costUsd)}) 쉬고 있는 워커에게 일이 담긴 메시지를 보내지 않았습니다. 새 스폰도 막혀 있습니다. 이미 도는 워커의 결과로 마무리하세요. 진행 메모(?progress)는 보낼 수 있습니다. ${BUDGET_CHECK}`,
 	};
 }
 
@@ -266,24 +290,17 @@ function totalBlock(runtime: SpawnRuntime): SpawnBlock | undefined {
 	};
 }
 
-/** Live agents of one role against the run plan's workers for it. */
-function roleCapBlock(config: StormConfig, runtime: SpawnRuntime, roleId: string, agent: string): SpawnBlock | undefined {
-	const run = runtime.run;
-	const plan = run?.plan;
-	if (!run || !plan) return undefined;
-	const cap = plan.workers[roleId] ?? 0;
-	if (cap <= 0) {
-		return {
-			code: "role-not-in-plan",
-			reason: `실행 계획에 ${roleTitle(roleId)} 역할 레인이 없어 ${agent} 스폰을 막았습니다. 이 역할이 필요하면 plan 동작으로 그 레인을 넣어 계획을 다시 내세요.`,
-		};
-	}
-	const running = run.active?.byRole[roleId] ?? 0;
-	if (running < cap) return undefined;
-	const max = workerRange(roleId, config.roles[roleId]).max;
+/**
+ * A role the run plan has no lane for cannot spawn. The plan's worker count for a role is a planning figure, not a
+ * limit: how many workers run at once is omp's own `task.maxConcurrency` (`totalBlock`), the user's setting.
+ */
+function roleInPlanBlock(runtime: SpawnRuntime, roleId: string, agent: string): SpawnBlock | undefined {
+	const plan = runtime.run?.plan;
+	if (!runtime.run || !plan) return undefined;
+	if ((plan.workers[roleId] ?? 0) > 0) return undefined;
 	return {
-		code: "role-cap",
-		reason: `${roleTitle(roleId)} 역할 서브에이전트 ${running}개가 실행 중이라 계획의 워커 ${cap}개에 닿아 ${agent} 스폰을 막았습니다. 사용자에게 묻지 말고 native wait나 완료 알림으로 하나가 끝난 뒤 다시 스폰하거나, plan 동작으로 워커를 늘려 계획을 다시 내세요(이 역할 최대 ${max}개).`,
+		code: "role-not-in-plan",
+		reason: `실행 계획에 ${roleTitle(roleId)} 역할 레인이 없어 ${agent} 스폰을 막았습니다. 이 역할이 필요하면 plan 동작으로 그 레인을 넣어 계획을 다시 내세요.`,
 	};
 }
 
@@ -326,8 +343,43 @@ export function blockedSpawn(event: SpawnEvent, refusal: SpawnBlock, now: number
 	};
 }
 
+/** What the extension learned before it asked for a decision. */
+export interface SpawnFacts {
+	/**
+	 * The team selectors (lowercased, `probeCredentials`) whose credential resolved just now. When given, an answer holds
+	 * only models in it, because omp answers a role whose models cannot authenticate with the parent session's model:
+	 * a spawn none of them can serve is refused. Absent means the credentials were not looked at (callers that predate
+	 * this input); the extension always passes it.
+	 */
+	authenticated?: ReadonlySet<string>;
+	/** The team selectors (lowercased) whose credential lookup did not answer in time: a refusal then says the check was late. */
+	slow?: ReadonlySet<string>;
+}
+
+/**
+ * The refusal when no approved model of a role can authenticate: only the user can restore a login or a key. When every one of
+ * them is only a lookup that did not answer in time, it says so instead: that is a late answer, not a lost login, and the same
+ * spawn may be sent again in a moment.
+ */
+export function noCredentialsBlock(agent: string, roleId: string, selectors: readonly string[], slow?: ReadonlySet<string>): SpawnBlock {
+	const late = slow !== undefined && selectors.length > 0 && selectors.every(selector => slow.has(selector.toLowerCase()));
+	if (late) {
+		return {
+			code: "unapproved",
+			reason: `${roleTitle(roleId)} 역할의 승인된 모델(${selectors.join(", ")})의 로그인 확인이 늦어 ${agent} 스폰을 막았습니다. 로그인이 끊긴 것은 아닐 수 있습니다. 잠시 뒤 같은 스폰을 다시 보내고, 계속 막히면 사용자에게 알리세요. 호스트는 인증 없는 모델 대신 상위 세션의 모델을 써서 승인 밖 모델이 돌 수 있어 확인 없이 보내지 않습니다.`,
+		};
+	}
+	return {
+		code: "unapproved",
+		reason: `${roleTitle(roleId)} 역할의 승인된 모델(${selectors.join(", ")})이 모두 인증되지 않아 ${agent} 스폰을 막았습니다. 호스트는 인증 없는 모델 대신 상위 세션의 모델을 써서 승인 밖 모델이 돌 수 있습니다. ${APPROVAL_CHECK}`,
+	};
+}
+
+/** Marker of a record whose answer dropped models without credentials; the dropped entries follow it. */
+export const CREDENTIAL_DROP_NOTE = "인증 없는 모델 제외";
+
 /** Decides how a spawn runs: `storm-*` agents always, other agents only while a Storm run is active. */
-export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: SpawnRuntime): SpawnOutcome {
+export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: SpawnRuntime, facts: SpawnFacts = {}): SpawnOutcome {
 	const base: SpawnRecord = {
 		ts: new Date(runtime.now).toISOString(),
 		agent: event.agent,
@@ -366,40 +418,50 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 						reason: `실행 중에는 계획 레인에 매핑된 에이전트만 스폰할 수 있습니다. ${event.agent} 에이전트는 팀 역할에 매핑되지 않아 쓰기 권한과 결과 소유자를 정할 수 없습니다. 팀의 storm-* 에이전트를 쓰거나 plan으로 역할이 있는 레인을 지정하세요.`,
 					}
 				: undefined;
+		// The ceiling counts every agent of a run, with a role or without one: an agent that fills no bundled role is
+		// still a live worker, so it never skips `parallelism`.
 		const runBlock =
 			planBlock(runtime) ??
 			unmapped ??
-			(counted.role === undefined
-				? undefined
-				: (roleCapBlock(checked.config, runtime, counted.role, event.agent) ??
-					totalBlock(runtime) ??
-					laneBindingBlock(runtime, counted.role, event.agent, event.spawnKey)));
+			(counted.role === undefined ? undefined : roleInPlanBlock(runtime, counted.role, event.agent)) ??
+			totalBlock(runtime) ??
+			(counted.role === undefined ? undefined : laneBindingBlock(runtime, counted.role, event.agent, event.spawnKey));
 		if (runBlock) return block(runBlock, counted);
 		const requested = stripEffort(event.patterns[0] ?? "");
-		if (approvedSelectors(checked.config).has(requested)) {
-			return { decision: undefined, record: { ...base, ...counted, outcome: "allowed" } };
-		}
-		if (builtinKey !== undefined && builtin) {
-			const models = orderByQuota(builtin.models, runtime.quotaMarks).map(m => withEffort(m, builtin.effort));
-			return route(models, {
-				outcome: "substituted",
-				role: builtinKey,
-				reason: `승인 밖 모델 ${requested || "없음"} → ${roleTitle(builtinKey)} 역할 모델`,
-			});
-		}
+		// The role whose approved models this agent may run on: its bundled role, else the team's fallback role.
 		const fallbackKey = checked.config.fallbackRole;
-		const fallback = fallbackKey === undefined ? undefined : checked.config.roles[fallbackKey];
-		if (fallbackKey !== undefined && fallback && fallback.models.length > 0) {
-			const models = orderByQuota(fallback.models, runtime.quotaMarks).map(m => withEffort(m, fallback.effort));
-			return route(models, {
-				outcome: "substituted",
-				role: fallbackKey,
-				reason: `승인 밖 모델 ${requested || "없음"} → ${roleTitle(fallbackKey)} 역할 모델`,
+		const target =
+			builtin !== undefined && builtinKey !== undefined
+				? builtinKey
+				: fallbackKey !== undefined && usableRole(checked.config, fallbackKey)
+					? fallbackKey
+					: undefined;
+		if (target === undefined) {
+			return block({
+				code: "unapproved",
+				reason: `실행 중에는 승인된 모델만 쓸 수 있어 ${event.agent} 스폰을 막았습니다(요청: ${requested || "없음"}). 팀의 storm-* 에이전트를 쓰세요.`,
 			});
 		}
-		return block({
-			code: "unapproved",
-			reason: `실행 중에는 승인된 모델만 쓸 수 있어 ${event.agent} 스폰을 막았습니다(요청: ${requested || "없음"}). 팀의 storm-* 에이전트를 쓰세요.`,
+		// The answer is always explicit. omp's own patterns never run: a request is honoured only when every pattern is
+		// exactly an approved entry of this role (model and effort), otherwise the role's approved list is given. Either
+		// way only entries that can authenticate are given, and none left is a refusal.
+		const approved = roleEntries(checked.config, target);
+		const authenticated = facts.authenticated;
+		const live =(entries: readonly ApprovedEntry[]): ApprovedEntry[] =>
+			authenticated === undefined ? [...entries] : entries.filter(entry => hasCredentials(authenticated, entry.selector));
+		const exact = exactEntries(event.patterns, approved);
+		const honoured = exact === undefined ? [] : live(exact);
+		if (honoured.length > 0) return route(honoured.map(entryPattern), { outcome: "allowed", ...counted });
+		const ordered = orderByQuota(approved.map(entryPattern), runtime.quotaMarks);
+		const given = live(approved);
+		const givenPatterns = ordered.filter(pattern => given.some(entry => entryPattern(entry) === pattern));
+		if (givenPatterns.length === 0) return block(noCredentialsBlock(event.agent, target, approved.map(entry => entry.selector), facts.slow), counted);
+		const dropped = approved.length - given.length;
+		const why = exact === undefined ? `승인 밖 모델 ${requested || "없음"}` : "요청한 모델에 인증이 없음";
+		return route(givenPatterns, {
+			outcome: "substituted",
+			role: target,
+			reason: `${why} → ${roleTitle(target)} 역할 모델${dropped > 0 ? ` (${CREDENTIAL_DROP_NOTE} ${dropped}개)` : ""}`,
 		});
 	}
 
@@ -444,22 +506,30 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	if (overBudget) return block(overBudget, { role: roleKey });
 	const runBlock =
 		planBlock(runtime) ??
-		roleCapBlock(config, runtime, requestedRole, event.agent) ??
+		roleInPlanBlock(runtime, requestedRole, event.agent) ??
 		totalBlock(runtime) ??
 		laneBindingBlock(runtime, requestedRole, event.agent, event.spawnKey);
 	if (runBlock) return block(runBlock, { role: roleKey });
 
-	const ordered = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));
+	// Only models that can authenticate are answered: omp answers a role whose models all fail with the parent's model.
+	const authenticated = facts.authenticated;
+	const keep = (models: readonly string[]): string[] =>
+		authenticated === undefined ? [...models] : models.filter(m => hasCredentials(authenticated, stripEffort(m)));
+	const all = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));
+	const ordered = keep(all);
+	if (ordered.length === 0) return block(noCredentialsBlock(event.agent, roleKey, role.models.map(stripEffort), facts.slow), { role: roleKey });
+	const droppedNote = ordered.length < all.length ? ` (${CREDENTIAL_DROP_NOTE} ${all.length - ordered.length}개)` : "";
 	if (standIn) {
-		return route(ordered, { outcome: "substituted", role: roleKey, reason: `설정에 없는 역할 → ${roleTitle(roleKey)} 역할 모델` });
+		return route(ordered, { outcome: "substituted", role: roleKey, reason: `설정에 없는 역할 → ${roleTitle(roleKey)} 역할 모델${droppedNote}` });
 	}
 	const trial = activeTrialFor(config, roleKey, runtime.trials, runtime.now);
 	const trialTag: Partial<SpawnRecord> = trial ? { trialId: trial.id } : {};
-	if (trial && shouldRouteToTrial(trial, runtime.trials[trial.id])) {
-		const models = dedupeBySelector([withEffort(trial.model, trial.effort ?? role.effort), ...ordered]);
+	const candidate = trial === undefined ? [] : keep([withEffort(trial.model, trial.effort ?? role.effort)]);
+	if (trial && candidate.length > 0 && shouldRouteToTrial(trial, runtime.trials[trial.id])) {
+		const models = dedupeBySelector([...candidate, ...ordered]);
 		return route(models, { outcome: "trial", role: roleKey, ...trialTag });
 	}
-	return route(ordered, { outcome: "routed", role: roleKey, ...trialTag });
+	return route(ordered, { outcome: "routed", role: roleKey, ...trialTag, ...(droppedNote === "" ? {} : { reason: `${CREDENTIAL_DROP_NOTE} ${all.length - ordered.length}개` }) });
 }
 
 /** How long a spawn decision may take: under omp's 30 s handler budget, past which omp runs the spawn unseen. */

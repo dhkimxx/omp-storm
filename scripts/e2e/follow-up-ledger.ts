@@ -6,11 +6,11 @@
  * omp registers the turn of a woken worker as a job under the agent id, and hands that id out again once the earlier
  * job's row has been evicted (30 s after its result was consumed). Storm used to build the attempt id from the job id,
  * so a follow-up sent after the eviction looked like a replay of the first answer and was dropped: the row kept its
- * first judgment, the lane read as running for the rest of the run, the lane that depended on it was refused, and the
+ * first judgment, the lane read as running for the rest of the run, the lane that depended on it never read as ready, and the
  * end of the run rewrote the delivered row. The scripted director therefore:
  *
  *   1. plans a prerequisite lane (a typed answer) and a lane that needs it,
- *   2. runs the prerequisite; its first answer cites nothing, so the row is `unmet` and the dependant is refused,
+ *   2. runs the prerequisite; its first answer cites nothing, so the row is `unmet` (the dependant is not called yet),
  *   3. waits out omp's eviction (the fake model sleeps before the follow-up's call), then writes a follow-up to the
  *      idle worker asking for the cited answer,
  *   4. receives the follow-up's result (by `wait` in one case, as a pushed `async-result` in the other),
@@ -68,7 +68,6 @@ const NAMES: Record<"wait" | "pushed", Names> = {
 /** More than omp's 30 s eviction of a consumed job row; the fake model sleeps this long before the follow-up's call. */
 const EVICTION_WAIT_MS = 34_000;
 const UNCITED = "E2E-CHILD-CLAIM I looked at the head control but found nothing I can cite";
-const REFUSAL = "[storm:lane-dependency]";
 
 const env = prepare("storm-e2e-follow-up", 18797);
 seedFact(env.project);
@@ -141,8 +140,9 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		const steps: Step[] = [
 			planStep(names),
 			task(PIN, UNCITED),
-			// The first answer is delivered as a pushed async-result; the dependant is refused on the unmet row.
-			{ ...task(DEP, cited), afterResult: PIN },
+			// The first answer is delivered as a pushed async-result and is not accepted (uncited). The dependant is not called yet:
+			// a lane may start before its prerequisite is accepted, but then its own result is never accepted (see early-start.ts),
+			// and this scenario is about the follow-up's answer becoming the row that lets the dependant be accepted.
 			// The fake model sleeps past omp's eviction of the consumed job row, then wakes the idle worker.
 			{ followUp: `agent://${PIN}`, content: `Cite the source this time. ${cited}`, pauseMs: EVICTION_WAIT_MS },
 			// The cited answer arrives by a wait, or as a pushed message that only the follow-up's answer can carry.
@@ -158,7 +158,6 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		const jobIds = mine.map(delivery => delivery.jobId);
 		const pin = row(run, "pin-answer");
 		const dep = row(run, "dep-answer");
-		const refusals = llm.of("main").filter(entry => entry.lastTool.includes(REFUSAL));
 		const spawns = (run.spawns ?? []).filter(spawn => spawn.lane === DEP && spawn.outcome !== "blocked");
 
 		// The precondition: the host really reused the agent id for the follow-up's job.
@@ -166,11 +165,6 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 			`${label}: omp delivered the first answer and the follow-up under the same job id (the agent id)`,
 			mine.length === 2 && jobIds.every(id => id === PIN) && mine[0]?.channel === "async" && mine[1]?.channel === (how === "wait" ? "wait" : "async"),
 			JSON.stringify(mine),
-		);
-		check(
-			`${label}: the dependant lane was refused while the prerequisite was unmet`,
-			refusals.length >= 1,
-			JSON.stringify(llm.of("main").map(entry => entry.lastTool.slice(0, 140)).slice(-6)),
 		);
 		// What the director read about the ledger, in its own requests: a developer message after the delivery.
 		// The session is resumed between cases, so an earlier case's notices stay in its history: only this case's lanes count.

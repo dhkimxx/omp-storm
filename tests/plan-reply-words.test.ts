@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WHY_AUTO_WRITER, WHY_EXEC_WRITER } from "../src/policy/capability.ts";
+import { WHY_AUTO_WRITER, WHY_EXEC_WRITER, WHY_UNDECLARED_WRITER } from "../src/policy/capability.ts";
 import type { StormToolHost } from "../src/tool/host.ts";
 import { runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
 import type { ShadowInfo } from "../src/types.ts";
@@ -67,14 +67,16 @@ async function reply(plan: PlanInput, options: Options = {}): Promise<string> {
 const line = (text: string, prefix: string) => text.split("\n").find(l => l.startsWith(prefix));
 
 describe("writers that will start one at a time", () => {
-	test("14:16:51 and 14:18:50 under automatic delegation: the three lanes and the cause are named, files or not", async () => {
+	test("14:16:51 and 14:18:50 under automatic delegation: the three lanes and the cause (the tool, not the mode) are named, files or not", async () => {
 		for (const plan of [plan1, plan2]) {
 			const text = await reply(plan, { auto: true });
 			const order = line(text, "- 쓰기 순서");
 			expect(order).toBeDefined();
 			for (const name of [BODY, HEAD, RAM]) expect(order).toContain(name);
 			expect(order).not.toContain(SCOUT);
-			expect(order).toContain(WHY_AUTO_WRITER);
+			// The bundled implementer has bash and eval: that is why it is unbounded, and the mode is no part of it.
+			expect(order).toContain(WHY_EXEC_WRITER);
+			expect(order).not.toContain(WHY_AUTO_WRITER);
 			// The files the director split are said to change nothing, and a reader may share the call.
 			expect(order).toContain("파일 목록과 무관");
 			expect(order).toContain("읽기 전용");
@@ -140,10 +142,18 @@ describe("writers that will start one at a time", () => {
 			expect(line(await reply(plan2, { shadows: shadow() }), "- 쓰기 순서")).toBeUndefined();
 		});
 
-		test("the same worker under automatic delegation does", async () => {
-			const order = line(await reply(plan2, { auto: true, shadows: shadow() }), "- 쓰기 순서");
-			expect(order).toBeDefined();
-			expect(order).toContain(WHY_AUTO_WRITER);
+		test("the same worker under automatic delegation gets none either: the mode no longer makes a writer unbounded", async () => {
+			expect(line(await reply(plan2, { auto: true, shadows: shadow() }), "- 쓰기 순서")).toBeUndefined();
+		});
+
+		test("without declared files it is unbounded in either mode, and the line names that", async () => {
+			for (const auto of [false, true]) {
+				const order = line(await reply(plan1, { auto, shadows: shadow() }), "- 쓰기 순서");
+				expect(order, `auto=${auto}`).toBeDefined();
+				for (const name of [BODY, HEAD, RAM]) expect(order).toContain(name);
+				expect(order).toContain(WHY_UNDECLARED_WRITER);
+				expect(order).not.toContain(WHY_AUTO_WRITER);
+			}
 		});
 	});
 

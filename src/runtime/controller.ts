@@ -23,7 +23,9 @@ import type { RunRequestResult } from "../tool/host.ts";
 import type {
 	AgentEntry,
 	CloseoutFacts,
+	PlanLane,
 	PlanLaneResult,
+	RanModel,
 	ResultInputVersion,
 	RunCheckpoint,
 	RunCheckEvidence,
@@ -37,6 +39,7 @@ import type {
 	SpawnBlockCode,
 	SpawnRecord,
 	StormConfig,
+	UnplannedDelivery,
 	UiPort,
 } from "../types.ts";
 import { ATTEMPT_REF, attemptUsable, type AttemptReport } from "./attempt-report.ts";
@@ -58,7 +61,7 @@ import {
 import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, AttemptSettlement } from "./attempt-bridge.ts";
 import { markAgentsCleaned } from "./agents.ts";
 import { bytesText, processKey, recordTrustedRun, runJanitor } from "./janitor.ts";
-import { runRequiredChecks, type CheckReport, type RequiredChecksResult } from "./checks.ts";
+import { runRequiredChecks, trackUnprovenCheck, uncertainCheckBlock, type CheckReport, type RequiredChecksResult } from "./checks.ts";
 import { runConfiguredJob, targetJobBlock } from "./job-executor.ts";
 import {
 	CLOSEOUT_TITLE,
@@ -80,7 +83,9 @@ import {
 	normalizeCheckpointPlan,
 	revalidateCheckpointProof,
 } from "./checkpoint-import.ts";
-import { dependencyBlock, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { hostJobRows } from "./host-jobs.ts";
+import { dependencyBlock, laneRouteFingerprint, ledgerNotice, type LedgerNoticeRow, replanConflict, RunLanes, writerFreedNotice, type LaneReadiness, type LaneResultReadiness } from "./lanes.ts";
+import { reviewLane, type LanePolicy } from "../policy/capability.ts";
 import {
 	attemptInputsCurrent,
 	changedInputRequirements,
@@ -96,7 +101,9 @@ import {
 	staleRequirementIdsForPlan,
 } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
-import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, startLedgerRun } from "./ledger.ts";
+import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, spendNote, startLedgerRun } from "./ledger.ts";
+import type { AttemptUnplannedDelivery } from "./attempt-collector.ts";
+import { UNPLANNED_MAX, unplannedNotice } from "./unplanned.ts";
 import { reviewLine } from "./review.ts";
 import {
 	buildRoundMessage,
@@ -162,6 +169,9 @@ const ADMISSION_SETTLE_WAIT_MS = 1_000;
 /** What the director reads about the ledger in one request: a few lines, never a dump. */
 const NOTICE_MAX_CHARS = 900;
 
+/** Why a run does not open while omp's plan mode is on; the same rule as the automatic start's. */
+export const PLAN_MODE_START_REFUSAL = "omp 계획 모드가 켜져 있어 시작하지 않았습니다. 계획 모드를 끝낸 뒤 다시 하세요.";
+
 /**
  * The fence a lane goes back to when a prepared dispatch is dropped: the newest attempt that is still real, whether it
  * is open or already settled (in any outcome). A dropped dispatch never ran, so it must not lower the fence below an
@@ -206,6 +216,31 @@ export function noteRunUserWait(runId: string | undefined, key: string, waiting:
 /** The spawns decided so far in a run, from whichever session decided them (a copy). */
 export function runSpawns(runId: string): SpawnRecord[] {
 	return [...(spawnsByRun.get(runId) ?? [])];
+}
+
+/** Where a fact about a worker reaches the director of a run, by run id; set while this process's controller owns the run. */
+const noticeSinks = new Map<string, (text: string) => void>();
+
+/**
+ * A fact the director must read that only a child's session can see (a worker stopped because it ran on a model the team
+ * did not approve). It reaches the director on its next request. Only a run this thread's controller owns takes it.
+ */
+export function noteRunNotice(runId: string, text: string): boolean {
+	const sink = noticeSinks.get(runId);
+	if (sink === undefined) return false;
+	sink(text);
+	return true;
+}
+
+/** What a child's check read of the model its spawn ran on, set on the spawn's record. No spawn of that key, no change. */
+export function noteRunRan(runId: string, spawnKey: string, ran: RanModel): void {
+	const record = spawnsByRun.get(runId)?.findLast(spawn => spawn.spawnKey === spawnKey && spawn.outcome !== "blocked");
+	if (record === undefined) return;
+	// A worker that ran on what the team did not approve stays recorded as such: a later reading of an approved model (it was
+	// woken again) never replaces it.
+	if (record.ran?.verdict === "mismatch" && ran.verdict !== "mismatch") return;
+	record.ran = ran;
+	touchRun(runId);
 }
 
 /** What compaction before a run must keep: the director works from it for the whole run. */
@@ -394,7 +429,9 @@ function compactResultReason(text: string): string {
 function planNeedsWrite(plan: RunPlan): boolean {
 	return plan.lanes.some(
 		lane =>
-			(lane.kind !== "explore" && lane.kind !== "review") ||
+			// A review lane may run commands (the approved reviewer carries a shell), so it needs the claim like a writer.
+			lane.kind !== "explore" ||
+			reviewLane(lane) ||
 			(lane.files?.length ?? 0) > 0 ||
 			(lane.results ?? []).some(result => result.kind !== "answer"),
 	);
@@ -580,8 +617,17 @@ interface OwnRun {
 	notices: string[];
 	/** Dispatches whose evaluation was already reported: one attempt is reported once, however many ways it arrives. */
 	noticed: Set<string>;
+	/** How many deliveries of each worker reached the collector as ones no declared result waits for (see `noteUnplannedDelivery`). */
+	deliveries: Map<string, number>;
+	/**
+	 * How many turns Storm's own work messages woke for each worker (see `noteWakingFollowUp`): each of them delivers once, so
+	 * each is a delivery Storm asked for. A message omp folded into a turn that was already open wakes none. Memory only.
+	 */
+	wakes: Map<string, number>;
 	/** Waiting lanes the director was told can start and that have not started or stopped being startable since. */
 	startableTold: Set<string>;
+	/** Writing lanes the director was told the write order lets start, until they start or the order holds them again. */
+	writersTold: Set<string>;
 	/** Revalidated lanes owe no new worker attempt unless their results are reopened. */
 	restoredLanes: Set<string>;
 	/** The answer submission each answer row currently stands on; see `AnswerSubject`. */
@@ -602,6 +648,8 @@ interface OwnRun {
 	/** Jobs may overlap inside a batch by declared resource, never with unchecked worktree writers. */
 	jobBatch?: true;
 	jobFence?: string;
+	/** Jobs whose end is not proven yet and that the OS may still prove (`open`), and whether one can never be (`hard`). */
+	jobUnproven?: { open: number; hard: boolean };
 	/** The compact evidence of the latest check report, written with every live and final record. */
 	checkEvidence?: RunCheckEvidence[];
 	/** The last valid closeout brief submitted for this run; the final record only, never a status change. */
@@ -681,6 +729,11 @@ export interface RunControllerDeps {
 	now(): number;
 	/** Subagents whose latest turn was during the run, from the agent ledger, scoped to this session's store. */
 	agents?(runId: string, sessionDir: string): AgentEntry[];
+	/**
+	 * Waits until the write authority of every worker whose place the run's lane table took has been withdrawn; the refusal's
+	 * reason when one could not be. A job or a check starts only after it (R-final N4). Absent: nothing is pending.
+	 */
+	settleEnds?(runId: string): Promise<string | undefined>;
 	/** The work tree's state against `base` (HEAD when absent); absent in hosts and tests that have no git. */
 	tree?(root: string, base?: string): Promise<TreeReading | undefined>;
 	/** Every subagent this process has seen in this session (any run): the janitor only cleans those omp has parked. */
@@ -701,6 +754,12 @@ export interface RunControllerDeps {
 	 * `undefined` when the run ends. A failing hook never breaks the run.
 	 */
 	live?(ctx: ExtensionContext, run: RunRecord | undefined): void;
+	/**
+	 * The approved write authority of each lane of `plan` (`lanePolicy` over the effective agent tools), for the one line
+	 * that says which writing lanes the write order now lets start. Absent, or `undefined` when the team cannot be read:
+	 * the run then says nothing about writers rather than guess.
+	 */
+	lanePolicies?(runId: string, plan: RunPlan): Promise<{ policies: ReadonlyMap<string, LanePolicy>; canonicalFiles: ReadonlyMap<string, readonly string[]> } | undefined>;
 }
 
 export class RunController {
@@ -708,6 +767,8 @@ export class RunController {
 	/** A start is between its checks and its handoff (it may be asking, compacting, or recording the run). */
 	#starting = false;
 	#own: OwnRun | undefined;
+	/** Names the entries a job batch or a required check makes in the lane table. */
+	#holderSerial = 0;
 	#flushTimer: ReturnType<typeof setTimeout> | undefined;
 	/** Bumped when the run lifecycle ends (shutdown, session switch): a start in flight must not continue into the next session. */
 	#generation = 0;
@@ -786,6 +847,8 @@ export class RunController {
 			spawns: [...(spawnsByRun.get(own.record.runId) ?? [])],
 			...(agents.length ? { agents } : {}),
 		};
+		const spend = spendNote(live);
+		if (spend !== undefined) record.spend = spend;
 		if (own.checkEvidence?.length) record.checks = own.checkEvidence;
 		return record;
 	}
@@ -945,6 +1008,9 @@ export class RunController {
 			const targetBlock = await targetJobBlock(root);
 			if (stale()) return gone();
 			if (targetBlock !== undefined) return refuse(targetBlock);
+			// A required check of an earlier run whose processes were not proven gone still holds this target.
+			const checkBlock = uncertainCheckBlock(root);
+			if (checkBlock !== undefined) return refuse(checkBlock);
 			// A plan that may change the target must hold the write claim before any handoff or spawn can act on it.
 			if (plan !== undefined && planNeedsWrite(plan)) {
 				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
@@ -1075,7 +1141,9 @@ export class RunController {
 				sessionId,
 				config,
 				store: state.store,
-				lanes: new RunLanes(runId),
+				// The run reads the director session's own background jobs through the lane table: a command the director sent to
+				// the background is a holder there, and a worker's task job that still runs keeps its reservation.
+				lanes: new RunLanes(runId, () => hostJobRows(ctx)),
 				attempts: new Map(),
 				attemptSerial: 0,
 				planRevision: 0,
@@ -1085,7 +1153,10 @@ export class RunController {
 				settledEpoch: new Map(),
 				notices: [],
 				noticed: new Set(),
+				deliveries: new Map(),
+				wakes: new Map(),
 				startableTold: new Set(),
+				writersTold: new Set(),
 				restoredLanes: new Set(),
 				settling: new Set(),
 				abort: new AbortController(),
@@ -1156,6 +1227,7 @@ export class RunController {
 					sessionDir,
 					repoId: own.repoId,
 					root: own.root,
+					...artifactsOf(ctx),
 					...(own.base !== undefined ? { base: own.base } : {}),
 					...(config.budget ? { budget: config.budget } : {}),
 					onThreshold: (kind, run) => this.#threshold(ctx, kind, run),
@@ -1163,6 +1235,9 @@ export class RunController {
 				// Bound before anything below awaits: a spawn decided the moment this returns must see the first plan.
 				if (plan !== undefined) setLedgerPlan(runId, plan);
 				spawnsByRun.set(runId, []);
+				noticeSinks.set(runId, text => {
+					if (this.#own === own) own.notices.push(text);
+				});
 				openRunReads(runId);
 				const startingWrite = writeRun(own.sessionDir, record);
 				// The final record waits for the start write, so a shutdown that lands during admission cannot overwrite it.
@@ -1230,6 +1305,8 @@ export class RunController {
 			return refuse("omp 목표 모드가 켜져 있어 시작하지 않았습니다. 목표를 끝내거나 일시 정지한 뒤 다시 하세요.");
 		}
 		if (state.loop.status !== "inactive") return refuse("omp 반복 모드가 켜져 있어 시작하지 않았습니다. 반복을 끈 뒤 다시 하세요.");
+		// Plan mode holds the session to planning. The automatic start already refuses in it; a hand start follows suit.
+		if (state.plan.status === "active") return refuse(PLAN_MODE_START_REFUSAL);
 		if (state.vibe.status !== "active") return { ok: true };
 		// A tool call cannot ask the user to change modes: an automatic start refuses and leaves the session as it is.
 		if (!allowDialog) return refuse("omp vibe 모드가 켜져 있어 자동 실행을 시작하지 않았습니다. vibe 모드를 끈 뒤 다시 하세요.");
@@ -1356,6 +1433,9 @@ export class RunController {
 						? "보존된 산출물의 시도 근거를 확인하지 못했습니다."
 						: "보존된 산출물의 근거가 현재 계약과 다릅니다.";
 				}
+				// The record's row still stands accepted or reviewable (it carries the version a consumer would bind) although
+				// the location check above found it unusable now. A row that never stood (answered, judged unmet) is not this.
+				const standing = state === "unmet" && (row?.state === "accepted" || row?.state === "reviewable");
 				const citation = (row?.proof?.item ?? (row !== undefined && result.kind === "answer" ? this.#answerReceipt(own, row) : undefined))?.citation;
 				// The ledger's own reason travels with a result that is not usable (unmet, reviewable): a consumer's refusal
 				// can then say why, instead of only naming the state. A reason found while re-locating wins.
@@ -1366,6 +1446,7 @@ export class RunController {
 					state,
 					integrated,
 					...(row?.contentVersion === undefined ? {} : { version: row.contentVersion }),
+					...(standing ? { standingVersion: true as const } : {}),
 					...(result.path === undefined ? {} : { path: result.path }),
 					...(citation === undefined ? {} : { citation: { path: citation.path, ...(citation.line === undefined ? {} : { line: citation.line }) } }),
 					...(retained === undefined ? {} : { retained }),
@@ -1736,6 +1817,60 @@ export class RunController {
 		if (text !== undefined) own.notices.push(text);
 	}
 
+	/** Lanes of the plan nothing has started: no worker, no open or settled attempt, no job, and a result still owed. */
+	#unstartedLanes(own: OwnRun, plan: RunPlan): PlanLane[] {
+		const rows = own.record.results ?? [];
+		return plan.lanes.filter(candidate => {
+			if (own.restoredLanes.has(candidate.name) || own.lanes.agentForLane(candidate.name) !== undefined) return false;
+			if ([...own.attempts.values()].some(prepared => prepared.lane === candidate.name) || own.settled.has(candidate.name)) return false;
+			if (candidate.job !== undefined && own.record.jobs?.some(job => job.lane === candidate.name)) return false;
+			const results = candidate.results ?? [];
+			return results.length === 0 || results.some(result => rows.find(row => row.id === result.id)?.state !== "accepted");
+		});
+	}
+
+	/**
+	 * When the worker that held the shared write order ended, the unstarted writing lanes the placement gate would now let
+	 * start, as one line, once per lane until it starts or the order holds it again. Nothing is started: the director
+	 * reads it where it reads a delivery. A run that cannot read the team's authority, or with no plan, says nothing.
+	 */
+	async #writersFreed(own: OwnRun): Promise<string | undefined> {
+		const plan = own.record.plan;
+		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
+		if (!own.lanes.takeWriterFreed(agents, Date.now()) || plan === undefined || this.deps.lanePolicies === undefined) return undefined;
+		const candidates = this.#unstartedLanes(own, plan).filter(lane => lane.job === undefined);
+		if (candidates.length === 0) return undefined;
+		const view = await this.deps.lanePolicies(own.record.runId, plan);
+		if (view === undefined || this.#own !== own) return undefined;
+		const needed = new Set(candidates.flatMap(lane => (lane.dependsOn ?? []).map(edge => edge.lane)));
+		const readiness = needed.size === 0 ? undefined : await this.#readLaneReadiness(own, plan, needed);
+		if (this.#own !== own) return undefined;
+		const startable = own.lanes.startableWriters(candidates, own.config, {
+			policies: view.policies,
+			canonicalFiles: view.canonicalFiles,
+			...(readiness === undefined ? {} : { readiness }),
+			agents: this.deps.agents?.(own.record.runId, own.sessionDir) ?? [],
+			now: Date.now(),
+		});
+		for (const name of [...own.writersTold]) if (!startable.includes(name)) own.writersTold.delete(name);
+		const fresh = startable.filter(name => !own.writersTold.has(name));
+		for (const name of fresh) own.writersTold.add(name);
+		return writerFreedNotice(fresh);
+	}
+
+	/**
+	 * What the director reads at its next request: the ledger lines queued by evaluated deliveries and unplanned
+	 * deliveries, then the one line about a freed write place. Taking empties both, so each is read once.
+	 */
+	async noticesForDirector(): Promise<string | undefined> {
+		const own = this.#own;
+		if (own !== undefined) {
+			const line = await this.#writersFreed(own).catch(() => undefined);
+			if (line !== undefined && this.#own === own) own.notices.push(line);
+		}
+		return this.takeNotices();
+	}
+
 	/**
 	 * Waiting lanes that name `lane` as a prerequisite and whose every prerequisite now holds, by the same
 	 * `dependencyBlock` the spawn guard asks. A lane already started, restored or fully accepted does not wait. A lane is
@@ -1744,15 +1879,7 @@ export class RunController {
 	async #startableAfter(own: OwnRun, lane: string): Promise<string[]> {
 		const plan = own.record.plan;
 		if (plan === undefined) return [];
-		const rows = own.record.results ?? [];
-		const waiting = plan.lanes.filter(candidate => {
-			if (!(candidate.dependsOn ?? []).some(edge => edge.lane === lane)) return false;
-			if (own.restoredLanes.has(candidate.name) || own.lanes.agentForLane(candidate.name) !== undefined) return false;
-			if ([...own.attempts.values()].some(prepared => prepared.lane === candidate.name) || own.settled.has(candidate.name)) return false;
-			if (candidate.job !== undefined && own.record.jobs?.some(job => job.lane === candidate.name)) return false;
-			const results = candidate.results ?? [];
-			return results.length === 0 || results.some(result => rows.find(row => row.id === result.id)?.state !== "accepted");
-		});
+		const waiting = this.#unstartedLanes(own, plan).filter(candidate => (candidate.dependsOn ?? []).some(edge => edge.lane === lane));
 		if (waiting.length === 0) return [];
 		const needed = new Set(waiting.flatMap(candidate => (candidate.dependsOn ?? []).map(edge => edge.lane)));
 		const view = await this.#readLaneReadiness(own, plan, needed);
@@ -1767,6 +1894,66 @@ export class RunController {
 			}
 		}
 		return startable;
+	}
+
+	/**
+	 * A work message of the director started a turn of this worker (the receipt says `woken` or `revived`, or the worker was
+	 * idle when it went out): the delivery that turn makes is one Storm asked for. A message omp folded into the open turn
+	 * is not counted, or each one would hide a delivery that someone else's wake made (R-final N9).
+	 */
+	noteWakingFollowUp(runId: string, agentId: string): void {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== runId) return;
+		own.wakes.set(agentId, (own.wakes.get(agentId) ?? 0) + 1);
+	}
+
+	/**
+	 * A delivery the run received that answers no declared result (see `AttemptUnplannedDelivery`). It is kept in the
+	 * record as the host showed it: whose child, when, what the worker cost so far, and whether it changed files when
+	 * the agent ledger knew. It never touches a result row, a lane or an attempt, and it is not acceptance. The
+	 * director reads one line for it, in the notice path an evaluated delivery uses.
+	 */
+	noteUnplannedDelivery(input: AttemptUnplannedDelivery): void {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== input.runId) return;
+		const list = own.record.unplanned ?? [];
+		if (list.some(entry => entry.id === input.id)) return;
+		// A delivery Storm itself asked for is not one nobody planned: the first delivery of a worker it placed in a lane (a lane with
+		// no declared results, a review lane, has no row to match it to; a spawn Storm refused delivers its refusal) and one for
+		// each follow-up that started a turn of that worker. Only deliveries beyond those (someone else woke it) are recorded and told;
+		// a worker Storm never placed always is.
+		const ledgerAgent = this.deps.agents?.(own.record.runId, own.sessionDir).find(entry => entry.id === input.agent);
+		if (input.kind === "unplaced") {
+			const seen = (own.deliveries.get(input.agent) ?? 0) + 1;
+			own.deliveries.set(input.agent, seen);
+			const placed = runSpawns(input.runId).findLast(spawn => spawn.spawnKey === input.agent);
+			if (placed !== undefined && (placed.outcome === "blocked" || placed.lane !== undefined) && seen <= 1 + (own.wakes.get(input.agent) ?? 0)) return;
+		}
+		const agent = ledgerAgent;
+		const changed =
+			agent === undefined || input.startedAt === undefined
+				? undefined
+				: agent.lastChangeAt !== undefined && agent.lastChangeAt >= input.startedAt;
+		const entry: UnplannedDelivery = {
+			id: input.id,
+			kind: input.kind,
+			agent: input.agent,
+			endedAt: input.endedAt,
+			...(input.parentId !== undefined ? { parentId: input.parentId } : { parentId: input.receiverId }),
+			...(input.lane !== undefined ? { lane: input.lane } : {}),
+			...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
+			...(input.status !== undefined ? { status: input.status } : {}),
+			...(input.costUsd !== undefined ? { costUsd: input.costUsd } : {}),
+			...(agent !== undefined && agent.costUsd > 0 ? { agentCostUsd: agent.costUsd } : {}),
+			...(changed !== undefined ? { changed } : {}),
+		};
+		list.push(entry);
+		// Bounded: the oldest go first, and the count keeps what the list no longer holds.
+		while (list.length > UNPLANNED_MAX) list.shift();
+		own.record.unplanned = list;
+		own.record.unplannedCount = (own.record.unplannedCount ?? 0) + 1;
+		own.notices.push(unplannedNotice(entry));
+		this.#scheduleFlush(own);
 	}
 
 	/**
@@ -3005,8 +3192,16 @@ export class RunController {
 				state.repo.repoId === own.repoId && state.config.status === "ok" &&
 				state.config.hash === own.record.configHash && isApproved(state);
 		};
+		// The batch takes the tree in the lane table in this same synchronous step: a command of the director that is running
+		// (in the foreground or in the background) refuses it, and from here a worker or a director command meets the batch.
+		const holderKey = `batch-${++this.#holderSerial}`;
+		const holder = own.lanes.commitHolder({ kind: "job", key: holderKey, now: this.deps.now(), agents: this.deps.agents?.(own.record.runId, own.sessionDir) });
+		if (!holder.ok) return { ok: false, reason: `[storm:job-wait] ${holder.reason}` };
 		own.jobBatch = true;
 		try {
+			// A worker the batch's place was taken from has no authority left to write beside it (R-final N4).
+			const unsettled = await this.deps.settleEnds?.(own.record.runId);
+			if (unsettled !== undefined) return { ok: false, reason: unsettled };
 			if (!(await approved())) return { ok: false, reason: "현재 팀 승인과 작업 대상을 확인하지 못해 시작하지 않았습니다." };
 			const lease = await this.#upgradeLease(own);
 			if (!lease.ok) return lease;
@@ -3079,7 +3274,23 @@ export class RunController {
 					const { name, status, exitCode, startedAt, finishedAt, detail, fence, unrunCause } = receipt;
 					const inconclusive = fence?.cause === "process-unproven";
 					const ambiguous = fence !== undefined || unrunCause === "owner-dead" || unrunCause === "owner-unknown" || unrunCause === "record-invalid";
-					if (inconclusive) own.jobFence = "[storm:job-fence] 정형 작업의 프로세스 종료를 확인할 수 없어 이 작업 대상을 계속 보호합니다. 실행 기록의 잠금 위치를 확인하세요.";
+					if (inconclusive) {
+						own.jobFence = "[storm:job-fence] 정형 작업의 프로세스 종료를 확인할 수 없어 이 작업 대상을 계속 보호합니다. 실행 기록의 잠금 위치를 확인하세요.";
+						// The fence ends when the OS later shows every unproven group empty (as a check's fence does); a child that cannot be probed keeps it.
+						const unproven = (own.jobUnproven ??= { open: 0, hard: false });
+						if (receipt.ended === undefined) unproven.hard = true;
+						else {
+							unproven.open += 1;
+							void receipt.ended.then(() => {
+								unproven.open -= 1;
+								if (unproven.open > 0 || unproven.hard || own.jobUnproven !== unproven) return;
+								delete own.jobFence;
+								delete own.jobUnproven;
+								own.lanes.releaseHolder("fence", holderKey);
+								this.#scheduleFlush(own);
+							});
+						}
+					}
 					const version = createHash("sha256").update(receipt.stdout.tail).digest("hex");
 					setJobReceipt(own.record, { lane: lane.name, name, status: inconclusive ? "unknown" : status,
 						exitCode, startedAt, finishedAt, attemptId: attempt, jobSha256,
@@ -3124,6 +3335,9 @@ export class RunController {
 			return { ok: true, text: lines.join("\n") || "정형 작업을 시작하기 전에 실행이 중단되었습니다." };
 		} finally {
 			delete own.jobBatch;
+			// A fence stays for the run (the processes' end was not proven); otherwise the batch's end proved every group empty.
+			if (own.jobFence !== undefined) own.lanes.fenceHolder("job", holderKey);
+			else own.lanes.releaseHolder("job", holderKey);
 			if (this.#own === own) this.#emitPhase(own);
 		}
 	}
@@ -3926,8 +4140,16 @@ export class RunController {
 		if (planLanes?.some(lane => lane.state !== "done")) return now;
 		const fingerprint = treeFingerprint(now.state);
 		if (own.checking !== undefined || own.checks.has(fingerprint)) return now;
+		// The check takes the tree in the lane table in this same synchronous step. A command of the director that is running
+		// (even one omp moved to the background), a job or a fence holds it: this look runs no check and a later look asks again.
+		const holderKey = `check-${++this.#holderSerial}`;
+		if (!own.lanes.commitHolder({ kind: "check", key: holderKey, now: this.deps.now(), agents: this.deps.agents?.(own.record.runId, own.sessionDir) }).ok) return now;
 		own.checking = fingerprint;
+		// A check whose process end is not proven turns its entry into a fence that only that end releases.
+		let fenced = false;
 		try {
+			// A worker the check's place was taken from has no authority left to write beside it; a failed withdrawal runs no check now (R-final N4).
+			if ((await this.deps.settleEnds?.(own.record.runId)) !== undefined) return now;
 			const state = await this.deps.loadState(own.ctx).catch(() => undefined);
 			if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted) return now;
 			// A changed hash or a withdrawal of approval is not permission to run the run's old checks. Neither is a
@@ -3967,6 +4189,16 @@ export class RunController {
 					cwd: own.root,
 					fingerprint,
 					signal: own.abort.signal,
+					onEndUnproven: ({ ended }) => {
+						fenced = true;
+						own.lanes.fenceHolder("check", holderKey);
+						// The tree stays held until the group is later seen empty, and no new run may take this target before it.
+						const release = trackUnprovenCheck(own.root, ended);
+						void ended.then(() => {
+							own.lanes.releaseHolder("fence", holderKey);
+							release();
+						});
+					},
 				});
 			} finally {
 				delete own.checksRunning;
@@ -3975,6 +4207,15 @@ export class RunController {
 			if (this.#own !== own) return now;
 			if (report.status === "skipped") {
 				own.checks.set(fingerprint, "skipped");
+				return now;
+			}
+			if (report.endUnproven !== undefined) {
+				// The check's processes may still be writing: the tree is not quiet, so nothing this report says is evidence.
+				own.checks.set(fingerprint, "skipped");
+				this.deps.ui(own.ctx).notify(
+					`필수 검사 ${report.endUnproven.check}의 프로세스가 끝났는지 확인하지 못해 이 검사 결과는 근거로 쓰지 않습니다. 끝났다고 확인될 때까지 이 작업 트리를 쓰는 새 작업을 시작하지 않습니다.`,
+					"warning",
+				);
 				return now;
 			}
 			own.checks.set(fingerprint, report);
@@ -3991,6 +4232,7 @@ export class RunController {
 			return await this.#treeAt(own.root, own.base);
 		} finally {
 			if (own.checking === fingerprint) delete own.checking;
+			if (!fenced) own.lanes.releaseHolder("check", holderKey);
 		}
 	}
 
@@ -4546,6 +4788,7 @@ export class RunController {
 		}
 		const pendingLanes = (own.record.plan?.lanes ?? []).filter(lane => pendingNames.has(lane.name)).map(lane => lane.name);
 		spawnsByRun.delete(own.record.runId);
+		noticeSinks.delete(own.record.runId);
 		clearRunReads(own.record.runId);
 		const record: RunRecord = {
 			...own.record,
@@ -4565,6 +4808,8 @@ export class RunController {
 			} satisfies CloseoutFacts,
 		};
 		if (own.checkEvidence?.length) record.checks = own.checkEvidence;
+		const spend = spendNote(ledger);
+		if (spend !== undefined) record.spend = spend;
 		// An automatic probe stays out of the main transcript while it is routine; a blocked spawn is not routine, and
 		// the live status line already carried the rest.
 		const quietAuto =
@@ -4741,7 +4986,9 @@ export class RunController {
 		}
 		const stop = budget?.onExceed === "stop";
 		ui.notify(
-			`Storm 실행 예산(${formatUsd(budget?.perRunUsd ?? 0)})을 넘었습니다(누계 ${formatUsd(run.costUsd)}). ${stop ? "실행을 중단합니다." : "새 스폰을 차단합니다."}`,
+			// The figure is the spend Storm has seen: no new spawn and no work message to an idle worker from here, and with `stop` the director's turn is aborted,
+			// but what workers already run still finishes (and its spend lands after this notice).
+			`Storm 실행 예산(${formatUsd(budget?.perRunUsd ?? 0)})에 관측된 지출이 닿았습니다(누계 ${formatUsd(run.costUsd)}). 새 스폰과 쉬는 워커에게 보내는 일 메시지를 막습니다(진행 메모는 보낼 수 있습니다).${stop ? " 감독의 응답을 중단합니다." : ""} 이미 도는 워커는 끝까지 진행하며, 그 지출은 이후에 더해집니다.`,
 			"warning",
 		);
 		if (!stop) return;
@@ -4762,7 +5009,8 @@ export class RunController {
 }
 
 const OUTCOME_LABEL: Record<SpawnRecord["outcome"], string> = {
-	routed: "승인 모델",
+	// The answer given to omp, not a statement of what ran (see `SpawnRecord.ran`).
+	routed: "승인 모델로 배정",
 	trial: "시험 사용",
 	allowed: "그대로 허용",
 	substituted: "대체 역할로 교체",
@@ -4803,6 +5051,10 @@ export function summarizeRun(run: RunRecord): string {
 			)
 		: "없음";
 	const blockLine = blockCodes.length ? ` · 차단 사유: ${tally(blockCodes, code => BLOCK_LABEL[code] ?? code)}` : "";
+	// What a spawn was answered with is not what ran: only a child's own first request says that, and only where one was read.
+	const verified = run.spawns.filter(spawn => spawn.ran?.verdict === "verified").length;
+	const mismatched = run.spawns.filter(spawn => spawn.ran?.verdict === "mismatch").length;
+	const ranLine = verified + mismatched === 0 ? "" : ` · 실행 모델 확인 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
 	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept and
 	// from every uncapped run.
@@ -4814,7 +5066,7 @@ export function summarizeRun(run: RunRecord): string {
 				: ` · ${run.turns}라운드`;
 	const lines = [
 		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${rounds} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
-		`- 스폰: ${spawnLine}${blockLine}`,
+		`- 스폰: ${spawnLine}${blockLine}${ranLine}`,
 	];
 	const main: string[] = [];
 	if (run.mainCostUsd !== undefined && run.costUsd > 0) {

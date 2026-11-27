@@ -59,6 +59,9 @@ export function testSessionId(prefix = "session"): string {
 	return `${prefix}-${++sessionSerial}`;
 }
 
+/** What `omp config list --json` answers in a test project: omp's own default edit mode, nothing else set. */
+export const DEFAULT_OMP_CONFIG = { "edit.mode": { value: "hashline", type: "enum", description: "" } };
+
 /**
  * A temp project with its own omp agent dir and an absent stats DB. Only `git` really runs; every other command
  * (the `omp` CLI) fails, so nothing outside `tmp` is read or written and no model is "available".
@@ -75,7 +78,14 @@ export async function makeProject(now: () => number = Date.now, opts: ProjectOpt
 	const sessionDir = sessionStoreDir(agentDir, sessionId);
 	const env: FlowEnv = {
 		cwd: root,
-		exec: (command, args, options) => (command === "git" ? exec(command, args, options) : Promise.resolve({ stdout: "", stderr: "", code: 1 })),
+		exec: (command, args, options) => {
+			if (command === "git") return exec(command, args, options);
+			// A host whose settings can only be read through the CLI answers the edit mode (the default); every other read fails.
+			if (command === "omp" && args[0] === "config" && args[1] === "list") {
+				return Promise.resolve({ stdout: JSON.stringify(DEFAULT_OMP_CONFIG), stderr: "", code: 0 });
+			}
+			return Promise.resolve({ stdout: "", stderr: "", code: 1 });
+		},
 		agentDir,
 		pluginAgentsDir: path.join(tmp, "plugin-agents"),
 		sessionId,

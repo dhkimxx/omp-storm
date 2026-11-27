@@ -29,6 +29,7 @@ import { readTrialStates, updateTrialState } from "../src/runtime/state-files.ts
 import type { TreeReading, TreeState } from "../src/runtime/tree.ts";
 import type { RunPhase } from "../src/view/appearance.ts";
 import { CLOSEOUT_CHOICE_HINT, renderCloseout } from "../src/view/closeout.ts";
+import { ON_EXCEED } from "../src/view/render.ts";
 import type { ProjectState } from "../src/state.ts";
 import type {
 	AgentEntry,
@@ -1126,6 +1127,17 @@ describe("start with plan", () => {
 		expect(reader.leases.held[0]?.mode).toBe("read");
 		await reader.controller.finish("no-changes");
 
+		// A review lane may run commands (the approved reviewer carries a shell), so it holds the claim like a writer.
+		const reviewer = session({ hold: { idle: false } });
+		const reviewPlan: RunPlan = {
+			lanes: [{ name: "gate", kind: "review", role: "reviewer" }],
+			workers: { reviewer: 1 },
+			submittedAt: "2026-11-20T09:00:00.000Z",
+		};
+		expect((await reviewer.controller.startWithPlan(reviewer.ctx, ask("review"), reviewPlan)).ok).toBe(true);
+		expect(reviewer.leases.held[0]?.mode).toBe("write");
+		await reviewer.controller.finish("no-changes");
+
 		// A manual start begins safe; binding a write-capable plan upgrades before the plan becomes spawn authority.
 		const manual = session();
 		await manual.start();
@@ -1848,10 +1860,11 @@ describe("round loop", () => {
 			expect(h.timers.delays()).toEqual([HOLD_MS]);
 			await h.controller.finish("shutdown");
 		}
+		// Plan mode that comes on after the run opened: a run does not open inside it (see the start refusal below).
 		const modes = fakeModes();
-		modes.state.plan.status = "active";
 		const planning = session({ agents: [writer()], modes });
 		await planning.start();
+		modes.state.plan.status = "active";
 		await planning.turn();
 		planning.timers.fire();
 		await until(() => planning.timers.delays().length === 1);
@@ -2346,6 +2359,28 @@ describe("budget", () => {
 		expect(await readRunIndex(h.sessionDir)).toMatchObject([{ runId, status: "budget-exceeded" }]);
 	});
 
+	test("what the notices and labels say about the limit claims no more than it does: observed spend, nothing new starts, work in flight finishes", async () => {
+		for (const onExceed of ["stop", "block-spawns"] as const) {
+			const h = session({ config: budget(onExceed) });
+			const runId = await h.start();
+			h.controller.onAgentStart();
+			recordCost(runId, "a/i", 3);
+			const text = h.notices.filter(n => n.level === "warning").map(n => n.text).at(-1) ?? "";
+			expect(text).toContain("관측된 지출");
+			expect(text).toContain("새 스폰과 쉬는 워커에게 보내는 일 메시지를 막습니다");
+			expect(text).toContain("이미 도는 워커는 끝까지 진행");
+			// The abort of the director's turn is claimed only where it is done; neither says the run or its workers stop.
+			expect(text.includes("감독의 응답을 중단합니다")).toBe(onExceed === "stop");
+			expect(text).not.toContain("실행을 중단합니다");
+			await h.controller.onAgentEnd({}, h.ctx);
+			resetLedger();
+		}
+		// The setup choice and the status line state the same two behaviours.
+		expect(ON_EXCEED["block-spawns"]).toBe("새 스폰과 쉬는 워커에게 보내는 일 메시지 차단");
+		expect(ON_EXCEED.stop).toContain("이미 도는 워커는 끝까지 진행");
+		expect(ON_EXCEED.stop).not.toBe("실행 중단");
+	});
+
 	test("block-spawns: nothing is aborted and the run goes on to its own end", async () => {
 		const h = session({ config: budget("block-spawns") });
 		const runId = await h.start();
@@ -2766,6 +2801,17 @@ describe("run summary", () => {
 		expect(text).not.toContain("SECRET SENTENCE");
 		// 1 routed, 3 blocked; then 2 of one code and 1 of another.
 		expect(numbers(text.split("\n")[1])).toEqual([1, 3, 2, 1]);
+	});
+
+	test("a routed spawn is told as an answer given, and what ran is stated only where a child's own request was read", () => {
+		const unread = summarizeRun({ ...base, spawns: [spawn] }).split("\n")[1] ?? "";
+		expect(unread).toContain("승인 모델로 배정");
+		expect(unread).not.toContain("실행 모델 확인");
+		const read = summarizeRun({
+			...base,
+			spawns: [spawn, { ...spawn, spawnKey: "B", ran: { model: "a/i", verdict: "verified" } }, { ...spawn, spawnKey: "C", ran: { model: "x/y", verdict: "mismatch" } }],
+		}).split("\n")[1] ?? "";
+		expect(read).toContain("실행 모델 확인 1, 승인 밖 1(멈춤)");
 	});
 
 	test("stays within five lines when every line is present; the director line carries its numbers", () => {

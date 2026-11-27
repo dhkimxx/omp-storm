@@ -413,9 +413,16 @@ async function main(): Promise<void> {
 				],
 				{ implementer: 2 },
 			),
-			// The implementer is the only writer; the two readers run beside it. The second implementer follows the
-			// explicit native wait, so S2's one-shared-writer rule holds and the consumed child results are exercised.
-			{ task: ["storm-implementer", "storm-explorer", "storm-reviewer"], as: "W", say: READ_AND_CLAIM },
+			// The implementer is the only writer; the explorer runs beside it. The reviewer has a shell, so it is ordered
+			// like a writer (0.27.0, P1-c: a call carries one writing lane, and no writer starts beside a running one):
+			// it follows the implementer's end, and the second implementer follows the reviewer's. Each wait is
+			// repeated because omp's wait may return on the first of two children; a second one with nothing left to
+			// wait for returns at once.
+			{ task: ["storm-implementer", "storm-explorer"], as: "W", say: READ_AND_CLAIM },
+			{ wait: true },
+			{ wait: true },
+			{ task: ["storm-reviewer"], as: "Rev", say: READ_AND_CLAIM },
+			{ wait: true },
 			{ wait: true },
 			{ task: ["task"], as: "Task", say: READ_AND_CLAIM },
 		];
@@ -443,7 +450,9 @@ async function main(): Promise<void> {
 		const director = mains(llm.all());
 		// omp puts its date reminder in front of the first user message.
 		const handoff = (director[0]?.lastUser ?? "").replace(/^<system-reminder>[\s\S]*?<\/system-reminder>\s*/, "");
-		const sent = new Set(director.flatMap(entry => entry.users).filter(user => !user.startsWith("<system-notice>")));
+		// A hook's `additionalContext` reaches the model as a user message too (omp 19.2.1): those are Storm's notes about the
+		// director's own calls, they start no turn, and each begins with the `[storm` tag.
+		const sent = new Set(director.flatMap(entry => entry.users).filter(user => !user.startsWith("<system-notice>") && !user.startsWith("[storm")));
 		check("one side turn classified it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
 		check("the handoff is the only user message Storm sends", sent.size === 1 && director[0]?.messageCount === 1, `user messages=${sent.size}`);
 		const firstLine = handoff.split("\n", 1)[0] ?? "";
@@ -1283,8 +1292,8 @@ async function main(): Promise<void> {
 				detail,
 			);
 			check(
-				"one more live explorer than the plan's workers is refused with role-cap",
-				reasons.includes("[storm:role-cap]") && run.spawns.find(spawn => spawn.spawnKey === "read-c")?.code === "role-cap" && !routedLanes.includes("read-c"),
+				"one more live explorer than the plan's workers is not refused for the plan's worker count (the role cap is gone; only omp's ceiling limits it)",
+				!reasons.includes("[storm:role-cap]") && run.spawns.find(spawn => spawn.spawnKey === "read-c")?.code !== "role-cap" && routedLanes.includes("read-c"),
 				`${detail} reasons=${reasons.slice(0, 300)}`,
 			);
 			check(
@@ -1328,14 +1337,15 @@ async function main(): Promise<void> {
 					explorerLane("read-a"),
 					explorerLane("read-d"),
 					{ name: "impl", kind: "code", role: "implementer", results: [trackedAnswer("impl-report", "the implementer reports the tracked fixture from source")] },
-					{ name: "review-a", kind: "review", role: "reviewer" },
+					// A reader: a reviewer has a shell and would be refused as a second writer beside `impl` (0.27.0).
+					explorerLane("read-e"),
 				];
 				let from = rpc.frames.length;
 				const queued = await runOf(
 					rpc,
 					files,
 					startRun([
-						plan(queuedLanes, { explorer: 2, implementer: 1, reviewer: 1 }),
+						plan(queuedLanes, { explorer: 3, implementer: 1 }),
 						// An ordinary child settles and becomes a parked worker, ready for a genuine reactivation.
 						{ tasks: [{ name: "read-a", agent: "storm-explorer", say: READ_AND_CLAIM }] },
 						{ wait: true, afterResult: "Background job read-a has completed." },
@@ -1347,7 +1357,7 @@ async function main(): Promise<void> {
 						},
 						// Both native permits are taken. This third fresh start has a valid planned lane, so only the
 						// native semaphore delays it: its spawn hook does not run until a permit is released.
-						{ tasks: [{ name: "review-a", agent: "storm-reviewer", say: "E2E-CHILD-VERDICT correct E2E-CAP-QUEUE-THIRD" }], awaitChildren: ["cap-q-d", "cap-q-impl"] },
+						{ tasks: [{ name: "read-e", agent: "storm-explorer", say: `E2E-CAP-QUEUE-THIRD ${READ_AND_CLAIM}` }], awaitChildren: ["cap-q-d", "cap-q-impl"] },
 						// A genuine reactivation of the parked explorer is refused by Storm at the same ceiling.
 						{ followUp: "agent://read-a", content: "E2E-CAP-QUEUE-REFUSED" },
 						// Freeing the permits lets the queued start reach the hook; the wait reports ordinary task
@@ -1370,7 +1380,7 @@ async function main(): Promise<void> {
 				});
 				const progressed = rpc.frames.slice(from).filter(frame => frame.type === "tool_execution_end" && frame.toolName === "wait").map(text).join("\n");
 				const releasedAt = queuedRequests[releaseAt]?.ts ?? 0;
-				const queuedSpawns = queued.spawns.filter(spawn => spawn.spawnKey === "review-a");
+				const queuedSpawns = queued.spawns.filter(spawn => spawn.spawnKey === "read-e");
 				const queuedAfter = queuedSpawns.find(spawn => Date.parse(spawn.ts) >= releasedAt);
 				const lateWakeAt = queuedRequests.findIndex(entry => entry.who === "child" && entry.lastUser.includes("E2E-CAP-QUEUE-WAKE-LATE"));
 				check(
@@ -1380,7 +1390,7 @@ async function main(): Promise<void> {
 				);
 				check(
 					"the queued fresh start is unseen by the spawn hook while the native permits are held",
-					!queued.spawns.some(spawn => spawn.agent === "storm-reviewer" && Date.parse(spawn.ts) < releasedAt),
+					!queued.spawns.some(spawn => spawn.spawnKey === "read-e" && Date.parse(spawn.ts) < releasedAt),
 					`releaseAt=${releasedAt} spawns=${JSON.stringify(queued.spawns.map(spawn => [spawn.agent, spawn.ts, spawn.code]))}`,
 				);
 				check(
@@ -1422,7 +1432,7 @@ async function main(): Promise<void> {
 						{ followUp: "agent://m-read-a", content: `E2E-CAP-MANAGED-RESUME E2E-WAKE-GATE cap-m-wake ${READ_AND_CLAIM}` },
 						{ tasks: [{ name: "m-impl", agent: "storm-implementer", say: `E2E-CAP-MANAGED-BLOCKED E2E-CHILD-WRITE ${implFile}` }], awaitChildren: ["cap-m-d", "cap-m-wake"] },
 						{ edit: "agent://m-read-b?progress", afterResult: "[storm:parallelism]" },
-						{ read: "agent://m-read-b", after: "[storm:lane-capacity]" },
+						{ read: "agent://m-read-b", after: "[storm:parallelism]" },
 						{ wait: true, releaseChildren: ["cap-m-d", "cap-m-wake"] },
 						// The free slot admits the same start on retry; its change result proves it ran.
 						{ wait: true },
@@ -1454,9 +1464,8 @@ async function main(): Promise<void> {
 					`blockedFollowUps=${managed.blockedFollowUps} read-a=${JSON.stringify(managed.agents?.find(agent => agent.id === "m-read-a"))} resume=${resumeAt}`,
 				);
 				check(
-					"an idle progress write is refused at the ceiling, but reading its output starts no model turn",
-					statusReadAt >= 0 && statusReadAt < managedReleaseAt && managedReasons.includes("[storm:lane-capacity]") &&
-						!managedRequests.some(entry => entry.who === "child" && entry.lastUser.includes("storm director check")) &&
+					"an idle progress note meets no capacity gate (it wakes a worker that can only read and report; a progress note is not a follow-up)",
+					statusReadAt >= 0 && statusReadAt < managedReleaseAt && !managedReasons.includes("[storm:lane-capacity]") &&
 						managed.agents?.find(agent => agent.id === "m-read-b")?.followUps === 0,
 					`read=${statusReadAt} release=${managedReleaseAt} read-b=${JSON.stringify(managed.agents?.find(agent => agent.id === "m-read-b"))}`,
 				);
@@ -1571,13 +1580,13 @@ async function main(): Promise<void> {
 			check("a bare read of a large code file passes", resultOf("notes/big.ts") !== "" && !resultOf("notes/big.ts").includes("[storm:"), resultOf("notes/big.ts").slice(0, 80));
 			check("a bare read of large prose passes too (omp pages it)", resultOf("notes/big.txt").includes("E2E-EVIDENCE-2") && !resultOf("notes/big.txt").includes("[storm:"), resultOf("notes/big.txt").slice(0, 120));
 			const refused = resultOf("notes/big.txt:1-500");
-			check("a 500-line range is refused with read-large, naming the agent that read it", refused.includes("[storm:read-large]") && refused.includes("agent://Reader0"), refused.slice(0, 120));
+			check("a 500-line range is not refused for its size (the director's reads are only counted)", !refused.includes("[storm:read-large]") && refused.includes("E2E-EVIDENCE-2"), refused.slice(0, 120));
 			check("a 10-line range passes", resultOf("notes/big.txt:1-10").includes("E2E-EVIDENCE-2") && !resultOf("notes/big.txt:1-10").includes("[storm:"));
 			check("a small file passes whole", resultOf("notes/small.txt").includes("E2E-SMALL-5") && !resultOf("notes/small.txt").includes("[storm:"));
 			const reads = run.reads;
 			check(
-				"the run record counts reads: 5 returned, 1 blocked, shared chars below the total",
-				reads?.director === 5 && reads.blocked === 1 && reads.directorChars > 0 && reads.duplicateChars > 0 && reads.duplicateChars < reads.directorChars,
+				"the run record counts reads: 6 returned, none blocked (a read is never refused for its size), shared chars below the total",
+				reads?.director === 6 && (reads.blocked ?? 0) === 0 && reads.directorChars > 0 && reads.duplicateChars > 0 && reads.duplicateChars < reads.directorChars,
 				JSON.stringify(reads),
 			);
 			check("the index carries the same numbers", same(files.index().find(line => line.runId === run.runId)?.reads, reads), JSON.stringify(files.index().find(line => line.runId === run.runId)?.reads));

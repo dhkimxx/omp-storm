@@ -18,9 +18,20 @@
  *   E2E-STEPS [step...]     the newest user message carrying it scripts the turn: one step per assistant tool call
  * Spawned children (assignment contains CHILD_MARK) finish through `yield` when offered. In a child's assignment:
  *   E2E-CHILD-READ <a,b>    call `read` on each path first
+ *   E2E-CHILD-SEND <agent> <word>
+ *                           call `write` on `agent://<agent>` with that one word first: a message to another agent
+ *   E2E-WAKE-CLAIM <text>   when a message wakes this child after it already answered, its answer is that text, to the
+ *                           end of the line (the first answer stays `E2E-CHILD-CLAIM`), so a scenario can tell the two
+ *                           deliveries apart; put it on its own line when `E2E-CHILD-CLAIM` is in the same assignment
  *   E2E-CHILD-WRITE <path>  call `write` with that path first (before the yield)
  *   E2E-CHILD-BASH <path>   change that path with `bash` first, through no edit tool
  *   E2E-CHILD-SH <base64>   run that shell command with `bash` first, so the child can record its real cwd/files
+ *   E2E-CHILD-BG <base64>   run that shell command with `bash` as a background job (`async: true`), once, before anything
+ *                           else that uses `bash`; the child then goes on (a `E2E-CHILD-SH` after it is the next call)
+ *   E2E-CHILD-EVAL <base64>  run that JavaScript with `eval` first (a cell that may ask a model through `completion()`)
+ *   E2E-CHILD-SERVICE <base64>
+ *                           ask `bash` to start that shell command as a named service (`name` + `ready`), once, before
+ *                           anything else that uses `bash`; a `E2E-CHILD-SH` in the same assignment is the next call
  *   E2E-CHILD-COMMIT <path> do the same and commit every tracked change
  *   E2E-CHILD-VERDICT correct
  *                           yield a review verdict that passes, when its schema asks for one
@@ -92,6 +103,12 @@ export interface ScriptedTask {
 	task?: string;
 	/** Appended to this item's assignment, e.g. an E2E-CHILD directive. */
 	say?: string;
+	/**
+	 * The director's own `effort` / `model` arguments of the item, as omp's task schema takes them (only when the user
+	 * turned on `task.enableEffort` / `task.perCallModel`). The hardening scenarios pass them to prove they are not used.
+	 */
+	effort?: string;
+	model?: string;
 	solutionSpace?: string;
 	isolated?: boolean;
 	outputSchema?: unknown;
@@ -122,9 +139,11 @@ export type Step = (
 	| { task: string[]; as?: string; say?: string; isolated?: boolean[] }
 	| { tasks: ScriptedTask[]; context?: string; awaitChildren?: string[] }
 	| { edit: string; content?: string }
-	| { bash: string }
+	| { bash: string; async?: boolean }
 	| { followUp: string; content?: string }
 	| { read: string }
+	/** Any tool by name with these arguments (required ones the schema names are filled with defaults). */
+	| { call: string; args: Record<string, unknown> }
 	| { ask: string }
 	| { ifAskApproved: string }
 	| { wait: true; releaseChildren?: string[] }
@@ -207,6 +226,8 @@ export interface LlmEntry {
 	roles: string[];
 	/** The tool result this request answers, cut. */
 	lastTool: string;
+	/** The last tool result in the request, wherever it sits (a note message may follow it), cut. */
+	lastToolResult: string;
 	/** What extensions added to a compaction request (`<additional-context>`), verbatim. */
 	compactionContext: string;
 	/**
@@ -418,6 +439,8 @@ function taskItemsCall(tools: Tool[] | undefined, items: ScriptedTask[], context
 			task,
 			solutionSpace: script.solutionSpace ?? "e2e: fixed reply",
 			...(script.isolated === true ? { isolated: true } : {}),
+			...(script.effort !== undefined ? { effort: script.effort } : {}),
+			...(script.model !== undefined ? { model: script.model } : {}),
 			...(script.outputSchema !== undefined ? { outputSchema: script.outputSchema } : {}),
 			...(script.schemaMode !== undefined ? { schemaMode: script.schemaMode } : {}),
 		};
@@ -438,6 +461,14 @@ function writeCall(path: string, content: string): Decision {
 /** A `bash` call: a change made this way is invisible to the edit-tool counter. */
 function bashCall(tools: Tool[] | undefined, command: string): Decision {
 	return { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command } };
+}
+
+/** The `name` omp's `bash` takes to start a long-lived service under its daemon instead of running a finite command. This file starts a server when loaded, so scenarios repeat the word rather than import it. */
+const SERVICE_NAME = "e2e-service";
+
+/** A `bash` call that asks omp to start `command` as a named service (omp's `name` + `ready` form). */
+function serviceCall(tools: Tool[] | undefined, command: string): Decision {
+	return { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command, name: SERVICE_NAME, ready: { log: "ready", timeout: 5 } } };
 }
 
 /** A call of an extension tool: by name when omp offers it, else through its `xd://<tool>` device. */
@@ -549,8 +580,9 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 		return step.awaitChildren === undefined ? decision : { ...decision, awaitChildren: step.awaitChildren };
 	}
 	if ("read" in step) return readCall(tools, step.read);
+	if ("call" in step) return { kind: "tool", name: step.call, args: { ...requiredArgs(schemaOf(tools, step.call)), ...step.args } };
 	if ("edit" in step) return writeCall(step.edit, step.content ?? "storm director check\n");
-	if ("bash" in step) return bashCall(tools, step.bash);
+	if ("bash" in step) return step.async === true ? { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(tools, "bash")), command: step.bash, async: true } } : bashCall(tools, step.bash);
 	if ("followUp" in step) return writeCall(step.followUp, step.content ?? "follow-up");
 	if ("ask" in step) return extensionCall(tools, "ask", { html: step.ask });
 	if ("wait" in step) {
@@ -606,8 +638,13 @@ function childDecision(request: ChatRequest): Decision {
 	const text = userText(messages);
 	const reads = (lastCapture(text, /E2E-CHILD-READ[ \t]+(\S+)/) ?? "").split(",").filter(Boolean);
 	const write = lastCapture(text, /E2E-CHILD-WRITE[ \t]+(\S+)/);
-	const bash = lastCapture(text, /E2E-CHILD-BASH[ \t]+(\S+)/);
+	const send = /E2E-CHILD-SEND[ \t]+(\S+)[ \t]+(\S+)/.exec(text) ?? undefined;
+	const wakeClaim = lastCapture(text, /E2E-WAKE-CLAIM[ \t]+([^\n]+)/);
+	const bash =lastCapture(text, /E2E-CHILD-BASH[ \t]+(\S+)/);
 	const sh = lastCapture(text, /E2E-CHILD-SH[ \t]+(\S+)/);
+	const service = lastCapture(text, /E2E-CHILD-SERVICE[ \t]+(\S+)/);
+	const background = lastCapture(text, /E2E-CHILD-BG[ \t]+(\S+)/);
+	const evalCode = lastCapture(text, /E2E-CHILD-EVAL[ \t]+(\S+)/);
 	const commit = lastCapture(text, /E2E-CHILD-COMMIT[ \t]+(\S+)/);
 	const answerVerdict = lastCapture(text, /E2E-CHILD-ANSWER-VERDICT[ \t]+(correct|incorrect)\b/) as "correct" | "incorrect" | undefined;
 	const allVerdict = lastCapture(text, /E2E-CHILD-ANSWER-VERDICT-ALL[ \t]+(correct|incorrect)\b/) as "correct" | "incorrect" | undefined;
@@ -623,10 +660,21 @@ function childDecision(request: ChatRequest): Decision {
 	// An explicit report repeats until the host accepts or gives up; a rejected yield must not turn into text.
 	if (report === undefined && yieldError === undefined && last?.role === "tool" && calls.at(-1) === "yield") return { kind: "text", text: claim ?? "done" };
 	if (done < reads.length) return readCall(request.tools, reads[done] ?? "");
+	if (evalCode !== undefined && !calls.includes("eval")) return { kind: "tool", name: "eval", args: { ...requiredArgs(schemaOf(request.tools, "eval")), language: "js", code: Buffer.from(evalCode, "base64").toString("utf8") } };
 	if (commit !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${commit} && git commit -qam storm-e2e-commit`);
-	if (sh !== undefined && !calls.includes("bash")) return bashCall(request.tools, Buffer.from(sh, "base64").toString("utf8"));
+	// The service request comes first and is made once, whatever answer it gets; a `E2E-CHILD-SH` after it is the next bash call.
+	const shells = calls.filter(name => name === "bash").length;
+	if (service !== undefined && shells === 0) return serviceCall(request.tools, Buffer.from(service, "base64").toString("utf8"));
+	const before = (service === undefined ? 0 : 1) + (background === undefined ? 0 : 1);
+	if (background !== undefined && shells === (service === undefined ? 0 : 1)) return { kind: "tool", name: "bash", args: { ...requiredArgs(schemaOf(request.tools, "bash")), command: Buffer.from(background, "base64").toString("utf8"), async: true } };
+	if (sh !== undefined && shells === before) return bashCall(request.tools, Buffer.from(sh, "base64").toString("utf8"));
 	if (bash !== undefined && !calls.includes("bash")) return bashCall(request.tools, `printf '%s\\n' storm-child-bash >> ${bash}`);
-	if (write !== undefined && !calls.includes("write")) return writeCall(write, "storm child change\n");
+	const writes = calls.filter(name => name === "write").length;
+	if (send !== undefined && writes === 0) return writeCall(`agent://${send[1]}`, send[2] ?? "hello");
+	if (write !== undefined && writes < (send === undefined ? 1 : 2)) return writeCall(write, "storm child change\n");
+	// Woken after it already answered (a text reply, then a new user message): the answer is the scenario's own word.
+	const answeredAt = messages.findIndex(message => message.role === "assistant" && !hasCalls(message) && textOf(message.content) !== "");
+	if (wakeClaim !== undefined && answeredAt >= 0 && messages.slice(answeredAt + 1).some(message => message.role === "user")) return { kind: "text", text: wakeClaim };
 	const yieldSchema = schemaOf(request.tools, "yield");
 	if (yieldSchema) {
 		if (yieldError !== undefined) return { kind: "tool", name: "yield", args: { error: yieldError } };
@@ -710,7 +758,7 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 		notes: request.messages
 			.filter(message => message.role === "developer" || message.role === "user")
 			.map(message => textOf(message.content))
-			.filter(text => text.startsWith("[storm:"))
+			.filter(text => text.startsWith("[storm:") || text.startsWith("[storm]"))
 			.map(text => text.slice(0, 1_200)),
 		model: request.model,
 		effort: request.reasoning_effort ?? request.reasoning?.effort ?? null,
@@ -734,6 +782,8 @@ function record(request: ChatRequest, who: Who, decision: Decision, bodyBytes: n
 		bodyBytes,
 		roles: [...new Set(messages.flatMap(entry => [...entry.text.matchAll(/STORM-ROLE ([\w-]+)/g)].map(match => match[1] ?? "")))],
 		lastTool: last?.role === "tool" ? last.text.slice(0, 1_000) : "",
+		// omp adds a tool's `additionalContext` as a user message after the result, so the result is not always last.
+		lastToolResult: messages.findLast(entry => entry.role === "tool")?.text.slice(0, 1_000) ?? "",
 		compactionContext: who === "compaction"
 			? (users.at(-1)?.text.match(/<additional-context>[\s\S]*?<\/additional-context>/)?.[0] ??
 				users.at(-1)?.text.match(/Additional focus: ([\s\S]*?)<\/instruction>/)?.[1] ?? "")

@@ -219,6 +219,18 @@ describe("closeout brief tiers", () => {
 		expect(brief.official).toMatchObject({ accepted: 1, inScope: 1, tone: "success" });
 	});
 
+	test("the one-row record of a short clean run names the spend only when it is a floor, so it stays one row at 60 columns; the card always names it", () => {
+		const base = record({ status: "done", endReason: "verified", endedAt: after(2), agents: [agentEntry({ changes: 2, review: { reviews: 1, passed: 1, failed: 0, findings: [0, 0, 0, 0] } })], results: [accepted("a")], costUsd: 0.0026 });
+		expect(closeoutBrief(base).tier).toBe("line");
+		expect(closeoutBrief(base).official.label).not.toContain("비용");
+		const floor = closeoutBrief({ ...base, spend: { lowerBound: true, evalUnread: 1 } }).official.label;
+		expect(floor).toContain("비용");
+		expect(floor).toContain("하한");
+		const card = closeoutBrief({ ...base, endedAt: after(42), closeout: draft() });
+		expect(card.tier).toBe("card");
+		expect(card.official.label).toContain("비용 $0.0026");
+	});
+
 	test("F1: a clean run of ten minutes or more is a durable card", () => {
 		const run = record({
 			status: "done",

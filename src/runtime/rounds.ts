@@ -786,18 +786,18 @@ function resultInstruction(gate: Unverified, reviewer?: string): string {
 	const remedy = gate.resultRemedy ?? (gate.resultState === "reviewable" ? "review" : gate.resultBlockedBy !== undefined ? "producer" : "work");
 	switch (remedy) {
 		case "replan":
-			return `Next: keep ${label} under the same id and replan it onto an approved lane, or record the user's explicit scope change; never send it for review and never rerun a lane the plan removed.`;
+			return `Next: ${label} sits on a lane the plan removed, so it can be neither reviewed nor rerun. Replan it onto an approved lane under the same id, or record the user's explicit scope change.`;
 		case "producer": {
 			const producer = detail(gate.resultBlockedBy, 40);
 			return producer === undefined
-				? `Next: complete the prerequisite result ${label} needs; do not rerun the consumer until that input lands.`
-				: `Next: have lane \`${producer}\` produce the input ${label} needs; do not rerun ${label} or spawn its replacement until that input lands.`;
+				? `Next: ${label} waits on a prerequisite result; rerunning it changes nothing until that input lands.`
+				: `Next: ${label} waits on an input from lane \`${producer}\`; rerunning it changes nothing until that lands.`;
 		}
 		case "review": {
 			const scoped = answerReview(gate);
 			if (scoped !== undefined) {
 				const reviewer = who === undefined ? "an approved reviewer" : `\`${who}\``;
-				return `Next: send ${reviewer} the answer ${label} exactly as its producer returned it and its cited source \`${scoped.citation}\` (receipt \`${scoped.receipt}\`); its final yield must add \`results: [{"id": "${target.id ?? ""}", "receipt": "${scoped.receipt}", "citation": "${scoped.citation}", "verdict": "correct" | "incorrect"}]\`. A tree or change verdict does not settle an answer; do not rerun its producing lane.`;
+				return `Next: send ${reviewer} the answer ${label} exactly as its producer returned it and its cited source \`${scoped.citation}\` (receipt \`${scoped.receipt}\`); its final yield must add \`results: [{"id": "${target.id ?? ""}", "receipt": "${scoped.receipt}", "citation": "${scoped.citation}", "verdict": "correct" | "incorrect"}]\`. A tree or change verdict does not settle an answer.`;
 			}
 			if (gate.resultKind === "answer") {
 				// No usable receipt: no verdict could ever bind, so a tree review would only loop.
@@ -805,14 +805,14 @@ function resultInstruction(gate: Unverified, reviewer?: string): string {
 				return `Next: ${where} with its cited source so Storm can issue a review receipt; a tree or change verdict does not settle an answer.`;
 			}
 			return who === undefined
-				? `Next: have an approved reviewer judge the submitted ${label} on the current tree; do not rerun its producing lane.`
-				: `Next: have \`${who}\` judge the submitted ${label} on the current tree; do not rerun its producing lane.`;
+				? `Next: have an approved reviewer judge the submitted ${label} on the current tree.`
+				: `Next: have \`${who}\` judge the submitted ${label} on the current tree.`;
 		}
 		case "retry":
-			return `Next: do not respawn the same work for ${label}. The host's native retry/fallback is exhausted for the failing attempt${target.attempt === undefined ? "" : ` \`${target.attempt}\``}; Storm will not retry it automatically. Replan it to a different approved lane, role or model, or report the blocker.`;
+			return `Next: the host's native retry/fallback is exhausted for ${label}'s failing attempt${target.attempt === undefined ? "" : ` \`${target.attempt}\``}, and Storm will not retry it automatically. Replan it onto a different approved lane, role or model, or report the blocker.`;
 		case "blocked": {
 			const unblock = detail(gate.resultUnblock, DETAIL_MAX);
-			return `Next: stop retrying ${label}. ${unblock === undefined ? "Report the blocker and the condition that would unblock it." : `Unblock condition: ${unblock}.`}`;
+			return `Next: ${label} is blocked. ${unblock === undefined ? "Report the blocker and the condition that would unblock it." : `Unblock condition: ${unblock}.`}`;
 		}
 		default: {
 			const where = target.lane === undefined ? `assign ${label} to a lane and show it` : `fix or rerun only ${label} in lane \`${target.lane}\``;
@@ -824,7 +824,7 @@ function resultInstruction(gate: Unverified, reviewer?: string): string {
 						: gate.resultKind === "change"
 							? " in the tree"
 							: "";
-			return `Next: ${where}${how}${attempt}; keep results already accepted and independent lanes as they are.`;
+			return `Next: ${where}${how}${attempt}; accepted results and independent lanes are kept as they are.`;
 		}
 	}
 }
@@ -833,13 +833,13 @@ function resultInstruction(gate: Unverified, reviewer?: string): string {
 function roundInstruction(gate: Unverified, reviewer?: string): string {
 	switch (gate.cause) {
 		case "incorrect":
-			return `Fix its findings through the team, then have \`${reviewer}\` verify again; stop only after a \`correct\` verdict.`;
+			return `Check which findings hold, fix those through the team, then have \`${reviewer}\` verify again; only a \`correct\` verdict settles this.`;
 		case "p0":
-			return `Re-check each open P0 on the current tree, fix it through the team, then have \`${reviewer}\` verify that exact tree again; only a later independent review of the same or replacement diff can clear it.`;
+			return `Re-check each open P0 on the current tree, fix those that hold through the team, then have \`${reviewer}\` verify that exact tree; only a later independent review of the same or replacement diff clears it.`;
 		case "coverage":
-			return "Use the planned worker to fix what made the required check fail; Storm runs the approved check on the new tree. Re-review only if the change requires it.";
+			return "Storm runs the approved check itself on the new tree; the planned worker fixes what made it fail. Re-review only if the change requires it.";
 		case "lanes":
-			return "Finish the remaining plan lane through the team and let the lane's own role complete it. A review cannot stand in for a lane that never ran.";
+			return "The lane's own role completes it through the team; a review cannot stand in for a lane that never ran.";
 		case "results":
 			return resultInstruction(gate, reviewer);
 		case "unbound":
@@ -847,7 +847,7 @@ function roundInstruction(gate: Unverified, reviewer?: string): string {
 		case "no-proof":
 			return `Have \`${reviewer}\` verify the exact current tree and make the run's required checks pass; a verdict without current tree and check evidence is not proof.`;
 		default:
-			return `Have \`${reviewer}\` verify the current state against the task, fix what it finds through the team, and stop only after a \`correct\` verdict.`;
+			return `Have \`${reviewer}\` verify the current state against the task and fix the findings that hold through the team; only a \`correct\` verdict ends this.`;
 	}
 }
 
@@ -871,7 +871,7 @@ function answerBatchInstruction(load: AnswerReviewLoad, reviewer: string | undef
 		load.batches > load.slots
 			? ` Run at most ${load.slots} at once; send each remaining one as a new task or a follow-up once a reviewer finishes.`
 			: "";
-	return `Next: Storm holds ${answers} waiting for review in ${load.batches} batch${load.batches === 1 ? "" : "es"}. Send ${who} ${tasks} this round, one per batch.${queue} Storm appends the next unsent batch (answers, receipts and anchors) to each ${who} task or follow-up; write a plain review task and do not paste answers or receipts yourself. A tree or change verdict does not settle an answer; do not rerun the producing lanes.`;
+	return `Next: Storm holds ${answers} waiting for review in ${load.batches} batch${load.batches === 1 ? "" : "es"}. Send ${who} ${tasks} this round, one per batch.${queue} Storm appends the next unsent batch (answers, receipts and anchors) to each ${who} task or follow-up; write a plain review task; pasted answers or receipts are not needed. A tree or change verdict does not settle an answer.`;
 }
 
 /** Whether the gate's own next action is the scoped review of an answer, which the batch instruction replaces. */
@@ -880,6 +880,16 @@ function answerReviewGate(gate: Unverified): boolean {
 	const remedy = gate.resultRemedy ?? (gate.resultState === "reviewable" ? "review" : undefined);
 	return remedy === "review" && answerReview(gate) !== undefined;
 }
+
+/**
+ * What a round says at the moment the director must decide, in place of a generic "think": a round that begins with a
+ * result open asks for the cause to be read first (the same call meets the same check); every other round asks for the
+ * evidence behind the next stop. A stalled round names what to compare. Tests import these, not their words.
+ */
+export const ROUND_RESULTS_CHECK = "Read why it is open first: the same work meets the same check.";
+export const ROUND_STOP_CHECK = "Before stopping again, check each requested result against your evidence.";
+export const ROUND_STALLED =
+	"Nothing changed since the last round. Name what you expected to change and why it did not, then act on that or state the blocker; another round without progress ends the run.";
 
 /** The model-facing section that starts a round: why Storm sent it, what to do, and whether another round follows. */
 export function buildRoundMessage(input: {
@@ -913,11 +923,8 @@ export function buildRoundMessage(input: {
 	const batched = load !== undefined && load.answers > 0 && load.batches > 0 ? answerBatchInstruction(load, input.reviewer) : undefined;
 	if (batched !== undefined && answerReviewGate(input.gate)) lines.push(batched);
 	else lines.push(roundInstruction(input.gate, input.reviewer), ...(batched === undefined ? [] : [batched]));
-	if ((input.stalled ?? 0) > 0) {
-		lines.push(
-			"Nothing changed since the last round: no new change, review or result evidence. Take a different approach or state the blocker; do not repeat the same work. Another round without progress ends the run.",
-		);
-	}
+	lines.push(input.gate.cause === "results" ? ROUND_RESULTS_CHECK : ROUND_STOP_CHECK);
+	if ((input.stalled ?? 0) > 0) lines.push(ROUND_STALLED);
 	if (capped && input.round === input.maxRounds) lines.push("This is the last round.");
 	lines.push("</storm-run>");
 	return lines.join("\n");

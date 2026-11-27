@@ -43,7 +43,7 @@ import {
 	type SyncResultFact,
 } from "./attempt-report.ts";
 import type { AttemptAdmission, AttemptArtifactMode, AttemptPreparation, AttemptSettlement } from "./attempt-bridge.ts";
-import type { PlanLane } from "../types.ts";
+import type { PlanLane, UnplannedKind } from "../types.ts";
 
 /**
  * Largest host output file read as a whole answer: the evaluator's scan bound in characters, at four UTF-8 bytes at
@@ -68,7 +68,32 @@ export interface AttemptSettlementPort {
 	settle(input: AttemptSettlement): Promise<void>;
 	/** Drop a prepared dispatch whose follow-up write never reached the worker; no settlement will come for it. */
 	discard?(input: { runId: string; dispatch: string }): Promise<void>;
+	/** A delivery that answers no declared result. Recorded and shown; it never touches a result row. */
+	unplanned?(input: AttemptUnplannedDelivery): void | Promise<void>;
 }
+
+/** One delivery the run received that no declared result waits for: host facts only. */
+export interface AttemptUnplannedDelivery {
+	runId: string;
+	/** `job:<job>:<agent>` for a pushed or waited job, `task:<call>:<agent>` for a synchronous result. */
+	id: string;
+	kind: UnplannedKind;
+	agent: string;
+	/** The session that received the delivery. */
+	receiverId: string;
+	/** The agent's parent in the host registry, when the registry knew it. */
+	parentId?: string;
+	lane?: string;
+	/** The turn's start, a host fact (a job row's start, or a result's settlement minus its duration). */
+	startedAt?: number;
+	endedAt: number;
+	status?: string;
+	/** The host's own price of this one turn (a synchronous result carries its usage); absent when it gave none. */
+	costUsd?: number;
+}
+
+/** How many delivery identities the collector remembers to keep one delivery from being recorded twice. */
+const UNPLANNED_SEEN_MAX = 512;
 
 /** The subset of `AgentRegistryApi` the collector uses, so tests and host versions stay decoupled. */
 export interface AttemptRegistryRef {
@@ -244,6 +269,10 @@ export interface AttemptSyncResult extends SyncResultFact {
 	outputMeta?: { charCount?: unknown } | undefined;
 	/** The host schema envelope including its data payload; citations are candidates only. */
 	structuredOutput?: { status?: unknown; error?: unknown; data?: unknown };
+	/** The turn's wall time as the host measured it; with the delivery time it gives the turn's start. */
+	durationMs?: unknown;
+	/** The host's usage of the turn; only its `cost.total` is read, as the turn's price. */
+	usage?: { cost?: { total?: unknown } } | undefined;
 }
 
 /** Host `TaskToolDetails.results`: object items only; attempt-report validates every field it reads. */
@@ -729,6 +758,10 @@ export class AttemptCollector {
 	#serial = 0;
 	#registryChain: Promise<void> = Promise.resolve();
 	#stopped = false;
+	/** When each agent's latest delivery reached this collector: a turn that began before it is a replay, not a new turn. */
+	#lastDelivery = new Map<string, number>();
+	/** Identities already reported as unplanned, so one delivery that arrives by two paths is recorded once. */
+	#unplannedSeen = new Set<string>();
 
 	constructor(deps: AttemptCollectorDeps) {
 		this.#deps = deps;
@@ -758,6 +791,8 @@ export class AttemptCollector {
 		this.#tracked.clear();
 		this.#openCalls.clear();
 		this.#acknowledged.clear();
+		this.#lastDelivery.clear();
+		this.#unplannedSeen.clear();
 		this.#registryChain = Promise.resolve();
 	}
 
@@ -1016,6 +1051,24 @@ export class AttemptCollector {
 					: rawContent.includes("<task-result")
 						? undefined
 						: { text: rawContent, preview: false };
+		// A result of a child this run has no dispatch for (a lane without declared results, a worker Storm did not place)
+		// answers no declared result. It is kept as a fact; the loop below only ever reads dispatches.
+		for (const result of results ?? []) {
+			const agent = typeof result.id === "string" ? result.id : undefined;
+			if (agent === undefined || this.#tracked.get(agent)?.runId === input.runId) continue;
+			const duration = typeof result.durationMs === "number" && Number.isFinite(result.durationMs) ? result.durationMs : undefined;
+			const price = result.usage?.cost?.total;
+			await this.#reportUnplanned(input.runId, {
+				kind: "unplaced",
+				agent,
+				receiverId: input.parentId,
+				call: input.toolCallId,
+				startedAt: duration === undefined ? undefined : Math.round(input.observedAt - duration),
+				endedAt: input.observedAt,
+				status: result.aborted === true ? "cancelled" : result.exitCode === 0 ? "completed" : "failed",
+				costUsd: typeof price === "number" && Number.isFinite(price) && price >= 0 ? price : undefined,
+			});
+		}
 		for (const tracked of [...this.#tracked.values()]) {
 			if (tracked.settled || tracked.followUp || tracked.runId !== input.runId) continue;
 			if (tracked.parentId !== input.parentId) continue;
@@ -1083,13 +1136,91 @@ export class AttemptCollector {
 			const agentId = typeof job.agentId === "string" ? job.agentId : undefined;
 			if (agentId === undefined) continue;
 			const tracked = this.#tracked.get(agentId);
-			if (tracked === undefined || tracked.runId !== input.runId || tracked.settled) continue;
 			const row = input.jobs?.find(candidate => candidate.id === job.jobId && candidate.agentId === agentId);
 			// A delivered job is never running: when omp reused the job id, a running row is the *next* turn's, and its
 			// start says nothing about the turn being delivered.
 			const start = row?.status !== "running" && typeof row?.startTime === "number" && Number.isFinite(row.startTime) ? row.startTime : undefined;
+			if (tracked === undefined || tracked.runId !== input.runId || tracked.settled) {
+				// No dispatch of this run is waiting for the worker: the delivery answers no declared result. It is kept
+				// as a fact; no row changes. `woken` when the worker's own dispatch had already settled.
+				const woken = tracked !== undefined && tracked.runId === input.runId && tracked.settled;
+				await this.#reportUnplanned(input.runId, {
+					kind: woken ? "woken" : "unplaced",
+					agent: agentId,
+					receiverId: input.parentId,
+					job: typeof job.jobId === "string" ? job.jobId : undefined,
+					startedAt: start,
+					endedAt: input.observedAt,
+					status: typeof job.status === "string" ? job.status : undefined,
+					lane: woken ? tracked?.lane : undefined,
+				});
+				continue;
+			}
+			this.#lastDelivery.set(agentId, input.observedAt);
 			// Only this job's own output, never the notice frame or a sibling job's answer.
 			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobOutput(envelope.content, jobs, index, agentId), start);
+		}
+	}
+
+	/**
+	 * Hands one unplanned delivery to the port, once. A delivery is a new turn when no earlier delivery of the same agent
+	 * was seen, or when the job's own start is not before that delivery (the clock is the host process's, as everywhere
+	 * in this file); a job that started before it is the same turn again (a replay, or the same message through the
+	 * second of two paths) and is not reported. Never throws: the port may refuse or fail, the delivery stays the
+	 * host's.
+	 */
+	async #reportUnplanned(
+		runId: string,
+		fact: {
+			kind: UnplannedKind;
+			agent: string;
+			receiverId: string;
+			job?: string | undefined;
+			call?: string | undefined;
+			startedAt?: number | undefined;
+			endedAt: number;
+			status?: string | undefined;
+			lane?: string | undefined;
+			costUsd?: number | undefined;
+		},
+	): Promise<void> {
+		const port = this.#deps.port.unplanned;
+		if (port === undefined) return;
+		const id =
+			fact.job !== undefined
+				? (asyncAttemptId(fact.job, fact.agent, fact.startedAt) ?? asyncAttemptId(fact.job, fact.agent))
+				: fact.call !== undefined
+					? syncAttemptId(fact.call, fact.agent)
+					: undefined;
+		if (id === undefined) return;
+		const previous = this.#lastDelivery.get(fact.agent);
+		const fresh = fact.call !== undefined || previous === undefined || (fact.startedAt !== undefined && fact.startedAt >= previous);
+		this.#lastDelivery.set(fact.agent, Math.max(previous ?? fact.endedAt, fact.endedAt));
+		if (!fresh || this.#unplannedSeen.has(id)) return;
+		this.#unplannedSeen.add(id);
+		if (this.#unplannedSeen.size > UNPLANNED_SEEN_MAX) this.#unplannedSeen.delete(this.#unplannedSeen.values().next().value as string);
+		let parentId: string | undefined;
+		try {
+			parentId = this.#deps.registry().get(fact.agent)?.parentId;
+		} catch {
+			parentId = undefined;
+		}
+		try {
+			await port.call(this.#deps.port, {
+				runId,
+				id,
+				kind: fact.kind,
+				agent: fact.agent,
+				receiverId: fact.receiverId,
+				...(parentId === undefined ? {} : { parentId }),
+				...(fact.lane === undefined ? {} : { lane: fact.lane }),
+				...(fact.startedAt === undefined ? {} : { startedAt: fact.startedAt }),
+				endedAt: fact.endedAt,
+				...(fact.status === undefined ? {} : { status: fact.status }),
+				...(fact.costUsd === undefined ? {} : { costUsd: fact.costUsd }),
+			});
+		} catch {
+			// The collector never throws into an omp event handler.
 		}
 	}
 
@@ -1109,7 +1240,26 @@ export class AttemptCollector {
 			const agentId = typeof job.agentUrlId === "string" ? job.agentUrlId : undefined;
 			if (jobId === undefined || agentId === undefined) continue;
 			const tracked = this.#tracked.get(agentId);
-			if (tracked === undefined || tracked.runId !== input.runId || tracked.parentId !== input.parentId || tracked.settled) continue;
+			if (tracked === undefined || tracked.runId !== input.runId || tracked.parentId !== input.parentId || tracked.settled) {
+				// A terminal row the host still holds a result for, with no dispatch of this run waiting for it.
+				const status = typeof job.status === "string" ? job.status : undefined;
+				const settledAt = typeof job.settledAtMs === "number" && Number.isFinite(job.settledAtMs) ? job.settledAtMs : undefined;
+				if (status === "running" || settledAt === undefined || !waitDeliverable(job)) continue;
+				const duration = typeof job.durationMs === "number" && Number.isFinite(job.durationMs) ? job.durationMs : undefined;
+				const same = tracked !== undefined && tracked.runId === input.runId && tracked.settled;
+				await this.#reportUnplanned(input.runId, {
+					kind: same ? "woken" : "unplaced",
+					agent: agentId,
+					receiverId: input.parentId,
+					job: jobId,
+					startedAt: duration === undefined ? undefined : Math.round(settledAt - duration),
+					endedAt: settledAt,
+					status,
+					lane: same ? tracked?.lane : undefined,
+				});
+				continue;
+			}
+			this.#lastDelivery.set(agentId, input.observedAt);
 			if (input.observedAt < tracked.startedAt) continue;
 			// The wait snapshot is the delivery only when the host still holds a result for this row; a later aggregate
 			// row of an independently delivered job carries no text and must not replace that completion.

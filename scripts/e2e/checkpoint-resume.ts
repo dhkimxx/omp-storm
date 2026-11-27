@@ -100,9 +100,13 @@ try {
 				second.results?.some(row => row.id === "retry-receipt" && row.state === "accepted") === true,
 				`${second.status}/${second.endReason} starts=${starts().join(",")} ${JSON.stringify(second.results)}`);
 			suite.check("resume did not ask for a new team setup or create AI workers", resumed.dialogs.length === 1 && cursor.of("child").length === 0);
-			suite.check("the director can see accepted and reopened result IDs on demand", resumed.frames.some(frame =>
-				frame.type === "tool_execution_end" && frame.toolName === "storm" &&
-				["Storm 실행 계획·필수 결과:", "first-receipt", "retry-receipt"].every(part => JSON.stringify(frame.result).includes(part))));
+			// 0.27.0 (P1-b W4): the director's `storm status` carries the plan in force with each result's state, drawn by
+			// `renderPlanView` (`src/tool/plan-view.ts`), not the compaction checkpoint's header it asserted before.
+			suite.check("the director can see accepted and reopened result IDs on demand", resumed.frames.some(frame => {
+				if (frame.type !== "tool_execution_end" || frame.toolName !== "storm") return false;
+				const shown = (frame.result as { content?: { text?: string }[] } | undefined)?.content?.map(part => part.text ?? "").join("\n") ?? "";
+				return /first-receipt.*→ 수용/.test(shown) && /retry-receipt.*→ 대기/.test(shown);
+			}));
 		} finally {
 			await resumed.close();
 		}

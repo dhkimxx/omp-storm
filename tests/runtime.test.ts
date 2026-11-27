@@ -17,7 +17,7 @@ import {
 	resetLedger,
 	startLedgerRun,
 } from "../src/runtime/ledger.ts";
-import { buildHandoff, lastRun, newRunId, pruneRuns, readRun, resumableRun, runsDir, stateDir, writeRun } from "../src/runtime/run.ts";
+import { buildHandoff, DECIDE_BEFORE_STOP, lastRun, newRunId, pruneRuns, readRun, resumableRun, runsDir, stateDir, writeRun } from "../src/runtime/run.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import { activeTrialFor, markTrialStop, noteTrialSpawn, resetTrialSpawns, shouldRouteToTrial, trialCharge, trialPhase } from "../src/runtime/trials.ts";
 import type { RoleConfig, RunEndReason, RunRecord, StormConfig, TrialConfig } from "../src/types.ts";
@@ -268,7 +268,10 @@ describe("handoff", () => {
 		expect(maxOf("storm-explorer")).toBe(4);
 		expect(maxOf("storm-implementer")).toBe(4);
 		expect(maxOf("storm-architect")).toBe(1);
-		expect(rules(text).some(l => l.includes("`progress`") && l.includes("new name"))).toBe(true);
+		// The replan form is taught once, by the tool description and the plan reply, not repeated in every run contract.
+		expect(rules(text).some(l => l.includes("`progress`"))).toBe(false);
+		// The decision point before stopping is in the contract exactly once.
+		expect(rules(text).filter(l => l.includes(DECIDE_BEFORE_STOP))).toHaveLength(1);
 		expect(rules(text).some(l => l.includes("`storm brief`") && l.includes("after it settles"))).toBe(true);
 		expect(rules(text).every(l => l.startsWith("- "))).toBe(true);
 	});
@@ -360,7 +363,8 @@ describe("handoff", () => {
 	test("shared lanes share the checkout; a reason-marked independent lane alone leaves it, never for parallelism", () => {
 		const shared = rules(buildHandoff({ ...base, config: five })).find(l => l.includes("Share this checkout"))!;
 		expect(shared).toContain("reviewer too");
-		expect(shared).toContain("sequence overlapping edits");
+		// Storm starts writing lanes one at a time itself: the contract does not ask the director to order them.
+		expect(shared).not.toContain("sequence");
 		expect(shared).toContain("`isolationReason`");
 		expect(shared).toContain("work stays outside");
 		expect(shared).not.toContain("parallelism");
@@ -478,7 +482,7 @@ describe("handoff", () => {
 		});
 		expect(text).toContain("Continues run run-20261119-090000-0ld0, which stopped (interrupted) after 2 rounds.");
 		expect(text).toContain("Checkpoint restored: kept 3 accepted, reopened 1, blocked 0.");
-		expect(text).toContain("accepted results restored from the checkpoint need no new work");
+		expect(text).toContain("restored from the checkpoint need no new work");
 		expect(text).not.toContain("Earlier plan:");
 		expect(text).not.toContain("repair the login flow");
 		expect(text).not.toContain("git status");

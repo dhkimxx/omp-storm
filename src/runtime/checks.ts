@@ -23,6 +23,37 @@ export const MAX_CHECK_OUTPUT_BYTES = 65_536;
 /** SIGTERM is followed by SIGKILL on this schedule; the result settles even if the child cannot be reaped. */
 const KILL_GRACE_MS = 1_000;
 const HARD_TEARDOWN_MS = 3_000;
+/**
+ * After the leader closed, members that are still in its group get this long to finish on their own (a helper that is
+ * exiting in the same instant is not "left behind") before the group is stopped. The wait only delays the end; the
+ * fence is never released during it.
+ */
+const GROUP_SETTLE_MS = 50;
+const GROUP_PROBE_MS = 25;
+/** After the result settled without proof, the group is probed this often, unreferenced, to resolve `ended` later. */
+const GROUP_LATE_PROBE_MS = 250;
+
+/**
+ * Whether a command's process group can be observed. POSIX only: the leader is started with its own group and
+ * `kill(-pgid, 0)` answers ESRCH exactly when no member is left. Where this is false (Windows) the end of the command
+ * is the leader's `close`, which says nothing about processes it started; the limit is the same as for a member that
+ * left the group (see `PROCESS_GROUP_LIMIT`).
+ */
+export const PROCESS_GROUPS_OBSERVABLE = process.platform !== "win32";
+
+/**
+ * What Storm cannot know about a command it ran, for the user who writes jobs and checks. Stated once so docs, notes
+ * and tests agree: Storm proves that its process group is empty, not that nothing the command started is still running.
+ */
+export const PROCESS_GROUP_LIMIT =
+	"Storm은 명령이 시작한 프로세스 그룹이 비었는지만 확인합니다. 명령이 하위 프로세스를 새 세션이나 새 그룹으로 떼어 놓은 경우(setsid, 데몬화)와 프로세스 그룹이 없는 플랫폼(Windows)에서는 그런 프로세스가 남아 있는지 알 수 없습니다.";
+
+/** A command that left group members behind: they were stopped, and the run is not counted as passed. */
+export const LEFT_BEHIND_STOPPED_NOTE =
+	"명령이 끝난 뒤에도 같은 프로세스 그룹에 하위 프로세스가 남아 있어 종료했습니다. 중간에 멈춘 작업이 있을 수 있어 통과로 보지 않습니다. 명령이 하위 프로세스를 기다린 뒤 끝나도록 하세요";
+/** The same, but the members could not be stopped in time: the end is unproven and the fence stays. */
+export const LEFT_BEHIND_ALIVE_NOTE =
+	"명령이 끝난 뒤에도 같은 프로세스 그룹에 하위 프로세스가 남아 있고 종료하지 못했습니다. 끝났다고 볼 수 없으니 통과로 보지 않습니다";
 
 /** Why checks did not run. Configured checks are never run without an approved config. */
 export type CheckSkipReason = "no-config" | "invalid-config" | "unapproved" | "no-checks";
@@ -61,9 +92,14 @@ export interface CheckReport {
 	configHash: string;
 	/** The tree fingerprint the caller read before the run; evidence after a different tree is not this report's. */
 	fingerprint: string;
-	/** Every configured check was started; false when cancellation left `unrun` entries. */
+	/** Every configured check was started; false when cancellation or an unproven end left `unrun` entries. */
 	complete: boolean;
 	aborted: boolean;
+	/**
+	 * Present when a check's process group could not be proven empty: its processes may still be running in the tree,
+	 * so the later checks did not start and the tree fingerprint is not a reading of a quiet tree. In memory only.
+	 */
+	endUnproven?: { check: string };
 	startedAt: string;
 	finishedAt: string;
 	durationMs: number;
@@ -86,6 +122,12 @@ export interface RequiredChecksInput {
 	signal?: AbortSignal;
 	/** Bytes kept from each output stream; clamped to 1..`MAX_CHECK_OUTPUT_BYTES`. */
 	outputLimitBytes?: number;
+	/**
+	 * Called once when a check's end could not be proven, with the promise that resolves if the OS later proves it. A
+	 * caller that holds the target (the write lease) must keep it until `ended` resolves: checks have no durable fence
+	 * of their own.
+	 */
+	onEndUnproven?: (info: { check: string; ended: Promise<void> }) => void;
 }
 
 export type CheckGate =
@@ -105,6 +147,31 @@ export function checkGate(config: ConfigLoad, approval: ApprovalRecord | undefin
 	const checks = config.config.requiredChecks;
 	if (checks === undefined || checks.length === 0) return { status: "skipped", reason: "no-checks" };
 	return { status: "ready", configHash: config.hash, checks };
+}
+
+/**
+ * Targets whose required check ended without proof that its process group is empty, by root, in this process. Checks have
+ * no durable fence of their own, so this is what keeps a later run from taking the target before the processes are seen gone.
+ */
+const unprovenChecks = new Map<string, number>();
+
+/** Records that a check on `root` is not proven ended; the returned function lifts it. `ended` is only for the caller's own wait. */
+export function trackUnprovenCheck(root: string, _ended: Promise<void>): () => void {
+	unprovenChecks.set(root, (unprovenChecks.get(root) ?? 0) + 1);
+	let lifted = false;
+	return () => {
+		if (lifted) return;
+		lifted = true;
+		const left = (unprovenChecks.get(root) ?? 1) - 1;
+		if (left <= 0) unprovenChecks.delete(root);
+		else unprovenChecks.set(root, left);
+	};
+}
+
+/** What a new run on `root` is told while a required check of an earlier run is not proven ended; undefined when none is. */
+export function uncertainCheckBlock(root: string): string | undefined {
+	if (!unprovenChecks.has(root)) return undefined;
+	return "[storm:check-fence] 이전 실행의 필수 검사 프로세스가 아직 끝났다고 확인되지 않아 이 작업 대상을 쓰는 새 실행을 시작하지 않았습니다. 잠시 뒤 다시 시도하세요. 계속되면 그 검사가 남긴 프로세스를 직접 확인해 종료하세요.";
 }
 
 function numberIn(value: number | undefined, fallback: number, max: number): number {
@@ -199,6 +266,21 @@ function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
 	}
 }
 
+/**
+ * `empty` only when the OS says no process is left in the group (ESRCH). A group that exists, one that cannot be
+ * signalled (EPERM still means a member exists) and any other error are all `occupied`: the end is proven by ESRCH
+ * and by nothing else, so an unexpected answer keeps the fence. While any member lives the pgid cannot be reused as
+ * a pid, so ESRCH is not a stale answer about another process.
+ */
+function groupState(pid: number): "empty" | "occupied" {
+	try {
+		process.kill(-pid, 0);
+		return "occupied";
+	} catch (error) {
+		return (error as NodeJS.ErrnoException | null | undefined)?.code === "ESRCH" ? "empty" : "occupied";
+	}
+}
+
 function spawnErrorNote(error: unknown): string {
 	const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
 	return typeof code === "string" && code.length <= 40 ? `실행하지 못했습니다 (${code})` : "실행하지 못했습니다";
@@ -254,7 +336,14 @@ export interface BoundedProcessResult {
  * Spawns one command and waits for it. A timeout or abort sends SIGTERM to its process group, then SIGKILL, and settles
  * the result even if teardown does not finish, so a caller can never hang forever. Stdout/stderr are retained only as
  * bounded tails. `processEnded` tells a caller whether releasing a resource fence is provable; when teardown gave up,
- * `ended` resolves only if the OS later reports the child's actual close, so a caller can release exact tokens then.
+ * `ended` resolves only if the OS later proves the end, so a caller can release exact tokens then.
+ *
+ * "Ended" means the leader exited, its pipes closed AND its process group is empty (POSIX; see
+ * `PROCESS_GROUPS_OBSERVABLE`). A command that exits while members of its group still run (a helper whose output was
+ * redirected keeps neither pipe) gets those members stopped (SIGTERM, then SIGKILL) before the end is reported, on
+ * every way a run finishes: normal exit, non-zero exit, timeout and abort. A clean exit that needed this is `failed`
+ * with the leader's exit code kept and a note, because the helpers were cut off mid-work. A member that left the group
+ * is not seen (`PROCESS_GROUP_LIMIT`).
  */
 export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedProcessResult> {
 	const { argv, cwd, timeoutMs, outputLimitBytes, signal } = input;
@@ -313,6 +402,10 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 	let timedOut = false;
 	let cancelled = false;
 	let spawnError: string | undefined;
+	/** The leader closed and its group still had members that nobody asked to stop (no timeout, no abort). */
+	let leftBehind = false;
+	/** What the leader reported at `close`; teardown that gives up later still reports the leader's own outcome. */
+	let leader: { code: number | null; endedBy: string | null } | undefined;
 	let deadline: NodeJS.Timeout | undefined;
 	let killGrace: NodeJS.Timeout | undefined;
 	let hardTeardown: NodeJS.Timeout | undefined;
@@ -324,16 +417,21 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 		clearTimeout(killGrace);
 		clearTimeout(hardTeardown);
 		if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+		// A leader that exited cleanly while its helpers were still running did not finish what it started: they were
+		// stopped (or could not be), so its exit code no longer vouches for the tree. The code is kept as observed.
+		const unfinished = leftBehind && !timedOut && !cancelled && spawnError === undefined;
 		const status: Exclude<CheckStatus, "unrun"> = timedOut
 			? "timed-out"
 			: cancelled
 				? "cancelled"
 				: spawnError !== undefined
 					? "spawn-error"
-					: code === 0
+					: code === 0 && !unfinished
 						? "passed"
 						: "failed";
-		const note = spawnError ?? (timedOut ? `시간 한도 ${timeoutMs}ms를 넘었습니다` : cancelled ? "취소되었습니다" : undefined);
+		const note = spawnError ??
+			(timedOut ? `시간 한도 ${timeoutMs}ms를 넘었습니다` : cancelled ? "취소되었습니다" : undefined) ??
+			(unfinished ? (processEnded ? LEFT_BEHIND_STOPPED_NOTE : LEFT_BEHIND_ALIVE_NOTE) : undefined);
 		resolve({
 			status,
 			exitCode: code,
@@ -348,12 +446,9 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 			...(note === undefined ? {} : { note }),
 		});
 	};
-	const terminate = (timeout: boolean): void => {
-		if (settled) return;
-		if (timeout) timedOut = true;
-		else cancelled = true;
-		// A second abort/timeout keeps the first teardown schedule; only its classification is updated.
-		if (killGrace !== undefined) return;
+	/** Stops the group: SIGTERM now, SIGKILL after the grace, and a result without proof after the hard limit. */
+	const beginTeardown = (): void => {
+		if (settled || killGrace !== undefined) return;
 		signalChild(child, "SIGTERM");
 		killGrace = setTimeout(() => {
 			if (!settled) signalChild(child, "SIGKILL");
@@ -361,11 +456,18 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 		hardTeardown = setTimeout(() => {
 			if (settled) return;
 			// A process that cannot be reaped must not keep this promise or this process alive. Its end is unproven, but
-			// the `close` listener stays: `ended` resolves only when the OS later reports the actual end.
+			// the `close` listener and the group probe stay: `ended` resolves only when the OS later proves the end.
 			releasePipes(child);
 			child.unref();
-			finish(null, null, false);
+			finish(leader?.code ?? null, leader?.endedBy ?? null, false);
 		}, KILL_GRACE_MS + HARD_TEARDOWN_MS);
+	};
+	const terminate = (timeout: boolean): void => {
+		if (settled) return;
+		if (timeout) timedOut = true;
+		else cancelled = true;
+		// A second abort/timeout keeps the first teardown schedule; only its classification is updated.
+		beginTeardown();
 	};
 
 	child.on("error", (error) => {
@@ -377,9 +479,35 @@ export function runBoundedProcess(input: BoundedProcessInput): Promise<BoundedPr
 	child.on("close", (code, endedBy) => {
 		// A spawn that never got a pid is a spawn failure even if only `close` reports it.
 		if (spawnError === undefined && child.pid === undefined) spawnError = "실행하지 못했습니다";
-		// This is the OS proof a retained fence waits for, including when it arrives after hard teardown.
-		ended.resolve();
-		finish(code, endedBy, true);
+		leader = { code, endedBy };
+		const pid = child.pid;
+		if (pid === undefined || !PROCESS_GROUPS_OBSERVABLE) {
+			// Nothing was started, or there is no group to ask about (see `PROCESS_GROUPS_OBSERVABLE`).
+			ended.resolve();
+			finish(code, endedBy, true);
+			return;
+		}
+		// `close` says the leader exited and its pipes are shut. It does not say the group is empty: a member that
+		// redirected its output is still running and may still write. The end is proven only by an empty group, and
+		// `ended` (what a retained fence waits for, even after the result gave up) resolves only then.
+		const closedAt = performance.now();
+		const probe = (): void => {
+			if (groupState(pid) === "empty") {
+				ended.resolve();
+				finish(code, endedBy, true);
+				return;
+			}
+			// Members were left behind. If nobody asked to stop the command, stop them now; a timeout or an abort already
+			// runs its own teardown, which this probe only observes.
+			if (!settled && killGrace === undefined && performance.now() - closedAt >= GROUP_SETTLE_MS) {
+				leftBehind = true;
+				beginTeardown();
+			}
+			const next = setTimeout(probe, settled ? GROUP_LATE_PROBE_MS : GROUP_PROBE_MS);
+			// A result that already gave up must not keep this process alive while it waits for a proof that may never come.
+			if (settled) next.unref();
+		};
+		probe();
 	});
 	child.stdout?.on("data", (chunk: Buffer) => stdout.add(chunk));
 	child.stderr?.on("data", (chunk: Buffer) => stderr.add(chunk));
@@ -408,6 +536,7 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 	const began = performance.now();
 	const evidence: CheckEvidence[] = [];
 	let aborted = false;
+	let endUnproven: { check: string } | undefined;
 
 	for (const [index, check] of gate.checks.entries()) {
 		if (input.signal?.aborted === true) {
@@ -435,9 +564,18 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 			stderr: result.stderr,
 			...(result.note === undefined ? {} : { note: result.note }),
 		});
+		// Every later check runs in the same tree, so it must not start while this one's processes may still be there.
+		if (!result.processEnded) {
+			endUnproven = { check: check.name };
+			input.onEndUnproven?.({ check: check.name, ended: result.ended });
+		}
 		// A cancellation that landed while this check ran leaves the rest unstarted.
 		if (result.status === "cancelled") {
 			aborted = true;
+			for (const rest of gate.checks.slice(index + 1)) evidence.push(unrun(rest));
+			break;
+		}
+		if (endUnproven !== undefined) {
 			for (const rest of gate.checks.slice(index + 1)) evidence.push(unrun(rest));
 			break;
 		}
@@ -455,5 +593,6 @@ export async function runRequiredChecks(input: RequiredChecksInput): Promise<Req
 		finishedAt: new Date().toISOString(),
 		durationMs: Math.round(performance.now() - began),
 		checks: evidence,
+		...(endUnproven === undefined ? {} : { endUnproven }),
 	};
 }

@@ -303,7 +303,7 @@ function resumeBlock(resume: ResumeInfo): string[] {
 		...(resume.checkpoint === undefined ? [] : checkpointBlock(resume.checkpoint)),
 		resume.checkpoint === undefined || resume.checkpoint.planUnavailable === true
 			? "The old plan could not be restored. Check `storm status` for remaining requirements and submit a plan."
-			: "Finish every open lane; accepted results restored from the checkpoint need no new work. See `storm status` for the current plan and results.",
+			: "Accepted results restored from the checkpoint need no new work. Read `storm status` for the open lanes and results before planning anything.",
 		...limit,
 		...(said ? [said] : []),
 	];
@@ -326,7 +326,7 @@ function historyBlock(history: { text: string; followUp?: boolean } | undefined)
 		.slice(0, HISTORY_LINES);
 	if (lines.length === 0) return [];
 	const lead = history.followUp === true
-		? ["New scope chosen after the earlier run below; nothing of it is restored. Plan this task on its own."]
+		? ["New scope chosen after the earlier run below; nothing of it is restored."]
 		: [];
 	let used = 0;
 	const kept: string[] = [];
@@ -337,6 +337,13 @@ function historyBlock(history: { text: string; followUp?: boolean } | undefined)
 	}
 	return [...lead, ...kept];
 }
+
+/**
+ * The decision point of a director about to stop, in the run contract: the specific check to make, and what a refusal
+ * means. Pinned by tests through this constant, not through its words.
+ */
+export const DECIDE_BEFORE_STOP =
+	"Before stopping, check every lane and result against your evidence, or report the blocker. A refused call stays refused: read why, change it.";
 
 /**
  * The message that starts a Storm run: the task, the team and the few rules the director needs up front. Enforced
@@ -368,13 +375,11 @@ export function buildHandoff(input: {
 	const rules = [
 		"- Delegate all changes; your own file edits are blocked.",
 		`- Before spawning use \`storm plan\`; non-review lanes need \`results\`. Kinds: ${laneRoles(config)}.`,
-		"- Replan: keep goal/kind/role/job/files/results; `progress`=status, new name=scope.",
-		"- Cite file:line or command/exit/log; verify ranges.",
+		"- Cite file:line or command/exit/log: results are read from it.",
 		isolated
 			? "- `isolated: true`: a separate checkout apart from a branch; changes land only as omp applies them. An isolated review must match the integrated tree to verify. For follow-up, a new agent reads `agent://<id>`."
-			: "- Share this checkout, reviewer too; sequence overlapping edits. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
-		`- Resolve \`incorrect\` reviews and open P0s${docsEnabled(config) ? ", including doc findings" : ""}.`,
-		"- Finish every lane or report its blocker.",
+			: "- Share this checkout, reviewer too. Only independent lanes set `isolationReason`; work stays outside. Follow up: `write agent://<id>`; if refused, a new agent reads `agent://<id>`.",
+		`- ${DECIDE_BEFORE_STOP}`,
 		"- Stage `storm brief` from evidence, 0-3 typed next; Storm reports after it settles.",
 	];
 	if (config.jobs?.length) {
@@ -382,18 +387,20 @@ export function buildHandoff(input: {
 	}
 	const reviewer = usableRole(config, "reviewer")?.agent;
 	if (reviewer) {
-		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`.`;
+		const check = `- Storm checks the run: changes, including shell edits, need a later \`correct\` verdict from \`${reviewer}\`; an open P0 blocks it${docsEnabled(config) ? ", doc findings included" : ""}.`;
 		rules.push(
 			input.maxRounds === undefined
-				? `${check} Without it Storm sends you back.`
+				? `${check} Without a verdict Storm sends you back.`
 				: input.maxRounds === 1
-					? `${check} Without it the run ends unverified.`
-					: `${check} Without it Storm sends you back, up to ${input.maxRounds} rounds in all.`,
+					? `${check} Without a verdict the run ends unverified.`
+					: `${check} Without a verdict Storm sends you back, up to ${input.maxRounds} rounds in all.`,
 		);
 	}
 	if (config.budget) {
-		const past = config.budget.onExceed === "stop" ? "the run stops" : "new spawns are blocked";
-		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; past it ${past}.`);
+		// Spend is seen after it happens: once the observed total reaches the limit no new worker starts and no work message goes to an idle worker (a quiet
+		// progress note does), and under stop the director's turn is aborted. Work already running is not stopped, so the text claims no more than that.
+		const past = config.budget.onExceed === "stop" ? "no new work starts and your turn is aborted" : "no new work starts";
+		rules.push(`- Budget: ${formatUsd(config.budget.perRunUsd)} for this run; at that observed spend ${past}.`);
 	}
 	const resume = input.resume ? resumeBlock(input.resume) : [];
 	const history = historyBlock(input.history);

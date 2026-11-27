@@ -9,8 +9,10 @@
  *
  * Resource fences are host-global for one user, not a cross-machine queue. Each explicit canonical key gets a lock
  * record in a fixed per-user lock root (`/tmp` on macOS and Linux; the OS temp directory elsewhere), created with a
- * hard link so a record is never partially visible. Sorted keys are acquired in order and held until the child's
- * `close` is observed; unrelated keys overlap. A job that declares no resources has no implicit key here: the caller
+ * hard link so a record is never partially visible. Sorted keys are acquired in order and held until the command's
+ * process group is proven empty (the leader's `close` is not enough: a member that redirected its output outlives it,
+ * so the runner stops such members first, see `runBoundedProcess`); unrelated keys overlap. A member that left the group
+ * (a new session, a daemon) cannot be seen; `PROCESS_GROUP_LIMIT` says so in the words the user reads. A job that declares no resources has no implicit key here: the caller
  * must pass a target-exclusive key for it, because this module cannot know its write footprint. When teardown cannot
  * prove the child ended, the fence is kept and the receipt says so instead of pretending the resource is free.
  *
@@ -113,6 +115,11 @@ export interface JobExecutionReceipt {
 	fence?: JobFence;
 	/** Present only with `status: "unrun"`; typed at the source, never parsed back from `detail`. */
 	unrunCause?: JobUnrunCause;
+	/**
+	 * Present only with a `process-unproven` fence whose child may still end: it resolves when the OS later proves the process
+	 * group empty, so the caller can lift what it held for the run. Never resolves for a child that cannot be probed.
+	 */
+	ended?: Promise<void>;
 }
 
 export interface RunConfiguredJobInput {
@@ -502,9 +509,11 @@ async function releaseLocks(
  * one durable target marker. The job is `unrun` when validation, lock acquisition, a dead/unreadable fence, bounded
  * queue waiting, cancellation or `canStart` stops it before a child exists; `unrunCause` says which. A running child,
  * including one ended by timeout or abort, reports the OS outcome. Fences are released only after the OS proves the
- * end (or before any child exists), and a failed release is reported as `lock-unreleased` with every exact path. When
- * teardown cannot prove the end, the receipt says `process-unproven`; a later `close` releases only this attempt's
- * exact tokens, and never on a timeout or a dead PID alone.
+ * end (or before any child exists), and a failed release is reported as `lock-unreleased` with every exact path. The
+ * proof is the empty process group, not the leader's exit: members left behind are stopped first, and a job that
+ * needed that is `failed` with a note even when its leader exited 0. When teardown cannot prove the end, the receipt
+ * says `process-unproven`; a later proof (the group empty) releases only this attempt's exact tokens, and never on a
+ * timeout or a dead PID alone.
  */
 export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<JobExecutionReceipt> {
 	const job = input.job;
@@ -598,8 +607,8 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 	}
 	if (!result.processEnded) {
 		const retained = marker;
-		// `close` is the same OS proof the normal path uses. It can arrive after hard teardown; only this attempt's
-		// exact tokens are released, and only when that proof arrives.
+		// An empty process group is the same OS proof the normal path uses. It can arrive after hard teardown; only this
+		// attempt's exact tokens are released, and only when that proof arrives.
 		void result.ended
 			.then(async () => {
 				if (retained !== undefined) await releaseTargetMarker(retained);
@@ -607,10 +616,13 @@ export async function runConfiguredJob(input: RunConfiguredJobInput): Promise<Jo
 			})
 			.catch(() => undefined);
 		const paths = [...(retained === undefined ? [] : [retained.path]), ...held.map((lock) => lock.path)];
-		return executedReceipt(name, result, {
-			detail: "프로세스 종료를 확인하지 못해 자원 잠금과 대상 표시를 유지했습니다. 상태를 확인하기 전에는 같은 자원으로 시작하지 마세요",
-			fence: fenceOf("process-unproven", paths),
-		});
+		return {
+			...executedReceipt(name, result, {
+				detail: "프로세스 종료를 확인하지 못해 자원 잠금과 대상 표시를 유지했습니다. 상태를 확인하기 전에는 같은 자원으로 시작하지 마세요",
+				fence: fenceOf("process-unproven", paths),
+			}),
+			ended: result.ended,
+		};
 	}
 	const markerRelease = marker === undefined ? { ok: true as const } : await releaseTargetMarker(marker);
 	const released = await releaseLocks(held);

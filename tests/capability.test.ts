@@ -10,9 +10,12 @@ import {
 	pathsOverlap,
 	readOnlyTool,
 	scopesOverlap,
+	shellReviewer,
 	targetWithinScope,
 	toolCapability,
 	toolWriteTargets,
+	WHY_EXEC_WRITER,
+	WHY_UNDECLARED_WRITER,
 } from "../src/policy/capability.ts";
 import type { PlanLane, ShadowInfo } from "../src/types.ts";
 
@@ -45,8 +48,8 @@ describe("lane policy", () => {
 	test("a read-only intent needs actual read-only tools; a role label never substitutes", () => {
 		const policy = lanePolicy({ lane: lane({ kind: "review", role: "reviewer" }), tools: ["read", "grep"], isolated: false, auto: false });
 		expect(policy.kind).toBe("read");
-		// The plugin reviewer/architect definitions used to carry bash; an approved shadow that restores it is blocked.
-		expect(lanePolicy({ lane: lane({ kind: "review", role: "reviewer" }), tools: ["read", "bash"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
+		// A shell is not a read-only tool: outside the review lane it is still refused (the review lane's shell is below).
+		expect(lanePolicy({ lane: lane({ kind: "design", role: "architect" }), tools: ["read", "bash"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
 		expect(lanePolicy({ lane: lane({ kind: "design", role: "architect" }), tools: undefined, isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
 		expect(lanePolicy({ lane: lane({ kind: "design", role: "architect" }), tools: ["read", "lsp"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
 		expect(lanePolicy({ lane: lane({ kind: "design", role: "architect" }), tools: ["read", "grep"], isolated: false, auto: false }).kind).toBe("read");
@@ -75,10 +78,16 @@ describe("lane policy", () => {
 		).toMatchObject({ kind: "read" });
 	});
 
-	test("manual path-only writers are scoped; auto and exec-capable writers are unknown; private is private", () => {
+	test("path-only writers are scoped in every mode; exec-capable writers are unknown in every mode; private is private", () => {
 		const scoped = lane({ files: ["src/a.ts"], kind: "code" });
-		expect(lanePolicy({ lane: scoped, tools: ["read", "write", "edit"], isolated: false, auto: false })).toMatchObject({ kind: "paths", paths: ["src/a.ts"] });
-		expect(lanePolicy({ lane: scoped, tools: ["read", "write", "edit"], isolated: false, auto: true })).toMatchObject({ kind: "unknown" });
+		for (const auto of [false, true]) {
+			expect(lanePolicy({ lane: scoped, tools: ["read", "write", "edit"], isolated: false, auto })).toMatchObject({ kind: "paths", paths: ["src/a.ts"] });
+			// A worker with a shell or eval is an unbounded writer whatever the mode and whatever files it declared (G1).
+			expect(lanePolicy({ lane: scoped, tools: ["read", "bash"], isolated: false, auto })).toMatchObject({ kind: "unknown", reason: WHY_EXEC_WRITER });
+			expect(lanePolicy({ lane: scoped, tools: ["read", "write", "eval"], isolated: false, auto })).toMatchObject({ kind: "unknown", reason: WHY_EXEC_WRITER });
+		}
+		// A path-only agent that declared no files cannot be bounded either, in every mode.
+		expect(lanePolicy({ lane: lane({ kind: "code" }), tools: ["read", "write"], isolated: false, auto: true })).toMatchObject({ kind: "unknown", reason: WHY_UNDECLARED_WRITER });
 		expect(lanePolicy({ lane: scoped, tools: ["read", "bash"], isolated: false, auto: false })).toMatchObject({ kind: "unknown" });
 		expect(lanePolicy({ lane: scoped, tools: undefined, isolated: false, auto: false })).toMatchObject({ kind: "unknown" });
 		expect(lanePolicy({ lane: scoped, tools: ["read", "grep"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
@@ -88,6 +97,35 @@ describe("lane policy", () => {
 
 	test("a read-only intent with no read tools is blocked rather than run blind", () => {
 		expect(lanePolicy({ lane: lane({ kind: "explore", role: "explorer" }), tools: ["bash"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
+	});
+
+	test("a review lane may run commands: it is a read lane with a shell, ordered like a writer, never a path writer", () => {
+		const review = lane({ kind: "review", role: "reviewer" });
+		for (const auto of [false, true]) {
+			const policy = lanePolicy({ lane: review, tools: ["read", "grep", "bash"], isolated: false, auto });
+			expect(policy).toMatchObject({ kind: "read", shell: true });
+			expect(shellReviewer(policy)).toBe(true);
+		}
+		// Reads only: no shell, nothing to order.
+		expect(shellReviewer(lanePolicy({ lane: review, tools: ["read", "grep"], isolated: false, auto: false }))).toBe(false);
+		// The shell is the one extra tool. Path-write tools, eval, lsp, MCP and an absent list stay refused to a review lane.
+		for (const tools of [["read", "bash", "write"], ["read", "bash", "edit"], ["read", "bash", "eval"], ["read", "bash", "lsp"], ["read", "bash", "mcp_x"], undefined]) {
+			expect(lanePolicy({ lane: review, tools, isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
+		}
+		// Only the review lane gets it: an explorer, an architect and a code lane keep today's classification.
+		expect(lanePolicy({ lane: lane({ kind: "explore", role: "explorer" }), tools: ["read", "bash"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
+		expect(lanePolicy({ lane: lane({ kind: "design", role: "architect" }), tools: ["read", "bash"], isolated: false, auto: false })).toMatchObject({ kind: "blocked" });
+		// An isolated reviewer is a private checkout, as before.
+		expect(lanePolicy({ lane: review, tools: ["read", "bash"], isolated: true, auto: false })).toMatchObject({ kind: "private" });
+		// A change obligation makes it a writer like any lane (WK11 keeps judging a reviewer that changed files).
+		expect(
+			lanePolicy({
+				lane: lane({ kind: "review", role: "reviewer", files: ["a.md"], results: [{ id: "c", kind: "change", criterion: "x", path: "a.md" }] }),
+				tools: ["read", "bash"],
+				isolated: false,
+				auto: false,
+			}),
+		).toMatchObject({ kind: "unknown", reason: WHY_EXEC_WRITER });
 	});
 });
 
@@ -144,13 +182,18 @@ describe("effective definitions and symlink aliases", () => {
 		expect(effectiveAgentTools("missing", [], path.join(dir, "agents"))).toBeUndefined();
 	});
 
-	test("the shipped definitions make read roles truly read-only and keep task out of worker roles", () => {
+	test("the shipped definitions: explorer and architect are read-only, the reviewer may add a shell, task stays out of worker roles", () => {
 		const pluginAgents = path.join(import.meta.dir, "..", "agents");
-		for (const role of ["storm-explorer", "storm-reviewer", "storm-architect"]) {
+		for (const role of ["storm-explorer", "storm-architect"]) {
 			const tools = effectiveAgentTools(role, [], pluginAgents);
 			expect(tools).toBeDefined();
 			expect(toolCapability(tools).readOnly).toBe(true);
 		}
+		// The reviewer carries read tools, optionally `bash`, and no path-write tool, whichever way the definition is written.
+		const reviewer = effectiveAgentTools("storm-reviewer", [], pluginAgents);
+		expect(reviewer).toBeDefined();
+		expect(toolCapability(reviewer).pathWrites).toBe(false);
+		expect(lanePolicy({ lane: lane({ kind: "review", role: "reviewer" }), tools: reviewer, isolated: false, auto: false }).kind).toBe("read");
 		for (const role of ["storm-implementer", "storm-quick"]) {
 			const tools = effectiveAgentTools(role, [], pluginAgents);
 			expect(tools).toBeDefined();

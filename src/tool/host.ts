@@ -6,6 +6,7 @@
 import type { CloseoutDraft } from "../runtime/closeout.ts";
 import type { ProjectState } from "../state.ts";
 import type { AgentEntry, RunPlan, RunSpec } from "../types.ts";
+import type { PlanView } from "./plan-view.ts";
 
 /** What a continued run carried over from the run it continues: counts of results, and the lanes still to do. */
 export interface ContinuedRun {
@@ -47,6 +48,12 @@ export interface StormToolHost {
 	now(): number;
 	/** The status report `/storm status` shows, as markdown; `quota` adds omp's provider quota (about a second). */
 	statusText(opts: { quota: boolean }): Promise<string>;
+	/**
+	 * The run this session directs: its plan in force and its result rows, for the `status` action to hand the director
+	 * its own plan back. Absent, or undefined outside a run or for a session that does not own one, the status text
+	 * stands alone.
+	 */
+	planView?(): PlanView | undefined;
 	/**
 	 * Whether omp task isolation is on, when the host can prove it. The extension's host reads the live omp settings;
 	 * absent or undefined means unknown, which the plan reply never reports as off.

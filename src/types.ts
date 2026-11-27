@@ -784,6 +784,21 @@ export interface SpawnRecord {
 	spawnKey?: string;
 	/** Director plan lane this admitted spawn was assigned to, when it came through the task tool. */
 	lane?: string;
+	/**
+	 * What the child's own first request ran on, read from the child (`before_provider_request`); absent until a check read
+	 * it. `models` is only what Storm answered to omp, never evidence of what ran. Optional: older records carry none.
+	 */
+	ran?: RanModel;
+}
+
+/** What a child's check read of the model its request used, and what that meant for the team. */
+export interface RanModel {
+	/** "provider/id" of the request the check read. */
+	model: string;
+	/** The reasoning level the child reported, when it reported one. */
+	effort?: string;
+	/** `verified`: the child's own request matched the team. `mismatch`: it did not, and the worker was stopped. */
+	verdict: "verified" | "mismatch";
 }
 
 /** Execution evidence for one approved command: raw output is not part of the run record. */
@@ -951,6 +966,64 @@ export interface RunRecord {
 	closeoutFacts?: CloseoutFacts;
 	/** The limits the user stated with the request. */
 	limits?: { rounds?: number; minutes?: number };
+	/**
+	 * Deliveries the run received that answer no declared result, oldest first and bounded (`UNPLANNED_MAX`). They are
+	 * facts about work that happened outside the plan: never a result row, never an acceptance. Absent on records
+	 * written before 0.27.
+	 */
+	unplanned?: UnplannedDelivery[];
+	/** How many such deliveries the run received in all: more than `unplanned` holds once the list was cut. */
+	unplannedCount?: number;
+	/** What the run's total spend leaves out or took from outside the plan; absent when there is nothing to say. */
+	spend?: RunSpendNote;
+}
+
+/**
+ * Why a delivery answers no declared result. `woken`: the worker's own dispatch had already settled, so this turn was
+ * started by someone else (a peer's message, a quiet note). Storm does not know who: it never names a sender.
+ * `unplaced`: no dispatch of this run was waiting for the worker (a lane without declared results, a worker Storm did
+ * not place, a worker of an earlier run).
+ */
+export type UnplannedKind = "woken" | "unplaced";
+
+/** One delivery that belongs to no declared result: host facts only, never model text. */
+export interface UnplannedDelivery {
+	/** The delivery's host identity (`job:<job>:<agent>` or `task:<call>:<agent>`), one record per id. */
+	id: string;
+	kind: UnplannedKind;
+	/** The worker's omp agent id. */
+	agent: string;
+	/** Whose child it is: the registry's parent when known, else the session that received the delivery. */
+	parentId?: string;
+	/** The lane the worker was placed on, when the run knew one. */
+	lane?: string;
+	/** ms since epoch: the turn's start when the host said so. */
+	startedAt?: number;
+	/** ms since epoch: when the delivery reached the run. */
+	endedAt: number;
+	/** The host's own verdict on the turn (`completed`, `failed`, ...), when it gave one. */
+	status?: string;
+	/** The price of this one turn when the host gave one (a synchronous result carries its usage); list price. */
+	costUsd?: number;
+	/**
+	 * What the worker has cost so far, in all its turns (the host does not price one pushed turn): list price. Absent
+	 * when the run never saw the worker spend.
+	 */
+	agentCostUsd?: number;
+	/** Whether the worker changed files during the turn: true or false when the agent ledger knew, else absent. */
+	changed?: boolean;
+}
+
+/** The part of the run's total spend that is not a plain sum of what Storm saw per model call. */
+export interface RunSpendNote {
+	/** True when the total is a floor: a model call ran that Storm could not read back. */
+	lowerBound?: true;
+	/** Eval cells that used `completion()` or `judge()` and whose cost the session file did not confirm. */
+	evalUnread?: number;
+	/** Eval `completion()` and `judge()` spend read back from the session files, counted in `costUsd`. */
+	evalUsd?: number;
+	/** Spend of children that were not bound to the run by their parent chain but ran in its session tree; counted. */
+	treeUsd?: number;
 }
 
 /** Facts that cannot be faithfully rebuilt from today's session settings. */

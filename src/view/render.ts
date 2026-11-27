@@ -7,6 +7,7 @@ import { goalTotals } from "../runtime/goal.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
+import { unplannedLine } from "../runtime/unplanned.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import { GOAL_LABEL, goalText } from "./closeout.ts";
 import { resultProgress, resultRowText, type ResultProgress } from "./results.ts";
@@ -20,6 +21,7 @@ import type {
 	RequiredCheck,
 	RoleConfig,
 	RunRecord,
+	RunSpendNote,
 	RunPlan,
 	ShadowInfo,
 	SpawnRecord,
@@ -99,7 +101,14 @@ export function priorityLabel(p: StoredPriority): string {
 	return PRIORITY_LABEL[p];
 }
 const ISOLATION: Record<StormConfig["isolation"], string> = { shared: "공유 작업 트리", isolated: "팀 격리(리뷰 포함)" };
-export const ON_EXCEED: Record<BudgetConfig["onExceed"], string> = { "block-spawns": "새 스폰 차단", stop: "실행 중단" };
+/**
+ * What passing the budget does. Storm sees spend after it happens, so neither choice stops work already running: both stop
+ * new spawns; `stop` also aborts the director's turn.
+ */
+export const ON_EXCEED: Record<BudgetConfig["onExceed"], string> = {
+	"block-spawns": "새 스폰과 쉬는 워커에게 보내는 일 메시지 차단",
+	stop: "새 스폰·일 메시지 차단과 감독 응답 중단(이미 도는 워커는 끝까지 진행)",
+};
 
 /** Local "YYYY-MM-DD HH:mm". */
 export function time(ms: number | null | undefined): string {
@@ -452,7 +461,8 @@ function runAgentsText(run: RunRecord): string | undefined {
 function runStatusParts(run: RunRecord, now: number): string[] {
 	const parts = runProgressParts(run, now);
 	const minutes = parts.pop()!;
-	parts.push(run.budget ? `${formatUsd(run.costUsd)}/${formatUsd(run.budget.perRunUsd)}` : formatUsd(run.costUsd));
+	const floor = run.spend?.lowerBound === true ? SPEND_FLOOR_NOTE : "";
+	parts.push(run.budget ? `${formatUsd(run.costUsd)}${floor}/${formatUsd(run.budget.perRunUsd)}` : `${formatUsd(run.costUsd)}${floor}`);
 	parts.push(minutes);
 	return parts;
 }
@@ -594,6 +604,8 @@ export function renderStatus(
 		// The model already reads the goal's earlier use in its resume handoff; the status line is for the user.
 		const goal = model ? undefined : goalLine(run, now);
 		if (goal !== undefined) styled([{ text: goal, tone: "muted" }]);
+		const unplanned = unplannedLine(run);
+		if (unplanned !== undefined) styled([{ text: `- ${unplanned}`, tone: "muted" }]);
 		if (run.plan) {
 			for (const line of isolationLaneLines(run.plan, run)) styled([{ text: line }], undefined, "status.warning");
 			const note = isolationNote(run.plan);
@@ -774,7 +786,7 @@ export function renderStatus(
 		heading("하드 예산 상한", "runtime", "status.info");
 		out.push(
 			b
-				? `- Storm 예산은 새 스폰만 막습니다. 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
+				? `- Storm 예산은 관측된 지출이 한도에 닿은 뒤 새 스폰과 쉬는 워커에게 보내는 일 메시지를 막고(\`stop\`이면 감독의 응답도 멈추고), 이미 도는 워커는 끝까지 갑니다(진행 메모는 보낼 수 있습니다). 지출을 중간에 끊는 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
 				: "- 하드 상한은 `omp --max-cost <USD>` 또는 `session.maxCost`로 거세요.",
 		);
 	}
@@ -810,7 +822,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 	out.push("");
 	if (view.run) {
 		const run = view.run;
-		const spend = spendText(run.costUsd, run.budget);
+		const spend = spendText(run.costUsd, run.budget, run.spend);
 		const index = out.length;
 		out.push(`- 실행 중: ${run.runId} · ${spend}`);
 		if (info) {
@@ -859,7 +871,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 	if (view.lastRun) {
 		const run = view.lastRun;
 		const index = out.length;
-		out.push(`- 마지막 실행: ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget)}`);
+		out.push(`- 마지막 실행: ${visible(run.runId)} · ${STATUS_LABEL[run.status]} · ${spendText(run.costUsd, run.budget, run.spend)}`);
 		if (info) {
 			const spend = spendTone(run);
 			info.push({
@@ -870,7 +882,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 					{ text: visible(run.runId), tone: "accent" },
 					{ text: " · " },
 					{ text: STATUS_LABEL[run.status], tone: runTone(run) },
-					{ text: ` · ${spendText(run.costUsd, run.budget)}`, ...(spend ? { tone: spend } : {}) },
+					{ text: ` · ${spendText(run.costUsd, run.budget, run.spend)}`, ...(spend ? { tone: spend } : {}) },
 				],
 			});
 		}
@@ -942,8 +954,12 @@ const END_REASON: Record<NonNullable<TrialView["endReason"]>, string> = {
 	budget: "예산 소진",
 };
 
-function spendText(cost: number, budget: BudgetConfig | undefined): string {
-	return `지출 ${usd(cost)}${budget ? ` / 예산 $${budget.perRunUsd}` : ""}`;
+/** A total Storm could not read whole says so: the figure is a floor, never presented as complete. */
+export const SPEND_FLOOR_NOTE = "(하한)";
+
+function spendText(cost: number, budget: BudgetConfig | undefined, spend?: RunSpendNote): string {
+	const floor = spend?.lowerBound === true ? SPEND_FLOOR_NOTE : "";
+	return `지출 ${usd(cost)}${floor}${budget ? ` / 예산 $${budget.perRunUsd}` : ""}`;
 }
 
 /** At or past the warning threshold, or over the hard run budget: only then is spend colored. */
@@ -989,7 +1005,7 @@ function runLineSpans(run: RunRecord): InfoSpan[] {
 		{ text: "- " },
 		{ text: visible(run.runId), tone: "accent" },
 		{ text: ` · 시작 ${isoText(run.startedAt)} · ` },
-		{ text: spendText(run.costUsd, run.budget), ...(tone ? { tone } : {}) },
+		{ text: spendText(run.costUsd, run.budget, run.spend), ...(tone ? { tone } : {}) },
 	];
 }
 
@@ -1002,7 +1018,7 @@ function lastRunLineSpans(run: RunRecord): InfoSpan[] {
 		{ text: " · " },
 		{ text: STATUS_LABEL[run.status], tone: runTone(run) },
 		{ text: " · " },
-		{ text: spendText(run.costUsd, run.budget), ...(tone ? { tone } : {}) },
+		{ text: spendText(run.costUsd, run.budget, run.spend), ...(tone ? { tone } : {}) },
 	];
 }
 
@@ -1042,12 +1058,15 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 		: "없음";
 	// A run the host cut off says so: neither the user nor the director may read it as the user pressing Esc.
 	const hostEnded = run.endReason === "host-ended" ? ` (${endLabel(run.endReason)})` : "";
-	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]}${hostEnded} · ${spendText(run.costUsd, run.budget)}`];
+	const out = [`- ${visible(run.runId)} · ${STATUS_LABEL[run.status]}${hostEnded} · ${spendText(run.costUsd, run.budget, run.spend)}`];
 	// The official result disposition leads a settled run; spawn receipts and plan shape follow it.
 	const progress = resultProgress(run);
 	const outcome = resultLine(progress, { detailed: details });
 	if (outcome !== undefined) out.push(outcome.text);
 	if (details) for (const row of progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
+	// Work that answered no declared result: a count, beside the result count it never changes.
+	const unplanned = unplannedLine(run);
+	if (unplanned !== undefined) out.push(`- ${unplanned}`);
 	const goal = details ? goalLine(run, now) : undefined;
 	if (goal !== undefined) out.push(goal);
 	out.push(`- 스폰: ${spawns}`);

@@ -8,13 +8,13 @@
  * - T02: an independent experiment's retained patch is the only result a comparison lane may consume; a build that
  *   needs the integrated tree waits until it is integrated. A later authorized shared worker applies the retained
  *   patch in the disposable parent, and the integrated consumer must then read its exact content. A producer that
- *   settled without its required result, or whose attempt failed, starts no consumer. Eight read-only fillers (five
- *   explorers, an architect, two reviewers) force the experiment onto an omp subagent worker thread; the observation
+ *   settled without its required result, or whose attempt failed, starts no consumer. Eight read-only fillers (seven
+ *   explorers, an architect) force the experiment onto an omp subagent worker thread; the observation
  *   is the host's own worker-tagged log record, not a logical child label.
  * - T03: a native batch whose item overlaps an in-flight shared write is refused before any item is reserved or
  *   started; after the writer settles the valid independent item is submitted again and must start. A work-bearing
- *   `write agent://<id>` follow-up waits, and so does a native `?progress` note: it wakes the idle holder into a turn
- *   that can write, so it meets the same conflict check and is refused with `lane-write`, reserving nothing.
+ *   `write agent://<id>` follow-up waits. A native `?progress` note does not: it wakes the idle holder into a turn whose
+ *   write authority ended with its last turn (it can read and report only), so it meets no write order.
  *   Independent isolated experiments and independent read lanes run in parallel; a plan lane's progress note neither
  *   reserves a write nor starts work.
  *
@@ -344,14 +344,14 @@ async function main(): Promise<void> {
 				);
 				files.editConfig(config => {
 					config.isolation = "shared";
-					config.roles.explorer = { ...config.roles.explorer!, workers: { min: 4, max: 6 } };
+					config.roles.explorer = { ...config.roles.explorer!, workers: { min: 4, max: 8 } };
 				});
 				await rpc.prompt("/storm");
 				const explorerWorkers = files.config().roles.explorer?.workers;
 				const explorerMax = typeof explorerWorkers === "object" && explorerWorkers !== null ? explorerWorkers.max : explorerWorkers;
 				check(
 					"the hand-edited shared team is approved again",
-					files.config().isolation === "shared" && explorerMax === 6,
+					files.config().isolation === "shared" && explorerMax === 8,
 					JSON.stringify({ isolation: files.config().isolation, explorerWorkers }),
 				);
 				rpc.answer = choose(LABEL.autoOff);
@@ -392,18 +392,14 @@ async function main(): Promise<void> {
 				task: `Read ${FACT_FILE} independently`,
 				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-FILLER-READ-5 E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
 			},
-			{
-				name: "F6",
-				agent: "storm-reviewer",
-				task: "Review the unchanged tree",
-				say: "E2E-CHILD-DELAY 7000 E2E-CHILD-VERDICT correct E2E-FILLER-READ-6",
-			},
-			{
-				name: "F7",
-				agent: "storm-reviewer",
-				task: "Review the unchanged tree",
-				say: "E2E-CHILD-DELAY 7000 E2E-CHILD-VERDICT correct E2E-FILLER-READ-7",
-			},
+			// Not reviewers: a reviewer has a shell and is ordered like a writer since 0.27.0 (P1-c), so two of them in
+			// one call are refused (`lane-write`) and no filler would start. Two more explorers fill the same places.
+			...[6, 7].map(index => ({
+				name: `F${index}`,
+				agent: "storm-explorer",
+				task: `Read ${FACT_FILE} independently`,
+				say: `E2E-CHILD-DELAY 7000 E2E-CHILD-READ ${FACT_FILE} E2E-FILLER-READ-${index} E2E-CHILD-CLAIM ${TRACKED_CLAIM}`,
+			})),
 		];
 		const lanes: ContractLane[] = [
 			{ name: "F0", kind: "explore", role: "explorer", goal: "Read the parent tree", results: [trackedAnswer("f0-answer")] },
@@ -412,8 +408,8 @@ async function main(): Promise<void> {
 			{ name: "F3", kind: "explore", role: "explorer", goal: "Read the parent tree", results: [trackedAnswer("f3-answer")] },
 			{ name: "F4", kind: "explore", role: "explorer", goal: "Read the parent tree", results: [trackedAnswer("f4-answer")] },
 			{ name: "F5", kind: "design", role: "architect", goal: "Inspect the unchanged tree", results: [trackedAnswer("f5-answer")] },
-			{ name: "F6", kind: "review", role: "reviewer", goal: "Review the unchanged tree" },
-			{ name: "F7", kind: "review", role: "reviewer", goal: "Review the unchanged tree" },
+			{ name: "F6", kind: "explore", role: "explorer", goal: "Read the parent tree", results: [trackedAnswer("f6-answer")] },
+			{ name: "F7", kind: "explore", role: "explorer", goal: "Read the parent tree", results: [trackedAnswer("f7-answer")] },
 			{
 				name: "E0",
 				kind: "run",
@@ -442,15 +438,18 @@ async function main(): Promise<void> {
 			},
 		];
 		const steps: Step[] = [
-			planFor(lanes, { explorer: 6, architect: 1, reviewer: 2, implementer: 2 }),
-			// Five read-only explorers, one architect and two reviewers: genuine independent reads, not ambiguous
+			planFor(lanes, { explorer: 8, architect: 1, implementer: 2 }),
+			// Seven read-only explorers (and the comparison's), one architect: genuine independent reads, not ambiguous
 			// writable quick lanes, keep eight subagent runs in flight so the ninth (E0) is homed on a worker thread.
 			{ tasks: fillerTasks },
 			{ task: ["storm-implementer"], as: "E", say: `E2E-CHILD-DELAY 3000 E2E-EXPERIMENT E2E-CHILD-SH ${b64(experimentCommand)}` },
 			{ task: ["storm-explorer"], as: "C", say: "E2E-CHILD-DELAY 8000 E2E-COMPARE-EARLY" },
 			{ task: ["storm-implementer"], as: "B", say: `E2E-CHILD-DELAY 8000 E2E-BUILD-EARLY E2E-CHILD-BASH ${buildCommand}` },
-			{ task: ["storm-explorer"], as: "C", say: "E2E-COMPARE-LATE", afterResult: 'id="E0"' },
-			{ task: ["storm-implementer"], as: "B", say: "E2E-BUILD-LATE", afterResult: 'id="E0"' },
+			// 0.27.0 (P1-c): the early consumers above start with a note and their results are not accepted on a missing input.
+			// What the note asks for is the way on: a follow-up to the comparison's worker once the experiment's result exists.
+			// The build needs the integrated tree: after its first worker ended, a second start is still refused.
+			{ followUp: "agent://C0", content: "E2E-COMPARE-LATE", afterResult: 'id="C0"' },
+			{ task: ["storm-implementer"], as: "B", say: "E2E-BUILD-LATE", afterResult: 'id="B0"' },
 		];
 		let retainedPatch = "";
 		await session(cancelAll, async (rpc, files) => {
@@ -473,7 +472,6 @@ async function main(): Promise<void> {
 			const compareAttempted = attempted(frames, "C0");
 			const buildAttempted = attempted(frames, "B0");
 			const patchAt = patch !== "" && existsSync(patch) ? statSync(patch).mtimeMs : undefined;
-			const compareBeforePatch = earlyCompare.filter(entry => patchAt === undefined || entry.ts < patchAt);
 			// The promised stable result id is the compact reference a consumer may receive; the host's absolute
 			// temporary patch path is not part of the product contract.
 			const compareWithRef = [...earlyCompare, ...lateCompare].filter(entry => entry.lastUser.includes("experiment-patch"));
@@ -515,20 +513,32 @@ async function main(): Promise<void> {
 				patch !== "" && outsideProject(patch) && artifact.ok,
 				`path=${patch || "(missing)"} ${artifact.detail}`,
 			);
+			// A consumer may start before the experiment's result exists (0.27.0, P1-c): it is told so in the call's own note, its
+			// result is never accepted on the input it started from (the record remembers it was `missing`), and the way on is a
+			// follow-up once the result exists.
+			// A start note (`'C0' 레인은 선행 ... 시작했습니다`) is a user message after the call's result, with no `[storm` tag in front.
+			const directorNotes = llm.of("main").flatMap(entry => [...entry.notes, ...entry.users]);
+			const comparison = run.results?.find(row => row.id === "comparison");
 			check(
-				"T02: no comparison consumer starts before the experiment's result exists",
-				compareAttempted && compareBeforePatch.length === 0,
-				`attempt=${compareAttempted} beforePatch=${JSON.stringify(compareBeforePatch.map(entry => entry.ts))} early=${earlyCompare.map(entry => entry.ts).join(",") || "none"} patchAt=${patchAt ?? "missing"} run=${run.runId}`,
+				"T02: a comparison consumer started before the experiment's result exists is told so and not accepted on that input",
+				compareAttempted && earlyCompare.length > 0 && directorNotes.some(note => note.includes("'C0'") && note.includes("수용되지 않")) && directorNotes.some(note => note.includes("'C0' 레인의 결과를 수용하지 않았습니다")),
+				`attempt=${compareAttempted} early=${earlyCompare.map(entry => entry.ts).join(",") || "none"} notes=${JSON.stringify(directorNotes.filter(note => note.includes("'C0'")).map(note => note.slice(0, 160)))}`,
 			);
 			check(
-				"T02: the comparison starts on the valid result and receives its compact trusted reference",
-				compareWithRef.length > 0 && (patchAt === undefined || compareWithRef.some(entry => entry.ts >= patchAt)),
-				`withRef=${JSON.stringify(compareWithRef.map(entry => entry.ts))} early=${earlyCompare.map(entry => entry.ts).join(",") || "none"} late=${lateCompare.map(entry => entry.ts).join(",") || "none"} patchAt=${patchAt ?? "missing"} patch=${patch || "(missing)"}`,
+				"T02: after the result exists the comparison runs again through a follow-up",
+				lateCompare.length > 0 && (patchAt === undefined || lateCompare.every(entry => entry.ts >= patchAt)) && comparison !== undefined,
+				`late=${lateCompare.map(entry => entry.ts).join(",") || "none"} patchAt=${patchAt ?? "missing"} comparison=${JSON.stringify(comparison)}`,
 			);
 			check(
-				"T02: the integration-required build stays blocked while only the unintegrated patch exists",
-				buildAttempted && earlyBuild.length === 0 && lateBuild.length === 0 && !existsSync(join(env.project, "build.txt")),
-				`earlyB=${earlyBuild.map(entry => entry.ts).join(",") || "none"} lateB=${lateBuild.map(entry => entry.ts).join(",") || "none"} attempted=${buildAttempted} buildExists=${existsSync(join(env.project, "build.txt"))} report=${report.slice(-500)}`,
+				"T02: the compact trusted reference reached the comparison",
+				compareWithRef.length > 0,
+				`withRef=${JSON.stringify(compareWithRef.map(entry => entry.ts))} patch=${patch || "(missing)"}`,
+			);
+			const build = run.results?.find(row => row.id === "build");
+			check(
+				"T02: the integration-required build is never accepted while only the unintegrated patch exists, and a start after the patch is refused",
+				buildAttempted && lateBuild.length === 0 && build?.state !== "accepted" && !existsSync(join(env.project, "build.txt")),
+				`earlyB=${earlyBuild.map(entry => entry.ts).join(",") || "none"} lateB=${lateBuild.map(entry => entry.ts).join(",") || "none"} attempted=${buildAttempted} build=${JSON.stringify(build)} buildExists=${existsSync(join(env.project, "build.txt"))} report=${report.slice(-500)}`,
 			);
 			check(
 				"T02: E0 settled with host usage and the run ended with a recorded reason",
@@ -550,6 +560,7 @@ async function main(): Promise<void> {
 		].join("; ");
 		const earlyReadCommand = `cat experiment.txt > ${shq(join(adoptDir, "build-early-content"))}`;
 		const lateReadCommand = `pwd -P > ${shq(join(adoptDir, "build-cwd"))}; cat experiment.txt > ${shq(join(adoptDir, "build-late-content"))}`;
+		// Named BA0, not B0: the first scenario now starts a B0 worker, and omp numbers a second agent of one name `B0-2`, which is no lane.
 		const adoptionLanes: ContractLane[] = [
 			{
 				name: "AD0",
@@ -560,7 +571,7 @@ async function main(): Promise<void> {
 				results: [requiredResult("adopt-change", "change", "the parent holds the adopted experiment", { path: "experiment.txt", contains: "experiment change" })],
 			},
 			{
-				name: "B0",
+				name: "BA0",
 				kind: "code",
 				role: "implementer",
 				files: ["build.txt"],
@@ -572,8 +583,8 @@ async function main(): Promise<void> {
 		const adoptionSteps: Step[] = [
 			planFor(adoptionLanes, { implementer: 2 }),
 			{ task: ["storm-implementer"], as: "AD", say: `E2E-CHILD-DELAY 1500 E2E-ADOPT E2E-CHILD-SH ${b64(adoptCommand)}` },
-			{ task: ["storm-implementer"], as: "B", say: `E2E-BUILD-ADOPT-EARLY E2E-CHILD-SH ${b64(earlyReadCommand)}` },
-			{ task: ["storm-implementer"], as: "B", say: `E2E-BUILD-ADOPT-LATE E2E-CHILD-SH ${b64(lateReadCommand)}`, afterResult: 'id="AD0"' },
+			{ task: ["storm-implementer"], as: "BA", say: `E2E-BUILD-ADOPT-EARLY E2E-CHILD-SH ${b64(earlyReadCommand)}` },
+			{ task: ["storm-implementer"], as: "BA", say: `E2E-BUILD-ADOPT-LATE E2E-CHILD-SH ${b64(lateReadCommand)}`, afterResult: 'id="AD0"' },
 		];
 		try {
 			await session(cancelAll, async (rpc, files) => {
@@ -657,8 +668,8 @@ async function main(): Promise<void> {
 				`P0=${JSON.stringify(producer)} artifactExists=${!reportMissing}`,
 			);
 			check(
-				"T02 missing result: the consumer attempt is made but no consumer starts",
-				attemptedConsumer && consumer.length === 0,
+				"T02 missing result: the consumer may start (0.27.0, P1-c) but its answer is not accepted on a result that never existed, and the run is not verified",
+				attemptedConsumer && run.results?.find(row => row.id === "c0-answer")?.state !== "accepted" && run.endReason !== "verified",
 				`attempted=${attemptedConsumer} children=${consumer.length} at=${consumer.map(entry => entry.ts).join(",") || "none"} run=${run.runId} status=${run.status} endReason=${run.endReason}`,
 			);
 			console.log(`T02 missing-result observed run ${run.runId}: status=${run.status} endReason=${run.endReason}`);
@@ -710,8 +721,8 @@ async function main(): Promise<void> {
 				`blockedSpawn=${blockedProducer} taskErrors=${taskErrors.length} children=${producerChildren.length} text=${taskErrors.join(" | ").slice(0, 300)}`,
 			);
 			check(
-				"T02 failed attempt: the consumer attempt is made but no consumer starts",
-				attemptedConsumer && consumer.length === 0,
+				"T02 failed attempt: the consumer may start (0.27.0, P1-c) but its answer is not accepted on a producer that never ran, and the run is not verified",
+				attemptedConsumer && run.results?.find(row => row.id === "c0-answer")?.state !== "accepted" && run.endReason !== "verified",
 				`attempted=${attemptedConsumer} children=${consumer.length} run=${run.runId} status=${run.status} endReason=${run.endReason}`,
 			);
 			console.log(`T02 failed-producer observed run ${run.runId}: status=${run.status} endReason=${run.endReason}`);
@@ -780,7 +791,7 @@ async function main(): Promise<void> {
 			planFor(lanes.map(lane => (lane.name === "W0" ? { ...lane, progress } : lane)), workers),
 			// A work-bearing follow-up to the idle holder: its lane owns the file W0 is writing.
 			{ followUp: "agent://H0", content: `E2E-T03-WORK-FOLLOW E2E-CHILD-BASH ${TRACKED_FILE}` },
-			// Native progress note: same agent handle with `?progress`. It would wake the idle holder too, so it is refused.
+			// Native progress note: same agent handle with `?progress`. It wakes the idle holder into a read-only turn: let through.
 			{ edit: "agent://H0?progress" },
 			{
 				tasks: [{ name: "X1", agent: "storm-quick", task: "Write the independent file", say: `E2E-T03-INDEPENDENT-LATE E2E-CHILD-SH ${b64(independentCommand)}` }],
@@ -823,8 +834,8 @@ async function main(): Promise<void> {
 				const noteAt = mainEntries.findIndex(entry => entry.decision.tool === "write" && entry.decision.args?.path === "agent://H0?progress");
 				const noteResult = noteAt < 0 ? undefined : mainEntries.slice(noteAt + 1).find(entry => entry.lastTool !== "")?.lastTool;
 				check(
-					"T03 progress: the native ?progress note to the idle holder is refused with lane-write while W0 writes",
-					noteResult?.includes("[storm:lane-write]") === true && progressNotes.length === 0 && (!CONTRACT || holder?.followUps === 0),
+					"T03 progress: the native ?progress note to the idle holder is not refused with lane-write while W0 writes, and is no follow-up",
+					noteAt >= 0 && noteResult?.includes("[storm:lane-write]") !== true && (!CONTRACT || holder?.followUps === 0),
 					`noteResult=${JSON.stringify(noteResult?.slice(0, 300))} progressNotes=${JSON.stringify(progressNotes.map(entry => entry.ts))} followUps=${holder?.followUps} run=${run.runId}`,
 				);
 				check(

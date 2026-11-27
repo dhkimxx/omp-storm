@@ -16,6 +16,16 @@ jobs:
       - run: npm run verify
 
   # The real plugin inside the pinned omp against a scripted fake LLM: no secrets, no paid calls.
+  #
+  # The scenarios run in three jobs because one job no longer fits its 20 minute limit. The last whole run of the single
+  # job (0.26.0, 2026-11-26) took 12 min 46 s, of which the TUI step was 3 min 28 s; 0.27.0 added the phase-1 and
+  # hardening scenarios and the host-facts one, which would not fit. Split in three, the jobs run side by side and every
+  # scenario still has its own step. Measured on the integration pass (macOS, omp 19.2.1, the fake model, 2026-11-27), per
+  # job: `e2e` 7 min 5 s (RPC and print 138 s, auto 60, checkpoint 12, follow-up ledger 75, job snapshot 128, continue 12),
+  # `e2e-guarantees` 4 min 14 s (unplanned 15, early start 7, director reads 7, pins 13, writers 62, host facts 150) and
+  # `e2e-tui` 3 min 12 s (TUI 180, plan mode 12). The same steps took 1.15 to 1.4 times as long on the ubuntu runner in the
+  # 0.26.0 run, so about 9, 6 and 4 minutes plus about 1 min 30 s of setup each: every job fits its 20 minutes with room.
+  # Each job keeps the limit as a guard against a hung scenario, not as a budget; replace these figures with the first CI run's.
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -50,7 +60,89 @@ jobs:
       # A run omp's host died in is found at the next start and the director continues it when the user says to go on.
       - name: E2E (the director continues a run the host cut off)
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-continue" node_modules/.bin/bun scripts/e2e/continue.ts
-      # omp's goal and loop modes exist only in its TUI, which the harness drives on a pty.
+      - name: Upload the work dirs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storm-e2e-work
+          include-hidden-files: true
+          if-no-files-found: ignore
+          # The linked plugin is a symlink to the checkout: the artifact needs the logs, not the repo again.
+          path: |
+            ${{ runner.temp }}/storm-e2e*/
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/plugins/**
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/natives/**
+
+  # 0.27.0: what the plugin promises and now enforces on the real host. Phase 1 (the record and the director's reads) and
+  # the hardening of the four guarantees (the pins on model and effort, the write order, the end of a job, a named service).
+  e2e-guarantees:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild bun --ignore-scripts=false
+      - name: Versions
+        run: |
+          uname -a
+          echo "node $(node --version) · npm $(npm --version) · $(git --version)"
+          echo "bun $(node_modules/.bin/bun --version)"
+          PATH="$PWD/node_modules/.bin:$PATH" omp --version
+          ls node_modules/@oh-my-pi | tr '\n' ' '
+      # Phase 1. Deliveries Storm asked for are not unplanned; a worker another worker woke answers that worker, not the director (about 15 s).
+      - name: E2E (a woken worker's answer is recorded)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-unplanned" node_modules/.bin/bun scripts/e2e/unplanned.ts
+      # A lane starts before its prerequisite is accepted; its result is not accepted until it runs again after it (about 15 s).
+      - name: E2E (a lane starts before its prerequisite is accepted)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-early-start" node_modules/.bin/bun scripts/e2e/early-start.ts
+      # Under automatic delegation the director reads and searches; an edit and a command stay refused with their causes (about 15 s).
+      - name: E2E (the director reads under automatic delegation)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-director-reads" node_modules/.bin/bun scripts/e2e/director-reads.ts
+      # Hardening. An effort the director passes in its task call is not used, and a role whose approved models cannot
+      # sign in starts no worker on another model, and a worker a later extension put on another model is stopped before its request is sent (about 15 s).
+      - name: E2E (the approved model and effort are what runs)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-hardening-pins" node_modules/.bin/bun scripts/e2e/hardening-pins.ts
+      # A writer that waited 36 s for a permit keeps its place; a named service is refused to a writer; a job that leaves
+      # a child behind is stopped and not counted as passed (about 1 min: the first one waits 36 s on purpose).
+      - name: E2E (two writers never share a work tree unbounded)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-hardening-writers" node_modules/.bin/bun scripts/e2e/hardening-writers.ts
+      # What the host does at the edges the first promise leans on: a worker's command that ignores termination, one that leaves a
+      # child behind, a woken worker's authority, the director's background command, a synchronous call, eval's journal.
+      - name: E2E (host facts the write order leans on)
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-host-facts" node_modules/.bin/bun scripts/e2e/host-facts.ts
+      - name: Upload the work dirs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storm-e2e-work-guarantees
+          include-hidden-files: true
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/storm-e2e*/
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/plugins/**
+            !${{ runner.temp }}/storm-e2e*/home/.omp/**/natives/**
+
+  # omp's goal and loop modes and plan mode exist only in its TUI, which the harness drives on a pty.
+  e2e-tui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild bun --ignore-scripts=false
+      - name: Versions
+        run: |
+          uname -a
+          echo "node $(node --version) · npm $(npm --version) · $(git --version)"
+          echo "bun $(node_modules/.bin/bun --version)"
+          PATH="$PWD/node_modules/.bin:$PATH" omp --version
+          ls node_modules/@oh-my-pi | tr '\n' ' '
       - name: Can this runner open a pty?
         id: pty
         if: ${{ !cancelled() }}
@@ -64,14 +156,17 @@ jobs:
       - name: E2E (TUI)
         if: ${{ !cancelled() && steps.pty.outputs.ok == 'true' }}
         run: E2E_WORK="$RUNNER_TEMP/storm-e2e-tui" npm run e2e:tui
+      # Plan mode is a TUI mode too: a manual start is refused while it is on, and the director can leave it (about 15 s).
+      - name: E2E (plan mode)
+        if: ${{ !cancelled() && steps.pty.outputs.ok == 'true' }}
+        run: E2E_WORK="$RUNNER_TEMP/storm-e2e-plan-mode" node_modules/.bin/bun scripts/e2e/plan-mode.ts
       - name: Upload the work dirs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: storm-e2e-work
+          name: storm-e2e-work-tui
           include-hidden-files: true
           if-no-files-found: ignore
-          # The linked plugin is a symlink to the checkout: the artifact needs the logs, not the repo again.
           path: |
             ${{ runner.temp }}/storm-e2e*/
             !${{ runner.temp }}/storm-e2e*/home/.omp/**/plugins/**

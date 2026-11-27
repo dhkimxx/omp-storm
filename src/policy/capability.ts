@@ -4,8 +4,8 @@
  * A role name or lane goal is not a capability. The effective agent definition's tool list is the starting fact, and
  * the extension enforces the decision at the tool boundary and (where the host supports it) in the task item's `tools`.
  * A lane may be parallel with writers only when its worker actually cannot change the shared tree: a read-only tool
- * list, a proven private checkout, or a path-only write set for disjoint manual work. Everything else is an unknown
- * shared writer and serializes conservatively.
+ * list, a proven private checkout, or a path-only write set for disjoint work. Everything else is an unknown
+ * shared writer and serializes conservatively. A worker with `bash` or `eval` is such a writer in every mode.
  */
 import { readFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
@@ -96,13 +96,27 @@ export function readOnlyIntent(lane: PlanLane): boolean {
 	return lane.kind !== "code" && lane.kind !== "run";
 }
 
-/** Why a shared writer's scope cannot be narrowed; short enough to sit in parentheses of a refusal or a plan line. */
+/** No longer a cause of anything: automatic delegation does not widen a writer's scope. Kept so old imports compile. */
 export const WHY_AUTO_WRITER = "자동 위임";
+/** Why a shared writer's scope cannot be narrowed; short enough to sit in parentheses of a refusal or a plan line. */
 export const WHY_EXEC_WRITER = "임의 실행 도구가 있음";
 export const WHY_UNDECLARED_WRITER = "파일 목록이 없음";
+/** A reviewer that may run commands can change files like any shell worker, so it is ordered like a writer. */
+export const WHY_SHELL_REVIEWER = "리뷰어가 셸 명령을 실행할 수 있음";
+
+/**
+ * The one tool, besides the read-only ones, a review lane may carry: `bash`, so the reviewer can run the project's
+ * checks itself. Path-write tools (`write`, `edit`, ...), `eval`, `lsp` and every other tool stay refused to it.
+ */
+export const REVIEW_SHELL_TOOLS: Readonly<Record<string, true>> = { bash: true };
 
 export type LanePolicy =
-	| { kind: "read"; reason: string }
+	/**
+	 * `shell` marks a review lane whose agent may also run commands. It reads and runs commands but never edits or writes
+	 * with path tools. Because a command can change the tree, such a lane is ordered like a shared writer (see
+	 * `shellReviewer` and `writeScope` in lanes.ts); a read lane without `shell` reserves nothing.
+	 */
+	| { kind: "read"; reason: string; shell?: true }
 	| { kind: "private"; reason: string }
 	| { kind: "paths"; paths: string[]; reason: string }
 	| { kind: "unknown"; reason: string }
@@ -115,15 +129,42 @@ export interface LanePolicyInput {
 	tools: readonly string[] | undefined;
 	/** The team/run places every worker in a private checkout. */
 	isolated: boolean;
-	/** Automatic delegation serializes every shared writer globally. */
-	auto: boolean;
+	/** Ignored: automatic delegation no longer changes a lane's write scope. Callers may still pass it. */
+	auto?: boolean;
+}
+
+/** What a refused lane capability tells the director to check before it sends the same call again. */
+export const CAPABILITY_CHECK_READ = "같은 호출을 다시 보내기 전에 이 레인의 kind와 결과 종류가 맞는지, 읽기 레인에는 읽기 전용 에이전트를 골랐는지 확인하세요.";
+export const CAPABILITY_CHECK_WRITE = "같은 호출을 다시 보내기 전에 쓰기 도구가 있는 역할의 에이전트를 골랐는지 확인하세요.";
+
+/** A review lane: the final reviewer's lane, whatever the role name says. */
+export function reviewLane(lane: PlanLane): boolean {
+	return lane.kind === "review" || lane.role === "reviewer";
+}
+
+/** Whether the list is read-only tools plus only the review shell (`bash`), and has at least one shell tool. */
+function readOnlyWithReviewShell(tools: readonly string[] | undefined): boolean {
+	if (tools === undefined) return false;
+	let shell = false;
+	for (const raw of tools) {
+		const name = raw.trim();
+		if (!name || READ_ONLY_TOOLS[name] === true) continue;
+		if (REVIEW_SHELL_TOOLS[name] !== true) return false;
+		shell = true;
+	}
+	return shell;
+}
+
+/** Whether a policy is a review lane that may run commands: it reads, never writes with path tools, and is ordered like a writer. */
+export function shellReviewer(policy: LanePolicy | undefined): boolean {
+	return policy?.kind === "read" && policy.shell === true;
 }
 
 /**
- * The one classification used by admission and runtime enforcement. A read-only intent is enforced by replacing the
- * worker's tools with the read-only subset, so a `bash`-capable agent definition does not make a review/architecture
- * lane a writer. A writable intent needs path-only tools to be scoped; exec/unknown tools are an unknown writer, and
- * automatic shared writers are global even when their files look disjoint.
+ * The one classification used by admission and runtime enforcement. A read-only intent is enforced at the tool
+ * boundary, so a `bash`-capable agent definition does not make a review/architecture lane a writer: it is refused.
+ * The one exception is a review lane whose only extra tool is `bash` (`read` with `shell`). A writable intent needs
+ * path-only tools to be scoped; exec/unknown tools are an unknown writer. Automatic delegation changes none of this.
  */
 export function lanePolicy(input: LanePolicyInput): LanePolicy {
 	const { lane, tools } = input;
@@ -131,19 +172,21 @@ export function lanePolicy(input: LanePolicyInput): LanePolicy {
 	if (lane === undefined) return { kind: "unknown", reason: "계획에 없는 작업이라 쓰기 범위를 알 수 없습니다" };
 	if (readOnlyIntent(lane)) {
 		const capability = toolCapability(tools);
+		if (!capability.readOnly && reviewLane(lane) && readOnlyWithReviewShell(tools)) {
+			return { kind: "read", reason: "읽기와 셸 실행만 하는 리뷰 레인", shell: true };
+		}
 		if (!capability.readOnly) {
 			return {
 				kind: "blocked",
-				reason: `'${lane.name}' 레인은 쓰기 의도가 없는데 이 에이전트의 실제 도구에 쓰기/실행 능력이 있습니다(${tools === undefined ? "도구 목록 없음=호스트 기본 전체" : tools.join(", ")}). 역할 이름으로 읽기 전용을 가정하지 않으며, 읽기 전용 정의나 승인된 센드박스가 필요합니다.`,
+				reason: `'${lane.name}' 레인은 쓰기 의도가 없는데 이 에이전트의 실제 도구에 쓰기/실행 능력이 있습니다(${tools === undefined ? "도구 목록 없음=호스트 기본 전체" : tools.join(", ")}). 역할 이름으로 읽기 전용을 가정하지 않으며, 읽기 전용 정의나 승인된 센드박스가 필요합니다. ${CAPABILITY_CHECK_READ}`,
 			};
 		}
 		return { kind: "read", reason: "실제 도구가 읽기 전용인 레인" };
 	}
 	const capability = toolCapability(tools);
 	if (capability.readOnly) {
-		return { kind: "blocked", reason: `'${lane.name}' 레인은 쓰기 결과를 요구하지만 이 에이전트의 도구는 읽기 전용입니다` };
+		return { kind: "blocked", reason: `'${lane.name}' 레인은 쓰기 결과를 요구하지만 이 에이전트의 도구는 읽기 전용입니다. ${CAPABILITY_CHECK_WRITE}` };
 	}
-	if (input.auto) return { kind: "unknown", reason: WHY_AUTO_WRITER };
 	if (capability.exec) return { kind: "unknown", reason: WHY_EXEC_WRITER };
 	if ((lane.files?.length ?? 0) === 0) return { kind: "unknown", reason: WHY_UNDECLARED_WRITER };
 	return { kind: "paths", paths: [...new Set(lane.files ?? [])].sort(), reason: "경로 지정 도구만 있는 수동 공유 쓰기" };

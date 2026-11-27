@@ -25,6 +25,7 @@ import { formatUsd } from "../policy/spawn.ts";
 import { resultProgress, type ResultRow } from "../view/results.ts";
 import { goalTotals } from "./goal.ts";
 import { endLabel, STATUS_LABEL } from "./rounds.ts";
+import { spendText, unplannedLine } from "./unplanned.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
@@ -226,7 +227,7 @@ function runReasonLabel(run: RunRecord): string {
 	return "필수 결과 이행";
 }
 
-function statusLine(run: RunRecord): string {
+function statusLine(run: RunRecord, card: boolean): string {
 	const status = STATUS_LABEL[run.status] ?? clean(run.status, NAME_MAX);
 	const label = clean(runReasonLabel(run), NAME_MAX);
 	const reason = label === "" ? "" : ` · ${label}`;
@@ -236,7 +237,13 @@ function statusLine(run: RunRecord): string {
 			: typeof run.maxRounds === "number"
 				? ` · ${run.turns}/${run.maxRounds}라운드`
 				: ` · ${run.turns}라운드`;
-	return `${status}${reason}${rounds}`;
+	// What the run spent in all, with a floor marked as one. A run that spent nothing says nothing. The one-row record of a
+	// short clean run carries the figure only when it is a floor (a bare number there would read as exact): with it that row is
+	// 68 columns wide and wraps on a 60 column terminal, which the TUI scenario "a short clean automatic run" pins. The card
+	// has room, and `/storm status` always has the figure.
+	const spent = Number.isFinite(run.costUsd) && run.costUsd > 0;
+	const spend = spent && (card || run.spend?.lowerBound === true) ? ` · 비용 ${spendText(run)}` : "";
+	return `${status}${reason}${rounds}${spend}`;
 }
 
 type OpenKind = keyof CloseoutBrief["official"]["open"];
@@ -349,6 +356,10 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 	}
 	const openTotal = Object.values(open).reduce((sum, n) => sum + n, 0);
 	const residual = residualOf(run, facts, openLanes);
+	// Work that happened outside the declared results is a fact the card names, not a risk: it shapes neither the tier
+	// nor the tone, and it takes a place on the card only from the lowest-ranked risk.
+	const unplanned = unplannedLine(run);
+	const shownResidual = unplanned === undefined ? residual : [...residual.slice(0, RESIDUAL_MAX - 1), unplanned];
 	const minutes = minutesOf(run);
 	const settled =
 		run.status !== "budget-exceeded" &&
@@ -408,7 +419,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		startedAt: run.startedAt,
 		...(typeof run.endedAt === "string" ? { endedAt: run.endedAt } : {}),
 		official: {
-			label: statusLine(run),
+			label: statusLine(run, tier === "card"),
 			tone: toneOf(run, openTotal, residual.length),
 			hasResults: progress.present,
 			accepted: progress.counts.accepted,
@@ -416,7 +427,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 			excluded: progress.counts.excluded,
 			open,
 		},
-		residual,
+		residual: shownResidual,
 		...(proof ? { proof } : {}),
 		...(goal !== undefined ? { goal } : {}),
 		...(card && draft !== undefined

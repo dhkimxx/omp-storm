@@ -16,6 +16,16 @@
  *   14:22:17 .. 14:55:15            four messages into the running implementer left four open dispatches
  *   end of run                      every row with an open dispatch was rewritten, delivered answers included
  *
+ * Phase 1 (0.27.0) changed what Storm answers at several of these moments; the replay asserts the new answers and
+ * ends with a count of how many of the session's 14 refusals (7 write order, 5 prerequisite, 2 tagged automatic) are
+ * left. The refusals of the first hour are all inside this file's window except the three of 16:35 and 17:06.
+ *
+ *   14:16:51 .. 14:54:04  write order stays (G1): the cause named under automatic delegation is the worker's tools
+ *   14:25:04              the director's `?progress` note passes the director gate (it was refused with the wrong cause)
+ *   14:30:32 .. 14:52:53  the prerequisite no longer refuses, whether it has not answered or answered and was judged unmet
+ *                         (the real session's case): the lane starts with a note. The same five calls still meet the
+ *                         running Body writer, so they are refused by the write order, with that cause named
+ *
  * Tests assert behaviour: states, codes, which lanes a text names, what the ledger records. Set `REPLAY_TRANSCRIPT=1`
  * to print what Storm says at each moment.
  */
@@ -23,14 +33,15 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { lanePolicy, type LanePolicy, WHY_AUTO_WRITER } from "../src/policy/capability.ts";
+import { lanePolicy, type LanePolicy, WHY_AUTO_WRITER, WHY_EXEC_WRITER } from "../src/policy/capability.ts";
+import { SUPERVISOR_REASONS, supervisorToolBlock } from "../src/policy/supervisor.ts";
 import { validatePlan } from "../src/plan/validate.ts";
 import { resetAgents } from "../src/runtime/agents.ts";
 import { AttemptCollector } from "../src/runtime/attempt-collector.ts";
 import { ATTEMPT_REF } from "../src/runtime/attempt-report.ts";
 import { resetCloseoutChoices } from "../src/runtime/closeout.ts";
 import { resetLedger } from "../src/runtime/ledger.ts";
-import { RunLanes } from "../src/runtime/lanes.ts";
+import { dependencyStart, RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
 import { readRun } from "../src/runtime/run.ts";
 import { type StormToolHost } from "../src/tool/host.ts";
 import { runStormTool, type StormToolInput } from "../src/tool/storm-tool.ts";
@@ -277,6 +288,7 @@ const taskCall = (...names: string[]) => ({
 
 async function place(at: string, names: string[], isolationEnabled: boolean | undefined = false): Promise<ReturnType<RunLanes["assign"]>> {
 	clock.t = KST(at);
+	lastPlacedAt = at;
 	const readiness = needed(current).size === 0 ? undefined : await h.controller.laneReadiness(current, needed(current));
 	return lanes.assign(taskCall(...names), current, h.config, {
 		host: { enabled: isolationEnabled },
@@ -288,9 +300,14 @@ async function place(at: string, names: string[], isolationEnabled: boolean | un
 	});
 }
 
+/** Every refusal this replay met, by the real session's clock, for the count at the end. */
+const refusalsMet = new Map<string, string>();
+let lastPlacedAt = "";
+
 function refused(binding: ReturnType<RunLanes["assign"]>): { code: string | undefined; reason: string } {
 	expect(binding.ok).toBe(false);
 	if (binding.ok) throw new Error("expected a refusal");
+	refusalsMet.set(lastPlacedAt, binding.code ?? "isolation");
 	return { code: binding.code, reason: binding.reason };
 }
 
@@ -307,6 +324,8 @@ async function start(at: string, names: string[]): Promise<void> {
 		jobStart.set(item.name, clock.t);
 		setAgent(item.name, target.role === "explorer" ? "explorer" : "implementer", "running");
 	}
+	// The real call returned at once (an async spawn): its end is no longer what a worker that settles later waits for.
+	lanes.callEnded(`call-${at}`);
 }
 
 /** A `write agent://<id>` that woke or joined the worker, with the job omp registered for it (when it registers one). */
@@ -354,16 +373,16 @@ async function pushedDelivery(at: string, name: string, text: string): Promise<v
 
 const running = async (name: string): Promise<boolean> => (await h.controller.laneReadiness(current, new Set([name]))).get(name)!.running;
 
-beforeAll(async () => {
-	root = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-replay-")));
-	await mkdir(path.join(root, KNOWLEDGE), { recursive: true });
-	const body = (lines: number) => Array.from({ length: lines }, (_, index) => `line ${index + 1}`).join("\n");
-	await writeFile(path.join(root, VLM), body(700));
-	await writeFile(path.join(root, HYBRID), body(40));
-	await writeFile(path.join(root, EXECUTORCH), body(160));
-	await writeFile(path.join(root, "knowledge/genai/k0-index.md"), body(10));
+/** A new session over the same project: the replay's run state starts empty. */
+async function freshSession(at: string): Promise<void> {
+	agents.length = 0;
+	settlements.length = 0;
+	spawned.clear();
+	jobStart.clear();
+	resetLedger();
+	resetAgents();
 	h = fakeSession({ root, config: team, agents, now: () => clock.t });
-	clock.t = KST("14:16:51");
+	clock.t = KST(at);
 	runId = await h.start();
 	collector = new AttemptCollector({
 		port: {
@@ -377,6 +396,17 @@ beforeAll(async () => {
 		registry: () => ({ get: id => ({ id, parentId: "main", session: null }), onChange: () => () => undefined }),
 		now: () => clock.t,
 	});
+}
+
+beforeAll(async () => {
+	root = await realpath(await mkdtemp(path.join(os.tmpdir(), "storm-replay-")));
+	await mkdir(path.join(root, KNOWLEDGE), { recursive: true });
+	const body = (lines: number) => Array.from({ length: lines }, (_, index) => `line ${index + 1}`).join("\n");
+	await writeFile(path.join(root, VLM), body(700));
+	await writeFile(path.join(root, HYBRID), body(40));
+	await writeFile(path.join(root, EXECUTORCH), body(160));
+	await writeFile(path.join(root, "knowledge/genai/k0-index.md"), body(10));
+	await freshSession("14:16:51");
 });
 
 afterAll(async () => {
@@ -397,7 +427,9 @@ describe("14:16 to 14:22: the plan step and the first refusals", () => {
 		expect(order).toBeDefined();
 		for (const name of ["GemmaQatBody", "GemmaQatHead", "GemmaMemoryHandoff"]) expect(order).toContain(name);
 		expect(order).not.toContain("TraceClawQatProducer");
-		expect(order).toContain(WHY_AUTO_WRITER);
+		// Phase 1: the cause is what the worker can do (bash, eval), never the delegation mode.
+		expect(order).toContain(WHY_EXEC_WRITER);
+		expect(order).not.toContain(WHY_AUTO_WRITER);
 		expect(reply).not.toContain("격리 불가");
 
 		const call = refused(await place("14:18:06", ["GemmaQatBody", "GemmaQatHead", "GemmaMemoryHandoff", "TraceClawQatProducer"]));
@@ -406,7 +438,8 @@ describe("14:16 to 14:22: the plan step and the first refusals", () => {
 		// What the director was told matches what the plan reply said: the lanes, the cause, one writer per call.
 		expect(call.reason).toContain("'GemmaQatBody' 레인");
 		expect(call.reason).toContain("'GemmaQatHead' 레인");
-		expect(call.reason).toContain(WHY_AUTO_WRITER);
+		expect(call.reason).toContain(WHY_EXEC_WRITER);
+		expect(call.reason).not.toContain(WHY_AUTO_WRITER);
 		expect(call.reason).toContain("읽기 전용");
 	});
 
@@ -440,6 +473,8 @@ describe("14:16 to 14:22: the plan step and the first refusals", () => {
 		expect(head.code).toBe("lane-write");
 		expect(head.reason).toContain("'BuildGemmaBodyQat' 레인");
 		expect(head.reason).toContain("끝난 뒤");
+		// Phase 1: the refusal says what to check before the same call goes again, so it is not sent three times in 2.5 minutes.
+		expect(head.reason).toContain(WRITE_ORDER_CHECK);
 		expect(head.reason).not.toContain("선언되지 않은");
 		await start("14:21:07", ["TraceClawQatProducer"]);
 		expect(agentOf("TraceClawQatProducer")).toMatch(/-lane-2$/);
@@ -491,6 +526,15 @@ describe("14:23 to 14:31: results of follow-ups reach the ledger, and the depend
 		expect(await running("BuildGemmaBodyQat")).toBe(true);
 	});
 
+	test("14:25:04 the director's quiet progress note to the running implementer passes the director gate (it was refused as a project tool)", () => {
+		const note = { path: `agent://${agentOf("BuildGemmaBodyQat")}?progress`, content: "the head candidates are separate: no action needed" };
+		// The real refusal read "[storm:auto] … the main session does not use project tools"; a status note is a message.
+		expect(supervisorToolBlock("write", note)).toBeUndefined();
+		// What stays refused has its own cause: a file edit and a command are not notes.
+		expect(supervisorToolBlock("bash", { command: "ls" })).toContain(SUPERVISOR_REASONS.toolRuns);
+		expect(supervisorToolBlock("edit", { path: "a.ts" })).toContain(SUPERVISOR_REASONS.toolEdits);
+	});
+
 	test("14:25:55 the explorer's answer is delivered; 14:26:51 the follow-up to it is delivered at 14:27:06 and is recorded", async () => {
 		const claw = agentOf("TraceClawQatProducer");
 		await waitDelivery("14:25:55", "TraceClawQatProducer", CLAW_FIRST);
@@ -520,21 +564,17 @@ describe("14:23 to 14:31: results of follow-ups reach the ledger, and the depend
 		expect(head.reason).toBeDefined();
 	});
 
-	test("14:30:32 the dependency refusal carries the ledger's reason and what an answer must cite, and does not say to respawn", async () => {
+	test("14:30:32 the prerequisite answered and was judged unmet: the dependency no longer refuses; the call meets the running Body writer instead", async () => {
+		// The real session was refused here as `lane-dependency` (the director then guessed and waited). The dependency does not
+		// refuse any more: what is left is the write order, which names the earlier writer, the one thing that did hold.
 		const call = refused(await place("14:30:32", ["BuildGemmaQatHeadShared"]));
 		say("14:30:32", "task call refused", call.reason);
-		expect(call.code).toBe("lane-dependency");
+		expect(call.code).toBe("lane-write");
 		expect(call.reason).toContain("'BuildGemmaQatHeadShared' 레인");
-		expect(call.reason).toContain("'PinGemmaHeadControl' 레인");
-		// The reason the ledger gave, which the old text dropped.
-		expect(call.reason).toContain(rowOf("head-control-source").reason!.replace(/[.。]+$/u, ""));
-		// The citation form that works, and the way to ask for it.
-		expect(call.reason).toContain("path:line");
-		expect(call.reason).toContain("write agent://");
-		expect(call.reason).not.toContain("다시 스폰");
-		// The old text spliced a name into a particle: `필수 결과을`.
-		expect(call.reason).not.toContain("결과을");
-		expect(call.reason).not.toContain("이(가)");
+		expect(call.reason).toContain("'BuildGemmaBodyQat' 레인");
+		expect(call.reason).toContain(WRITE_ORDER_CHECK);
+		const head = await h.controller.laneReadiness(current, new Set(["PinGemmaHeadControl"]));
+		expect(dependencyStart(laneOf("BuildGemmaQatHeadShared"), head).ok).toBe(true);
 	});
 
 	test("14:30:50 follow-ups to both prerequisites; 14:31:06 and 14:31:16 their answers are recorded and neither lane reads as running", async () => {
@@ -552,12 +592,33 @@ describe("14:23 to 14:31: results of follow-ups reach the ledger, and the depend
 		expect(await running("PinGemmaHandoffControl")).toBe(false);
 	});
 
-	test("14:31:39 the refusal now speaks of the answer, not of a worker that is still running", async () => {
-		const call = refused(await place("14:31:39", ["BuildGemmaQatHeadShared"]));
-		say("14:31:39", "task call refused", call.reason);
-		expect(call.code).toBe("lane-dependency");
+	test("14:31:40 neither prerequisite lane reads as running, and the call is held only by the running writer", async () => {
+		const call = refused(await place("14:31:40", ["BuildGemmaQatHeadShared"]));
+		say("14:31:40", "task call refused", call.reason);
+		expect(call.code).toBe("lane-write");
 		expect(call.reason).not.toContain("아직 실행 중");
-		expect(call.reason).toContain(rowOf("head-control-source").reason!.replace(/[.。]+$/u, ""));
+	});
+});
+
+describe("14:31 to 14:35: the prerequisite that answered and was judged unmet no longer refuses", () => {
+	test("the ledger row carries a content version but never stood accepted: the start check lets it start, with its note", async () => {
+		// The real session's case in all five of its prerequisite refusals: the explorer DID answer, with a citation
+		// Storm cannot read. The row is unmet and carries a content version, and the readiness view says it never stood
+		// accepted, so the record would bind the input as `missing` and never accept the dependant's result on it.
+		const needed = new Set(["PinGemmaHeadControl", "PinGemmaHandoffControl"]);
+		const view = await h.controller.laneReadiness(current, needed);
+		const result = view.get("PinGemmaHeadControl")!.results[0]!;
+		expect(result.state).toBe("unmet");
+		expect(result.version).toBeDefined();
+		expect(result.standingVersion).toBeUndefined();
+		const start = dependencyStart(laneOf("BuildGemmaQatHeadShared"), view);
+		expect(start.ok).toBe(true);
+		if (start.ok) expect(start.notes.join(" ")).toContain("'PinGemmaHeadControl' 레인");
+		// What still refuses the call at that moment is the write order, a different guarantee.
+		const call = refused(await place("14:35:06", ["BuildGemmaQatHeadShared"]));
+		say("14:35:06", "task call refused (answered, unmet): by the write order", call.reason);
+		expect(call.code).toBe("lane-write");
+		expect(call.reason).toContain("'BuildGemmaBodyQat' 레인");
 	});
 });
 
@@ -573,22 +634,21 @@ describe("14:35 to 14:56: the stuck lane no longer blocks, and the running imple
 		expect(rowOf("head-control-source").state).toBe("unmet");
 	});
 
-	test("14:44:33 the refusal is the same honest sentence: the lane is not running, the answer is what is missing", async () => {
+	test("14:44:33 the answer is still unmet, the dependency does not refuse, and the running writer is what holds the call", async () => {
 		const call = refused(await place("14:44:33", ["BuildGemmaQatHeadShared"]));
 		say("14:44:33", "task call refused", call.reason);
+		expect(call.code).toBe("lane-write");
 		expect(call.reason).not.toContain("아직 실행 중");
-		expect(call.reason).toContain("path:line");
 	});
 
-	test("14:45:17 the edge is relaxed to a reviewable submission; 14:52:53 the refusal still names the answer, not a running worker", async () => {
+	test("14:45:17 the edge is relaxed to a reviewable submission; 14:52:53 the call is still held by the running writer only", async () => {
 		const reply = await submitPlan(P5, "14:45:17");
 		say("14:45:17", "plan reply", reply);
 		await followUp("14:48:02", "BuildGemmaBodyQat", "call-follow-3", { id: agentOf("BuildGemmaBodyQat"), startTime: KST("14:20:28") });
 		const call = refused(await place("14:52:53", ["BuildGemmaQatHeadShared"]));
 		say("14:52:53", "task call refused", call.reason);
-		expect(call.code).toBe("lane-dependency");
+		expect(call.code).toBe("lane-write");
 		expect(call.reason).not.toContain("아직 실행 중");
-		expect(call.reason).toContain("검토 가능 제출");
 	});
 
 	test("(not in the real run) the answer the refusal asks for is accepted for review and the writer is then held only by the running writer", async () => {
@@ -665,5 +725,72 @@ describe("the end of the run", () => {
 		const view = resultProgress(record!);
 		for (const row of view.rows) if (row.attempt !== undefined) expect(ids).toContain(row.attempt);
 		expect(view.rows.filter(row => row.attempt !== undefined).length).toBe(ids.length);
+	});
+});
+
+describe("how many of the session's refusals are left", () => {
+	/**
+	 * The refused calls of the real session inside this replay's window, by the real clock. The session had 14 in all:
+	 * 7 write order, 5 prerequisite, 2 tagged automatic. The events file kept for this replay lists 13 refused calls
+	 * (6 write order); the 14th is not in it. The 16:35:52 task and 17:06:02 follow-up refusals are write order on
+	 * lanes this replay does not carry; the same rule refuses them (a shell writer beside a running one).
+	 */
+	const REAL: { at: string; kind: "write order" | "prerequisite" | "automatic" }[] = [
+		{ at: "14:18:06", kind: "write order" },
+		{ at: "14:19:35", kind: "write order" },
+		{ at: "14:20:50", kind: "write order" },
+		{ at: "14:22:17", kind: "automatic" },
+		{ at: "14:25:04", kind: "automatic" },
+		{ at: "14:30:32", kind: "prerequisite" },
+		{ at: "14:31:40", kind: "prerequisite" },
+		{ at: "14:35:06", kind: "prerequisite" },
+		{ at: "14:44:33", kind: "prerequisite" },
+		{ at: "14:52:53", kind: "prerequisite" },
+		{ at: "14:54:04", kind: "write order" },
+	];
+
+	test("each refusal of the first hour is either still refused, with its code, or gone", () => {
+		const left = REAL.filter(item => refusalsMet.has(item.at));
+		const gone = REAL.filter(item => !refusalsMet.has(item.at));
+		// Write order is G1 and stays: a worker with bash or eval is a writer that cannot be bounded, in either mode.
+		expect(left.filter(item => item.kind === "write order").map(item => refusalsMet.get(item.at))).toEqual(Array(4).fill("lane-write"));
+		// The isolation refusal is a fact about omp's setting; its code is none, so the tag is `isolation`, not `auto`.
+		expect(refusalsMet.get("14:22:17")).toBe("isolation");
+		// The director's progress note is the one that is gone: the director gate admits it.
+		expect(gone.map(item => item.at)).toEqual(["14:25:04"]);
+		// The five prerequisite calls are refused again, but no longer for the prerequisite: each prerequisite had answered and
+		// been judged unmet, the dependency starts, and the running Body writer is what holds the call (write order, G1).
+		expect(left.filter(item => item.kind === "prerequisite").map(item => refusalsMet.get(item.at))).toEqual(Array(5).fill("lane-write"));
+		const line = (kind: string) => `${left.filter(item => item.kind === kind).length}/${REAL.filter(item => item.kind === kind).length}`;
+		say(
+			"summary",
+			"refusals of the real session left after phase 1 (window 14:18 to 14:54)",
+			`write order ${line("write order")}, prerequisite ${line("prerequisite")}, automatic ${line("automatic")}: ${left.length} of ${REAL.length} remain; gone: ${gone.map(item => item.at).join(", ")}`,
+		);
+	});
+});
+
+describe("(not in the real run) a prerequisite that has not answered yet", () => {
+	test("the writer starts with a note that its result will not be accepted until the prerequisite is, then settles unmet and is run again", async () => {
+		await freshSession("15:10:00");
+		await submitPlan(P4, "15:10:00");
+		// The explorer prerequisite of the head writer has not been started: its row is pending and carries no version.
+		const view = await h.controller.laneReadiness(current, new Set(["PinGemmaHeadControl"]));
+		expect(view.get("PinGemmaHeadControl")!.results[0]!.version).toBeUndefined();
+		const binding = await place("15:10:30", ["BuildGemmaQatHeadShared"]);
+		if (!binding.ok) throw new Error(`refused: ${binding.reason}`);
+		// Before phase 1 this was `lane-dependency`. Now the call starts, and its result says what the start means.
+		expect(binding.notes).toHaveLength(1);
+		expect(binding.notes![0]).toContain("'PinGemmaHeadControl' 레인");
+		expect(binding.notes![0]).toContain("수용되지 않습니다");
+		expect(binding.notes![0]).toContain("write agent://");
+		say("15:10:30", "task call started with a note", binding.notes![0]!);
+	});
+
+	test("the second writer of the same plan is still ordered after the first: starting early does not lift write order", async () => {
+		await start("15:11:00", ["BuildGemmaQatHeadShared"]);
+		const second = refused(await place("15:11:20", ["TestGemmaRamHandoffShared"]));
+		expect(second.code).toBe("lane-write");
+		expect(second.reason).toContain("'BuildGemmaQatHeadShared' 레인");
 	});
 });
