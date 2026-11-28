@@ -43,7 +43,7 @@ import {
 	PRIVATE_OVERLAP_WARNING,
 	validatePlan,
 } from "../src/plan/validate.ts";
-import { INTEGRATED_UNAVAILABLE, renderPlanView } from "../src/tool/plan-view.ts";
+import { INTEGRATED_NEEDS_SELECTION, renderPlanView } from "../src/tool/plan-view.ts";
 import type { AgentEntry, RunPlan, RunRecord, RunResult, StormConfig } from "../src/types.ts";
 import { renderCloseout } from "../src/view/closeout.ts";
 import { isolationNote } from "../src/view/render.ts";
@@ -272,7 +272,7 @@ describe("row 2/row 5: isolated judgement in the controller", () => {
 		expect(row?.reason).not.toContain("바뀐 내용이 없습니다");
 	});
 
-	test("an integrated prerequisite on an isolated producer says it cannot be met in this version", async () => {
+	test("an integrated prerequisite on an isolated producer waits for explicit integration", async () => {
 		const h = session();
 		const runId = await h.start();
 		const producer = lane("P", { isolationReason: "retained candidate", results: [artifact("p0")] });
@@ -292,7 +292,7 @@ describe("row 2/row 5: isolated judgement in the controller", () => {
 		expect(p?.results[0]?.reason).toBe(ISOLATED_INTEGRATED_REASON);
 		const refusal = dependencyBlock(consumer, readiness as LaneReadinessView);
 		expect(refusal).toContain(ISOLATED_INTEGRATED_REASON);
-		expect(renderPlanView({ runId, plan: lanePlan, results: h.controller.active()?.results })).toContain(INTEGRATED_UNAVAILABLE);
+		expect(renderPlanView({ runId, plan: lanePlan, results: h.controller.active()?.results })).toContain(INTEGRATED_NEEDS_SELECTION);
 		await rm(artifactDir, { recursive: true, force: true });
 	});
 	test("a success with no patch says a branch is unread; an empty capture says no change, never a failed attempt", async () => {

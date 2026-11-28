@@ -3,7 +3,7 @@
  * description read the same chips; only the layout decides which whole chips fit. Animation never reaches this file.
  */
 import { formatUsd } from "../policy/spawn.ts";
-import { NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, TREE_CHANGE_LABEL, WORKER_CHANGE_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
+import { INTEGRATION_CANDIDATES, NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, TREE_CHANGE_LABEL, WORKER_CHANGE_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
 import type { InfoTone, RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, type RunPhase } from "./appearance.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
@@ -73,7 +73,11 @@ function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
 					: `${WORKER_CHANGE_LABEL} ${facts.activity.changed}`
 				: `${TREE_CHANGE_LABEL} ${facts.changedPaths}`;
 		const out = facts.outOfPlan === 0 ? undefined : `${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
-		const tail = [workers, changed, out].filter((part): part is string => part !== undefined).join(" · ");
+		const integration =
+			facts.integration?.kind === "recorded"
+				? `${INTEGRATION_CANDIDATES} ${Math.max(0, Math.floor(facts.integration.candidates ?? 0))}`
+				: undefined;
+		const tail = [workers, changed, out, integration].filter((part): part is string => part !== undefined).join(" · ");
 		const forms: LiveMetricForm[] =
 			tail === workers
 				? [{ value: NO_DECLARED_RESULTS, suffix: ` · ${workers}` }, { value: NO_DECLARED_RESULTS }]
@@ -103,7 +107,11 @@ function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
 	const retainedCount = `${RETAINED_ACCEPTED} ${counts.accepted}/${counts.inScope}`;
 	const plainCount = `${counts.accepted}/${counts.inScope}`;
 	const progressText = retainedOnly ? retainedCount : `이행 ${plainCount}${retainedPart}`;
-	const full = (focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`) + mixed;
+	const integrationPart =
+		facts.integration?.kind === "recorded"
+			? ` · ${INTEGRATION_CANDIDATES} ${Math.max(0, Math.floor(facts.integration.candidates ?? 0))}`
+			: "";
+	const full = (focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`) + mixed + integrationPart;
 	const forms: LiveMetricForm[] =
 		counts.inScope > 0
 			? retainedOnly

@@ -22,12 +22,13 @@ import type {
 	WorkerStopReason,
 } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
+import type { CandidateProjection } from "./integration-controller-port.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { workerStopNotice } from "../policy/thread.ts";
 import type { ResultRow } from "../view/results.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, PLANLESS_PLACEMENT_NOTE } from "./contract-text.ts";
 import { goalTotals } from "./goal.ts";
-import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type ResultFacts, type RetainedFacts, type StormStopFact, type StormStopFacts } from "./result-facts.ts";
+import { integrationHandoffLine, integrationHasObservations, OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type IntegrationFacts, type ResultFacts, type RetainedFacts, type StormStopFact, type StormStopFacts } from "./result-facts.ts";
 import { HANDOFF_RESUME_LABEL } from "./resume.ts";
 import { endLabel, NO_PARENT_CHANGE_HANDOFF, STATUS_LABEL } from "./rounds.ts";
 import { handoffOutcomes, outOfPlanLine, spendText, unplannedLine, unplannedSplit } from "./unplanned.ts";
@@ -445,6 +446,8 @@ export interface CloseoutRetainedBrief extends CloseoutBrief {
 	 * worker left nothing.
 	 */
 	readonly captureUnknown?: CaptureUnknown;
+	/** The owning run's integration queue, from C's one projection; absent when the caller read no journal. */
+	readonly integration?: IntegrationFacts;
 }
 
 /**
@@ -457,8 +460,8 @@ export interface CloseoutRetainedBrief extends CloseoutBrief {
  * - `card`: everything else. The director's result and remaining appear only here, marked stale when finalization
  *   changed a row after the draft could have been written.
  */
-export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } = {}): CloseoutRetainedBrief {
-	const fact = resultFacts(run);
+export function closeoutBrief(run: RunRecord, options: { resumable?: boolean; integration?: CandidateProjection } = {}): CloseoutRetainedBrief {
+	const fact = resultFacts(run, options.integration === undefined ? {} : { integration: options.integration });
 	const progress = fact.progress;
 	const markers = finalizedById(run);
 	const stored = storedFacts(run.closeoutFacts);
@@ -492,6 +495,8 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		fact.captureUnknown === undefined &&
 		// The stop sentence and its count are named on the card; a one-line closeout would hide why workers ended.
 		fact.stormStops === undefined &&
+		// A recorded or unreadable integration state is named on the card; an older record or an empty queue is not.
+		!integrationHasObservations(fact.integration) &&
 		residual.length === 0;
 	const tier: CloseoutBrief["tier"] =
 		run.status === "running" ? "none" : settled && (minutes === undefined || minutes < CLOSEOUT_CARD_MINUTES) ? "line" : "card";
@@ -540,6 +545,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		retained: fact.retained,
 		...(fact.stormStops === undefined ? {} : { stormStops: fact.stormStops }),
 		...(fact.captureUnknown === undefined ? {} : { captureUnknown: fact.captureUnknown }),
+		...(fact.integration === undefined ? {} : { integration: fact.integration }),
 		request: clean(run.task, REQUEST_MAX),
 		...(target ? { target } : {}),
 		startedAt: run.startedAt,
@@ -616,8 +622,8 @@ const OPEN_WORDS: Readonly<Record<OpenKind, string>> = {
  * no markup. Official counts lead; the director's own words follow as unverified and, when finalization changed a row
  * after they were written, as superseded by those counts.
  */
-export function closeoutHandoff(run: RunRecord): string {
-	const brief = closeoutBrief(run);
+export function closeoutHandoff(run: RunRecord, integration?: CandidateProjection): string {
+	const brief = closeoutBrief(run, integration === undefined ? {} : { integration });
 	const official = brief.official;
 	const draft = storedCloseout(run.closeout);
 	const runRef = /^run-[0-9A-Za-z-]+$/.test(run.runId) ? run.runId : "(unknown)";
@@ -703,6 +709,7 @@ export function closeoutHandoff(run: RunRecord): string {
 		`- Request: ${scrub(run.task, REQUEST_MAX)}`,
 		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
 		results,
+		integrationHandoffLine(brief.integration),
 		retainedLine,
 		recoveryLine,
 		stoppedLine,

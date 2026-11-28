@@ -1,3 +1,4 @@
+import type { IntegrationFacts } from "../../runtime/result-facts.ts";
 import type { RunPhase } from "../appearance.ts";
 
 export type LaneState =
@@ -37,4 +38,6 @@ export interface LaneSnapshot {
 	lanes: readonly LaneTrack[];
 	/** Every in-scope result is met: a stopping run ends in the finale instead of lights out. */
 	complete: boolean;
+	/** The run's integration queue, from C's one projection; absent when the caller read no journal. */
+	integration?: IntegrationFacts;
 }

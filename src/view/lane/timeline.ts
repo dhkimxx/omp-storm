@@ -11,7 +11,8 @@
  */
 import { BUILTIN_AGENT_ROLES, ROLES, roleTitle } from "../../roles.ts";
 import type { AgentEntry, PlanLane, RunJob, RunRecord, SpawnRecord } from "../../types.ts";
-import { resultFacts } from "../../runtime/result-facts.ts";
+import { resultFacts, type IntegrationFacts } from "../../runtime/result-facts.ts";
+import type { CandidateProjection } from "../../runtime/integration-controller-port.ts";
 import type { RunPhase } from "../appearance.ts";
 import type { ResultProgress } from "../results.ts";
 import { UNPLANNED_LABEL, type LaneSnapshot, type LaneSpan, type LaneState, type LaneTrack, type PhaseSpan } from "./model.ts";
@@ -298,10 +299,11 @@ export class LaneTimeline {
 	#complete = false;
 	/** Wall-clock ms at which the earliest running lane turns quiet; infinity when none will. */
 	#quietAt = Number.POSITIVE_INFINITY;
+	#integration: IntegrationFacts | undefined;
 	#base: { phases: readonly PhaseSpan[]; rounds: readonly number[]; lanes: readonly LaneTrack[]; live: boolean } | undefined;
 
 	/** Folds one observation of the run into the history. Called on every live update; cheap when nothing changed. */
-	observe(run: RunRecord, phase: RunPhase, now: number): void {
+	observe(run: RunRecord, phase: RunPhase, now: number, integration?: CandidateProjection): void {
 		const first = this.#start === undefined;
 		const start = (this.#start ??= epoch(run.startedAt) ?? now);
 		const at = this.#at(now);
@@ -336,7 +338,12 @@ export class LaneTimeline {
 		}
 		this.#turns = turns;
 
-		const facts = resultFacts(run);
+		const facts = resultFacts(run, integration === undefined ? {} : { integration });
+		const nextIntegration = facts.integration;
+		if (JSON.stringify(this.#integration ?? null) !== JSON.stringify(nextIntegration ?? null)) {
+			this.#integration = nextIntegration;
+			changed = true;
+		}
 		const progress = facts.progress;
 		const plan = run.plan?.lanes;
 		const crew = crewOf(run);
@@ -412,16 +419,19 @@ export class LaneTimeline {
 
 	/** The picture's input at wall-clock `now`. Called for every frame: no work beyond advancing `now`. */
 	snapshot(now: number): LaneSnapshot {
-		if (this.#start === undefined) return { now: 0, phases: [], rounds: [0], lanes: [], complete: false };
+		if (this.#start === undefined) {
+			return { now: 0, phases: [], rounds: [0], lanes: [], complete: false, ...(this.#integration === undefined ? {} : { integration: this.#integration }) };
+		}
 		if (now >= this.#quietAt) this.#promoteQuiet(now);
 		const base = this.#base!;
 		const at = this.#at(now);
-		if (!base.live) return { now: at, phases: base.phases, rounds: base.rounds, lanes: base.lanes, complete: this.#complete };
+		const integration = this.#integration === undefined ? {} : { integration: this.#integration };
+		if (!base.live) return { now: at, phases: base.phases, rounds: base.rounds, lanes: base.lanes, complete: this.#complete, ...integration };
 		const lanes = base.lanes.map(track => {
 			const history = this.#lanes.get(track.name)!;
 			return isBusy(history) ? { ...track, activity: activityOf(history, now) } : track;
 		});
-		return { now: at, phases: base.phases, rounds: base.rounds, lanes, complete: this.#complete };
+		return { now: at, phases: base.phases, rounds: base.rounds, lanes, complete: this.#complete, ...integration };
 	}
 
 	/** Milliseconds from run start, never earlier than anything already recorded. */

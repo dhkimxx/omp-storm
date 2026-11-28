@@ -5,7 +5,7 @@
  * result rows' states as the run record has them now.
  */
 import { roleTitle } from "../roles.ts";
-import { LANE_ADDRESS_HINT, PLAN_WORKER_COUNT_NOTE } from "../runtime/contract-text.ts";
+import { INTEGRATION_SELECTION_NOTE, LANE_ADDRESS_HINT, PLAN_WORKER_COUNT_NOTE } from "../runtime/contract-text.ts";
 import type { PlanLane, PlanLaneResult, RunPlan, RunResult, RunResultState } from "../types.ts";
 
 /** What the host hands over for the run this session directs: its plan in force and its result rows. */
@@ -17,8 +17,8 @@ export interface PlanView {
 
 /** Most characters of one plan view; lanes past it are counted, not shown. The plan itself is never cut. */
 export const MAX_PLAN_VIEW_CHARS = 30_000;
-/** Row 5: a plan view marks an `integrated` edge on an isolated producer as unsatisfiable in this version. */
-export const INTEGRATED_UNAVAILABLE = "이 버전에서 충족 불가: 격리 생산자";
+/** Row 5: an `integrated` edge on an isolated producer waits for an explicit live selection and receipt. */
+export const INTEGRATED_NEEDS_SELECTION = "명시 선택·통합 전에는 시작하지 않음";
 
 const STATE_LABEL: Readonly<Record<RunResultState, string>> = {
 	pending: "대기",
@@ -49,8 +49,8 @@ function laneLines(lane: PlanLane, rows: ReadonlyMap<string, RunResult>, isolate
 	if (lane.progress !== undefined) head.push(`진행: ${lane.progress}`);
 	if (lane.dependsOn !== undefined && lane.dependsOn.length > 0) {
 		const edges = lane.dependsOn.map(dependency => {
-			const unmet = dependency.need === "integrated" && isolatedProducers.has(dependency.lane) ? ` · ${INTEGRATED_UNAVAILABLE}` : "";
-			return `${dependency.lane}(${dependency.need})${unmet}`;
+			const waiting = dependency.need === "integrated" && isolatedProducers.has(dependency.lane) ? ` · ${INTEGRATED_NEEDS_SELECTION}` : "";
+			return `${dependency.lane}(${dependency.need})${waiting}`;
 		});
 		head.push(`선행: ${edges.join(", ")}`);
 	}
@@ -73,6 +73,7 @@ export function renderPlanView(view: PlanView): string | undefined {
 	// The count is a plan fact per role; the host's concurrency setting and the write order decide what runs at once.
 	if (workers.length > 0) out.push(`역할별 워커(${PLAN_WORKER_COUNT_NOTE}): ${workers.join(", ")}`);
 	out.push(`- ${LANE_ADDRESS_HINT}`);
+	if (plan.lanes.some(lane => lane.isolationReason !== undefined)) out.push(`- ${INTEGRATION_SELECTION_NOTE}`);
 	let size = out.join("\n").length;
 	let shown = 0;
 	for (const lane of plan.lanes) {

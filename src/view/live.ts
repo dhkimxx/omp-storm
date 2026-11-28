@@ -28,6 +28,7 @@ import {
 	type UiNode,
 	visibleWidth,
 } from "../tui/kit.ts";
+import type { CandidateProjection } from "../runtime/integration-controller-port.ts";
 import type { RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
 import { LANE_MIN_COLUMNS, laneFrame, laneLiveliness } from "./lane/frame.ts";
@@ -419,7 +420,7 @@ export class LiveStatus {
 	 * controller and defaults to `working`. Returns false for every other host, whose caller keeps the plain
 	 * `setStatus` text. Updates reuse the one widget and only ask it to repaint.
 	 */
-	show(ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working"): boolean {
+	show(ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working", integration?: CandidateProjection): boolean {
 		if (!isLiveTui(ctx)) return false;
 		const ui = ctx.ui;
 		if (this.#ui !== undefined && this.#ui !== ui) {
@@ -436,13 +437,14 @@ export class LiveStatus {
 			clock: this.#now,
 			laneView,
 			settings: scopedSettings(),
+			...(integration === undefined ? {} : { integration }),
 			onDropped: () => {
 				// The host removed or replaced the widget underneath us: the next `show` installs it again.
 				this.#installed = undefined;
 				this.#statusCleared = false;
 			},
 		}));
-		if (!fresh) widget.update(run, now, phase, laneView);
+		if (!fresh) widget.update(run, now, phase, laneView, integration);
 		const drawing = nativeRendering() ? "native" : "rows";
 		if (this.#installed !== drawing && !this.#install(ui, widget, drawing)) {
 			if (fresh) {
@@ -534,6 +536,7 @@ class LiveRunWidget {
 	#status: StatusRow | undefined;
 	#laneView: boolean;
 	#runId: string;
+	#integration: CandidateProjection | undefined;
 	#timeline = new LaneTimeline();
 	/** Animation time: advances only while the timer runs, so a restart continues the motion instead of jumping. */
 	#animTime = 0;
@@ -545,16 +548,23 @@ class LiveRunWidget {
 		run: RunRecord,
 		now: number,
 		phase: RunPhase,
-		options: { onDropped?: () => void; clock?: () => number; laneView?: boolean; settings?: Settings | undefined } = {},
+		options: {
+			onDropped?: () => void;
+			clock?: () => number;
+			laneView?: boolean;
+			settings?: Settings | undefined;
+			integration?: CandidateProjection;
+		} = {},
 	) {
 		this.#phase = phase;
-		this.#facts = liveMetricFacts(run, phase, now);
+		this.#integration = options.integration;
+		this.#facts = liveMetricFacts(run, phase, now, options.integration === undefined ? {} : { integration: options.integration });
 		this.#onDropped = options.onDropped;
 		this.#clock = options.clock ?? Date.now;
 		this.#laneView = options.laneView ?? true;
 		this.#settings = options.settings;
 		this.#runId = run.runId;
-		this.#timeline.observe(run, phase, now);
+		this.#timeline.observe(run, phase, now, options.integration);
 		this.#motion = motionEffectsEnabled(this.#settings);
 		this.#offMotion = onMotionChange(this.#settings, () => this.#motionChanged());
 	}
@@ -605,17 +615,19 @@ class LiveRunWidget {
 	 * The controller's live record, phase or the lane view switch changed: repaint, but keep the one widget. The
 	 * timeline sees every update, even one that changes no chip, because lanes move without them.
 	 */
-	update(run: RunRecord, now: number, phase: RunPhase, laneView: boolean = this.#laneView): void {
+	update(run: RunRecord, now: number, phase: RunPhase, laneView: boolean = this.#laneView, integration?: CandidateProjection): void {
 		if (this.#stopped) return;
 		if (run.runId !== this.#runId) {
 			// One timeline belongs to one run.
 			this.#runId = run.runId;
+			this.#integration = undefined;
 			this.#timeline = new LaneTimeline();
 		}
-		this.#timeline.observe(run, phase, now);
+		if (integration !== undefined) this.#integration = integration;
+		this.#timeline.observe(run, phase, now, this.#integration);
 		const switched = laneView !== this.#laneView;
 		this.#laneView = laneView;
-		const facts = liveMetricFacts(run, phase, now);
+		const facts = liveMetricFacts(run, phase, now, this.#integration === undefined ? {} : { integration: this.#integration });
 		const unchanged = this.#phase === phase && this.#facts.key === facts.key;
 		if (unchanged && !switched && !this.#laneShown()) return;
 		if (this.#phase !== phase) this.#frame = 0;

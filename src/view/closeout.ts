@@ -9,7 +9,7 @@
 import { formatUsd } from "../policy/spawn.ts";
 import { RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
 import { CAPTURE_UNKNOWN_LABEL, stormStopLine } from "../runtime/closeout.ts";
-import { NO_DECLARED_RESULTS, type CaptureUnknown, type RetainedFacts, type StormStopFacts } from "../runtime/result-facts.ts";
+import { integrationLine, NO_DECLARED_RESULTS, type CaptureUnknown, type IntegrationFacts, type RetainedFacts, type StormStopFacts } from "../runtime/result-facts.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
 
@@ -172,7 +172,12 @@ function officialLine(brief: CloseoutBrief, duration: string | undefined, out: B
  * input instruction appears. A `line` (or `none`) brief is one factual line.
  */
 export function renderCloseout(
-	brief: CloseoutBrief & { readonly retained?: RetainedFacts; readonly captureUnknown?: CaptureUnknown; readonly stormStops?: StormStopFacts },
+	brief: CloseoutBrief & {
+		readonly retained?: RetainedFacts;
+		readonly captureUnknown?: CaptureUnknown;
+		readonly stormStops?: StormStopFacts;
+		readonly integration?: IntegrationFacts;
+	},
 	showChoices: boolean,
 ): { markdown: string; info: InfoLine[] } {
 	const out = new Builder();
@@ -191,6 +196,18 @@ export function renderCloseout(
 	out.item(where);
 
 	officialLine(brief, duration, out);
+
+	// Integration is a journal fact, not a verdict: the card names the queue and its write state without turning a
+	// receipt or matching bytes into an acceptance.
+	const integration = integrationLine(brief.integration);
+	if (integration !== undefined && integration !== "") {
+		const text = clean(integration, DETAILS_TEXT_MAX);
+		if (text !== "") {
+			out.item([{ text: "통합: ", tone: "muted" }, { text }], {
+				icon: brief.integration?.kind === "unknown" ? "status.warning" : "status.info",
+			});
+		}
+	}
 
 	// Row 1/row 4: where the accepted bytes are, how to reach them, and what that source does not prove. One bounded
 	// line, first reference only.

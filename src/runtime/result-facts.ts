@@ -14,6 +14,8 @@
  */
 import type { AgentEntry, InfoTone, PlanLaneResult, RunRecord, RunResult, SpawnRecord, WorkerStopReason } from "../types.ts";
 import { attemptAgentId } from "./attempt-report.ts";
+import type { IntegrationCandidateId, IntegrationProblem } from "./integration-admission.ts";
+import type { CandidateProjection } from "./integration-controller-port.ts";
 import { resultProgress, type ResultProgress } from "../view/results.ts";
 import { unplannedSplit, unplannedTotal } from "./unplanned.ts";
 
@@ -29,6 +31,195 @@ export const WORKER_CHANGE_LABEL = "변경 기록 워커";
 export const TREE_CHANGE_LABEL = "부모 트리 변경";
 /** The one line a run says the first time it places a worker outside the plan, for the task result. */
 export const UNPLANNED_WORKER_NOTE = "계획 밖 워커: 결과 집계에 들어가지 않습니다. 결과로 세려면 계획의 레인 이름을 쓰세요.";
+
+/**
+ * Integration is a journal fact, not a result-row state. A record written before integration has no such fact; that is
+ * not the same as an empty queue and never means the run captured nothing. These words are shared by the tool queue,
+ * `/storm status`, the live chip, the closeout card and the historical handoff.
+ */
+export const INTEGRATION_NOT_RECORDED = "통합 기록 없음";
+/** An older record read by a newer Storm: no candidate count may be inferred from its absence. */
+export const INTEGRATION_NOT_RECORDED_NOTE = "통합 이전 기록이며 후보가 없었다는 뜻이 아닙니다";
+export const INTEGRATION_UNKNOWN = "통합 기록 미상";
+export const INTEGRATION_CANDIDATES = "통합 후보";
+export const INTEGRATION_READY = "준비";
+export const INTEGRATION_AWAITING_NATIVE = "네이티브 대기";
+export const INTEGRATION_CONFIRMED_EMPTY = "확정 빈 캡처";
+export const INTEGRATION_KEPT_ONLY = "보존 전용";
+/** The manifest exists but its capture bundle is unknown: never "no delta". */
+export const INTEGRATION_CAPTURE_UNKNOWN = "캡처 미상";
+export const INTEGRATION_CONFLICT = "충돌";
+export const INTEGRATION_STALE = "낡음";
+export const INTEGRATION_READINESS_UNKNOWN = "준비 미상";
+/** A durable receipt exists: Storm wrote these exact bytes in this run. It is not an acceptance. */
+export const INTEGRATION_WRITTEN = "Storm 적용 기록 있음";
+/** The count label: a row of `Storm 적용 기록 N` reads as a count, not as a state word. */
+export const INTEGRATION_WRITTEN_COUNT = "Storm 적용 기록";
+export const INTEGRATION_NOT_WRITTEN = "Storm 적용 기록 없음";
+export const INTEGRATION_WRITE_NOT_RECORDED = "적용 여부 기록 없음";
+export const INTEGRATION_PRESENT_UNATTRIBUTED = "같은 바이트 있음 · 출처 미증명";
+export const INTEGRATION_NO_EFFECT = "효과 없음";
+export const INTEGRATION_RECOVERY_REQUIRED = "복구 필요";
+/** The postimage was present at the last bounded read; it is not a promise about now. */
+export const INTEGRATION_PRESENT = "읽기 시점 일치";
+/** The postimage was present after the write, but a later read observed a different footprint. */
+export const INTEGRATION_CHANGED = "이후 변경";
+export const INTEGRATION_PRESENCE_UNKNOWN = "현재 미상";
+export const INTEGRATION_LAST_SEEN = "마지막 확인";
+/** Matching bytes without a reviewable receipt prove no origin: never say Storm applied them. */
+export const INTEGRATION_ORIGIN_UNPROVED = "출처 미증명";
+
+/**
+ * A compact, fixed-size integration summary derived from C's one typed projection. `kind: "not-recorded"` is the
+ * manifest absence of the older record, `"unknown"` is an unreadable or unsupported read, and `"recorded"` is a real
+ * candidate read (zero is then a true zero). Counts are observations at `observedAt`, never a live scan on repaint.
+ */
+export interface IntegrationFacts {
+	readonly kind: "not-recorded" | "recorded" | "unknown";
+	/** Candidates observed in the queue; absent for an older or unreadable record. */
+	readonly candidates?: number;
+	readonly ready?: number;
+	readonly awaitingNative?: number;
+	readonly confirmedEmpty?: number;
+	readonly keptOnly?: number;
+	readonly conflict?: number;
+	readonly stale?: number;
+	readonly readinessUnknown?: number;
+	readonly written?: number;
+	readonly present?: number;
+	readonly changed?: number;
+	readonly unknownPresence?: number;
+	/** One exact ID a surface may name; the full page remains in C's projection. */
+	readonly example?: IntegrationCandidateId;
+	/** A stopped/failed candidate's native handle, only when the admission recorded a safe id. */
+	readonly native?: string;
+	readonly problem?: IntegrationProblem;
+}
+
+const INTEGRATION_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
+const INTEGRATION_NATIVE = /^[A-Za-z0-9._-]{1,120}$/u;
+
+/** One bounded, single-line presentation value from a journal or native field. */
+function integrationText(value: string, max: number): string {
+	const text = value.replace(INTEGRATION_UNSAFE, " ").replace(/\s+/g, " ").trim();
+	if (text === "") return "";
+	const points = Array.from(text);
+	return points.length > max ? `${points.slice(0, Math.max(1, max - 1)).join("")}…` : text;
+}
+
+/** `code — reason`, bounded; never parsed as a path or an authority. */
+export function integrationProblemText(problem: IntegrationProblem): string {
+	const reason = integrationText(problem.reason, 160);
+	const code = integrationText(problem.code, 40);
+	if (code === "") return reason || "원인 미상";
+	return reason === "" ? code : `${code} — ${reason}`;
+}
+
+const countOf = (value: number | undefined): number =>
+	typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+
+/**
+ * The single derivation from C's projection. `undefined` means the caller supplied no projection (no claim); it is
+ * different from `{kind: "not-recorded"}`, which is the owner's positive statement that this record predates
+ * integration. An overview is counted once per read; a detail is one candidate with the same fields.
+ */
+export function integrationFacts(projection: CandidateProjection | undefined): IntegrationFacts | undefined {
+	if (projection === undefined) return undefined;
+	if (projection.kind === "not-recorded") return { kind: "not-recorded" };
+	if (projection.kind === "unknown") return { kind: "unknown", problem: projection.problem };
+	if (projection.kind === "overview") {
+		const value = projection.value;
+		return {
+			kind: "recorded",
+			candidates: Object.values(value.readiness).reduce((sum, count) => sum + countOf(count), 0),
+			ready: countOf(value.readiness.ready),
+			awaitingNative: countOf(value.readiness["awaiting-native"]),
+			confirmedEmpty: countOf(value.readiness["confirmed-empty"]),
+			keptOnly: countOf(value.readiness["kept-only"]),
+			conflict: countOf(value.readiness.conflict),
+			stale: countOf(value.readiness.stale),
+			readinessUnknown: countOf(value.readiness.unknown),
+			written: countOf(value.writes.written),
+			present: countOf(value.present),
+			changed: countOf(value.changed),
+			unknownPresence: countOf(value.unknownPresence),
+			...(value.examples[0] === undefined ? {} : { example: value.examples[0].candidateId }),
+		};
+	}
+	const value = projection.value;
+	const line = value.line;
+	const presence = line.presence.kind;
+	const handle = line.childHandle;
+	return {
+		kind: "recorded",
+		candidates: 1,
+		ready: line.readiness.kind === "ready" ? 1 : 0,
+		awaitingNative: line.readiness.kind === "awaiting-native" ? 1 : 0,
+		confirmedEmpty: line.readiness.kind === "confirmed-empty" ? 1 : 0,
+		keptOnly: line.readiness.kind === "kept-only" ? 1 : 0,
+		conflict: line.readiness.kind === "conflict" ? 1 : 0,
+		stale: line.readiness.kind === "stale" ? 1 : 0,
+		readinessUnknown: line.readiness.kind === "unknown" ? 1 : 0,
+		written: line.write.kind === "written" ? 1 : 0,
+		present: presence === "present" ? 1 : 0,
+		changed: presence === "changed" ? 1 : 0,
+		unknownPresence: presence === "unknown" ? 1 : 0,
+		example: line.candidateId,
+		...(typeof handle === "string" && INTEGRATION_NATIVE.test(handle) ? { native: `agent://${handle}` } : {}),
+		...(line.readiness.kind === "unknown" ? { problem: line.readiness.problem } : {}),
+	};
+}
+
+/** Whether a projection holds something a one-line closeout would hide. An empty recorded queue does not. */
+export function integrationHasObservations(facts: IntegrationFacts | undefined): boolean {
+	if (facts === undefined || facts.kind === "not-recorded") return false;
+	if (facts.kind === "unknown") return true;
+	return countOf(facts.candidates) > 0 || countOf(facts.written) > 0 || countOf(facts.present) > 0 || countOf(facts.changed) > 0 || countOf(facts.unknownPresence) > 0;
+}
+
+/**
+ * One Korean line for status, the live chip and the closeout card. Unknown is a positive explanation with a safe read
+ * action; an older record states what it is missing and claims no zero. No surface names an invented path here.
+ */
+export function integrationLine(facts: IntegrationFacts | undefined): string | undefined {
+	if (facts === undefined) return undefined;
+	if (facts.kind === "not-recorded") return `${INTEGRATION_NOT_RECORDED} — ${INTEGRATION_NOT_RECORDED_NOTE}`;
+	if (facts.kind === "unknown") {
+		return `${INTEGRATION_UNKNOWN} — ${facts.problem === undefined ? "원인 미상" : integrationProblemText(facts.problem)}. 다음: 통합 후보를 다시 조회하세요.`;
+	}
+	const parts = [
+		`${INTEGRATION_CANDIDATES} ${countOf(facts.candidates)}개`,
+		`${INTEGRATION_READY} ${countOf(facts.ready)}`,
+		`${INTEGRATION_WRITTEN_COUNT} ${countOf(facts.written)}`,
+	];
+	if (countOf(facts.awaitingNative) > 0) parts.push(`${INTEGRATION_AWAITING_NATIVE} ${countOf(facts.awaitingNative)}`);
+	if (countOf(facts.confirmedEmpty) > 0) parts.push(`${INTEGRATION_CONFIRMED_EMPTY} ${countOf(facts.confirmedEmpty)}`);
+	if (countOf(facts.keptOnly) > 0) parts.push(`${INTEGRATION_KEPT_ONLY} ${countOf(facts.keptOnly)}`);
+	if (countOf(facts.conflict) > 0) parts.push(`${INTEGRATION_CONFLICT} ${countOf(facts.conflict)}`);
+	if (countOf(facts.stale) > 0) parts.push(`${INTEGRATION_STALE} ${countOf(facts.stale)}`);
+	if (countOf(facts.readinessUnknown) > 0) parts.push(`${INTEGRATION_READINESS_UNKNOWN} ${countOf(facts.readinessUnknown)}`);
+	if (countOf(facts.present) > 0) parts.push(`${INTEGRATION_PRESENT} ${countOf(facts.present)}`);
+	if (countOf(facts.changed) > 0) parts.push(`${INTEGRATION_CHANGED} ${countOf(facts.changed)}`);
+	if (countOf(facts.unknownPresence) > 0) parts.push(`${INTEGRATION_PRESENCE_UNKNOWN} ${countOf(facts.unknownPresence)}`);
+	if (facts.example !== undefined) parts.push(`예: ${integrationText(facts.example, 80)}`);
+	if (facts.native !== undefined) parts.push(`네이티브 기록 ${integrationText(facts.native, 80)}`);
+	return `${INTEGRATION_LAST_SEEN}: ${parts.join(" · ")}`;
+}
+
+/**
+ * The bounded English handoff line. It names the first exact ID so a later run can reach the detail, and explicitly
+ * denies automatic application: a write receipt is neither an acceptance nor permission for a later run.
+ */
+export function integrationHandoffLine(facts: IntegrationFacts | undefined): string | undefined {
+	if (facts === undefined) return undefined;
+	if (facts.kind === "not-recorded") return "- Integration: not recorded for this run (the record predates integration; that is not zero captured work)";
+	if (facts.kind === "unknown") return `- Integration: unknown (${facts.problem === undefined ? "cause unknown" : integrationText(integrationProblemText(facts.problem), 160)}); no write or acceptance was inferred`;
+	const candidates = countOf(facts.candidates);
+	const written = countOf(facts.written);
+	const first = facts.example === undefined ? "" : `; first ${integrationText(facts.example, 80)}`;
+	const unknown = countOf(facts.readinessUnknown) + countOf(facts.conflict) + countOf(facts.stale) + countOf(facts.keptOnly);
+	return `- Integration: ${candidates} candidate${candidates === 1 ? "" : "s"}, ready ${countOf(facts.ready)}, ${unknown === 0 ? "" : `not ready ${unknown}, `}Storm-written ${written}, present ${countOf(facts.present)}, changed ${countOf(facts.changed)}${first}; no automatic application`;
+}
 
 /** `mixed` means declared rows exist and out-of-plan deliveries also happened. */
 export type ResultDeclaration = "declared" | "mixed" | "none";
@@ -128,6 +319,8 @@ export interface ResultFactOptions {
 	 * holds no such fact; a view must then show what it does hold (changed workers), never an invented path count.
 	 */
 	readonly changedPaths?: number;
+	/** C's typed candidate projection, when the owning caller read the integration journal for this run. */
+	readonly integration?: CandidateProjection;
 }
 
 export interface ResultFacts {
@@ -166,6 +359,11 @@ export interface ResultFacts {
 	readonly outOfPlan: number;
 	/** Only when the caller supplied it. */
 	readonly changedPaths?: number;
+	/**
+	 * The integration queue this exact run owns, when the caller read it. An older record's absence is derived as
+	 * `not-recorded` only when a projection is supplied; without one no surface may claim anything about integration.
+	 */
+	readonly integration?: IntegrationFacts;
 	/** The result disposition alone: `선언된 결과 없음`, or the focus headline plus `계획 밖 N` when mixed. */
 	readonly headline: string;
 	/** The same facts as counts, for a caller that already names the focus. */
@@ -228,8 +426,8 @@ export function changeAttribution(run: RunRecord): ChangeAttribution {
 		const kept = row.proof?.item.artifact !== undefined ||
 			(hasText(row.lane) && isolatedLanes.has(row.lane) && kind === "artifact");
 		if (kept) outsideAgents.add(agent);
-		// 0.29.0 accepts a change only from the parent tree; a shared artifact is read there as well. An answer and a
-		// pending or unmet row place no writes.
+		// The evaluator accepts a change only from the parent tree; a shared artifact is read there as well. An answer
+		// and a pending or unmet row place no writes. An isolated candidate's parent bytes come only after integration.
 		else if (kind === "change" || kind === "artifact") sharedAgents.add(agent);
 	}
 	const laneByAgent = new Map<string, string>();
@@ -392,6 +590,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 	};
 	const changes = changeAttribution(run);
 	const captureUnknown = captureUnknownFact(run);
+	const integration = integrationFacts(options.integration);
 	return {
 		declaration,
 		hasDeclared,
@@ -407,6 +606,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 		...(stormStops === undefined ? {} : { stormStops }),
 		outOfPlan,
 		...(changedPaths === undefined ? {} : { changedPaths }),
+		...(integration === undefined ? {} : { integration }),
 		headline,
 		parts,
 		tone: hasDeclared ? progress.tone : "muted",
@@ -429,6 +629,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 			allExcluded,
 			outOfPlan,
 			changedPaths ?? null,
+			integration ?? null,
 		]),
 	};
 }

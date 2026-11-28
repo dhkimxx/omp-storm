@@ -63,11 +63,11 @@ const RESULT_ROW_BYTES = 512;
  * What the plan reply says beside any plan that places a lane in its own checkout (rows 7, 9, 11). Fixed size; the
  * plan reply is the first place the director reads it, the worker contract and closeout repeat the same facts.
  */
-export const CHECKOUT_PLAN_NOTE = "분리 체크아웃은 작업 위치일 뿐 차단벽이 아니며, 만들어진 시점의 사본이라 사용자의 미커밋 변경도 들어갑니다. 정리는 호스트가 맡고 Storm은 확인하지 못합니다.";
-/** Row 5: an `integrated` prerequisite on an isolated producer cannot be met in this version; the plan reply says so. */
-export const ISOLATED_INTEGRATED_WARNING = "격리 생산자를 선행으로 두고 need: integrated를 요구한 레인은 이 버전에서 그 조건을 충족할 수 없습니다. Storm은 격리 작업을 부모 작업 트리에 통합하지 않습니다. need를 result로 바꾸거나 통합 버전을 기다리세요.";
-/** Row 6: two private lanes may implement together; their candidates can still conflict when someone lands them. */
-export const PRIVATE_OVERLAP_WARNING = "두 레인 모두 격리 체크아웃에서 동시에 구현할 수 있지만, 후보를 부모 작업 트리에 함께 적용하면 충돌할 수 있습니다. 이 버전은 통합을 대신하지 않습니다.";
+export const CHECKOUT_PLAN_NOTE = "분리 체크아웃은 작업 위치일 뿐 차단벽이 아니며, 만들어진 시점의 사본이라 사용자의 미커밋 변경도 들어갑니다. 정리는 호스트가 맡고 Storm은 확인하지 못합니다. 격리 후보는 정확한 ID를 선택하기 전까지 부모에 반영되지 않습니다.";
+/** Row 5: an `integrated` prerequisite on an isolated producer waits for its explicit integration, never inferred. */
+export const ISOLATED_INTEGRATED_WARNING = "격리 생산자를 선행으로 두고 need: integrated를 요구한 레인은 그 생산자의 후보를 이 실행에서 정확한 ID로 선택해 부모에 통합한 뒤 현재 수용 판정과 위치가 있어야 시작합니다. 선택 전에는 시작하지 않습니다.";
+/** Row 6: two private lanes may implement together; their candidates can be selected one at a time and may conflict. */
+export const PRIVATE_OVERLAP_WARNING = "두 레인 모두 격리 체크아웃에서 동시에 구현할 수 있지만, 후보를 부모 작업 트리에 함께 적용하면 충돌할 수 있습니다. 통합은 선택한 후보를 하나씩 적용하고, 겹치는 경로는 거부됩니다.";
 export const RESULT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const RESULT_KINDS = ["change", "artifact", "answer"] as const satisfies readonly LaneResultKind[];
 const RESULT_KEYS: Readonly<Record<string, true>> = {
@@ -617,8 +617,8 @@ export function validatePlan(config: StormConfig, input: unknown, now: number): 
 	}
 	// Rows 7, 9 and 11: one fixed-size qualification for any plan that uses a checkout, whatever the team size.
 	if (config.isolation === "isolated" || lanes.some(lane => lane.isolationReason !== undefined)) warnings.push(CHECKOUT_PLAN_NOTE);
-	// Row 5: an `integrated` edge on an isolated producer cannot be satisfied in this version, and the plan reply says
-	// so once, with the first affected consumer and how many there are.
+	// Row 5: an `integrated` edge on an isolated producer waits for that candidate's explicit integration; the plan
+	// reply says so once, with the first affected consumer and how many there are.
 	const isolatedProducers = new Set(
 		lanes.filter(lane => lane.isolationReason !== undefined || config.isolation === "isolated").map(lane => lane.name),
 	);

@@ -93,17 +93,23 @@ export const JUDGE_TEXT = {
 	machine: "조건을 충족하면 Storm이 기계로 인정합니다",
 	reviewer: "조건을 충족해도 리뷰어가 판정합니다",
 	never: "경로가 없어 Storm이 인정하지 못합니다",
-	unavailable: "이 버전은 격리 change를 수용하지 않습니다",
+	unavailable: "격리 change는 부모 통합 기록 전에는 수용되지 않습니다",
 } as const;
 
 const CHANGE_RULE =
 	"change: 작업 시작 때 잡은 기준선과 비교해 대상 파일의 내용이 실제로 바뀌어야 합니다. 대상은 path가 있으면 그 파일, 없으면 레인의 파일 범위입니다. 요구 문자열이 있으면 바뀐 파일 안에 공백까지 그대로 있어야 합니다.";
 /**
- * A target change is never judged on an isolated attempt. The advice names the real route for target work (a shared
- * lane), so only work the user chose to keep outside the target is declared as an artifact.
+ * A target change is never judged by the isolated attempt alone. The work stays a candidate; only an explicit live
+ * selection and a receipt can re-open judgment on the parent bytes. The advice names the real route for target work (a
+ * shared lane), so only work the user chose to keep outside the target is declared as an artifact.
  */
 export const ISOLATED_CHANGE_RULE =
-	"격리 실행의 change는 이 버전에서 수용되지 않습니다. Storm은 격리 작업을 부모 작업 트리로 가져오지 않습니다. 대상 트리에 반영할 작업이면 공유 레인으로 계획하고, 반영하지 않고 보존할 작업만 artifact로 선언하세요.";
+	"격리 실행의 change는 이 시도만으로 수용되지 않습니다. 작업은 후보로 남고, 디렉터가 이 실행의 live 요청에서 정확한 후보 ID를 선택해 부모에 통합한 뒤에만 다시 판정됩니다. 자동 적용은 없습니다. 대상 트리에 바로 반영할 작업이면 공유 레인으로 계획하고, 반영하지 않고 보존할 작업만 artifact로 선언하세요.";
+/**
+ * The one plan-level sentence that teaches explicit selection: an isolated candidate is not written until the director
+ * names its exact ID under the live ask. Shared by the plan reply, the plan view and the correction copy.
+ */
+export const INTEGRATION_SELECTION_NOTE = "격리 후보는 디렉터가 live 요청에서 정확한 후보 ID를 선택해야 부모 작업 트리에 반영됩니다. 자동 반영은 없습니다.";
 /** The retained artifact's judged source is outside the parent tree; the note says what that does not prove. */
 export const ISOLATED_ARTIFACT_RULE = `artifact: 이 시도에 결속된 보존 산출물 안에서 path를 읽습니다. ${RETAINED_SOURCE_NOTE} 요구 문자열은 그 파일 내용에, 패치라면 추가된 줄에 있어야 합니다.`;
 const ARTIFACT_SHARED_RULE =
@@ -129,7 +135,8 @@ export type ResultJudge = "machine" | "reviewer" | "never" | "cited" | "unavaila
  */
 export function resultJudge(result: Pick<PlanLaneResult, "kind" | "path" | "contains" | "check">, options: { isolated: boolean; laneHasFiles: boolean }): ResultJudge {
 	if (result.kind === "answer") return "cited";
-	// Row 2: an isolated change has no accepted outcome in 0.29.0, whatever its path, literal or check says.
+	// Row 2: an isolated change has no accepted outcome from its own attempt, whatever its path, literal or check says.
+	// Integration can re-open judgment on the parent bytes only from a durable receipt under the live ask (C).
 	if (result.kind === "change" && options.isolated) return "unavailable";
 	// A change with no path is judged on the lane's files; with none of those either there is nothing to compare to a baseline.
 	if (result.kind === "change" && result.path === undefined && !options.laneHasFiles) return "never";

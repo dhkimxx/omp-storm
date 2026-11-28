@@ -6,7 +6,7 @@ import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../rol
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE, PLANLESS_PLACEMENT_NOTE, RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
 import { CAPTURE_UNKNOWN_LABEL, WORKER_STOP_LABEL } from "../runtime/closeout.ts";
 import { goalTotals } from "../runtime/goal.ts";
-import { resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
+import { integrationLine, resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
@@ -14,6 +14,7 @@ import { outOfPlanLine, unplannedLine } from "../runtime/unplanned.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import { GOAL_LABEL, goalText } from "./closeout.ts";
 import { resultRowText, type ResultProgress } from "./results.ts";
+import type { CandidateProjection } from "../runtime/integration-controller-port.ts";
 import type {
 	BudgetConfig,
 	InfoLine,
@@ -576,6 +577,7 @@ export function renderStatus(
 	now: number,
 	audience: "user" | "model" = "user",
 	info?: InfoLine[],
+	integration?: CandidateProjection,
 ): string {
 	const model = audience === "model";
 	const out: string[] = [];
@@ -618,7 +620,7 @@ export function renderStatus(
 		if (!run) return;
 		out.push("");
 		heading("실행 중", undefined, "status.running");
-		const outcome = resultFacts(run);
+		const outcome = resultFacts(run, integration === undefined ? {} : { integration });
 		const outcomeLine = resultLine(outcome, { detailed: !model });
 		if (outcomeLine !== undefined) {
 			const index = out.length;
@@ -654,6 +656,11 @@ export function renderStatus(
 		if (keptNote !== undefined) styled([{ text: keptNote, tone: "muted" }]);
 		const unknownCapture = captureUnknownLine(outcome);
 		if (unknownCapture !== undefined) styled([{ text: unknownCapture, tone: "warning" }], undefined, "status.warning");
+		const integrationFact = integrationLine(outcome.integration);
+		if (integrationFact !== undefined) {
+			const unknown = outcome.integration?.kind === "unknown";
+			styled([{ text: `- ${integrationFact}`, tone: unknown ? "warning" : "muted" }], undefined, unknown ? "status.warning" : "status.info");
+		}
 		const planless = planlessPlacementNote(outcome);
 		if (planless !== undefined) styled([{ text: planless, tone: "muted" }]);
 		if (run.plan) {
@@ -864,7 +871,7 @@ export function renderStatus(
  * The status in a few lines, for the panel above the /storm menu; `/storm status` shows the whole team setting and
  * every section. `info` indexes this same Markdown, and `resume` is the caller's trusted resume candidate.
  */
-export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine[], resume = false): string {
+export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine[], resume = false, integration?: CandidateProjection): string {
 	const out: string[] = [];
 	// The hub has the same first line as the full user report: present state, then the next action when there is one.
 	pushStatusHead(out, info, statusState(view, resume, false), view.newerVersion);
@@ -889,7 +896,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 				...(meter ? { meter } : {}),
 			});
 		}
-		const outcome = resultFacts(run);
+		const outcome = resultFacts(run, integration === undefined ? {} : { integration });
 		const outcomeLine = resultLine(outcome);
 		if (outcomeLine !== undefined) {
 			const resultIndex = out.length;
@@ -898,6 +905,8 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 		}
 		const unknownCapture = captureUnknownLine(outcome);
 		if (unknownCapture !== undefined) out.push(unknownCapture);
+		const integrationFact = integrationLine(outcome.integration);
+		if (integrationFact !== undefined) out.push(`- ${integrationFact}`);
 		const progress = runProgressParts(run, now);
 		const progressIndex = out.length;
 		out.push(`- ${progress.join(" · ")}`);
