@@ -111,7 +111,8 @@ import {
 } from "./requirements.ts";
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { PLANLESS_DEADLINE, PLANLESS_NO_TURN_TIME, PLANLESS_SAME_TURN, planlessOpen, stoppedInTurn } from "./planless.ts";
-import { activeLedgerRun, endLedgerRun, getLedgerRun, type LedgerRun, setLedgerPlan, spendNote, startLedgerRun } from "./ledger.ts";
+import { activeLedgerRun, attachPaidAccounting, endLedgerRun, getLedgerRun, type LedgerPaidAccounting, type LedgerRun, noteRetiredPaidAttemptIds, recordPaidCost, retiredPaidAttemptIds, setLedgerPlan, spendNote, startLedgerRun, updatePaidAccounting } from "./ledger.ts";
+import { bindPaidAttemptAdapter, PAID_ATTEMPT_REFUSAL_TAG, PAID_ATTEMPT_UNKNOWN_MODEL, type PaidAttemptAdapter, type PaidAttemptBindResult, type PaidAttemptDelta, type PaidAttemptMetadata } from "./paid-attempt-adapter.ts";
 import type { AttemptUnplannedDelivery } from "./attempt-collector.ts";
 import { UNPLANNED_MAX, unplannedNotice } from "./unplanned.ts";
 import { reviewLine } from "./review.ts";
@@ -966,8 +967,20 @@ type AcceptedLocation =
 	| { ok: true; integrated: boolean; retained?: LaneResultReadiness["retained"] }
 	| { ok: false; reason: string };
 
+/** The installed native paid-attempt authority of one run; valid only while the owning controller finalizes it. */
+interface PaidAttemptBinding {
+	readonly adapter: PaidAttemptAdapter;
+	readonly metadata: PaidAttemptMetadata;
+}
+
+type PaidAttemptBindOutcome =
+	| { readonly ok: true; readonly binding?: PaidAttemptBinding }
+	| { readonly ok: false; readonly reason: string };
+
 interface OwnRun {
 	record: RunRecord;
+	/** The exact native paid-attempt owner this run bound before its first covered provider send. */
+	paid?: PaidAttemptBinding;
 	/** The actual target worktree: tree snapshots, checks, evidence and reviewer proofs read here. */
 	root: string;
 	repoId: string;
@@ -1284,6 +1297,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	active(): RunRecord | undefined {
 		const own = this.#own;
 		if (!own) return undefined;
+		if (own.paid !== undefined) this.#ingestPaid(own);
 		const live = getLedgerRun(own.record.runId);
 		const agents = this.deps.agents?.(own.record.runId, own.sessionDir) ?? [];
 		const record: RunRecord = {
@@ -1482,10 +1496,25 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		const ready = await this.#ready(ctx, ui, !auto);
 		if (stale()) return gone();
 		if (!ready.ok) return ready;
+		// The run's own preflight compaction is a paid send: bind the exact owner and its zero baseline before it.
+		let pendingPaid: PaidAttemptBinding | undefined;
+		const boundPaid = this.#bindPaidAttempts(ctx, runId, sessionId, gate.config);
+		if (!boundPaid.ok) return refuse(boundPaid.reason);
+		pendingPaid = boundPaid.binding;
+		const discardPaid = (): void => {
+			pendingPaid?.adapter.dispose();
+			pendingPaid = undefined;
+		};
 		if (!auto) await this.#compactFirst(ctx, ui);
-		if (stale()) return gone();
+		if (stale()) {
+			discardPaid();
+			return gone();
+		}
 		// The dialog and the compaction awaited: a run of this session may have started meanwhile.
-		if (activeLedgerRun(sessionDir)) return busy;
+		if (activeLedgerRun(sessionDir)) {
+			discardPaid();
+			return busy;
+		}
 
 		// The last step before the baseline snapshot: take this session's slot and the target claim the start needs. A
 		// safe reader may run beside another session's reader; a writer of any session conflicts. A plan-less batch
@@ -1504,13 +1533,18 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				...(writeFirst ? { scope: { kind: "unbounded" as const } } : {}),
 			});
 		} catch (error) {
+			discardPaid();
 			return refuse(`실행 잠금을 확인하지 못해 시작하지 않았습니다: ${errorText(error)}`);
 		}
 		if (stale()) {
+			discardPaid();
 			if (acquired.ok) await this.#releaseLease(acquired.lease, ctx);
 			return gone();
 		}
-		if (!acquired.ok) return refuse(acquired.reason);
+		if (!acquired.ok) {
+			discardPaid();
+			return refuse(acquired.reason);
+		}
 		let lease: RunLease | undefined = acquired.lease;
 		try {
 			const targetBlock = await targetJobBlock(root);
@@ -1790,6 +1824,10 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 					...(config.budget ? { budget: config.budget } : {}),
 					onThreshold: (kind, run) => this.#threshold(ctx, kind, run),
 				});
+				if (pendingPaid !== undefined) {
+					this.#adoptPaidAttempts(own, pendingPaid);
+					pendingPaid = undefined;
+				}
 				// Bound before anything below awaits: a spawn decided the moment this returns must see the first plan.
 				if (plan !== undefined) setLedgerPlan(runId, plan);
 				spawnsByRun.set(runId, []);
@@ -1838,6 +1876,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			}
 			return { ok: true, runId };
 		} finally {
+			if (pendingPaid !== undefined) pendingPaid.adapter.dispose();
 			if (lease !== undefined) await this.#releaseLease(lease, ctx);
 		}
 	}
@@ -5141,6 +5180,9 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	 */
 	#sendRound(own: OwnRun, ctx: ExtensionContext, decision: RoundContinue): void {
 		if (own.ending !== undefined || this.#own !== own) return;
+		// Exact native receipts settled since the last event decide whether this round may still be sent.
+		this.#ingestPaid(own);
+		if (own.ending !== undefined || this.#own !== own) return;
 		const ui = this.deps.ui(ctx);
 		const { gate, round, stalled } = decision;
 		// A plain/review round may intervene between two result gates. Keep the last witness so the next result gate does
@@ -5685,6 +5727,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		clearTimeout(this.#flushTimer);
 		this.#flushTimer = undefined;
 		liveWriters.delete(own.record.runId);
+		this.#retirePaid(own);
 		const ledger = endLedgerRun(own.record.runId);
 		if (own.provisional === true && (spawnsByRun.get(own.record.runId)?.length ?? 0) === 0 && !own.directorEdit) {
 			const { runId } = own.record;
@@ -5965,6 +6008,149 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		});
 		this.#liveWrite = write.catch(() => undefined);
 		return write;
+	}
+
+	/** Pull new exact native receipts into this run's ledger; a safe no-op for a stock host or another run. */
+	ingestPaidSpend(): void {
+		const own = this.#own;
+		if (own === undefined || own.paid === undefined) return;
+		this.#ingestPaid(own);
+	}
+
+	/**
+	 * Binds the host's paid-attempt owner to this exact run before its first covered provider send. Stock 19.2.1 has no
+	 * surface and keeps the legacy accounting; any present but unusable/unproven patched surface refuses the start rather
+	 * than silently falling back to carriers the host is already charging.
+	 */
+	#bindPaidAttempts(
+		ctx: ExtensionContext,
+		runId: string,
+		sessionId: string,
+		config: StormConfig,
+	): PaidAttemptBindOutcome {
+		let result: PaidAttemptBindResult;
+		const excludeAttemptIds = retiredPaidAttemptIds(sessionId);
+		try {
+			result = bindPaidAttemptAdapter({
+				ctx,
+				runId,
+				ownerSessionId: sessionId,
+				spentUsd: 0,
+				...(excludeAttemptIds.length === 0 ? {} : { excludeAttemptIds }),
+				...(config.budget === undefined ? {} : { limitUsd: config.budget.perRunUsd }),
+			});
+		} catch (error) {
+			return { ok: false, reason: `${PAID_ATTEMPT_REFUSAL_TAG} host-invalid: ${errorText(error)}` };
+		}
+		if (result.status === "unavailable") {
+			if (result.code === "host-absent") return { ok: true };
+			return { ok: false, reason: `${PAID_ATTEMPT_REFUSAL_TAG} ${result.code}: ${result.detail}` };
+		}
+		if (result.metadata.nativeAccounting !== "effective") {
+			let detail = "native paid-attempt proof is not effective";
+			try {
+				const observed = result.adapter.observe();
+				detail = observed.fault === undefined ? detail : `${observed.fault.code}: ${observed.fault.detail}`;
+			} catch {
+				// The installed authority still refuses; the start refusal below stays the outcome.
+			}
+			result.adapter.dispose();
+			return { ok: false, reason: `${PAID_ATTEMPT_REFUSAL_TAG} host-invalid: ${detail}` };
+		}
+		return { ok: true, binding: { adapter: result.adapter, metadata: result.metadata } };
+	}
+
+	/** Makes the bound authority and its zero baseline part of the run that owns it. */
+	#adoptPaidAttempts(own: OwnRun, paid: PaidAttemptBinding): void {
+		const { metadata } = paid;
+		if (metadata.bindingToken === undefined || metadata.startSeq === undefined || metadata.nativeAccounting === "unavailable") {
+			throw new Error("paid-attempt binding metadata is incomplete");
+		}
+		const attached = attachPaidAccounting(own.record.runId, {
+			ownerSessionId: metadata.expectedOwnerSessionId,
+			bindingToken: metadata.bindingToken,
+			startSeq: metadata.startSeq,
+			...(metadata.limit.mode === "finite" ? { limitUsd: metadata.limit.usd } : {}),
+			startCostUsd: metadata.startCostUsd,
+			receiptsUsd: 0,
+			receipts: 0,
+			lastSeq: metadata.startSeq,
+			pending: 0,
+			unresolved: 0,
+			accounting: metadata.nativeAccounting,
+		});
+		if (attached === undefined) throw new Error("the run ledger could not take the paid-attempt binding");
+		own.paid = paid;
+	}
+
+	/** Adds one adapter delta exactly once, models and total together, then persists the new live view. */
+	#ingestPaid(own: OwnRun): void {
+		const paid = own.paid;
+		if (paid === undefined) return;
+		let delta: PaidAttemptDelta;
+		try {
+			delta = paid.adapter.takeDelta();
+		} catch {
+			// The adapter's own gate stays installed and refuses; no unproven delta is guessed into the total.
+			return;
+		}
+		const current = getLedgerRun(own.record.runId)?.paid;
+		if (current === undefined) return;
+		const next: LedgerPaidAccounting = {
+			...current,
+			receiptsUsd: current.receiptsUsd + delta.usd,
+			receipts: current.receipts + delta.settledReceipts,
+			lastSeq: delta.toSeq,
+			pending: delta.pendingCount,
+			unresolved: delta.inScopeUnresolvedCount,
+		};
+		updatePaidAccounting(own.record.runId, next);
+		if (delta.usd > 0) recordPaidCost(own.record.runId, delta.byModel, delta.usd, PAID_ATTEMPT_UNKNOWN_MODEL);
+		if (
+			delta.usd > 0 ||
+			delta.settledReceipts > 0 ||
+			delta.pendingCount !== current.pending ||
+			delta.inScopeUnresolvedCount !== current.unresolved
+		) {
+			this.#scheduleFlush(own);
+		}
+	}
+
+	/** Final exact read, then retires the exact run's authority; durable late receipts never reach the next run. */
+	#retirePaid(own: OwnRun): void {
+		const paid = own.paid;
+		if (paid === undefined) return;
+		try {
+			this.#ingestPaid(own);
+			const observed = paid.adapter.observe();
+			noteRetiredPaidAttemptIds(
+				paid.metadata.expectedOwnerSessionId,
+				observed.pending.map(item => item.attemptId),
+			);
+			const current = getLedgerRun(own.record.runId)?.paid;
+			if (current !== undefined) {
+				const cumulative = Math.max(0, observed.knownCostUsd - observed.startCostUsd);
+				const next: LedgerPaidAccounting = {
+					...current,
+					receiptsUsd: Math.max(current.receiptsUsd, cumulative),
+					receipts: Math.max(current.receipts, observed.settledReceipts),
+					lastSeq: Math.max(current.lastSeq, observed.lastSeq),
+					pending: observed.pendingCount,
+					unresolved: observed.unresolved.filter(fact => fact.inScope).length,
+					accounting: observed.accounting,
+				};
+				updatePaidAccounting(own.record.runId, next);
+				const missing = next.receiptsUsd - current.receiptsUsd;
+				if (observed.accounting === "effective" && missing > 1e-9) {
+					recordPaidCost(own.record.runId, {}, missing, PAID_ATTEMPT_UNKNOWN_MODEL);
+				}
+			}
+		} catch {
+			// A failed final read leaves the amount already ingested and any pending receipt explicit in the note.
+		} finally {
+			paid.adapter.dispose();
+			delete own.paid;
+		}
 	}
 
 	#threshold(ctx: ExtensionContext, kind: "warn" | "limit", run: LedgerRun): void {

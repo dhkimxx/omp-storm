@@ -734,6 +734,22 @@ describe("baseline and accounting-source discipline", () => {
 		expect(delta.receiptToken).toBe(`${adapter.metadata.bindingToken}#2`);
 	});
 
+	test("a retired pending attempt settling after this binding never charges this run", () => {
+		const fake = fakeHost({ owner: "owner-retired-late" });
+		fake.pend("old-attempt");
+		const adapter = bind(fake, { limitUsd: 0.5, excludeAttemptIds: ["old-attempt"] });
+		expect(adapter.metadata.startSeq).toBe(0);
+		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0, pendingCount: 0 });
+
+		fake.settlePending("old-attempt", { costTotal: 0.4 });
+		expect(adapter.observe().knownCostUsd).toBe(0);
+		expect(adapter.takeDelta()).toMatchObject({ usd: 0, settledReceipts: 0, pendingCount: 0, unresolvedCount: 0 });
+
+		fake.add({ costTotal: 0.1 });
+		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0.1 });
+		expect(adapter.takeDelta().usd).toBeCloseTo(0.1);
+	});
+
 	test("cumulative receipts and per-model deltas are exact and a second take is empty", () => {
 		const fake = fakeHost({ owner: "owner-delta" });
 		const adapter = bind(fake, { limitUsd: 1 });

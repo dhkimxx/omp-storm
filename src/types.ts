@@ -1085,6 +1085,12 @@ export interface RunSpendNote {
 	evalUsd?: number;
 	/** Spend of children that were not bound to the run by their parent chain but ran in its session tree; counted. */
 	treeUsd?: number;
+	/** Native paid attempts admitted in this run that have not settled yet: their cost is unknown, not zero. */
+	paidPending?: number;
+	/** Settled native paid receipts in this run without exact usage or durable append proof. */
+	paidUnresolved?: number;
+	/** The native paid-attempt proof faulted; the total is a floor and no further provider send is admitted. */
+	paidFaulted?: true;
 }
 
 /** Facts that cannot be faithfully rebuilt from today's session settings. */

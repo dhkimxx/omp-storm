@@ -12,7 +12,9 @@
  * observed `costTotal` of in-scope receipts; pending attempts are unknown, never zero. In finite-budget mode it refuses
  * every further paid attempt while an attempt is pending, an in-scope receipt is unresolved, or the exact authorized
  * cost exceeds the approved limit. Earlier-run receipts stay visible with `inScope: false` but cannot spend this run's
- * budget. The host's refusal is terminal, so there is no resend path.
+ * budget. A caller may also name attempt ids left pending by an earlier binding of the same owner: they are excluded even
+ * when their late receipt's sequence follows this baseline, so a durable late receipt never charges the next run. The
+ * host's refusal is terminal, so there is no resend path.
  *
  * The adapter never reads assistant `message_end` usage or `model_usage` journal rows. When it is effective the wiring
  * metadata says the native receipts are the only spend source; adding those legacy carriers as well would double count.
@@ -269,6 +271,8 @@ export interface PaidAttemptDelta {
 	readonly receiptToken: string;
 	readonly pendingCount: number;
 	readonly unresolvedCount: number;
+	/** Unresolved facts that belong to this binding: an earlier run's receipt never makes this run's live total a floor. */
+	readonly inScopeUnresolvedCount: number;
 }
 
 export interface PaidAttemptCleanup {
@@ -289,6 +293,12 @@ export interface PaidAttemptBindOptions {
 	readonly spentUsd?: number;
 	/** Rechecked for every decision. Throwing is an unknown revocation state and refuses. */
 	readonly isRevoked?: () => boolean;
+	/**
+	 * Attempt ids retired by an earlier binding of the same owner but not yet settled when it closed. They remain visible
+	 * to the host's contiguous receipt sequence yet never count toward this run: a durable late receipt that arrives
+	 * after this binding must not charge the next run.
+	 */
+	readonly excludeAttemptIds?: readonly string[];
 }
 
 export type PaidAttemptBindResult =
@@ -608,12 +618,17 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const limitValid = rawLimit === undefined || finiteNonNegative(rawLimit);
 	const spentValid = rawSpent === undefined || finiteNonNegative(rawSpent);
 	const revokedValid = options.isRevoked === undefined || typeof options.isRevoked === "function";
+	const excludedRaw = options.excludeAttemptIds;
+	const excludedValid =
+		excludedRaw === undefined ||
+		(Array.isArray(excludedRaw) && excludedRaw.every(nonEmpty) && new Set(excludedRaw).size === excludedRaw.length);
+	const excludeAttemptIds = new Set(excludedValid && excludedRaw !== undefined ? excludedRaw : []);
 	const finite = finiteNonNegative(rawLimit);
 	const startCostUsd = finiteNonNegative(rawSpent) ? rawSpent : 0;
 	const limit = limitOf(finite ? "finite" : "unbounded", finite ? rawLimit : undefined);
 
-	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid) {
-		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty and limit/spent must be finite nonnegative numbers", {
+	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid) {
+		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, and excluded attempt ids unique non-empty strings", {
 			runId: runId || "(missing run id)",
 			expectedOwnerSessionId: expectedOwnerSessionId || "(missing owner session id)",
 			startCostUsd,
@@ -677,6 +692,7 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 		startCostUsd,
 		bindingToken,
 		isRevoked: options.isRevoked,
+		excludeAttemptIds,
 	});
 	let failure: { readonly code: PaidAttemptUnavailableCode; readonly detail: string } | undefined;
 	try {
@@ -823,6 +839,7 @@ interface PaidAttemptAdapterInput {
 	readonly startCostUsd: number;
 	readonly bindingToken: string;
 	readonly isRevoked: (() => boolean) | undefined;
+	readonly excludeAttemptIds: ReadonlySet<string>;
 }
 
 /** One run's read-only accounting plus its installed pre-send decision. */
@@ -835,6 +852,7 @@ export class PaidAttemptAdapter {
 	readonly #api: PaidAttemptsSurface;
 	readonly #startCostUsd: number;
 	readonly #isRevoked: (() => boolean) | undefined;
+	readonly #excludeAttemptIds: ReadonlySet<string>;
 	readonly #decider: PaidAttemptDecider = (attempt, state) => this.#decide(attempt, state);
 	#baselineKnown = false;
 	#baselineSeq = 0;
@@ -879,6 +897,7 @@ export class PaidAttemptAdapter {
 		this.#knownCostUsd = input.startCostUsd;
 		this.bindingToken = input.bindingToken;
 		this.#isRevoked = input.isRevoked;
+		this.#excludeAttemptIds = input.excludeAttemptIds;
 	}
 
 	get metadata(): PaidAttemptMetadata {
@@ -959,6 +978,9 @@ export class PaidAttemptAdapter {
 			receiptToken: this.#receiptToken(),
 			pendingCount: this.#pending.length,
 			unresolvedCount: this.#unresolved.length,
+			// The delta is this run's business only: an earlier binding's unresolved receipt stays visible in `observe`
+			// but must not make this run's live spend a floor.
+			inScopeUnresolvedCount: this.#unresolved.filter(fact => fact.inScope).length,
 		};
 		this.#deltaUsd = 0;
 		this.#deltaByModel = new Map();
@@ -1087,6 +1109,7 @@ export class PaidAttemptAdapter {
 		if (state.lastSeq !== this.#lastSeq) return false;
 		if (Math.abs(state.observedCost - this.#hostObservedCost) > COST_EPSILON) return false;
 		const passedPending = state.pending
+			.filter(item => !this.#excludeAttemptIds.has(item.attemptId))
 			.map(item => item.attemptId)
 			.sort()
 			.join("\u0000");
@@ -1378,7 +1401,7 @@ export class PaidAttemptAdapter {
 		const classifications = new Map<string, Classification>();
 		for (const entry of entries) {
 			const receipt = entry.receipt;
-			const inScope = receipt.seq > this.#baselineSeq;
+			const inScope = receipt.seq > this.#baselineSeq && !this.#excludeAttemptIds.has(receipt.attemptId);
 			const classification = classify(receipt);
 			classifications.set(receipt.attemptId, classification);
 			if (inScope) {
@@ -1391,24 +1414,28 @@ export class PaidAttemptAdapter {
 					model.observedReceipts++;
 				}
 			}
-			if (classification.reasons.length > 0) addUnresolved(receipt, classification.reasons, inScope);
+			if (classification.reasons.length > 0 && !this.#excludeAttemptIds.has(receipt.attemptId)) {
+				addUnresolved(receipt, classification.reasons, inScope);
+			}
 		}
 
 		for (const receipt of state.unresolved) {
 			// The host keeps every refused receipt in `unresolved` because its costBasis is unknown. A refused receipt
 			// proves `sent: false`, so its exact spend is zero; treating it as unresolved would block every later permit
 			// for the rest of the run after the first refusal.
-			if (isExactRefusal(receipt)) continue;
+			if (isExactRefusal(receipt) || this.#excludeAttemptIds.has(receipt.attemptId)) continue;
 			const inScope = receipt.seq > this.#baselineSeq;
 			addUnresolved(receipt, ["host-unresolved"], inScope);
 		}
 
-		const pending: PaidAttemptPendingFact[] = state.pending.map(item => ({
-			attemptId: item.attemptId,
-			model: item.model,
-			purpose: item.purpose,
-			actorSessionId: item.actorSessionId,
-		}));
+		const pending: PaidAttemptPendingFact[] = state.pending
+			.filter(item => !this.#excludeAttemptIds.has(item.attemptId))
+			.map(item => ({
+				attemptId: item.attemptId,
+				model: item.model,
+				purpose: item.purpose,
+				actorSessionId: item.actorSessionId,
+			}));
 		for (const item of pending) {
 			if (unresolved.has(item.attemptId)) {
 				faults.push({
@@ -1426,7 +1453,7 @@ export class PaidAttemptAdapter {
 
 		for (const entry of entries) {
 			const receipt = entry.receipt;
-			if (receipt.seq <= this.#baselineSeq) continue;
+			if (receipt.seq <= this.#baselineSeq || this.#excludeAttemptIds.has(receipt.attemptId)) continue;
 			if (this.#deltaSeen.has(receipt.attemptId)) continue;
 			this.#deltaSeen.add(receipt.attemptId);
 			this.#deltaSettled++;

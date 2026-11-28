@@ -35,6 +35,7 @@ import { CONTINUE_SAME_TURN, lastRunEndAt, RunController, runSpawns } from "../s
 import * as ledgerModule from "../src/runtime/ledger.ts";
 import { activeLedgerRun, bindLedgerChild, getLedgerRun, resetLedger, spendNote } from "../src/runtime/ledger.ts";
 import { DISCARDED_TURN_PURPOSE } from "../src/runtime/side-spend.ts";
+import { type PaidAttemptDecider, type PaidAttemptPendingView, type PaidAttemptReceiptView, type PaidAttemptsSurface } from "../src/runtime/paid-attempt-adapter.ts";
 import { processKey } from "../src/runtime/janitor.ts";
 import { LEDGER_READY_LEAD, noteLaneAgentEnd, onLaneReservationEnd, type ReservationEnd, WRITER_FREED_LEAD } from "../src/runtime/lanes.ts";
 import { PLANLESS_SAME_TURN } from "../src/runtime/planless.ts";
@@ -95,7 +96,7 @@ async function shutdownFakeSessions(): Promise<void> {
 }
 
 /** One session's omp as the extension sees it. Only `git` really runs; the `omp` CLI fails, as in `makeProject`. */
-function fakeOmp(project: TestProject, load: typeof storm = storm) {
+function fakeOmp(project: TestProject, load: typeof storm = storm, paidAttempts?: (sessionId: string | undefined) => unknown) {
 	const handlers = new Map<string, Handler[]>();
 	const sent: string[] = [];
 	const notices: Array<{ text: string; level: string }> = [];
@@ -281,6 +282,7 @@ function fakeOmp(project: TestProject, load: typeof storm = storm) {
 				getSessionId: () => (agent.kind === "main" ? (mainSessionId as string) : `child-${agent.id}`),
 			},
 			runEphemeralTurn: async () => ({ replyText: '{"action":"run"}' }),
+			...(paidAttempts === undefined ? {} : { paidAttempts: paidAttempts(mainSessionId) }),
 		}) as unknown as ExtensionContext;
 	return {
 		sent,
@@ -365,6 +367,71 @@ function rememberPlacedHandles(input: unknown, answer: unknown): void {
 const assistant = (provider: string, model: string, input: number, usd: number) => ({
 	message: { role: "assistant", provider, model, usage: { input, cacheRead: 0, cacheWrite: 0, cost: { total: usd } } },
 });
+
+/** A structural Slice Y surface whose receipts the paid-wiring tests settle by hand. */
+function fakePaidSurface(owner: string) {
+	const authorizeCalls: Array<PaidAttemptDecider | undefined> = [];
+	const receipts: PaidAttemptReceiptView[] = [];
+	let pending: PaidAttemptPendingView[] = [];
+	let decider: PaidAttemptDecider | undefined;
+	let observedCost = 0;
+	let lastSeq = 0;
+	const api: PaidAttemptsSurface = {
+		ownerSessionId: owner,
+		get managed(): boolean {
+			return decider !== undefined;
+		},
+		authorize(next): void {
+			authorizeCalls.push(next);
+			decider = next;
+		},
+		state() {
+			return {
+				observedCost,
+				pending: pending.map(item => ({ ...item })),
+				unresolved: receipts.filter(receipt => receipt.costBasis === "unknown"),
+				lastSeq,
+			};
+		},
+		receipts() {
+			return receipts.map(receipt => ({ ...receipt }));
+		},
+		onReceipt() {
+			return () => undefined;
+		},
+	};
+	return {
+		api,
+		authorizeCalls,
+		add(usd: number): void {
+			const seq = ++lastSeq;
+			receipts.push({
+				attemptId: `a${seq}`,
+				seq,
+				sessionId: owner,
+				actorSessionId: owner,
+				purpose: "loop",
+				provider: "openai",
+				model: "gpt-test",
+				attempt: 1,
+				startedAt: 1_000,
+				settledAt: 2_000,
+				gate: "admitted",
+				sent: true,
+				outcome: "completed",
+				costBasis: "observed",
+				costTotal: usd,
+				append: "flushed",
+				receiptEntryId: `entry-${seq}`,
+			});
+			pending = pending.filter(item => item.attemptId !== `a${seq}`);
+			observedCost += usd;
+		},
+		pend(attemptId: string): void {
+			pending = [...pending, { attemptId, model: "gpt-test", purpose: "loop", actorSessionId: owner }];
+		},
+	};
+}
 /** The `[storm:<code>]` a hook answered with (a refused `task` call carries its code in its input), "pass" when it let the call through, or the routed models. */
 function verdict(answer: unknown): string {
 	if (answer === undefined) return "pass";
@@ -8075,5 +8142,33 @@ describe("the spawn decision section: the last place is taken once, and nothing 
 		// spawns and are not counted as seen.
 		expect((await readTrialStates(project.sessionDir)).t1).toMatchObject({ seen: 1, routed: 1, costUsd: 0 });
 		await omp.emit("session_shutdown", {}, main);
+	});
+});
+
+describe("native paid attempts through the hooks", () => {
+	test("a bound run takes spend from exact receipts once; assistant usage is not added twice; shutdown retires the run", async () => {
+		await approve({ ...TEAM, budget: { perRunUsd: 1, onExceed: "block-spawns" } });
+		const paid = fakePaidSurface(project.sessionId);
+		const omp = fakeOmp(project, storm, () => paid.api);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual paid task", main);
+		expect(await omp.tool({ action: "plan", plan: { lanes: [fixLane] } }, main)).toBe("ok");
+		const runId = activeLedgerRun(project.sessionDir)?.runId as string;
+		expect(getLedgerRun(runId)?.paid).toMatchObject({
+			ownerSessionId: project.sessionId,
+			startSeq: 0,
+			startCostUsd: 0,
+			limitUsd: 1,
+		});
+
+		await omp.emit("message_end", assistant("openai", "gpt-test", 1_000, 0.5), main);
+		expect(getLedgerRun(runId)?.costUsd).toBe(0);
+		paid.add(0.2);
+		await omp.emit("message_end", assistant("openai", "gpt-test", 1_000, 0.5), main);
+		expect(getLedgerRun(runId)?.costUsd).toBeCloseTo(0.2);
+
+		await omp.emit("session_shutdown", {}, main);
+		expect(paid.authorizeCalls.at(-1)).toBeUndefined();
+		expect(getLedgerRun(runId)).toBeUndefined();
 	});
 });

@@ -39,6 +39,29 @@ export interface LedgerRun {
 	plan?: RunPlan;
 	/** Called once when spend first reaches budget.warnAtUsd and once when it first reaches budget.perRunUsd, by whichever session recorded the cost. */
 	onThreshold?: (kind: "warn" | "limit", run: LedgerRun) => void;
+	/** Native paid-attempt receipts are this run's only spend source; assistant and journal additions must stay off. */
+	paid?: LedgerPaidAccounting;
+}
+
+/**
+ * The exact native paid-attempt accounting of one run, written by the controller that bound the host owner. Its presence
+ * means native receipts, not message/journal carriers, own this run's spend.
+ */
+export interface LedgerPaidAccounting {
+	readonly ownerSessionId: string;
+	readonly bindingToken: string;
+	/** The host receipt sequence at binding: earlier receipts belong to an earlier run and never charge this one. */
+	readonly startSeq: number;
+	/** The exact approved run budget, when the team has one. */
+	readonly limitUsd?: number;
+	readonly startCostUsd: number;
+	/** In-scope observed receipt cost already counted into `costUsd`. */
+	receiptsUsd: number;
+	receipts: number;
+	lastSeq: number;
+	pending: number;
+	unresolved: number;
+	accounting: "effective" | "faulted";
 }
 
 // The owner key is the profile's session directory, not a worktree or a bare native id: one profile/session owns one run.
@@ -248,14 +271,9 @@ function notify(run: LedgerRun, kind: "warn" | "limit"): void {
 	}
 }
 
-export function recordCost(runId: string, selector: string, usd: number): LedgerRun | undefined {
-	const run = runs.get(runId);
-	if (!run) return undefined;
-	if (!Number.isFinite(usd) || usd < 0) return run;
-	run.costUsd += usd;
-	run.costByModel[selector] = (run.costByModel[selector] ?? 0) + usd;
+function notifyBudget(run: LedgerRun): void {
 	const budget = run.budget;
-	if (!budget) return run;
+	if (!budget) return;
 	if (!run.warned && budget.warnAtUsd !== undefined && run.costUsd >= budget.warnAtUsd) {
 		run.warned = true;
 		notify(run, "warn");
@@ -264,7 +282,84 @@ export function recordCost(runId: string, selector: string, usd: number): Ledger
 		run.exceeded = true;
 		notify(run, "limit");
 	}
+}
+
+export function recordCost(runId: string, selector: string, usd: number): LedgerRun | undefined {
+	const run = runs.get(runId);
+	if (!run) return undefined;
+	if (!Number.isFinite(usd) || usd < 0) return run;
+	run.costUsd += usd;
+	run.costByModel[selector] = (run.costByModel[selector] ?? 0) + usd;
+	notifyBudget(run);
 	return run;
+}
+
+/**
+ * Adds one native receipt batch to the run: the exact total once, the per-model split for the record, and one budget
+ * notification after every addition. The controller takes the adapter's delta exactly once, so this is the only path
+ * that adds native spend.
+ */
+export function recordPaidCost(
+	runId: string,
+	byModel: Readonly<Record<string, number>>,
+	totalUsd: number,
+	fallbackSelector: string,
+): LedgerRun | undefined {
+	const run = runs.get(runId);
+	if (!run) return undefined;
+	if (!Number.isFinite(totalUsd) || totalUsd < 0) return run;
+	run.costUsd += totalUsd;
+	let split = 0;
+	for (const [selector, usd] of Object.entries(byModel)) {
+		if (!Number.isFinite(usd) || usd <= 0) continue;
+		run.costByModel[selector] = (run.costByModel[selector] ?? 0) + usd;
+		split += usd;
+	}
+	const remainder = totalUsd - split;
+	if (Math.abs(remainder) > 1e-9) {
+		run.costByModel[fallbackSelector] = (run.costByModel[fallbackSelector] ?? 0) + remainder;
+	}
+	notifyBudget(run);
+	return run;
+}
+
+/** Whether this run has bound the host's native paid-attempt receipts; its legacy cost carriers must not also add. */
+export function paidNativeAccounting(runId: string | undefined): boolean {
+	const run = getLedgerRun(runId);
+	return run?.paid !== undefined;
+}
+
+/** Attaches the native paid-attempt binding to a run before its first covered provider send. */
+export function attachPaidAccounting(runId: string, paid: LedgerPaidAccounting): LedgerRun | undefined {
+	const run = runs.get(runId);
+	if (!run || run.closing) return undefined;
+	run.paid = paid;
+	return run;
+}
+
+/** Advances the native paid-attempt view; cost itself is added only by `recordPaidCost`. */
+export function updatePaidAccounting(runId: string, next: LedgerPaidAccounting): LedgerRun | undefined {
+	const run = runs.get(runId);
+	if (!run || run.paid === undefined) return undefined;
+	run.paid = next;
+	return run;
+}
+
+// Attempt ids of an earlier run of one owner that had not settled when it closed. They stay out of every later binding:
+// a durable receipt settling after the next run began is that earlier run's business, never the next run's spend.
+const retiredPaidAttempts = sharedMap<string, Set<string>>("storm.paid-attempt.retired");
+
+/** The earlier-run attempt ids of this owner that no later binding may charge. */
+export function retiredPaidAttemptIds(ownerSessionId: string): readonly string[] {
+	return [...(retiredPaidAttempts.get(ownerSessionId) ?? [])].sort();
+}
+
+/** Records the attempt ids left pending when one exact run retired. Attempt ids are host-minted and owner-unique. */
+export function noteRetiredPaidAttemptIds(ownerSessionId: string, attemptIds: readonly string[]): void {
+	if (attemptIds.length === 0) return;
+	let ids = retiredPaidAttempts.get(ownerSessionId);
+	if (ids === undefined) retiredPaidAttempts.set(ownerSessionId, (ids = new Set()));
+	for (const id of attemptIds) if (id !== "") ids.add(id);
 }
 
 /**
@@ -286,7 +381,7 @@ export const EVAL_COST_SELECTOR = "eval/completion";
  */
 export function noteEvalModelCalls(runId: string, sessionKey: string): void {
 	const run = runs.get(runId);
-	if (run !== undefined && sessionKey !== "") run.evalUnread.add(sessionKey);
+	if (run !== undefined && run.paid === undefined && sessionKey !== "") run.evalUnread.add(sessionKey);
 }
 
 /**
@@ -298,6 +393,8 @@ export function noteEvalModelCalls(runId: string, sessionKey: string): void {
 export function recordEvalCost(runId: string, sessionKey: string, totalUsd: number, lift = true): LedgerRun | undefined {
 	const run = runs.get(runId);
 	if (!run) return undefined;
+	// The native receipt already carries every in-scope paid attempt, journaled side calls included.
+	if (run.paid !== undefined) return run;
 	if (lift) run.evalUnread.delete(sessionKey);
 	if (!Number.isFinite(totalUsd) || totalUsd < 0) return run;
 	const before = run.evalCostBySource[sessionKey] ?? 0;
@@ -317,6 +414,20 @@ export function spendNote(run: LedgerRun | undefined): RunSpendNote | undefined 
 	}
 	if (run.evalCostUsd > 0) note.evalUsd = run.evalCostUsd;
 	if (run.treeCostUsd > 0) note.treeUsd = run.treeCostUsd;
+	if (run.paid !== undefined) {
+		if (run.paid.pending > 0) {
+			note.lowerBound = true;
+			note.paidPending = run.paid.pending;
+		}
+		if (run.paid.unresolved > 0) {
+			note.lowerBound = true;
+			note.paidUnresolved = run.paid.unresolved;
+		}
+		if (run.paid.accounting === "faulted") {
+			note.lowerBound = true;
+			note.paidFaulted = true;
+		}
+	}
 	return Object.keys(note).length === 0 ? undefined : note;
 }
 
@@ -325,4 +436,5 @@ export function resetLedger(): void {
 	sessions.clear();
 	children.clear();
 	childKeysByRun.clear();
+	retiredPaidAttempts.clear();
 }

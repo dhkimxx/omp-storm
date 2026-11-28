@@ -127,7 +127,7 @@ import { lastRunEndAt, noteRunNotice, noteRunRan, noteRunSpawn, noteRunStopped, 
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
 import { batchWriteNeed, broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, spawnKeyMismatchReason, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { hostJobRows } from "./runtime/host-jobs.ts";
-import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, recordCost, type LedgerRun } from "./runtime/ledger.ts";
+import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, paidNativeAccounting, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { mayMakeSideCalls, settleSideSpend } from "./runtime/side-spend.ts";
 import { stopDeadRuns } from "./runtime/janitor.ts";
 import { sharedMap } from "./runtime/thread-state.ts";
@@ -2112,6 +2112,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 								const usage = assistantUsage(message);
 								if (!usage || usage.usd <= 0) return;
 								if (runs.runId() === runId) runs.noteMainSpend(usage.usd);
+								// Native receipts already carry this attempt; only a stock host uses the message carrier.
+								if (paidNativeAccounting(runId)) return;
 								const run = recordCost(runId, usage.selector, usage.usd);
 								if (run) touchRun(run.runId);
 							},
@@ -2124,6 +2126,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	// A decision that fails or outlasts omp's handler budget blocks storm-* agents and any agent during a run: omp
 	// would otherwise run the spawn on its own model, unrecorded and uncounted.
 	pi.on("before_subagent_spawn", async (event, ctx) => {
+		runs.ingestPaidSpend();
 		const generation = sessionGeneration;
 		const mainId = mainSessionId(ctx);
 		const auto = autoOf(ctx);
@@ -2788,6 +2791,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	// 2. An unclean one (any of them was refused, blocked, failed or aborted): kept, because the host may still be committing
 	//    what an aborted call wrote. The next completed assistant message of this conversation ends them (below).
 	pi.on("turn_end", (event, ctx) => {
+		runs.ingestPaidSpend();
 		if (ctx.agent.kind !== "main") return;
 		// Every call of this message has executed (or was aborted); nothing of it can still start after its turn end. The
 		// message's own call ids and the refusal notes exist only until here, so no proof accumulates across messages (RF4-5).
@@ -2800,6 +2804,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	});
 
 	pi.on("message_end", async (event, ctx) => {
+		runs.ingestPaidSpend();
 		rememberMainAgent(ctx);
 		// 3. The backstop for all of it. On the host (19.2.1) the hooks of a message's calls run first, then that message's own
 		//    `message_end` comes, then its calls execute: so this event must never free the holds of the message it ends. A
@@ -2834,6 +2839,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
 		const ledger = ctx.agent.kind === "main" ? getLedgerRun(runs.runId()) : childLedger(ctx);
+		const nativePaid = ledger?.paid !== undefined;
 		if (ctx.agent.kind === "sub") {
 			// A bare child has no attested Storm owner: its own native session is never substituted. A child on another thread
 			// (a pooled worker) never reaches here with a request; it was stopped before its first one.
@@ -2854,7 +2860,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		}
 		if (usage.usd <= 0) return;
 		if (ctx.agent.kind === "main") runs.noteMainSpend(usage.usd);
-		const run = ledger === undefined ? undefined : recordCost(ledger.runId, usage.selector, usage.usd);
+		const run = nativePaid ? undefined : ledger === undefined ? undefined : recordCost(ledger.runId, usage.selector, usage.usd);
 		if (run) touchRun(run.runId);
 		// A trial's budget counts what the subagents routed to its candidate spend on that candidate. Only the run its
 		// parent admitted supplies the session store; a bare child's own native session is never a Storm session.
@@ -2936,6 +2942,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 
 	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
 	pi.on("before_agent_start", async (event, ctx) => {
+		runs.ingestPaidSpend();
 		if (ctx.agent.kind === "main") {
 			rememberMainAgent(ctx);
 			// Without a native session identity there is no Storm policy to apply; the ordinary conversation is untouched.
@@ -3141,6 +3148,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		ctx.abort();
 	};
 	pi.on("before_provider_request", async (_event, ctx) => {
+		runs.ingestPaidSpend();
 		if (ctx.agent.kind !== "sub") return undefined;
 		const key = authorityKey(artifactsOf(ctx), ctx.agent.id);
 		// R15: a request after the user's `stop` at the limit is not sent. The close is on disk, so this works on any
@@ -3261,6 +3269,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 */
 	const spendFromLedger = (runId: string | undefined): SpendCloseRead | undefined => {
 		if (runId === undefined) return undefined;
+		runs.ingestPaidSpend();
 		const run = getLedgerRun(runId);
 		if (run === undefined) return undefined;
 		if (run.exceeded !== true || run.budget?.onExceed === undefined) return { kind: "open" };
@@ -3268,6 +3277,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	};
 
 	const spendSendBlock = (runId: string): string | undefined => {
+		runs.ingestPaidSpend();
 		const run = getLedgerRun(runId);
 		// The director's thread owns the ledger: it crosses the limit before the disk receipt lands, and a run whose
 		// ledger is gone cannot prove the close is open.
@@ -4329,6 +4339,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	// Every compaction of a directing session, omp's own included, keeps Storm's view of the run. An idle compaction
 	// gets nothing: no recap of an earlier run is put back into a conversation that has moved on.
 	pi.on("session.compacting", async (_event, ctx) => {
+		runs.ingestPaidSpend();
 		const run = runs.active();
 		const ledger = run === undefined ? undefined : getLedgerRun(run.runId);
 		if (run === undefined || ledger === undefined) return undefined;
@@ -4355,11 +4366,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const runId = runs.runId();
 		const run = getLedgerRun(runId);
 		if (runId === undefined || run === undefined || mainSessionId(ctx) !== run.sessionId) return;
+		// Native receipts already carry every run-covered provider attempt, journals included.
+		if (paidNativeAccounting(runId)) return;
 		// A reading with no call is the turn's end.
 		await settleSideSpend(runId, sessionFileOf(ctx), run.startedAt, call === undefined ? false : mayMakeSideCalls(call.toolName, call.input, call.isError), call === undefined);
 	};
 
 	const onToolResult = async (event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined> => {
+		runs.ingestPaidSpend();
 		// A call Storm refused ran into omp's own rejection (task-refusal.ts): its result becomes Storm's reason. The call
 		// spawned nothing and was never admitted, so only what its call id reserved is freed; no delivery is observed.
 		const refusal = event.toolName === "task" ? refusedCalls.take(event.toolCallId) : undefined;
@@ -4382,8 +4396,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// Model calls a tool makes outside the session's main loop (an eval cell's `completion()`, `find`'s judge, a search, an
 			// edit's repair) reach no hook: omp journals them in this agent's own session file. Read them back into the run's total
 			// after every call (only what was appended is parsed); a call that may have made one marks the total a floor until its
-			// entry is found, and so does a file that cannot be read.
-			await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, mayMakeSideCalls(event.toolName, event.input, event.isError));
+			// entry is found, and so does a file that cannot be read. Native receipts already carry these attempts.
+			if (!paidNativeAccounting(ledger.runId)) {
+				await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, mayMakeSideCalls(event.toolName, event.input, event.isError));
+			}
 			touchRun(ledger.runId);
 			// A reviewer's structured verdict arrives through its `yield`; it lands on the ledger entry and from there in the run record.
 			const now = Date.now();
@@ -4593,6 +4609,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
+		runs.ingestPaidSpend();
 		rememberMainAgent(ctx);
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
@@ -4613,7 +4630,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					scope: ledger.sessionDir,
 				});
 				// What the turn's side model calls cost (its last tool call's own entry may be the newest line of its file).
-				await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, false, true);
+				if (!paidNativeAccounting(ledger.runId)) {
+					await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, false, true);
+				}
 				// After the ledger says settled: the run's phase reads it, so touching the run before the update would
 				// leave the last worker or reviewer looking active until another event.
 				touchRun(ledger.runId);
@@ -4745,7 +4764,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (ctx.agent.kind === "sub") {
 			const ledger = childLedger(ctx);
 			if (ledger !== undefined) {
-				await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, false, true);
+				if (!paidNativeAccounting(ledger.runId)) {
+					await settleSideSpend(ledger.runId, sessionFileOf(ctx), ledger.startedAt, false, true);
+				}
 				noteAgentParked(ctx.agent.id, ledger.sessionDir);
 				releaseWorkerSlot(ledger.runId, ctx.agent.id);
 				noteLaneAgentEnd(ledger.runId, ctx.agent.id);
