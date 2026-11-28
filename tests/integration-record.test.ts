@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type {
@@ -272,6 +272,27 @@ describe("integration journal", () => {
 		if (fenceRead.kind === "unknown") throw new Error(fenceRead.problem.reason);
 		const fence = fenceRead.value;
 		expect(await other.findFence({ canonicalRoot: item.root })).toEqual({ kind: "fenced", fence });
+		const nextWriter = (mode: "read" | "write") => acquireRunLease({
+			sessionDir: otherSession, sessionId: "session-other", root: item.root, runId: "run-other", mode,
+		}, { dir: item.leaseDir });
+		expect(await nextWriter("write")).toMatchObject({ ok: false, reason: expect.stringContaining("통합 펜스") });
+		const reader = await nextWriter("read");
+		if (!reader.ok) throw new Error(reader.reason);
+		try {
+			expect(await reader.lease.upgrade()).toMatchObject({ ok: false, reason: expect.stringContaining("통합 펜스") });
+		} finally {
+			await reader.lease.release();
+		}
+		const oldRoot = `${item.root}-original`;
+		await rename(item.root, oldRoot);
+		await mkdir(item.root);
+		try {
+			expect(await other.findFence({ canonicalRoot: item.root })).toEqual({ kind: "fenced", fence });
+			expect(await nextWriter("write")).toMatchObject({ ok: false, reason: expect.stringContaining("통합 펜스") });
+		} finally {
+			await rm(item.root, { recursive: true });
+			await rename(oldRoot, item.root);
+		}
 		await journal.appendEffectEnd(item.key.runId, { token: fence.effectToken, basis: "never-dispatched", observedAt: Date.now() });
 		const released = await other.resolveFence({
 			fence,
@@ -280,6 +301,9 @@ describe("integration journal", () => {
 		}, window());
 		expect(released).toEqual({ kind: "released", disposition: "proved-no-effect" });
 		expect(await other.findFence({ canonicalRoot: item.root })).toEqual({ kind: "clear" });
+		const acquired = await nextWriter("write");
+		if (!acquired.ok) throw new Error(acquired.reason);
+		await acquired.lease.release();
 	});
 
 	test("all-post without a receipt is present-unattributed, mixed stays fenced, garbage is unknown", async () => {
@@ -316,7 +340,7 @@ describe("integration journal", () => {
 			checkOperator: () => ({ ok: true }),
 		}, window());
 		expect(mixed.kind).toBe("kept");
-		const dir = path.join(item.leaseDir, "worktrees", item.target.leaseKey, "integration", "fences");
+		const dir = path.join(item.leaseDir, "integration-fences");
 		const names = await readdir(dir);
 		await writeFile(path.join(dir, names[0]!), "not json", "utf8");
 		expect(await journal.findFence({ canonicalRoot: item.root })).toMatchObject({ kind: "unknown" });

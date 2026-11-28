@@ -29,7 +29,7 @@ import {
 	type Footprint, readFootprint, verifyFootprint, observePostimages,
 } from "./integration-git.ts";
 import { runLanes } from "./lanes.ts";
-import { canonicalWorktree, leaseNamespace, type LeaseDeps, type LeaseOwner, type LeaseSnapshot, type RunLease } from "./lease.ts";
+import { canonicalWorktree, integrationFenceFile, integrationFenceFiles, leaseNamespace, type LeaseDeps, type LeaseOwner, type LeaseSnapshot, type RunLease } from "./lease.ts";
 import { isRunId } from "./run.ts";
 
 const JOURNAL_SCHEMA = "storm.integration-journal/v1";
@@ -371,8 +371,8 @@ function isReceipt(value: unknown): value is WriteReceipt {
 
 function isFence(value: unknown): value is TargetFenceRef {
 	return isIntegrationObject(value) &&
-		typeof value.leaseKey === "string" &&
-		typeof value.root === "string" &&
+		typeof value.leaseKey === "string" && DIGEST.test(value.leaseKey) &&
+		typeof value.root === "string" && path.isAbsolute(value.root) &&
 		typeof value.runId === "string" &&
 		isRunId(value.runId) &&
 		Number.isSafeInteger(value.intentSequence) &&
@@ -543,10 +543,6 @@ export class IntegrationJournal implements IntegrationJournalStore {
 
 	#journalFile(runId: RunId): string {
 		return path.join(this.#runDir(runId), "journal.jsonl");
-	}
-
-	#fenceDir(key: string): string {
-		return path.join(this.leaseBase, "worktrees", key, "integration", "fences");
 	}
 
 	/** Reads and validates the whole run journal; any torn/foreign/corrupt record is unknown, never an empty list. */
@@ -925,35 +921,36 @@ export class IntegrationJournal implements IntegrationJournalStore {
 			this.fenceCache.set(canonical.root, unknown);
 			return unknown;
 		}
-		const dir = this.#fenceDir(canonical.key);
-		let names: string[];
+		let files: string[];
 		try {
-			names = await fs.readdir(dir);
-		} catch (error) {
-			if (errorCodeOf(error) === "ENOENT") {
-				const clear: TargetFenceLookup = { kind: "clear" };
-				this.fenceCache.set(canonical.root, clear);
-				return clear;
-			}
+			files = await integrationFenceFiles(this.leaseBase, canonical.root, canonical.key);
+		} catch {
 			const unknown: TargetFenceLookup = { kind: "unknown", problem: problem("integration-fence", "통합 펜스 디렉터리를 읽을 수 없습니다.") };
 			this.fenceCache.set(canonical.root, unknown);
 			return unknown;
 		}
-		const fences: TargetFenceRef[] = [];
-		for (const name of names.filter(value => value.endsWith(".fence.json")).sort()) {
-			const read = await readFenceFile(path.join(dir, name), canonical.root);
+		let found: TargetFenceRef | undefined;
+		for (const file of files) {
+			const read = await readFenceFile(file);
 			if (read.kind === "unknown") {
 				this.fenceCache.set(canonical.root, read);
 				return read;
 			}
-			if (read.kind === "fenced") fences.push(read.fence);
+			const fence = read.fence;
+			if ((fence.root !== canonical.root && fence.leaseKey !== canonical.key) ||
+				file !== integrationFenceFile(this.leaseBase, fence.root, fence.leaseKey, fence.effectToken)) {
+				const unknown: TargetFenceLookup = { kind: "unknown", problem: problem("integration-fence", "펜스의 파일명과 대상이 일치하지 않습니다.") };
+				this.fenceCache.set(canonical.root, unknown);
+				return unknown;
+			}
+			found ??= fence;
 		}
-		if (fences.length === 0) {
+		if (found === undefined) {
 			const clear: TargetFenceLookup = { kind: "clear" };
 			this.fenceCache.set(canonical.root, clear);
 			return clear;
 		}
-		const fenced: TargetFenceLookup = { kind: "fenced", fence: fences[0]! };
+		const fenced: TargetFenceLookup = { kind: "fenced", fence: found };
 		this.fenceCache.set(canonical.root, fenced);
 		return fenced;
 	}
@@ -1061,8 +1058,8 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		const canonical = await canonicalWorktree(fence.root);
 		if (canonical === undefined) return { kind: "unknown", problem: problem("integration-fence", "대상 루트의 정체성을 확인할 수 없습니다.") };
 		if (canonical.key !== fence.leaseKey) return { kind: "unknown", problem: problem("integration-fence-identity", "대상 lease key가 물리 identity와 다릅니다.") };
-		const dir = this.#fenceDir(canonical.key);
-		const file = path.join(dir, `${fence.runId}-${String(fence.intentSequence).padStart(6, "0")}-${fence.effectToken.slice(0, 12)}.fence.json`);
+		const file = integrationFenceFile(this.leaseBase, fence.root, fence.leaseKey, fence.effectToken);
+		const dir = path.dirname(file);
 		const record = {
 			schema: FENCE_SCHEMA,
 			fence,
@@ -1071,7 +1068,7 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		};
 		try {
 			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-			const tmp = path.join(dir, `.${fence.effectToken}.tmp`);
+			const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
 			const handle = await fs.open(tmp, "wx", 0o600);
 			try {
 				await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
@@ -1135,33 +1132,21 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		if (canonical === undefined || canonical.key !== fence.leaseKey) {
 			return { kind: "unknown", problem: problem("integration-fence-identity", "펜스 대상의 정체성을 확인할 수 없습니다.") };
 		}
-		const dir = this.#fenceDir(canonical.key);
-		let names: string[];
-		try {
-			names = await fs.readdir(dir);
-		} catch (error) {
-			if (errorCodeOf(error) === "ENOENT") return { kind: "unknown", problem: problem("integration-fence", "펜스 파일이 없습니다.") };
-			return { kind: "unknown", problem: problem("integration-fence", "펜스 디렉터리를 읽을 수 없습니다.") };
+		const file = integrationFenceFile(this.leaseBase, fence.root, fence.leaseKey, fence.effectToken);
+		const read = await readFenceFile(file);
+		if (read.kind === "unknown") return read;
+		if (!sameFence(read.fence, fence)) return { kind: "unknown", problem: problem("integration-fence", "펜스의 소유자가 다릅니다.") };
+		const journalPath = read.journalPath;
+		if (!path.isAbsolute(journalPath) || path.basename(journalPath) !== "journal.jsonl") {
+			return { kind: "unknown", problem: problem("integration-fence", "펜스의 저널 경로가 올바르지 않습니다.") };
 		}
-		for (const name of names.filter(value => value.endsWith(".fence.json")).sort()) {
-			const file = path.join(dir, name);
-			const read = await readFenceFile(file, canonical.root);
-			if (read.kind === "unknown") return read;
-			if (read.kind === "fenced" && sameFence(read.fence, fence)) {
-				const journalPath = read.journalPath;
-				if (!path.isAbsolute(journalPath) || path.basename(journalPath) !== "journal.jsonl") {
-					return { kind: "unknown", problem: problem("integration-fence", "펜스의 저널 경로가 올바르지 않습니다.") };
-				}
-				return { kind: "known", value: { file, journalPath } };
-			}
-		}
-		return { kind: "unknown", problem: problem("integration-fence", "펜스 파일을 찾을 수 없습니다.") };
+		return { kind: "known", value: { file, journalPath } };
 	}
 
 	async clearFence(fence: TargetFenceRef): Promise<IntegrationCheck> {
 		const pointer = await this.fencePointer(fence);
 		if (pointer.kind === "unknown") return { ok: false, problem: pointer.problem };
-		const read = await readFenceFile(pointer.value.file, fence.root);
+		const read = await readFenceFile(pointer.value.file);
 		if (read.kind !== "fenced" || !sameFence(read.fence, fence)) {
 			return { ok: false, problem: problem("integration-fence", "펜스 파일이 확인 중에 바뀌었습니다.") };
 		}
@@ -1236,7 +1221,7 @@ interface FenceFileRead {
 	readonly journalPath: string;
 }
 
-async function readFenceFile(file: string, root: string): Promise<FenceFileRead | { kind: "unknown"; problem: IntegrationProblem }> {
+async function readFenceFile(file: string): Promise<FenceFileRead | { kind: "unknown"; problem: IntegrationProblem }> {
 	let handle: FileHandle;
 	try {
 		handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -1259,7 +1244,6 @@ async function readFenceFile(file: string, root: string): Promise<FenceFileRead 
 		if (!isIntegrationObject(value) || value.schema !== FENCE_SCHEMA || !isFence(value.fence) || typeof value.journalPath !== "string") {
 			return { kind: "unknown", problem: problem("integration-fence", "펜스 파일 형식이 올바르지 않습니다.") };
 		}
-		if (value.fence.root !== root) return { kind: "unknown", problem: problem("integration-fence", "펜스 파일의 대상이 다릅니다.") };
 		return { kind: "fenced", fence: value.fence, journalPath: value.journalPath };
 	} catch {
 		return { kind: "unknown", problem: problem("integration-fence", "펜스 파일을 확인할 수 없습니다.") };

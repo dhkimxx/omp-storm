@@ -370,6 +370,45 @@ export function leaseNamespace(deps: LeaseDeps = {}): string {
 	return deps.dir !== undefined ? deps.dir : defaultLeaseDir();
 }
 
+const FENCE_EXT = ".fence.json";
+
+/** A single published record is discoverable by either physical target or canonical path, including after replacement. */
+export function integrationFenceFile(baseDir: string, root: string, key: string, effectToken: string): string {
+	const rootKey = createHash("sha256").update(root).digest("hex");
+	const effectKey = createHash("sha256").update(effectToken).digest("hex");
+	return path.join(baseDir, "integration-fences", `${key}.${rootKey}.${effectKey}${FENCE_EXT}`);
+}
+
+export async function integrationFenceFiles(baseDir: string, root: string, key: string): Promise<string[]> {
+	const dir = path.join(baseDir, "integration-fences");
+	const rootKey = createHash("sha256").update(root).digest("hex");
+	const physicalPrefix = `${key}.`;
+	const rootPrefix = `${rootKey}.`;
+	let names: string[];
+	try {
+		const info = await fs.lstat(dir);
+		if (!info.isDirectory() || (info.mode & 0o077) !== 0 ||
+			(typeof process.getuid === "function" && info.uid !== process.getuid())) throw new Error(`유효한 통합 펜스 디렉터리가 아닙니다: ${dir}`);
+		names = await fs.readdir(dir);
+	} catch (error) {
+		if (errCode(error) === "ENOENT") return [];
+		throw error;
+	}
+	const files: string[] = [];
+	for (const name of names) {
+		if (!name.endsWith(FENCE_EXT) || !(name.startsWith(physicalPrefix) || name.startsWith(rootPrefix, physicalPrefix.length))) continue;
+		files.push(path.join(dir, name));
+	}
+	return files;
+}
+
+async function writerFenceBlock(baseDir: string, record: LeaseRecord): Promise<string | undefined> {
+	const target = await canonicalWorktree(record.root);
+	if (target?.key !== record.key || target.root !== record.root) return "쓰기 lease를 얻기 전에 작업 트리의 정체성이 바뀌었습니다.";
+	const [fence] = await integrationFenceFiles(baseDir, record.root, record.key);
+	return fence === undefined ? undefined : `이 대상에 끝났는지 확인되지 않은 통합 펜스가 남아 있어 쓰기 lease를 얻지 않았습니다: ${fence}`;
+}
+
 /** The canonical worktree identity the lease and the integration fence both key on. */
 export interface CanonicalWorktree {
 	/** Real path of the worktree top level. */
@@ -903,6 +942,7 @@ async function acquireReader(
  * backs out or is seen here, so readers and writers never both return success.
  */
 async function acquireWriter(
+	baseDir: string,
 	worktreeDir: string,
 	key: string,
 	record: LeaseRecord,
@@ -927,6 +967,8 @@ async function acquireWriter(
 			if (!claimsOverlap(record.paths, other.record.paths)) continue;
 			return fail(writerConflictReason(other.record, overlappingPath(record.paths, other.record.paths)));
 		}
+		const fenced = await writerFenceBlock(baseDir, record).catch(error => `통합 펜스를 확인할 수 없습니다: ${errText(error)}`);
+		if (fenced !== undefined) return fail(fenced);
 		return { ok: true, held: { path: heldPath, record } };
 	});
 }
@@ -947,6 +989,7 @@ function overlappingPath(a: readonly string[] | undefined, b: readonly string[] 
  * free of new conflicts, so the transition is atomic from every other process's point of view.
  */
 async function replaceWriter(
+	baseDir: string,
 	worktreeDir: string,
 	key: string,
 	current: WorktreeRecord,
@@ -966,6 +1009,8 @@ async function replaceWriter(
 			if (other.path === current.path || !claimsOverlap(next.paths, other.record.paths)) continue;
 			return fail(writerConflictReason(other.record, overlappingPath(next.paths, other.record.paths)));
 		}
+		const fenced = await writerFenceBlock(baseDir, next).catch(error => `통합 펜스를 확인할 수 없습니다: ${errText(error)}`);
+		if (fenced !== undefined) return fail(fenced);
 		return { ok: true, held: { path: heldPath, record: next } };
 	});
 }
@@ -1084,6 +1129,7 @@ function makeLease(state: LeaseState, liveness: (owner: LeaseOwner) => LeaseOwne
 		let acquired: { ok: true; held: WorktreeRecord } | { ok: false; reason: string };
 		try {
 			acquired = await acquireWriter(
+				state.baseDir,
 				path.join(state.baseDir, "worktrees", state.worktree),
 				state.worktree,
 				next,
@@ -1116,6 +1162,7 @@ function makeLease(state: LeaseState, liveness: (owner: LeaseOwner) => LeaseOwne
 		let replaced: { ok: true; held: WorktreeRecord } | { ok: false; reason: string };
 		try {
 			replaced = await replaceWriter(
+				state.baseDir,
 				path.join(state.baseDir, "worktrees", state.worktree),
 				state.worktree,
 				{ path: state.recordPath, record: state.record },
@@ -1345,7 +1392,7 @@ export async function acquireRunLease(
 				key: canonical.worktree,
 				...(paths !== undefined ? { paths: [...paths] } : {}),
 			};
-			held = await acquireWriter(worktreeDir, canonical.worktree, writeRecord, liveness);
+			held = await acquireWriter(baseDir, worktreeDir, canonical.worktree, writeRecord, liveness);
 		}
 	} catch (error) {
 		const cleanup = await releaseSession();

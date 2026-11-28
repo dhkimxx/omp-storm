@@ -1991,9 +1991,12 @@ export class RunLanes {
 		options: TaskPlacementOptions,
 	): { ok: true; notes: string[] } | { ok: false; reason: string; code: LaneBlockCode; retry: boolean } {
 		const now = options.now ?? Date.now();
-		this.#pruneWrites(options.agents, now);
-		const fenced = this.#fenceBlock();
-		if (fenced !== undefined) return { ok: false, reason: fenced, code: "lane-write", retry: false };
+		const hostKnown = this.#pruneWrites(options.agents, now);
+		if (placed.some(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown")) {
+			const fenced = this.#fenceBlock();
+			if (fenced !== undefined) return { ok: false, reason: fenced, code: "lane-write", retry: false };
+			if (!hostKnown) return { ok: false, reason: "omp가 이 세션의 백그라운드 작업 목록을 주지 않아 공유 쓰기 워커를 배치하지 않았습니다.", code: "lane-write", retry: true };
+		}
 		const scopes = placed;
 		const notes: string[] = [];
 		for (const entry of scopes) {
@@ -2052,8 +2055,8 @@ export class RunLanes {
 	 * is different: until its reactivated turn starts, the worker still looks settled, so only its start (or the pending
 	 * window) decides, never the stale idle state.
 	 */
-	#pruneWrites(agents: readonly AgentEntry[] | undefined, now: number): void {
-		this.#syncHost();
+	#pruneWrites(agents: readonly AgentEntry[] | undefined, now: number): boolean {
+		const hostKnown = this.#syncHost();
 		const byId = new Map((agents ?? []).map(agent => [agent.id, agent]));
 		for (const [lane, hold] of this.#held) {
 			const age = now - hold.at;
@@ -2069,7 +2072,7 @@ export class RunLanes {
 				this.#held.delete(lane);
 			}
 		}
-		if (this.#writes.size === 0) return;
+		if (this.#writes.size === 0) return hostKnown;
 		for (const [key, reservation] of this.#writes) {
 			// A holder that is not a worker has its own end (the call's end, the host job's end, the process group's end).
 			if (reservation.kind !== undefined) continue;
@@ -2118,6 +2121,7 @@ export class RunLanes {
 			this.#writerFreed = true;
 			this.#ended(reservation.agentId, reservation.lane, "settled");
 		}
+		return hostKnown;
 	}
 
 	/** The reactivated turn of a follow-up began: the agent's own running state is now the lane's reservation. */
@@ -2444,7 +2448,9 @@ export class RunLanes {
 		if (input.deadline !== undefined && !(input.now < input.deadline)) {
 			return { ok: false, code: "deadline", reason: DIRECTOR_WRITE_LATE };
 		}
-		this.#pruneWrites(input.agents, input.now);
+		if (!this.#pruneWrites(input.agents, input.now)) {
+			return { ok: false, code: "lane-write", reason: "omp가 이 세션의 백그라운드 작업 목록을 주지 않아 통합 적용을 시작하지 않았습니다." };
+		}
 		const fenced = this.#fenceBlock();
 		if (fenced !== undefined) return { ok: false, code: "lane-write", reason: fenced };
 		const own = `integration:${input.key}`;
@@ -2760,7 +2766,7 @@ export class RunLanes {
 				};
 			}
 		}
-		this.#pruneWrites(input.agents, now);
+		const hostKnown = this.#pruneWrites(input.agents, now);
 		const scope = writeScope(
 			lane,
 			input.role,
@@ -2768,6 +2774,11 @@ export class RunLanes {
 			input.policy,
 			input.canonicalFiles,
 		);
+		if (scope.kind === "paths" || scope.kind === "unknown") {
+			const fenced = this.#fenceBlock();
+			if (fenced !== undefined) return { ok: false, reason: fenced, code: "lane-write" };
+			if (!hostKnown) return { ok: false, reason: "omp가 이 세션의 백그라운드 작업 목록을 주지 않아 공유 쓰기 워커에게 후속 작업을 보내지 않았습니다.", code: "lane-write", retry: true };
+		}
 		if (lane !== undefined) this.#laneScopes.set(lane.name, scope);
 		// A progress note whose wake is not proven read-only (`wakeReadOnly`) is a message that may start a writer, and meets exactly
 		// what a work message meets below (a reservation, a lane hold, a slot): without that a second writer could be placed

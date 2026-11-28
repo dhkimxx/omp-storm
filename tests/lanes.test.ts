@@ -586,6 +586,28 @@ test("one integration holder is exclusive; a pending job blocks it and a fence b
 	work.releaseIntegration("s3");
 });
 
+test("a blind host job snapshot cannot authorize integration or a shared writing wake", () => {
+	let known = false;
+	const work = new RunLanes("run-blind-integration", () => known ? [] : undefined);
+	const input = { key: "s1", live: () => ({ ok: true } as const), now: 1 };
+	const writer = { agentId: "X0", agent: "storm-implementer", role: "implementer" as const, isolated: false };
+	expect(work.commitIntegration(input)).toMatchObject({ ok: false, code: "lane-write" });
+	expect(work.checkFollowUp(writer)).toMatchObject({ ok: false, code: "lane-write" });
+	known = true;
+	expect(work.commitIntegration(input)).toEqual({ ok: true });
+	work.releaseIntegration(input.key);
+	expect(work.checkFollowUp(writer).ok).toBe(true);
+});
+
+test("a target fence blocks even a note that could wake a writer, but not a private or read-only wake", () => {
+	const work = new RunLanes("run-fenced-wake");
+	work.bindIntegration({ root: "/tmp/storm-target", fence: () => ({ kind: "fenced", reason: "이전 적용" }) });
+	const writer = { agentId: "X0", agent: "storm-implementer", role: "implementer" as const, isolated: false, progress: true };
+	expect(work.checkFollowUp({ ...writer, agents: [agentEntry({ id: writer.agentId, state: "running" })] })).toMatchObject({ ok: false, code: "lane-write" });
+	expect(work.checkFollowUp({ ...writer, isolated: true }).ok).toBe(true);
+	expect(work.checkFollowUp({ agentId: "R0", agent: "storm-explorer", role: "explorer", isolated: false }).ok).toBe(true);
+});
+
 test("a shared-write batch is all-or-nothing and a settled worker frees its scope", () => {
 	const shared = plan(
 		{ name: "W0", kind: "run", role: "quick", files: ["shared.txt"] },
