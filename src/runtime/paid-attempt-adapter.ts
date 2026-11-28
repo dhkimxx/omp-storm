@@ -63,6 +63,15 @@ export interface PaidAttemptsSurface {
 	onReceipt(listener: (receipt: PaidAttemptReceiptView) => void): () => void;
 }
 
+/** Scope join read by accounting; the live Storm grant also checks the complete native tuple. */
+type PaidWorkerTurn = Readonly<Record<string, unknown>> & {
+	readonly revision: 1;
+	readonly token: string;
+	readonly ownerSessionId: string;
+	readonly actorSessionId: string;
+	readonly runId: string;
+};
+
 /** One pre-send request, narrowed to identity and sequencing fields. */
 export interface PaidAttemptRequestView {
 	readonly attemptId: string;
@@ -74,6 +83,8 @@ export interface PaidAttemptRequestView {
 	readonly attempt: number;
 	readonly startedAt: number;
 	readonly retryOf?: string;
+	readonly effort?: string;
+	readonly workerTurn?: PaidWorkerTurn;
 }
 
 /** One settled host receipt, narrowed to accounting and append proof. */
@@ -95,6 +106,7 @@ export interface PaidAttemptReceiptView {
 	readonly costTotal?: number;
 	readonly append: "flushed" | "failed" | "unavailable";
 	readonly receiptEntryId?: string;
+	readonly workerTurn?: PaidWorkerTurn;
 }
 
 /** One admitted attempt that has not settled. Its cost is unknown, not zero. */
@@ -149,7 +161,8 @@ export type PaidAttemptRefusalCode =
 	| "unresolved-receipt"
 	| "limit-exceeded"
 	| "dispatch-invalid"
-	| "dispatch-owner-mismatch";
+	| "dispatch-owner-mismatch"
+	| "dispatch-worker-unproven";
 
 export interface PaidAttemptRefusal {
 	readonly code: PaidAttemptRefusalCode;
@@ -297,6 +310,8 @@ export interface PaidAttemptBindOptions {
 	readonly spentUsd?: number;
 	/** Rechecked for every decision. Throwing is an unknown revocation state and refuses. */
 	readonly isRevoked?: () => boolean;
+	/** Positive synchronous role and reservation decision for the actual model sent by a native bound worker. */
+	readonly authorizeWorkerTurn?: (attempt: PaidAttemptRequestView, workerTurn: PaidWorkerTurn) => boolean;
 	/**
 	 * Which over-limit provider attempts may still send. Default `refuse` refuses every send once exact in-scope cost
 	 * exceeds `limitUsd`. `leader-and-exact-worker` (Storm's `block-spawns`) additionally permits the director's own
@@ -408,6 +423,24 @@ function optionalText(
 	return { ok: true, value };
 }
 
+function paidWorkerTurn(
+	value: unknown,
+	ownerSessionId: string,
+	actorSessionId: string,
+): PaidWorkerTurn | undefined {
+	if (typeof value !== "object" || value === null) return undefined;
+	const turn = value as Record<string, unknown>;
+	return turn.revision === 1 && nonEmpty(turn.token) && turn.token.length <= 128 &&
+		turn.ownerSessionId === ownerSessionId && turn.actorSessionId === actorSessionId && ownerSessionId !== actorSessionId &&
+		nonEmpty(turn.runId) && turn.runId.length <= 512 ? turn as PaidWorkerTurn : undefined;
+}
+
+function workerContinuationKey(actorSessionId: string, workerTurn: PaidWorkerTurn | undefined): string {
+	return workerTurn === undefined
+		? `legacy\0${actorSessionId}`
+		: `turn\0${workerTurn.runId}\0${actorSessionId}\0${workerTurn.token}`;
+}
+
 function parseReceipt(
 	record: Record<string, unknown>,
 	ownerSessionId: string,
@@ -443,6 +476,10 @@ function parseReceipt(
 	if (record.costTotal !== undefined && !finiteNonNegative(record.costTotal)) {
 		return { ok: false, code: "receipt-malformed", detail: `receipt ${record.attemptId} costTotal is not a finite nonnegative number` };
 	}
+	const workerTurn = paidWorkerTurn(record.workerTurn, ownerSessionId, record.actorSessionId);
+	if (record.workerTurn !== undefined && workerTurn === undefined) {
+		return { ok: false, code: "receipt-malformed", detail: `receipt ${record.attemptId} has an invalid worker turn` };
+	}
 	const entry = optionalText(record, "receiptEntryId");
 	if (!entry.ok) return { ok: false, code: "receipt-malformed", detail: `receipt ${record.attemptId}: ${entry.detail}` };
 
@@ -463,6 +500,7 @@ function parseReceipt(
 		costBasis: record.costBasis,
 		...(record.costTotal === undefined ? {} : { costTotal: record.costTotal }),
 		append: record.append,
+		...(workerTurn === undefined ? {} : { workerTurn }),
 		...(entry.value === undefined ? {} : { receiptEntryId: entry.value }),
 	};
 	const fingerprint = JSON.stringify([
@@ -481,6 +519,8 @@ function parseReceipt(
 		receipt.outcome,
 		receipt.costBasis,
 		receipt.costTotal ?? null,
+		receipt.workerTurn?.token ?? null,
+		receipt.workerTurn?.runId ?? null,
 	]);
 	return { ok: true, parsed: { receipt, fingerprint } };
 }
@@ -558,6 +598,12 @@ function parseAttempt(
 	if (!nonEmpty(record.model)) return { ok: false, code: "dispatch-invalid", detail: "attempt model is missing" };
 	if (!integerAtLeast(record.attempt, 1)) return { ok: false, code: "dispatch-invalid", detail: "attempt ordinal is not a positive integer" };
 	if (!finiteNonNegative(record.startedAt)) return { ok: false, code: "dispatch-invalid", detail: "attempt startedAt is not a finite timestamp" };
+	const workerTurn = paidWorkerTurn(record.workerTurn, ownerSessionId, record.actorSessionId);
+	if ((record.workerTurn !== undefined || record.workerTurnRequired === true) && workerTurn === undefined) {
+		return { ok: false, code: "dispatch-worker-unproven", detail: "attempt has no exact native worker-turn scope" };
+	}
+	const effort = optionalText(record, "effort");
+	if (!effort.ok) return { ok: false, code: "dispatch-invalid", detail: effort.detail };
 	const retry = optionalText(record, "retryOf");
 	if (!retry.ok) return { ok: false, code: "dispatch-invalid", detail: retry.detail };
 	if (record.attempt > 1 && retry.value === undefined) {
@@ -578,6 +624,8 @@ function parseAttempt(
 			attempt: record.attempt,
 			startedAt: record.startedAt,
 			...(retry.value === undefined ? {} : { retryOf: retry.value }),
+			...(workerTurn === undefined ? {} : { workerTurn }),
+			...(effort.value === undefined ? {} : { effort: effort.value }),
 		},
 	};
 }
@@ -630,6 +678,7 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const limitValid = rawLimit === undefined || finiteNonNegative(rawLimit);
 	const spentValid = rawSpent === undefined || finiteNonNegative(rawSpent);
 	const revokedValid = options.isRevoked === undefined || typeof options.isRevoked === "function";
+	const workerAuthorityValid = options.authorizeWorkerTurn === undefined || typeof options.authorizeWorkerTurn === "function";
 	const continuationPolicy = options.continuationPolicy ?? "refuse";
 	const continuationPolicyValid = continuationPolicy === "refuse" || continuationPolicy === "leader-and-exact-worker";
 	const excludedRaw = options.excludeAttemptIds;
@@ -641,8 +690,9 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const startCostUsd = finiteNonNegative(rawSpent) ? rawSpent : 0;
 	const limit = limitOf(finite ? "finite" : "unbounded", finite ? rawLimit : undefined);
 
-	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid || !continuationPolicyValid) {
-		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, continuationPolicy valid, and excluded attempt ids unique non-empty strings", {
+	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid ||
+		!excludedValid || !continuationPolicyValid || !workerAuthorityValid) {
+		return unavailable("invalid-options", "invalid run identity, limit, baseline, continuation or worker authority options", {
 			runId: runId || "(missing run id)",
 			expectedOwnerSessionId: expectedOwnerSessionId || "(missing owner session id)",
 			startCostUsd,
@@ -706,6 +756,7 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 		startCostUsd,
 		bindingToken,
 		isRevoked: options.isRevoked,
+		authorizeWorkerTurn: options.authorizeWorkerTurn,
 		continuationPolicy,
 		excludeAttemptIds,
 	});
@@ -854,6 +905,7 @@ interface PaidAttemptAdapterInput {
 	readonly startCostUsd: number;
 	readonly bindingToken: string;
 	readonly isRevoked: (() => boolean) | undefined;
+	readonly authorizeWorkerTurn: PaidAttemptBindOptions["authorizeWorkerTurn"];
 	readonly continuationPolicy: PaidAttemptContinuationPolicy;
 	readonly excludeAttemptIds: ReadonlySet<string>;
 }
@@ -869,9 +921,10 @@ export class PaidAttemptAdapter {
 	readonly #startCostUsd: number;
 	readonly #isRevoked: (() => boolean) | undefined;
 	readonly #continuationPolicy: PaidAttemptContinuationPolicy;
+	readonly #authorizeWorkerTurn: PaidAttemptBindOptions["authorizeWorkerTurn"];
 	readonly #excludeAttemptIds: ReadonlySet<string>;
-	/** In-scope worker actors with an admitted receipt whose observed cost is exact; their continuations are granted. */
-	#grantedActors = new Set<string>();
+	/** In-scope turns with an admitted receipt whose observed cost is exact (actor key only on legacy hosts). */
+	#grantedWorkers = new Set<string>();
 	readonly #decider: PaidAttemptDecider = (attempt, state) => this.#decide(attempt, state);
 	#baselineKnown = false;
 	#baselineSeq = 0;
@@ -914,6 +967,7 @@ export class PaidAttemptAdapter {
 		this.limitUsd = input.limitUsd;
 		this.#startCostUsd = input.startCostUsd;
 		this.#knownCostUsd = input.startCostUsd;
+		this.#authorizeWorkerTurn = input.authorizeWorkerTurn;
 		this.bindingToken = input.bindingToken;
 		this.#isRevoked = input.isRevoked;
 		this.#continuationPolicy = input.continuationPolicy;
@@ -1112,6 +1166,19 @@ export class PaidAttemptAdapter {
 			const gate = this.#refuse(parsed.code, parsed.detail);
 			return { send: false, reason: gate.reason };
 		}
+		const { workerTurn } = parsed.attempt;
+		if (workerTurn !== undefined) {
+			let authorized = false;
+			try {
+				authorized = workerTurn.runId === this.runId &&
+					this.#authorizeWorkerTurn?.(parsed.attempt, workerTurn) === true;
+			} catch {
+				// A single wrong or stale worker cannot write or poison the director's other attempts.
+			}
+			if (!authorized) {
+				return { send: false, reason: this.#refuse("dispatch-worker-unproven", "no live Storm grant for this worker route").reason };
+			}
+		}
 		const gate = this.#currentGate(parsed.attempt);
 		if (!gate.send) return { send: false, reason: gate.reason };
 		const passed = parseState(stateRaw, this.ownerSessionId);
@@ -1200,7 +1267,8 @@ export class PaidAttemptAdapter {
 		// A worker actor is granted only after an in-scope admitted receipt with observed exact cost. The receipt's own
 		// append ack is a separate durability flag (the persisted row is written before the flush ack); cost exactness is
 		// what this grant proves. A pending or unknown attempt has no grant and a never-admitted worker stays terminal.
-		return this.#grantedActors.has(attempt.actorSessionId);
+		return (attempt.workerTurn === undefined || attempt.purpose === "loop") &&
+			this.#grantedWorkers.has(workerContinuationKey(attempt.actorSessionId, attempt.workerTurn));
 	}
 
 	#revocation(): PaidAttemptGate | undefined {
@@ -1434,10 +1502,10 @@ export class PaidAttemptAdapter {
 		let knownReceipts = 0;
 		let settledReceipts = 0;
 		const classifications = new Map<string, Classification>();
-		const grantedActors = new Set<string>();
+		const grantedWorkers = new Set<string>();
 		for (const entry of entries) {
 			const receipt = entry.receipt;
-			const inScope = receipt.seq > this.#baselineSeq && !this.#excludeAttemptIds.has(receipt.attemptId);
+			const inScope = this.#receiptInScope(receipt);
 			const classification = classify(receipt);
 			classifications.set(receipt.attemptId, classification);
 			if (inScope) {
@@ -1449,7 +1517,7 @@ export class PaidAttemptAdapter {
 					model.knownUsd += classification.spendUsd;
 					model.observedReceipts++;
 					if (receipt.gate === "admitted" && receipt.sent === true && receipt.actorSessionId !== this.ownerSessionId) {
-						grantedActors.add(receipt.actorSessionId);
+						grantedWorkers.add(workerContinuationKey(receipt.actorSessionId, receipt.workerTurn));
 					}
 				}
 			}
@@ -1463,7 +1531,7 @@ export class PaidAttemptAdapter {
 			// proves `sent: false`, so its exact spend is zero; treating it as unresolved would block every later permit
 			// for the rest of the run after the first refusal.
 			if (isExactRefusal(receipt) || this.#excludeAttemptIds.has(receipt.attemptId)) continue;
-			const inScope = receipt.seq > this.#baselineSeq;
+			const inScope = this.#receiptInScope(receipt);
 			addUnresolved(receipt, ["host-unresolved"], inScope);
 		}
 
@@ -1492,7 +1560,7 @@ export class PaidAttemptAdapter {
 
 		for (const entry of entries) {
 			const receipt = entry.receipt;
-			if (receipt.seq <= this.#baselineSeq || this.#excludeAttemptIds.has(receipt.attemptId)) continue;
+			if (!this.#receiptInScope(receipt)) continue;
 			if (this.#deltaSeen.has(receipt.attemptId)) continue;
 			this.#deltaSeen.add(receipt.attemptId);
 			this.#deltaSettled++;
@@ -1511,11 +1579,16 @@ export class PaidAttemptAdapter {
 			reasons: UNRESOLVED_ORDER.filter(reason => fact.reasons.has(reason)),
 		}));
 		this.#byModel = byModel;
-		this.#grantedActors = grantedActors;
+		this.#grantedWorkers = grantedWorkers;
 		this.#knownCostUsd = knownCostUsd;
 		this.#knownReceipts = knownReceipts;
 		this.#settledReceipts = settledReceipts;
 		return faults;
+	}
+
+	#receiptInScope(receipt: PaidAttemptReceiptView): boolean {
+		return receipt.seq > this.#baselineSeq && !this.#excludeAttemptIds.has(receipt.attemptId) &&
+			(receipt.workerTurn === undefined || receipt.workerTurn.runId === this.runId);
 	}
 
 	#fault(code: PaidAttemptRefusalCode, detail: string, sticky = false): void {

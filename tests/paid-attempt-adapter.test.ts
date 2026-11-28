@@ -758,6 +758,36 @@ describe("baseline and accounting-source discipline", () => {
 		expect(fake.invoke({ actorSessionId: "worker-exact", purpose: "loop" }).send).toBe(true);
 	});
 
+	test("a settled native turn cannot continue a fresh wake, auxiliary send, or different run", () => {
+		const fake = fakeHost({ owner: "owner-native-worker" });
+		const turn = Object.freeze({
+			revision: 1 as const,
+			token: "first-token",
+			ownerSessionId: fake.api.ownerSessionId,
+			actorSessionId: "worker-native",
+			runId: "current",
+		});
+		const adapter = bind(fake, {
+			runId: turn.runId,
+			limitUsd: 0.5,
+			continuationPolicy: "leader-and-exact-worker",
+			authorizeWorkerTurn: (attempt, proof) => attempt.model === "approved-wire" && proof.token !== "revoked",
+		});
+		const request = { actorSessionId: turn.actorSessionId, model: "approved-wire", workerTurn: turn };
+		expect(fake.invoke(request).send).toBe(true);
+		expect(fake.invoke({ ...request, model: "fallback-wire" }).send).toBe(false);
+		expect(fake.invoke({ ...request, workerTurn: { ...turn, token: "revoked" } }).send).toBe(false);
+		expect(fake.invoke({ ...request, workerTurn: { ...turn, runId: "previous" } }).send).toBe(false);
+		fake.add({ actorSessionId: turn.actorSessionId, workerTurn: { ...turn, runId: "previous" }, costTotal: 4 });
+		expect(adapter.takeDelta().usd).toBe(0);
+		fake.add({ actorSessionId: turn.actorSessionId, workerTurn: turn, costTotal: 0.6 });
+		expect(fake.invoke(request).send).toBe(true);
+		expect(fake.invoke({ ...request, purpose: "judge" }).send).toBe(false);
+		expect(fake.invoke({ ...request, workerTurn: { ...turn, token: "wake-token" } }).send).toBe(false);
+		expect(fake.invoke({ actorSessionId: turn.actorSessionId }).send).toBe(false);
+		expect(adapter.takeDelta().usd).toBeCloseTo(0.6);
+	});
+
 	test("an unknown-cost worker receipt proves no grant and stays a terminal refusal", () => {
 		const fake = fakeHost({ owner: "owner-grant" });
 		bind(fake, { limitUsd: 0.5, continuationPolicy: "leader-and-exact-worker" });

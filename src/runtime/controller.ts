@@ -112,7 +112,7 @@ import {
 import { acquireRunLease, type AcquireRunLeaseResult, type RunLease } from "./lease.ts";
 import { PLANLESS_DEADLINE, PLANLESS_NO_TURN_TIME, PLANLESS_SAME_TURN, planlessOpen, stoppedInTurn } from "./planless.ts";
 import { activeLedgerRun, attachPaidAccounting, endLedgerRun, getLedgerRun, type LedgerPaidAccounting, type LedgerRun, noteRetiredPaidAttemptIds, recordPaidCost, retiredPaidAttemptIds, setLedgerPlan, spendNote, startLedgerRun, updatePaidAccounting } from "./ledger.ts";
-import { bindPaidAttemptAdapter, PAID_ATTEMPT_REFUSAL_TAG, PAID_ATTEMPT_UNKNOWN_MODEL, type PaidAttemptAdapter, type PaidAttemptBindResult, type PaidAttemptDelta, type PaidAttemptMetadata } from "./paid-attempt-adapter.ts";
+import { bindPaidAttemptAdapter, PAID_ATTEMPT_REFUSAL_TAG, PAID_ATTEMPT_UNKNOWN_MODEL, type PaidAttemptAdapter, type PaidAttemptBindOptions, type PaidAttemptBindResult, type PaidAttemptDelta, type PaidAttemptMetadata } from "./paid-attempt-adapter.ts";
 import type { AttemptUnplannedDelivery } from "./attempt-collector.ts";
 import { UNPLANNED_MAX, unplannedNotice } from "./unplanned.ts";
 import { reviewLine } from "./review.ts";
@@ -1187,6 +1187,8 @@ export interface RunControllerDeps {
 	 * have no marker.
 	 */
 	closeSpend?(runId: string, onExceed: BudgetConfig["onExceed"]): void | Promise<void>;
+	/** Live owner decision over each scoped worker's exact request, including transport's final wire route. */
+	authorizeWorkerTurn?: PaidAttemptBindOptions["authorizeWorkerTurn"];
 	/**
 	 * Isolated-integration ports (journal, exact delta, exclusive writer). Absent until the host boundary is proved:
 	 * every existing attempt/evaluation path then keeps its 0.29.0 behavior. The run's captured session owns the ports.
@@ -6051,6 +6053,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				runId,
 				ownerSessionId: sessionId,
 				spentUsd: 0,
+				...(this.deps.authorizeWorkerTurn === undefined ? {} : { authorizeWorkerTurn: this.deps.authorizeWorkerTurn }),
 				...(excludeAttemptIds.length === 0 ? {} : { excludeAttemptIds }),
 				// block-spawns lets the leader's own continuation and an exactly-granted worker continuation finish;
 				// its spawn and message gates refuse new work. Only a stop owns the provider-layer next-send refusal.
