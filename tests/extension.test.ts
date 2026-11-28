@@ -4422,7 +4422,31 @@ describe("the director reads what a delivery changed, in the place it reads the 
 			});
 			return out as ContextAnswer;
 		};
-		return { omp, child, main, worker, runId, rowOf, pushed, waited, request, pushedNotice };
+		/** The host's typed task acknowledgement for the call that placed `look`, with its exact execution proof. */
+		const acknowledged = (look: string, token: string) => omp.emit("tool_result", {
+			toolName: "task",
+			toolCallId: "call_n1",
+			isError: false,
+			input: {},
+			content: [],
+			details: {
+				async: {
+					state: "running",
+					jobId: look,
+					type: "task",
+					executions: [{
+						revision: 1,
+						jobId: look,
+						type: "task",
+						executionToken: token,
+						itemIndex: 0,
+						agentId: look,
+						ownerSessionId: project.sessionId,
+					}],
+				},
+			},
+		}, main);
+		return { omp, child, main, worker, runId, rowOf, pushed, waited, request, pushedNotice, acknowledged };
 	}
 	const textOf = (answer: ContextAnswer): string => answer.messages.at(-1)?.content.map(part => part.text).join("") ?? "";
 
@@ -4507,6 +4531,133 @@ describe("the director reads what a delivery changed, in the place it reads the 
 		expect(result?.additionalContext).toBeUndefined();
 		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
 		expect(await run.request()).toBeUndefined();
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("an exact typed ack makes the pushed delivery one bounded model-only summary", async () => {
+		const run = await lookRun([lookLane]);
+		const look = run.worker.agent.id;
+		await run.acknowledged(look, "exec-look-1");
+		const user = { role: "user", content: "go on", timestamp: 1 };
+		const delivery = {
+			role: "custom",
+			customType: "async-result",
+			content: CITED_ANSWER,
+			timestamp: 10,
+			details: {
+				jobs: [{
+					jobId: look,
+					agentId: look,
+					status: "completed",
+					execution: {
+						revision: 1,
+						jobId: look,
+						type: "task",
+						executionToken: "exec-look-1",
+						itemIndex: 0,
+						agentId: look,
+						ownerSessionId: project.sessionId,
+					},
+				}],
+			},
+		};
+		// The request itself carries the delivery: the hook observes it first, then projects the original array.
+		const answer = (await run.omp.emit("context", { messages: [user, delivery] }, run.main)) as ContextAnswer | undefined;
+		expect(answer).toBeDefined();
+		expect(answer!.messages).toHaveLength(2);
+		expect(answer!.messages[0]?.role).toBe("user");
+		expect(JSON.stringify(answer!.messages[0])).toContain("go on");
+		expect(answer!.messages.at(-1)?.role).toBe("developer");
+		const summary = textOf(answer!);
+		expect(summary).toContain("비동기 배달 요약");
+		expect(summary).toContain(`job:${look}:${look}`);
+		expect(summary).toContain("미해결 0개");
+		expect(summary).not.toContain(CITED_ANSWER);
+		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
+		// Taken once, and nothing was started because of it.
+		expect(await run.request()).toBeUndefined();
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a proof with no exact typed ack leaves the original request byte-identical", async () => {
+		const run = await lookRun([lookLane]);
+		const look = run.worker.agent.id;
+		const user = { role: "user", content: "go on", timestamp: 1 };
+		const delivery = {
+			role: "custom",
+			customType: "async-result",
+			content: CITED_ANSWER,
+			timestamp: 10,
+			details: {
+				jobs: [{
+					jobId: look,
+					agentId: look,
+					status: "completed",
+					execution: {
+						revision: 1,
+						jobId: look,
+						type: "task",
+						executionToken: "exec-unacked",
+						itemIndex: 0,
+						agentId: look,
+						ownerSessionId: project.sessionId,
+					},
+				}],
+			},
+		};
+		const before = JSON.stringify([user, delivery]);
+		// The delivery is still evaluated (its row settles), but no summary replaces it in the provider request.
+		expect(await run.omp.emit("context", { messages: [user, delivery] }, run.main)).toBeUndefined();
+		expect(JSON.stringify([user, delivery])).toBe(before);
+		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
+		await run.omp.emit("session_shutdown", {}, run.main);
+	}, 15_000);
+
+	test("a mixed message is kept byte-identical while an owned sibling collapses", async () => {
+		const run = await lookRun([lookLane]);
+		const look = run.worker.agent.id;
+		await run.acknowledged(look, "exec-look-1");
+		const execution = {
+			revision: 1,
+			jobId: look,
+			type: "task",
+			executionToken: "exec-look-1",
+			itemIndex: 0,
+			agentId: look,
+			ownerSessionId: project.sessionId,
+		};
+		const user = { role: "user", content: "go on", timestamp: 1 };
+		const owned = {
+			role: "custom",
+			customType: "async-result",
+			content: CITED_ANSWER,
+			timestamp: 10,
+			details: { jobs: [{ jobId: look, agentId: look, status: "completed", execution }] },
+		};
+		// No agentId on either row: the collector skips this test-only mixed frame, while the projection still sees the
+		// first row's exact proof and the missing proof on its sibling.
+		const mixed = {
+			role: "custom",
+			customType: "async-result",
+			content: "MIXED BODY",
+			timestamp: 11,
+			details: { jobs: [{ jobId: look, status: "completed", execution }, { jobId: "foreign-row", status: "completed" }] },
+		};
+		const mixedBefore = JSON.stringify(mixed);
+		const answer = (await run.omp.emit("context", { messages: [user, owned, mixed] }, run.main)) as ContextAnswer | undefined;
+		expect(answer).toBeDefined();
+		expect(answer!.messages).toHaveLength(3);
+		expect(answer!.messages[0]?.role).toBe("user");
+		expect(JSON.stringify(answer!.messages[0])).toContain("go on");
+		expect(answer!.messages[1]?.role).toBe("custom");
+		expect(JSON.stringify(answer!.messages[1])).toBe(mixedBefore);
+		expect(JSON.stringify(mixed)).toBe(mixedBefore);
+		const summary = textOf(answer!);
+		expect(summary).toContain("원문을 그대로 둔 배달 1건");
+		expect(summary).toContain(`job:${look}:${look}`);
+		expect(summary).not.toContain("MIXED BODY");
+		expect(summary).not.toContain(CITED_ANSWER);
+		expect((await run.rowOf("accepted"))?.state).toBe("accepted");
 		await run.omp.emit("session_shutdown", {}, run.main);
 	}, 15_000);
 

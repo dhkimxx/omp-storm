@@ -112,6 +112,9 @@ INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP=write ./node_modules/.bin/bun scr
 
 # 격리·쓰기 경계가 있는 비공개 테스트 바이너리에서 실제 동시 실행과 기본 풀 정지 확인
 OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
+
+# 실제 후보 100개 조회 및 한 번의 선택, 최대 16개씩 격리 실행
+OMP_BIN=/path/to/private/omp INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP="judgment: candidate volume" ./node_modules/.bin/bun scripts/e2e/integration.ts
 ```
 
 `integration-pin.ts`는 고정 커밋·패키지·락·호스트 19.2.1·OS/Git·프로필을 확인한다. 호스트 소스 검토는
@@ -139,4 +142,6 @@ OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bu
 사용자의 기존 변경·인덱스를 보존하는 설치, 삭제 거부, 설치 영수증에 따른 수용과 `need: integrated`를 실제 세션에서 확인했다.
 `task.workerThreads: 0` 통제에서는 4·8·16개 작업자의 모델 요청과 셸이 각각 실제로 겹쳤다.
 각 시나리오에서 작업자 수만큼 물리 체크아웃·봉인·사본이 확인됐고, 선택하지 않은 부모 트리는 그대로였다.
+소스가 바뀌지 않는 스냅샷으로 실제 후보 100개를 5페이지에서 읽고 한 번 선택했다. 정확한 사본·순서대로 쓴
+영수증·수용 각 100개와 부모의 HEAD·인덱스·무관한 WIP 보존을 확인했다.
 이 검증은 배포본의 호스트 경계를 바꾸지 않으며, 기본 작업자 풀에서의 100개 동시 실행을 증명하지 않는다.

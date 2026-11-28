@@ -123,9 +123,11 @@ import { checkpointWorkState, workingState } from "./runtime/checkpoint.ts";
 import { CHECKOUT_PLACEMENT_SHORT, laneContract } from "./runtime/contract-text.ts";
 import { parseAdjustCommand, parseAdjustment } from "./runtime/adjust.ts";
 import { AttemptCollector, type AttemptHostJob } from "./runtime/attempt-collector.ts";
+import { DirectorDeliveryIndex, withHostExecutionProofs } from "./runtime/director-delivery.ts";
+import { projectDirectorContext, type DirectorContextProjection } from "./runtime/director-context.ts";
 import { lastRunEndAt, noteRunNotice, noteRunRan, noteRunSpawn, noteRunStopped, noteRunUserWait, RunController, runSpawns, touchRun } from "./runtime/controller.ts";
 import { RefusedCalls, refusedTaskInput, refusedTaskResult } from "./runtime/task-refusal.ts";
-import { batchWriteNeed, broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, spawnKeyMismatchReason, type LaneReadinessView, type ReservationEnd, type TaskIsolationHost } from "./runtime/lanes.ts";
+import { batchWriteNeed, broadcastBlock, noteLaneAgentEnd, noteLaneAgentStart, onLaneReservationEnd, replanConflict, spawnKeyMismatchReason, type LaneReadinessView, type ReservationEnd, type RunLanes, type TaskIsolationHost } from "./runtime/lanes.ts";
 import { hostJobRows } from "./runtime/host-jobs.ts";
 import { bindLedgerChild, anyLedgerRun, getLedgerRun, ledgerRunForChild, ledgerRunForLineage, ledgerRunForTree, paidNativeAccounting, recordCost, type LedgerRun } from "./runtime/ledger.ts";
 import { mayMakeSideCalls, settleSideSpend } from "./runtime/side-spend.ts";
@@ -139,7 +141,7 @@ import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from 
 import { markTrialStop, noteTrialSpawn, trialCharge } from "./runtime/trials.ts";
 import { PLANLESS_DEADLINE, planlessOpen } from "./runtime/planless.ts";
 import { findResumeCandidate, resumeSpec, trustedResume } from "./runtime/resume.ts";
-import { isRunId, readRun } from "./runtime/run.ts";
+import { isRunId, readRun, runRecordRef } from "./runtime/run.ts";
 import { TREE_READ_TIMEOUT_MS, treeAgainst, type TreeReading } from "./runtime/tree.ts";
 import { timingsOf, type TimingOverrides } from "./runtime/timings.ts";
 import { newerInstalledVersion } from "./runtime/version.ts";
@@ -2784,6 +2786,78 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		return observing;
 	};
 
+	/**
+	 * Native execution proofs for the director's provider projection. One instance per extension load; only the main
+	 * conversation uses it, and every conversation boundary clears it. A different run starts empty.
+	 */
+	const directorDeliveries = new DirectorDeliveryIndex();
+	/** The exact identities a proof may name for this request: the native conversation and the director agent. */
+	const deliveryOwners = (ctx: ExtensionContext): string[] => {
+		const native = mainSessionId(ctx);
+		return native === undefined || native === ctx.agent.id ? [ctx.agent.id] : [native, ctx.agent.id];
+	};
+	/**
+	 * The exact scope an ack/wait/projection event must still share: this run, its captured native session, the same
+	 * director agent and the run's placement table. A switch or a finished run makes all of them fail together.
+	 */
+	const exactDeliveryScope = (runId: string, nativeSessionId: string | undefined, ctx: ExtensionContext): RunLanes | undefined => {
+		if (nativeSessionId === undefined || ctx.agent.kind !== "main" || runs.runId() !== runId) return undefined;
+		const ledger = getLedgerRun(runId);
+		if (ledger === undefined || ledger.sessionId !== nativeSessionId || ledger.directorId !== ctx.agent.id) return undefined;
+		const lanes = runs.runLanes();
+		return lanes !== undefined && lanes.runId === runId ? lanes : undefined;
+	};
+	/**
+	 * Project the director's provider messages only when every native fact is exact: the live run, its captured
+	 * conversation, the placement table, an observed execution-token owner and a persisted result row. The original
+	 * provider array is never touched; a kept proxy is replaced by its original message before returning.
+	 */
+	const projectDirectorMessages = <Message,>(ctx: ExtensionContext, runId: string, messages: Message[]): Message[] | undefined => {
+		const native = mainSessionId(ctx);
+		const lanes = exactDeliveryScope(runId, native, ctx);
+		const ownerSessionId = directorDeliveries.owner();
+		if (lanes === undefined || ownerSessionId === undefined) return undefined;
+		if (ownerSessionId !== native && ownerSessionId !== ctx.agent.id) return undefined;
+		const evidence = runs.directorDeliveryEvidence();
+		if (evidence === undefined) return undefined;
+		const prepared = withHostExecutionProofs(messages);
+		const request = {
+			runId,
+			ownerSessionId,
+			placement: (agentId: string) => lanes.deliveryPlacement(agentId),
+			attempts: evidence.results.flatMap(row =>
+				typeof row.attemptId === "string"
+					? [{
+							attemptId: row.attemptId,
+							state: row.state,
+							...(row.lane === undefined ? {} : { lane: row.lane }),
+							...(row.scope === undefined ? {} : { scope: row.scope }),
+						}]
+					: [],
+			),
+			unplanned: evidence.unplanned.map(record => ({
+				id: record.id,
+				agent: record.agent,
+				...(record.lane === undefined ? {} : { lane: record.lane }),
+				...(record.status === undefined ? {} : { status: record.status }),
+			})),
+		};
+		const inspectAll = runRecordRef(runId);
+		let projection: DirectorContextProjection<Message>;
+		try {
+			projection = projectDirectorContext({
+				ownerSessionId,
+				messages: prepared.messages,
+				confirmExecution: proof => directorDeliveries.confirm(proof, request),
+				...(inspectAll === undefined ? {} : { inspectAll }),
+			});
+		} catch {
+			return undefined;
+		}
+		if (!projection.changed) return undefined;
+		return projection.messages.map(message => prepared.originals.get(message) ?? message);
+	};
+
 	// The end of the director's turn is what releases its path edits (decision D2). Positive events only: no timer, never the end
 	// of one call (a formatter writes an earlier call's file during a later call of the same message), never `agent_end` (it
 	// carries the whole history and can arrive twice), never a prune or the run's end.
@@ -4533,6 +4607,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			}
 		}
 		const runId = ctx.agent.kind === "main" ? runs.runId() : undefined;
+		// The exact native conversation and proof identities this call belongs to, captured before any await.
+		const deliveryNativeId = runId === undefined ? undefined : mainSessionId(ctx);
+		const deliveryOwnersNow = runId === undefined ? [] : deliveryOwners(ctx);
 		// A follow-up that carried a result contract was delivered: its worker has now been sent it.
 		if (runId !== undefined && typeof event.toolCallId === "string") {
 			const pendingKey = `${runId}\0${event.toolCallId}`;
@@ -4547,6 +4624,25 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (noteKey !== undefined) startNotes.delete(noteKey);
 		const result = await onToolResult(event, ctx);
 		if (ctx.agent.kind !== "main") return result;
+		// The typed acknowledgement and terminal wait row are the only carriers that can later confirm a push for this
+		// exact run. Indexed after the collector saw the call, so neither observation can change what it settles.
+		if (runId !== undefined && typeof event.toolCallId === "string" && (event.toolName === "task" || event.toolName === "wait")) {
+			const lanes = exactDeliveryScope(runId, deliveryNativeId, ctx);
+			if (lanes !== undefined) {
+				const placement = (agentId: string) => lanes.deliveryPlacement(agentId);
+				if (event.toolName === "task") {
+					directorDeliveries.observeTaskAck({
+						runId,
+						owners: deliveryOwnersNow,
+						toolCallId: event.toolCallId,
+						details: event.details,
+						placement,
+					});
+				} else {
+					directorDeliveries.observeWait({ runId, owners: deliveryOwnersNow, details: event.details, placement });
+				}
+			}
+		}
 		const parts: string[] = [];
 		if (started !== undefined && !event.isError) parts.push(...started);
 		if (event.isError && runId !== undefined) {
@@ -4569,7 +4665,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// request must neither read nor take the director's notice.
 		if (ctx.agent.kind !== "main") return undefined;
 		const runId = runs.runId();
-		if (runId === undefined && captureOwner(ctx) === undefined) return undefined;
+		if (runId === undefined) {
+			directorDeliveries.reset();
+			if (captureOwner(ctx) === undefined) return undefined;
+		} else directorDeliveries.beginRun(runId);
 		// The deliveries this request carries: the `async-result` messages after the director's last turn.
 		const arrived: Promise<void>[] = [];
 		for (let at = event.messages.length - 1; at >= 0; at--) {
@@ -4592,8 +4691,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		}
 		await adoptChildStops(ctx, runId);
 		const notice = await runs.noticesForDirector();
-		if (notice === undefined) return undefined;
-		return { messages: [...event.messages, { role: "developer", content: [{ type: "text", text: notice }], attribution: "agent", timestamp: Date.now() }] };
+		const noticeMessage = notice === undefined
+			? undefined
+			: { role: "developer" as const, content: [{ type: "text" as const, text: notice }], attribution: "agent" as const, timestamp: Date.now() };
+		// The projection runs on the original request, after every delivery was observed and evaluated. A message it
+		// cannot confirm stays the exact source object; only a confirmed delivery is replaced by the bounded summary.
+		const projected = projectDirectorMessages(ctx, runId, event.messages);
+		if (projected === undefined) return noticeMessage === undefined ? undefined : { messages: [...event.messages, noticeMessage] };
+		return { messages: noticeMessage === undefined ? projected : [...projected, noticeMessage] };
 	});
 
 	pi.on("agent_start", (_event, ctx) => {
@@ -4709,6 +4814,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		}
 		stateCache.clear();
 		attempts.stop();
+		directorDeliveries.reset();
 		followDispatches.clear();
 		followWakeCalls.clear();
 		startNotes.clear();

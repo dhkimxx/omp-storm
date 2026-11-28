@@ -1293,6 +1293,21 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		return { ok: true, runId };
 	}
 
+	/**
+	 * Exact persisted delivery facts for the director's provider projection: the live run's result rows and recorded
+	 * deliveries that answer no declared result, by reference. No agents, spend, tree or I/O; the caller must not
+	 * mutate them, and the projection's synchronous confirmation runs before anything can.
+	 */
+	directorDeliveryEvidence(): {
+		readonly results: readonly RunResult[];
+		readonly unplanned: readonly UnplannedDelivery[];
+	} | undefined {
+		const own = this.#own;
+		return own === undefined
+			? undefined
+			: { results: own.record.results ?? [], unplanned: own.record.unplanned ?? [] };
+	}
+
 	/** This session's run with live spend from the ledger. */
 	active(): RunRecord | undefined {
 		const own = this.#own;

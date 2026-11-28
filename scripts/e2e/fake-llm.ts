@@ -162,6 +162,8 @@ export type Step = (
 ) & {
 	after?: string;
 	afterResult?: string;
+	/** This run has one pushed result at this step; a real provider-only delivery summary also unblocks it. */
+	afterProjectedDelivery?: boolean;
 	/** Task steps: wait for Storm's scoped answer-review template for this result id and forward it verbatim. */
 	reviewFor?: string;
 	/** After a host receipt, park an unmet `after` reply until the PTY driver signals release. */
@@ -738,7 +740,10 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 	const wanted = step.afterResult?.includes("@") === true
 		? step.afterResult.replace(/@([A-Za-z0-9_.-]+)/g, (whole, name: string) => spawnedIds.get(name) ?? whole)
 		: step.afterResult;
-	if (wanted !== undefined && !seen(wanted, role => role === "user")) return { kind: "text", text: "waiting" };
+	if (wanted !== undefined && !seen(wanted, role => role === "user") &&
+		!(step.afterProjectedDelivery === true && seen("[storm] 비동기 배달 요약(모델 전용):", role => role === "developer" || role === "user"))) {
+		return { kind: "text", text: "waiting" };
+	}
 	if (step.after !== undefined && !seen(step.after, role => role !== "assistant")) {
 		const gate = step.releaseFile;
 		return gate !== undefined && seen(gate.receipt, role => role === "user" || role === "tool")

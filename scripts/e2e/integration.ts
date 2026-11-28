@@ -342,7 +342,7 @@ async function carrierWaitPush(): Promise<void> {
 		const pushLane = "carrier-push";
 		const pushRun = await plannedRun(rpc, files, [laneFor(pushLane, pushFile, "carrier-push-change")], [
 			{ tasks: [{ name: pushLane, agent: "storm-implementer", task: "Write one file", say: childWrite(pushFile, "PUSH-DONE") }] },
-			{ read: FACT_FILE, afterResult: "PUSH-DONE" },
+			{ read: FACT_FILE, afterResult: "PUSH-DONE", afterProjectedDelivery: true },
 			{ wait: true },
 			{ storm: { action: "candidates" } },
 		], { implementer: 1 });
@@ -370,7 +370,7 @@ async function carrierMixedBatch(): Promise<void> {
 				],
 			},
 			{ wait: true },
-			{ read: FACT_FILE, afterResult: "LATE-DONE" },
+			{ read: FACT_FILE, afterResult: "LATE-DONE", afterProjectedDelivery: true },
 			{ storm: { action: "candidates" } },
 		], { implementer: 2 });
 		const view = stormTexts(run.frames).join("\n");

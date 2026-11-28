@@ -1717,6 +1717,7 @@ export class RunLanes {
 				this.#assigned.set(handle, {
 					agent: entry.agent,
 					placement,
+					itemIndex: index,
 					scope: entry.scope,
 					toolsCarried: entry.toolsCarried,
 					...call,
@@ -1731,6 +1732,7 @@ export class RunLanes {
 					lane: entry.lane.name,
 					agent: entry.agent,
 					placement,
+					itemIndex: index,
 					scope: entry.scope,
 					toolsCarried: entry.toolsCarried,
 					...call,
@@ -2270,6 +2272,29 @@ export class RunLanes {
 	 */
 	placementAgent(spawnKey: string): string | undefined {
 		return this.#assigned.get(spawnKey)?.agent;
+	}
+
+	/**
+	 * The exact placement that gave the host this spawn handle: the call that made it, the item's original position
+	 * in that call and the lane it was placed on. A pending placement is exact for an acknowledgement that can arrive
+	 * before the spawn event; `admitted` says whether this run's spawn hook has since correlated the handle. Never a
+	 * lane-name, suffix or role guess: an unknown handle has no placement.
+	 */
+	deliveryPlacement(spawnKey: string): {
+		readonly admitted: boolean;
+		readonly callId?: string;
+		readonly itemIndex?: number;
+		readonly lane?: string;
+	} | undefined {
+		const admitted = this.#admitted.get(spawnKey);
+		const assignment = admitted ?? this.#assigned.get(spawnKey);
+		if (assignment === undefined) return undefined;
+		return {
+			admitted: admitted !== undefined,
+			...(assignment.callId === undefined ? {} : { callId: assignment.callId }),
+			...(assignment.itemIndex === undefined ? {} : { itemIndex: assignment.itemIndex }),
+			...(assignment.lane === undefined ? {} : { lane: assignment.lane }),
+		};
 	}
 
 	/**
