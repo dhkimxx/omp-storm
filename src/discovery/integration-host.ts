@@ -1,7 +1,10 @@
-import { isAbsolute } from "node:path";
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { sha256Hex } from "../config/canonical.ts";
 import { isRecord } from "../config/schema.ts";
 import type { ApplyPolicyProofRef, DirectorIdentity, IntegrationRead, NativeTaskItem } from "../runtime/integration-admission.ts";
 import { INTEGRATION_GUARD_BUILD, ISOLATION_BACKEND_UNPROVEN, ISOLATION_SCOPE_UNKNOWN, type DirectorIsolationObservation } from "./settings.ts";
+import type { ApprovalRecord } from "../types.ts";
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
@@ -65,6 +68,32 @@ export function guardedDispatch(event: unknown): IntegrationRead<NativeDispatch>
 			...(definition.sourceDigest === undefined ? {} : { sourceDigest: definition.sourceDigest }),
 		},
 	} };
+}
+
+/** Tie host-parsed bytes to the selected approved definition; rediscovery cannot prove what the host already loaded. */
+export async function approvedIntegrationDefinition(input: {
+	readonly dispatch: NativeDispatch;
+	readonly agent: string;
+	readonly pluginAgentsDir: string;
+	readonly approval: ApprovalRecord;
+}): Promise<boolean> {
+	const { definition } = input.dispatch;
+	const approvedShadows = input.approval.scope.shadowedAgents;
+	if (definition.source === "bundled") {
+		return definition.path === undefined && definition.sourceDigest === undefined &&
+			!approvedShadows.some(shadow => shadow.agent === input.agent);
+	}
+	if (definition.path === undefined || definition.sourceDigest === undefined) return false;
+	if (approvedShadows.some(shadow => shadow.agent === input.agent && shadow.path === definition.path &&
+		shadow.scope === definition.source && `sha256:${shadow.sha256}` === definition.sourceDigest)) return true;
+	if (!/^storm-[a-z0-9-]+$/u.test(input.agent)) return false;
+	try {
+		const pluginFile = join(await realpath(input.pluginAgentsDir), `${input.agent}.md`);
+		return await realpath(definition.path) === pluginFile &&
+			`sha256:${sha256Hex(await readFile(pluginFile))}` === definition.sourceDigest;
+	} catch {
+		return false;
+	}
 }
 /** Exact captured native policy must match the owner and the still-current placement observation. */
 export function bindGuardedIsolation(input: {

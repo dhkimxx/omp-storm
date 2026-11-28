@@ -244,6 +244,8 @@ export interface AttemptSpawnInput {
 	lane: PlanLane;
 	artifactMode: AttemptArtifactMode;
 	startedAt: number;
+	/** The managed host's exact first-execution dispatch and its carrying native task call. */
+	native?: { readonly dispatch: string; readonly toolCallId: string };
 }
 
 export interface AttemptFollowUpInput {
@@ -901,10 +903,10 @@ export class AttemptCollector {
 		const lane = input.lane.results !== undefined && input.lane.results.length > 0 ? input.lane : undefined;
 		if (lane === undefined) return { ok: true };
 		this.start();
-		const dispatch = this.#dispatch(input.spawnKey, input.startedAt);
+		const dispatch = input.native?.dispatch ?? this.#dispatch(input.spawnKey, input.startedAt);
 		const open = (this.#openCalls.get(input.parentId) ?? []).filter(call => call.runId === input.runId);
 		const named = open.filter(call => call.names.includes(input.spawnKey));
-		let toolCallId = named.length === 1 ? named[0]?.toolCallId : open.length === 1 ? open[0]?.toolCallId : undefined;
+		let toolCallId = input.native?.toolCallId ?? (named.length === 1 ? named[0]?.toolCallId : open.length === 1 ? open[0]?.toolCallId : undefined);
 		let acknowledgedJobId: string | undefined;
 		// The async spawn acknowledgment may already have named this child before the host emitted its spawn event.
 		const ackKey = `${input.runId}\0${input.parentId}\0${input.spawnKey}`;
@@ -942,6 +944,15 @@ export class AttemptCollector {
 		if (previous !== undefined) this.#clearPending(previous);
 		this.#tracked.set(input.spawnKey, tracked);
 		return { ok: true };
+	}
+
+	/** A managed spawn refused before native dispatch owns only this first-execution baseline. */
+	async abandonSpawn(input: { runId: string; spawnKey: string; dispatch: string }): Promise<void> {
+		const tracked = this.#tracked.get(input.spawnKey);
+		if (tracked === undefined || tracked.runId !== input.runId || tracked.dispatch !== input.dispatch || tracked.followUp || tracked.settled) return;
+		this.#clearPending(tracked);
+		this.#tracked.delete(input.spawnKey);
+		await this.#deps.port.discard?.({ runId: input.runId, dispatch: input.dispatch });
 	}
 
 	/**

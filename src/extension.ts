@@ -7,10 +7,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { stat } from "node:fs/promises";
-import { resolve as resolvePath, sep } from "node:path";
+import { mkdir, stat } from "node:fs/promises";
+import { isAbsolute, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentRegistry, type ExtensionAPI, type ExtensionContext, type SessionModeState, type ToolCallEvent, type ToolCallEventResult, type ToolResultEvent, type ToolResultEventResult } from "@oh-my-pi/pi-coding-agent";
+import { getActiveProfile } from "@oh-my-pi/pi-utils";
+import { canonicalJson, sha256Hex } from "./config/canonical.ts";
 import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
 import { isRecord } from "./config/schema.ts";
@@ -21,14 +23,13 @@ import {
 	type DirectorIsolationObservation,
 	directorIdentityFor,
 	INTEGRATION_GUARD_BUILD,
-	integrationApplyPolicy,
 	liveIsolationSettings,
 	liveTaskMaxConcurrency,
 	liveToolCallTimeoutMs,
 	observeDirectorIsolation,
 	readExplicitSettings,
 } from "./discovery/settings.ts";
-import { supportsGuardedIsolation } from "./discovery/integration-host.ts";
+import { approvedIntegrationDefinition, bindGuardedIsolation, guardedDispatch, supportsGuardedIsolation } from "./discovery/integration-host.ts";
 import {
 	agentsFlow,
 	approveAndSave,
@@ -193,14 +194,14 @@ import {
 	type WorkerStopReading,
 } from "./worker-admission.ts";
 
-import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationRead, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
+import type { AdmissionKey, FrozenIntegrationAdmission, FrozenScope, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationTarget, NativeSlotLease, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
 import type { ByteWindow, IntegrationDeltaPort } from "./runtime/integration-delta.ts";
 import type { CandidateQuery, IntegrationAttemptPort, IntegrationControllerPort, IntegrationSelectionReply, IntegrationViewPort } from "./runtime/integration-controller-port.ts";
 import type { IntegrationCapturePort } from "./runtime/integration-capture.ts";
-import { IntegrationAdmissionStore } from "./runtime/integration-artifacts.ts";
-import { GitDelta } from "./runtime/integration-git.ts";
+import { IntegrationAdmissionStore, integrationCandidateId } from "./runtime/integration-artifacts.ts";
+import { GitDelta, spawnGit } from "./runtime/integration-git.ts";
+import { canonicalWorktree } from "./runtime/lease.ts";
 import { IsolationCapture } from "./runtime/isolation-capture.ts";
-import type { SyncResultFact } from "./runtime/attempt-report.ts";
 import { IntegrationJournal, IntegrationWriter, type IntegrationJournalPort, type IntegrationWriterPort } from "./runtime/integration-record.ts";
 import { formatIntegrationCandidates, formatIntegrationSelection } from "./runtime/views.ts";
 import { INTEGRATION_CANDIDATE_ID_RE, INTEGRATION_RUN_ID_RE, integrationIdListProblem } from "./tool/host.ts";
@@ -219,10 +220,6 @@ export interface IntegrationRuntimePorts {
 	readonly writer: IntegrationWriterPort;
 	readonly attempt: IntegrationAttemptPort;
 	readonly view: IntegrationViewPort;
-	/** E's fail-closed port unless a host seam proves the later backend read. */
-	readonly policy?: ApplyPolicyPort;
-	/** The loaded child guard's build tag; defaults to this build's tag. */
-	readonly guardBuild?: string;
 }
 
 // Child modules loaded separately on the same host thread join their director's capture by the attested store.
@@ -247,6 +244,24 @@ async function spaceIdentityOf(path: string): Promise<SpaceIdentity | undefined>
 	} catch {
 		return undefined;
 	}
+}
+
+/** The authorized root is a Git worktree top level; resolve all admin identities without inherited Git overrides. */
+async function integrationTarget(root: string): Promise<IntegrationTarget | undefined> {
+	const worktree = await canonicalWorktree(root);
+	if (worktree === undefined) return undefined;
+	const result = await spawnGit(["rev-parse", "--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", "--git-path", "objects", "--show-object-format"], {
+		cwd: worktree.root, timeoutMs: 2_000,
+	});
+	if (result.code !== 0) return undefined;
+	const rows = new TextDecoder().decode(result.stdout).trimEnd().split("\n");
+	const [top, admin, common, objects, objectFormat] = rows;
+	if (rows.length !== 5 || top === undefined || admin === undefined || common === undefined || objects === undefined ||
+		![top, admin, common, objects].every(isAbsolute) || (objectFormat !== "sha1" && objectFormat !== "sha256")) return undefined;
+	const [gitRoot, gitDir, commonDir, objectDir] = await Promise.all([top, admin, common, objects].map(spaceIdentityOf));
+	if (gitRoot === undefined || gitDir === undefined || commonDir === undefined || objectDir === undefined ||
+		gitRoot.canonicalPath !== worktree.root || gitRoot.device !== worktree.device || gitRoot.inode !== worktree.inode) return undefined;
+	return { leaseKey: worktree.key, authorizedRoot: gitRoot, gitRoot, gitDir, sourceOdb: { commonDir, objects: objectDir, objectFormat }, targetPrefix: "" };
 }
 
 
@@ -1245,68 +1260,66 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 * prepared admission, bind its actual `ctx.cwd` and Git admin through A, and let B verify any integrated input
 	 * bytes. Missing proof stops the child; a claim is recorded once per attempt and handed to A's capture.
 	 */
-	const integrationClaimed = new Set<string>();
-	const integrationChildEntry = async (ctx: ExtensionContext, ledger: LedgerRun): Promise<void> => {
-		const ports = boundIntegrationRuntime(ledger.sessionDir);
-		if (ports === undefined) return;
-		const read = await readWorkerAdmission({
-			agentDir: workerAdmissionAgentDir(),
-			artifactRoot: artifactsOf(ctx),
-			parentId: ctx.agent.parentId,
-			childId: ctx.agent.id,
-		});
-		if (read.kind !== "record" || read.record.runId !== ledger.runId || read.record.policy.kind !== "private") return;
-		const claimKey = `${ledger.runId}\0${ctx.agent.id}\0${read.record.attempt}`;
-		if (integrationClaimed.has(claimKey)) return;
-		const refuse = (problem: { readonly reason: string }): void => {
-			stopChild(ctx, ledger, authorityKey(artifactsOf(ctx), ctx.agent.id), `[storm:integration] ${problem.reason}`, undefined, read.record.attempt);
-		};
-		const prepared: IntegrationRead<FrozenIntegrationAdmission> = await ports.admission.readPrepared({
-			key: read.key,
-			attempt: read.record.attempt,
-		});
-		if (prepared.kind === "unknown") return refuse(prepared.problem);
-		const ref = AgentRegistry.global().get(ctx.agent.id);
-		const sessionFile = sessionFileOf(ctx);
-		const fileIdentity = sessionFile === undefined ? undefined : await spaceIdentityOf(sessionFile);
-		const registryInstance = ref?.session?.instanceKey;
-		if (ref === undefined || registryInstance === undefined || fileIdentity === undefined || ref.sessionFile !== sessionFile ||
-			ref.parentId !== prepared.value.director.parentId || ref.parentSessionKey !== prepared.value.director.sessionInstance) {
-			return refuse({ reason: "자식 세션의 레지스트리 세대와 세션 파일 신원을 확인하지 못해 격리 진입을 허용하지 않았습니다." });
+	const integrationChildEntry = async (event: unknown, ctx: ExtensionContext): Promise<{ block: true; reason: string } | { dispatchId: string; guard: string }> => {
+		const refuse = (reason: string) => ({ block: true as const, reason: `[storm:integration] ${reason}` });
+		const dispatch = guardedDispatch(event);
+		if (dispatch.kind === "unknown") return refuse(dispatch.problem.reason);
+		if (!isRecord(event) || event.guard !== INTEGRATION_GUARD_BUILD || !isRecord(event.parent) || !isRecord(event.agent) ||
+			!isRecord(event.checkout) || !isRecord(event.sessionFileIdentity) || ctx.agent.kind !== "sub") {
+			return refuse("호스트의 정확한 자식 진입 신원을 확인하지 못했습니다.");
 		}
-		const entry: ObservationIdentity = {
-			registryInstance,
-			generation: ref.generation,
-			childSessionFile: fileIdentity,
-		};
+		const ledger = childLedger(ctx);
+		const ports = boundIntegrationRuntime(ledger?.sessionDir);
+		if (ledger === undefined || ports === undefined) return refuse("격리 디스패치의 감독 실행과 가드를 결속하지 못했습니다.");
+		const read = await readWorkerAdmission({
+			agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id,
+		});
+		if (read.kind !== "record" || read.record.runId !== ledger.runId || read.record.policy.kind !== "private") {
+			return refuse("이 자식의 격리 권한 기록을 찾을 수 없습니다.");
+		}
+		const prepared = await ports.admission.readPrepared({ key: read.key, attempt: read.record.attempt });
+		if (prepared.kind === "unknown") return refuse(prepared.problem.reason);
+		const admission = prepared.value;
+		const sessionFile = sessionFileOf(ctx);
+		if (sessionFile === undefined || sessionFile !== event.sessionFile || event.checkout.isolated !== true || event.checkout.cwd !== ctx.cwd) {
+			return refuse("자식 세션 파일이나 실제 격리 작업 경로가 호스트 진입 신원과 다릅니다.");
+		}
+		const [fileIdentity, checkout] = await Promise.all([spaceIdentityOf(sessionFile), spaceIdentityOf(ctx.cwd)]);
+		const ref = AgentRegistry.global().get(ctx.agent.id);
+		const registryInstance = ref?.session?.instanceKey;
+		if (ref?.kind !== "sub" || registryInstance === undefined || fileIdentity === undefined || checkout === undefined ||
+			ref.sessionFile !== sessionFile || ref.parentId !== admission.director.parentId || ref.parentSessionKey !== admission.director.sessionInstance ||
+			event.parent.agentId !== ref.parentId || event.parent.sessionKey !== ref.parentSessionKey ||
+			event.agent.id !== ctx.agent.id || event.agent.sessionKey !== registryInstance || event.agent.generation !== ref.generation ||
+			event.sessionFileIdentity.device !== fileIdentity.device || event.sessionFileIdentity.inode !== fileIdentity.inode ||
+			event.checkout.device !== checkout.device || event.checkout.inode !== checkout.inode ||
+			dispatch.value.token !== admission.policy.backendProofId || dispatch.value.backend !== admission.policy.backendSetting ||
+			dispatch.value.definition.digest !== admission.approvedDefinitionDigest || admission.item.handle !== ctx.agent.id) {
+			return refuse("격리 디스패치, 정의, 레지스트리 세대 또는 물리 체크아웃이 감독이 승인한 기록과 다릅니다.");
+		}
+		const entry: ObservationIdentity = { registryInstance, generation: ref.generation, childSessionFile: fileIdentity };
 		const claim = await ports.admission.claimAtEntry({
-			admission: prepared.value,
-			worker: read.record,
-			entry,
-			childCwd: ctx.cwd,
-			guardBuild: ports.guardBuild ?? INTEGRATION_GUARD_BUILD,
+			admission, worker: read.record, entry, childCwd: ctx.cwd, guardBuild: INTEGRATION_GUARD_BUILD,
 			live: () => {
 				const current = getLedgerRun(ledger.runId);
-				if (current === undefined || current.closing) return { ok: false, reason: "실행이 끝났거나 닫혀 격리 진입을 허용하지 않았습니다." };
-				const spend = spendFromLedger(ledger.runId);
-				if (spend === undefined) return { ok: false, reason: `${SPEND_UNKNOWN_TAG} ${SPEND_UNKNOWN_REASON}` };
-				if (spend.kind !== "open") return { ok: false, reason: `${SPEND_TAG} ${SPEND_SEND_REASON}` };
-				return { ok: true };
+				if (current !== ledger || current.closing) return { ok: false, reason: "실행이 끝났거나 닫혀 격리 진입을 허용하지 않았습니다." };
+				const spend = spendSendBlock(ledger.runId);
+				return spend === undefined ? { ok: true } : { ok: false, reason: spend };
 			},
 			verifyInputs: (claim, inputs) => ports.delta.verifyCheckoutInputs(claim, inputs, integrationWindow(undefined)),
 		});
-		if (claim.kind === "unknown") return refuse(claim.problem);
-		integrationClaimed.add(claimKey);
-		if (integrationClaimed.size > 256) {
-			const oldest = integrationClaimed.values().next().value;
-			if (oldest !== undefined) integrationClaimed.delete(oldest);
+		if (claim.kind === "unknown") return refuse(claim.problem.reason);
+		if (claim.value.checkout.device !== checkout.device || claim.value.checkout.inode !== checkout.inode) {
+			return refuse("권한 기록을 쓰는 사이 실제 자식 체크아웃이 바뀌었습니다.");
 		}
-		try {
-			ports.capture.observeClaim(entry, claim.value);
-		} catch {
-			// The claim is already durable in A; a failed observation is not a successful capture.
-		}
+		ports.capture.observeClaim(entry, claim.value);
+		return { dispatchId: dispatch.value.token, guard: INTEGRATION_GUARD_BUILD };
 	};
+	if (integrationCapable) {
+		// The npm 19.2.1 declaration predates the guarded event; the native capability proves the compatible overload.
+		const onEntry = pi.on as unknown as (name: "subagent_entry", handler: typeof integrationChildEntry) => void;
+		onEntry.call(pi, "subagent_entry", integrationChildEntry);
+	}
 
 	/** The child's own settled turn/switch closes its current attempt; a follow-up admission opens the next one. */
 	const closeChildWorkerAdmission = async (ctx: ExtensionContext): Promise<void> => {
@@ -1385,11 +1398,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		hold?: string;
 		/** What this worker's role (and trial, when the spawn was routed to one) approves: the snapshot its own check reads on any thread. */
 		approved: ReadonlyArray<{ selector: string; effort?: Effort }>;
-	}): Promise<void> => {
+	}): Promise<{ key: string; record: WorkerAdmissionRecord }> => {
 		const hold = input.hold ?? input.authority.hold;
 		// Through the same key a reservation's end revokes under: an older end never interleaves with this newer write.
-		await serialized(admissionKey(input.run.runId, input.childId), async () => {
-			await persistWorkerAdmission({
+		return serialized(admissionKey(input.run.runId, input.childId), async () => {
+			const saved = await persistWorkerAdmission({
 				agentDir: workerAdmissionAgentDir(),
 				artifactRoot: input.artifacts,
 				parentId: input.ctx.agent.id,
@@ -1408,6 +1421,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// The record is the proof for a child on any thread; this run's own memory of what it admitted is what proves
 			// a worker whose record is later lost is not admitted again as if for the first time (RF4-1).
 			admittedChildren.set(`${input.run.runId}\u0000${input.childId}`, true);
+			return saved;
 		});
 	};
 	/**
@@ -1568,6 +1582,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			journal,
 			delta,
 			registry: () => AgentRegistry.global(),
+			onNativeEnded: async frozen => {
+				const released = await admission.releaseSlot(frozen.slot, "native-ended");
+				if (!released.ok) throw new Error(released.problem.reason);
+			},
 			publish: update => runs.observe(update),
 		});
 		const ports = {
@@ -2118,6 +2136,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const refused = refusedCalls.unsettled();
 			if (refused !== undefined) return { block: true, reason: refused };
 		}
+		const decisionUntil = Date.now() + SPAWN_DECISION_MS;
 		const limit = deadline(SPAWN_DECISION_MS);
 		let timedOut = false;
 		void limit.expired.catch(() => {
@@ -2134,6 +2153,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const placement = event.spawnKey === undefined ? undefined : capturedLanes?.placementOf(event.spawnKey);
 		const decisionToken = Symbol("spawn-decision");
 		let ownAuthority: AgentAuthority | undefined;
+		let preparedNative: {
+			admission: FrozenIntegrationAdmission;
+			ports: IntegrationRuntimePorts;
+			recheck(): string | undefined;
+			rollback(): Promise<void>;
+			record(): void;
+		} | undefined;
 		// A1-6/R4: ownership of this key is established before anything else is decided. A key this run already admitted,
 		// or a pending placement made for another agent, is refused here, and this hook cleans up nothing: a refusal may
 		// undo only what its own call created or bound, never a live admission of an earlier hook.
@@ -2473,35 +2499,102 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// spawn carries the trial; a historical spawn record is not consulted.
 			const trial = record.trialId === undefined ? undefined : config.trials?.find(item => item.id === record.trialId);
 			const approved = approvedEntries(config, event.agent, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
-			// Integration is enabled in this process: a private launch needs the exact scoped Settings proof and a
-			// host-captured backend/factory. On 19.2.1 the latter does not exist, so this refuses before the child
-			// admission is written or the host materialises anything. A future host seam mints `known` here; nothing
-			// else in this hook may treat an unbound 0.29 private launch as an integration path.
-			const integration = prepared.privatePlacement ? boundIntegrationRuntime(current.sessionDir) : undefined;
-			if (integration !== undefined) {
+			// Only the guarded host can admit an integration candidate. A capable host missing any exact binding
+			// refuses, rather than starting this item through the unguarded stock path.
+			if (integrationCapable && prepared.privatePlacement) {
+				const ports = boundIntegrationRuntime(current.sessionDir);
 				const observation = preAuthorizedIsolation.get(spawnKey);
-				if (observation === undefined) {
-					return ledgerBlock("이 격리 스폰의 사전 설정 관찰을 찾지 못했습니다. 같은 task 호출을 새로 보내 배치와 정책을 함께 고정하세요.", current, Date.now());
+				const item = capturedLanes?.nativeTaskItem(spawnKey);
+				if (ctx.agent.kind !== "main" || ports === undefined || observation === undefined || item === undefined ||
+					placement === undefined || artifacts === undefined || state.approval === undefined) {
+					return ledgerBlock("이 격리 배치의 감독·승인·아티팩트 저장소와 task 항목을 확인하지 못했습니다.", current, Date.now());
 				}
-				const observationCheck = observation.check();
-				if (!observationCheck.ok) return ledgerBlock(observationCheck.problem.reason, current, Date.now());
 				const director = directorIdentityFor({ sessionId: current.sessionId, sessionDir: current.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "unknown") return ledgerBlock(director.problem.reason, current, Date.now());
-				const item = capturedLanes?.nativeTaskItem(spawnKey);
-				if (item === undefined) return ledgerBlock("격리 스폰의 정확한 task 호출과 항목 순번을 확인하지 못했습니다.", current, Date.now());
-				const policy = integration.policy ?? integrationApplyPolicy;
-				const proof = policy.arm({ director: director.value, toolCallId: item.toolCallId });
+				const dispatch = guardedDispatch(event);
+				if (dispatch.kind === "unknown") return ledgerBlock(dispatch.problem.reason, current, Date.now());
+				const proofInput = { director: director.value, item, profile: getActiveProfile() ?? "default", observation, dispatch: dispatch.value };
+				const proof = bindGuardedIsolation(proofInput);
 				if (proof.kind === "unknown") return ledgerBlock(proof.problem.reason, current, Date.now());
-				const grantCheck = policy.checkBeforeGrant(proof.value, item);
-				if (!grantCheck.ok) return ledgerBlock(grantCheck.problem.reason, current, Date.now());
-				// A host seam with a captured backend/factory also publishes A's prepared admission, candidate id
-				// and slot before this point. This build has no such publisher; falling through would start a private
-				// worker with no integration admission for the child-entry guard to claim.
-				return ledgerBlock(
-					"이 빌드에는 격리 통합 사전 승격(후보 id·슬롯·자식 진입 증명)을 게시하는 경로가 연결되어 있지 않아 이 격리 스폰을 시작하지 않았습니다.",
-					current,
-					Date.now(),
-				);
+				const recheck = (): string | undefined => {
+					if (timedOut || Date.now() >= decisionUntil) return CALL_TIME_UP;
+					if (!stillOwn() || getLedgerRun(current.runId) !== current || current.closing || runs.runLanes() !== capturedLanes ||
+						boundIntegrationRuntime(current.sessionDir) !== ports || preAuthorizedIsolation.get(spawnKey) !== observation) return CALL_REQUEST_ENDED;
+					const fresh = bindGuardedIsolation(proofInput);
+					if (fresh.kind === "unknown") return fresh.problem.reason;
+					return runs.jobGate() ?? spendSendBlock(current.runId);
+				};
+				const key: AdmissionKey = { schema: "storm.integration-admission/v1", runId: current.runId, dispatch: dispatch.value.token };
+				let slot: NativeSlotLease | undefined;
+				let worker: Awaited<ReturnType<typeof persistChildAdmission>> | undefined;
+				let admission: FrozenIntegrationAdmission | undefined;
+				const rollback = async (): Promise<void> => {
+					ports.capture.abandonBeforeDispatch(key);
+					ports.attempt.discardAdmission(key);
+					await Promise.allSettled([
+						attempts.abandonSpawn({ runId: key.runId, spawnKey, dispatch: key.dispatch }),
+						admission !== undefined ? ports.admission.abandonPrepared(admission)
+							: slot !== undefined ? ports.admission.releaseSlot(slot, "not-dispatched") : undefined,
+						worker === undefined ? undefined : serialized(admissionKey(key.runId, spawnKey), () =>
+							revokeWorkerAdmissions(workerAdmissionAgentDir(), { key: worker!.key, attempt: worker!.record.attempt })),
+					]);
+				};
+				try {
+					if (!(await approvedIntegrationDefinition({ dispatch: dispatch.value, agent: event.agent, pluginAgentsDir: PLUGIN_AGENTS_DIR, approval: state.approval }))) {
+						return ledgerBlock("호스트가 실제 로드한 에이전트 정의가 감독이 승인한 정의와 다릅니다.", current, Date.now());
+					}
+					const target = await integrationTarget(current.root);
+					if (target === undefined) return ledgerBlock("격리 통합의 대상과 Git 저장소 신원을 확인하지 못했습니다.", current, Date.now());
+					const paths = lane?.files?.length ? await canonicalScope(target.authorizedRoot.canonicalPath, lane.files) : undefined;
+					if (lane?.files?.length && paths === undefined) return ledgerBlock("레인의 승인된 쓰기 범위를 실제 대상 안에서 확인하지 못했습니다.", current, Date.now());
+					const scope: FrozenScope = paths === undefined ? { kind: "unbounded" } : { kind: "paths", paths };
+					const beforeSlot = recheck();
+					if (beforeSlot !== undefined) return ledgerBlock(beforeSlot, current, Date.now());
+					// The native session owns this exact artifact path even when no spill has materialized it yet.
+					await mkdir(artifacts, { recursive: true, mode: 0o700 });
+					const artifactRoot = await spaceIdentityOf(artifacts);
+					if (artifactRoot === undefined) return ledgerBlock("격리 아티팩트 저장소의 물리 신원을 확인하지 못했습니다.", current, Date.now());
+					const reserved = await ports.admission.reserveSlot({ key, target, item, profile: proof.value.profile });
+					if (reserved.kind === "unknown") return ledgerBlock(reserved.problem.reason, current, Date.now());
+					slot = reserved.value;
+					const beforeWrite = recheck();
+					if (beforeWrite !== undefined) return ledgerBlock(beforeWrite, current, Date.now());
+					worker = await persistChildAdmission({ ctx, run: current, artifacts, childId: spawnKey, authority, approved,
+						...(lane === undefined ? {} : { lane }), ...(prepared.hold === undefined ? {} : { hold: prepared.hold }) });
+					const startedAt = Date.now();
+					if (lane !== undefined) {
+						const baseline = await attempts.admitSpawn({ runId: key.runId, parentId: ctx.agent.id, spawnKey, lane, artifactMode: "isolated",
+							startedAt, native: { dispatch: key.dispatch, toolCallId: item.toolCallId } });
+						if (!baseline.ok) return ledgerBlock(baseline.reason, current, Date.now());
+					}
+					const frozen = await ports.attempt.prepareAdmission({
+						admission: {
+							key, candidateId: integrationCandidateId(key), director: director.value, target, artifactRoot, item,
+							placementOrdinal: placement, approvedDefinitionDigest: dispatch.value.definition.digest,
+							approvalDigest: sha256Hex(canonicalJson(state.approval)),
+							workerAdmission: { key: worker.key, attempt: worker.record.attempt, ...(worker.record.approved === undefined ? {} : { approved: worker.record.approved }) },
+							scope, policy: proof.value, slot, startedAt,
+						},
+						placement: lane === undefined ? { kind: "unplanned" } : { kind: "planned", lane: lane.name },
+					});
+					if (frozen.kind === "unknown") return ledgerBlock(frozen.problem.reason, current, Date.now());
+					admission = frozen.value;
+					const durable = await ports.admission.persistPrepared(admission);
+					if (!durable.ok) return ledgerBlock(durable.problem.reason, current, Date.now());
+					const unsettled = await settleEndRevokes(key.runId);
+					if (unsettled !== undefined) return ledgerBlock(unsettled, current, Date.now());
+					const lastCheck = recheck();
+					if (lastCheck !== undefined) return ledgerBlock(lastCheck, current, Date.now());
+					preparedNative = { admission, ports, recheck, rollback, record: () => {
+						noteRunSpawn(current.runId, record);
+						if (lane === undefined) return;
+						const delivered = contractDigests.placed.get(`${current.runId}\0${lane.name}`);
+						if (delivered !== undefined) contractDigests.sent.set(`${current.runId}\0${spawnKey}`, delivered);
+					} };
+					return routedDecision;
+				} finally {
+					if (preparedNative === undefined) await rollback();
+				}
 			}
 			// Persist before returning: the child's own hooks run in its session, which may be another thread. A failure
 			// here blocks the spawn rather than allowing an unverifiable writer.
@@ -2559,9 +2652,33 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		}).finally(limit.cancel).then(async routed => {
 			let decision = routed;
 			// The spawn is routed only after the authority of any worker whose place it took has really been withdrawn (R-final N4).
-			if (decision !== undefined && !("block" in decision) && capturedRunId !== undefined && ctx.agent.kind === "main") {
+			if (preparedNative === undefined && decision !== undefined && !("block" in decision) && capturedRunId !== undefined && ctx.agent.kind === "main") {
 				const unsettled = await settleEndRevokes(capturedRunId);
 				if (unsettled !== undefined) decision = { block: true, reason: unsettled };
+			}
+			if (preparedNative !== undefined) {
+				const pending = preparedNative;
+				try {
+					if (decision === undefined || !("block" in decision)) {
+						const reason = pending.recheck();
+						if (reason !== undefined) decision = { block: true, reason };
+						else {
+							const tracked = pending.ports.capture.track(pending.admission);
+							if (!tracked.ok) decision = { block: true, reason: tracked.problem.reason };
+							else {
+								const committed = pending.ports.attempt.commitAdmission(pending.admission.key);
+								if (!committed.ok) decision = { block: true, reason: committed.problem.reason };
+								else {
+									pending.record();
+									return { ...decision, requireChildEntry: { guard: pending.admission.policy.guardBuild } };
+								}
+							}
+						}
+					}
+				} catch {
+					decision = { block: true, reason: "격리 자식의 최종 증명을 게시하지 못해 시작하지 않았습니다." };
+				}
+				void pending.rollback().catch(() => undefined);
 			}
 			// A refused spawn must not keep its lane/write/capacity reservation or its enforced authority: another
 			// worker may start.
@@ -2598,6 +2715,26 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		);
 	};
 
+	/** Capture belongs to the native conversation even after its run ledger has closed. */
+	const captureOwner = (ctx: ExtensionContext) => {
+		const sessionId = mainSessionId(ctx);
+		const sessionDir = agentScope(ctx);
+		if (sessionId === undefined || sessionDir === undefined) return undefined;
+		const capture = boundIntegrationRuntime(sessionDir)?.capture;
+		if (capture === undefined) return undefined;
+		const origin = directorIdentityFor({ sessionId, sessionDir, parentId: ctx.agent.id });
+		return origin.kind === "known" ? { director: origin.value, capture } : undefined;
+	};
+	const capturePush = (ctx: ExtensionContext, message: unknown): void => {
+		if (!isRecord(message) || message.customType !== "async-result") return;
+		const owner = captureOwner(ctx);
+		try {
+			owner?.capture.observeAsync({ director: owner.director, carrier: "push", details: message, observedAt: Date.now() });
+		} catch {
+			// Consumption of a native result does not depend on Storm successfully observing it.
+		}
+	};
+
 	const observedDeliveries = new Map<string, Promise<void>>();
 	const OBSERVED_DELIVERIES_MAX = 128;
 	// A message without its own timestamp has no identity that tells two identical answers apart (the same worker may
@@ -2611,20 +2748,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const known = key === undefined ? undefined : observedDeliveries.get(key);
 		if (known !== undefined) return known;
 		const observedAt = Date.now();
-		// A's capture sees the same immutable async envelope the attempt collector reads; it never repeats wait or
-		// watches a mutable ref. Unbound events are ignored by A.
-		const ledger = getLedgerRun(runId);
-		const ports = boundIntegrationRuntime(ledger?.sessionDir);
-		if (ports !== undefined && ledger !== undefined) {
-			const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
-			if (director.kind === "known") {
-				try {
-					ports.capture.observeAsync({ director: director.value, carrier: "push", details: message, observedAt });
-				} catch {
-					// Observation only; the collector below is the existing behavior.
-				}
-			}
-		}
 		const observing = attempts.observeMessage({ runId, parentId: ctx.agent.id, message, observedAt, jobs: jobsForRun(ctx, runId) });
 		if (key !== undefined) {
 			observedDeliveries.set(key, observing);
@@ -2679,6 +2802,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// A finished background task is a custom `async-result` message on the parent, not an assistant turn. Observe it
 		// before the usage guard, which has no usage to read for that message.
 		if (ctx.agent.kind === "main") {
+			capturePush(ctx, event.message);
 			const runId = runs.runId();
 			if (runId !== undefined) await observeDelivery(ctx, runId, event.message);
 		}
@@ -2859,9 +2983,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (binding.kind === "bound") stopDetachedChild(ctx, binding);
 			return undefined;
 		}
-		// The exact child entry, before its first provider request: A binds the checkout and B verifies integrated
-		// input bytes. A missing claim stops this child; no provider work starts on an unproven placement.
-		await integrationChildEntry(ctx, ledger);
 		const { id, name } = ctx.agent;
 		const artifacts = artifactsOf(ctx);
 		childWorkTrees.set(reviewerBaselineKey(artifacts, id), ctx.cwd);
@@ -4278,29 +4399,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				content: event.content,
 				observedAt,
 			});
-			const ledger = getLedgerRun(runId);
-			const ports = boundIntegrationRuntime(ledger?.sessionDir);
-			if (ports !== undefined && ledger !== undefined) {
-				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
-				if (director.kind === "known") {
-					const results = isRecord(event.details) && Array.isArray(event.details.results) ? event.details.results : undefined;
-					try {
-						if (results !== undefined && results.length > 0) {
-							ports.capture.observeSync({
-								director: director.value,
-								toolCallId: event.toolCallId,
-								results: results as unknown as readonly (SyncResultFact & { readonly isolated?: unknown; readonly branchName?: unknown; readonly branchBaseSha?: unknown })[],
-								observedAt,
-							});
-						} else {
-							// An async spawn's task result is only an acknowledgement; the job's own delivery comes later.
-							ports.capture.observeAsync({ director: director.value, carrier: "ack", details: event.details, observedAt });
-						}
-					} catch {
-						// Observation only.
-					}
-				}
-			}
 		}
 		// A native `wait` consumes completed background jobs, so its terminal task rows are deliveries even though no
 		// `async-result` message follows. The collector accepts only exact admitted rows with a real deliverable.
@@ -4313,18 +4411,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				observedAt,
 				jobs: jobsForRun(ctx, runId),
 			});
-			const ledger = getLedgerRun(runId);
-			const ports = boundIntegrationRuntime(ledger?.sessionDir);
-			if (ports !== undefined && ledger !== undefined) {
-				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
-				if (director.kind === "known") {
-					try {
-						ports.capture.observeAsync({ director: director.value, carrier: "wait", details: event.details, observedAt });
-					} catch {
-						// Observation only.
-					}
-				}
-			}
 		}
 		if (event.isError) return undefined;
 		if (event.toolName === "read") {
@@ -4382,6 +4468,25 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (ctx.agent.kind === "main") {
 			const hold = typeof event.toolCallId === "string" ? directorHolds.get(event.toolCallId) : undefined;
 			if (hold !== undefined) hold.resulted = true;
+			if (event.toolName === "task" || event.toolName === "wait") {
+				const owner = captureOwner(ctx);
+				if (owner !== undefined) {
+					const { director, capture } = owner;
+					const observedAt = Date.now();
+					try {
+						if (event.toolName === "task") {
+							const details = event.details;
+							if (isRecord(details) && Array.isArray(details.results) && details.results.length > 0) {
+								const results = details.results as Parameters<IntegrationCapturePort["observeSync"]>[0]["results"];
+								capture.observeSync({ director, toolCallId: event.toolCallId, results, observedAt });
+							}
+							capture.observeAsync({ director, carrier: "ack", toolCallId: event.toolCallId, details, observedAt });
+						} else capture.observeAsync({ director, carrier: "wait", details: event.details, observedAt });
+					} catch {
+						// Consumption of a native result must survive a capture failure.
+					}
+				}
+			}
 		}
 		const runId = ctx.agent.kind === "main" ? runs.runId() : undefined;
 		// A follow-up that carried a result contract was delivered: its worker has now been sent it.
@@ -4420,14 +4525,16 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// request must neither read nor take the director's notice.
 		if (ctx.agent.kind !== "main") return undefined;
 		const runId = runs.runId();
-		if (runId === undefined) return undefined;
+		if (runId === undefined && captureOwner(ctx) === undefined) return undefined;
 		// The deliveries this request carries: the `async-result` messages after the director's last turn.
 		const arrived: Promise<void>[] = [];
 		for (let at = event.messages.length - 1; at >= 0; at--) {
 			const message = event.messages[at];
 			if (message === undefined || message.role === "assistant") break;
-			if (deliveryKey(message) !== undefined) arrived.push(observeDelivery(ctx, runId, message));
+			capturePush(ctx, message);
+			if (runId !== undefined && deliveryKey(message) !== undefined) arrived.push(observeDelivery(ctx, runId, message));
 		}
+		if (runId === undefined) return undefined;
 		if (arrived.length > 0) {
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			const limit = new Promise<void>(resolve => {

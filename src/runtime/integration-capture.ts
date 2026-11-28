@@ -101,7 +101,15 @@ export interface RegistrySnapshotInput {
 export interface AsyncObservationInput {
 	readonly director: DirectorIdentity;
 	readonly carrier: "registration" | "ack" | "wait" | "push";
-	/** A validates host rows, indexing once; includes full typed owner/registration evidence when available. */
+	/**
+	 * Host call id for an `ack` envelope. Required to bind the resolved job to the exact admitted call/item; absent
+	 * means the acknowledgement cannot authorize a positive capture.
+	 */
+	readonly toolCallId?: string | undefined;
+	/**
+	 * Host details unchanged. An `ack` carries `async.executions[]` of exact per-item execution proofs; `wait` and
+	 * `push` rows carry the same proof as `execution`. A stock row has no proof and can never authorize a positive.
+	 */
 	readonly details: unknown;
 	readonly observedAt: number;
 }
@@ -114,7 +122,8 @@ export interface IntegrationCapturePort {
 	abandonBeforeDispatch(key: AdmissionKey): void;
 	/** Invoke in the registry listener stack, before any await; the adapter snapshots primitive data/part list here. */
 	observeRegistry(snapshot: RegistrySnapshotInput): void;
-	observeSync(input: { readonly director: DirectorIdentity; readonly toolCallId: string; readonly results: readonly (SyncResultFact & { readonly isolated?: unknown; readonly branchName?: unknown; readonly branchBaseSha?: unknown })[]; readonly observedAt: number }): void;
+	/** `results` are the host's rows unchanged, including each row's original-call `index`; E never re-indexes a batch. */
+	observeSync(input: { readonly director: DirectorIdentity; readonly toolCallId: string; readonly results: readonly (SyncResultFact & { readonly index?: unknown; readonly isolated?: unknown; readonly branchName?: unknown; readonly branchBaseSha?: unknown })[]; readonly observedAt: number }): void;
 	observeAsync(input: AsyncObservationInput): void;
 	/** Called only for the matching first-execution admission, never from wake/arrival fallback. */
 	observeClaim(entry: ObservationIdentity, claim: ChildEntryClaim): void;

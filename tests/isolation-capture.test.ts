@@ -32,6 +32,7 @@ import {
 	INTEGRATION_POLICY_HOST,
 	integrationCandidateId,
 } from "../src/runtime/integration-artifacts.ts";
+import type { IntegrationDeltaPort } from "../src/runtime/integration-delta.ts";
 import {
 	IsolationCapture,
 	captureManifestDigest,
@@ -312,22 +313,29 @@ async function patch(f: Fixture, handle: string, content: string): Promise<strin
 	return path;
 }
 
+/** The exact child-entry claim every positive capture now requires; a sync result without one is recovery only. */
+function claimCapture(rig: CaptureRig, f: Fixture, built: BuiltAdmission): void {
+	rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+}
+
 function syncResult(input: {
 	handle: string;
+	index?: number;
 	patchPath?: string;
 	hasRootChanges?: boolean;
 	nestedPatchPaths?: readonly string[];
 	nestedPatches?: readonly { relativePath: string; patch: string }[];
 	isolated?: boolean;
-	exitCode?: number;
+	exitCode?: number | null;
 	aborted?: boolean;
 	branchName?: string;
 	branchBaseSha?: string;
 }) {
 	return {
 		id: input.handle,
+		index: input.index ?? 0,
 		isolated: input.isolated ?? true,
-		exitCode: input.exitCode ?? 0,
+		...(input.exitCode === null ? {} : { exitCode: input.exitCode ?? 0 }),
 		aborted: input.aborted ?? false,
 		...(input.patchPath === undefined ? {} : { patchPath: input.patchPath }),
 		...(input.hasRootChanges === undefined ? {} : { hasRootChanges: input.hasRootChanges }),
@@ -336,6 +344,111 @@ function syncResult(input: {
 		...(input.branchName === undefined ? {} : { branchName: input.branchName }),
 		...(input.branchBaseSha === undefined ? {} : { branchBaseSha: input.branchBaseSha }),
 	};
+}
+
+/** One host task acknowledgement; the additive `executions` array is the only positive authority. */
+function asyncAck(input: { jobId: string; handle?: string; index?: number; executions?: readonly unknown[] }) {
+	return {
+		results: [],
+		progress: [{ index: input.index ?? 0, id: input.handle ?? "W1", status: "running" }],
+		async: {
+			state: "running",
+			jobId: input.jobId,
+			...(input.executions === undefined ? {} : { executions: input.executions }),
+		},
+	};
+}
+
+/** The exact additive per-item proof the host emits on ack, wait and push. */
+interface ExecutionFixture {
+	readonly revision: 1;
+	readonly jobId: string;
+	readonly type: "task";
+	readonly executionToken: string;
+	readonly itemIndex: number;
+	readonly agentId: string;
+	readonly ownerSessionId: string;
+}
+
+function nativeExecution(input: { jobId: string; handle?: string; index?: number; owner?: string; token?: string }): ExecutionFixture {
+	return {
+		revision: 1,
+		jobId: input.jobId,
+		type: "task",
+		executionToken: input.token ?? randomUUID(),
+		itemIndex: input.index ?? 0,
+		agentId: input.handle ?? "W1",
+		ownerSessionId: input.owner ?? "Main",
+	};
+}
+
+/** One native wait row: `settledAtMs - durationMs` recovers the job's registration stamp. */
+function waitJob(input: {
+	jobId: string;
+	handle?: string;
+	status?: "completed" | "failed" | "cancelled";
+	settledAtMs: number;
+	durationMs: number;
+	structured?: Record<string, unknown>;
+	execution?: ExecutionFixture;
+}) {
+	return {
+		id: input.jobId,
+		type: "task",
+		status: input.status ?? "completed",
+		agentUrlId: input.handle ?? "W1",
+		settledAtMs: input.settledAtMs,
+		durationMs: input.durationMs,
+		...(input.structured === undefined ? {} : { structured: input.structured }),
+		...(input.execution === undefined ? {} : { agentId: input.execution.agentId, execution: input.execution }),
+	};
+}
+
+/** One pushed delivery row: it carries `schema` and the additive execution object. */
+function pushJob(input: {
+	jobId: string;
+	handle?: string | null;
+	status?: "completed" | "failed" | "cancelled";
+	durationMs?: number;
+	schema?: Record<string, unknown>;
+	label?: string;
+	execution?: ExecutionFixture;
+}) {
+	const handle = input.handle === undefined ? "W1" : input.handle;
+	return {
+		jobId: input.jobId,
+		type: "task",
+		status: input.status ?? "completed",
+		...(handle === null ? {} : { agentId: handle }),
+		...(input.durationMs === undefined ? {} : { durationMs: input.durationMs }),
+		...(input.schema === undefined ? {} : { schema: input.schema }),
+		...(input.label === undefined ? {} : { label: input.label }),
+		...(input.execution === undefined ? {} : { execution: input.execution }),
+	};
+}
+
+function observeAck(rig: CaptureRig, built: BuiltAdmission, details: unknown, observedAt = built.admission.startedAt): void {
+	rig.capture.observeAsync({
+		director: built.admission.director,
+		carrier: "ack",
+		toolCallId: built.admission.item.toolCallId,
+		details,
+		observedAt,
+	});
+}
+
+/** Ack one exact additive execution proof for its owning admission. */
+function observeExecutionAck(rig: CaptureRig, built: BuiltAdmission, execution: ExecutionFixture): void {
+	observeAck(
+		rig,
+		built,
+		asyncAck({
+			jobId: execution.jobId,
+			handle: execution.agentId,
+			index: execution.itemIndex,
+			executions: [execution],
+		}),
+	);
 }
 
 function registrySnapshot(f: Fixture, admission: FrozenIntegrationAdmission, overrides: Partial<RegistrySnapshotInput> = {}): RegistrySnapshotInput {
@@ -379,6 +492,7 @@ describe("sync typed capture", () => {
 		const content = "diff --git a/a.txt b/a.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+A\n";
 		const path = await patch(f, "W1", content);
 		expect(rig.capture.track(built.admission)).toEqual({ ok: true });
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -410,6 +524,7 @@ describe("sync typed capture", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -427,6 +542,7 @@ describe("sync typed capture", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -447,6 +563,7 @@ describe("sync typed capture", () => {
 		const nestedBytes = "diff --git a/x b/x\nnew file mode 100644\n";
 		await writeFile(nestedPath, nestedBytes);
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -477,6 +594,7 @@ describe("sync typed capture", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -485,6 +603,107 @@ describe("sync typed capture", () => {
 		});
 		const [manifest] = await sealed(rig);
 		expect(manifest?.bundle.kind).toBe("unknown");
+	});
+
+	test("a sync success without the exact child claim is recovery-only after the bounded wait", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const content = "diff --git a/a b/a\n+A\n";
+		const path = await patch(f, "W1", content);
+		rig.capture.track(built.admission);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		await rig.capture.drain();
+		vi.advanceTimersByTime(30);
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		if (manifests[0]?.bundle.kind === "unknown") expect(manifests[0].bundle.problem.code).toBe("child-claim-missing");
+		expect(manifests[0]?.childClaim.kind).toBe("unknown");
+		expect(manifests[0]?.recovery.root.kind).toBe("known");
+		if (manifests[0]?.recovery.root.kind === "known" && manifests[0].recovery.root.value.copy.kind === "known") {
+			const read = await rig.store.readPatch(manifests[0].recovery.root.value.copy.value, {
+				maxBytes: 1024,
+				deadline: f.clock.now + 1_000,
+				signal: new AbortController().signal,
+			});
+			expect(read.kind).toBe("known");
+			if (read.kind === "known") expect(Buffer.from(read.value).toString("utf8")).toBe(content);
+		}
+		claimCapture(rig, f, built);
+		await rig.capture.drain();
+		expect(rig.journal.manifests).toHaveLength(1);
+		expect(rig.journal.recoveries).toHaveLength(1);
+		expect(rig.journal.recoveries[0]?.facts.checkout.kind).toBe("present");
+		expect(rig.journal.recoveries[0]?.contradiction.kind).toBe("unknown");
+	});
+
+	test("a contradicting child claim fails closed while the copied bytes stay recovery", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), { ...claimFor(f, built.admission), slotOwnerToken: "other-owner" });
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		const [manifest] = await sealed(rig);
+		expect(manifest?.bundle.kind).toBe("unknown");
+		if (manifest?.bundle.kind === "unknown") expect(manifest.bundle.problem.code).toBe("claim-admission-mismatch");
+		expect(manifest?.recovery.root.kind).toBe("known");
+	});
+
+	test("a sparse sync envelope binds by the host's original index, not its array position", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f, { itemIndex: 1 });
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [
+				syncResult({ handle: "OTHER", index: 0, patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] }),
+				syncResult({ handle: "W1", index: 1, patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] }),
+			],
+			observedAt: f.clock.now,
+		});
+		const [manifest] = await sealed(rig);
+		expect(manifest?.bundle.kind).toBe("root-only");
+		expect(manifest?.admission.item.itemIndex).toBe(1);
+	});
+
+	test("a registry part contradiction fails closed for a sync success", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const other = await patch(f, "W1-other", "diff --git a/b b/b\n+B\n");
+		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: other, nestedPatchPaths: [] } }));
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		const [manifest] = await sealed(rig);
+		expect(manifest?.bundle.kind).toBe("unknown");
+		if (manifest?.bundle.kind === "unknown") expect(manifest.bundle.problem.code).toBe("registry-parts-changed");
+		expect(manifest?.recovery.root.kind).toBe("known");
 	});
 
 	test("an admission without the runtime apply-off proof is refused before capture", async () => {
@@ -505,6 +724,7 @@ describe("sync typed capture", () => {
 		const rig = captureRig(f);
 		const built = await admissionFor(f);
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -525,30 +745,65 @@ describe("sync typed capture", () => {
 });
 
 describe("async carrier join", () => {
-	test("wait and push are one terminal identity; a push then empty wait mints once", async () => {
+	test("push then wait are one terminal identity; the wait proves first-generation registration", async () => {
 		const f = await fixture();
 		const rig = captureRig(f);
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
-		const entry = entryFor(f);
-		rig.capture.observeClaim(entry, claimFor(f, built.admission));
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, {
 			history: { patchPath: path, nestedPatchPaths: [] },
 		}));
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
-		});
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
 		rig.capture.observeAsync({
 			director: built.admission.director,
 			carrier: "push",
-			details: {
-				customType: "async-result",
-				details: { jobs: [{ jobId: "W1", type: "task", status: "completed", agentId: "W1" }] },
-			},
+			details: { customType: "async-result", details: { jobs: [pushJob({ jobId: "W1", durationMs: 5, execution })] } },
+			observedAt: f.clock.now + 1,
+		});
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
+		});
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("root-only");
+		expect(manifests[0]?.terminal.kind).toBe("known");
+		if (manifests[0]?.terminal.kind === "known" && manifests[0].terminal.value.carrier !== "sync") {
+			expect(manifests[0].terminal.value.job.jobId).toBe("W1");
+		}
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5, execution })] } },
+			observedAt: f.clock.now + 5,
+		});
+		await rig.capture.drain();
+		expect(rig.journal.manifests).toHaveLength(1);
+		expect(rig.journal.recoveries).toHaveLength(1);
+		expect(rig.journal.recoveries[0]?.contradiction.kind).toBe("unknown");
+	});
+
+	test("a push followed only by an empty wait stays typed recovery", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, {
+			history: { patchPath: path, nestedPatchPaths: [] },
+		}));
+		observeAck(rig, built, asyncAck({ jobId: "W1" }));
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5 })] } },
 			observedAt: f.clock.now + 1,
 		});
 		rig.capture.observeAsync({
@@ -557,14 +812,15 @@ describe("async carrier join", () => {
 			details: { op: "wait", jobs: [] },
 			observedAt: f.clock.now + 2,
 		});
+		vi.advanceTimersByTime(30);
 		const manifests = await sealed(rig);
 		expect(manifests).toHaveLength(1);
-		expect(manifests[0]?.bundle.kind).toBe("root-only");
-		expect(manifests[0]?.terminal.kind).toBe("known");
-		if (manifests[0]?.terminal.kind === "known") expect(manifests[0].terminal.value.carrier).toBe("push");
+		expect(manifests[0]?.terminal.kind).toBe("unknown");
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		expect(manifests[0]?.recovery.root.kind).toBe("known");
 	});
 
-	test("ack after terminal and a suffixed actual job id still join the same first execution", async () => {
+	test("a terminal that arrives first joins the real suffixed acknowledgement by exact job id", async () => {
 		const f = await fixture();
 		const rig = captureRig(f);
 		const built = await admissionFor(f);
@@ -572,28 +828,60 @@ describe("async carrier join", () => {
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		const execution = nativeExecution({ jobId: "W1-7" });
 		rig.capture.observeAsync({
 			director: built.admission.director,
 			carrier: "wait",
 			details: {
 				op: "wait",
-				jobs: [{ id: "W1-7", type: "task", status: "completed", agentUrlId: "W1", settledAtMs: f.clock.now + 5, durationMs: 2 }],
+				jobs: [waitJob({ jobId: "W1-7", settledAtMs: f.clock.now + 4, durationMs: 5, execution })],
 			},
 			observedAt: f.clock.now + 5,
 		});
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now + 6,
-		});
+		observeExecutionAck(rig, built, execution);
 		const manifests = await sealed(rig);
 		expect(manifests).toHaveLength(1);
 		expect(manifests[0]?.bundle.kind).toBe("root-only");
-		if (manifests[0]?.terminal.kind === "known") {
-			expect(manifests[0].terminal.value.carrier).toBe("wait");
-			if (manifests[0].terminal.value.carrier !== "sync") expect(manifests[0].terminal.value.job.jobId).toBe("W1-7");
+		if (manifests[0]?.terminal.kind === "known" && manifests[0].terminal.value.carrier !== "sync") {
+			expect(manifests[0].terminal.value.job.jobId).toBe("W1-7");
 		}
+	});
+
+	test("prefix, label-only and same-id terminals never replace the ack's resolved job", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		const execution = nativeExecution({ jobId: "W1-7" });
+		observeExecutionAck(rig, built, execution);
+		for (const row of [
+			waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution: nativeExecution({ jobId: "W1" }) }),
+			waitJob({ jobId: "W1-9", settledAtMs: f.clock.now + 4, durationMs: 5, execution: nativeExecution({ jobId: "W1-9" }) }),
+		]) {
+			rig.capture.observeAsync({
+				director: built.admission.director,
+				carrier: "wait",
+				details: { op: "wait", jobs: [row] },
+				observedAt: f.clock.now + 4,
+			});
+		}
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", handle: null, label: "W1" })] } },
+			observedAt: f.clock.now + 5,
+		});
+		vi.advanceTimersByTime(30);
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.terminal.kind).toBe("unknown");
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		expect(manifests[0]?.recovery.root.kind).toBe("known");
+		expect(rig.capture.stats().unmatched["async-late-other-execution"]).toBeGreaterThan(0);
 	});
 
 	test("a registry list missing nestedPatchPaths is unknown, never empty", async () => {
@@ -604,18 +892,14 @@ describe("async carrier join", () => {
 		const path = await patch(f, "W1", "");
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
-		});
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path } }));
 		rig.capture.observeAsync({
 			director: built.admission.director,
-			carrier: "push",
-			details: { details: { jobs: [{ jobId: "W1", type: "task", status: "completed", agentId: "W1" }] } },
-			observedAt: f.clock.now + 1,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
 		});
 		vi.advanceTimersByTime(30);
 		const manifests = await sealed(rig);
@@ -635,17 +919,13 @@ describe("async carrier join", () => {
 		const snapshot = registrySnapshot(f, built.admission, { history });
 		rig.capture.observeRegistry(snapshot);
 		history.nestedPatchPaths.push("/tmp/late.patch");
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
-		});
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
 		rig.capture.observeAsync({
 			director: built.admission.director,
 			carrier: "wait",
-			details: { op: "wait", jobs: [{ id: "W1", type: "task", status: "completed", agentUrlId: "W1", settledAtMs: f.clock.now + 5, durationMs: 2 }] },
-			observedAt: f.clock.now + 5,
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
 		});
 		const manifests = await sealed(rig);
 		expect(manifests[0]?.bundle.kind).toBe("root-only");
@@ -657,6 +937,7 @@ describe("async carrier join", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -683,6 +964,7 @@ describe("async carrier join", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -707,6 +989,7 @@ describe("async carrier join", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -744,12 +1027,8 @@ describe("async carrier join", () => {
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
-		});
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, {
 			registryInstance: "other:instance",
 			history: { patchPath: path, nestedPatchPaths: [] },
@@ -757,8 +1036,8 @@ describe("async carrier join", () => {
 		rig.capture.observeAsync({
 			director: built.admission.director,
 			carrier: "wait",
-			details: { op: "wait", jobs: [{ id: "W1", type: "task", status: "completed", agentUrlId: "W1", settledAtMs: f.clock.now + 5, durationMs: 2 }] },
-			observedAt: f.clock.now + 5,
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
 		});
 		vi.advanceTimersByTime(30);
 		const manifests = await sealed(rig);
@@ -774,13 +1053,15 @@ describe("async carrier join", () => {
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
 		rig.capture.observeAsync({
 			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
 		});
-		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, {
 			event: "removed",
 			registryInstance: "",
@@ -788,12 +1069,6 @@ describe("async carrier join", () => {
 			childSessionFile: null,
 			history: {},
 		}));
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "push",
-			details: { details: { jobs: [{ jobId: "W1", type: "task", status: "completed", agentId: "W1" }] } },
-			observedAt: f.clock.now + 1,
-		});
 		const manifests = await sealed(rig);
 		expect(manifests[0]?.bundle.kind).toBe("root-only");
 	});
@@ -806,18 +1081,420 @@ describe("async carrier join", () => {
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
-		rig.capture.observeAsync({
-			director: built.admission.director,
-			carrier: "ack",
-			details: { results: [], progress: [{ index: 0, id: "W1", status: "running" }], async: { state: "running", jobId: "W1" } },
-			observedAt: f.clock.now,
-		});
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
 		vi.advanceTimersByTime(30);
 		const manifests = await sealed(rig);
 		expect(manifests).toHaveLength(1);
 		expect(manifests[0]?.terminal.kind).toBe("unknown");
 		expect(manifests[0]?.bundle.kind).toBe("unknown");
+	});
+
+	test("one native wait batch binds each admission by its exact resolved job", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const first = await admissionFor(f, { handle: "W1", dispatch: "attempt:A", toolCallId: "call-a" });
+		const second = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-b" });
+		const firstPath = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const secondPath = await patch(f, "W2", "diff --git a/b b/b\n+B\n");
+		const firstExecution = nativeExecution({ jobId: "W1-7", handle: "W1" });
+		const secondExecution = nativeExecution({ jobId: "W2", handle: "W2" });
+		for (const [built, path, execution] of [[first, firstPath, firstExecution], [second, secondPath, secondExecution]] as const) {
+			rig.capture.track(built.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+			rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+			observeExecutionAck(rig, built, execution);
+		}
+		rig.capture.observeAsync({
+			director: first.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [
+					waitJob({ jobId: "W1-7", handle: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution: firstExecution }),
+					waitJob({ jobId: "W2", handle: "W2", settledAtMs: f.clock.now + 4, durationMs: 5, execution: secondExecution }),
+				],
+			},
+			observedAt: f.clock.now + 4,
+		});
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(2);
+		for (const manifest of manifests) expect(manifest.bundle.kind).toBe("root-only");
+		const firstManifest = manifests.find(manifest => manifest.admission.item.handle === "W1");
+		if (firstManifest?.terminal.kind === "known" && firstManifest.terminal.value.carrier !== "sync") {
+			expect(firstManifest.terminal.value.job.jobId).toBe("W1-7");
+		}
+	});
+
+	test("completed jobs with an invalid schema stay recovery-only on wait and push", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const waitBuilt = await admissionFor(f, { handle: "W1", dispatch: "attempt:A", toolCallId: "call-a" });
+		const pushBuilt = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-b" });
+		const waitPath = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const pushPath = await patch(f, "W2", "diff --git a/b b/b\n+B\n");
+		const waitExecution = nativeExecution({ jobId: "W1", handle: "W1" });
+		const pushExecution = nativeExecution({ jobId: "W2", handle: "W2" });
+		for (const [built, path, execution] of [[waitBuilt, waitPath, waitExecution], [pushBuilt, pushPath, pushExecution]] as const) {
+			rig.capture.track(built.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+			rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+			observeExecutionAck(rig, built, execution);
+		}
+		rig.capture.observeAsync({
+			director: waitBuilt.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [waitJob({ jobId: "W1", handle: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, structured: { status: "invalid" }, execution: waitExecution })],
+			},
+			observedAt: f.clock.now + 4,
+		});
+		rig.capture.observeAsync({
+			director: pushBuilt.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W2", handle: "W2", durationMs: 5, schema: { status: "invalid" }, execution: pushExecution })] } },
+			observedAt: f.clock.now + 4,
+		});
+		rig.capture.observeAsync({
+			director: pushBuilt.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [waitJob({ jobId: "W2", handle: "W2", settledAtMs: f.clock.now + 4, durationMs: 5, structured: { status: "invalid" }, execution: pushExecution })],
+			},
+			observedAt: f.clock.now + 5,
+		});
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(2);
+		for (const manifest of manifests) {
+			expect(manifest.bundle.kind).toBe("kept-only");
+			expect(manifest.terminal.kind).toBe("known");
+			if (manifest.terminal.kind === "known") expect(manifest.terminal.value.structured).toBe("invalid");
+		}
+	});
+
+	test("a reused job id registered after the ack is a different execution", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		const execution = nativeExecution({ jobId: "W1-7" });
+		observeExecutionAck(rig, built, execution);
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [waitJob({ jobId: "W1-7", settledAtMs: f.clock.now + 20, durationMs: 2, execution: nativeExecution({ jobId: "W1-7" }) })],
+			},
+			observedAt: f.clock.now + 20,
+		});
+		expect(rig.capture.stats().unmatched["async-late-other-execution"]).toBeGreaterThan(0);
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [waitJob({ jobId: "W1-7", settledAtMs: f.clock.now + 4, durationMs: 5, execution })],
+			},
+			observedAt: f.clock.now + 21,
+		});
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("root-only");
+	});
+
+	test("a timeout then a late typed patch and ref are copied into recovery only", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const content = "diff --git a/a b/a\n+LATE\n";
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		observeAck(rig, built, asyncAck({ jobId: "W1" }));
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5 })] } },
+			observedAt: f.clock.now + 1,
+		});
+		vi.advanceTimersByTime(30);
+		expect(await sealed(rig)).toHaveLength(1);
+		const latePath = await patch(f, "W1-late", content);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({
+				handle: "W1",
+				patchPath: latePath,
+				hasRootChanges: true,
+				nestedPatchPaths: [],
+				nestedPatches: [],
+				branchName: "omp/task/W1",
+				branchBaseSha: "a".repeat(40),
+			})],
+			observedAt: f.clock.now + 40,
+		});
+		await rig.capture.drain();
+		expect(rig.journal.manifests).toHaveLength(1);
+		expect(rig.updates.filter(update => update.kind === "sealed")).toHaveLength(1);
+		const recovery = rig.journal.recoveries.at(-1);
+		expect(recovery?.facts.root.kind).toBe("known");
+		expect(recovery?.facts.branch.kind).toBe("known");
+		if (recovery?.facts.root.kind !== "known" || recovery.facts.root.value.copy.kind !== "known") return;
+		await rm(latePath);
+		const read = await rig.store.readPatch(recovery.facts.root.value.copy.value, {
+			maxBytes: 1024,
+			deadline: f.clock.now + 1_000,
+			signal: new AbortController().signal,
+		});
+		expect(read.kind).toBe("known");
+		if (read.kind === "known") expect(Buffer.from(read.value).toString("utf8")).toBe(content);
+	});
+
+	test("a benign late replay cannot suppress a later changed-part contradiction", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const root = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const nestedPath = join(await realpath(f.artifactRoot), "W1.nested-late.patch");
+		const nestedBytes = "diff --git a/x b/x\nnew file mode 100644\n";
+		await writeFile(nestedPath, nestedBytes);
+		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: root, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		await sealed(rig);
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: root, nestedPatchPaths: [] } }));
+		await rig.capture.drain();
+		expect(rig.journal.recoveries).toHaveLength(1);
+		expect(rig.journal.recoveries[0]?.contradiction.kind).toBe("unknown");
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({
+				handle: "W1",
+				patchPath: root,
+				hasRootChanges: true,
+				nestedPatchPaths: [nestedPath],
+				nestedPatches: [{ relativePath: "nested-repo", patch: nestedBytes }],
+			})],
+			observedAt: f.clock.now + 5,
+		});
+		await rig.capture.drain();
+		expect(rig.journal.recoveries).toHaveLength(2);
+		const conflict = rig.journal.recoveries.at(-1)?.contradiction;
+		expect(conflict?.kind).toBe("known");
+		if (conflict?.kind === "known") expect(conflict.value.code).toBe("readiness-contradicted");
+		const nested = rig.journal.recoveries.at(-1)?.facts.nested;
+		expect(nested?.kind).toBe("known");
+		if (nested?.kind === "known") expect(nested.value).toHaveLength(1);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({
+				handle: "W1",
+				patchPath: root,
+				hasRootChanges: true,
+				nestedPatchPaths: [nestedPath],
+				nestedPatches: [{ relativePath: "nested-repo", patch: nestedBytes }],
+			})],
+			observedAt: f.clock.now + 6,
+		});
+		await rig.capture.drain();
+		expect(rig.journal.recoveries).toHaveLength(2);
+	});
+
+	test("a claim or terminal contradiction during root proof never publishes stale readiness", async () => {
+		const f = await fixture();
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		let proofs = 0;
+		const delta: IntegrationDeltaPort = {
+			async proveRoot(request) {
+				proofs += 1;
+				entered.resolve();
+				await gate.promise;
+				return {
+					kind: "known",
+					value: {
+						...request,
+						schema: "storm.integration-delta/v1",
+						digest: "d".repeat(64),
+						entries: [],
+						expandedBytes: 0,
+					},
+				};
+			},
+			async verifyCheckoutInputs() {
+				return { ok: true };
+			},
+			async observePresence() {
+				return { kind: "unknown", problem: { code: "test", reason: "test" } };
+			},
+			async observeDirtyPaths() {
+				return { kind: "unknown", problem: { code: "test", reason: "test" } };
+			},
+		};
+		const rig = captureRig(f, { delta });
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		await entered.promise;
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", aborted: true })],
+			observedAt: f.clock.now + 1,
+		});
+		gate.resolve();
+		const manifests = await sealed(rig);
+		expect(proofs).toBe(1);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		if (manifests[0]?.bundle.kind === "unknown") expect(manifests[0].bundle.problem.code).toBe("terminal-contradicted");
+		expect(manifests[0]?.recovery.root.kind).toBe("known");
+	});
+
+	test("a mixed task envelope feeds both the sync row and the async acknowledgement", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const syncBuilt = await admissionFor(f, { handle: "W1", dispatch: "attempt:A", toolCallId: "call-1", itemIndex: 0 });
+		const asyncBuilt = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-1", itemIndex: 1 });
+		const syncPath = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const asyncPath = await patch(f, "W2", "diff --git a/b b/b\n+B\n");
+		const asyncExecution = nativeExecution({ jobId: "W2", handle: "W2", index: 1 });
+		for (const built of [syncBuilt, asyncBuilt]) {
+			rig.capture.track(built.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		}
+		rig.capture.observeSync({
+			director: syncBuilt.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", index: 0, patchPath: syncPath, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		rig.capture.observeAsync({
+			director: asyncBuilt.admission.director,
+			carrier: "ack",
+			toolCallId: "call-1",
+			details: {
+				results: [],
+				progress: [
+					{ index: 0, id: "W1", status: "completed" },
+					{ index: 1, id: "W2", status: "running" },
+				],
+				async: { state: "running", jobId: "W2", executions: [asyncExecution] },
+			},
+			observedAt: f.clock.now,
+		});
+		rig.capture.observeRegistry(registrySnapshot(f, asyncBuilt.admission, { history: { patchPath: asyncPath, nestedPatchPaths: [] } }));
+		rig.capture.observeAsync({
+			director: asyncBuilt.admission.director,
+			carrier: "wait",
+			details: {
+				op: "wait",
+				jobs: [waitJob({ jobId: "W2", handle: "W2", settledAtMs: f.clock.now + 4, durationMs: 5, execution: asyncExecution })],
+			},
+			observedAt: f.clock.now + 4,
+		});
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(2);
+		const syncManifest = manifests.find(manifest => manifest.admission.item.handle === "W1");
+		const asyncManifest = manifests.find(manifest => manifest.admission.item.handle === "W2");
+		expect(syncManifest?.bundle.kind).toBe("root-only");
+		expect(asyncManifest?.bundle.kind).toBe("root-only");
+	});
+
+	test("an acknowledgement without the owning call id cannot bind a job", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "ack",
+			details: asyncAck({ jobId: "W1", executions: [nativeExecution({ jobId: "W1" })] }),
+			observedAt: f.clock.now,
+		});
+		vi.advanceTimersByTime(30);
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		if (manifests[0]?.bundle.kind === "unknown") expect(manifests[0].bundle.problem.code).toBe("async-ack-unbound");
+		expect(rig.capture.stats().unmatched["async-ack-unbound"]).toBeGreaterThan(0);
+	});
+
+	test("stock async rows are recovery only even when wait and push agree", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		observeAck(rig, built, asyncAck({ jobId: "W1" }));
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5 })] },
+			observedAt: f.clock.now + 4,
+		});
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5 })] } },
+			observedAt: f.clock.now + 5,
+		});
+		vi.advanceTimersByTime(30);
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		expect(manifests[0]?.terminal.kind).toBe("unknown");
+		expect(manifests[0]?.recovery.root.kind).toBe("known");
+		expect(rig.capture.stats().unmatched["async-ack-stock"]).toBeGreaterThan(0);
+		expect(rig.capture.stats().unmatched["async-stock-unproven"]).toBeGreaterThan(0);
+	});
+
+	test("an execution proof naming another owner is refused", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
+		const execution = nativeExecution({ jobId: "W1", owner: "Other" });
+		observeExecutionAck(rig, built, execution);
+		vi.advanceTimersByTime(30);
+		const manifests = await sealed(rig);
+		expect(manifests).toHaveLength(1);
+		expect(manifests[0]?.bundle.kind).toBe("unknown");
+		if (manifests[0]?.bundle.kind === "unknown") expect(manifests[0].bundle.problem.code).toBe("async-ack-unproven");
 	});
 
 	test("a journal refusal is an unavailable diagnostic, never a durable capture", async () => {
@@ -827,6 +1504,7 @@ describe("async carrier join", () => {
 		const built = await admissionFor(f);
 		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -849,6 +1527,7 @@ describe("async carrier join", () => {
 		rig.capture.track(first.admission);
 		rig.capture.track(second.admission);
 		for (const [built, handle] of [[first, "W1"], [second, "W2"]] as const) {
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
 			rig.capture.observeSync({
 				director: built.admission.director,
 				toolCallId: "call-1",
@@ -861,6 +1540,182 @@ describe("async carrier join", () => {
 		expect(new Set(manifests.map(manifest => manifest.admission.candidateId)).size).toBe(2);
 		expect(manifests[0]?.bundle.kind).toBe("root-only");
 		expect(manifests[1]?.bundle.kind).toBe("root-only");
+	});
+});
+
+describe("native effect end", () => {
+	test("an exact sync terminal releases once even when the capture is recovery-only", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.journal.fail = true;
+		rig.capture.track(built.admission);
+		const result = syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] });
+		rig.capture.observeSync({ director: built.admission.director, toolCallId: "call-1", results: [result], observedAt: f.clock.now });
+		expect(ended).toHaveLength(1);
+		expect(ended[0]?.candidateId).toBe(built.admission.candidateId);
+		rig.capture.observeSync({ director: built.admission.director, toolCallId: "call-1", results: [result], observedAt: f.clock.now + 1 });
+		expect(ended).toHaveLength(1);
+		await rig.capture.drain();
+		vi.advanceTimersByTime(30);
+		await rig.capture.drain();
+		expect(ended).toHaveLength(1);
+		expect(rig.journal.manifests).toHaveLength(0);
+		expect(rig.updates.some(update => update.kind === "unavailable")).toBe(true);
+		rig.capture.stop();
+	});
+
+	test("a sync result without an exit code keeps the slot held until an exact terminal arrives", async () => {
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const built = await admissionFor(f);
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", exitCode: null, patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		expect(ended).toHaveLength(0);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now + 1,
+		});
+		expect(ended).toHaveLength(1);
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now + 2,
+		});
+		expect(ended).toHaveLength(1);
+		rig.capture.stop();
+	});
+
+	test("an ack-linked exact terminal releases once; replays do not release again", async () => {
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const built = await admissionFor(f);
+		rig.capture.track(built.admission);
+		const execution = nativeExecution({ jobId: "W1" });
+		observeExecutionAck(rig, built, execution);
+		expect(ended).toHaveLength(0);
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
+		});
+		expect(ended).toHaveLength(1);
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5, execution })] } },
+			observedAt: f.clock.now + 5,
+		});
+		expect(ended).toHaveLength(1);
+		rig.capture.stop();
+	});
+
+	test("a terminal buffered before the ack releases only when the ack exact-binds it", async () => {
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const built = await admissionFor(f);
+		rig.capture.track(built.admission);
+		const execution = nativeExecution({ jobId: "W1" });
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5, execution })] },
+			observedAt: f.clock.now + 4,
+		});
+		expect(ended).toHaveLength(0);
+		observeExecutionAck(rig, built, execution);
+		expect(ended).toHaveLength(1);
+		rig.capture.stop();
+	});
+
+	test("stock rows and an ack without a terminal never release the slot", async () => {
+		vi.useFakeTimers();
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const stockBuilt = await admissionFor(f, { handle: "W1", dispatch: "attempt:A", toolCallId: "call-a" });
+		const ackOnlyBuilt = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-b" });
+		const stockPath = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const ackOnlyPath = await patch(f, "W2", "diff --git a/b b/b\n+B\n");
+		for (const built of [stockBuilt, ackOnlyBuilt]) {
+			rig.capture.track(built.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		}
+		rig.capture.observeRegistry(registrySnapshot(f, stockBuilt.admission, { history: { patchPath: stockPath, nestedPatchPaths: [] } }));
+		observeAck(rig, stockBuilt, asyncAck({ jobId: "W1" }));
+		rig.capture.observeAsync({
+			director: stockBuilt.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: "W1", settledAtMs: f.clock.now + 4, durationMs: 5 })] },
+			observedAt: f.clock.now + 4,
+		});
+		rig.capture.observeAsync({
+			director: stockBuilt.admission.director,
+			carrier: "push",
+			details: { details: { jobs: [pushJob({ jobId: "W1", durationMs: 5 })] } },
+			observedAt: f.clock.now + 5,
+		});
+		rig.capture.observeRegistry(registrySnapshot(f, ackOnlyBuilt.admission, { history: { patchPath: ackOnlyPath, nestedPatchPaths: [] } }));
+		observeExecutionAck(rig, ackOnlyBuilt, nativeExecution({ jobId: "W2", handle: "W2" }));
+		expect(ended).toHaveLength(0);
+		await rig.capture.drain();
+		vi.advanceTimersByTime(30);
+		await rig.capture.drain();
+		expect(ended).toHaveLength(0);
+		rig.capture.stop();
+	});
+
+	test("an exact sync result with the wrong call/index/handle never releases the slot", async () => {
+		const f = await fixture();
+		const ended: FrozenIntegrationAdmission[] = [];
+		const rig = captureRig(f, { onNativeEnded: admission => { ended.push(admission); } });
+		const built = await admissionFor(f, { itemIndex: 1 });
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		rig.capture.track(built.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
+		rig.capture.observeSync({
+			director: built.admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", index: 0, patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		expect(ended).toHaveLength(0);
+		rig.capture.stop();
+	});
+
+	test("a throwing release callback is counted, not retried or allowed to break capture", async () => {
+		const f = await fixture();
+		let calls = 0;
+		const rig = captureRig(f, {
+			onNativeEnded: () => {
+				calls += 1;
+				throw new Error("release failed");
+			},
+		});
+		const built = await admissionFor(f);
+		rig.capture.track(built.admission);
+		const result = syncResult({ handle: "W1", exitCode: 0, nestedPatchPaths: [], nestedPatches: [] });
+		rig.capture.observeSync({ director: built.admission.director, toolCallId: "call-1", results: [result], observedAt: f.clock.now });
+		rig.capture.observeSync({ director: built.admission.director, toolCallId: "call-1", results: [result], observedAt: f.clock.now + 1 });
+		expect(calls).toBe(1);
+		expect(rig.capture.stats().unmatched["native-ended-callback-failed"]).toBe(1);
+		rig.capture.stop();
 	});
 });
 
@@ -914,6 +1769,7 @@ describe("owned bytes", () => {
 		const rig = captureRig(f);
 		const path = await patch(f, "W1", "owned\n");
 		rig.capture.track(built.admission);
+		claimCapture(rig, f, built);
 		rig.capture.observeSync({
 			director: built.admission.director,
 			toolCallId: "call-1",
@@ -1106,6 +1962,8 @@ describe("scale and bounded refusal", () => {
 		const second = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-b" });
 		rig.capture.track(first.admission);
 		rig.capture.track(second.admission);
+		rig.capture.observeClaim(entryFor(f), claimFor(f, first.admission));
+		rig.capture.observeClaim(entryFor(f), claimFor(f, second.admission));
 		rig.capture.observeSync({
 			director: first.admission.director,
 			toolCallId: "call-a",
@@ -1134,6 +1992,7 @@ describe("scale and bounded refusal", () => {
 			const value = await admissionFor(f, { handle: `W${index}`, dispatch: `attempt:${index}`, toolCallId: `call-${index}` });
 			built.push({ handle: `W${index}`, admission: value.admission });
 			rig.capture.track(value.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, value.admission));
 			if (index === 3) continue;
 			const path = await patch(f, `W${index}`, `patch-${index}\n`);
 			rig.capture.observeSync({
@@ -1155,6 +2014,7 @@ describe("scale and bounded refusal", () => {
 			const handle = `N${index}`;
 			const built = await admissionFor(f, { handle, dispatch: `attempt:${index}`, toolCallId: `call-${index}` });
 			rig.capture.track(built.admission);
+			rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
 			const path = await patch(f, handle, `small-${index}\n`);
 			rig.capture.observeSync({
 				director: built.admission.director,
