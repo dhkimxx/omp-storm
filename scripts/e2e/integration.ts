@@ -19,14 +19,12 @@
  *   judgment: an integrated change row through the existing evaluator, a strict integrated dependency before/after
  *            the receipt, and an outside equal postimage that is present but unattributed (no receipt, no acceptance).
  *
- * Not run by default: the managed-launch carrier/writer/judgment scenarios on stock 19.2.1 (`INTEGRATION_MANAGED_LAUNCH=1`
- * after the host seam), the 16-lane main-thread/pooled measurement and the 100-candidate scale case (`E2E_SCALE=1`).
- * The pin script and this file report them as blocked/not-run; no suite run is reported as a release proof.
+ * The managed-launch scenarios require a host with the guarded native slot and child-entry capability
+ * (`INTEGRATION_MANAGED_LAUNCH=1`). Run physical worker overlap separately in `integration-scale.ts`.
  *
  * Usage:
- *   E2E_ONLY="carrier: sync" ./node_modules/.bin/bun scripts/e2e/integration.ts
+ *   E2E_ONLY="carrier: sync root-only" ./node_modules/.bin/bun scripts/e2e/integration.ts
  *   INTEGRATION_GROUP=write ./node_modules/.bin/bun scripts/e2e/integration.ts
- *   E2E_SCALE=1 ./node_modules/.bin/bun scripts/e2e/integration.ts
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -40,7 +38,6 @@ import { FACT_FILE, seedFact } from "./typed-fixture.ts";
 
 const REASON = "통합 E2E: 부모 트리와 분리된 구현 체크아웃";
 const GROUP = process.env.INTEGRATION_GROUP?.trim().toLowerCase();
-const SCALE = process.env.E2E_SCALE === "1";
 /** Stock 19.2.1 has no per-dispatch native backend proof; the carrier/writer scenarios stay unrun until the seam is real. */
 const MANAGED_LAUNCH = process.env.INTEGRATION_MANAGED_LAUNCH === "1";
 
@@ -1008,16 +1005,10 @@ async function main(): Promise<void> {
 	if (include("judgment", "judgment: need integrated")) await suite.step("judgment: a strict integrated consumer waits for the receipt", judgmentNeedIntegrated, 420_000);
 	if (include("judgment", "judgment: outside")) await suite.step("judgment: an outside equal postimage is unattributed", judgmentOutside, 300_000);
 	} else {
-		console.log("GATE carrier/write/judgment: BLOCKED — stock 19.2.1 has no per-dispatch native backend proof; set INTEGRATION_MANAGED_LAUNCH=1 only after the host seam. The policy refusal controls below still run.");
+		console.log("GATE carrier/write/judgment: BLOCKED — stock 19.2.1 lacks the guarded native dispatch capability; use INTEGRATION_MANAGED_LAUNCH=1 only with a compatible host.");
 	}
 
-	if (SCALE) {
-		console.log("GATE scale-16: not-run — E2E_SCALE=1 was set, but the real 16-lane/pooled measurement is still a coordinator release decision; run it separately with the main-thread control profile.");
-		console.log("GATE scale-100: not-run — no deterministic 100-candidate fixture is wired into this run; use the approved host-event fixture plus the real subset.");
-	} else {
-		console.log("GATE scale-16: not-run — set E2E_SCALE=1 to run the 16-lane main-thread control and the default pooled stop.");
-		console.log("GATE scale-100: not-run — set E2E_SCALE=1 with the approved 100-candidate fixture.");
-	}
+	console.log("GATE scale: separate scenario — use scripts/e2e/integration-scale.ts with the guarded native host.");
 	await suite.step("omp exit codes", async () => {
 		check("every omp session exited 0", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);
 	});

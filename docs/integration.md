@@ -118,7 +118,7 @@ OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bu
 `SOURCE-REVIEWED`로만 인용한다. `backend-late-read`는 `BLOCKED`, 미실행 시나리오는 `NOT-RUN`이다.
 실제 캐리어·쓰기·판정은 `integration.ts`에서 시나리오별로 검증한다.
 
-### 이 저장소에서 마지막으로 확인한 값 (2026-11-28)
+### 초기 배포본 소스·프로필 고정값 (2026-11-28)
 
 | 항목 | 값 |
 |---|---|
@@ -137,4 +137,6 @@ OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bu
 
 별도로 빌드한 비공개 `omp/19.2.1`에서는 동기·`wait`·푸시와 혼합 배치, 빈 `wait` 중복 방지, 정확한 후보 상세,
 사용자의 기존 변경·인덱스를 보존하는 설치, 삭제 거부, 설치 영수증에 따른 수용과 `need: integrated`를 실제 세션에서 확인했다.
+`task.workerThreads: 0` 통제에서는 4·8·16개 작업자의 모델 요청과 셸이 각각 실제로 겹쳤다.
+각 시나리오에서 작업자 수만큼 물리 체크아웃·봉인·사본이 확인됐고, 선택하지 않은 부모 트리는 그대로였다.
 이 검증은 배포본의 호스트 경계를 바꾸지 않으며, 기본 작업자 풀에서의 100개 동시 실행을 증명하지 않는다.
