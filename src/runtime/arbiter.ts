@@ -67,6 +67,8 @@ export function holderPhrase(view: HolderView): string {
 			return "감독의 셸 명령";
 		case "director-path":
 			return DIRECTOR_EDITING;
+		case "integration":
+			return "부모 트리 통합 적용";
 		default: {
 			const lane = view.lane === undefined ? "계획에 없는 워커" : `'${view.lane}' 레인`;
 			if (view.awaiting === true) return `${lane} 후속 작업(시작 전)`;
@@ -86,6 +88,7 @@ function waitFor(view: HolderView): string {
 		case "director-exec":
 		case "director-bg":
 		case "director-path":
+		case "integration":
 			return "";
 		default:
 			return WORKER_WAIT;

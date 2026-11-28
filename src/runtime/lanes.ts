@@ -22,6 +22,7 @@ import type {
 	LaneResultKind,
 	LiveCheck,
 	PlanLane,
+	PlanLaneDependency,
 	RunPlan,
 	RunResult,
 	SpawnRecord,
@@ -245,6 +246,12 @@ export interface LaneReadiness {
 	running: boolean;
 	/** The lane's admitted native agent id, so a consumer can read `agent://<id>` without a path guess. */
 	handle?: string;
+	/**
+	 * The whole lane runs in its own checkout. Its `integrated` flag and every result row then stand on a current
+	 * integration receipt, and an `integrated` consumer edge is strict: no pending result, retained artifact or
+	 * resultless "settled" state may start it.
+	 */
+	isolated?: true;
 }
 
 export type LaneReadinessView = ReadonlyMap<string, LaneReadiness>;
@@ -770,6 +777,38 @@ function shortfallAdvice(need: LaneNeed, state: LaneReadiness): string {
 	return notes.size === 0 ? "그 결과가 충족된 뒤 다시 보내세요." : [...notes].slice(0, 2).join(" ");
 }
 
+/** Whether this producer's facts stand for an isolated lane whose integrated edge needs a current typed receipt. */
+function isolatedProducer(state: LaneReadiness): boolean {
+	return state.isolated === true || state.results.some(result => result.isolated === true);
+}
+
+/**
+ * The strict `integrated` edge of an isolated producer: every declared result must be accepted and verifiably carried
+ * by the current integrated tree, or a resultless lane must have a settled, integrated footprint. A running producer,
+ * a pending row, a retained-only artifact and a missing footprint are not proof and never start the consumer.
+ */
+function strictIntegratedShortfall(state: LaneReadiness): string | undefined {
+	if (state.running) return "그 레인의 워커가 아직 실행 중이라 현재 통합 결과가 확정되지 않았습니다";
+	if (state.results.length === 0) {
+		return state.settled && state.integrated ? undefined : "현재 부모 트리에서 확인된 통합 영수증이 없습니다";
+	}
+	const open = state.results.filter(result => result.state !== "accepted" || !result.integrated);
+	if (open.length === 0) return undefined;
+	return open
+		.slice(0, 3)
+		.map(result => {
+			const marker = result.state === "accepted" ? "통합 미확인" : STATE_LABEL[result.state];
+			const why = result.reason === undefined || result.reason.trim() === "" ? "" : `: ${result.reason.replace(/[.。]+$/u, "")}`;
+			return `${result.id}(${marker}${why})`;
+		})
+		.join(", ") + (open.length > 3 ? ` 외 ${open.length - 3}건` : "");
+}
+
+/** The refusal of an isolated producer's `integrated` edge; the same sentence from the placement gate and start check. */
+function strictIntegratedBlock(lane: PlanLane, dependency: PlanLaneDependency, shortfall: string): string {
+	return `'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL.integrated} 조건이 현재 통합 영수증으로 확인되지 않았습니다: ${shortfall}. 격리 작업은 선택해 부모 트리에 적용한 뒤 그 결과로만 이어갈 수 있습니다. 적용과 판정이 끝난 뒤 다시 스폰하세요.`;
+}
+
 /** Whether one prerequisite lane's current ledger facts satisfy the edge; a missing row is never satisfied. */
 function dependencyShortfall(need: LaneNeed, state: LaneReadiness): string | undefined {
 	// A lane that is still working may change the result the consumer would read. Its prior row is not final input.
@@ -814,6 +853,10 @@ export function dependencyBlock(lane: PlanLane, readiness: LaneReadinessView | u
 		}
 		const shortfall = dependencyShortfall(dependency.need, state);
 		if (shortfall === undefined) continue;
+		if (dependency.need === "integrated" && isolatedProducer(state)) {
+			const strict = strictIntegratedShortfall(state);
+			if (strict !== undefined) return strictIntegratedBlock(lane, dependency, strict);
+		}
 		// A fixed noun sits between each inserted value and its particle, so the sentence is grammatical whatever is inserted.
 		return `'${lane.name}' 레인은 선행 '${dependency.lane}' 레인의 ${NEED_LABEL[dependency.need]} 조건이 충족되지 않았습니다: ${shortfall}. ${shortfallAdvice(dependency.need, state)} 선행을 대신 실행하거나 같은 이름으로 결과를 주장하지 마세요.`;
 	}
@@ -857,6 +900,13 @@ export function dependencyStart(lane: PlanLane, readiness: LaneReadinessView | u
 		if (state === undefined) return { ok: false, reason: dependencyBlock(lane, readiness) ?? "" };
 		const shortfall = dependencyShortfall(dependency.need, state);
 		if (shortfall === undefined) continue;
+		// An isolated producer's integrated edge is never satisfied by speculation: a pending or retained result does
+		// not become a current receipt by starting the consumer earlier.
+		if (dependency.need === "integrated" && isolatedProducer(state)) {
+			const strict = strictIntegratedShortfall(state);
+			if (strict !== undefined) return { ok: false, reason: strictIntegratedBlock(lane, dependency, strict) };
+			continue;
+		}
 		const open = openResults(dependency.need, state);
 		// Nothing open and the worker not running means the shortfall is something else (a kindless view's integration):
 		// the record ties none of it, so it is refused like the cases above.
@@ -1058,6 +1108,8 @@ function heldBy(entry: { kind?: HolderKind; lane?: string }): string {
 			return "실행 중인 필수 검사";
 		case "fence":
 			return "끝났는지 확인되지 않은 정형 작업이나 검사";
+		case "integration":
+			return "부모 트리 통합 적용";
 		default:
 			return earlierWriter(entry.lane);
 	}
@@ -1065,7 +1117,14 @@ function heldBy(entry: { kind?: HolderKind; lane?: string }): string {
 
 /** The scope every non-worker holder has: it can change the shared tree anywhere. */
 function holderScope(kind: Exclude<HolderKind, "director-path">): WriteScope {
-	return { kind: "unknown", why: kind === "director-exec" || kind === "director-bg" ? WHY_DIRECTOR_COMMAND : WHY_HOST_COMMAND };
+	return {
+		kind: "unknown",
+		why: kind === "director-exec" || kind === "director-bg"
+			? WHY_DIRECTOR_COMMAND
+			: kind === "integration"
+				? "선택한 격리 작업을 부모 트리에 적용하는 중"
+				: WHY_HOST_COMMAND,
+	};
 }
 
 interface WriteReservation {
@@ -1285,6 +1344,22 @@ export const PLACEMENT_CHANGED_REASON =
 
 const liveLanes = sharedMap<string, WeakRef<RunLanes>>("storm.lanes.liveLanes");
 
+/**
+ * The synchronous view the table needs of a target's unresolved integration fence. `clear` is a positive observation;
+ * an unreadable or never-observed fence is `unknown`, which refuses every shared writer. The asynchronous writer
+ * re-checks the durable pointer at its own effect boundary; this view only prevents an ordinary writer from entering
+ * the table beside a known fence.
+ */
+export type IntegrationFenceState =
+	| { readonly kind: "clear" }
+	| { readonly kind: "fenced"; readonly reason: string }
+	| { readonly kind: "unknown"; readonly reason: string };
+
+/** The live table of a run in this process, for the integration writer's synchronous holder step. */
+export function runLanes(runId: string): RunLanes | undefined {
+	return liveLanes.get(runId)?.deref();
+}
+
 /** A finished run's key leaves the shared registry; the object itself goes with the controller that owned it. */
 export function forgetRunLanes(runId: string): void {
 	liveLanes.delete(runId);
@@ -1495,6 +1570,14 @@ export class RunLanes {
 	 * that settles is not free yet: the host is still cancelling and reaping what the worker left, inside that call.
 	 */
 	readonly #openCalls = new Set<string>();
+	/**
+	 * The target this run's shared writers use and the synchronous state of its unresolved integration fence. Absent
+	 * for phase-3 callers and tests: those keep the old table semantics. When present, every shared writer and the
+	 * integration holder refuse while the fence is fenced or unknown.
+	 */
+	#integrationBinding:
+		| { readonly root: string; readonly fence: () => IntegrationFenceState }
+		| undefined = undefined;
 	#serial = 0;
 	#holdSerial = 0;
 	#placementSerial = 0;
@@ -1507,6 +1590,32 @@ export class RunLanes {
 	 */
 	constructor(readonly runId: string, private readonly hostJobs?: HostJobSource) {
 		liveLanes.set(runId, new WeakRef(this));
+	}
+
+	/**
+	 * Binds the physical target and its integration-fence view to this run's table. Called once by the wiring that also
+	 * owns the durable fence; a second call for a different target is refused so one table can never check two roots.
+	 */
+	bindIntegration(target: { readonly root: string; readonly fence: () => IntegrationFenceState }): boolean {
+		if (this.#integrationBinding !== undefined && this.#integrationBinding.root !== target.root) return false;
+		this.#integrationBinding = Object.freeze({ root: target.root, fence: target.fence });
+		return true;
+	}
+
+	/** Why a shared writer may not enter now because the target's integration fence is not proved clear. */
+	#fenceBlock(): string | undefined {
+		const binding = this.#integrationBinding;
+		if (binding === undefined) return undefined;
+		let state: IntegrationFenceState;
+		try {
+			state = binding.fence();
+		} catch {
+			state = { kind: "unknown", reason: "통합 펜스 상태를 확인할 수 없습니다" };
+		}
+		if (state.kind === "clear") return undefined;
+		return state.kind === "fenced"
+			? `이 대상에 끝났는지 확인되지 않은 통합 적용이 남아 있어 같은 트리에 쓰는 작업을 시작하지 않았습니다(${state.reason}). 통합 상태를 확인해 펜스를 정리한 뒤 다시 시도하세요.`
+			: `이 대상의 통합 펜스 상태를 확인할 수 없어 같은 트리에 쓰는 작업을 시작하지 않았습니다(${state.reason}). 확인 전에는 시작하지 마세요.`;
 	}
 
 	/**
@@ -1800,6 +1909,13 @@ export class RunLanes {
 			this.#releaseSpawn(spawnKey, laneName, "refused");
 			return { ok: false, code: "lane-write", reason: "omp가 이 세션의 백그라운드 작업 목록을 주지 않아 공유 쓰기 워커를 시작하지 않았습니다. 작업 목록을 확인할 수 있게 되면 다시 시도하세요." };
 		}
+		if (recheck) {
+			const fenced = this.#fenceBlock();
+			if (fenced !== undefined) {
+				this.#releaseSpawn(spawnKey, laneName, "refused");
+				return { ok: false, code: "lane-write", reason: fenced };
+			}
+		}
 		// A1-2: at admission every shared writer is checked again against everything that holds the tree now, its own
 		// reservation excepted. A host job or another call's writer can become visible between placement and this hook,
 		// and a timer lapse is never the only way into the check.
@@ -1873,6 +1989,8 @@ export class RunLanes {
 	): { ok: true; notes: string[] } | { ok: false; reason: string; code: LaneBlockCode; retry: boolean } {
 		const now = options.now ?? Date.now();
 		this.#pruneWrites(options.agents, now);
+		const fenced = this.#fenceBlock();
+		if (fenced !== undefined) return { ok: false, reason: fenced, code: "lane-write", retry: false };
 		const scopes = placed;
 		const notes: string[] = [];
 		for (const entry of scopes) {
@@ -2239,6 +2357,8 @@ export class RunLanes {
 	commitDirectorExec(input: { callId: string; agents?: readonly AgentEntry[]; now: number }): { ok: true } | { ok: false; reason: string } {
 		if (this.hostJobs?.() === undefined) return { ok: false, reason: DIRECTOR_BLIND_REASON };
 		this.#pruneWrites(input.agents, input.now);
+		const fenced = this.#fenceBlock();
+		if (fenced !== undefined) return { ok: false, reason: fenced };
 		for (const reservation of this.#writes.values()) {
 			if (reservation.kind === "director-exec" || reservation.kind === "director-bg") continue;
 			// The director's own path edit holds until its message's calls are over; say so rather than "wait for it".
@@ -2263,6 +2383,8 @@ export class RunLanes {
 	 */
 	commitHolder(input: { kind: "job" | "check"; key: string; now: number; agents?: readonly AgentEntry[] | undefined }): { ok: true } | { ok: false; reason: string } {
 		this.#pruneWrites(input.agents, input.now);
+		const fenced = this.#fenceBlock();
+		if (fenced !== undefined) return { ok: false, reason: fenced };
 		for (const [key, reservation] of this.#writes) {
 			if (key === `${input.kind}:${input.key}`) continue;
 			if (reservation.kind === "director-path") return { ok: false, reason: directorEditWait(input.kind === "job" ? "정형 작업" : "필수 검사") };
@@ -2285,6 +2407,95 @@ export class RunLanes {
 	fenceHolder(kind: "job" | "check", key: string): void {
 		this.#writes.delete(`${kind}:${key}`);
 		this.#writes.set(`fence:${key}`, { scope: holderScope("fence"), kind: "fence", at: Date.now() });
+	}
+
+	/**
+	 * The one synchronous step that admits an integration segment as an exclusive writer of the shared tree. The caller
+	 * holds the canonical write lease and has already proved the durable fence clear; this step proves the live run and
+	 * deadline, applies the host/agent snapshot, refuses any other live entry, and publishes the holder. Nothing yields
+	 * between the checks and the entry, so a worker, a job, a check, a director call or a second integration segment
+	 * meeting this step in either order sees one writer.
+	 */
+	commitIntegration(input: {
+		readonly key: string;
+		readonly live: () => LiveCheck;
+		readonly now: number;
+		readonly agents?: readonly AgentEntry[];
+		readonly deadline?: number;
+	}): { ok: true } | { ok: false; code: "lane-write" | "deadline" | "run-ending"; reason: string } {
+		let live: LiveCheck;
+		try {
+			live = input.live();
+		} catch {
+			live = { ok: false, reason: DIRECTOR_WRITE_ENDING };
+		}
+		if (!live.ok) return { ok: false, code: "run-ending", reason: live.reason };
+		if (input.deadline !== undefined && !(input.now < input.deadline)) {
+			return { ok: false, code: "deadline", reason: DIRECTOR_WRITE_LATE };
+		}
+		this.#pruneWrites(input.agents, input.now);
+		const fenced = this.#fenceBlock();
+		if (fenced !== undefined) return { ok: false, code: "lane-write", reason: fenced };
+		const own = `integration:${input.key}`;
+		for (const [key, reservation] of this.#writes) {
+			if (key === own) continue;
+			if (reservation.kind === "director-path") {
+				return { ok: false, code: "lane-write", reason: directorEditWait("통합 적용") };
+			}
+			if (reservation.kind === "fence") {
+				return {
+					ok: false,
+					code: "lane-write",
+					reason: "끝났는지 확인되지 않은 정형 작업이나 검사가 같은 작업 트리에 남아 있어 통합 적용을 시작하지 않았습니다. 그 상태를 확인한 뒤 다시 시도하세요.",
+				};
+			}
+			const other = heldBy(reservation);
+			return {
+				ok: false,
+				code: "lane-write",
+				reason: `${withJosa(other, "이/가")} 같은 작업 트리에서 실행 중이라 통합 적용을 시작하지 않았습니다. 끝난 뒤 다시 시도하세요.`,
+			};
+		}
+		this.#writes.set(own, { scope: holderScope("integration"), kind: "integration", at: input.now });
+		return { ok: true };
+	}
+
+	/**
+	 * The final synchronous boundary before an integration effect: the segment's own entry must still be the one this
+	 * call published, the caller's live check must pass and the fence must still read clear. A failure never removes
+	 * the entry; the caller fences or finishes its segment.
+	 */
+	recheckIntegration(input: {
+		readonly key: string;
+		readonly live: () => LiveCheck;
+		readonly now: number;
+		readonly deadline?: number;
+	}): LiveCheck {
+		if (this.#writes.get(`integration:${input.key}`)?.kind !== "integration") {
+			return { ok: false, reason: "통합 적용 자리가 더 이상 이 실행의 것이 아닙니다." };
+		}
+		if (input.deadline !== undefined && !(input.now < input.deadline)) {
+			return { ok: false, reason: DIRECTOR_WRITE_LATE };
+		}
+		let live: LiveCheck;
+		try {
+			live = input.live();
+		} catch {
+			live = { ok: false, reason: DIRECTOR_WRITE_ENDING };
+		}
+		if (!live.ok) return live;
+		const fenced = this.#fenceBlock();
+		return fenced === undefined ? { ok: true } : { ok: false, reason: fenced };
+	}
+
+	/** Whether this exact segment still holds the table entry; no fence is consulted (the segment's own fence exists). */
+	integrationHeld(key: string): boolean {
+		return this.#writes.get(`integration:${key}`)?.kind === "integration";
+	}
+
+	/** The end of the bounded table holder only. Recovery fences and the run lease are independent of it. */
+	releaseIntegration(key: string): void {
+		if (this.#writes.delete(`integration:${key}`)) this.#writerFreed = true;
 	}
 
 	/** What a refusal reads of one entry: its kind and, for a worker, its lane and how far it got. */
@@ -2322,6 +2533,8 @@ export class RunLanes {
 		}
 		if (!proof.ok) return { ok: false, code: "run-ending", reason: proof.reason };
 		if (input.deadline !== undefined && !(input.now < input.deadline)) return { ok: false, code: "deadline", reason: DIRECTOR_WRITE_LATE };
+		const fenced = this.#fenceBlock();
+		if (fenced !== undefined) return { ok: false, code: "lane-write", reason: fenced, holder: {} };
 		const paths = [...new Set(input.paths.filter(path => path !== ""))].sort();
 		if (paths.length === 0) return { ok: false, code: "no-target", reason: DIRECTOR_WRITE_NO_TARGET };
 		this.#pruneWrites(input.agents, input.now);

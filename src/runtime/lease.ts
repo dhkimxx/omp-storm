@@ -363,6 +363,46 @@ function defaultLeaseDir(): string {
 }
 
 /**
+ * The one lease namespace a caller uses. Integration fences live under the same namespace so a later session can find
+ * a failed target write by the canonical worktree identity, not by a run id or a session store it cannot read.
+ */
+export function leaseNamespace(deps: LeaseDeps = {}): string {
+	return deps.dir !== undefined ? deps.dir : defaultLeaseDir();
+}
+
+/** The canonical worktree identity the lease and the integration fence both key on. */
+export interface CanonicalWorktree {
+	/** Real path of the worktree top level. */
+	readonly root: string;
+	/** `sha256("<dev>:<ino>")`: the same key the lease record uses. */
+	readonly key: string;
+	/** Decimal device and inode, never rounded through a JS number. */
+	readonly device: string;
+	readonly inode: string;
+}
+
+/**
+ * Canonicalizes an existing worktree top level for a fence lookup. `undefined` means the path is gone, unreadable or
+ * not a directory: a caller must not read that as "no fence". The key matches `canonicalizeRoot` exactly, so a symlink
+ * alias, a differently cased path and a linked worktree resolve to one physical identity.
+ */
+export async function canonicalWorktree(root: string): Promise<CanonicalWorktree | undefined> {
+	try {
+		const real = await fs.realpath(root);
+		const st = await fs.stat(real, { bigint: true });
+		if (!st.isDirectory()) return undefined;
+		return {
+			root: real,
+			key: createHash("sha256").update(`${st.dev}:${st.ino}`).digest("hex"),
+			device: st.dev.toString(),
+			inode: st.ino.toString(),
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * The path a not-yet-created directory will have once its existing ancestor is resolved: catches a parent symlink
  * that points inside the worktree before anything is created there.
  */

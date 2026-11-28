@@ -627,8 +627,17 @@ export type ToolBlockCode = "director-edit" | "director-write" | "read-large" | 
  * - `director-exec`, `director-bg`: the director's own command, in the foreground or sent to the background.
  * - `job`, `check`: a host process Storm runs, a configured job or a required check.
  * - `fence`: one of those whose process end is not proven.
+ * - `integration`: the one selected parent write of an integration segment; it ends only with its own proved
+ *   terminal record or fence resolution, never with a timer.
  */
-export type HolderKind = "director-path" | "director-exec" | "director-bg" | "job" | "check" | "fence";
+export type HolderKind =
+	| "director-path"
+	| "director-exec"
+	| "director-bg"
+	| "job"
+	| "check"
+	| "fence"
+	| "integration";
 
 /** What a caller proves, in the synchronous step that commits a writer, about the run it acts for. */
 export type LiveCheck = { ok: true } | { ok: false; reason: string };

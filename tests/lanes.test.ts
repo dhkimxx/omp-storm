@@ -536,6 +536,56 @@ test("the start check reports each unmet prerequisite and never refuses a state 
 	expect(dependencyStart(lane, vanished).ok).toBe(false);
 });
 
+test("an isolated producer's integrated edge needs a current receipt, never a pending or retained result", () => {
+	const edge = consumer("integrated");
+	const state = (over: {
+		results?: readonly { id: string; kind?: "change" | "answer"; state: "pending" | "unmet" | "reviewable" | "accepted"; integrated: boolean; isolated?: true; retained?: { ref: string; path: string; kind: "patch" } }[];
+		settled?: boolean;
+		integrated?: boolean;
+		running?: boolean;
+	}) => new Map([["producer", {
+		results: over.results ?? [],
+		settled: over.settled ?? true,
+		integrated: over.integrated ?? false,
+		running: over.running ?? false,
+		isolated: true as const,
+	}]]);
+	const row = (stateName: "pending" | "accepted", integrated: boolean, extra: { retained?: { ref: string; path: string; kind: "patch" } } = {}) => ({
+		id: "r1", kind: "change" as const, state: stateName, integrated, isolated: true as const, path: "out.txt", ...extra,
+	});
+	const pending = state({ results: [row("pending", false)] });
+	expect(dependencyStart(edge, pending).ok).toBe(false);
+	expect(dependencyBlock(edge, pending)).toContain("통합 영수증");
+	expect(dependencyStart(edge, state({ results: [row("accepted", false)] })).ok).toBe(false);
+	expect(dependencyStart(edge, state({ results: [row("accepted", false, { retained: { ref: "patch-1", path: "out.txt", kind: "patch" } })] })).ok).toBe(false);
+	expect(dependencyStart(edge, state({ results: [row("accepted", true)] }))).toEqual({ ok: true, notes: [] });
+	expect(dependencyStart(edge, state({ results: [row("accepted", true)], running: true })).ok).toBe(false);
+	expect(dependencyStart(edge, state({ results: [], settled: true, integrated: true }))).toEqual({ ok: true, notes: [] });
+	expect(dependencyStart(edge, state({ results: [], settled: true, integrated: false })).ok).toBe(false);
+});
+
+test("one integration holder is exclusive; a pending job blocks it and a fence blocks both directions", () => {
+	const work = new RunLanes("run-integration");
+	let fence: { kind: "clear" } | { kind: "fenced"; reason: string } = { kind: "clear" };
+	expect(work.bindIntegration({ root: "/tmp/storm-target", fence: () => fence })).toBe(true);
+	expect(work.commitIntegration({ key: "s1", live: () => ({ ok: true }), now: 1 })).toEqual({ ok: true });
+	expect(work.integrationHeld("s1")).toBe(true);
+	expect(work.commitHolder({ kind: "job", key: "job-1", now: 1 }).ok).toBe(false);
+	expect(work.commitDirectorExec({ callId: "call-1", now: 1 }).ok).toBe(false);
+	expect(work.commitWriter({ kind: "director-path", callId: "write-1", paths: ["a.ts"], live: () => ({ ok: true }), now: 1 }).ok).toBe(false);
+	expect(work.commitIntegration({ key: "s2", live: () => ({ ok: true }), now: 1 }).ok).toBe(false);
+	work.releaseIntegration("s1");
+	expect(work.commitHolder({ kind: "job", key: "job-1", now: 1 })).toEqual({ ok: true });
+	expect(work.commitIntegration({ key: "s2", live: () => ({ ok: true }), now: 1 }).ok).toBe(false);
+	work.releaseHolder("job", "job-1");
+	fence = { kind: "fenced", reason: "이전 적용" };
+	expect(work.commitIntegration({ key: "s3", live: () => ({ ok: true }), now: 1 }).ok).toBe(false);
+	expect(work.commitHolder({ kind: "check", key: "check-1", now: 1 }).ok).toBe(false);
+	fence = { kind: "clear" };
+	expect(work.commitIntegration({ key: "s3", live: () => ({ ok: true }), now: 1 })).toEqual({ ok: true });
+	work.releaseIntegration("s3");
+});
+
 test("a shared-write batch is all-or-nothing and a settled worker frees its scope", () => {
 	const shared = plan(
 		{ name: "W0", kind: "run", role: "quick", files: ["shared.txt"] },

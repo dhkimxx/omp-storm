@@ -28,6 +28,55 @@ export interface ContinuedRun {
 
 export type RunRequestResult = { ok: true; runId: string; continued?: ContinuedRun } | { ok: false; reason: string };
 
+
+/** A candidate id as persisted: `c1_` plus 64 lowercase hex, never model text or a path. */
+export const INTEGRATION_CANDIDATE_ID_RE = /^c1_[0-9a-f]{64}$/u;
+/** One `integrate` call accepts 1-128 distinct exact ids. */
+export const INTEGRATION_SELECTION_MAX = 128;
+/** The encoded id list stays at or below 16 KiB. */
+export const INTEGRATION_SELECTION_MAX_BYTES = 16 * 1024;
+/** A read-only run id is a bounded host token, not a path. */
+export const INTEGRATION_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/u;
+
+/**
+ * The exact id list a write request may carry, or the refusal for the whole call. Validation happens
+ * before any writer, fence lookup or queue read: one malformed/duplicate id refuses every id in the
+ * request. Known non-ready ids are per-item skips inside the controller instead.
+ */
+export function integrationIdListProblem(ids: readonly string[]): string | undefined {
+	if (ids.length < 1 || ids.length > INTEGRATION_SELECTION_MAX) {
+		return `통합할 후보 id를 ${INTEGRATION_SELECTION_MAX}개 이하로 1개 이상 정확히 고르세요.`;
+	}
+	const unique = new Set<string>();
+	for (const id of ids) {
+		if (!INTEGRATION_CANDIDATE_ID_RE.test(id)) return "후보 id 형식이 올바르지 않습니다. c1_ 뒤에 소문자 16진수 64자여야 합니다.";
+		if (unique.has(id)) return "같은 후보 id를 두 번 넣었습니다. 각 id를 한 번씩만 넣으세요.";
+		unique.add(id);
+	}
+	if (Buffer.byteLength(JSON.stringify(ids), "utf8") > INTEGRATION_SELECTION_MAX_BYTES) {
+		return "후보 id 목록이 16 KiB를 넘습니다. 더 적은 id를 골라 나눠 요청하세요.";
+	}
+	return undefined;
+}
+
+/** A bounded reply from the integration runtime; the tool maps it to its own outcome type. */
+export interface IntegrationToolReply {
+	readonly outcome: "ok" | "rejected";
+	readonly text: string;
+}
+
+/**
+ * The bounded `candidates`/`integrate` surface. The extension supplies it from the bound A/B/C/D ports;
+ * a host without them refuses both actions rather than reading a model-supplied run or authority.
+ */
+export interface IntegrationToolHost {
+	candidates(
+		input: { readonly candidateId?: string; readonly candidateRunId?: string; readonly candidateAfter?: string },
+		signal?: AbortSignal,
+	): Promise<IntegrationToolReply>;
+	integrate(candidateIds: readonly string[], signal?: AbortSignal): Promise<IntegrationToolReply>;
+}
+
 /**
  * The personal automatic-delegation policy of the native main session that owns a tool call. Consent is read from
  * that session's own store, never derived from team approval: a blocked state keeps the main session's direct tools
@@ -66,6 +115,8 @@ export interface StormToolHost {
 	auto?(): AutoDelegationState;
 	/** Final authorization of an automatic start, after tool reply construction. */
 	checkStartReply?(): string | Promise<string> | undefined;
+	/** Candidate inspection and explicit parent writes; absent when no integration runtime is bound. */
+	integration?: IntegrationToolHost;
 	runtime: {
 		/** Queues a run that starts once the current agent turn settles. */
 		requestRun(spec: RunSpec): RunRequestResult;

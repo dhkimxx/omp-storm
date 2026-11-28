@@ -44,7 +44,14 @@ import { LANE_ADDRESS_HINT, PLAN_LANE_NAMES_SHOWN, PLAN_WORKER_COUNT_NOTE } from
 import { continuedHandoffText } from "../runtime/resume.ts";
 import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, ShadowInfo, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
-import type { ContinuedRun, StormToolHost } from "./host.ts";
+import {
+	INTEGRATION_CANDIDATE_ID_RE,
+	INTEGRATION_RUN_ID_RE,
+	INTEGRATION_SELECTION_MAX,
+	integrationIdListProblem,
+	type ContinuedRun,
+	type StormToolHost,
+} from "./host.ts";
 import { renderPlanView } from "./plan-view.ts";
 
 type Zod = ExtensionAPI["zod"];
@@ -52,17 +59,33 @@ type Zod = ExtensionAPI["zod"];
 export type StormToolSchema = ZodLikeSchema<StormToolInput>;
 
 export type StormToolOutcome = ActionOutcome | "queued";
+/** The integration actions share the one storm tool; they are not a second model-facing surface. */
+export type StormToolIntegrationAction = "candidates" | "integrate";
+export type StormToolAnyAction = StormToolAction | StormToolIntegrationAction;
 export interface StormToolDetails {
-	action: StormToolAction;
+	action: StormToolAnyAction;
 	outcome: StormToolOutcome;
 }
 export type StormToolReply = ActionReply<StormToolOutcome>;
+/** Fields of the integration actions. B adds the same optional names to `StormToolParams`; this local arm keeps E building alone. */
+export interface StormToolIntegrationFields {
+	/** candidates detail: one exact candidate id. */
+	candidateId?: string | undefined;
+	/** candidates: read-only history of one run id; never live authority. */
+	candidateRunId?: string | undefined;
+	/** candidates overview: exclusive exact-ID cursor. */
+	candidateAfter?: string | undefined;
+	/** integrate: 1-128 distinct exact candidate ids. */
+	candidateIds?: readonly string[] | undefined;
+}
 /** `StormToolParams` as the schema parses it: optional fields may come back as explicit `undefined`. */
-export type StormToolInput = { action: StormToolAction } & {
+export type StormToolInput = { action: StormToolAnyAction } & {
 	[K in Exclude<keyof StormToolParams, "action">]?: StormToolParams[K] | undefined;
-};
+} & StormToolIntegrationFields;
 
-const ACTIONS = ["run", "plan", "execute", "brief", "status", "agents", "continue"] as const satisfies readonly StormToolAction[];
+const ACTIONS = ["run", "plan", "execute", "brief", "status", "agents", "continue", "candidates", "integrate"] as const satisfies readonly StormToolAnyAction[];
+const CANDIDATE_ID_MESSAGE = "c1_ 뒤에 소문자 16진수 64자를 쓰는 정확한 후보 id여야 합니다.";
+const RUN_ID_MESSAGE = "영문·숫자로 시작하는 120자 이하의 실행 id여야 합니다.";
 const ROLE_IDS = ROLES.map((r) => r.id) as [RoleId, ...RoleId[]];
 const LANE_KINDS = Object.keys(LANE_ROLES) as [LaneKind, ...LaneKind[]];
 const RESULT_KIND_IDS = RESULT_KINDS as unknown as [LaneResultKind, ...LaneResultKind[]];
@@ -73,18 +96,28 @@ const NEXT_KINDS = ["resume", "run", "user"] as const satisfies readonly Closeou
 const PLUGIN_AGENTS_DIR = fileURLToPath(new URL("../../agents/", import.meta.url));
 
 const DESCRIPTION = `OMP Storm: plan, delegate, close approved work.
-- run {task}: queue the request verbatim, then end the turn.
-- plan {plan}: opens this request's run, which spawns need. Non-review lanes need results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
-- execute {lanes}: planned job lanes, not AI workers; exit and an exact stdout marker prove execution only.
-- brief {brief}: stages result, verification, remaining? and 0-3 next, best first: resume, run {task} for new scope, user {text} for the user; never verifies or ends the run.
-- status: team, approval, runs, approved job names and this run's plan with each result's state.
-- continue: reopens an interrupted run once the user asked to go on; plan's rules, results carried.
+- run {task}: queue the request, then end the turn.
+- plan {plan}: opens this turn's run. Lanes declare results; dependsOn waits for proof. A replan keeps name, kind, role, job, files and goal; progress is status only.
+- execute {lanes}: approved job lanes, not AI workers; exit and an exact stdout marker prove execution only.
+- brief {brief}: stage result, verification, remaining? and 0-3 next, best first; never verifies or ends the run.
+- status: team, approval, runs, approved jobs and this run's plan with each result's state.
+- continue: reopen an interrupted run once the user asked to go on; plan rules, results carried.
 - agents: existing workers and follow-up allowance.
+- candidates/integrate: read this run's isolated candidates, or explicitly land exact current-run ids under this live turn.
 Team changes: /storm.`;
 
 function stormParams(z: Zod): StormToolSchema {
 	return z.object({
 		action: z.enum(ACTIONS).describe("Operation"),
+		candidateId: z.string().regex(INTEGRATION_CANDIDATE_ID_RE, CANDIDATE_ID_MESSAGE).optional().describe("exact id"),
+		candidateRunId: z.string().regex(INTEGRATION_RUN_ID_RE, RUN_ID_MESSAGE).optional().describe("run id"),
+		candidateAfter: z.string().regex(INTEGRATION_CANDIDATE_ID_RE, CANDIDATE_ID_MESSAGE).optional().describe("cursor"),
+		candidateIds: z
+			.array(z.string().regex(INTEGRATION_CANDIDATE_ID_RE, CANDIDATE_ID_MESSAGE))
+			.min(1)
+			.max(INTEGRATION_SELECTION_MAX)
+			.optional()
+			.describe("exact ids"),
 		task: z.string().optional().describe("run: the request verbatim"),
 		lanes: z.array(z.string().min(1).max(MAX_LANE_NAME)).min(1).max(MAX_LANES).optional().describe("execute: planned job lane names"),
 		plan: z
@@ -94,16 +127,16 @@ function stormParams(z: Zod): StormToolSchema {
 						z.object({
 							name: z.string().min(1).max(MAX_LANE_NAME).describe("Unique lane name"),
 							kind: z.enum(LANE_KINDS).describe("explore|code|run|review|design"),
-							role: z.enum(ROLE_IDS).optional().describe("Role for the lane; default from kind"),
-							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("Approved job name; kind run, no AI worker"),
+							role: z.enum(ROLE_IDS).optional().describe("lane role"),
+							job: z.string().max(MAX_CHECK_NAME_LENGTH).optional().describe("approved job name"),
 							files: z.array(z.string()).max(MAX_LANE_FILES).optional().describe("Files the lane may change"),
-							goal: z.string().max(MAX_LANE_TEXT).optional().describe("What the lane delivers; keep on replan"),
+							goal: z.string().max(MAX_LANE_TEXT).optional().describe("what the lane delivers"),
 							isolationReason: z
 								.string()
 								.max(MAX_LANE_TEXT)
 								.optional()
-								.describe("Independent experiment outside the tree; omit to share it"),
-							progress: z.string().max(MAX_LANE_TEXT).optional().describe("Status only; a scope change needs a new name"),
+								.describe("isolated experiment"),
+							progress: z.string().max(MAX_LANE_TEXT).optional().describe("status only; scope change = new name"),
 							results: z
 								.array(
 									z
@@ -117,28 +150,28 @@ function stormParams(z: Zod): StormToolSchema {
 											criterion: z
 												.string()
 												.max(MAX_RESULT_CRITERION)
-												.describe("Visible line the attempt must show; not proof"),
+												.describe("visible line; not proof"),
 											path: z
 												.string()
 												.max(MAX_RESULT_PATH)
 												.optional()
-												.describe("Workspace-relative; pathless change uses files; answer cites a source"),
+												.describe("workspace-relative; answer needs a source"),
 											contains: z
 												.string()
 												.max(MAX_RESULT_CONTAINS)
 												.optional()
-												.describe("Exact literal, whitespace kept; on answer read from the cited source"),
+												.describe("exact literal, whitespace kept"),
 											check: z
 												.string()
 												.optional()
-												.describe("Approved requiredChecks name, never a command"),
+												.describe("approved check name"),
 										})
 										.strict(),
 								)
 								.min(1)
 								.max(MAX_LANE_RESULTS)
 								.optional()
-								.describe("Required on non-review lanes; plan input, not evidence"),
+								.describe("required on non-review lanes"),
 							dependsOn: z
 								.array(
 									z
@@ -146,14 +179,14 @@ function stormParams(z: Zod): StormToolSchema {
 											lane: z.string().min(1).max(MAX_LANE_NAME).describe("Prerequisite lane in this plan"),
 											need: z
 												.enum(LANE_NEED_IDS)
-												.describe("result|integrated|reviewable before this lane starts"),
+												.describe("result|integrated|reviewable"),
 										})
 										.strict(),
 								)
 								.min(1)
 								.max(MAX_LANE_DEPENDENCIES)
 								.optional()
-								.describe("Prerequisite lanes; not proof the need holds"),
+								.describe("prerequisite lanes; not proof"),
 						}),
 					)
 					.max(MAX_LANES)
@@ -165,7 +198,7 @@ function stormParams(z: Zod): StormToolSchema {
 			.describe("plan: lanes and workers"),
 		brief: z
 			.object({
-				result: z.string().max(CLOSEOUT_RESULT_MAX).describe("What the run delivered, with locations"),
+				result: z.string().max(CLOSEOUT_RESULT_MAX).describe("delivered, with locations"),
 				verification: z.string().max(CLOSEOUT_TEXT_MAX).describe("What proves it, with locations"),
 				remaining: z.string().max(CLOSEOUT_RESULT_MAX).optional().describe("Still open; omit if none"),
 				next: z
@@ -192,13 +225,13 @@ function stormParams(z: Zod): StormToolSchema {
 				return remaining === undefined ? { ...rest, next: directions } : { ...rest, remaining, next: directions };
 			})
 			.optional()
-			.describe("brief: result, verification and next directions"),
+			.describe("brief: result, verification, next"),
 	});
 }
 
 export function createStormTool(
 	z: Zod,
-	hostFor: (ctx: ExtensionContext, signal?: AbortSignal) => StormToolHost,
+	hostFor: (ctx: ExtensionContext, signal?: AbortSignal, toolCallId?: string) => StormToolHost,
 ): ToolDefinition<StormToolSchema, StormToolDetails> {
 	return {
 		name: "storm",
@@ -222,7 +255,7 @@ export function createStormTool(
 			if (refusal !== undefined) {
 				return { content: [{ type: "text", text: refusal }], details: { action: params.action, outcome: "rejected" } };
 			}
-			const host = hostFor(ctx, signal);
+			const host = hostFor(ctx, signal, _toolCallId);
 			let reply = await runStormTool(host, params, signal);
 			const cut = host.checkStartReply?.();
 			const lateRefusal = cut instanceof Promise ? await cut : cut;
@@ -246,6 +279,9 @@ const BRIEF_INVALID =
 	"마무리 보고가 올바르지 않습니다. result(결과)와 verification(검증 근거)을 증거 위치와 함께 한 줄씩 적고, next는 서로 다른 0~3개로 다시 제출하세요. 이어 가기는 {kind:\"resume\"}, 새 범위 작업은 {kind:\"run\", task}, 사용자가 직접 할 일은 {kind:\"user\", text}입니다.";
 const BRIEF_NO_HOST =
 	"이 호스트에서는 마무리 보고를 준비할 수 없습니다. 보고 내용은 응답에 직접 적고, 실행 종료는 Storm에 맡기세요.";
+const INTEGRATION_UNAVAILABLE =
+	"이 세션에는 격리 통합 기록이나 쓰기 권한이 연결되어 있지 않습니다. 후보를 만들려면 관리 격리 실행을 시작해야 하고, 그 경로가 이 호스트에서 증명되지 않으면 아무것도 시작하지 않습니다. /storm status로 현재 실행을 확인하세요.";
+const INTEGRATION_SELECTION_REQUIRED = `통합할 후보 id를 1~${INTEGRATION_SELECTION_MAX}개 정확히 넣으세요. 전체·범위·암시적 선택은 받지 않습니다.`;
 const BRIEF_STAGED =
 	"마무리 보고를 준비했습니다. 최종 판정과 실행 종료는 Storm 검증 게이트가 결정하고, 실행이 끝나면 Storm이 공식 결과를 먼저 보여줍니다. 짧고 깨끗하게 끝나면 한 줄 기록만 남으니 평소처럼 설명하고, 미해결·잔여 위험이 있거나 오래 걸린 실행은 카드에 이 보고의 결과와 남은 일이 실리므로 응답은 짧게 마치세요. 응답에 번호 목록을 다시 쓰지 말고, 검증 전에는 검증됐다고 말하지 마세요. 이후 라운드에서 결과가 바뀌면 새 보고로 다시 제출하세요.";
 
@@ -358,6 +394,36 @@ export async function runStormTool(host: StormToolHost, params: StormToolInput, 
 			if (staged === undefined) return rejected(BRIEF_NO_HOST);
 			if (!staged.ok) return rejected(staged.reason);
 			return { outcome: "ok", text: BRIEF_STAGED };
+		}
+		case "candidates": {
+			const integration = host.integration;
+			if (integration === undefined) return rejected(INTEGRATION_UNAVAILABLE);
+			if (params.candidateId !== undefined && params.candidateAfter !== undefined) {
+				return rejected("candidates는 정확한 후보 하나(candidateId)와 목록 커서(candidateAfter)를 함께 받지 않습니다. 하나만 고르세요.");
+			}
+			const reply = await integration.candidates(
+				{
+					...(params.candidateId === undefined ? {} : { candidateId: params.candidateId }),
+					...(params.candidateRunId === undefined ? {} : { candidateRunId: params.candidateRunId }),
+					...(params.candidateAfter === undefined ? {} : { candidateAfter: params.candidateAfter }),
+				},
+				signal,
+			);
+			return reply.outcome === "ok" ? { outcome: "ok", text: reply.text } : rejected(reply.text);
+		}
+		case "integrate": {
+			const integration = host.integration;
+			if (integration === undefined) return rejected(INTEGRATION_UNAVAILABLE);
+			if (params.candidateId !== undefined || params.candidateRunId !== undefined || params.candidateAfter !== undefined) {
+				return rejected("integrate는 candidateIds 하나만 받습니다. 조회용 id·실행·커서를 함께 보내지 마세요.");
+			}
+			const ids = params.candidateIds;
+			if (ids === undefined || ids.length === 0) return rejected(INTEGRATION_SELECTION_REQUIRED);
+			// The whole request is refused before any writer: one bad id never lets the valid prefix through.
+			const problem = integrationIdListProblem(ids);
+			if (problem !== undefined) return rejected(problem);
+			const reply = await integration.integrate(ids, signal);
+			return reply.outcome === "ok" ? { outcome: "ok", text: reply.text } : rejected(reply.text);
 		}
 	}
 }

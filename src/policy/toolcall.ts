@@ -46,3 +46,17 @@ export function decideDirectorCall(call: DirectorPathCall): DirectorCallDecision
 	if (decision.kind === "refuse") return { kind: "block", block: decision.block };
 	return decision.kind === "path" ? { kind: "director-path", paths: decision.paths } : { kind: "allow" };
 }
+
+/**
+ * A target fence refuses every managed parent writer before it takes its own claim. A clear target is
+ * the only allow; an unreadable lookup is a refusal with the unknown cause, never an empty fence.
+ * Releasing a proved fence is the direct user action in `/storm`, never a model tool or a timeout.
+ */
+export const INTEGRATION_FENCE_REFUSAL =
+	"이 작업 대상에는 끝이 증명되지 않은 통합 흔적이 남아 있어 새 쓰기를 시작하지 않았습니다. /storm에서 대상 상태를 확인하고, 증명된 경우에만 사용자가 직접 정리하세요.";
+
+export function fenceRefusal(lookup: import("../runtime/integration-record.ts").TargetFenceLookup): string | undefined {
+	if (lookup.kind === "clear") return undefined;
+	if (lookup.kind === "unknown") return `${INTEGRATION_FENCE_REFUSAL} (${lookup.problem.reason})`;
+	return INTEGRATION_FENCE_REFUSAL;
+}
