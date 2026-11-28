@@ -734,6 +734,18 @@ describe("baseline and accounting-source discipline", () => {
 		expect(delta.receiptToken).toBe(`${adapter.metadata.bindingToken}#2`);
 	});
 
+	test("caller-owned dispatch gating keeps active turns alive at the limit while pending stays nonzero", () => {
+		const fake = fakeHost({ owner: "owner-dispatch-gated" });
+		const adapter = bind(fake, { limitUsd: 0.5, enforceLimit: false });
+		fake.add({ costTotal: 0.6 });
+		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0.6 });
+
+		fake.pend("pending-after-limit");
+		expect(refusal(adapter.check()).code).toBe("unresolved-pending");
+		fake.settlePending("pending-after-limit", { costTotal: 0.1 });
+		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0.7 });
+	});
+
 	test("a retired pending attempt settling after this binding never charges this run", () => {
 		const fake = fakeHost({ owner: "owner-retired-late" });
 		fake.pend("old-attempt");

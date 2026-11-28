@@ -222,7 +222,7 @@ describe("coordinator paid-attempt wiring", () => {
 		expect(final?.spend).toEqual({ lowerBound: true, paidUnresolved: 1 });
 	});
 
-	test("the exact run budget is granted; the installed decision refuses only after exact cost exceeds it", async () => {
+	test("block-spawns keeps exact overrun accounting; its dispatch gates, not the provider gate, refuse new work", async () => {
 		const owner = "native-owner-budget";
 		const paid = fakePaid(owner);
 		const h = fakeSession({ root, sessionId: owner, config: CONFIG });
@@ -231,6 +231,26 @@ describe("coordinator paid-attempt wiring", () => {
 		expect(getLedgerRun(runId)?.paid?.limitUsd).toBe(1);
 		expect(paid.invoke().send).toBe(true);
 
+		paid.add(1.2);
+		h.controller.ingestPaidSpend();
+		expect(getLedgerRun(runId)?.exceeded).toBe(true);
+		// block-spawns leaves the current turns and director alive; new spawns/messages are refused by Storm's gates.
+		expect(paid.invoke().send).toBe(true);
+		await h.controller.finish("budget");
+	});
+
+	test("stop keeps the adapter's exact next-send refusal after the limit", async () => {
+		const owner = "native-owner-stop";
+		const paid = fakePaid(owner);
+		const stopConfig: StormConfig = {
+			...CONFIG,
+			budget: { perRunUsd: 1, warnAtUsd: 0.8, onExceed: "stop" },
+		};
+		const h = fakeSession({ root, sessionId: owner, config: stopConfig });
+		withPaid(h, paid);
+		const runId = await h.start();
+		// A stop aborts the active turn; keep it open so the installed next-send decision is still observable.
+		h.controller.onAgentStart();
 		paid.add(1.2);
 		h.controller.ingestPaidSpend();
 		expect(getLedgerRun(runId)?.exceeded).toBe(true);

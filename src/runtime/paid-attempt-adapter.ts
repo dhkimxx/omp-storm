@@ -294,6 +294,13 @@ export interface PaidAttemptBindOptions {
 	/** Rechecked for every decision. Throwing is an unknown revocation state and refuses. */
 	readonly isRevoked?: () => boolean;
 	/**
+	 * Whether the installed decision itself refuses a send once exact in-scope cost exceeds `limitUsd`. Default true.
+	 * A caller whose policy keeps already-active turns alive at the limit (`block-spawns`) passes false: the adapter still
+	 * reports the exact overrun, while the caller's dispatch boundary refuses new spawns, work-bearing messages and wakes.
+	 * A policy that stops the next send (`stop`) keeps the adapter gate.
+	 */
+	readonly enforceLimit?: boolean;
+	/**
 	 * Attempt ids retired by an earlier binding of the same owner but not yet settled when it closed. They remain visible
 	 * to the host's contiguous receipt sequence yet never count toward this run: a durable late receipt that arrives
 	 * after this binding must not charge the next run.
@@ -618,6 +625,8 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const limitValid = rawLimit === undefined || finiteNonNegative(rawLimit);
 	const spentValid = rawSpent === undefined || finiteNonNegative(rawSpent);
 	const revokedValid = options.isRevoked === undefined || typeof options.isRevoked === "function";
+	const enforceLimit = options.enforceLimit ?? true;
+	const enforceLimitValid = typeof enforceLimit === "boolean";
 	const excludedRaw = options.excludeAttemptIds;
 	const excludedValid =
 		excludedRaw === undefined ||
@@ -627,8 +636,8 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const startCostUsd = finiteNonNegative(rawSpent) ? rawSpent : 0;
 	const limit = limitOf(finite ? "finite" : "unbounded", finite ? rawLimit : undefined);
 
-	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid) {
-		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, and excluded attempt ids unique non-empty strings", {
+	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid || !enforceLimitValid) {
+		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, enforceLimit boolean, and excluded attempt ids unique non-empty strings", {
 			runId: runId || "(missing run id)",
 			expectedOwnerSessionId: expectedOwnerSessionId || "(missing owner session id)",
 			startCostUsd,
@@ -692,6 +701,7 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 		startCostUsd,
 		bindingToken,
 		isRevoked: options.isRevoked,
+		enforceLimit,
 		excludeAttemptIds,
 	});
 	let failure: { readonly code: PaidAttemptUnavailableCode; readonly detail: string } | undefined;
@@ -839,6 +849,7 @@ interface PaidAttemptAdapterInput {
 	readonly startCostUsd: number;
 	readonly bindingToken: string;
 	readonly isRevoked: (() => boolean) | undefined;
+	readonly enforceLimit: boolean;
 	readonly excludeAttemptIds: ReadonlySet<string>;
 }
 
@@ -852,6 +863,7 @@ export class PaidAttemptAdapter {
 	readonly #api: PaidAttemptsSurface;
 	readonly #startCostUsd: number;
 	readonly #isRevoked: (() => boolean) | undefined;
+	readonly #enforceLimit: boolean;
 	readonly #excludeAttemptIds: ReadonlySet<string>;
 	readonly #decider: PaidAttemptDecider = (attempt, state) => this.#decide(attempt, state);
 	#baselineKnown = false;
@@ -897,6 +909,7 @@ export class PaidAttemptAdapter {
 		this.#knownCostUsd = input.startCostUsd;
 		this.bindingToken = input.bindingToken;
 		this.#isRevoked = input.isRevoked;
+		this.#enforceLimit = input.enforceLimit;
 		this.#excludeAttemptIds = input.excludeAttemptIds;
 	}
 
@@ -1152,7 +1165,7 @@ export class PaidAttemptAdapter {
 					`${relevant.length} in-scope settled receipt(s) lack exact native proof: ${facts}${relevant.length > 3 ? ",..." : ""}`,
 				);
 			}
-			if (this.limitUsd !== undefined && this.#knownCostUsd > this.limitUsd) {
+			if (this.#enforceLimit && this.limitUsd !== undefined && this.#knownCostUsd > this.limitUsd) {
 				return this.#refuse(
 					"limit-exceeded",
 					`exact authorized cost ${this.#knownCostUsd} exceeds the approved limit ${this.limitUsd}`,
