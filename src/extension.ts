@@ -13,6 +13,7 @@ import { readAutoDelegation } from "./approval/auto.ts";
 import { resolveRepo } from "./approval/repo.ts";
 import { isRecord } from "./config/schema.ts";
 import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
+import { instrument } from "./e2e-meter.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { liveIsolationSettings, liveTaskMaxConcurrency, liveToolCallTimeoutMs, readExplicitSettings } from "./discovery/settings.ts";
 import {
@@ -131,7 +132,7 @@ import { newerInstalledVersion } from "./runtime/version.ts";
 import { type ActionHost, runChange } from "./request/actions.ts";
 import { routeRequest } from "./request/route.ts";
 import { sessionStoreDir } from "./session-scope.ts";
-import { createStateCache, isApproved, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
+import { createStateCache, isApproved, liveDiscovery, loadProjectState, type ProjectEnv, type ProjectState } from "./state.ts";
 import type { RunRequestResult, StormToolHost } from "./tool/host.ts";
 import { createStormTool } from "./tool/storm-tool.ts";
 import type {
@@ -148,6 +149,7 @@ import type {
 	ShadowInfo,
 	SpawnDecision,
 	SpawnBlockCode,
+	SpawnRecord,
 	StormConfig,
 	UiPort,
 	WorkerStopReason,
@@ -163,6 +165,7 @@ import {
 	admissionMayUseNonReadTools,
 	closeWorkerSpend,
 	endWorkerAdmission,
+	ensureWorkerRunMarker,
 	persistWorkerAdmission,
 	readChildBinding,
 	readWorkerAdmission,
@@ -760,6 +763,7 @@ export interface StormOptions {
 }
 
 export default function storm(pi: ExtensionAPI, options: StormOptions = {}): void {
+	pi = instrument(pi);
 	const timings = timingsOf(options.timings);
 	const exec = execPort(pi);
 	/**
@@ -863,21 +867,17 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		return id;
 	};
 	/** This main session's Storm store; the target root is only the worktree the state describes. */
-	const projectEnv = (ctx: ExtensionContext): ProjectEnv => ({
-		cwd: ctx.cwd,
-		exec,
-		agentDir: pi.pi.getAgentDir(),
-		pluginAgentsDir: PLUGIN_AGENTS_DIR,
-		sessionId: requireSessionId(ctx),
-	});
-	/** A run's state is read under the session that admitted it, at the target the run was started on. */
-	const runEnv = (run: LedgerRun): ProjectEnv => ({
-		cwd: run.root,
-		exec,
-		agentDir: pi.pi.getAgentDir(),
-		pluginAgentsDir: PLUGIN_AGENTS_DIR,
-		sessionId: run.sessionId,
-	});
+	const projectEnv = (ctx: ExtensionContext): ProjectEnv => {
+		const sessionId = requireSessionId(ctx);
+		return {
+			cwd: ctx.cwd,
+			exec,
+			agentDir: pi.pi.getAgentDir(),
+			pluginAgentsDir: PLUGIN_AGENTS_DIR,
+			sessionId,
+			discovery: liveDiscovery(ctx.agent.id, sessionId),
+		};
+	};
 	/** A snapshot of one session's state, for delayed work that must not read whichever session is live later. */
 	const envForSession = (sessionId: string, cwd: string): ProjectEnv => ({
 		cwd,
@@ -885,6 +885,12 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		agentDir: pi.pi.getAgentDir(),
 		pluginAgentsDir: PLUGIN_AGENTS_DIR,
 		sessionId,
+		discovery: mainAgentId === undefined ? undefined : liveDiscovery(mainAgentId, sessionId),
+	});
+	/** A run's state is read under the session that admitted it, at the target the run was started on. */
+	const runEnv = (run: LedgerRun): ProjectEnv => ({
+		...envForSession(run.sessionId, run.root),
+		discovery: run.directorId === undefined ? undefined : liveDiscovery(run.directorId, run.sessionId),
 	});
 	/**
 	 * One native session's personal automatic-delegation policy, keyed by its own identity. A refresh that completes
@@ -1001,7 +1007,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	const stateForEvent = (ctx: ExtensionContext): Promise<ProjectState | undefined> => {
 		if (ctx.agent.kind === "main") {
 			const id = mainSessionId(ctx);
-			return id === undefined ? Promise.resolve(undefined) : stateCache.get(envForSession(id, ctx.cwd));
+			return id === undefined ? Promise.resolve(undefined) : stateCache.get(projectEnv(ctx));
 		}
 		const ledger = childLedger(ctx);
 		return ledger === undefined ? Promise.resolve(undefined) : stateCache.get(runEnv(ledger));
@@ -1057,6 +1063,26 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 
 	/** Profile dir for the persisted worker admission bridge; a host failure is a closed failure, not a fallback. */
 	const workerAdmissionAgentDir = (): string => pi.pi.getAgentDir();
+	/**
+	 * Writes a run's marker once, at its start, so no spawn pays for the first write. Best effort: a store that cannot
+	 * take it is not a reason to fail the start; the first admission writes it again and refuses the spawn closed with
+	 * the real cause if the store still cannot hold it.
+	 */
+	const markRunStarted = (ctx: ExtensionContext, runId: string | undefined): void => {
+		if (runId === undefined) return;
+		const run = getLedgerRun(runId);
+		if (run === undefined || run.artifactsDir === undefined) return;
+		void ensureWorkerRunMarker({
+			agentDir: workerAdmissionAgentDir(),
+			artifactRoot: run.artifactsDir,
+			parentId: ctx.agent.id,
+			runId,
+			sessionId: run.sessionId,
+			sessionDir: run.sessionDir,
+			repoId: run.repoId,
+			targetRoot: run.root,
+		}).catch(() => undefined);
+	};
 	const revokeWorkerAdmissionsFor = async (match: { runId?: string; sessionId?: string }): Promise<void> => {
 		try {
 			await revokeWorkerAdmissions(workerAdmissionAgentDir(), match);
@@ -1190,8 +1216,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	/**
 	 * Parent side: write the exact admission before returning from the spawn hook.
 	 */
-	/** The main agent id that admitted each run's first worker, for the spend-close marker (its key includes it). */
-	const runDirectors = new Map<string, string>();
 	const persistChildAdmission = async (input: {
 		ctx: ExtensionContext;
 		run: LedgerRun;
@@ -1204,7 +1228,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		/** What this worker's role (and trial, when the spawn was routed to one) approves: the snapshot its own check reads on any thread. */
 		approved: ReadonlyArray<{ selector: string; effort?: Effort }>;
 	}): Promise<void> => {
-		runDirectors.set(input.run.runId, input.ctx.agent.id);
 		const hold = input.hold ?? input.authority.hold;
 		// Through the same key a reservation's end revokes under: an older end never interleaves with this newer write.
 		await serialized(admissionKey(input.run.runId, input.childId), async () => {
@@ -1212,6 +1235,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				agentDir: workerAdmissionAgentDir(),
 				artifactRoot: input.artifacts,
 				parentId: input.ctx.agent.id,
+				...(input.run.directorId === undefined ? {} : { directorId: input.run.directorId }),
 				childId: input.childId,
 				runId: input.run.runId,
 				sessionId: input.run.sessionId,
@@ -1279,6 +1303,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				agentDir: workerAdmissionAgentDir(),
 				artifactRoot: input.artifacts,
 				parentId: input.ctx.agent.id,
+				...(input.run.directorId === undefined ? {} : { directorId: input.run.directorId }),
 				childId: input.childId,
 				runId: input.run.runId,
 				sessionId: input.run.sessionId,
@@ -1313,7 +1338,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// controller's own notice names it (a close no worker can read is the hole this exists to prevent).
 		closeSpend: async (runId, onExceed) => {
 			const run = getLedgerRun(runId);
-			const parentId = runDirectors.get(runId) ?? mainAgentId;
+			const parentId = run?.directorId;
 			if (run === undefined || parentId === undefined) {
 				throw new Error("실행의 관리 표시 위치를 확인하지 못했습니다");
 			}
@@ -1613,7 +1638,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		};
 	};
 
-	const toolHost = (ctx: ExtensionContext): StormToolHost => {
+	const toolHost = (ctx: ExtensionContext, signal?: AbortSignal): StormToolHost => {
 		const env = projectEnv(ctx);
 		const generation = sessionGeneration;
 		const sessionId = env.sessionId;
@@ -1621,13 +1646,32 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const stillOwner = (): boolean => generation === sessionGeneration && closeoutSessionId(ctx) === sessionId;
 		const stale = "대화가 바뀌어 이 호출은 적용하지 않았습니다. 새 대화에서 다시 시도하세요.";
 		const flow = flowEnv(ctx);
+		const owner = autoOf(ctx);
+		const request = owner?.request;
+		const timeout = liveToolCallTimeoutMs();
+		const deadline = Date.now() + timeout - Math.min(2_000, timeout / 2);
+		const authorize = (): string | undefined => {
+			if (!stillOwner()) return stale;
+			if (signal?.aborted || owner === undefined || owner.task === undefined || autoOf(ctx) !== owner || owner.request !== request) return CALL_REQUEST_ENDED;
+			return Date.now() >= deadline ? CALL_TIME_UP : undefined;
+		};
+		let opened: string | undefined;
+		const checkStartReply = (): string | Promise<string> | undefined => {
+			if (opened === undefined) return undefined;
+			const denied = authorize() ?? (runs.completeOpening(opened) ? undefined : CALL_REQUEST_ENDED);
+			if (denied !== undefined) return runs.rollbackOpening(opened, ctx).then(() => denied, () => denied);
+			markRunStarted(ctx, opened);
+			runs.startAutoCheckpoint();
+			return undefined;
+		};
 		const scope = agentScope(ctx);
 		/**
 		 * The one door of an automatic start, a first plan's and a continuation's alike: this tool call still belongs to the
 		 * conversation that made it, omp's public plan mode is not on, and only then does the controller's start run.
 		 */
 		const startAutomatic = async (start: () => Promise<RunRequestResult>): Promise<RunRequestResult> => {
-			if (!stillOwner()) return { ok: false, reason: stale };
+			const denied = authorize();
+			if (denied !== undefined) return { ok: false, reason: denied };
 			// Public plan mode means the user is still planning; an automatic run may not start there.
 			const modes = ctx.sessionModes;
 			if (modes !== undefined) {
@@ -1640,12 +1684,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				}
 			}
 			const started = await start();
-			// The first accepted automatic plan is a live tool boundary: the run's heavy pre-work context was
-			// never preflight-compacted (and a sync subagent wait may never pause the agent loop). Start the one
-			// background checkpoint now; omp commits it at its next turn/idle boundary. The already-oversized
-			// first request cannot be prevented from here — the host classifies prompt size only after the
-			// prompt has arrived — so this restores every request after that boundary, not that first one.
-			if (started.ok) runs.startAutoCheckpoint();
+			if (started.ok) opened = started.runId;
 			return started;
 		};
 		/** Fresh state under the captured session; a stale call reads nothing and writes nothing. */
@@ -1672,6 +1711,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			},
 			isolationEnabled: () => liveIsolationSettings().isolationEnabled,
 			auto: () => autoSnapshot(sessionId),
+			checkStartReply,
 			runtime: {
 				requestRun: spec => (stillOwner() ? runs.request(spec) : { ok: false, reason: stale }),
 				replanConflict: plan => (stillOwner() ? replanConflict(getLedgerRun(runs.runId())?.plan, plan) : undefined),
@@ -1679,9 +1719,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				executeJobs: (lanes, signal) => runs.executeJobs(ctx, lanes, stillOwner, signal),
 				submitCloseout: draft => (stillOwner() ? runs.submitCloseout(ctx, draft) : { ok: false, reason: stale }),
 				runActive: () => stillOwner() && runs.runId() !== undefined,
-				startWithPlan: async (spec: RunSpec, plan: RunPlan, validatedHash?: string) =>
-					startAutomatic(() => runs.startWithPlan(ctx, spec, plan, validatedHash, autoSnapshot(sessionId).turnStartedAt)),
-				continueRun: (said, turnStartedAt) => startAutomatic(() => runs.continueInTurn(ctx, said, turnStartedAt)),
+				startWithPlan: (spec, plan, validatedHash, turnStartedAt) =>
+					startAutomatic(() => runs.startWithPlan(ctx, spec, plan, validatedHash, turnStartedAt, authorize)),
+				continueRun: (said, turnStartedAt) => startAutomatic(() => runs.continueInTurn(ctx, said, turnStartedAt, authorize)),
 				agents: () => (stillOwner() && scope !== undefined ? listAgents({ ancestorId: ctx.agent.id, scope }) : []),
 			},
 		};
@@ -1739,6 +1779,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				artifactRoot: artifactsOf(ctx),
 				parentId: ctx.agent.parentId,
 				childId: ctx.agent.id,
+				stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 				...(workerRun === undefined ? {} : { runId: workerRun.runId }),
 			});
 			const spendRefusal = spendToolRefusal(spend, { toolName: "task" });
@@ -1820,6 +1861,32 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		};
 		// A controller run whose ledger disappeared is a scope we cannot admit into.
 		if (ctx.agent.kind === "main" && runs.runId() !== undefined && captured === undefined) return closed();
+		// A spawn's own trial accounting. It runs before the decision section ends, so the next decision reads the
+		// counters this decision produced: a trial with room for one never receives two workers of one burst.
+		const noteTrialDecision = async (state: ProjectState, record: SpawnRecord | undefined, now: number): Promise<void> => {
+			if (record?.trialId === undefined) return;
+			const trialId = record.trialId;
+			const routed = record.outcome === "trial" ? 1 : 0;
+			if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId, state.sessionDir);
+			const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
+			// The decision stands even when the counter file cannot be written.
+			await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
+		};
+		// What the exclusive section admitted, for the steps that must run after it: resolving a sub-session child's
+		// own capability, writing the admission, and taking a planned lane's pre-write baseline. None of those decides
+		// a place, so none of them holds the section.
+		let prepared:
+			| {
+					run: LedgerRun;
+					record: SpawnRecord;
+					config: StormConfig;
+					/** The main session's frozen policy and hold from `admitChecked`; a sub child resolves its own below. */
+					policy?: LanePolicy;
+					hold?: string;
+					/** The frozen placement was private: the host's isolation facts are read before the admission. */
+					privatePlacement: boolean;
+			  }
+			| undefined;
 		const decide = async (): Promise<SpawnDecision> => {
 			// Recheck the captured run rather than a repo or cwd match; a close or a new run is not this spawn's owner.
 			const run = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
@@ -1834,20 +1901,39 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// Outside a run only storm-* agents are Storm's business.
 			if (!event.agent.startsWith(ROLE_AGENT_PREFIX) && capturedRunId === undefined) return undefined;
 			// A run carries its originating session; a bare main session must have its own. A child's own id is never used.
-			const env = run === undefined ? (ctx.agent.kind === "main" && mainId !== undefined ? envForSession(mainId, ctx.cwd) : undefined) : undefined;
+			const env = run === undefined && ctx.agent.kind === "main" && mainId !== undefined ? projectEnv(ctx) : undefined;
 			if (run === undefined && env === undefined) return moved();
 			const state = await stateCache.get(run === undefined ? env! : runEnv(run));
 			if (timedOut) return closed();
 			if (ctx.agent.kind === "main" && (generation !== sessionGeneration || mainSessionId(ctx) !== mainId)) return moved();
 			if (run !== undefined && state.repo.root !== run.root) return closed();
+			// Everything that does not decide a place is read before the section: the team's credential answer and the
+			// quota marks. The section below is synchronous for a team without trials, so no spawn waits behind another
+			// spawn's reads; the trial counters are its one exception (see there).
+			const teamConfig = state.config.status === "ok" ? state.config.config : undefined;
+			const quotaMarks = await readQuotaMarks(state.sessionDir, Date.now());
+			const probed =
+				teamConfig === undefined
+					? undefined
+					: await probeCredentialsDetailed(teamSelectors(teamConfig), async selector => {
+							const slash = selector.indexOf("/");
+							const model = slash < 0 ? undefined : ctx.modelRegistry.find(selector.slice(0, slash), selector.slice(slash + 1));
+							// A model the registry does not know cannot be resolved by omp either.
+							if (model === undefined) return false;
+							return Boolean(await ctx.modelRegistry.getApiKey(model, closeoutSessionId(ctx)));
+						});
+			if (timedOut) return closed();
 			// One decision at a time per session, so parallel spawns never read the same trial counters or live counts;
-			// different sessions on the same target stay independent.
-			return serialized(`spawn:${state.sessionDir}`, async () => {
+			// different sessions on the same target stay independent. The section holds the recount of who is running,
+			// the decision, the reservation of a place, the trial counters (_inside_ so a trial never receives more
+			// workers than it allows) and the record of a refusal. The record of an admitted spawn is written after its
+			// admission, so a failed admission leaves exactly the blocked record it left before.
+			const routedDecision = await serialized(`spawn:${state.sessionDir}`, async () => {
 				if (timedOut) return closed();
 				const now = Date.now();
 				const current = capturedRunId === undefined ? undefined : getLedgerRun(capturedRunId);
 				if (capturedRunId !== undefined && (current === undefined || current.closing)) return closed();
-				const [quotaMarks, trials] = await Promise.all([readQuotaMarks(state.sessionDir, now), readTrialStates(state.sessionDir)]);
+				const trials = teamConfig !== undefined && (teamConfig.trials?.length ?? 0) > 0 ? await readTrialStates(state.sessionDir) : {};
 				if (!stillOwn()) return moved();
 				// One authoritative count for this decision: reservations and running Storm rows dedupe by worker id,
 				// then observed direct children that Storm does not own add their native-session occupancy once.
@@ -1863,20 +1949,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					for (const agent of stormAgents) known.add(agent.id);
 					nativeOther = otherNativeWorkers(ctx, known);
 				}
-				// omp swaps a role's models for the parent session's model when none of them can authenticate. The answer is given
-				// only over models whose credential resolved just now, through the same registry lookup omp makes.
-				const teamConfig = state.config.status === "ok" ? state.config.config : undefined;
-				const probed =
-					teamConfig === undefined
-						? undefined
-						: await probeCredentialsDetailed(teamSelectors(teamConfig), async selector => {
-								const slash = selector.indexOf("/");
-								const model = slash < 0 ? undefined : ctx.modelRegistry.find(selector.slice(0, slash), selector.slice(slash + 1));
-								// A model the registry does not know cannot be resolved by omp either.
-								if (model === undefined) return false;
-								return Boolean(await ctx.modelRegistry.getApiKey(model, closeoutSessionId(ctx)));
-							});
-				if (timedOut) return closed();
 				const outcome = decideSpawn(
 					event,
 					{ config: state.config, approval: state.approval, shadows: state.shadows },
@@ -1903,14 +1975,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				const allowed = outcome.decision === undefined || !("block" in outcome.decision);
 				if (timedOut) return closed();
 				if (!allowed) {
-					if (record?.trialId) {
-						const trialId = record.trialId;
-						const routed = record.outcome === "trial" ? 1 : 0;
-						if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId, state.sessionDir);
-						const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
-						// The decision stands even when the counter file cannot be written.
-						await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
-					}
+					await noteTrialDecision(state, record, now);
 					if (record && current) noteRunSpawn(current.runId, record);
 					return outcome.decision;
 				}
@@ -1940,6 +2005,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					if (config === undefined) {
 						return ledgerBlock("실행의 승인된 팀 설정을 확인하지 못해 자식 스폰을 허용하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요.", current, now);
 					}
+					if (record === undefined) {
+						return ledgerBlock("스폰 기록을 만들지 못해 대기 중인 배치를 확인할 수 없습니다. 다시 스폰하세요.", current, now);
+					}
 					const plan = current.plan;
 					// R4/R3/R7: the director session's own task spawn is admitted against its exact placement, with or
 					// without a plan. The table matches the key, proves the policy the hook will persist against the
@@ -1947,10 +2015,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					// whose key is not exactly a pending placement of this run is refused, never guessed.
 					let admittedPolicy: LanePolicy | undefined;
 					let admittedHold: string | undefined;
+					let privatePlacement = false;
 					if (ctx.agent.kind === "main") {
-						if (record === undefined) {
-							return ledgerBlock("스폰 기록을 만들지 못해 대기 중인 배치를 확인할 수 없습니다. 다시 스폰하세요.", current, now);
-						}
 						const lanesNow = runs.runLanes();
 						if (lanesNow === undefined) {
 							return ledgerBlock("이 실행의 레인 배정을 확인하지 못해 자식 스폰을 허용하지 않았습니다. 실행 상태를 확인한 뒤 다시 시도하세요.", current, now);
@@ -1987,17 +2053,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 							},
 						});
 						if (!admission.ok) return ledgerBlock(admission.reason, current, now);
-						// A1-3: a private admission needs the host's isolation facts read now and found enabled with apply
-						// off. A settings file changed after the placement, or one that cannot be read, refuses here.
-						if (admission.authority?.kind === "private") {
-							const atDispatch = await isolationAtDispatch();
-							if (atDispatch.enabled !== true || atDispatch.apply !== false) {
-								return ledgerBlock(PRIVATE_DISPATCH_CHANGED, current, now);
-							}
-						}
 						if (admission.lane !== undefined) record.lane = admission.lane;
 						admittedPolicy = admission.policy;
 						admittedHold = admission.hold;
+						// A1-3: the host's isolation facts are read after the section, before the admission is stored.
+						privatePlacement = admission.authority?.kind === "private";
 					}
 					const spawnKey = event.spawnKey;
 					if (spawnKey === undefined) {
@@ -2009,94 +2069,119 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					// The lane's approved capability is decided before the child starts: a read-only intent is enforced by
 					// restricting tools, and a write-capable intent never becomes a shared writer by role label alone. The
 					// director's child takes the policy admission proved; a sub-session child keeps the read-only route.
-					if (config !== undefined) {
-						const lane = record?.lane === undefined ? undefined : plan?.lanes.find(candidate => candidate.name === record.lane);
-						let authority: AgentAuthority;
-						if (ctx.agent.kind === "main") {
-							if (admittedPolicy === undefined) {
-								return ledgerBlock("이 배치의 승인된 쓰기 권한을 확인하지 못했습니다. 같은 task 호출을 다시 보내 새 배치를 만드세요.", current, now);
-							}
-							authority = {
-								policy: admittedPolicy,
-								root: current.root,
-								runId: current.runId,
-								...(lane === undefined ? {} : { lane: lane.name }),
-								...(admittedHold === undefined ? {} : { hold: admittedHold }),
-							};
-						} else {
-							const computed = await authorityFor({
-								agent: event.agent,
-								lane,
-								shadows: state.shadows,
-								config,
-								root: current.root,
-								auto: autoOn,
-							});
-							if (!computed.ok) return ledgerBlock(computed.reason, current, now);
-							authority = { ...computed.authority, runId: current.runId };
+					if (ctx.agent.kind === "main") {
+						if (admittedPolicy === undefined) {
+							return ledgerBlock("이 배치의 승인된 쓰기 권한을 확인하지 못했습니다. 같은 task 호출을 다시 보내 새 배치를 만드세요.", current, now);
 						}
-						agentAuthorities.set(authorityKey(artifacts, spawnKey), authority);
-						ownAuthority = authority;
-						// What this exact spawn's role and trial approve travels with its admission: the child's own check reads this
-						// snapshot, on the main thread as well as on any other, never the live team file. The decision made for this
-						// spawn carries the trial; a historical spawn record is not consulted.
-						const trial = record?.trialId === undefined ? undefined : config.trials?.find(item => item.id === record.trialId);
-						const approved = approvedEntries(config, event.agent, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
-						// Persist before returning: the child's own hooks run in its session, which may be another thread. A failure
-						// here blocks the spawn rather than allowing an unverifiable writer.
-						try {
-							await persistChildAdmission({
-								ctx,
-								run: current,
-								artifacts,
-								childId: spawnKey,
-								...(lane === undefined ? {} : { lane }),
-								authority,
-								...(ctx.agent.kind === "main" && admittedHold !== undefined ? { hold: admittedHold } : {}),
-								approved,
-							});
-						} catch (error) {
-							const cause = error instanceof Error && error.message !== "" ? `: ${error.message}` : ". 프로필 경로와 권한을 확인하세요.";
-							return ledgerBlock(`자식 실행 권한을 프로필에 저장하지 못해 스폰을 허용하지 않았습니다${cause}`, current, now);
-						}
-					}
-					// The lane's required results need their pre-write state before the child starts. This runs after every
-					// existing refusal and the ledger binding, so a failed baseline is the only new block here.
-					if (ctx.agent.kind === "main" && record?.lane !== undefined && plan !== undefined && config !== undefined) {
-						const lane = plan.lanes.find(candidate => candidate.name === record.lane);
-						if (lane !== undefined) {
-							const artifactMode = lane.isolationReason !== undefined || config.isolation === "isolated" ? "isolated" : "shared";
-							const admitted = await attempts.admitSpawn({
-								runId: current.runId,
-								parentId: ctx.agent.id,
-								spawnKey,
-								lane,
-								artifactMode,
-								startedAt: Date.now(),
-							});
-							if (!admitted.ok) return ledgerBlock(admitted.reason, current, Date.now());
-							// The worker's assignment carried this lane's contract block when its task call was placed.
-							const delivered = contractDigests.placed.get(`${current.runId}\0${lane.name}`);
-							if (delivered !== undefined) contractDigests.sent.set(`${current.runId}\0${spawnKey}`, delivered);
-						}
+						prepared = {
+							run: current,
+							record,
+							config,
+							policy: admittedPolicy,
+							...(admittedHold === undefined ? {} : { hold: admittedHold }),
+							privatePlacement,
+						};
+					} else {
+						prepared = { run: current, record, config, privatePlacement: false };
 					}
 				}
-				if (timedOut) return closed();
-				if (!stillOwn()) return moved();
-				if (current !== undefined && current.runId === runs.runId()) {
-					const gate = runs.jobGate();
-					if (gate !== undefined) return ledgerBlock(gate, current, Date.now());
-				}
-				if (record?.trialId) {
-					const trialId = record.trialId;
-					const routed = record.outcome === "trial" ? 1 : 0;
-					if (routed && record.spawnKey) noteTrialSpawn(record.spawnKey, trialId, state.sessionDir);
-					const trial = state.config.status === "ok" ? state.config.config.trials?.find(t => t.id === trialId) : undefined;
-					await updateTrialState(state.sessionDir, trialId, current => markTrialStop(trial, { ...current, seen: current.seen + 1, routed: current.routed + routed }, now)).catch(() => undefined);
-				}
-				if (record && current) noteRunSpawn(current.runId, record);
+				await noteTrialDecision(state, record, now);
 				return outcome.decision;
 			});
+			if (routedDecision !== undefined && "block" in routedDecision) return routedDecision;
+			if (routedDecision === undefined || prepared === undefined) return routedDecision;
+			const current = prepared.run;
+			const record = prepared.record;
+			const config = prepared.config;
+			const plan = current.plan;
+			const spawnKey = event.spawnKey;
+			if (spawnKey === undefined) return ledgerBlock("호스트가 스폰 키를 주지 않아 자식 실행을 결속하지 못했습니다. 다시 스폰하세요.", current, Date.now());
+			const lane = record.lane === undefined ? undefined : plan?.lanes.find(candidate => candidate.name === record.lane);
+			let authority: AgentAuthority;
+			if (ctx.agent.kind === "main") {
+				const policy = prepared.policy;
+				if (policy === undefined) {
+					return ledgerBlock("이 배치의 승인된 쓰기 권한을 확인하지 못했습니다. 같은 task 호출을 다시 보내 새 배치를 만드세요.", current, Date.now());
+				}
+				authority = {
+					policy,
+					root: current.root,
+					runId: current.runId,
+					...(lane === undefined ? {} : { lane: lane.name }),
+					...(prepared.hold === undefined ? {} : { hold: prepared.hold }),
+				};
+			} else {
+				const computed = await authorityFor({
+					agent: event.agent,
+					lane,
+					shadows: state.shadows,
+					config,
+					root: current.root,
+					auto: autoOn,
+				});
+				if (!computed.ok) return ledgerBlock(computed.reason, current, Date.now());
+				authority = { ...computed.authority, runId: current.runId };
+			}
+			agentAuthorities.set(authorityKey(artifacts, spawnKey), authority);
+			ownAuthority = authority;
+			// A1-3: a private admission needs the host's isolation facts read now and found enabled with apply off. A
+			// settings file changed after the placement, or one that cannot be read, refuses here.
+			if (prepared.privatePlacement) {
+				const atDispatch = await isolationAtDispatch();
+				if (atDispatch.enabled !== true || atDispatch.apply !== false) {
+					return ledgerBlock(PRIVATE_DISPATCH_CHANGED, current, Date.now());
+				}
+			}
+			// What this exact spawn's role and trial approve travels with its admission: the child's own check reads this
+			// snapshot, on the main thread as well as on any other, never the live team file. The decision made for this
+			// spawn carries the trial; a historical spawn record is not consulted.
+			const trial = record.trialId === undefined ? undefined : config.trials?.find(item => item.id === record.trialId);
+			const approved = approvedEntries(config, event.agent, trial === undefined ? undefined : { model: trial.model, ...(trial.effort === undefined ? {} : { effort: trial.effort }) });
+			// Persist before returning: the child's own hooks run in its session, which may be another thread. A failure
+			// here blocks the spawn rather than allowing an unverifiable writer.
+			try {
+				await persistChildAdmission({
+					ctx,
+					run: current,
+					artifacts,
+					childId: spawnKey,
+					...(lane === undefined ? {} : { lane }),
+					authority,
+					...(ctx.agent.kind === "main" && prepared.hold !== undefined ? { hold: prepared.hold } : {}),
+					approved,
+				});
+			} catch (error) {
+				const cause = error instanceof Error && error.message !== "" ? `: ${error.message}` : ". 프로필 경로와 권한을 확인하세요.";
+				return ledgerBlock(`자식 실행 권한을 프로필에 저장하지 못해 스폰을 허용하지 않았습니다${cause}`, current, Date.now());
+			}
+			// The lane's required results need their pre-write state before the child starts. This runs after every
+			// existing refusal and the ledger binding, so a failed baseline is the only new block here.
+			if (ctx.agent.kind === "main" && record.lane !== undefined && plan !== undefined) {
+				const laneRow = plan.lanes.find(candidate => candidate.name === record.lane);
+				if (laneRow !== undefined) {
+					const artifactMode = laneRow.isolationReason !== undefined || config.isolation === "isolated" ? "isolated" : "shared";
+					const admitted = await attempts.admitSpawn({
+						runId: current.runId,
+						parentId: ctx.agent.id,
+						spawnKey,
+						lane: laneRow,
+						artifactMode,
+						startedAt: Date.now(),
+					});
+					if (!admitted.ok) return ledgerBlock(admitted.reason, current, Date.now());
+					// The worker's assignment carried this lane's contract block when its task call was placed.
+					const delivered = contractDigests.placed.get(`${current.runId}\0${laneRow.name}`);
+					if (delivered !== undefined) contractDigests.sent.set(`${current.runId}\0${spawnKey}`, delivered);
+				}
+			}
+			if (timedOut) return closed();
+			if (!stillOwn()) return moved();
+			if (current.runId === runs.runId()) {
+				const gate = runs.jobGate();
+				if (gate !== undefined) return ledgerBlock(gate, current, Date.now());
+			}
+			noteRunSpawn(current.runId, record);
+			return routedDecision;
 		};
 		return failClosed(event.agent, () => capturedRunId !== undefined || autoOn || anyLedgerRun(), decide, {
 			expired: limit.expired,
@@ -2312,7 +2397,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		followCapacityCalls.delete(followKey);
 		startNotes.delete(followKey);
 		if (follow !== undefined && follow.runId === runId && !running.has(follow.agentId)) releaseWorkerSlot(runId, follow.agentId);
-		const placed = runs.runLanes()?.releaseCall(callId, running) ?? [];
+		const lanes = runs.runLanes();
+		const placed = lanes?.runId === runId ? lanes.releaseCall(callId, running) : [];
 		for (const name of new Set([...placed, ...handles])) {
 			if (!running.has(name) && workerSlot(runId, name) !== undefined) releaseWorkerSlot(runId, name);
 		}
@@ -2321,6 +2407,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	// Agent ledger: each subagent session reports its own turns and end; omp offers no parent-side view of them.
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (ctx.agent.kind === "main") {
+			rememberMainAgent(ctx);
 			// Without a native session identity there is no Storm policy to apply; the ordinary conversation is untouched.
 			const sessionId = mainSessionId(ctx);
 			if (sessionId === undefined) return undefined;
@@ -2362,8 +2449,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 						// The first prompt of a user turn starts its request; decisions never inherit from the last one.
 						decisions.nextRequest(sessionId, sessionGeneration);
 					}
-					const env = envForSession(sessionId, ctx.cwd);
-					await refreshAuto(ctx, () => stateCache.get(env));
+					await refreshAuto(ctx, () => stateCache.get(projectEnv(ctx)));
 				}
 				// A switch during the read must not attach Storm guidance to another conversation's prompt.
 				if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId) return undefined;
@@ -2533,6 +2619,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			artifactRoot: artifactsOf(ctx),
 			parentId: ctx.agent.parentId,
 			childId: ctx.agent.id,
+			stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 			...(ledger === undefined ? {} : { runId: ledger.runId }),
 		});
 		const spendStop = spendRequestStop(spend, ctx.agent.id);
@@ -2787,7 +2874,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		return undefined;
 	};
 
-	const guardToolCall = async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+	type TaskReplyCheck = (verdict: ToolCallEventResult | undefined) => ToolCallEventResult | Promise<ToolCallEventResult> | undefined;
+
+	const guardToolCall = async (
+		event: ToolCallEvent,
+		ctx: ExtensionContext,
+		onTaskReply: (check: TaskReplyCheck) => void,
+	): Promise<ToolCallEventResult | undefined> => {
 		rememberMainAgent(ctx);
 		// The host's budget for this hook starts about now (see `directorPathEdit`).
 		const hookStart = Date.now();
@@ -2801,6 +2894,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				artifactRoot: artifactsOf(ctx),
 				parentId: ctx.agent.parentId,
 				childId: ctx.agent.id,
+				stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 				...(ledger === undefined ? {} : { runId: ledger.runId }),
 			});
 			const spendRefusal = spendToolRefusal(spend, { toolName: event.toolName, input: event.input });
@@ -2958,13 +3052,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const undoOpen = async (): Promise<void> => {
 			const opened = planlessOpened;
 			planlessOpened = undefined;
-			if (opened !== undefined && runs.active()?.runId === opened) await runs.finish("start-failed", ctx).catch(() => undefined);
+			if (opened !== undefined) await runs.rollbackOpening(opened, ctx).catch(() => undefined);
 		};
 		/** Whatever this call provisionally created is undone, then the real cause is returned (A2-2/A2-3/A2-4). */
 		const lostCall = async (reason: string): Promise<ToolCallEventResult> => {
 			const moved = generation !== sessionGeneration || mainSessionId(ctx) !== mainId;
-			const live = runs.runId();
-			if (live !== undefined && typeof event.toolCallId === "string") releaseFailedCall(live, event.toolCallId, taskHandles(event.input));
+			const live = planlessOpened ?? runId;
+			if (live !== undefined && typeof event.toolCallId === "string") releaseFailedCall(live, event.toolCallId);
 			await undoOpen();
 			// A conversation switch is its own, named cause; a turn or time that ended keeps the reason it was called with.
 			return {
@@ -2972,6 +3066,19 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				reason: moved ? "[storm:session] 대화가 바뀌어 이 task 호출을 적용하지 않았습니다. 새 대화에서 다시 시도하세요." : reason,
 			};
 		};
+		if (event.toolName === "task" && (runId !== undefined || autoOn)) onTaskReply(verdict => {
+			if (verdict?.block === true) {
+				return lostCall(verdict.reason ?? CALL_REQUEST_ENDED);
+			}
+			if (generation !== sessionGeneration || mainSessionId(ctx) !== mainId || turnLost()) return lostCall(CALL_REQUEST_ENDED);
+			if (timeUp()) return lostCall(CALL_TIME_UP);
+			if (planlessOpened !== undefined) {
+				if (!runs.completeOpening(planlessOpened)) return lostCall(CALL_REQUEST_ENDED);
+				markRunStarted(ctx, planlessOpened);
+				runs.startAutoCheckpoint();
+			}
+			return verdict;
+		});
 		// R9's plan-less open, read before the run exists. The batch is classified and gated before a run is opened,
 		// so a refused batch opens nothing; the open takes the lease the batch needs and leaves the normal placement
 		// below in this same handler.
@@ -3033,7 +3140,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				? await isolationHost(`planless:${state.sessionDir}:${state.repo.root}`)
 				: undefined;
 			if (turnLost()) return lostCall(CALL_REQUEST_ENDED);
-			const batch = unplannedBatchGate(facts.items, host);
+			const batch = unplannedBatchGate(facts.items, host, configNow.isolation === "isolated");
 			if (!batch.ok) return { block: true, reason: `[storm:${batch.code}] ${batch.reason}` };
 			// A2-4: what can be known before opening is checked now. Every agent of the first batch must be one the
 			// team can run (the same membership rules the spawn hook applies), and a shared writer must not open beside
@@ -3059,14 +3166,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (turnLost()) return lostCall(CALL_REQUEST_ENDED);
 			if (timeUp()) return lostCall(CALL_TIME_UP);
 			const started = await runs.startPlanless(ctx, { task: verdict.task }, {
+				authorize: () => generation !== sessionGeneration || mainSessionId(ctx) !== mainId || turnLost() ? CALL_REQUEST_ENDED : undefined,
 				turnStartedAt: verdict.turnStartedAt,
 				deadline: hookDeadline,
 				lease: batch.writers > 0 ? "write" : "read",
 			});
 			if (!started.ok) return { block: true, reason: autoRefusal(blockedNow, started.reason) };
 			planlessOpened = started.runId;
-			// The same live boundary every automatic start is: a heavy context gets its one background checkpoint.
-			runs.startAutoCheckpoint();
+			// Checkpoint and marker publication belong to the final accepted reply, not a provisional open.
 			// A2-2/A2-3: the open is published; if the call lost its turn or its time meanwhile, this call's run is
 			// finished as failed to start and no placement of the batch is kept.
 			if (turnLost()) return lostCall(CALL_REQUEST_ENDED);
@@ -3248,6 +3355,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			while (oneItem && !placed.ok && placed.retry === true && Date.now() < waitUntil && Date.now() < hookDeadline) {
 				await pause(timings.writeWaitStepMs);
 				if (turnLost()) return lostCall(CALL_REQUEST_ENDED);
+				if (timeUp()) return lostCall(CALL_TIME_UP);
 				placed = placeOnce();
 			}
 			if (!placed.ok) {
@@ -3278,6 +3386,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (spendBlocked !== undefined) return { block: true, reason: spendBlocked };
 		}
 		if (followTarget?.toLowerCase() === "all") {
+			const lanes = runs.runLanes();
+			const outside = AgentRegistry.global().listVisibleTo(ctx.agent.id).find(ref => lanes?.isAdmitted(ref.id) !== true);
+			if (outside !== undefined) {
+				return { block: true, reason: `[storm:lane] ${outside.id} 워커는 이 실행에서 수용하지 않았습니다. 이번 실행에서 수용한 워커에 agent://<id>로 각각 보내세요.` };
+			}
 			// omp does not count the wakes of a broadcast against its own ceiling, so the ceiling (`task.maxConcurrency`) is
 			// the one limit a broadcast meets here: refused only when waking every idle worker would exceed it.
 			const nativeLimit = liveTaskMaxConcurrency();
@@ -3488,7 +3601,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// admission its last turn ended, so it can read and yield but never write or run a command.
 			// A1-10/R7: every work follow-up opens a fresh attempt. A writer gets the new reservation key (`hold`); a
 			// reader gets a fresh read attempt with no hold, so the ended record is never taken as the new turn's grant.
-			if (!quietWake && authority !== undefined) {
+			const runningNote = progress && followAgents.some(agent => agent.id === followAgent.id && agent.state === "running");
+			if (!quietWake && !runningNote && authority !== undefined) {
 				// The follow-up carries the approved entries of the decision that admitted this worker, read from its own
 				// admission. Rebuilding them from the current team file (or the run-start one) would re-authorize a model the
 				// user did not approve at that decision (RF3-2). A worker this run never admitted (a reused leftover) has no
@@ -3605,7 +3719,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	// (see task-refusal.ts). The call runs into omp's own rejection of a stale field and `tool_result` swaps in Storm's
 	// reason. Every other tool keeps the plain block: its view draws that result.
 	pi.on("tool_call", async (event, ctx) => {
-		let verdict = await guardToolCall(event, ctx);
+		let finalizeTask: TaskReplyCheck | undefined;
+		let verdict: ToolCallEventResult | undefined;
+		verdict = await guardToolCall(event, ctx, check => { finalizeTask = check; });
 		// The director's path edit made that wait before its commit (it must be the last step), and nothing may wait after it.
 		const committed = ctx.agent.kind === "main" && typeof event.toolCallId === "string" && committedHere.delete(event.toolCallId);
 		if (committed) return verdict;
@@ -3616,6 +3732,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const unsettled = runId === undefined ? undefined : await settleEndRevokes(runId);
 			if (unsettled !== undefined) verdict = { block: true, reason: unsettled };
 		}
+		const finalized = finalizeTask?.(verdict);
+		if (finalizeTask !== undefined) verdict = finalized instanceof Promise ? await finalized : finalized;
 		if (verdict?.block === true && ctx.agent.kind === "main" && typeof event.toolCallId === "string" && directorFileChange(event.toolName, event.input) !== undefined) {
 			// The host still reports a start for a blocked call. It was judged and refused, not rewritten by another
 			// extension, so its start must not hold the whole tree or claim a rewrite. Kept until that start or the turn
@@ -3929,13 +4047,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			return;
 		}
 		const eventSessionId = mainSessionId(ctx);
-		await settleDirectorSpend(ctx);
 		const auto = !event.willContinue && eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
 		// Clear the ending request before yielding; a detached old handler must never clear a newer prompt's task.
 		if (auto !== undefined) {
 			resetAutoRequest(auto);
 			auto.paused = false;
 		}
+		await settleDirectorSpend(ctx);
 		// Paused on async subagents: the moment to shed context before their results arrive. Both manual and automatic
 		// runs use the same background handoff, so the recorded ledger is identical.
 		if (event.awaitingAsyncWork) {
@@ -4086,7 +4204,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	pi.on("session_clear", async (_event, ctx) => conversationChanged(ctx));
 	pi.on("session_branch", async (_event, ctx) => conversationChanged(ctx));
 
-	const tool = createStormTool(pi.zod, ctx => toolHost(ctx));
+	const tool = createStormTool(pi.zod, toolHost);
 	const activateTool = async (): Promise<void> => {
 		const active = pi.getActiveTools();
 		if (!active.includes(tool.name)) await pi.setActiveTools([...active, tool.name]);
@@ -4104,6 +4222,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (reason !== undefined) return { ok: false, reason };
 		await activateTool();
 		const result = await runs.start(ctx, spec);
+		if (result.ok) markRunStarted(ctx, result.runId);
 		// A user-started run is a new user request even when the previous run already settled.
 		if (result.ok) {
 			const sessionId = mainSessionId(ctx);

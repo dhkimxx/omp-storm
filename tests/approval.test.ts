@@ -3,8 +3,9 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { resolveRepo } from "../src/approval/repo.ts";
-import { findShadows, unapprovedShadows } from "../src/approval/shadow.ts";
+import { findShadows, isRoutedAgentName, unattestedShadows, unapprovedShadows, type LiveDiscovery } from "../src/approval/shadow.ts";
 import { ApprovalStore } from "../src/approval/store.ts";
 import { effectiveAgentTools, lanePolicy, shellReader } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
@@ -23,6 +24,30 @@ const HASH_B = `jcs-sha256:${"b".repeat(64)}`;
 
 function approveInput(configHash: string) {
 	return { configHash, config, scope: { shadowedAgents: [] } };
+}
+
+/** A live-session discovery input with no ambient roots, so only the roots a test names contribute. */
+function discovery(opts: {
+	explicit?: readonly string[];
+	mode?: "merge" | "explicit-only";
+	configured?: readonly string[];
+	configuredLevel?: "user" | "project";
+	sessionAgents?: LiveDiscovery["sessionAgents"];
+} = {}): LiveDiscovery {
+	return {
+		extensionRoots: {
+			explicit: opts.explicit ?? [],
+			mode: opts.mode ?? "explicit-only",
+			configured: opts.configured ?? [],
+			configuredLevel: opts.configuredLevel ?? "user",
+		},
+		sessionAgents: opts.sessionAgents ?? [],
+	};
+}
+
+/** Shadows whose file is inside this test's temp tree, ignoring the runner's real user-level agents. */
+function owned(shadows: readonly ShadowInfo[]): ShadowInfo[] {
+	return shadows.filter(shadow => shadow.path.startsWith(tmp + path.sep));
 }
 
 /** Every file under `dir`, relative, sorted. */
@@ -349,37 +374,42 @@ describe("approvals written before session stores (principle 6: no implicit impo
 describe("findShadows", () => {
 	const agent = (name: string) => `---\nname: ${name}\ndescription: x\n---\nbody\n`;
 
-	test("scans only the nearest project dir and keys on frontmatter name", async () => {
+	test("uses native discovery: nearest project dir, extension roots, declared name", async () => {
 		const outer = path.join(tmp, "proj", ".omp", "agents");
 		const inner = path.join(tmp, "proj", "sub", ".omp", "agents");
 		const cwd = path.join(tmp, "proj", "sub", "deep");
-		const user = path.join(tmp, "user-agents");
+		const ext = path.join(tmp, "pkg");
+		const extAgents = path.join(ext, "agents");
 		const plugin = path.join(tmp, "plugin", "agents");
-		for (const d of [outer, inner, cwd, user, plugin]) await mkdir(d, { recursive: true });
+		for (const d of [outer, inner, cwd, extAgents, plugin]) await mkdir(d, { recursive: true });
 		await writeFile(path.join(outer, "storm-architect.md"), agent("storm-architect"));
 		await writeFile(path.join(inner, "storm-quick.md"), agent("storm-quick"));
 		await writeFile(path.join(inner, "helper.md"), agent("helper"));
-		await writeFile(path.join(user, "storm-x.md"), agent("other"));
-		await writeFile(path.join(user, "foo.md"), agent("storm-reviewer"));
-		await writeFile(path.join(user, "bad.md"), "---\nname: [unclosed\n---\n");
+		await writeFile(path.join(extAgents, "storm-x.md"), agent("other"));
+		const declared = path.join(extAgents, "foo.md");
+		const declaredText = agent("storm-reviewer");
+		await writeFile(declared, declaredText);
+		await writeFile(path.join(extAgents, "bad.md"), "---\nname: [unclosed\n---\n");
 
-		const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
-		expect(shadows.map((s) => [s.scope, s.agent, s.path])).toEqual([
+		const shadows = owned(await findShadows({ cwd, pluginAgentsDir: plugin, discovery: discovery({ explicit: [ext] }), home: tmp }));
+		expect(shadows.map(s => [s.scope, s.agent, s.path])).toEqual([
+			["user", "storm-reviewer", declared],
 			["project", "storm-quick", path.join(inner, "storm-quick.md")],
-			["user", "storm-reviewer", path.join(user, "foo.md")],
 		]);
-		expect(shadows[1]?.sha256).toBe(new Bun.CryptoHasher("sha256").update(agent("storm-reviewer")).digest("hex"));
+		expect(shadows[0]?.sha256).toBe(new Bun.CryptoHasher("sha256").update(declaredText).digest("hex"));
 	});
 
 	test("adding the shell to an approved definition changes its hash, so the approval no longer covers it and the lane policy changes with it", async () => {
-		const user = path.join(tmp, "user-agents");
+		const ext = path.join(tmp, "pkg");
+		const agents = path.join(ext, "agents");
 		const plugin = path.join(tmp, "plugin", "agents");
 		const cwd = path.join(tmp, "work");
-		for (const d of [user, plugin, cwd]) await mkdir(d, { recursive: true });
-		const file = path.join(user, "explorer.md");
+		for (const d of [agents, plugin, cwd]) await mkdir(d, { recursive: true });
+		const file = path.join(agents, "explorer.md");
 		const body = (tools: string) => `---\nname: storm-explorer\ndescription: x\ntools: ${tools}\n---\nbody\n`;
+		const opts = { cwd, pluginAgentsDir: plugin, discovery: discovery({ explicit: [ext] }), home: tmp };
 		await writeFile(file, body("read, grep, find"));
-		const before = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		const before = owned(await findShadows(opts));
 		expect(before).toHaveLength(1);
 		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", target: "t", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: before } };
 		expect(unapprovedShadows(approval, before)).toEqual([]);
@@ -389,7 +419,7 @@ describe("findShadows", () => {
 
 		// The user adds the shell: the same file now hashes differently and is no longer covered by the approval.
 		await writeFile(file, body("read, grep, find, bash"));
-		const after = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		const after = owned(await findShadows(opts));
 		expect(after[0]?.sha256).not.toBe(before[0]?.sha256);
 		expect(unapprovedShadows(approval, after)).toHaveLength(1);
 		// Storm reads the tool list from the file; with the shell it is a shell reader, which only an approved file may be.
@@ -400,54 +430,100 @@ describe("findShadows", () => {
 		const reapproved: ApprovalRecord = { ...approval, scope: { shadowedAgents: after } };
 		expect(unapprovedShadows(reapproved, after)).toEqual([]);
 		await writeFile(file, body("read, grep, find"));
-		const back = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		const back = owned(await findShadows(opts));
 		expect(back[0]?.sha256).toBe(before[0]?.sha256);
 		expect(unapprovedShadows(reapproved, back)).toHaveLength(1);
 	});
 
-	test("plugin's own definitions are never shadows", async () => {
+	test("plugin's own definitions are never shadows, even mounted as an extension root", async () => {
 		const plugin = path.join(tmp, "plugin", "agents");
 		await mkdir(plugin, { recursive: true });
 		await writeFile(path.join(plugin, "storm-reviewer.md"), agent("storm-reviewer"));
-		const link = path.join(tmp, "user-link");
-		await symlink(plugin, link);
+		const ext = path.join(tmp, "pkg");
+		await mkdir(ext, { recursive: true });
+		await symlink(plugin, path.join(ext, "agents"));
 		const cwd = path.join(tmp, "empty");
 		await mkdir(cwd);
-		expect(await findShadows({ cwd, userAgentsDir: link, pluginAgentsDir: plugin })).toEqual([]);
-		expect(await findShadows({ cwd, userAgentsDir: plugin, pluginAgentsDir: plugin })).toEqual([]);
+		const shadows = await findShadows({ cwd, pluginAgentsDir: plugin, discovery: discovery({ explicit: [ext] }), home: tmp });
+		expect(owned(shadows)).toEqual([]);
 	});
 
 	test("a project definition under a bundled agent's name is a shadow the approval must cover (B1)", async () => {
 		const cwd = path.join(tmp, "b1", "work");
 		const agents = path.join(tmp, "b1", ".omp", "agents");
-		const user = path.join(tmp, "b1-user");
 		const plugin = path.join(tmp, "b1-plugin");
-		for (const d of [cwd, agents, user, plugin]) await mkdir(d, { recursive: true });
+		for (const d of [cwd, agents, plugin]) await mkdir(d, { recursive: true });
 		const file = path.join(agents, "task.md");
 		await writeFile(file, agent("task"));
-		const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		const opts = { cwd, pluginAgentsDir: plugin, discovery: discovery(), home: tmp };
+		const shadows = owned(await findShadows(opts));
 		expect(shadows.map(s => [s.agent, s.path])).toEqual([["task", file]]);
 		// Renaming the declared agent removes the shadow even if the file is still named task.md.
 		await writeFile(file, agent("something-else"));
-		expect(await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin })).toEqual([]);
+		expect(owned(await findShadows(opts))).toEqual([]);
 	});
 
-	test("a routed definition that cannot be read is an unapproved shadow, never assumed absent (B1)", async () => {
+	test("an explicit extension definition ahead of bundled task is caught and approved by exactly its selected digest (B1)", async () => {
+		const cwd = path.join(tmp, "b1-ext", "work");
+		const ext = path.join(tmp, "b1-ext", "pkg");
+		const agents = path.join(ext, "agents");
+		const plugin = path.join(tmp, "b1-ext-plugin");
+		for (const d of [cwd, agents, plugin]) await mkdir(d, { recursive: true });
+		const file = path.join(agents, "fixture.md");
+		const text = "---\nname: task\ndescription: An ordinary local task definition\n---\nOnly return the fixture note.\n";
+		await writeFile(file, text);
+		const roots: LiveDiscovery["extensionRoots"] = { explicit: [ext], mode: "explicit-only", configured: [], configuredLevel: "user" };
+		const native = await discoverAgents(cwd, tmp, roots);
+		expect(native.agents.find(a => a.name === "task")?.filePath).toBe(file);
+
+		const shadows = await findShadows({ cwd, pluginAgentsDir: plugin, discovery: { extensionRoots: roots, sessionAgents: [] }, home: tmp });
+		const task = shadows.filter(s => s.agent === "task");
+		expect(task).toEqual([{ agent: "task", path: file, scope: "user", sha256: new Bun.CryptoHasher("sha256").update(text).digest("hex") }]);
+		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", target: "t", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: task } };
+		expect(unapprovedShadows(approval, task)).toEqual([]);
+		const other = { ...task[0]!, sha256: "0".repeat(64) };
+		expect(unapprovedShadows({ ...approval, scope: { shadowedAgents: [other] } }, task)).toHaveLength(1);
+	});
+
+	test("a session agent appended by the host under a routed name is unattested when it has no file", async () => {
+		const cwd = path.join(tmp, "session-agent", "work");
+		const plugin = path.join(tmp, "session-agent-plugin");
+		await mkdir(cwd, { recursive: true });
+		await mkdir(plugin, { recursive: true });
+		const sessionAgent: LiveDiscovery["sessionAgents"][number] = { name: "storm-quick", description: "", systemPrompt: "", source: "user" };
+		const shadows = await findShadows({ cwd, pluginAgentsDir: plugin, discovery: discovery({ sessionAgents: [sessionAgent] }), home: tmp });
+		expect(shadows.find(s => s.agent === "storm-quick")).toEqual({ agent: "storm-quick", path: "", scope: "user", sha256: "" });
+	});
+
+	test("a file native discovery cannot read is not selected by the host, so it is not an approved shadow", async () => {
 		if (process.getuid?.() === 0) return;
 		const cwd = path.join(tmp, "b1-unreadable", "work");
 		const agents = path.join(tmp, "b1-unreadable", ".omp", "agents");
-		const user = path.join(tmp, "b1-unreadable-user");
 		const plugin = path.join(tmp, "b1-unreadable-plugin");
-		for (const d of [cwd, agents, user, plugin]) await mkdir(d, { recursive: true });
+		for (const d of [cwd, agents, plugin]) await mkdir(d, { recursive: true });
 		const file = path.join(agents, "task.md");
 		await writeFile(file, agent("task"));
 		await chmod(file, 0o000);
 		try {
-			const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
-			expect(shadows).toEqual([{ agent: "task", path: file, scope: "project", sha256: "" }]);
+			expect(owned(await findShadows({ cwd, pluginAgentsDir: plugin, discovery: discovery(), home: tmp }))).toEqual([]);
 		} finally {
 			await chmod(file, 0o600);
 		}
+	});
+
+	test("unknown discovery is unattested per routed name, and empty roots are not unknown", async () => {
+		const cwd = path.join(tmp, "known-empty");
+		const plugin = path.join(tmp, "known-empty-plugin");
+		await mkdir(cwd, { recursive: true });
+		await mkdir(plugin, { recursive: true });
+		const known = await findShadows({ cwd, pluginAgentsDir: plugin, discovery: discovery(), home: tmp });
+		expect(known.some(s => s.path === "")).toBe(false);
+		const unknown = unattestedShadows();
+		expect(unknown.length).toBeGreaterThan(0);
+		expect(unknown.every(s => s.path === "" && s.sha256 === "" && isRoutedAgentName(s.agent))).toBe(true);
+		expect(unknown.map(s => s.agent)).toContain("task");
+		const approval: ApprovalRecord = { schema: "storm.approval/v1", status: "active", repoId: "r", target: "t", configHash: HASH_A, approvedAt: "x", scope: { shadowedAgents: unknown } };
+		expect(unapprovedShadows(approval, unknown)).toEqual(unknown);
 	});
 
 	test("missing dirs yield nothing", async () => {
@@ -455,9 +531,10 @@ describe("findShadows", () => {
 		await mkdir(cwd);
 		const shadows = await findShadows({
 			cwd,
-			userAgentsDir: path.join(tmp, "missing-user"),
 			pluginAgentsDir: path.join(tmp, "missing-plugin"),
+			discovery: discovery(),
+			home: tmp,
 		});
-		expect(shadows).toEqual([]);
+		expect(owned(shadows)).toEqual([]);
 	});
 });

@@ -1,23 +1,32 @@
 /** File helpers shared by Storm's state modules: one atomic writer, one per-key serializer, one JSONL reader. */
+import { linkSync, renameSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 /** Writes text through a temp file and rename, so readers never see a partial file. */
-export async function writeTextAtomic(file: string, text: string): Promise<void> {
+export async function writeTextAtomic(file: string, text: string, beforePublish?: () => void, exclusive = false): Promise<void> {
 	const dir = path.dirname(file);
 	await fs.mkdir(dir, { recursive: true });
 	const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
 	try {
 		await fs.writeFile(tmp, text);
-		await fs.rename(tmp, file);
+		if (exclusive) {
+			beforePublish?.();
+			linkSync(tmp, file);
+		} else if (beforePublish === undefined) await fs.rename(tmp, file);
+		else {
+			beforePublish();
+			renameSync(tmp, file);
+		}
 	} catch (error) {
-		await fs.rm(tmp, { force: true });
+		await fs.rm(tmp, { force: true }).catch(() => undefined);
 		throw error;
 	}
+	if (exclusive) await fs.rm(tmp, { force: true }).catch(() => undefined);
 }
 
-export function writeJsonAtomic(file: string, value: unknown): Promise<void> {
-	return writeTextAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
+export function writeJsonAtomic(file: string, value: unknown, beforePublish?: () => void, exclusive = false): Promise<void> {
+	return writeTextAtomic(file, `${JSON.stringify(value, null, 2)}\n`, beforePublish, exclusive);
 }
 
 /** Reads and parses JSON; any failure (missing, unreadable, corrupt) is undefined. */

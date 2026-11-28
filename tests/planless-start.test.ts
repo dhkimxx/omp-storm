@@ -129,7 +129,7 @@ describe("the plan-less automatic start (R9)", () => {
 		await h.controller.finish("shutdown");
 	});
 
-	test("a plan-less open past the handler's deadline is finished at once as stopped, not left holding the lease", async () => {
+	test("a plan-less open already past the handler deadline never takes a lease or writes a record", async () => {
 		const clock = { now: Date.parse("2026-11-27T00:00:00Z") };
 		const h = session({ now: () => clock.now });
 		const opened = await h.controller.startPlanless(h.ctx, ask("look"), {
@@ -141,9 +141,32 @@ describe("the plan-less automatic start (R9)", () => {
 		expect(h.controller.directing()).toBe(false);
 		expect(h.sent).toEqual([]);
 		expect(h.leases.held).toEqual([]);
-		const ids = await runIds(h.sessionDir);
-		expect(ids).toHaveLength(1);
-		expect(await readRun(h.sessionDir, ids[0]!)).toMatchObject({ status: "stopped", endReason: "start-failed", turns: 0 });
+		expect(h.leases.acquired).toEqual([]);
+		expect(await runIds(h.sessionDir)).toEqual([]);
+	});
+
+	test("an automatic plan whose owning request is withdrawn during preparation takes no lease and leaves no record", async () => {
+		let withdrawn = false;
+		const h = session({ state: s => { withdrawn = true; return s; } });
+		const reason = "request withdrawn";
+		const started = await h.controller.startWithPlan(h.ctx, ask("prepare"), writePlan(), undefined, Date.now(), () => withdrawn ? reason : undefined);
+		expect(started).toEqual({ ok: false, reason });
+		expect(h.leases.acquired).toEqual([]);
+		expect(await runIds(h.sessionDir)).toEqual([]);
+		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
+	});
+
+	test("another session of the same profile cannot reuse a finished run's id", async () => {
+		const first = session();
+		const runId = "run-20261127-000000-fixed";
+		expect(await first.controller.start(first.ctx, ask("first"), runId)).toMatchObject({ ok: true, runId });
+		await first.controller.finish("shutdown");
+		const next = session({ agentDir: first.agentDir });
+		expect(await next.controller.start(next.ctx, ask("second"), runId)).toMatchObject({
+			ok: false, reason: expect.stringContaining("이미 사용된 실행 ID"),
+		});
+		expect(await runIds(next.sessionDir)).toEqual([]);
+		expect((await readRun(first.sessionDir, runId))?.request).toBe("first");
 	});
 
 	test("a refused plan-less open leaves no run, lease or ledger entry", async () => {

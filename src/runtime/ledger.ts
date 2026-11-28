@@ -7,6 +7,8 @@ export interface LedgerRun {
 	runId: string;
 	/** The native main session id captured at admission; never re-read from ambient state. */
 	sessionId: string;
+	/** The host handle of the main session that owns this run, including for hooks loaded by a child. */
+	directorId?: string;
 	/** The profile's session store directory for that session; includes the profile and is the owner key. */
 	sessionDir: string;
 	repoId: string;
@@ -61,6 +63,7 @@ function requireIdentity(value: unknown, field: string): string {
 export function startLedgerRun(init: {
 	runId: string;
 	sessionId: string;
+	directorId?: string;
 	sessionDir: string;
 	repoId: string;
 	root: string;
@@ -92,6 +95,7 @@ export function startLedgerRun(init: {
 		exceeded: false,
 		closing: false,
 	};
+	if (init.directorId !== undefined) run.directorId = requireIdentity(init.directorId, "메인 에이전트 id");
 	if (init.budget) run.budget = init.budget;
 	if (init.base !== undefined) run.base = init.base;
 	if (init.artifactsDir !== undefined && init.artifactsDir !== "") run.artifactsDir = init.artifactsDir;

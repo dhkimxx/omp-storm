@@ -8,8 +8,8 @@
  */
 import { formatUsd } from "../policy/spawn.ts";
 import { RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
-import { CAPTURE_UNKNOWN_LABEL } from "../runtime/closeout.ts";
-import { NO_DECLARED_RESULTS, type CaptureUnknown, type RetainedFacts } from "../runtime/result-facts.ts";
+import { CAPTURE_UNKNOWN_LABEL, stormStopLine } from "../runtime/closeout.ts";
+import { NO_DECLARED_RESULTS, type CaptureUnknown, type RetainedFacts, type StormStopFacts } from "../runtime/result-facts.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
 
@@ -172,7 +172,7 @@ function officialLine(brief: CloseoutBrief, duration: string | undefined, out: B
  * input instruction appears. A `line` (or `none`) brief is one factual line.
  */
 export function renderCloseout(
-	brief: CloseoutBrief & { readonly retained?: RetainedFacts; readonly captureUnknown?: CaptureUnknown },
+	brief: CloseoutBrief & { readonly retained?: RetainedFacts; readonly captureUnknown?: CaptureUnknown; readonly stormStops?: StormStopFacts },
 	showChoices: boolean,
 ): { markdown: string; info: InfoLine[] } {
 	const out = new Builder();
@@ -215,6 +215,12 @@ export function renderCloseout(
 			],
 			{ icon: "status.warning" },
 		);
+	}
+	// Fault 2: a worker Storm stopped reaches the director with the host's failure text. The record says what happened
+	// and quotes the worker's own sentence, one line per cause, before any residual risk or prose.
+	for (const stop of brief.stormStops?.reasons ?? []) {
+		const text = clean(stormStopLine(stop), DETAILS_TEXT_MAX);
+		if (text !== "") out.item([{ text }], { icon: "status.warning", emphasis: "action" });
 	}
 
 	// Known residual risk leads any prose, so no explanation can sit between the status and its warnings.

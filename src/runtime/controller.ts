@@ -44,6 +44,7 @@ import type {
 	StormConfig,
 	UnplannedDelivery,
 	UiPort,
+	WorkerStopReason,
 } from "../types.ts";
 import { DIRECTOR_DRAIN_WARNING, DIRECTOR_WRITE_ENDING, directorEditWait } from "./arbiter.ts";
 import { ATTEMPT_REF, attemptUsable, type AttemptReport } from "./attempt-report.ts";
@@ -79,6 +80,8 @@ import {
 	parseCloseout,
 	rememberCloseoutReport,
 	resetCloseoutChoices,
+	stormStopNotice,
+	WORKER_STOP_LABEL,
 } from "./closeout.ts";
 import { renderCloseout } from "../view/closeout.ts";
 import { checkpointGuidance, shouldCheckpoint } from "./checkpoint.ts";
@@ -116,6 +119,7 @@ import {
 	decideRound,
 	END_STATUS,
 	endLabel,
+	NO_DECLARED_END_REASON,
 	stopWords,
 	lastWriterChangeAt,
 	maxRounds,
@@ -123,6 +127,7 @@ import {
 	reviewProof,
 	STATUS_LABEL,
 	treeFingerprint,
+	treeMoved,
 	type CoverageCheck,
 	type CoverageInput,
 	type CoverageLane,
@@ -134,10 +139,10 @@ import {
 import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "./answer-review.ts";
 import { captureSharedBaseline, evaluateSettledResults, ISOLATED_CHANGE_REASON, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
-import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
+import { buildHandoff, discardStartRecord, newRunId, pruneRuns, publishRun, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
-import { findResumeCandidate, handoffSpec, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
+import { discardStartPointer, findResumeCandidate, handoffSpec, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import { sharedMap } from "./thread-state.ts";
 import { DEFAULT_TIMINGS, type StormTimings } from "./timings.ts";
@@ -151,6 +156,17 @@ const spawnsByRun = sharedMap<string, SpawnRecord[]>("storm.controller.spawnsByR
  */
 const lastSpawnByKey = sharedMap<string, Map<string, SpawnRecord>>("storm.controller.lastSpawnByKey");
 const deliveryKindsByRun = sharedMap<string, Map<string, "lane" | "blocked" | "unplanned">>("storm.controller.deliveryKindsByRun");
+/**
+ * Workers this run's own admission stopped, by cause, for the bounded notice the director reads with the results. Keyed
+ * by cause and by the worker's spawn key: two causes and this run's own stopped workers, never a sentence per worker in
+ * the director's context (fault 2, D11). The first safe handle is the worker the cause sentence names.
+ */
+interface StopTally {
+	keys: Set<string>;
+	first?: string;
+}
+const stormStopsByRun = sharedMap<string, Map<WorkerStopReason, StopTally>>("storm.controller.stormStopsByRun");
+const NATIVE_AGENT_ID = /^[A-Za-z0-9._-]{1,120}$/u;
 
 /** One delivery this run asked a worker for: its admission, or a work message that wakes a turn. */
 interface ExpectedDelivery {
@@ -226,6 +242,8 @@ export interface PlanlessStart {
 	deadline: number;
 	/** What the gated batch needs of the target: a batch of safe readers must not take the write lease (R9). */
 	lease: "read" | "write";
+	/** The owning hook's grant. A refusal is evaluated again at each controller boundary. */
+	authorize?: (() => string | undefined) | undefined;
 }
 
 /** Debounced writers of the runs owned by sessions in this process, keyed by run id. */
@@ -323,7 +341,23 @@ export function noteRunRan(runId: string, spawnKey: string, ran: RanModel): void
 export function noteRunStopped(runId: string, spawnKey: string, stop: SpawnStop): void {
 	const record = spawnsByRun.get(runId)?.findLast(spawn => spawn.spawnKey === spawnKey && spawn.outcome !== "blocked");
 	if (record === undefined) return;
+	// The same attempt read twice is one stop; a later attempt's stop is its own fact.
+	if (record.stop?.attempt === stop.attempt) return;
 	record.stop = stop;
+	// The bounded notice's own tally, keyed by cause and worker: a worker stopped twice is counted once, under its
+	// latest cause, so the count matches the spawn records the card and status read.
+	let stops = stormStopsByRun.get(runId);
+	if (stops === undefined) {
+		stops = new Map();
+		stormStopsByRun.set(runId, stops);
+	}
+	for (const [reason, tally] of [...stops]) {
+		if (reason !== stop.reason && tally.keys.delete(spawnKey) && tally.keys.size === 0) stops.delete(reason);
+	}
+	const tally = stops.get(stop.reason) ?? { keys: new Set<string>() };
+	tally.keys.add(spawnKey);
+	if (tally.first === undefined && NATIVE_AGENT_ID.test(spawnKey)) tally.first = spawnKey;
+	stops.set(stop.reason, tally);
 	touchRun(runId);
 }
 
@@ -774,6 +808,10 @@ interface OwnRun {
 	 * `takeNotices`. Memory only: a notice is a reading aid for the next director request, never state to restore.
 	 */
 	notices: string[];
+	/** The stop summary already delivered for this run; a later stop changes it so the director reads the new count. */
+	stopNoticeShown?: string;
+	/** The initiating hook has not handed this automatic start back to omp. */
+	provisional?: true;
 	/** Dispatches whose evaluation was already reported: one attempt is reported once, however many ways it arrives. */
 	noticed: Set<string>;
 	/** Waiting lanes the director was told can start and that have not started or stopped being startable since. */
@@ -827,6 +865,8 @@ interface OwnRun {
 	awaitingRound?: number;
 	/** Started inside a running turn as an automatic probe: it sends no handoff and keeps routine ends out of the transcript. */
 	auto?: boolean;
+	/** Opened by R9's plan-less automatic door (`startPlanless`), not the manual branch that also has no plan. */
+	planless?: boolean;
 	/** Why the run is over, decided while a turn was still running: that turn's end finishes it, its last message counted. */
 	ending?: RunEndReason;
 	/** Most rounds the run may take, fixed at start: a team edited mid-run must not move the goal posts. Absent: no cap. */
@@ -930,11 +970,12 @@ export interface RunControllerDeps {
  * Which door a start came through. Only the manual one waits for a handoff; the other three open inside a turn that is
  * already running. `planless` is R9's explicit start mode: it is not `#start` with no plan, which is the manual branch.
  */
-type StartMode =
+type StartMode = (
 	| { kind: "manual" }
 	| { kind: "plan"; plan: RunPlan; configHash?: string; turnStartedAt?: number }
 	| { kind: "continue"; said: string | undefined; turnStartedAt: number }
-	| { kind: "planless"; turnStartedAt: number; deadline: number; lease: "read" | "write" };
+	| (Pick<PlanlessStart, "turnStartedAt" | "deadline" | "lease"> & { kind: "planless" })
+) & { authorize?: (() => string | undefined) | undefined };
 
 export class RunController {
 	#pending: { runId: string; spec: RunSpec } | undefined;
@@ -1057,9 +1098,10 @@ export class RunController {
 	 * message that began this turn: R9's same-turn rule refuses a start after a run of this session and target ended or
 	 * stopped at or after it. The wiring passes it for every automatic plan; callers that do not keep 0.28.0's checks.
 	 */
-	async startWithPlan(ctx: ExtensionContext, spec: RunSpec, plan: RunPlan, configHash?: string, turnStartedAt?: number): Promise<RunRequestResult> {
+	async startWithPlan(ctx: ExtensionContext, spec: RunSpec, plan: RunPlan, configHash?: string, turnStartedAt?: number, authorize?: () => string | undefined): Promise<RunRequestResult> {
 		return this.#start(ctx, spec, newRunId(this.deps.now()), {
 			kind: "plan",
+			authorize,
 			plan,
 			...(configHash !== undefined ? { configHash } : {}),
 			...(turnStartedAt !== undefined ? { turnStartedAt } : {}),
@@ -1079,6 +1121,7 @@ export class RunController {
 			kind: "planless",
 			turnStartedAt: input.turnStartedAt,
 			deadline: input.deadline,
+			authorize: input.authorize,
 			lease: input.lease,
 		});
 	}
@@ -1094,8 +1137,8 @@ export class RunController {
 	 * which of the two happened. The caller has already decided that this is the user's turn and that delegation is
 	 * automatic.
 	 */
-	async continueInTurn(ctx: ExtensionContext, said: string | undefined, turnStartedAt: number): Promise<RunStartResult> {
-		return this.#start(ctx, { task: "" }, newRunId(this.deps.now()), { kind: "continue", said, turnStartedAt });
+	async continueInTurn(ctx: ExtensionContext, said: string | undefined, turnStartedAt: number, authorize?: () => string | undefined): Promise<RunStartResult> {
+		return this.#start(ctx, { task: "" }, newRunId(this.deps.now()), { kind: "continue", said, turnStartedAt, authorize });
 	}
 
 	async #start(ctx: ExtensionContext, spec: RunSpec, runId: string, mode: StartMode): Promise<RunStartResult> {
@@ -1140,9 +1183,13 @@ export class RunController {
 		let plan: RunPlan | undefined = mode.kind === "plan" ? mode.plan : undefined;
 		const configHash = mode.kind === "plan" ? mode.configHash : undefined;
 		let requested = asked;
-		const gone = (): Refusal => refuse("세션이 바뀌어 Storm 실행을 시작하지 않았습니다.");
+		const denied = (): string | undefined =>
+			mode.authorize?.() ?? (planless !== undefined && this.deps.now() >= planless.deadline ? PLANLESS_DEADLINE : undefined);
+		const gone = (): Refusal => refuse(denied() ?? "세션이 바뀌어 Storm 실행을 시작하지 않았습니다.");
+		const initial = denied();
+		if (initial !== undefined) return refuse(initial);
 		const state = await this.deps.loadState(ctx);
-		if (this.#generation !== generation) return gone();
+		if (this.#generation !== generation || denied() !== undefined) return gone();
 		// Pure reads, decided in R9's order below: the plan-less gate needs the team's and the shadow's refusals last.
 		const gate = teamGate(state);
 		const shadow = shadowBlock(state);
@@ -1184,7 +1231,7 @@ export class RunController {
 		if (continuing !== undefined) {
 			// The candidate is the menu's own: the newest trusted unfinished run of this session and target.
 			const candidate = await findResumeCandidate(sessionDir, target).catch(() => undefined);
-			if (this.#generation !== generation) return gone();
+			if (this.#generation !== generation || denied() !== undefined) return gone();
 			if (candidate === undefined) return refuse(NO_CONTINUABLE_RUN);
 			// The user must have spoken after the run stopped. Both times are recorded facts: the run's own end (a run found
 			// dead has the time of its last sign of life) and the moment the user's message began this turn. The same
@@ -1202,7 +1249,7 @@ export class RunController {
 		}
 		// The host may mutate its session manager in place instead of emitting a switch: every await below must also
 		// prove that the context still names this same native session.
-		const stale = (): boolean => this.#generation !== generation || closeoutSessionId(ctx) !== sessionId;
+		const stale = (): boolean => this.#generation !== generation || closeoutSessionId(ctx) !== sessionId || denied() !== undefined;
 		const ui = this.deps.ui(ctx);
 		const ready = await this.#ready(ctx, ui, !auto);
 		if (stale()) return gone();
@@ -1412,6 +1459,7 @@ export class RunController {
 				turnStarted: auto,
 				inTurn: auto,
 				...(auto ? { auto, roundInFlight: 1 } : {}),
+				...(mode.kind === "planless" ? { planless: true } : {}),
 				...(roundLimit === undefined ? {} : { maxRounds: roundLimit }),
 				awaitingAsync: false,
 				...(startTree !== undefined ? { tree: startTree.state, base: startTree.base } : {}),
@@ -1457,19 +1505,47 @@ export class RunController {
 					return refuse(`실행 계약을 만들지 못해 시작하지 않았습니다: ${errorText(error)}`);
 				}
 			}
-			// The run takes the lease from here; a failed start finalizes and releases it through `#stop`.
+			// Seed the record while no live writer can observe it or schedule a flush.
+			this.#syncResults(own);
+			let written = false;
+			let pointed = false;
+			const assertLive = (): void => {
+				if (stale()) throw new Error(gone().reason);
+			};
+			const rollback = async (): Promise<void> => {
+				if (pointed) await discardStartPointer(sessionDir, target, record);
+				if (written) await discardStartRecord(sessionDir, record);
+			};
+			try {
+				await publishRun(sessionDir, record, assertLive);
+				written = true;
+				try {
+					await noteResumePointer(sessionDir, target, record, assertLive);
+					pointed = true;
+				} catch (error) {
+					assertLive();
+					if (record.resumeOf !== undefined) {
+						await rollback();
+						return stale() ? gone() : refuse(RESUME_POINTER_FAILED);
+					}
+				}
+				assertLive();
+			} catch (error) {
+				await rollback();
+				return stale() ? gone() : refuse(`실행을 기록하지 못해 시작하지 않았습니다: ${errorText(error)}`);
+			}
+			// No wait between the last authorization check and the live run that takes the lease.
 			own.lease = lease;
 			lease = undefined;
+			if (mode.authorize !== undefined) own.provisional = true;
 			this.#own = own;
-			// An automatic plan is bound before its first spawn: seed its requirements into the record now.
-			this.#syncResults(own);
-			// From here a child's start, settle or approval can refresh the phase immediately; finalization removes it.
 			userWaits.delete(runId);
 			phaseWatchers.set(runId, () => this.#emitPhase(own));
 			try {
 				startLedgerRun({
 					runId,
 					sessionId,
+					directorId: ctx.agent.id,
 					sessionDir,
 					repoId: own.repoId,
 					root: own.root,
@@ -1488,35 +1564,6 @@ export class RunController {
 					if (this.#own === own) own.notices.push(text);
 				});
 				openRunReads(runId);
-				const startingWrite = writeRun(own.sessionDir, record);
-				// The final record waits for the start write, so a shutdown that lands during admission cannot overwrite it.
-				this.#liveWrite = startingWrite.catch(() => undefined);
-				await startingWrite;
-				if (stale() || this.#own !== own) {
-					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
-					return gone();
-				}
-				// In this session's own profile store, keyed by its native id and bound to the exact target.
-				// A run that continues another is recorded as its successor here, and only this entry stops the next
-				// continuation from taking the same parent again. Without it the lineage forks (two runs claim one parent, the
-				// spend and accepted results of this one fall out of the goal), so a continued run that cannot be recorded
-				// does not go on. A fresh run only loses its own resumability, which was always best effort.
-				const pointed = await noteResumePointer(own.sessionDir, target, record).then(() => true, () => false);
-				if (!pointed && record.resumeOf !== undefined) {
-					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
-					return refuse(RESUME_POINTER_FAILED);
-				}
-				if (stale() || this.#own !== own) {
-					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
-					return gone();
-				}
-				// R9's deadline: the host has blocked this `tool_call` handler after its budget and ignores what this
-				// continuation does. A run opened now can never place the batch, so it is finished at once as stopped
-				// instead of holding the lease with no work. The caller is refused with the real cause.
-				if (planless !== undefined && this.deps.now() >= planless.deadline) {
-					await this.#stop(own, "start-failed", ctx).catch(() => undefined);
-					return refuse(PLANLESS_DEADLINE);
-				}
 			} catch (error) {
 				// This session directs and the ledger is open, but nothing was handed off: close both rather than leave a run nobody started.
 				await this.#stop(own, "start-failed", ctx).catch(() => undefined);
@@ -1540,7 +1587,7 @@ export class RunController {
 					return {
 						ok: true,
 						runId,
-						continued: { mode: "handoff", from: continued.runId, ended: stopWords(continued.endReason), kept: 0, reopened: 0, blocked: 0, open: [] },
+						continued: { mode: "handoff", from: continued.runId, ended: stopWords(continued.endReason), kept: 0, reopened: 0, blocked: 0, open: [], ...(carriedRows > 0 && priorExcluded.length === carriedRows ? { allExcluded: true } : {}) },
 					};
 				}
 				const rows = own.record.results ?? [];
@@ -2277,6 +2324,10 @@ export class RunController {
 		while (list.length > UNPLANNED_MAX) list.shift();
 		own.record.unplanned = list;
 		own.record.unplannedCount = (own.record.unplannedCount ?? 0) + 1;
+		// F2: counted here, when the delivery is recorded, so cutting the list never turns an asked-for delivery into an
+		// unasked arrival.
+		if (expected) own.record.unplannedAsked = (own.record.unplannedAsked ?? 0) + 1;
+		else own.record.unplannedUnasked = (own.record.unplannedUnasked ?? 0) + 1;
 		if (!expected) own.notices.push(unplannedNotice(entry));
 		this.#scheduleFlush(own);
 	}
@@ -2303,13 +2354,34 @@ export class RunController {
 	}
 
 	/**
+	 * The one bounded line about workers this run's own admissions stopped, from the keyed tally. It goes before the
+	 * queued notices so a hundred per-worker sentences or delivery lines can never truncate the cause away; a new stop
+	 * changes the signature, so the director reads the new count once. Two causes at most (fault 2, D11).
+	 */
+	#stopNotice(own: OwnRun): string | undefined {
+		const tally = stormStopsByRun.get(own.record.runId);
+		if (tally === undefined || tally.size === 0) return undefined;
+		const reasons = [...tally.entries()]
+			.map(([reason, entry]) => ({ reason, count: entry.keys.size, ...(entry.first === undefined ? {} : { first: entry.first }) }))
+			.filter(stop => stop.count > 0)
+			.sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+		if (reasons.length === 0) return undefined;
+		const signature = reasons.map(stop => `${stop.reason}:${stop.count}`).join(",");
+		if (own.stopNoticeShown === signature) return undefined;
+		own.stopNoticeShown = signature;
+		return stormStopNotice({ count: reasons.reduce((sum, stop) => sum + stop.count, 0), reasons });
+	}
+
+	/**
 	 * The notices queued since the last call, as one bounded text for the director's next request, or nothing. Taking
 	 * them empties the queue, so a notice is read once however it is delivered.
 	 */
 	takeNotices(): string | undefined {
 		const own = this.#own;
-		if (own === undefined || own.notices.length === 0) return undefined;
-		const taken = own.notices.splice(0, own.notices.length);
+		if (own === undefined) return undefined;
+		const stop = this.#stopNotice(own);
+		if (own.notices.length === 0 && stop === undefined) return undefined;
+		const taken = stop === undefined ? own.notices.splice(0, own.notices.length) : [stop, ...own.notices.splice(0, own.notices.length)];
 		const text = taken.join("\n");
 		return text.length > NOTICE_MAX_CHARS ? `${text.slice(0, NOTICE_MAX_CHARS - 1)}…` : text;
 	}
@@ -4279,6 +4351,11 @@ export class RunController {
 			...(own.minutes !== undefined ? { minutes: own.minutes } : {}),
 			...(own.progress ? { progressSince: own.progress } : {}),
 			...(own.stalled === undefined ? {} : { stalled: own.stalled }),
+			// Only R9's plan-less door takes the zero-row end: a manual or planned run may still verify through its
+			// required checks, so its gate keeps its existing meaning there (the coordinator's regression).
+			noDeclaredResults: own.planless === true && (own.record.results?.length ?? 0) === 0,
+			parentChanged: treeMoved(currentTree, coverage),
+			directorEdit: own.directorEdit === true,
 		});
 		return { decision, tree: now };
 	}
@@ -4800,6 +4877,19 @@ export class RunController {
 		await this.finish(own.ending, ctx);
 	}
 
+	/** An automatic start becomes ordinary work only at its own tool's accepted reply. */
+	completeOpening(runId: string): boolean {
+		const own = this.#own;
+		if (own?.record.runId !== runId || own.ending !== undefined || own.provisional !== true) return false;
+		delete own.provisional;
+		return true;
+	}
+
+	async rollbackOpening(runId: string, ctx: ExtensionContext): Promise<void> {
+		if (this.#own?.record.runId !== runId || this.#own.provisional !== true) return;
+		await this.finish("start-failed", ctx);
+	}
+
 	/** Ends this session's run (if any), writes its record and reports the summary. */
 	async finish(reason: RunEndReason, ctx?: ExtensionContext): Promise<RunRecord | undefined> {
 		// A queued run belongs to the session that shut down or switched; the next one starts clean.
@@ -4812,7 +4902,7 @@ export class RunController {
 		if (!own) return undefined;
 		own.ending ??= reason;
 		// R9's same-turn fact: the run is stopped from now on, even while owned work drains and the final record waits.
-		noteRunEnd(own.sessionDir, own.root, this.deps.now());
+		if (own.provisional !== true) noteRunEnd(own.sessionDir, own.root, this.deps.now());
 		if (ctx !== undefined) own.finishCtx ??= ctx;
 		own.abort.abort();
 		// A background checkpoint belongs to this run: cancel it before the run leaves; a late commit cannot mark another.
@@ -4922,7 +5012,7 @@ export class RunController {
 			coverage,
 			{ directorEdit: own.directorEdit === true },
 		);
-		if (gate.state === "passed") return "verified";
+		if (gate.state === "passed") return own.planless === true && (own.record.results?.length ?? 0) === 0 ? NO_DECLARED_END_REASON : "verified";
 		if (gate.state === "none") {
 			if (gate.why === "no-changes") return "no-changes";
 			if (gate.why === "quick-only") return "unreviewed";
@@ -5157,6 +5247,26 @@ export class RunController {
 		this.#flushTimer = undefined;
 		liveWriters.delete(own.record.runId);
 		const ledger = endLedgerRun(own.record.runId);
+		if (own.provisional === true && (spawnsByRun.get(own.record.runId)?.length ?? 0) === 0 && !own.directorEdit) {
+			const { runId } = own.record;
+			spawnsByRun.delete(runId);
+			lastSpawnByKey.delete(runId);
+			deliveryKindsByRun.delete(runId);
+			expectedByRun.delete(runId);
+			stormStopsByRun.delete(runId);
+			noticeSinks.delete(runId);
+			clearRunReads(runId);
+			forgetRunLanes(runId);
+			try {
+				await this.#liveWrite;
+				await discardStartPointer(own.sessionDir, { repoId: own.repoId, root: own.root }, own.record);
+				await discardStartRecord(own.sessionDir, own.record);
+				if (ctx !== undefined) this.#liveStatus(ctx, undefined);
+			} finally {
+				if (own.lease !== undefined) await this.#releaseLease(own.lease, ctx);
+			}
+			return undefined;
+		}
 		// What each row held before finalization touched it: a held result this step reopens is marked revoked. The
 		// marker classifies the closeout only; it is never evidence and is never carried into a continuation.
 		const held = new Map(this.#heldStates(own));
@@ -5206,6 +5316,7 @@ export class RunController {
 		lastSpawnByKey.delete(own.record.runId);
 		deliveryKindsByRun.delete(own.record.runId);
 		expectedByRun.delete(own.record.runId);
+		stormStopsByRun.delete(own.record.runId);
 		noticeSinks.delete(own.record.runId);
 		clearRunReads(own.record.runId);
 		const record: RunRecord = {
@@ -5419,9 +5530,9 @@ export class RunController {
 			ui.notify(`사용량 마감을 워커에게 알리지 못했습니다: ${errorText(error)}`, "error");
 		}
 		ui.notify(
-			// The figure is the spend Storm has seen: no new spawn and no work message to an idle worker from here, and with `stop` the director's turn is aborted,
-			// but what workers already run still finishes (and its spend lands after this notice).
-			`Storm 실행 예산(${formatUsd(budget?.perRunUsd ?? 0)})에 관측된 지출이 닿았습니다(누계 ${formatUsd(run.costUsd)}). 새 스폰과 쉬는 워커에게 보내는 일 메시지를 막습니다(진행 메모는 보낼 수 있습니다).${stop ? " 감독의 응답을 중단합니다." : ""} 이미 도는 워커는 끝까지 진행하며, 그 지출은 이후에 더해집니다.`,
+			// F3: say what happens now. After the limit no message of any kind reaches a worker (B3 refuses even a progress
+			// note); a turn already running finishes under `block-spawns`, while under `stop` its next request is not sent.
+			`Storm 실행 예산(${formatUsd(budget?.perRunUsd ?? 0)})에 관측된 지출이 닿았습니다(누계 ${formatUsd(run.costUsd)}). 이제 워커에게 어떤 agent:// 메시지도 보내지 않습니다(진행 메모 포함). 새 스폰도 막습니다.${stop ? " 감독의 응답을 중단하고, 이미 도는 워커의 다음 요청도 보내지 않습니다." : " 이미 도는 워커의 지금 턴은 끝까지 진행하며, 그 지출은 이후에 더해집니다."}`,
 			"warning",
 		);
 		if (!stop) return;
@@ -5491,6 +5602,11 @@ export function summarizeRun(run: RunRecord): string {
 	const verified = run.spawns.filter(spawn => spawn.ran?.verdict === "verified").length;
 	const mismatched = run.spawns.filter(spawn => spawn.ran?.verdict === "mismatch").length;
 	const ranLine = verified + mismatched === 0 ? "" : ` · 시도별 실행 모델 관측 ${verified}${mismatched > 0 ? `, 승인 밖 ${mismatched}(멈춤)` : ""}`;
+	const stoppedReasons = run.spawns.flatMap(spawn => (spawn.stop === undefined ? [] : [spawn.stop.reason]));
+	const stopLine =
+		stoppedReasons.length === 0
+			? ""
+			: `- Storm 중단: ${stoppedReasons.length}개 · ${tally(stoppedReasons, reason => WORKER_STOP_LABEL[reason] ?? reason)}`;
 	const end = run.endReason ? ` · ${endLabel(run.endReason)}` : "";
 	// Records of 0.10 and earlier counted no rounds; `maxRounds` is absent from those written before it was kept and
 	// from every uncapped run.
@@ -5503,6 +5619,7 @@ export function summarizeRun(run: RunRecord): string {
 	const lines = [
 		`- 실행: ${run.runId} (${STATUS_LABEL[run.status]}${end})${rounds} · 비용(정가 환산) ${formatUsd(run.costUsd)}${run.budget ? ` / 예산 ${formatUsd(run.budget.perRunUsd)}` : ""}${run.plan ? ` · ${planText(run.plan)}` : ""}`,
 		`- 스폰: ${spawnLine}${blockLine}${ranLine}`,
+		...(stopLine === "" ? [] : [stopLine]),
 	];
 	const main: string[] = [];
 	if (run.mainCostUsd !== undefined && run.costUsd > 0) {

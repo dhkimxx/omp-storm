@@ -12,6 +12,7 @@ import type { PlanView } from "./plan-view.ts";
 export interface ContinuedRun {
 	/** Which of R12's two continuations happened: the old plan and rows carried, or a handoff with nothing re-proved. */
 	mode: "carry" | "handoff";
+	allExcluded?: true;
 	from: string;
 	/** Why the continued run stopped, in the words `/storm status` uses ("이유 기록 없음" for a record that names none). */
 	ended: string;
@@ -63,6 +64,8 @@ export interface StormToolHost {
 	isolationEnabled?(): boolean | undefined;
 	/** The main session's automatic-delegation policy; absent hosts behave as if it were never opted in. */
 	auto?(): AutoDelegationState;
+	/** Final authorization of an automatic start, after tool reply construction. */
+	checkStartReply?(): string | Promise<string> | undefined;
 	runtime: {
 		/** Queues a run that starts once the current agent turn settles. */
 		requestRun(spec: RunSpec): RunRequestResult;

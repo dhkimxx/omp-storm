@@ -2392,7 +2392,7 @@ describe("budget", () => {
 		expect(await readRunIndex(h.sessionDir)).toMatchObject([{ runId, status: "budget-exceeded" }]);
 	});
 
-	test("what the notices and labels say about the limit claims no more than it does: observed spend, nothing new starts, work in flight finishes", async () => {
+	test("what the notices and labels say about the limit claims no more than it does: no message of any kind, nothing new starts, work in flight follows the choice", async () => {
 		for (const onExceed of ["stop", "block-spawns"] as const) {
 			const h = session({ config: budget(onExceed) });
 			const runId = await h.start();
@@ -2400,18 +2400,23 @@ describe("budget", () => {
 			recordCost(runId, "a/i", 3);
 			const text = h.notices.filter(n => n.level === "warning").map(n => n.text).at(-1) ?? "";
 			expect(text).toContain("관측된 지출");
-			expect(text).toContain("새 스폰과 쉬는 워커에게 보내는 일 메시지를 막습니다");
-			expect(text).toContain("이미 도는 워커는 끝까지 진행");
-			// The abort of the director's turn is claimed only where it is done; neither says the run or its workers stop.
-			expect(text.includes("감독의 응답을 중단합니다")).toBe(onExceed === "stop");
+			expect(text).toContain("어떤 agent:// 메시지도 보내지 않습니다");
+			expect(text).toContain("진행 메모 포함");
+			expect(text).toContain("새 스폰도 막습니다");
+			// The two choices differ exactly where they act: the director's response and the running worker's next request.
+			expect(text.includes("감독의 응답을 중단하고")).toBe(onExceed === "stop");
+			expect(text.includes("다음 요청도 보내지 않습니다")).toBe(onExceed === "stop");
+			expect(text.includes("지금 턴은 끝까지 진행")).toBe(onExceed === "block-spawns");
 			expect(text).not.toContain("실행을 중단합니다");
 			await h.controller.onAgentEnd({}, h.ctx);
 			resetLedger();
 		}
-		// The setup choice and the status line state the same two behaviours.
-		expect(ON_EXCEED["block-spawns"]).toBe("새 스폰과 쉬는 워커에게 보내는 일 메시지 차단");
-		expect(ON_EXCEED.stop).toContain("이미 도는 워커는 끝까지 진행");
-		expect(ON_EXCEED.stop).not.toBe("실행 중단");
+		// The setup choice and the status line state the same behaviours.
+		expect(ON_EXCEED["block-spawns"]).toContain("모든 워커 메시지 차단");
+		expect(ON_EXCEED["block-spawns"]).toContain("도는 턴은 끝까지");
+		expect(ON_EXCEED.stop).toContain("모든 워커 메시지 차단");
+		expect(ON_EXCEED.stop).toContain("다음 요청 중단");
+		expect(ON_EXCEED.stop).not.toContain("끝까지 진행");
 	});
 
 	test("block-spawns: nothing is aborted and the run goes on to its own end", async () => {

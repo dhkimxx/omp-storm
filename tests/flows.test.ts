@@ -1081,7 +1081,7 @@ describe("status and agents", () => {
 	async function busyEnv(): Promise<{ env: FlowEnv; calls: { settings: number; omp: number } }> {
 		const agents = path.join(project.root, ".omp", "agents");
 		await mkdir(agents, { recursive: true });
-		await writeFile(path.join(agents, "shadow-file.md"), "---\nname: storm-reviewer\n---\nbody\n");
+		await writeFile(path.join(agents, "shadow-file.md"), "---\nname: storm-reviewer\ndescription: test reviewer\n---\nbody\n");
 		const state = await load();
 		await approveAndSave(state, TEAM, { shadowedAgents: state.shadows });
 		const calls = { settings: 0, omp: 0 };

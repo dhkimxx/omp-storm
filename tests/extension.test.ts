@@ -11,6 +11,8 @@ import * as path from "node:path";
 import * as zod from "@oh-my-pi/omptype/zod";
 import { AgentRegistry, type CompactOptions, type ExtensionAPI, type ExtensionContext, type ExtensionUiFactory, type ExtensionUiHost } from "@oh-my-pi/pi-coding-agent";
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig, configPath } from "../src/config/store.ts";
@@ -54,7 +56,7 @@ import { refusedCodeOf } from "../src/runtime/task-refusal.ts";
 import { until } from "./fake-session.ts";
 import { TEST_TIMINGS } from "./timings.ts";
 import { DEAD_PROCESS, runRecord } from "./fixtures.ts";
-import { git, gitRepo, makeProject, scriptedUi, TEAM, type TestProject } from "./support.ts";
+import { git, gitRepo, makeProject, scriptedUi, TEAM, TEST_DISCOVERY, type TestProject } from "./support.ts";
 import { extensionTheme } from "./tui-host.ts";
 
 /** The fresh-plan contract the tool boundary requires; these tests exercise admission, not result evidence. */
@@ -100,6 +102,19 @@ function fakeOmp(project: TestProject, load: typeof storm = storm) {
 	const sessions = new Map<string, ExtensionContext>();
 	const rememberSession = (ctx: ExtensionContext): void => {
 		sessions.set(`${ctx.agent.kind}:${ctx.agent.id}`, ctx);
+		if (ctx.agent.kind !== "main") return;
+		const id = ctx.agent.id;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const registry = AgentRegistry.global();
+		if (!sessionId || registry.get(id)?.session?.sessionManager.getSessionId() === sessionId) return;
+		registry.register({
+			id, displayName: id, kind: "main", status: "idle", createdAt: Date.now(), lastActivity: Date.now(),
+			session: {
+				sessionManager: { getSessionId: () => sessionId },
+				effectiveExtensionRoots: TEST_DISCOVERY.extensionRoots,
+				getSessionAgents: () => TEST_DISCOVERY.sessionAgents,
+			} as unknown as AgentSessionHandle,
+		});
 	};
 	/**
 	 * The fake host speaks the names it was given: a task item's job, progress and result rows carry the handle the
@@ -368,10 +383,13 @@ function placedName(answer: unknown, fallback: string): string {
 }
 
 let project: TestProject;
+let beforeAgentDir: string;
 
 beforeEach(async () => {
 	placedHandles.clear();
 	project = await makeProject();
+	beforeAgentDir = getAgentDir();
+	setAgentDir(project.agentDir);
 });
 
 afterEach(async () => {
@@ -385,6 +403,8 @@ afterEach(async () => {
 		resetAgents();
 		resetTrialSpawns();
 		resetCloseoutChoices();
+		AgentRegistry.resetGlobalForTests();
+		setAgentDir(beforeAgentDir);
 		await project.remove();
 	}
 });
@@ -469,7 +489,9 @@ describe("a run through the hooks", () => {
 		expect(verdict(await omp.emit("tool_call", edit, main))).toBe("pass");
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", toolCallId: "write-2", input: { path: "vault://x.md", content: "x" } }, main))).toBe("director-edit");
 		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "local://notes.md" } }, main))).toBe("pass");
-		expect(verdict(await child.emit("tool_call", edit, impl))).toBe("pass");
+		// The run's marker exists from its start, so a child this run never admitted is unknown in a managed tree:
+		// it fails closed instead of editing as unrelated native work.
+		expect(verdict(await child.emit("tool_call", edit, impl))).toBe("authority");
 		// The host's order: the hooks of a message's calls, then that message's own `message_end`, then its calls run. The edit's
 		// message is over when the director's NEXT request completes (its refused sibling made the turn unclean).
 		const callBlocks = ["edit-1", "write-2"].map(id => ({ type: "toolCall", id, name: "edit", arguments: {} }));
@@ -492,6 +514,8 @@ describe("a run through the hooks", () => {
 		// A spawn decided in a subagent's session sees the same run; the plan's worker count is no limit.
 		const implWorker = child.ctx(sub(String(placedFix.input.name)));
 		expect(verdict(await child.emit("before_subagent_spawn", spawnOf("storm-implementer", "Impl2"), implWorker))).toBe("route:a/i");
+		// The worker the run admitted edits freely: the director's own edit rules never apply to a lane's writer.
+		expect(verdict(await child.emit("tool_call", { ...edit, toolCallId: "worker-edit-1" }, impl))).toBe("pass");
 
 		// The subagent's first turn registers it under the run and brings its role's doc rules.
 		const section = docPromptFor("storm-implementer", TEAM);
@@ -1608,7 +1632,7 @@ describe("a run through the hooks", () => {
 		// The approval is still there, but it does not cover this definition: the team is not approved, so the
 		// resume hint is not offered and the status says what the user must do.
 		await mkdir(path.join(project.root, ".omp", "agents"), { recursive: true });
-		await writeFile(path.join(project.root, ".omp", "agents", "storm-reviewer.md"), "---\nname: storm-reviewer\n---\nbody\n");
+		await writeFile(path.join(project.root, ".omp", "agents", "storm-reviewer.md"), "---\nname: storm-reviewer\ndescription: test reviewer\n---\nbody\n");
 		await omp.emit("session_start", {}, main);
 		const shadowed = omp.statuses.at(-1);
 		expect(shadowed).not.toBe(idle);
@@ -4941,6 +4965,18 @@ describe("phase 1: what the slices changed, proven through the hooks", () => {
 		expect(verdict(await settingsWith({ "task.maxConcurrency": 1 }, () => omp.emit("tool_call", all, main)))).toBe("lane-capacity");
 		expect(verdict(await settingsWith({ "task.maxConcurrency": 3 }, () => omp.emit("tool_call", all, main)))).toBe("pass");
 		expect(verdict(await omp.emit("tool_call", all, main))).toBe("pass");
+		const registry = AgentRegistry.global();
+		const earlier = registry.register({ id: "earlier-run-worker", displayName: "earlier-run-worker", kind: "sub", parentId: main.agent.id, session: null, status: "idle", createdAt: Date.now(), lastActivity: Date.now() });
+		try {
+			const visible = spyOn(registry, "listVisibleTo").mockReturnValue([earlier]);
+			try {
+				expect(verdict(await omp.emit("tool_call", all, main))).toBe("lane");
+			} finally {
+				visible.mockRestore();
+			}
+		} finally {
+			registry.unregister(earlier.id, earlier);
+		}
 		// A worker whose persisted authority is still live and able to write is not woken without a write order: the
 		// broadcast is refused and names it. (Its authority ended with its turn; this is what a failed close would leave.)
 		await persistWorkerAdmission({
@@ -4969,7 +5005,12 @@ describe("phase 1: what the slices changed, proven through the hooks", () => {
 		// B0 writes once and settles: its authority ends with the turn. A0 is the writer now running.
 		const idle = await startWorker(omp, child, main, "B0");
 		await child.emit("agent_end", {}, idle);
-		await startWorker(omp, child, main, "A0");
+		const running = await startWorker(omp, child, main, "A0");
+		const admission = () => readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: main.agent.id, childId: running.agent.id });
+		const before = await admission();
+		expect(before).toMatchObject({ kind: "record", record: { hold: expect.any(String) } });
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://A0?progress", content: "status" } }, main))).toBe("pass");
+		expect(await admission()).toEqual(before);
 		const note = { toolName: "write", input: { path: "agent://B0?progress", content: "status please" } };
 		const work = { toolName: "write", input: { path: "agent://B0", content: "write more" } };
 		// A work message would run a second writer beside A0: refused. The note starts a turn that cannot write: let through.
@@ -6012,15 +6053,19 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 			await omp.emit("session_shutdown", {}, main);
 		});
 
-		test("an ordinary native child on another thread has no Storm run and is left alone", async () => {
+		test("an ordinary native child on another thread is left alone outside a run and stopped once the tree has a managed run", async () => {
 			await approve(TEAM);
 			const omp = fakeOmp(project), child = fakeOmp(project), main = omp.ctx(MAIN);
-			await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
 			const spies = pooled();
 			try {
 				const native = asking(child.ctx(sub("native", "unrelated")), "a", "i");
 				await child.emit("before_provider_request", { payload: {} }, native.ctx);
 				expect(native.aborted()).toBe(0);
+				// The run writes its marker at its start, so from then on the same unrecorded child is unknown in a
+				// managed tree, never unmanaged: it is stopped before its first request.
+				await openRun(omp, main, { lanes: [{ name: "look", kind: "explore", role: "explorer", goal: "Read the tree", results: answerFor("look-answer") }], workers: { explorer: 1 } });
+				await child.emit("before_provider_request", { payload: {} }, native.ctx);
+				expect(native.aborted()).toBe(1);
 			} finally {
 				for (const spy of spies) spy.mockRestore();
 			}
@@ -6208,6 +6253,16 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 			}
 			await omp.emit("session_shutdown", {}, main);
 		});
+	});
+
+	test("an unmanaged in-memory subagent can send its first request and read", async () => {
+		const omp = fakeOmp(project);
+		const native = omp.ctx(sub("no-storage", "task"));
+		const manager = { ...native.sessionManager, getArtifactsDir: () => null };
+		const checked = asking({ ...native, sessionManager: manager } as unknown as ExtensionContext, "a", "x");
+		await omp.emit("before_provider_request", { payload: {} }, checked.ctx);
+		expect(checked.aborted()).toBe(0);
+		expect(verdict(await omp.emit("tool_call", { toolName: "read", input: { path: "README.md" } }, checked.ctx))).toBe("pass");
 	});
 
 	// R-G234 H1 (decision): the promise about approved models is about the model and effort a worker's own loop runs on. A tool
@@ -7603,6 +7658,10 @@ describe("phase 3 through the hooks: the plan-less team", () => {
 		const main = first.ctx(MAIN);
 		await enterAutoTurn(first, main);
 		const placedOld = await first.emit("tool_call", call("old-task", { agent: "storm-explorer", name: "old", task: "read" }), main);
+		if (verdict(placedOld) !== "pass") {
+			const shown = await first.emit("tool_result", { ...call("old-task", {}), input: placedInput(placedOld), isError: true, content: [], details: {} }, main);
+			throw new Error(JSON.stringify(shown));
+		}
 		const old = placedName(placedOld, "old");
 		expect(verdict(await first.emit("before_subagent_spawn", spawnOf("storm-explorer", old), main))).toMatch(/^route:/);
 		const admission = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: MAIN.id, childId: old });
@@ -7845,4 +7904,147 @@ describe("phase 3 through the hooks: the plan-less team", () => {
 		expect((await lastRun(project.sessionDir))?.endReason).not.toBe("unreviewed");
 		await omp.emit("session_shutdown", {}, main);
 	}, 20_000);
+});
+
+/**
+ * The per-session decision section: the recount of who is running, the decision, the reservation of a place and the
+ * record of a refusal stay strictly one at a time, while the admission write (which is not a decision) must not hold
+ * the next spawn. These tests park admission writes on a barrier, never on a sleep, and read what the hooks decided
+ * while they were parked. A section that still holds the write makes a wait below never settle: the test then fails
+ * on the runner's own bound rather than on a clock the test guessed.
+ */
+describe("the spawn decision section: the last place is taken once, and nothing else waits behind it", () => {
+	const N = 6;
+	const readerLanes = Array.from({ length: N }, (_, index) => ({
+		name: `R${index}`,
+		kind: "explore" as const,
+		role: "explorer" as const,
+		goal: `Read ${index}`,
+		results: answerFor(`r${index}-answer`),
+	}));
+
+	/**
+	 * Parks every admission write until `release`; `arrived` settles when the `target`-th write enters, so a test can
+	 * wait for the last admission without polling. A call that enters after the release is not parked.
+	 */
+	const parkAdmissions = (target: number): { entered: string[]; arrived: Promise<void>; release: () => void; restore: () => void } => {
+		const real = admissionModule.persistWorkerAdmission;
+		const entered: string[] = [];
+		const open: Array<() => void> = [];
+		const arrived = Promise.withResolvers<void>();
+		let released = false;
+		const spy = spyOn(admissionModule, "persistWorkerAdmission").mockImplementation(async (...args: Parameters<typeof real>) => {
+			entered.push(args[0].childId);
+			if (entered.length === target) arrived.resolve();
+			if (!released) {
+				const gate = Promise.withResolvers<void>();
+				open.push(() => gate.resolve());
+				await gate.promise;
+			}
+			return real(...args);
+		});
+		return {
+			entered,
+			arrived: arrived.promise,
+			release: () => {
+				released = true;
+				for (const resume of open.splice(0)) resume();
+			},
+			restore: () => spy.mockRestore(),
+		};
+	};
+
+	test("a decision and its reservation do not wait for another spawn's admission write, and the last native place is taken once", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		// The plan's per-role number is the director's target, not a concurrency gate: six lanes with a target of four
+		// must all be placeable (the native ceiling is what decides one place at a time).
+		expect(await omp.tool({ action: "plan", plan: { lanes: readerLanes, workers: { explorer: 4 } } }, main)).toBe("ok");
+		const handles: string[] = [];
+		for (const lane of readerLanes) {
+			const placed = await omp.emit("tool_call", { toolName: "task", toolCallId: `place-${lane.name}`, input: { agent: "storm-explorer", name: lane.name, task: `read ${lane.name}` } }, main);
+			expect(verdict(placed)).toBe("pass");
+			handles.push(placedName(placed, lane.name));
+		}
+		const parked = parkAdmissions(1);
+		// The host's one native place. The admission of the one routed spawn is parked, so the other five decisions
+		// must answer while it is parked.
+		const hooks = withActiveSettings(Settings.isolated({ "task.maxConcurrency": 1 }), () =>
+			handles.map(handle => omp.emit("before_subagent_spawn", spawnOf("storm-explorer", handle), main)),
+		);
+		const settled = Promise.withResolvers<void>();
+		let finished = 0;
+		const watched = hooks.map(hook =>
+			hook.then(result => {
+				finished++;
+				if (finished === N - 1) settled.resolve();
+				return result;
+			}),
+		);
+		let results: unknown[] = [];
+		try {
+			// Every refusal is a decision that did not wait for the parked admission write; the routed one still waits.
+			await settled.promise;
+			expect(parked.entered).toHaveLength(1);
+		} finally {
+			parked.release();
+			results = await Promise.all(watched);
+			parked.restore();
+		}
+		expect(results.map(verdict).filter(value => value.startsWith("route:"))).toHaveLength(1);
+		expect(results.map(verdict).filter(value => value === "parallelism")).toHaveLength(N - 1);
+		// The one admitted worker's record is there for its child on another thread, before the hook returned.
+		const admitted = handles.find((_, index) => verdict(results[index]).startsWith("route:"));
+		expect(admitted).toBeDefined();
+		const read = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: admitted as string });
+		expect(read.kind).toBe("record");
+		await omp.emit("session_shutdown", {}, main);
+	});
+
+	test("a trial with room for one gets one worker when every decision runs at once and the admission writes are parked", async () => {
+		const now = Date.now();
+		const trial: TrialConfig = {
+			id: "t1",
+			role: "explorer",
+			model: "c/cand",
+			share: 1,
+			maxSpawns: 1,
+			startsAt: new Date(now - 60_000).toISOString(),
+			endsAt: new Date(now + 3_600_000).toISOString(),
+			budgetUsd: 5,
+		};
+		await approve({ ...TEAM, trials: [trial] });
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(await omp.tool({ action: "plan", plan: { lanes: readerLanes, workers: { explorer: 4 } } }, main)).toBe("ok");
+		const handles: string[] = [];
+		for (const lane of readerLanes) {
+			const placed = await omp.emit("tool_call", { toolName: "task", toolCallId: `place-${lane.name}`, input: { agent: "storm-explorer", name: lane.name, task: `read ${lane.name}` } }, main);
+			expect(verdict(placed)).toBe("pass");
+			handles.push(placedName(placed, lane.name));
+		}
+		const parked = parkAdmissions(N);
+		const hooks = withActiveSettings(Settings.isolated({ "task.maxConcurrency": N }), () =>
+			handles.map(handle => omp.emit("before_subagent_spawn", spawnOf("storm-explorer", handle), main)),
+		);
+		let results: unknown[] = [];
+		try {
+			// Every routed spawn's write is parked, so each decision's trial counters must already be visible to the
+			// next decision; otherwise all N would be routed to a trial that has room for one.
+			await parked.arrived;
+			expect(parked.entered).toHaveLength(N);
+		} finally {
+			parked.release();
+			results = await Promise.all(hooks);
+			parked.restore();
+		}
+		expect(results.map(verdict).filter(value => value.includes("c/cand"))).toHaveLength(1);
+		// The first spawn takes the trial's only place; the trial then has no room, so the later spawns are not its
+		// spawns and are not counted as seen.
+		expect((await readTrialStates(project.sessionDir)).t1).toMatchObject({ seen: 1, routed: 1, costUsd: 0 });
+		await omp.emit("session_shutdown", {}, main);
+	});
 });

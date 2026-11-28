@@ -32,6 +32,13 @@ export const STATUS_LABEL: Record<RunStatus, string> = {
 export const NO_PARENT_CHANGE_LABEL = "부모 트리 전후 비교에서 변경 없음";
 /** The same fact for the English handoff: what was compared, never a tree-wide claim. */
 export const NO_PARENT_CHANGE_HANDOFF = "no parent-tree change seen by Storm's before/after read";
+/**
+ * What a run with no declared result rows can truthfully say when its workers are done: there is nothing a result check
+ * could pass. It is an end, not a stall, and never a verification (R11).
+ */
+export const NO_DECLARED_END_LABEL = "선언된 결과 없이 워커가 끝남";
+/** The stored reason for that end; exported so a record, a test and a caller name it the same way. */
+export const NO_DECLARED_END_REASON = "no-declared-results" satisfies RunEndReason;
 
 /** Korean labels for the reasons a run can end with. */
 export const END_LABEL: Readonly<Record<RunEndReason, string>> = {
@@ -39,6 +46,7 @@ export const END_LABEL: Readonly<Record<RunEndReason, string>> = {
 	"no-changes": NO_PARENT_CHANGE_LABEL,
 	unreviewed: "리뷰 없이 끝남",
 	"no-reviewer": "리뷰 역할 없음",
+	"no-declared-results": NO_DECLARED_END_LABEL,
 	interrupted: "사용자가 중단",
 	"round-limit": "라운드 한도",
 	"no-progress": "진전 없음",
@@ -55,6 +63,7 @@ export const END_STATUS: Readonly<Record<RunEndReason, RunStatus>> = {
 	"no-changes": "ended",
 	unreviewed: "ended",
 	"no-reviewer": "ended",
+	"no-declared-results": "ended",
 	interrupted: "stopped",
 	"round-limit": "stopped",
 	"no-progress": "stopped",
@@ -513,7 +522,19 @@ export interface GateFacts {
 	directorEdit?: boolean;
 }
 
-/** What the run's file changes, the work tree and review verdicts amount to: nothing to verify, verified, or unverified with why. */
+/**
+ * Whether the parent work tree moved since this run's baseline: a different diff or file list, an unreadable tree after
+ * a known start, or an accepted change whose bytes were restored. A worker's own change counter is not this fact.
+ */
+export function treeMoved(
+	tree: { start?: TreeState; now?: TreeState } | undefined,
+	coverage?: Pick<CoverageInput, "restoredChange">,
+): boolean {
+	return coverage?.restoredChange === true ||
+		(tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files));
+}
+
+/** What a run's file changes, the work tree and review verdicts amount to: nothing to verify, verified, or unverified with why. */
 export function reviewGate(
 	agents: readonly AgentEntry[],
 	config: StormConfig,
@@ -537,8 +558,7 @@ function gateCore(
 	const changes = agents.reduce((sum, agent) => sum + (agent.changes ?? 0), 0);
 	const requests = agents.reduce((sum, agent) => sum + agent.requests, 0);
 	// A read that fails after a known start is a change Storm cannot rule out; a run without a start tree has no tree evidence.
-	const treeChanged = coverage?.restoredChange === true ||
-		(tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files));
+	const treeChanged = treeMoved(tree, coverage);
 	// A change the director made itself (a path edit or a command that could write) removes that reading: the change
 	// may be the director's own, so only a review can settle it.
 	const directorEdit = facts?.directorEdit === true;
@@ -703,12 +723,27 @@ export function decideRound(input: {
 	progressSince?: RoundProgress;
 	/** Rounds in a row without progress before the one that just ended, as the last continue decision counted them. */
 	stalled?: number;
+	/**
+	 * The record holds no declared result row. No result check can pass, so a passed gate must not become `verified`
+	 * (R11), and a `no-review` gate created only by worker change counters is the end of the work, not a stall.
+	 */
+	noDeclaredResults?: boolean;
+	/** The parent work tree moved since the run's baseline, or an accepted change was restored. */
+	parentChanged?: boolean;
+	/** The director changed the tree itself (a path edit or a write-capable command) and no review covers it yet. */
+	directorEdit?: boolean;
 }): RoundDecision {
 	if (input.aborted) return { action: "end", reason: "interrupted" };
 	const gate = input.gate;
 	if (gate.state === "none") return { action: "end", reason: gate.why === "quick-only" ? "unreviewed" : gate.why };
-	if (gate.state === "passed") return { action: "end", reason: "verified" };
+	// No result row means nothing a result check could pass: it ends as what it is, never as verified.
+	if (gate.state === "passed") return { action: "end", reason: input.noDeclaredResults === true ? NO_DECLARED_END_REASON : "verified" };
 	if (input.overBudget) return { action: "end", reason: "budget" };
+	// The only unverified cause Storm's own worker change counters create: a worker changed files in its own checkout
+	// and the parent tree did not move. The run is done; it is not a stall, and no review is owed on the parent.
+	const workerChangesOnly = gate.cause === "no-review";
+	const sharedChange = input.parentChanged === true || input.directorEdit === true;
+	if (input.noDeclaredResults === true && workerChangesOnly && !sharedChange) return { action: "end", reason: NO_DECLARED_END_REASON };
 	// An explicit round or time limit reached before the remedy is reported as that limit, not as a new reason.
 	if (input.maxRounds !== undefined && input.turns >= input.maxRounds) return { action: "end", reason: "round-limit" };
 	if (input.minutes !== undefined && input.elapsedMs >= input.minutes * 60_000) return { action: "end", reason: "time-limit" };
@@ -720,7 +755,12 @@ export function decideRound(input: {
 	}
 	// One quiet round may be a slow repair, so it buys one directed round; a second in a row is a loop.
 	const stalled = roundProgressed(gate, input.progressSince) ? 0 : (input.stalled ?? 0) + 1;
-	if (stalled >= NO_PROGRESS_ROUNDS) return { action: "end", reason: "no-progress" };
+	if (stalled >= NO_PROGRESS_ROUNDS) {
+		// A run that declared nothing and only missed a review of worker-owned changes ends as what it is. When the
+		// parent tree moved or the director changed it, the honest end is that no review happened.
+		if (input.noDeclaredResults === true && workerChangesOnly) return { action: "end", reason: sharedChange ? "unreviewed" : NO_DECLARED_END_REASON };
+		return { action: "end", reason: "no-progress" };
+	}
 	return {
 		action: "continue",
 		gate,

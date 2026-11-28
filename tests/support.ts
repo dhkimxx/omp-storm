@@ -52,6 +52,11 @@ export interface ProjectOptions {
 	agentDir?: string;
 }
 
+export const TEST_DISCOVERY = {
+	extensionRoots: { explicit: [], configured: [], configuredLevel: "user", mode: "explicit-only" },
+	sessionAgents: [],
+} as const;
+
 let sessionSerial = 0;
 
 /** A deterministic, process-local native session id. Unrelated projects and helpers must not share one. */
@@ -89,6 +94,7 @@ export async function makeProject(now: () => number = Date.now, opts: ProjectOpt
 		agentDir,
 		pluginAgentsDir: path.join(tmp, "plugin-agents"),
 		sessionId,
+		discovery: TEST_DISCOVERY,
 		ompBin: "omp",
 		statsDb: path.join(tmp, "no-stats.db"),
 		registry: { getAll: () => [], getAvailable: () => [] },

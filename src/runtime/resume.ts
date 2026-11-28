@@ -231,7 +231,7 @@ async function trimResumeEntries(sessionDir: string, entries: ResumeEntry[], kee
 }
 
 /** Records the run this machine started in this session for `target`, with the request the resume block will send. */
-export function noteResumePointer(sessionDir: string, target: ResumeTarget, run: RunRecord): Promise<void> {
+export function noteResumePointer(sessionDir: string, target: ResumeTarget, run: RunRecord, beforePublish?: () => void): Promise<void> {
 	const file = path.resolve(resumePointerFile(sessionDir));
 	return serialized(file, async () => {
 		await assertSessionPathSafe(sessionDir, file);
@@ -247,7 +247,18 @@ export function noteResumePointer(sessionDir: string, target: ResumeTarget, run:
 		const merged = [...current.filter(item => item.runId !== entry.runId), entry];
 		const kept = await trimResumeEntries(sessionDir, merged, entry.runId);
 		await assertSessionPathSafe(sessionDir, file);
-		await writeJsonAtomic(file, { schema: POINTERS_SCHEMA, entries: kept });
+		await writeJsonAtomic(file, { schema: POINTERS_SCHEMA, entries: kept }, beforePublish);
+	});
+}
+
+/** Removes only the pointer installed for a provisional start, leaving earlier lineage intact. */
+export function discardStartPointer(sessionDir: string, target: ResumeTarget, run: RunRecord): Promise<void> {
+	const file = path.resolve(resumePointerFile(sessionDir));
+	return serialized(file, async () => {
+		await assertSessionPathSafe(sessionDir, file);
+		const current = entriesOf(await readJson(file));
+		const kept = current.filter(entry => !matches(entry, run, target));
+		if (kept.length !== current.length) await writeJsonAtomic(file, { schema: POINTERS_SCHEMA, entries: kept });
 	});
 }
 
@@ -325,14 +336,16 @@ export const HANDOFF_RESUME_LABEL = "인계해 새로 시작 — 결과 행이 �
 /** The word a handoff reply leads with, and the fact it states: nothing confirmed was carried over. */
 export const HANDOFF_HEAD = "인계";
 export const HANDOFF_NO_RESULTS = "결과 행이 없어 확인된 것을 이어받지 않았습니다";
+export const HANDOFF_ALL_EXCLUDED = "결과 행이 전부 사용자 제외여서 확인된 것을 이어받지 않았습니다";
 
 /**
  * What the director reads when `storm continue` hands a run with no declared result rows to a fresh run: a new run
  * opened, no plan applied, and the earlier record is background only. Exported for `continuedText`, which the wiring
  * pass makes choose it for `ContinuedRun.mode: "handoff"`.
  */
-export function continuedHandoffText(runId: string, from: string, ended: string): string {
-	return `중단된 실행(${from})을 ${HANDOFF_HEAD}해 새 실행(${runId})을 열었습니다. 멈춘 이유: ${ended}. ${HANDOFF_NO_RESULTS}. 이전 계획은 적용하지 않았고, 이전 요청과 끝난 사실, 계획 밖 도착은 배경으로만 쓰세요. 새 범위에서 작업하세요.`;
+export function continuedHandoffText(runId: string, from: string, ended: string, allExcluded = false): string {
+	const result = allExcluded ? HANDOFF_ALL_EXCLUDED : HANDOFF_NO_RESULTS;
+	return `중단된 실행(${from})을 ${HANDOFF_HEAD}해 새 실행(${runId})을 열었습니다. 멈춘 이유: ${ended}. ${result}. 이전 계획은 적용하지 않았고, 이전 요청과 끝난 사실, 계획 밖 도착은 배경으로만 쓰세요. 새 범위에서 작업하세요.`;
 }
 
 /** The request as the user's turn or command wrote it: what follows the marker of a generated task, else the request. */

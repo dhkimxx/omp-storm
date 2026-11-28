@@ -144,7 +144,7 @@ describe("run files", () => {
 		expect(stateDir("/r")).toBe(path.join("/r", "state"));
 		expect(runsDir("/r")).toBe(path.join("/r", "state", "runs"));
 		const id = newRunId(Date.parse("2026-11-20T15:30:12.000Z"));
-		expect(id).toMatch(/^run-20261120-153012-[0-9a-f]{32}$/);
+		expect(id).toMatch(/^run-20261120-153012-[0-9a-z]{13}$/);
 		const ids = new Set(Array.from({ length: 50 }, () => newRunId(0)));
 		expect(ids.size).toBe(50);
 		expect(newRunId(Date.parse("2026-11-20T15:30:13.000Z")) > id).toBe(true);

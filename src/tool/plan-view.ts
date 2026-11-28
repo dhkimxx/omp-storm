@@ -5,6 +5,7 @@
  * result rows' states as the run record has them now.
  */
 import { roleTitle } from "../roles.ts";
+import { LANE_ADDRESS_HINT, PLAN_WORKER_COUNT_NOTE } from "../runtime/contract-text.ts";
 import type { PlanLane, PlanLaneResult, RunPlan, RunResult, RunResultState } from "../types.ts";
 
 /** What the host hands over for the run this session directs: its plan in force and its result rows. */
@@ -69,7 +70,9 @@ export function renderPlanView(view: PlanView): string | undefined {
 	const out = [`이 실행(${view.runId})의 계획(제출 ${plan.submittedAt}), 레인 ${plan.lanes.length}개:`];
 	if (plan.note !== undefined) out.push(`메모: ${plan.note}`);
 	const workers = Object.entries(plan.workers).map(([role, count]) => `${roleTitle(role)} ${count}`);
-	if (workers.length > 0) out.push(`워커: ${workers.join(", ")}`);
+	// The count is a plan fact per role; the host's concurrency setting and the write order decide what runs at once.
+	if (workers.length > 0) out.push(`역할별 워커(${PLAN_WORKER_COUNT_NOTE}): ${workers.join(", ")}`);
+	out.push(`- ${LANE_ADDRESS_HINT}`);
 	let size = out.join("\n").length;
 	let shown = 0;
 	for (const lane of plan.lanes) {

@@ -16,6 +16,8 @@ import { join, sep } from "node:path";
 import { ISOLATED_CHANGE_REASON } from "../../src/runtime/result-evidence.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE } from "../../src/runtime/contract-text.ts";
 import { NO_DECLARED_RESULTS } from "../../src/runtime/result-facts.ts";
+import { END_LABEL, NO_DECLARED_END_LABEL, NO_DECLARED_END_REASON } from "../../src/runtime/rounds.ts";
+import { HANDOFF_RESUME_LABEL } from "../../src/runtime/resume.ts";
 import { RETAINED_ONLY_VERDICT } from "../../src/runtime/closeout.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "../../src/view/results.ts";
 import { CHECKOUT_PLAN_NOTE, ISOLATED_INTEGRATED_WARNING } from "../../src/plan/validate.ts";
@@ -272,6 +274,53 @@ async function main(): Promise<void> {
 			);
 			const noticed = llm.of("main").some(entry => entry.notes.some(note => note.includes("결과와 무관한 도착"))) || frames.some(frame => customMessage(frame) === "async-result" && JSON.stringify(frame).includes("결과와 무관한 도착"));
 			check("no placed worker's delivery is told as 결과와 무관한 도착", !noticed, "");
+		});
+	}, 500_000);
+
+	await suite.step("eight isolated implementers with no plan finish; the run ends as no declared results, not a stall", async () => {
+		const llm = new LlmCursor(env);
+		await sessions.open(() => undefined, async (rpc, files) => {
+			const before = files.runIds();
+			const names = Array.from({ length: 8 }, (_, index) => `p${index}`);
+			const steps: Step[] = [
+				{
+					tasks: names.map(name => ({
+						agent: "storm-implementer",
+						task: `Implement ${name} planless-eight`,
+						isolated: true,
+						// The write tool, not a shell: the agent ledger counts this worker's change, which is the state the
+						// measurement found (a worker that changed files in its own checkout and no parent-tree change).
+						say: `E2E-CHILD-DELAY 3000 E2E-CHILD-WRITE ${name}.txt E2E-CHILD-CLAIM ${name}-done`,
+					})),
+				},
+				{ wait: true },
+			];
+			await rpc.turn(`E2E-STEPS ${JSON.stringify(steps)}`, 300_000);
+			const run = await files.finishedRun(before, 300_000);
+			const closeout = await until(() => closeoutOf(rpc.frames, run.runId), 10_000, "the plan-less eight closeout").catch(() => undefined);
+			const routed = run.spawns.filter(spawn => spawn.outcome !== "blocked");
+			check("the run has no plan and placed all eight", run.plan === undefined && routed.length === 8, JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.lane, spawn.outcome, spawn.code])));
+			check(
+				"every child's own request reached the offline model",
+				names.every(name => llm.of("child").some(entry => entry.lastUser.includes(`Implement ${name} planless-eight`))),
+				`children=${llm.of("child").length}`,
+			);
+			check(
+				"the run ended as no declared results in its first round, never as a stall",
+				run.endReason === NO_DECLARED_END_REASON && run.status === "ended" && run.turns === 1,
+				`${run.status}/${run.endReason ?? "?"} turns=${run.turns ?? "?"}`,
+			);
+			check(
+				"the closeout says no declared results, names the end and offers no handoff",
+				closeout !== undefined &&
+					closeout.text.includes(NO_DECLARED_RESULTS) &&
+					closeout.text.includes(NO_DECLARED_END_LABEL) &&
+					closeout.text.includes("워커 8") &&
+					!closeout.text.includes(END_LABEL["no-progress"]) &&
+					!closeout.text.includes(HANDOFF_RESUME_LABEL),
+				closeout?.text.slice(-800) ?? "no closeout",
+			);
+			check("nothing the eight wrote reached the parent tree", names.every(name => !existsSync(join(env.project, `${name}.txt`))), "");
 		});
 	}, 500_000);
 

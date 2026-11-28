@@ -19,16 +19,18 @@ import type {
 	LaneResultKind,
 	RunRecord,
 	RunResult,
+	WorkerStopReason,
 } from "../types.ts";
 import { MAX_RESULT_ID } from "../plan/validate.ts";
 import { formatUsd } from "../policy/spawn.ts";
+import { workerStopNotice } from "../policy/thread.ts";
 import type { ResultRow } from "../view/results.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, PLANLESS_PLACEMENT_NOTE } from "./contract-text.ts";
 import { goalTotals } from "./goal.ts";
-import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type ResultFacts, type RetainedFacts } from "./result-facts.ts";
+import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type ResultFacts, type RetainedFacts, type StormStopFact, type StormStopFacts } from "./result-facts.ts";
 import { HANDOFF_RESUME_LABEL } from "./resume.ts";
 import { endLabel, NO_PARENT_CHANGE_HANDOFF, STATUS_LABEL } from "./rounds.ts";
-import { outOfPlanLine, spendText, unplannedLine, unplannedSplit } from "./unplanned.ts";
+import { handoffOutcomes, outOfPlanLine, spendText, unplannedLine, unplannedSplit } from "./unplanned.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
@@ -242,6 +244,36 @@ export const UNKNOWN_CHANGE_RISK = "작업 위치를 기록으로 확인하지 �
 export const CAPTURE_UNKNOWN_LABEL = "보존 캡처 미상";
 /** The same fact in the English handoff. */
 export const CAPTURE_UNKNOWN_HANDOFF = "capture unknown";
+/** The head of the one line that names what Storm did to a stopped worker, never the host's failure text (fault 2). */
+export const STORM_STOP_LABEL = "Storm이 중단한 워커";
+/** The short cause word the status and the card use; the full sentence is `stormStopLine`. */
+export const WORKER_STOP_LABEL: Readonly<Record<WorkerStopReason, string>> = {
+	"pooled-thread": "omp가 풀 스레드에 배치",
+	"state-not-shared": "실행 상태를 공유하지 않음",
+};
+/** The same fact in the English handoff: the host failure text is not the cause. */
+export const STORM_STOP_HANDOFF = "Storm stopped these workers; the host failure text is not the cause";
+
+/**
+ * The real sentence a stopped worker's own admission carries, for one cause, with the count before it. The sentence is
+ * the contract (`policy/thread.ts`), so it is quoted, never paraphrased; one line per cause keeps the size fixed at
+ * any team size. The first native handle is the worker the sentence names; the rest share its cause.
+ */
+export function stormStopLine(stop: StormStopFact): string {
+	return `${STORM_STOP_LABEL} ${stop.count}개 — ${workerStopNotice(stop.first ?? "이번 실행의", stop.reason)}`;
+}
+
+/**
+ * The bounded notice the director reads with the results: the largest stop cause in full, and only a count for the
+ * others. Two causes at most, so this never grows with the number of workers.
+ */
+export function stormStopNotice(stops: StormStopFacts): string {
+	const [main, ...rest] = stops.reasons;
+	if (main === undefined) return "";
+	const other = rest.reduce((sum, stop) => sum + stop.count, 0);
+	return `[storm] ${stormStopLine(main)}${other > 0 ? ` 그 밖에 ${other}개도 Storm이 중단했습니다.` : ""}`;
+}
+
 /** Row 1/§5 in the handoff: the judged source is outside the parent, and what that does not prove. */
 export const RETAINED_OUTSIDE_HANDOFF = "judged outside the parent tree";
 /** The same count word for the handoff's result line, so a kept-only run never reads as tree work there either. */
@@ -368,7 +400,7 @@ function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes:
 }
 
 /** Ends that settle without anything left to judge; every other end leaves a durable card. */
-const CLEAN_ENDS: Readonly<Record<string, true | undefined>> = { verified: true, "no-changes": true, unreviewed: true };
+const CLEAN_ENDS: Readonly<Record<string, true | undefined>> = { verified: true, "no-changes": true, unreviewed: true, "no-declared-results": true };
 function minutesOf(run: RunRecord): number | undefined {
 	const start = Date.parse(run.startedAt);
 	const end = typeof run.endedAt === "string" ? Date.parse(run.endedAt) : Number.NaN;
@@ -405,6 +437,8 @@ function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
 export interface CloseoutRetainedBrief extends CloseoutBrief {
 	/** Row 1: accepted retained artifacts kept outside the target, with one safe reference. */
 	readonly retained?: RetainedFacts;
+	/** Row 2: workers this run's own record says Storm stopped, by cause. Absent when Storm stopped none. */
+	readonly stormStops?: StormStopFacts;
 	/**
 	 * Row 8/§5: a stopped or failed worker's retained patch or branch is not bound to this record. When no bound retained
 	 * reference exists, the native delivery is the only pointer; the card says capture unknown rather than implying the
@@ -456,6 +490,8 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		fact.retained.count === 0 &&
 		// A stopped or failed worker's unbound capture is named on the card; a one-line closeout would hide it.
 		fact.captureUnknown === undefined &&
+		// The stop sentence and its count are named on the card; a one-line closeout would hide why workers ended.
+		fact.stormStops === undefined &&
 		residual.length === 0;
 	const tier: CloseoutBrief["tier"] =
 		run.status === "running" ? "none" : settled && (minutes === undefined || minutes < CLOSEOUT_CARD_MINUTES) ? "line" : "card";
@@ -502,6 +538,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		runId: run.runId,
 		tier,
 		retained: fact.retained,
+		...(fact.stormStops === undefined ? {} : { stormStops: fact.stormStops }),
 		...(fact.captureUnknown === undefined ? {} : { captureUnknown: fact.captureUnknown }),
 		request: clean(run.task, REQUEST_MAX),
 		...(target ? { target } : {}),
@@ -621,6 +658,12 @@ export function closeoutHandoff(run: RunRecord): string {
 		unknownCapture === undefined
 			? undefined
 			: `- Recovery: ${CAPTURE_UNKNOWN_HANDOFF} for ${unknownCapture.count} stopped or failed worker${unknownCapture.count === 1 ? "" : "s"}; the record holds no bound patch or branch${unknownCapture.native === undefined ? "" : `, native delivery ${unknownCapture.native}`}`;
+	// Row 2: a worker Storm stopped is not a host crash, even though the host's own result text says so. The cause and
+	// count are stated; the run record's card carries the worker's full sentence.
+	const stoppedLine =
+		brief.stormStops === undefined
+			? undefined
+			: `- Storm stops: ${brief.stormStops.count} worker${brief.stormStops.count === 1 ? "" : "s"} (${brief.stormStops.reasons.map(stop => `${stop.reason} ${stop.count}`).join(", ")}); ${STORM_STOP_HANDOFF}`;
 	// Work that answers no declared result is part of the record a handoff carries: who delivered, whether it changed
 	// files and what it cost. Asked-for out-of-plan work is stated apart from arrivals nobody asked for (B8). The list
 	// is bounded like every other handoff line.
@@ -637,9 +680,15 @@ export function closeoutHandoff(run: RunRecord): string {
 	// per-worker text, so the handoff stays bounded.
 	const detailText = shownDeliveries.length === 0 ? "" : `: ${shownDeliveries.join("; ")}${total > shownDeliveries.length ? ` (+${total - shownDeliveries.length} not listed)` : ""}`;
 	const recordNote = `; ${HANDOFF_CHANGE_RECORD_NOTE}`;
+	const outcomePart = (outcomes: typeof split.outOfPlanOutcomes, count: number): string => {
+		const text = handoffOutcomes(outcomes);
+		if (text === undefined) return "";
+		const basis = count > outcomes.kept ? `, of ${outcomes.kept} kept` : "";
+		return ` (${text}${basis})`;
+	};
 	const outOfPlan =
-		split.outOfPlan === 0 ? undefined : `- Out-of-plan work: ${split.outOfPlan}${split.unasked === 0 ? detailText : ""}${recordNote}`;
-	const unasked = split.unasked === 0 ? undefined : `- Unasked arrivals: ${split.unasked}${split.outOfPlan === 0 ? detailText : ""}${recordNote}`;
+		split.outOfPlan === 0 ? undefined : `- Out-of-plan work: ${split.outOfPlan}${outcomePart(split.outOfPlanOutcomes, split.outOfPlan)}${split.unasked === 0 ? detailText : ""}${recordNote}`;
+	const unasked = split.unasked === 0 ? undefined : `- Unasked arrivals: ${split.unasked}${outcomePart(split.unaskedOutcomes, split.unasked)}${split.outOfPlan === 0 ? detailText : ""}${recordNote}`;
 	const stale = [...finalizedById(run).values()].some(marker => marker !== undefined);
 	const said = stale ? "director's words, written before the final judgment; the counts above prevail" : "director's words, not evidence";
 	const blockers = brief.userActions;
@@ -656,6 +705,7 @@ export function closeoutHandoff(run: RunRecord): string {
 		results,
 		retainedLine,
 		recoveryLine,
+		stoppedLine,
 		outOfPlan,
 		unasked,
 		goal,

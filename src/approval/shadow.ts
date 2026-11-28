@@ -1,5 +1,8 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import * as path from "node:path";
+import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { discoverAgents, getAgent } from "@oh-my-pi/pi-coding-agent/task/discovery";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { sha256Hex } from "../config/canonical.ts";
 import { BUILTIN_AGENT_ROLES, ROLES } from "../roles.ts";
 import type { ApprovalRecord, ShadowInfo } from "../types.ts";
@@ -19,6 +22,15 @@ export function isRoutedAgentName(name: string): boolean {
 	return ROUTED_AGENT_NAMES.has(name);
 }
 
+/**
+ * The live session's native discovery inputs. `effectiveExtensionRoots` is the host object threaded whole (explicit
+ * roots, mode, configured roots and their level); `sessionAgents` are the ones the host appends after discovery.
+ */
+export interface LiveDiscovery {
+	extensionRoots: EffectiveExtensionRoots;
+	sessionAgents: readonly AgentDefinition[];
+}
+
 async function realOrResolved(p: string): Promise<string> {
 	try {
 		return await realpath(p);
@@ -27,100 +39,76 @@ async function realOrResolved(p: string): Promise<string> {
 	}
 }
 
-/** omp scans only the nearest `.omp/agents` walking up from cwd. */
-async function nearestProjectAgentsDir(cwd: string): Promise<string | undefined> {
-	let dir = path.resolve(cwd);
-	for (;;) {
-		const candidate = path.join(dir, ".omp", "agents");
-		try {
-			if ((await stat(candidate)).isDirectory()) return candidate;
-		} catch (error) {
-			// An unreadable candidate may hold definitions the host will load: hand it to `scan`, which fails closed.
-			const absent = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-			if (!absent) return candidate;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) return undefined;
-		dir = parent;
-	}
+/**
+ * One unattested shadow per routed name. Used when the live handle that owns this session is absent, cannot be
+ * verified, or native discovery itself failed: no definition's selection can then be established. The empty digest
+ * never matches an approval, so every routed name is refused with the ordinary shadow cause while config, status and
+ * names Storm does not route still load.
+ */
+export function unattestedShadows(): ShadowInfo[] {
+	return [...ROUTED_AGENT_NAMES].sort().map(agent => ({ agent, path: "", scope: "project", sha256: "" }));
 }
 
-function frontmatterName(text: string): unknown {
-	const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
-	if (lines[0]?.trim() !== "---") return undefined;
-	const end = lines.findIndex((l, i) => i > 0 && l.trim() === "---");
-	if (end === -1) return undefined;
+/** The digest of exactly the definition native discovery selected, or an unattested shadow when it cannot be read. */
+async function selectedShadow(agent: AgentDefinition, pluginReal: string): Promise<ShadowInfo | undefined> {
+	const scope = agent.source;
+	if (scope === "bundled") return undefined;
+	const file = agent.filePath;
+	if (file === undefined) return { agent: agent.name, path: "", scope, sha256: "" };
+	let real: string;
 	try {
-		const data: unknown = Bun.YAML.parse(lines.slice(1, end).join("\n"));
-		return typeof data === "object" && data !== null && "name" in data ? data.name : undefined;
+		real = await realpath(file);
 	} catch {
-		return undefined;
+		return { agent: agent.name, path: file, scope, sha256: "" };
+	}
+	if (real === pluginReal || real.startsWith(pluginReal + path.sep)) return undefined;
+	try {
+		return { agent: agent.name, path: file, scope, sha256: sha256Hex(await readFile(real)) };
+	} catch {
+		// Selected by the host's parser but unreadable now: its bytes cannot be attested, never "no shadow".
+		return { agent: agent.name, path: file, scope, sha256: "" };
 	}
 }
 
 /**
- * A directory that exists but cannot be listed: none of its definitions can be shown approved, so every name Storm
- * routes is reported as an unapproved shadow with a hash no approval can carry. A directory that is simply absent
- * (`ENOENT`) has no definitions and reports nothing.
+ * The definitions the host would select now for the names Storm routes, resolved by the same native `discoverAgents`
+ * the task preflight calls (`task/structured-subagent.ts:509`): project, user, effective extension-package roots,
+ * Claude marketplace roots, then bundled, first name wins. `sessionAgents` are appended exactly as the host does.
+ *
+ * The spawn event names only the agent; it carries neither file nor digest. This attests the definition selected at
+ * this read time, not one the host selected earlier. A definition that changes or disappears between the host's
+ * resolution and this read is outside what a second discovery can prove; the approval digest covers the bytes hashed
+ * here. When the host's inputs are unavailable, the caller refuses through {@link unattestedShadows} instead.
  */
-function unreadableDirShadows(dir: string, scope: ShadowInfo["scope"]): ShadowInfo[] {
-	return [...ROUTED_AGENT_NAMES]
-		.sort()
-		.map(agent => ({ agent, path: dir, scope, sha256: "" }));
-}
-
-async function scan(dir: string, scope: ShadowInfo["scope"], pluginReal: string): Promise<ShadowInfo[]> {
-	let names: string[];
-	try {
-		names = await readdir(dir);
-	} catch (error) {
-		const absent =
-			typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-		return absent ? [] : unreadableDirShadows(dir, scope);
-	}
-	const out: ShadowInfo[] = [];
-	for (const name of names) {
-		if (!name.endsWith(".md")) continue;
-		const file = path.join(dir, name);
-		const stem = name.slice(0, -".md".length);
-		let real: string;
-		let bytes: Uint8Array;
-		try {
-			real = await realpath(file);
-			if (!(await stat(real)).isFile()) continue;
-			bytes = await readFile(real);
-		} catch (error) {
-			// B1: where Storm cannot establish which definition the host will load, it refuses. A routed file name that
-			// cannot be read is an unapproved definition of that name, never evidence that there is none.
-			const vanished = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-			if (!vanished && isRoutedAgentName(stem)) {
-				out.push({ agent: stem, path: file, scope, sha256: "" });
-			}
-			continue;
-		}
-		if (real === pluginReal || real.startsWith(pluginReal + path.sep)) continue;
-		const agent = frontmatterName(new TextDecoder().decode(bytes));
-		// omp picks a readable definition by its declared name, not the file's basename.
-		if (typeof agent !== "string" || !isRoutedAgentName(agent)) continue;
-		out.push({ agent, path: file, scope, sha256: sha256Hex(bytes) });
-	}
-	return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0));
-}
-
 export async function findShadows(opts: {
 	cwd: string;
-	userAgentsDir: string;
 	pluginAgentsDir: string;
+	discovery: LiveDiscovery;
+	/** Home the host discovery reads for plugin/marketplace roots; the host default when absent. */
+	home?: string;
 }): Promise<ShadowInfo[]> {
+	let agents: AgentDefinition[];
+	try {
+		({ agents } = await discoverAgents(opts.cwd, opts.home, opts.discovery.extensionRoots));
+	} catch {
+		return unattestedShadows();
+	}
+	const candidates = [...agents, ...(opts.discovery.sessionAgents ?? [])];
 	const pluginReal = await realOrResolved(opts.pluginAgentsDir);
-	const projectDir = await nearestProjectAgentsDir(opts.cwd);
-	const project = projectDir ? await scan(projectDir, "project", pluginReal) : [];
-	const user = await scan(path.resolve(opts.userAgentsDir), "user", pluginReal);
-	return [...project, ...user];
+	const out: ShadowInfo[] = [];
+	for (const name of [...ROUTED_AGENT_NAMES].sort()) {
+		const agent = getAgent(candidates, name);
+		if (agent === undefined) continue;
+		const shadow = await selectedShadow(agent, pluginReal);
+		if (shadow !== undefined) out.push(shadow);
+	}
+	return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0));
 }
 
 /** Shadowing definitions the approval does not cover (new, or changed since the user saw them). */
 export function unapprovedShadows(approval: ApprovalRecord | undefined, shadows: readonly ShadowInfo[]): ShadowInfo[] {
 	const seen = approval?.scope.shadowedAgents ?? [];
-	return shadows.filter(shadow => !seen.some(s => s.agent === shadow.agent && s.sha256 === shadow.sha256));
+	// An empty digest is unattested by construction: an approval can never carry it, even if a record was tampered
+	// with or copied from an older store.
+	return shadows.filter(shadow => !seen.some(s => s.agent === shadow.agent && shadow.sha256 !== "" && s.sha256 === shadow.sha256));
 }

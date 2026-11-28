@@ -7,6 +7,7 @@ import {
 	carriesEvalTools,
 	classifyUnplannedItem,
 	isolatedToolsReason,
+	taskAgentName,
 	TASK_EMPTY_REASON,
 	TASK_ITEM_INVALID_REASON,
 	unplannedFacts,
@@ -353,7 +354,7 @@ export function plannedTaskLanes(input: unknown, plan: RunPlan, config: StormCon
 	const lanes: PlanLane[] = [];
 	for (const item of items) {
 		if (!object(item)) return { ok: false, code: "lane", reason: "task 항목이 올바르지 않습니다." };
-		const agent = typeof item.agent === "string" ? item.agent : "task";
+		const agent = taskAgentName(item.agent);
 		const role = workerRole(config, agent);
 		const name = typeof item.name === "string" ? item.name : undefined;
 		const named = name === undefined ? undefined : plan.lanes.find(lane => lane.name === name);
@@ -497,7 +498,7 @@ export function resolveTaskLanes(input: unknown, plan: RunPlan | undefined, conf
 	const placed: TaskItemPlacement[] = [];
 	for (const item of items) {
 		if (!object(item)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
-		const agent = typeof item.agent === "string" ? item.agent : "task";
+		const agent = taskAgentName(item.agent);
 		const role = workerRole(config, agent);
 		const name = typeof item.name === "string" ? item.name : undefined;
 		const named = name === undefined ? undefined : byName.get(name);
@@ -1351,7 +1352,7 @@ function describePlacement(
 	const placed: PlacedEntry[] = [];
 	for (const [index, item] of items.entries()) {
 		if (!object(item)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
-		const agent = typeof item.agent === "string" ? item.agent : "task";
+		const agent = taskAgentName(item.agent);
 		const role = workerRole(config, agent);
 		const lane = resolved.items[index]?.lane;
 		const note = resolved.items[index]?.note;
@@ -1399,7 +1400,7 @@ function describePlacement(
 		return {
 			ok: false,
 			reason: needing.lane === undefined
-				? unplannedIsolationUnavailableReason(needing.agent, options.host?.enabled)
+				? unplannedIsolationUnavailableReason(needing.agent, options.host?.enabled, teamIsolated)
 				: isolationCapabilityReason(needing.agent, options.host?.enabled),
 		};
 	}
@@ -1410,7 +1411,7 @@ function describePlacement(
 		return {
 			ok: false,
 			reason: merged.lane === undefined
-				? unplannedIsolationApplyReason(merged.agent, options.host?.apply)
+				? unplannedIsolationApplyReason(merged.agent, options.host?.apply, teamIsolated)
 				: merged.selective
 					? isolationApplyReason(merged.agent, merged.lane.name, options.host?.apply)
 					: teamIsolationApplyReason(merged.agent, options.host?.apply),

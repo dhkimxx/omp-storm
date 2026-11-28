@@ -17,6 +17,7 @@ import {
 	admissionMayUseNonReadTools,
 	closeWorkerSpend,
 	endWorkerAdmission,
+	MAX_ADMISSION_RECORDS,
 	persistWorkerAdmission,
 	readChildBinding,
 	readWorkerAdmission,
@@ -55,6 +56,7 @@ afterEach(async () => {
 
 const admit = (over: {
 	parentId?: string;
+	directorId?: string;
 	childId?: string;
 	policy?: Parameters<typeof persistWorkerAdmission>[0]["policy"];
 	lane?: string;
@@ -68,6 +70,7 @@ const admit = (over: {
 		agentDir,
 		artifactRoot: over.artifactRoot ?? artifacts,
 		parentId: over.parentId ?? parentId,
+		...(over.directorId === undefined ? {} : { directorId: over.directorId }),
 		childId: over.childId ?? childId,
 		runId: over.runId ?? runId,
 		sessionId: "main-session",
@@ -95,6 +98,42 @@ const resolve = (over: {
 		childSessionId: over.childSessionId ?? "child-session",
 		childCwd: over.childCwd ?? project,
 	});
+
+/**
+ * Writes `count` open records of this build as another session in the same profile would, so a test can put the store
+ * at its cap without going through the cap check. They are records, not fixtures of the reading side: the housekeeping
+ * under test reads them from disk like any other writer's.
+ */
+const fillRecords = async (count: number, options: { prefix?: string; expired?: boolean } = {}): Promise<void> => {
+	const dir = join(agentDir, "storm", "admissions");
+	await mkdir(dir, { recursive: true });
+	const now = Date.now();
+	const prefix = options.prefix ?? "filler";
+	for (let index = 0; index < count; index++) {
+		const filler = `${prefix}-${index}`;
+		const key = workerAdmissionKey(artifacts, parentId, filler);
+		const record = {
+			schema: "storm.worker-admission/v2",
+			build: buildId(),
+			key,
+			runId: `${prefix}-run`,
+			sessionId: "main-session",
+			sessionDir,
+			repoId: "repo-test",
+			targetRoot: project,
+			artifactRoot: artifacts,
+			parentId,
+			childId: filler,
+			attempt: randomUUID(),
+			policy: { kind: "read", paths: [], reason: "another session's reader" },
+			createdAt: now,
+			// An expired record is free for housekeeping; an unexpired one of a run this tree's marker does not name
+			// cannot be proved closed and is kept (the same rule a live run's closed records get).
+			expiresAt: options.expired === true ? now - 1 : now + 7 * 24 * 3_600_000,
+		};
+		await writeFile(join(dir, `${key}.json`), JSON.stringify(record));
+	}
+};
 
 describe("worker admission records", () => {
 	test("persist works before the host creates the artifact directory, and read binds the exact identity", async () => {
@@ -340,7 +379,7 @@ describe("worker admission records", () => {
 	test("B4: a descendant finds the close through the run named in its own admission, and a missing marker is unknown", async () => {
 		await admit({ childId: "Impl" });
 		// The unplanned worker's own eval child: the same run, a marker named by the worker rather than the director.
-		await admit({ parentId: "Impl", childId: "Inner", runId });
+		await admit({ parentId: "Impl", directorId: parentId, childId: "Inner", runId });
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl" })).toEqual({ kind: "open" });
 		const at = 1_800_000_000_000;
 		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop", now: at })).toEqual({ ok: true });
@@ -349,6 +388,9 @@ describe("worker admission records", () => {
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl", runId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
 		// The worker's own admission names a run the marker cannot answer for: never read as open.
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl", runId: "run-other" })).toMatchObject({ kind: "unknown" });
+		// The same run ID on a different director is not authority to read this close.
+		await admit({ parentId: "Other", childId: "Unrelated", runId });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Other", runId })).toEqual({ kind: "open" });
 		// A marker that is gone is a fact the managed worker cannot establish, not an open run.
 		const runs = join(agentDir, "storm", "admissions", "runs");
 		for (const name of await readdir(runs)) {
@@ -438,6 +480,8 @@ describe("worker admission records", () => {
 		await writeFile(target, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
 		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
 		await utimes(target, stale, stale);
+		// The store is at its cap, so this admission is the one that scans and cleans.
+		await fillRecords(MAX_ADMISSION_RECORDS - 1);
 		const realRm = fsp.rm;
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -517,21 +561,28 @@ describe("worker admission records", () => {
 		expect(names).toHaveLength(1);
 		await writeFile(join(runs, names[0] ?? ""), "{ not a marker");
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toMatchObject({ kind: "unknown" });
-		// The identity of the worker's parent is required: without it no marker can be named.
-		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined })).toMatchObject({ kind: "unknown" });
+		// Missing storage identity is not evidence of a spend fence for a native worker.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined })).toEqual({ kind: "open" });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined, stormRole: true })).toMatchObject({ kind: "unknown" });
 	});
 
-	test("RF4-1: an aged closed record of a live run is kept until that run closes", async () => {
+	test("RF4-1: an aged closed record of a live run is kept until that run closes, and the scan at the cap then removes it", async () => {
 		await admit();
 		// Close the record only (the run marker stays open): the run is still live.
 		expect(await revokeWorkerAdmissions(agentDir, { runId, childId })).toBe(1);
 		const file = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, childId)}.json`);
 		const stale = new Date(Date.now() - 25 * 3_600_000);
 		await utimes(file, stale, stale);
+		// Another session's records bring the store to its cap, and one of them has expired: the admission below runs
+		// the one housekeeping scan. The aged record's run is still live, so it survives although it is closed and old,
+		// while the expired record frees the place the admission needs.
+		await fillRecords(MAX_ADMISSION_RECORDS - 2);
+		await fillRecords(1, { prefix: "expired", expired: true });
 		await admit({ childId: "Other" });
 		const kept = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
 		expect(kept.kind === "record" && kept.record.revokedAt).toEqual(expect.any(Number));
-		// The same aged record is housekeeping's to remove once the run itself has closed.
+		// The same aged record is housekeeping's to remove once the run itself has closed; the next writer at the cap
+		// scans, frees it, and takes its place.
 		await revokeWorkerAdmissions(agentDir, { runId });
 		await admit({ childId: "Another" });
 		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
@@ -608,8 +659,79 @@ describe("worker admission records", () => {
 		await writeFile(fresh, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
 		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
 		await utimes(aged, stale, stale);
+		// At the cap: the admission's own housekeeping scan is what may remove the aged tombstone.
+		await fillRecords(MAX_ADMISSION_RECORDS - 2);
 		await admit({ childId: "AfterTombstone" });
 		expect(await lstat(aged).catch(() => undefined)).toBeUndefined();
 		expect((await lstat(fresh)).isFile()).toBe(true);
+	});
+
+	test("the cap is enforced by the writer that would cross it, and another session's expired record is what makes room", async () => {
+		const dir = join(agentDir, "storm", "admissions");
+		const recordCount = async (): Promise<number> => (await readdir(dir)).filter(name => /^[0-9a-f]{64}\.json$/.test(name)).length;
+		// Another writer of the same profile fills the store to its cap, with one expired record among them. The next
+		// writer scans only because it is at the crossing; the expired record frees its place, and the count was read
+		// from the directory, never from this process's memory.
+		await fillRecords(MAX_ADMISSION_RECORDS - 1);
+		await fillRecords(1, { prefix: "expired-other", expired: true });
+		expect(await recordCount()).toBe(MAX_ADMISSION_RECORDS);
+		await admit({ childId: "AtCap" });
+		expect(await recordCount()).toBe(MAX_ADMISSION_RECORDS);
+		expect(await lstat(join(dir, `${workerAdmissionKey(artifacts, parentId, "expired-other-0")}.json`)).catch(() => undefined)).toBeUndefined();
+		// A full store of records this build may not remove refuses the writer that would cross the cap, with the cause.
+		await expect(admit({ childId: "Over" })).rejects.toThrow(/보관 중인 자식 권한 기록이 너무 많습니다/);
+		expect(await recordCount()).toBe(MAX_ADMISSION_RECORDS);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Over" })).kind).toBe("missing");
+	});
+
+	test("two writers that both see one free place cannot both cross the cap", async () => {
+		await fillRecords(MAX_ADMISSION_RECORDS - 1);
+		const results = await Promise.allSettled([admit({ childId: "RaceA" }), admit({ childId: "RaceB" })]);
+		expect(results.filter(result => result.status === "rejected")).not.toHaveLength(0);
+		const dir = join(agentDir, "storm", "admissions");
+		const count = (await readdir(dir)).filter(name => /^[0-9a-f]{64}\.json$/.test(name)).length;
+		expect(count).toBeLessThanOrEqual(MAX_ADMISSION_RECORDS);
+	});
+
+	test("the run marker is written when missing, repaired when another writer replaced it, and not rewritten for its own run", async () => {
+		await admit();
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		const [name] = (await readdir(runs)).filter(entry => entry.endsWith(".json"));
+		const file = join(runs, name!);
+		const marker = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		// A second admission of the same run reads the marker and does not rewrite it: a spawn's share of the marker is
+		// one read, so no spawn queues behind another for it.
+		const fixed = new Date("2026-11-20T00:00:00Z");
+		await utimes(file, fixed, fixed);
+		await admit({ childId: "Second" });
+		expect((await lstat(file)).mtimeMs).toBe(fixed.getTime());
+		expect((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>).runId).toBe(runId);
+		// Another run of this tree replaced it: the next admission names its own run again before its record is written.
+		await writeFile(file, JSON.stringify({ ...marker, runId: "run-other", createdAt: Number(marker.createdAt) + 1 }));
+		await admit({ childId: "Third" });
+		expect((JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>).runId).toBe(runId);
+		// Another writer removed it: the next admission writes it again, before its record can be read by the child.
+		await rm(file, { force: true });
+		const record = join(agentDir, "storm", "admissions", `${workerAdmissionKey(artifacts, parentId, "Fourth")}.json`);
+		const realRename = fsp.rename;
+		let observed: Record<string, unknown> | undefined;
+		const spy = spyOn(fsp, "rename").mockImplementation(async (from, to) => {
+			if (to === record && observed === undefined) {
+				const raw = await readFile(file, "utf8").catch(() => "null");
+				observed = JSON.parse(raw) as Record<string, unknown>;
+			}
+			await realRename(from, to);
+		});
+		try {
+			await admit({ childId: "Fourth" });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(observed).toMatchObject({ runId, key: name!.replace(/\.json$/, "") });
+		// A marker of another build fails the admission closed before its record is written (RF4-3 holds for the
+		// per-spawn repair too, not only for a marker that was already there when the run started).
+		await writeFile(file, JSON.stringify({ ...marker, build: "another-build" }));
+		await expect(admit({ childId: "Fifth" })).rejects.toThrow(/다른 빌드/);
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "Fifth" })).kind).toBe("missing");
 	});
 });

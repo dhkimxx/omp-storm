@@ -12,7 +12,7 @@
  * view says so instead of drawing `0/0` or an acceptance mark. Nothing here reads plan text as proof; a plan only says
  * which ids are declared.
  */
-import type { AgentEntry, InfoTone, PlanLaneResult, RunRecord, RunResult, SpawnRecord } from "../types.ts";
+import type { AgentEntry, InfoTone, PlanLaneResult, RunRecord, RunResult, SpawnRecord, WorkerStopReason } from "../types.ts";
 import { attemptAgentId } from "./attempt-report.ts";
 import { resultProgress, type ResultProgress } from "../view/results.ts";
 import { unplannedSplit, unplannedTotal } from "./unplanned.ts";
@@ -105,6 +105,23 @@ export interface CaptureUnknown {
 	readonly native?: string;
 }
 
+/** One cause of a worker stop Storm recorded on its own admission: a count and the first usable native handle. */
+export interface StormStopFact {
+	readonly reason: WorkerStopReason;
+	readonly count: number;
+	/** `agent://<id>` is usable for this worker; absent when no safe id was recorded. */
+	readonly first?: string;
+}
+
+/**
+ * Workers Storm itself stopped, counted by cause. The director reads the same fixed sentence per cause, not one line
+ * per worker: at a hundred workers this stays two reasons and two handles (fault 2, D11).
+ */
+export interface StormStopFacts {
+	readonly count: number;
+	readonly reasons: readonly StormStopFact[];
+}
+
 export interface ResultFactOptions {
 	/**
 	 * Paths the shared tree changed since the run's baseline, when the caller read the tree. Absent means the record
@@ -140,6 +157,11 @@ export interface ResultFacts {
 	 * is nothing unbound to point at. One count and one native handle: no list grows with the number of workers.
 	 */
 	readonly captureUnknown?: CaptureUnknown;
+	/**
+	 * Workers this run's own spawn record says Storm stopped, by cause. Absent when Storm stopped none. Fixed size:
+	 * one entry per cause (two today), never one per worker.
+	 */
+	readonly stormStops?: StormStopFacts;
 	/** Deliveries that answer no declared result; a mixed run shows this beside its declared rows. */
 	readonly outOfPlan: number;
 	/** Only when the caller supplied it. */
@@ -289,7 +311,17 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 	let placed = 0;
 	let refused = 0;
 	let unplannedPlaced = 0;
+	// A worker its own admission stopped (D5, a closed spend): the record says Storm ended it, not the host. Counted
+	// by cause with one native handle, so no list grows with the number of workers (fault 2, D11).
+	const stopCounts = new Map<WorkerStopReason, { count: number; first?: string }>();
 	for (const spawn of spawns) {
+		const stop = spawn.stop;
+		if (stop !== undefined) {
+			const entry = stopCounts.get(stop.reason) ?? { count: 0 };
+			entry.count += 1;
+			if (entry.first === undefined && hasText(spawn.spawnKey) && NATIVE_ID.test(spawn.spawnKey)) entry.first = spawn.spawnKey;
+			stopCounts.set(stop.reason, entry);
+		}
 		if (spawn.outcome === "blocked") {
 			refused += 1;
 			continue;
@@ -297,6 +329,15 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 		placed += 1;
 		if (spawn.lane === undefined) unplannedPlaced += 1;
 	}
+	const stormStops: StormStopFacts | undefined =
+		stopCounts.size === 0
+			? undefined
+			: {
+					count: [...stopCounts.values()].reduce((sum, entry) => sum + entry.count, 0),
+					reasons: [...stopCounts.entries()]
+						.map(([reason, entry]) => ({ reason, count: entry.count, ...(entry.first === undefined ? {} : { first: entry.first }) }))
+						.sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason)),
+				};
 	const agents: readonly AgentEntry[] = Array.isArray(run.agents) ? run.agents : [];
 	const started = agents.length;
 	const settled = agents.filter(agent => agent.state !== "running").length;
@@ -363,6 +404,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 		activity,
 		changes,
 		...(captureUnknown === undefined ? {} : { captureUnknown }),
+		...(stormStops === undefined ? {} : { stormStops }),
 		outOfPlan,
 		...(changedPaths === undefined ? {} : { changedPaths }),
 		headline,
@@ -382,6 +424,7 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 			activity,
 			changes,
 			captureUnknown ?? null,
+			stormStops ?? null,
 			retained,
 			allExcluded,
 			outOfPlan,

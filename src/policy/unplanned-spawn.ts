@@ -25,6 +25,11 @@ export const WHY_ITEM_TOOLS = "항목이 정의한 도구가 있음";
 export const TASK_ITEM_INVALID_REASON = "task 항목이 올바르지 않습니다.";
 export const TASK_EMPTY_REASON = "task에 맡길 작업이 필요합니다.";
 
+/** Native task trims the explicit name and uses the root session's default `task` for a blank name. */
+export function taskAgentName(value: unknown): string {
+	return (typeof value === "string" ? value.trim() : "") || "task";
+}
+
 /** What one unplanned item's classification depends on. */
 export interface UnplannedItemFacts {
 	agent: string;
@@ -61,22 +66,22 @@ export function isolatedToolsReason(agent: string): string {
 }
 
 /** An isolated placement with omp's isolation off or unreadable. */
-export function unplannedIsolationUnavailableReason(agent: string, enabled: boolean | undefined): string {
+export function unplannedIsolationUnavailableReason(agent: string, enabled: boolean | undefined, teamIsolated = false): string {
 	const state = enabled === false ? "꺼져 있습니다(task.isolation.enabled=false)" : "상태를 확인하지 못했습니다";
 	return `${agent}: 이 작업은 부모 트리와 분리된 격리 실행을 요청했는데 omp 격리가 ${state}. ` +
 		"격리를 켜는 것은 사용자의 omp 설정(`omp config set task.isolation.enabled true`, 확인은 `omp config list --json`)입니다. " +
-		"지금 쓸 수 없으면 isolated를 빼고 공유 작업으로 다시 보내세요. 공유 쓰기 작업은 한 번에 하나씩 시작합니다.";
+		(teamIsolated ? "이 팀은 모든 작업을 격리하므로 항목에서 isolated를 빼도 실행할 수 없습니다." : "지금 쓸 수 없으면 isolated를 빼고 공유 작업으로 다시 보내세요. 공유 쓰기 작업은 한 번에 하나씩 시작합니다.");
 }
 
 /** An isolated placement whose result omp would merge into the parent tree after the worker ended. */
-export function unplannedIsolationApplyReason(agent: string, apply: boolean | undefined): string {
+export function unplannedIsolationApplyReason(agent: string, apply: boolean | undefined, teamIsolated = false): string {
 	const head =
 		apply === true
 			? `${agent}: 이 작업은 부모 트리 밖에 남는 격리 결과를 요청했는데 omp가 격리 결과를 부모 작업 트리에 자동 적용합니다(task.isolation.apply=true). `
 			: `${agent}: 이 작업은 부모 트리 밖에 남는 격리 결과를 요청했는데 omp가 격리 결과를 부모 작업 트리에 자동 적용하는지 확인하지 못했습니다(task.isolation.apply 값을 읽지 못함). 적용이 켜져 있으면 워커가 끝난 뒤 예약 없이 부모 트리가 바뀝니다. `;
 	return head +
 		"`omp config set task.isolation.apply false`로 적용을 끄고, `omp config list --json`으로 값을 확인한 뒤 다시 스폰하세요. " +
-		"결과를 부모 트리에 합쳐도 되면 isolated를 빼고 공유 작업으로 다시 보내세요.";
+		(teamIsolated ? "이 팀은 모든 작업을 격리하므로 항목에서 isolated를 빼도 자동 적용 조건은 그대로입니다." : "결과를 부모 트리에 합쳐도 되면 isolated를 빼고 공유 작업으로 다시 보내세요.");
 }
 
 /**
@@ -185,7 +190,7 @@ export function unplannedWriterConflictReason(first: string, second: string): st
  * Against an empty table the only shared-write conflict is inside the batch: every unplanned writer has an unknown
  * scope, so two of them always collide. O(items) time and no per-worker state.
  */
-export function unplannedBatchGate(facts: readonly UnplannedItemFacts[], host?: IsolationHost): UnplannedBatchResult {
+export function unplannedBatchGate(facts: readonly UnplannedItemFacts[], host?: IsolationHost, teamIsolated = false): UnplannedBatchResult {
 	const items: UnplannedClassification[] = [];
 	let isolated = false;
 	for (const fact of facts) {
@@ -196,11 +201,11 @@ export function unplannedBatchGate(facts: readonly UnplannedItemFacts[], host?: 
 	}
 	if (isolated && host?.enabled !== true) {
 		const first = items.find(item => item.authority.kind === "private")!;
-		return { ok: false, code: "isolation", reason: unplannedIsolationUnavailableReason(first.agent, host?.enabled) };
+		return { ok: false, code: "isolation", reason: unplannedIsolationUnavailableReason(first.agent, host?.enabled, teamIsolated) };
 	}
 	if (isolated && host?.apply !== false) {
 		const first = items.find(item => item.authority.kind === "private")!;
-		return { ok: false, code: "isolation", reason: unplannedIsolationApplyReason(first.agent, host?.apply) };
+		return { ok: false, code: "isolation", reason: unplannedIsolationApplyReason(first.agent, host?.apply, teamIsolated) };
 	}
 	const writers = items.filter(item => item.authority.kind !== "read" && item.authority.kind !== "private");
 	if (writers.length > 1) {
@@ -236,7 +241,7 @@ export function unplannedBatchFacts(
 		if (item === null || typeof item !== "object" || Array.isArray(item)) return { ok: false, reason: TASK_ITEM_INVALID_REASON };
 		// Narrowed above to a plain object; every read below re-checks its own type.
 		const record = item as Record<string, unknown>;
-		const agent = typeof record.agent === "string" ? record.agent : "task";
+		const agent = taskAgentName(record.agent);
 		facts.push(unplannedFacts(record, agent, teamIsolated, agentTools(agent)));
 	}
 	return { ok: true, items: facts };

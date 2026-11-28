@@ -586,7 +586,6 @@ describe("14:23 to 14:31: results of follow-ups reach the ledger, and the depend
 		const first = { ...rowOf("claw-producer-provenance") };
 		expect(first.state).toBe("reviewable");
 		expect(first.attemptId).toBe(`job:${claw}:${claw}`);
-		expect(first.attemptId).toHaveLength(67);
 		// 56 s after the delivery omp has dropped the job row, so the follow-up's job takes the agent id again.
 		await followUp("14:26:51", "TraceClawQatProducer", "call-follow-claw", { id: claw, startTime: KST("14:26:51") + 300 });
 		expect(await running("TraceClawQatProducer")).toBe(true);

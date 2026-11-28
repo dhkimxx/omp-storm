@@ -888,7 +888,7 @@ describe("accepting on a small terminal", () => {
 		env = { ...project.env, registry: { getAll: () => CATALOG, getAvailable: () => CATALOG } };
 		const agents = path.join(project.root, ".omp", "agents");
 		await mkdir(agents, { recursive: true });
-		await writeFile(path.join(agents, "shadow-file.md"), "---\nname: storm-reviewer\n---\nbody\n");
+		await writeFile(path.join(agents, "shadow-file.md"), "---\nname: storm-reviewer\ndescription: test reviewer\n---\nbody\n");
 	});
 	afterEach(() => project.remove());
 

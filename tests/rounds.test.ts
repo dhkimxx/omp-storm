@@ -120,7 +120,7 @@ const unverified = (over: Partial<Unverified> = {}): Unverified => ({
 
 describe("end labels", () => {
 	test("only a verified run is done; an unverified end is ended; the rest are stopped", () => {
-		const unverified = ["no-changes", "unreviewed", "no-reviewer"];
+		const unverified = ["no-changes", "unreviewed", "no-reviewer", "no-declared-results"];
 		const reasons = ["verified", ...unverified, "interrupted", "round-limit", "no-progress", "time-limit", "shutdown", "host-ended", "budget", "start-failed"];
 		expect(Object.keys(END_STATUS).sort()).toEqual([...reasons].sort());
 		for (const [reason, status] of Object.entries(END_STATUS)) {

@@ -1,4 +1,4 @@
-import { constants as fsConstants } from "node:fs";
+import { closeSync, constants as fsConstants, openSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -44,12 +44,12 @@ export function runsDir(sessionDir: string): string {
 
 const pad = (n: number): string => String(n).padStart(2, "0");
 
-/** Timestamp in UTC for ordering, with a profile-wide collision-resistant 128-bit suffix. */
+/** UTC timestamp and a compact 64-bit suffix; run-derived worker addresses stay within the host's name bounds. */
 export function newRunId(now: number): string {
 	const d = new Date(now);
 	const date = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
 	const time = `${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
-	const tail = randomBytes(16).toString("hex");
+	const tail = randomBytes(8).readBigUInt64BE().toString(36).padStart(13, "0");
 	return `run-${date}-${time}-${tail}`;
 }
 
@@ -91,6 +91,42 @@ export async function writeRun(sessionDir: string, run: RunRecord): Promise<void
 	if (!file) throw new Error(`잘못된 실행 id입니다: ${run.runId}`);
 	await assertSessionPathSafe(sessionDir, file);
 	await writeJsonAtomic(file, run);
+}
+
+/** A new id is exclusive across the profile, including after old records are pruned. Never replaces a record. */
+export async function publishRun(sessionDir: string, run: RunRecord, beforePublish: () => void): Promise<void> {
+	const file = runFile(sessionDir, run.runId);
+	if (file === undefined) throw new Error("잘못된 실행 ID입니다");
+	await assertSessionPathSafe(sessionDir, file);
+	const storm = path.dirname(path.dirname(sessionDir));
+	const root = path.join(storm, "run-ids");
+	await fs.mkdir(root, { recursive: true, mode: 0o700 });
+	const [realRoot, realProfile] = await Promise.all([fs.realpath(root), fs.realpath(path.dirname(storm))]);
+	if (realRoot !== path.join(realProfile, "storm", "run-ids")) throw new Error("실행 ID 저장소가 프로필 밖으로 연결되어 있습니다");
+	const claim = path.join(realRoot, run.runId);
+	let claimed = false;
+	try {
+		await writeJsonAtomic(file, run, () => {
+			beforePublish();
+			const fd = openSync(claim, "wx", 0o600);
+			claimed = true;
+			closeSync(fd);
+		}, true);
+	} catch (error) {
+		if (claimed) await fs.rm(claim, { force: true }).catch(() => undefined);
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`이미 사용된 실행 ID입니다: ${run.runId}`);
+		throw error;
+	}
+}
+
+/** Discard a provisional start after its writer is done, if the exact start still owns this record. */
+export async function discardStartRecord(sessionDir: string, run: Pick<RunRecord, "runId" | "startedAt">): Promise<void> {
+	const file = runFile(sessionDir, run.runId);
+	if (file === undefined) return;
+	await assertSessionPathSafe(sessionDir, file);
+	const current = await readRunJson(file);
+	if (!isRunRecord(current) || current.runId !== run.runId || current.startedAt !== run.startedAt || current.status !== "running") return;
+	await fs.rm(file, { force: true });
 }
 
 /** One run record is bounded before parsing: a large, replaced or non-regular file is not a record. */

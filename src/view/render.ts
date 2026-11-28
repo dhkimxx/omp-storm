@@ -4,7 +4,7 @@ import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE, PLANLESS_PLACEMENT_NOTE, RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
-import { CAPTURE_UNKNOWN_LABEL } from "../runtime/closeout.ts";
+import { CAPTURE_UNKNOWN_LABEL, WORKER_STOP_LABEL } from "../runtime/closeout.ts";
 import { goalTotals } from "../runtime/goal.ts";
 import { resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
@@ -105,12 +105,13 @@ export function priorityLabel(p: StoredPriority): string {
 }
 const ISOLATION: Record<StormConfig["isolation"], string> = { shared: "공유 작업 트리", isolated: "팀 격리(리뷰 포함)" };
 /**
- * What passing the budget does. Storm sees spend after it happens, so neither choice stops work already running: both stop
- * new spawns; `stop` also aborts the director's turn.
+ * What passing the budget does. Storm sees spend after it happens, so neither choice stops work already running: both
+ * stop new spawns and refuse every message to a worker; `stop` also aborts the director's turn and the next request of
+ * a running worker (B3, F3).
  */
 export const ON_EXCEED: Record<BudgetConfig["onExceed"], string> = {
-	"block-spawns": "새 스폰과 쉬는 워커에게 보내는 일 메시지 차단",
-	stop: "새 스폰·일 메시지 차단과 감독 응답 중단(이미 도는 워커는 끝까지 진행)",
+	"block-spawns": "새 스폰·모든 워커 메시지 차단(도는 턴은 끝까지)",
+	stop: "새 스폰·모든 워커 메시지 차단과 감독 응답·도는 워커의 다음 요청 중단",
 };
 
 /** Local "YYYY-MM-DD HH:mm". */
@@ -554,6 +555,17 @@ export function captureUnknownLine(facts: Pick<ResultFacts, "captureUnknown">): 
 }
 
 /**
+ * Fault 2: the status says Storm itself stopped these workers and why. The card carries the worker's full sentence;
+ * this line is one count and up to two causes, so it never grows with the number of workers.
+ */
+export function stormStopStatusLine(facts: Pick<ResultFacts, "stormStops">): string | undefined {
+	const stops = facts.stormStops;
+	if (stops === undefined) return undefined;
+	const reasons = stops.reasons.map(stop => `${WORKER_STOP_LABEL[stop.reason] ?? stop.reason} ${stop.count}`).join(" · ");
+	return `- Storm 중단: ${stops.count}개 · ${reasons}`;
+}
+
+/**
  * The whole status. For the user it leads with present state, version and a real next action, then the active and
  * last run, then everything else with the commands that fix what it points out. For the model (the storm tool) it is
  * the same facts without advice the director could act on (omp commands, /restart, cost flags) and without file
@@ -824,7 +836,7 @@ export function renderStatus(
 		heading("하드 예산 상한", "runtime", "status.info");
 		out.push(
 			b
-				? `- Storm 예산은 관측된 지출이 한도에 닿은 뒤 새 스폰과 쉬는 워커에게 보내는 일 메시지를 막고(\`stop\`이면 감독의 응답도 멈추고), 이미 도는 워커는 끝까지 갑니다(진행 메모는 보낼 수 있습니다). 지출을 중간에 끊는 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
+				? `- Storm 예산은 관측된 지출이 한도에 닿은 뒤 어떤 agent:// 메시지도 워커에게 보내지 않고(진행 메모 포함) 새 스폰을 막으며(\`stop\`이면 감독의 응답과 이미 도는 워커의 다음 요청도 멈춥니다), \`block-spawns\`에서는 이미 도는 워커의 지금 턴이 끝까지 갑니다. 지출을 중간에 끊는 하드 상한은 \`omp --max-cost ${b.perRunUsd}\` 또는 \`session.maxCost\`로 거세요.`
 				: "- 하드 상한은 `omp --max-cost <USD>` 또는 `session.maxCost`로 거세요.",
 		);
 	}
@@ -1109,6 +1121,9 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 	const facts = resultFacts(run);
 	const outcome = resultLine(facts, { detailed: details });
 	if (outcome !== undefined) out.push(outcome.text);
+	// Fault 2: the host's failure text is not the cause when Storm stopped the worker; say so before any delivery line.
+	const stops = stormStopStatusLine(facts);
+	if (stops !== undefined) out.push(stops);
 	if (details) for (const row of facts.progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
 	// Work that answered no declared result: out-of-plan work and unasked arrivals are separate facts.
 	const unplannedWork = outOfPlanLine(run);

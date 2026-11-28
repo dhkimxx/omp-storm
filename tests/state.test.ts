@@ -12,7 +12,8 @@ import { noteResumePointer, trustedResume } from "../src/runtime/resume.ts";
 import { readRun, runIds, writeRun } from "../src/runtime/run.ts";
 import { addQuotaMark, readQuotaMarks, readTrialStates, updateTrialState } from "../src/runtime/state-files.ts";
 import { assertSessionStoreSafe, sessionStateDir, sessionStoreDir } from "../src/session-scope.ts";
-import { createStateCache, isApproved, loadProjectState, type ProjectEnv } from "../src/state.ts";
+import type { LiveDiscovery } from "../src/approval/shadow.ts";
+import { createStateCache, isApproved, liveDiscovery, loadProjectState, type ProjectEnv } from "../src/state.ts";
 import type { RunSummary, StormConfig } from "../src/types.ts";
 import { runRecord } from "./fixtures.ts";
 import { makeProject, TEAM, type TestProject } from "./support.ts";
@@ -20,6 +21,11 @@ import { makeProject, TEAM, type TestProject } from "./support.ts";
 const T0 = Date.parse("2026-11-20T09:00:00Z");
 const SESSION_A = "native-session-a";
 const SESSION_B = "native-session-b";
+/** A verified live handle whose extension roots are empty: known, and distinct from an unknown handle. */
+const live: LiveDiscovery = {
+	extensionRoots: { explicit: [], mode: "explicit-only", configured: [], configuredLevel: "user" },
+	sessionAgents: [],
+};
 
 let project: TestProject;
 /** The project's env, counting the git calls a state load makes (one each). */
@@ -32,6 +38,7 @@ beforeEach(async () => {
 	env = {
 		...project.env,
 		sessionId: SESSION_A,
+		discovery: live,
 		exec: (command, args, options) => {
 			loads++;
 			return project.env.exec(command, args, options);
@@ -46,12 +53,12 @@ afterEach(async () => {
 });
 
 /** The same owner without the git-call counter, so writes do not look like cache reads. */
-const baseEnv = (): ProjectEnv => ({ ...project.env, sessionId: SESSION_A });
+const baseEnv = (): ProjectEnv => ({ ...project.env, sessionId: SESSION_A, discovery: live });
 
 /** Writes the approval first, then the session config: the order the real approval path uses. */
 async function approveTeam(team: StormConfig, target: ProjectEnv = baseEnv()): Promise<void> {
 	const state = await loadProjectState(target);
-	await state.store.approve({ configHash: configHash(team), config: team, scope: { shadowedAgents: [] } });
+	await state.store.approve({ configHash: configHash(team), config: team, scope: { shadowedAgents: state.shadows } });
 	await writeConfig(state.sessionDir, team);
 }
 
@@ -130,6 +137,46 @@ describe("the spawn hook's state cache", () => {
 		await expect(cache.get(flaky)).rejects.toThrow("agent dir unavailable");
 		broken = false;
 		expect((await cache.get(flaky)).config.status).toBe("missing");
+	});
+
+	test("an unknown handle never shares a cache entry with known empty roots or another root set", async () => {
+		const cache = createStateCache();
+		const known = await cache.get(env);
+		const unknown = await cache.get({ ...env, discovery: undefined });
+		expect(loads).toBe(2);
+		expect(known.shadows.some(s => s.path === "")).toBe(false);
+		expect(unknown.shadows.length).toBeGreaterThan(0);
+		expect(unknown.shadows.every(s => s.path === "" && s.sha256 === "")).toBe(true);
+		expect(unknown.shadows.map(s => s.agent)).toContain("task");
+		expect(isApproved(unknown)).toBe(false);
+
+		const ext = path.join(project.tmp, "extra-extension");
+		await mkdir(path.join(ext, "agents"), { recursive: true });
+		const file = path.join(ext, "agents", "fixture.md");
+		await writeFile(file, "---\nname: task\ndescription: x\n---\nbody\n");
+		const changed = await cache.get({ ...env, discovery: { ...live, extensionRoots: { ...live.extensionRoots, explicit: [ext] } } });
+		expect(loads).toBe(3);
+		expect(changed.shadows.find(s => s.agent === "task")?.path).toBe(file);
+	});
+});
+
+describe("live discovery identity", () => {
+	test("only the handle owning this exact native session is live; blank and mismatched are unknown", () => {
+		const session = {
+			sessionManager: { getSessionId: () => "native-owner" },
+			effectiveExtensionRoots: live.extensionRoots,
+			getSessionAgents: () => [],
+		};
+		const ref = { id: "Main", session } as never;
+		const registry = { get: (id: string) => (id === "Main" ? ref : undefined) };
+		expect(liveDiscovery("Main", "native-owner", registry)).toEqual(live);
+		expect(liveDiscovery("Main", "another-session", registry)).toBeUndefined();
+		expect(liveDiscovery("Other", "native-owner", registry)).toBeUndefined();
+		expect(liveDiscovery("", "native-owner", registry)).toBeUndefined();
+		expect(liveDiscovery("Main", "", registry)).toBeUndefined();
+		expect(liveDiscovery("Main", "native-owner", { get: () => ({ id: "Main", session: null } as never) })).toBeUndefined();
+		const brokenRoots = { ...session, effectiveExtensionRoots: undefined };
+		expect(liveDiscovery("Main", "native-owner", { get: () => ({ id: "Main", session: brokenRoots } as never) })).toBeUndefined();
 	});
 });
 

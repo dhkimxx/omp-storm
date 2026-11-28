@@ -740,6 +740,11 @@ export type RunEndReason =
 	| "unreviewed"
 	/** Files changed but the team has no usable reviewer role. */
 	| "no-reviewer"
+	/**
+	 * The run declared no result rows and its workers are done: there is nothing for a result check to pass. This is an
+	 * end, never a verification and never a stall; the record still carries the workers and their deliveries.
+	 */
+	| "no-declared-results"
 	/** The user stopped the run. */
 	| "interrupted"
 	/** The run reached its round limit. */
@@ -1011,6 +1016,14 @@ export interface RunRecord {
 	unplanned?: UnplannedDelivery[];
 	/** How many such deliveries the run received in all: more than `unplanned` holds once the list was cut. */
 	unplannedCount?: number;
+	/**
+	 * Of `unplannedCount`, how many were work this run asked for (an admission or a wake), counted when each delivery
+	 * was recorded. The list is bounded, so a count read from it would turn asked-for deliveries into unasked arrivals
+	 * once it was cut (F2); absent on earlier records, which fall back to the kept list.
+	 */
+	unplannedAsked?: number;
+	/** Of `unplannedCount`, how many nobody asked for, counted the same way. */
+	unplannedUnasked?: number;
 	/** What the run's total spend leaves out or took from outside the plan; absent when there is nothing to say. */
 	spend?: RunSpendNote;
 }

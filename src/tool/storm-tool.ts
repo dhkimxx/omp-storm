@@ -28,7 +28,7 @@ import {
 import { agentRows, renderAgentRows } from "../report/agents.ts";
 import { type ActionOutcome, type ActionReply, NO_CONFIG } from "../request/actions.ts";
 import { runSpec } from "../request/args.ts";
-import { LANE_ROLES, ROLES, roleTitle, workerRange } from "../roles.ts";
+import { LANE_ROLES, ROLES, roleTitle } from "../roles.ts";
 import {
 	CLOSEOUT_NEXT_COUNT,
 	CLOSEOUT_NEXT_MAX,
@@ -40,6 +40,7 @@ import {
 	parseCloseout,
 } from "../runtime/closeout.ts";
 import { PLANLESS_NO_TURN_TIME } from "../runtime/planless.ts";
+import { LANE_ADDRESS_HINT, PLAN_LANE_NAMES_SHOWN, PLAN_WORKER_COUNT_NOTE } from "../runtime/contract-text.ts";
 import { continuedHandoffText } from "../runtime/resume.ts";
 import type { ProjectState } from "../state.ts";
 import type { LaneKind, LaneNeed, LaneResultKind, PlanRequest, RoleId, RunPlan, ShadowInfo, StormConfig, StormToolAction, StormToolParams } from "../types.ts";
@@ -197,7 +198,7 @@ function stormParams(z: Zod): StormToolSchema {
 
 export function createStormTool(
 	z: Zod,
-	hostFor: (ctx: ExtensionContext) => StormToolHost,
+	hostFor: (ctx: ExtensionContext, signal?: AbortSignal) => StormToolHost,
 ): ToolDefinition<StormToolSchema, StormToolDetails> {
 	return {
 		name: "storm",
@@ -221,7 +222,11 @@ export function createStormTool(
 			if (refusal !== undefined) {
 				return { content: [{ type: "text", text: refusal }], details: { action: params.action, outcome: "rejected" } };
 			}
-			const reply = await runStormTool(hostFor(ctx), params, signal);
+			const host = hostFor(ctx, signal);
+			let reply = await runStormTool(host, params, signal);
+			const cut = host.checkStartReply?.();
+			const lateRefusal = cut instanceof Promise ? await cut : cut;
+			if (lateRefusal !== undefined) reply = rejected(lateRefusal);
 			return { content: [{ type: "text", text: reply.text }], details: { action: params.action, outcome: reply.outcome } };
 		},
 	};
@@ -264,7 +269,7 @@ const CONTINUE_NO_HOST = "이 호스트에서는 중단된 실행을 이어 갈 
 /** What a continued run carried over, in the words the director acts on. Facts and the next step, no plan dump. */
 function continuedText(runId: string, carried: ContinuedRun): string {
 	// R12: a run with no result rows opens a handoff, not a carry; it must never say the old plan was applied.
-	if (carried.mode === "handoff") return continuedHandoffText(runId, carried.from, carried.ended);
+	if (carried.mode === "handoff") return continuedHandoffText(runId, carried.from, carried.ended, carried.allExcluded === true);
 	const parts = [`이어받은 결과 ${carried.kept}개(현재 근거로 다시 확인함)`, `다시 할 결과 ${carried.reopened}개`];
 	if (carried.blocked > 0) parts.push(`막힌 결과 ${carried.blocked}개`);
 	const open = carried.open.length === 0 ? "" : ` 남은 레인: ${carried.open.join(", ")}.`;
@@ -420,11 +425,15 @@ function dependencyLine(plan: RunPlan): string | undefined {
 }
 
 /** Lanes and workers of a plan per role, as the director and the dialog read them. */
-function planLines(config: StormConfig, plan: RunPlan): string[] {
+function planLines(plan: RunPlan): string[] {
 	const out: string[] = [];
 	for (const [role, n] of Object.entries(plan.workers)) {
 		const lanes = plan.lanes.filter((l) => l.role === role).map((l) => l.name);
-		out.push(`- ${roleTitle(role)}(${role}): 워커 ${n}개/최대 ${workerRange(role, config.roles[role]).max} · 레인 ${lanes.join(", ")}`);
+		const shown = lanes.slice(0, PLAN_LANE_NAMES_SHOWN);
+		const rest = lanes.length - shown.length;
+		// The lane names are what the director addresses; the worker number is a plan fact, never a limit (faults 6/7).
+		const laneText = rest > 0 ? `${shown.join(", ")} 외 ${rest}개(전체는 storm status)` : shown.join(", ");
+		out.push(`- ${roleTitle(role)}(${role}): 레인 ${lanes.length}개 — ${laneText} · 역할별 워커 ${n}개(${PLAN_WORKER_COUNT_NOTE})`);
 	}
 	const jobs = plan.lanes.filter(lane => lane.job !== undefined).map(lane => `${lane.name} ← ${lane.job}`);
 	if (jobs.length > 0) out.push(`- 승인된 정형 작업: ${jobs.join(" · ")}`);
@@ -477,7 +486,7 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 	if (conflict !== undefined) return rejected(`계획을 적용하지 않았습니다. ${conflict}`);
 	if (check.outOfBounds.length) return outOfBoundsReply(config, check.outOfBounds);
 	const plan = check.plan!;
-	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(config, plan)];
+	const body = [`레인 ${plan.lanes.length}개:`, ...planLines(plan), `- ${LANE_ADDRESS_HINT}`];
 	if (check.warnings.length) body.push("경고:", ...check.warnings.map((w) => `- ${w}`));
 	const auto = host.auto?.();
 	const order = writerOrderLine(config, plan, cur.state.shadows, auto?.enabled === true);

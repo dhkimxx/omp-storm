@@ -75,6 +75,18 @@ export const CHECKOUT_CLEANUP_NOTE = "체크아웃 정리는 호스트가 맡으
 export const RETAINED_SOURCE_NOTE = "판정 근거는 부모 작업 트리가 아니라 보존 산출물입니다. 부모에 그 바이트가 없다는 뜻도, 부모 트리가 그대로라는 뜻도 아닙니다.";
 /** §5: a placement outside a plan has no recorded isolation fact on this host, so its work location is not established. */
 export const PLANLESS_PLACEMENT_NOTE = "계획 밖 배치의 작업 위치는 기록에 없을 수 있으니 호스트 기록에서 확인하세요.";
+/**
+ * Fault 6: the lane names a plan reply shows are the director's own key for each lane. Once this run places the lane,
+ * `agent://<lane name>` reaches that worker (the host handle is in the result); the reply must say so.
+ */
+export const LANE_ADDRESS_HINT = "레인 이름은 이 실행이 그 레인을 스폰한 뒤 agent://<레인 이름>으로 부를 수 있습니다. 호스트가 붙인 실제 핸들은 결과의 agent와 storm status에 나옵니다.";
+/**
+ * Fault 7: the per-role worker count beside a plan is a plan fact, not a limit. The host's `task.maxConcurrency` and the
+ * write order decide how many run at once. Every surface that shows the number carries this note.
+ */
+export const PLAN_WORKER_COUNT_NOTE = "동시 실행 상한 아님";
+/** Lane names a plan reply lists in one line; the rest are counted and named in `storm status` (bounded reply). */
+export const PLAN_LANE_NAMES_SHOWN = 6;
 
 /** What a result's per-result line says about who decides it once its conditions are met. */
 export const JUDGE_TEXT = {
