@@ -29,7 +29,7 @@ import { runStormTool } from "../src/tool/storm-tool.ts";
 const SESSION_ID = "main:integration-wiring";
 const SESSION_INSTANCE = "main:integration-wiring-instance";
 const SESSION_DIR = "/tmp/storm-p4/E/profile/session";
-const DIRECTOR = { sessionId: SESSION_ID, sessionInstance: SESSION_INSTANCE, sessionDir: SESSION_DIR, parentId: "" };
+const DIRECTOR = { sessionId: SESSION_ID, sessionInstance: SESSION_INSTANCE, sessionDir: SESSION_DIR, parentId: "Main" };
 const CANDIDATE = `c1_${"a".repeat(64)}`;
 const CANDIDATE_2 = `c1_${"b".repeat(64)}`;
 
@@ -46,14 +46,14 @@ function isolated(overrides: Record<string, unknown> = {}): Settings {
 
 function registerDirector(settings: Settings): void {
 	AgentRegistry.global().register({
-		id: SESSION_ID,
+		id: DIRECTOR.parentId,
 		displayName: "Main",
 		kind: "main",
 		status: "idle",
 		sessionFile: null,
 		createdAt: 1,
 		lastActivity: 1,
-		session: { instanceKey: SESSION_INSTANCE, settings } as unknown as AgentSessionHandle,
+		session: { instanceKey: SESSION_INSTANCE, settings, sessionManager: { getSessionId: () => SESSION_ID } } as unknown as AgentSessionHandle,
 	});
 }
 
@@ -195,9 +195,9 @@ describe("the fail-closed managed private-launch gate", () => {
 	test("a director identity needs the live local session; another id is unknown", () => {
 		const settings = isolated();
 		registerDirector(settings);
-		const known = directorIdentityFor({ sessionId: SESSION_ID, sessionDir: SESSION_DIR, parentId: "" });
-		expect(known.kind).toBe("known");
-		const unknown = directorIdentityFor({ sessionId: "main:missing", sessionDir: SESSION_DIR, parentId: "" });
+		expect(directorIdentityFor(DIRECTOR)).toEqual({ kind: "known", value: DIRECTOR });
+		expect(directorIdentityFor({ ...DIRECTOR, parentId: SESSION_ID })).toMatchObject({ kind: "unknown" });
+		const unknown = directorIdentityFor({ ...DIRECTOR, sessionId: "main:missing" });
 		expect(unknown.kind).toBe("unknown");
 		if (unknown.kind === "unknown") expect(unknown.problem.code).toBe(ISOLATION_SCOPE_UNKNOWN);
 	});

@@ -18,6 +18,7 @@ import { invalidateAnalysis, prepareAnalysis } from "./context.ts";
 import { instrument } from "./e2e-meter.ts";
 import { readQuota } from "./discovery/quota.ts";
 import {
+	type DirectorIsolationObservation,
 	directorIdentityFor,
 	INTEGRATION_GUARD_BUILD,
 	integrationApplyPolicy,
@@ -191,8 +192,8 @@ import {
 	type WorkerStopReading,
 } from "./worker-admission.ts";
 
-import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationCandidateId, IntegrationRead, NativeTaskItem, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
-import type { ByteWindow } from "./runtime/integration-delta.ts";
+import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationRead, NativeTaskItem, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
+import type { ByteWindow, IntegrationDeltaPort } from "./runtime/integration-delta.ts";
 import type { CandidateQuery, IntegrationAttemptPort, IntegrationControllerPort, IntegrationSelectionReply, IntegrationViewPort } from "./runtime/integration-controller-port.ts";
 import type { IntegrationCapturePort, RegistrySnapshotInput } from "./runtime/integration-capture.ts";
 import type { SyncResultFact } from "./runtime/attempt-report.ts";
@@ -205,10 +206,10 @@ import { INTEGRATION_CANDIDATE_ID_RE, INTEGRATION_RUN_ID_RE, integrationIdListPr
  * Nothing here reads a model-supplied run id, session, fence or settings value as authority.
  */
 export interface IntegrationRuntimePorts {
-	readonly admission: import("./runtime/integration-admission.ts").IntegrationAdmissionPort;
+	readonly admission: IntegrationAdmissionPort;
 	readonly capture: IntegrationCapturePort;
 	readonly controller: IntegrationControllerPort;
-	readonly delta: import("./runtime/integration-delta.ts").IntegrationDeltaPort;
+	readonly delta: IntegrationDeltaPort;
 	readonly journal: IntegrationJournalPort;
 	readonly writer: IntegrationWriterPort;
 	readonly attempt: IntegrationAttemptPort;
@@ -220,15 +221,6 @@ export interface IntegrationRuntimePorts {
 }
 
 let integrationRuntime: IntegrationRuntimePorts | undefined;
-let integrationRegistryStop: (() => void) | undefined;
-/**
- * Exact isolation observations armed at the owning task call, keyed by the host handle the call placed. The spawn
- * hook reads the same observation: a relevant effective change between the tool call and the hook (including ABA) is
- * refused before the host materialises anything. Bounded; the oldest entry's listener is stopped when it is dropped.
- */
-const preAuthorizedIsolation = new Map<string, import("./discovery/settings.ts").DirectorIsolationObservation>();
-/** One observer identity per extension module, so a capture cannot be joined to another process's registry. */
-const INTEGRATION_REGISTRY_INSTANCE = `storm-registry-${process.pid}-${randomUUID()}`;
 
 /** Coordinator/composition entry point. Passing undefined leaves the actions refused, not silently permissive. */
 export function bindIntegrationRuntime(ports: IntegrationRuntimePorts | undefined): void {
@@ -846,6 +838,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	pi = instrument(pi);
 	const timings = timingsOf(options.timings);
 	const exec = execPort(pi);
+	let integrationRegistryStop: (() => void) | undefined;
+	// Per director instance: a different session's shutdown must not stop this run's capture or settings observation.
+	const preAuthorizedIsolation = new Map<string, DirectorIsolationObservation>();
 	/**
 	 * The native sessions whose lane view the user turned off with `/storm view`. The view is on by default; like the
 	 * automatic-delegation policy this is one session's own setting, dropped at every identity boundary, and unlike it
@@ -1259,11 +1254,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const ref = AgentRegistry.global().get(ctx.agent.id);
 		const sessionFile = sessionFileOf(ctx);
 		const fileIdentity = sessionFile === undefined ? undefined : await spaceIdentityOf(sessionFile);
-		if (ref === undefined || fileIdentity === undefined) {
+		const registryInstance = ref?.session?.instanceKey;
+		if (ref === undefined || registryInstance === undefined || fileIdentity === undefined || ref.sessionFile !== sessionFile ||
+			ref.parentId !== prepared.value.director.parentId || ref.parentSessionKey !== prepared.value.director.sessionInstance) {
 			return refuse({ reason: "자식 세션의 레지스트리 세대와 세션 파일 신원을 확인하지 못해 격리 진입을 허용하지 않았습니다." });
 		}
 		const entry: ObservationIdentity = {
-			registryInstance: INTEGRATION_REGISTRY_INSTANCE,
+			registryInstance,
 			generation: ref.generation,
 			childSessionFile: fileIdentity,
 		};
@@ -1935,7 +1932,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 						? `${sessionId}:${request}:${owner.turnStartedAt}`
 						: undefined;
 					if (askId === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_NO_ASK };
-					const director = directorIdentityFor({ sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.parentId ?? "" });
+					const director = directorIdentityFor({ sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 					if (director.kind === "unknown") return { outcome: "rejected", text: director.problem.reason };
 					if (toolCallId === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_NO_CALL };
 					// A target fence blocks every managed writer until an accountable operator resolves it.
@@ -2434,7 +2431,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				}
 				const observationCheck = observation.check();
 				if (!observationCheck.ok) return ledgerBlock(observationCheck.problem.reason, current, Date.now());
-				const director = directorIdentityFor({ sessionId: current.sessionId, sessionDir: current.sessionDir, parentId: ctx.agent.parentId ?? "" });
+				const director = directorIdentityFor({ sessionId: current.sessionId, sessionDir: current.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "unknown") return ledgerBlock(director.problem.reason, current, Date.now());
 				const policy = integrationRuntime.policy ?? integrationApplyPolicy;
 				const proof = policy.arm({ director: director.value, toolCallId: spawnKey });
@@ -2564,7 +2561,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const ports = integrationRuntime;
 		const ledger = getLedgerRun(runId);
 		if (ports !== undefined && ledger !== undefined) {
-			const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.parentId ?? "" });
+			const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 			if (director.kind === "known") {
 				try {
 					ports.capture.observeAsync({ director: director.value, carrier: "push", details: message, observedAt });
@@ -3714,7 +3711,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// items. The spawn hook reads this same observation; a change through the hook (ABA included) refuses the
 			// launch. Without the bound integration runtime the row's existing 0.29 behavior is unchanged.
 			if (wantsIsolation && integrationRuntime !== undefined) {
-				const director = directorIdentityFor({ sessionId: mainId, sessionDir: getLedgerRun(runId)?.sessionDir ?? "", parentId: ctx.agent.parentId ?? "" });
+				const director = directorIdentityFor({ sessionId: mainId, sessionDir: getLedgerRun(runId)?.sessionDir ?? "", parentId: ctx.agent.id });
 				if (director.kind === "unknown") return { block: true, reason: director.problem.reason };
 				const armed = observeDirectorIsolation({ director: director.value, toolCallId: event.toolCallId });
 				if (armed.kind === "unknown") return { block: true, reason: armed.problem.reason };
@@ -4229,7 +4226,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const ports = integrationRuntime;
 			const ledger = getLedgerRun(runId);
 			if (ports !== undefined && ledger !== undefined) {
-				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.parentId ?? "" });
+				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "known") {
 					const results = isRecord(event.details) && Array.isArray(event.details.results) ? event.details.results : undefined;
 					try {
@@ -4264,7 +4261,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const ports = integrationRuntime;
 			const ledger = getLedgerRun(runId);
 			if (ports !== undefined && ledger !== undefined) {
-				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.parentId ?? "" });
+				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "known") {
 					try {
 						ports.capture.observeAsync({ director: director.value, carrier: "wait", details: event.details, observedAt });
@@ -4852,18 +4849,16 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (generation !== sessionGeneration) return;
 			// A's registry subscription is installed before this session can spawn, so no first registered/metadata
 			// event is missed. The listener snapshots primitives synchronously; the capture port owns all joining.
-			if (integrationRuntime !== undefined) {
-				const ports = integrationRuntime;
-				const directorInstance = AgentRegistry.global().get(ctx.agent.id)?.session?.instanceKey;
-				const sessionDir = state.sessionDir;
-				integrationRegistryStop?.();
+			const ports = integrationRuntime;
+			const director = ports === undefined ? undefined : directorIdentityFor({ sessionId, sessionDir: state.sessionDir, parentId: ctx.agent.id });
+			integrationRegistryStop?.();
+			integrationRegistryStop = undefined;
+			if (ports !== undefined && director?.kind === "known") {
 				integrationRegistryStop = AgentRegistry.global().onChange(event => {
+					if (generation !== sessionGeneration) return;
 					const ref = event.ref;
-					if (ref.kind !== "sub") return;
-					const director = directorIdentityFor({ sessionId, sessionDir, parentId: ctx.agent.parentId ?? "" });
-					if (director.kind === "unknown") return;
-					const owns = ref.parentId === ctx.agent.id || (directorInstance !== undefined && ref.parentSessionKey === directorInstance);
-					if (!owns) return;
+					if (ref.kind !== "sub" || ref.parentId !== director.value.parentId ||
+						(ref.parentSessionKey != null && ref.parentSessionKey !== director.value.sessionInstance)) return;
 					const history = isRecord(ref.history) ? ref.history : undefined;
 					const patchPath = typeof history?.patchPath === "string" ? history.patchPath : undefined;
 					const nested = Array.isArray(history?.nestedPatchPaths)
@@ -4872,7 +4867,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					const branchName = typeof history?.branchName === "string" ? history.branchName : undefined;
 					const snapshot: RegistrySnapshotInput = {
 						director: director.value,
-						registryInstance: INTEGRATION_REGISTRY_INSTANCE,
+						registryInstance: ref.session?.instanceKey ?? "",
 						event: event.type,
 						handle: ref.id,
 						parentId: ref.parentId ?? null,

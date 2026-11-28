@@ -298,14 +298,16 @@ function snapshotOf(settings: Settings): IsolationPolicySnapshot {
 }
 
 /**
- * The live local session handle for `sessionId`, or undefined. A worker-bridge handle is not a local
- * AgentSession and carries no settings object; a parked ref has no session. Both are unknown.
+ * Resolve the exact registry parent and verify its native session identity. They are different namespaces.
+ * A remote handle or a parked ref carries no local Settings and cannot authorize a launch.
  */
-function liveSessionHandle(sessionId: string): { settings: Settings; instanceKey: string } | undefined {
+function liveSessionHandle(sessionId: string, parentId: string): { settings: Settings; instanceKey: string } | undefined {
 	try {
-		const handle = AgentRegistry.global().get(sessionId)?.session;
-		if (handle === null || handle === undefined || !isLocalAgentSession(handle)) return undefined;
-		return handle.settings === undefined ? undefined : { settings: handle.settings, instanceKey: handle.instanceKey };
+		const ref = AgentRegistry.global().get(parentId);
+		const handle = ref?.session;
+		if (ref?.kind !== "main" || handle == null || !isLocalAgentSession(handle) ||
+			handle.sessionManager.getSessionId() !== sessionId || handle.settings === undefined) return undefined;
+		return { settings: handle.settings, instanceKey: handle.instanceKey };
 	} catch {
 		return undefined;
 	}
@@ -324,7 +326,7 @@ export function observeDirectorIsolation(input: {
 	if (input.toolCallId.trim() === "") {
 		return { kind: "unknown", problem: isolationProblem(ISOLATION_SCOPE_UNKNOWN, "스폰 항목의 호출 키가 비어 있어 격리 정책의 범위를 확인하지 못했습니다.") };
 	}
-	const live = liveSessionHandle(director.sessionId);
+	const live = liveSessionHandle(director.sessionId, director.parentId);
 	if (live === undefined) {
 		return { kind: "unknown", problem: isolationProblem(ISOLATION_SCOPE_UNKNOWN, "감독 세션의 실제 Settings 인스턴스를 확인하지 못했습니다(등록된 로컬 세션이 아니거나 설정을 읽을 수 없음).") };
 	}
@@ -370,7 +372,7 @@ export function observeDirectorIsolation(input: {
 		},
 		check: () => {
 			if (stopped) return { ok: false, problem: isolationProblem(ISOLATION_SCOPE_UNKNOWN, "격리 정책 관찰이 이미 끝났습니다.") };
-			const now = liveSessionHandle(director.sessionId);
+			const now = liveSessionHandle(director.sessionId, director.parentId);
 			if (now === undefined || now.settings !== settings || now.instanceKey !== director.sessionInstance) {
 				return { ok: false, problem: isolationProblem(ISOLATION_SCOPE_UNKNOWN, "감독 세션의 Settings 인스턴스가 바뀌었습니다.") };
 			}
@@ -442,7 +444,7 @@ export function directorIdentityFor(input: {
 	readonly sessionDir: string;
 	readonly parentId: string;
 }): IntegrationRead<DirectorIdentity> {
-	const live = liveSessionHandle(input.sessionId);
+	const live = liveSessionHandle(input.sessionId, input.parentId);
 	if (live === undefined) {
 		return { kind: "unknown", problem: isolationProblem(ISOLATION_SCOPE_UNKNOWN, "감독 세션의 실제 인스턴스를 확인하지 못했습니다.") };
 	}
