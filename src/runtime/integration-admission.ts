@@ -170,6 +170,8 @@ export interface ApplyPolicyPort {
 export interface IntegrationAdmissionPort {
 	reserveSlot(input: {
 		readonly key: AdmissionKey; readonly target: IntegrationTarget; readonly item: NativeTaskItem; readonly profile: string;
+		/** Exact absolute base directory attested and used by the guarded host, not an independently hashed path. */
+		readonly nativeSlotPath: string;
 	}): Promise<IntegrationRead<NativeSlotLease>>;
 	/** Prepare before E's final synchronous policy/live checks; aborted grants are rolled back by exact owner. */
 	persistPrepared(admission: FrozenIntegrationAdmission): Promise<IntegrationCheck>;

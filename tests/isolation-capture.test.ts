@@ -143,7 +143,8 @@ async function admissionFor(f: Fixture, options: AdmissionOptions = {}): Promise
 	const key = keyOf({ runId, dispatch });
 	const target = await targetOf(f);
 	const item = { toolCallId, itemIndex, handle };
-	const slot = await f.store.reserveSlot({ key, target, item, profile: "test" });
+	const nativeSlotPath = join(f.worktreesDir, `t${sha(handle).slice(0, 9)}`);
+	const slot = await f.store.reserveSlot({ key, target, item, profile: "test", nativeSlotPath });
 	if (slot.kind === "unknown") throw new Error(`slot refused: ${slot.problem.code}`);
 	const workerKey = sha(`${f.tmp}\0${handle}\0${dispatch}`);
 	const attempt = randomUUID();
@@ -1797,17 +1798,20 @@ describe("native slot and child entry", () => {
 		const item = { toolCallId: "call-1", itemIndex: 0, handle: "W1" };
 		const firstKey = keyOf({ runId: "run-1", dispatch: "attempt:1" });
 		const secondKey = keyOf({ runId: "run-1", dispatch: "attempt:2" });
-		const first = await f.store.reserveSlot({ key: firstKey, target, item, profile: "test" });
+		const nativeSlotPath = join(f.worktreesDir, "t000000001");
+		expect(await f.store.reserveSlot({ key: firstKey, target, item, profile: "test", nativeSlotPath: join(f.repo, "t000000001") }))
+			.toMatchObject({ kind: "unknown", problem: { code: "slot-path-unproved" } });
+		const first = await f.store.reserveSlot({ key: firstKey, target, item, profile: "test", nativeSlotPath });
 		expect(first.kind).toBe("known");
-		const contended = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test" });
+		const contended = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test", nativeSlotPath });
 		expect(contended.kind).toBe("unknown");
 		if (first.kind !== "known") return;
 		expect(await f.store.releaseSlot(first.value, "not-dispatched")).toEqual({ ok: true });
-		const second = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test" });
+		const second = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test", nativeSlotPath });
 		expect(second.kind).toBe("known");
 		expect(await f.store.releaseSlot(first.value, "not-dispatched")).toMatchObject({ ok: false });
 		if (second.kind !== "known") return;
-		const again = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test" });
+		const again = await f.store.reserveSlot({ key: secondKey, target, item, profile: "test", nativeSlotPath });
 		expect(again.kind).toBe("known");
 		if (again.kind === "known") expect(again.value.ownerToken).toBe(second.value.ownerToken);
 	});
@@ -1821,6 +1825,7 @@ describe("native slot and child entry", () => {
 			target,
 			item: { toolCallId: "call-1", itemIndex: 0, handle: "W1" },
 			profile: "test",
+			nativeSlotPath: join(f.worktreesDir, "t000000001"),
 		});
 		expect(first.kind).toBe("known");
 		const reused = await f.store.reserveSlot({
@@ -1828,6 +1833,7 @@ describe("native slot and child entry", () => {
 			target,
 			item: { toolCallId: "call-1", itemIndex: 0, handle: "W2" },
 			profile: "test",
+			nativeSlotPath: join(f.worktreesDir, "t000000002"),
 		});
 		expect(reused.kind).toBe("unknown");
 	});

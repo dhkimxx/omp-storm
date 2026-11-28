@@ -137,7 +137,7 @@ describe("the guarded host's dispatch proof", () => {
 		const capability = Object.freeze({ version: 1, spawnPolicy: true, childEntryGuard: true, entryGuard: true, agentDefinitionIdentity: true });
 		expect(supportsGuardedIsolation({ version: "19.2.1" })).toBe(false);
 		expect(supportsGuardedIsolation({ capabilities: Object.freeze({ version: 1, subagentIsolation: capability }) })).toBe(true);
-		const workspace = Object.freeze({ kind: "native", backend: "apfs" });
+		const workspace = Object.freeze({ kind: "native", backend: "apfs", sourceRoot: "/tmp/project", slotPath: "/tmp/profile/wt/t000000001" });
 		const policy = Object.freeze({ requested: true, enabled: true, merge: "patch", apply: false, commits: "generic", workspace });
 		const event = { dispatchId: "iso_41", isolation: policy, agentDefinition: Object.freeze({ source: "bundled", digest: `sha256:${"a".repeat(64)}` }) };
 		expect(guardedDispatch({ ...event, isolation: Object.freeze({ ...policy, apply: true }) }).kind).toBe("unknown");

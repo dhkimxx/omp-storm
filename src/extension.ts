@@ -1294,6 +1294,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			event.sessionFileIdentity.device !== fileIdentity.device || event.sessionFileIdentity.inode !== fileIdentity.inode ||
 			event.checkout.device !== checkout.device || event.checkout.inode !== checkout.inode ||
 			dispatch.value.token !== admission.policy.backendProofId || dispatch.value.backend !== admission.policy.backendSetting ||
+			dispatch.value.slotPath !== admission.slot.slotPath ||
 			dispatch.value.definition.digest !== admission.approvedDefinitionDigest || admission.item.handle !== ctx.agent.id) {
 			return refuse("격리 디스패치, 정의, 레지스트리 세대 또는 물리 체크아웃이 감독이 승인한 기록과 다릅니다.");
 		}
@@ -2545,6 +2546,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					}
 					const target = await integrationTarget(current.root);
 					if (target === undefined) return ledgerBlock("격리 통합의 대상과 Git 저장소 신원을 확인하지 못했습니다.", current, Date.now());
+					const source = await spaceIdentityOf(dispatch.value.sourceRoot);
+					if (source?.device !== target.gitRoot.device || source.inode !== target.gitRoot.inode) {
+						return ledgerBlock("호스트가 고정한 소스가 승인된 Git 작업 트리와 다릅니다.", current, Date.now());
+					}
 					const paths = lane?.files?.length ? await canonicalScope(target.authorizedRoot.canonicalPath, lane.files) : undefined;
 					if (lane?.files?.length && paths === undefined) return ledgerBlock("레인의 승인된 쓰기 범위를 실제 대상 안에서 확인하지 못했습니다.", current, Date.now());
 					const scope: FrozenScope = paths === undefined ? { kind: "unbounded" } : { kind: "paths", paths };
@@ -2554,7 +2559,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					await mkdir(artifacts, { recursive: true, mode: 0o700 });
 					const artifactRoot = await spaceIdentityOf(artifacts);
 					if (artifactRoot === undefined) return ledgerBlock("격리 아티팩트 저장소의 물리 신원을 확인하지 못했습니다.", current, Date.now());
-					const reserved = await ports.admission.reserveSlot({ key, target, item, profile: proof.value.profile });
+					const reserved = await ports.admission.reserveSlot({ key, target, item, profile: proof.value.profile, nativeSlotPath: dispatch.value.slotPath });
 					if (reserved.kind === "unknown") return ledgerBlock(reserved.problem.reason, current, Date.now());
 					slot = reserved.value;
 					const beforeWrite = recheck();

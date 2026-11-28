@@ -137,53 +137,23 @@ function jsonObjects(text: string): Record<string, unknown>[] {
 	});
 }
 
-function walkFiles(root: string, visit: (path: string) => void, depth = 0): void {
-	if (depth > 8 || !existsSync(root)) return;
-	for (const entry of readdirSync(root, { withFileTypes: true })) {
-		if (entry.name === "node_modules" || entry.name === ".git") continue;
-		const path = join(root, entry.name);
-		if (entry.isDirectory()) walkFiles(path, visit, depth + 1);
-		else if (entry.isFile()) visit(path);
-	}
-}
-
-function manifestsIn(root: string): Record<string, unknown>[] {
-	const found: Record<string, unknown>[] = [];
-	walkFiles(root, path => {
-		if (statSync(path).size > 8_000_000) return;
-		for (const value of jsonObjects(readFileSync(path, "utf8"))) {
-			if (property(value, "schema") === "storm.integration-capture/v1") found.push(value);
-		}
-	});
-	return found;
+function journalAt(sessionDir: string, runId: string): Record<string, unknown>[] {
+	const path = join(sessionDir, "state", "integration", "runs", runId, "journal.jsonl");
+	return existsSync(path) ? jsonObjects(readFileSync(path, "utf8")).filter(row => row.schema === "storm.integration-journal/v1") : [];
 }
 
 function manifestOf(files: StormFiles, runId: string): Record<string, unknown> | undefined {
-	const roots = [files.sessionDir, ...files.storeDirs()];
-	for (const root of roots) {
-		const found = manifestsIn(root).find(value => property(property(property(value, "admission"), "key"), "runId") === runId);
-		if (found !== undefined) return found;
-	}
-	return undefined;
+	return journalAt(files.sessionDir, runId)
+		.filter(row => row.kind === "manifest")
+		.map(row => property(row.payload, "manifest"))
+		.find((value): value is Record<string, unknown> => isRecord(value) && value.schema === "storm.integration-capture/v1" &&
+			property(property(value.admission, "key"), "runId") === runId);
 }
 
-function ownedCopyOf(files: StormFiles, hash: string): string | undefined {
-	for (const root of [files.sessionDir, ...files.storeDirs()]) {
-		const found = fileByHash(root, hash);
-		if (found !== undefined) return found;
-	}
-	return undefined;
-}
-
-function fileByHash(root: string, hash: string): string | undefined {
-	let found: string | undefined;
-	walkFiles(root, path => {
-		if (found !== undefined) return;
-		const stat = statSync(path);
-		if (stat.size > 64 * 1024 * 1024) return;
-		if (sha256(readFileSync(path)) === hash) found = path;
-	});
-	return found;
+function ownedCopyOf(hash: string): string | undefined {
+	if (!/^[0-9a-f]{64}$/u.test(hash)) return undefined;
+	const path = join(env.agentDir, "integration", "v1", "objects", hash);
+	return existsSync(path) && sha256(readFileSync(path)) === hash ? path : undefined;
 }
 
 interface PatchInfo {
@@ -329,7 +299,7 @@ async function carrierSync(): Promise<void> {
 		const patches = patchesOf(run);
 		check("carrier sync: the host emitted a root patch", patches.length > 0, JSON.stringify(patches.map(patch => [patch.name, patch.bytes])));
 		const manifest = manifestOf(files, run.runId);
-		check("carrier sync: a sealed manifest exists for the run", manifest !== undefined, JSON.stringify(manifestsIn(files.sessionDir).length));
+		check("carrier sync: a sealed manifest exists for the run", manifest !== undefined, JSON.stringify(journalAt(files.sessionDir, run.runId).map(row => row.kind)));
 		if (manifest !== undefined) {
 			const bundle = property(manifest, "bundle");
 			const root = property(bundle, "root");
@@ -345,7 +315,7 @@ async function carrierSync(): Promise<void> {
 			check("carrier sync: the child claim is outside the parent checkout", typeof checkoutPath === "string" && outsideProject(checkoutPath), String(checkoutPath));
 			const copyHash = property(property(manifest, "bundle"), "root");
 			const hash = property(copyHash, "sha256");
-			check("carrier sync: a Storm-owned copy of the root bytes exists", typeof hash === "string" && ownedCopyOf(files, hash) !== undefined, typeof hash === "string" ? hash : "no hash");
+			check("carrier sync: a Storm-owned copy of the root bytes exists", typeof hash === "string" && ownedCopyOf(hash) !== undefined, typeof hash === "string" ? hash : "no hash");
 		}
 		const view = await candidates(rpc);
 		const ids = candidateIds(view.text);
@@ -579,7 +549,7 @@ async function carrierTamper(): Promise<void> {
 			check("tamper: deleting the native bytes does not remove the candidate", candidateIds(view.text).length === 1, view.text.slice(0, 700));
 		}
 		if (typeof hash === "string") {
-			const copy = ownedCopyOf(files, hash);
+			const copy = ownedCopyOf(hash);
 			check("tamper: Storm owns a copy of the bytes", copy !== undefined, copy ?? "not found");
 			if (copy !== undefined) {
 				const bytes = readFileSync(copy);
@@ -987,8 +957,10 @@ async function judgmentOutside(): Promise<void> {
 		check("judgment outside: HEAD and the index did not move", before.head === after.head && before.index === after.index, `${before.head} -> ${after.head}`);
 		const row = (run.run.results ?? []).find(candidate => candidate.id === "judgment-outside-result");
 		check("judgment outside: a manually equal postimage is not an isolated acceptance", row?.state !== "accepted", JSON.stringify(row ?? null));
-		const manifests = manifestsIn(files.sessionDir);
-		check("judgment outside: a manifest exists but the write is not claimed as a receipt", manifests.length > 0 && !JSON.stringify(manifests).includes("storm.integration-receipt/v1"), `manifests=${manifests.length}`);
+		const records = journalAt(files.sessionDir, run.run.runId);
+		check("judgment outside: a manifest exists but the write is not claimed as a receipt",
+			manifestOf(files, run.run.runId) !== undefined && !records.some(row => row.kind === "receipt"),
+			JSON.stringify(records.map(row => row.kind)));
 	});
 }
 

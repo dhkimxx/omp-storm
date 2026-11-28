@@ -844,13 +844,14 @@ function decide(request: ChatRequest, who: Who): Decision {
 	}
 	if (who === "child") return childDecision(request);
 	if (who === "main") noteSpawnedAgents(messages);
+	const lastAssistant = messages.findLastIndex(message => message.role === "assistant");
+	const fresh = userText(messages.slice(lastAssistant + 1));
+	// A fresh explicit tool request is not the just-finished script continuing from history.
+	const stormArgs = payload(fresh, "E2E-TOOL");
+	if (isRecord(stormArgs)) return extensionCall(request.tools, "storm", stormArgs);
 	const scripted = scriptedSteps(messages, request.tools);
 	if (scripted) return scripted;
 	if (messages.at(-1)?.role === "tool") return { kind: "text", text: "done" };
-	const lastAssistant = messages.findLastIndex(message => message.role === "assistant");
-	const fresh = userText(messages.slice(lastAssistant + 1));
-	const stormArgs = payload(fresh, "E2E-TOOL");
-	if (isRecord(stormArgs)) return extensionCall(request.tools, "storm", stormArgs);
 	const spawn = /E2E-TASK((?:[ \t]+[\w.-]+)+)/.exec(fresh)?.[1];
 	if (spawn) return taskCall(request.tools, spawn.trim().split(/\s+/));
 	const write = /E2E-WRITE[ \t]+(\S+)/.exec(fresh)?.[1];

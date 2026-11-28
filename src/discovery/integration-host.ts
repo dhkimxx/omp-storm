@@ -18,6 +18,8 @@ interface NativeDefinitionIdentity {
 interface NativeDispatch {
 	readonly token: string;
 	readonly backend: string;
+	readonly sourceRoot: string;
+	readonly slotPath: string;
 	readonly definition: NativeDefinitionIdentity;
 }
 
@@ -47,7 +49,9 @@ export function guardedDispatch(event: unknown): IntegrationRead<NativeDispatch>
 	}
 	const workspace = route.workspace;
 	if (!isRecord(workspace) || !Object.isFrozen(workspace) || workspace.kind !== "native" || typeof workspace.backend !== "string" ||
-		workspace.ovnfsPath !== undefined || workspace.sessionId !== undefined) {
+		workspace.ovnfsPath !== undefined || workspace.sessionId !== undefined ||
+		typeof workspace.sourceRoot !== "string" || !isAbsolute(workspace.sourceRoot) ||
+		typeof workspace.slotPath !== "string" || !isAbsolute(workspace.slotPath)) {
 		return missing(ISOLATION_BACKEND_UNPROVEN, "호스트가 이 스폰의 네이티브 Git 체크아웃을 고정하지 않았습니다.");
 	}
 	const definition = event.agentDefinition;
@@ -61,6 +65,8 @@ export function guardedDispatch(event: unknown): IntegrationRead<NativeDispatch>
 	return { kind: "known", value: {
 		token: event.dispatchId,
 		backend: workspace.backend,
+		sourceRoot: workspace.sourceRoot,
+		slotPath: workspace.slotPath,
 		definition: {
 			source: definition.source,
 			digest: definition.digest,

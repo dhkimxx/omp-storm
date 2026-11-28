@@ -1012,12 +1012,6 @@ function slotOwnedBy(owner: SlotOwnerRecord, slot: NativeSlotLease, key: Admissi
 	);
 }
 
-/** The pinned host's deterministic task-isolation base dir: `<worktrees>/t<hash9>` from repo root and handle. */
-export function taskIsolationBaseDir(repoRoot: string, handle: string, worktreesDir = getWorktreesDir()): string {
-	const key = `${resolve(repoRoot)}\u0000${handle}`;
-	const digest = Bun.hash(key).toString(16).padStart(16, "0").slice(-9);
-	return join(worktreesDir, `t${digest}`);
-}
 
 async function readJsonFile(path: string): Promise<unknown> {
 	try {
@@ -1132,6 +1126,7 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		readonly target: IntegrationTarget;
 		readonly item: NativeTaskItem;
 		readonly profile: string;
+		readonly nativeSlotPath: string;
 	}): Promise<IntegrationRead<NativeSlotLease>> {
 		if (!isAdmissionKey(input.key)) return unknown("slot-key-invalid", "슬롯 승인 키가 올바르지 않습니다");
 		if (!isItem(input.item)) return unknown("slot-item-invalid", "슬롯 작업 항목이 올바르지 않습니다");
@@ -1147,7 +1142,11 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		} catch {
 			return unknown("slot-repo-missing", "저장소 루트를 읽지 못했습니다", input.target.gitRoot.canonicalPath);
 		}
-		const slotPath = taskIsolationBaseDir(input.target.gitRoot.canonicalPath, input.item.handle, this.#worktreesDir());
+		const slotPath = input.nativeSlotPath;
+		if (!boundedPath(slotPath) || slotPath !== resolve(slotPath) || dirname(slotPath) !== resolve(this.#worktreesDir()) ||
+			!/^t[0-9a-f]{9}$/u.test(basename(slotPath))) {
+			return unknown("slot-path-unproved", "호스트가 고정한 슬롯이 이 프로필의 네이티브 작업 디렉터리 밖에 있습니다", slotPath);
+		}
 		const lockDir = this.#slotLockDir(slotPath);
 		const ownerPath = join(lockDir, "owner.json");
 		const indexPath = this.#slotIndexPath(input.key);

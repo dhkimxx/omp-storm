@@ -128,7 +128,7 @@ async function admissionFor(f: Fixture): Promise<BuiltAdmission> {
 	const key: AdmissionKey = { schema: INTEGRATION_ADMISSION_SCHEMA, runId, dispatch };
 	const target = await targetOf(f);
 	const item = { toolCallId, itemIndex, handle };
-	const slot = await f.store.reserveSlot({ key, target, item, profile: "test" });
+	const slot = await f.store.reserveSlot({ key, target, item, profile: "test", nativeSlotPath: join(f.worktreesDir, "t000000001") });
 	if (slot.kind === "unknown") throw new Error(`slot refused: ${slot.problem.code}`);
 	const workerKey = createHash("sha256").update(`${f.tmp}\0${handle}\0${dispatch}`).digest("hex");
 	const attempt = randomUUID();
