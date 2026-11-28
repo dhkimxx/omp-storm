@@ -6,23 +6,22 @@
  * the director's Storm instance, so none of G2 (what really runs), G3 (every cost counted) or the record (a reviewer's
  * verdict bound to a tree) can be held there. A worker must therefore not run there at all (decision D5).
  *
- * The detection is positive: the worker's own instance asks the host runtime which thread it is on. "I found no run in
- * memory" is not evidence of a pooled thread — on the main thread the same absence means another build of Storm wrote
- * the admission or the shared state is gone, and the worker stops with that different cause. Nothing predicts placement
- * at the spawn hook: a prediction was shown to refuse work the host would run on the main thread and to miss work it
- * pools, so the stop in the child is the rule and an unlucky spawn costs only that child's start (decision D7).
+ * The detection is positive: the worker's own instance checks its Bun thread and whether omp installed a remote
+ * registry. "I found no run in memory" is not evidence of a pooled thread — on the main thread the same absence
+ * means another build of Storm wrote the admission or the shared state is gone, and the worker stops with that
+ * different cause. The spawn hook does not predict placement: it would both refuse main-thread runs and miss pooled
+ * runs. The child is where the stop happens, so unlucky placement costs only that child's start (decision D7).
  */
-import { isMainThread as hostMainThread } from "@oh-my-pi/pi-coding-agent/thread/identity";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent";
 import type { WorkerStopReason } from "../types.ts";
 
 /**
- * Whether this module instance runs on the host's main thread. Two positive facts must agree: the runtime's own
- * `Bun.isMainThread`, and the host's thread identity, which its worker bootstrap sets before any session exists. A
- * host that cannot answer is not evidence of the main thread, so the worker stops.
+ * Require the Bun main thread and the host's local registry. Pooled workers install a remote registry before
+ * loading extensions. Unlike omp's private thread identity module, the registry is exported by standalone omp.
  */
 export function onHostMainThread(): boolean {
 	try {
-		return Bun.isMainThread === true && hostMainThread();
+		return Bun.isMainThread === true && AgentRegistry.global() instanceof AgentRegistry;
 	} catch {
 		return false;
 	}
