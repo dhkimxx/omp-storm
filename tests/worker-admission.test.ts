@@ -504,7 +504,7 @@ describe("worker admission records", () => {
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toMatchObject({ kind: "unknown" });
 		// Missing storage identity is not evidence of a spend fence for a native worker.
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined })).toEqual({ kind: "open" });
-		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined, stormRole: true })).toMatchObject({ kind: "unknown" });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: undefined, runId })).toMatchObject({ kind: "unknown" });
 	});
 
 	test("RF4-1: an aged closed record of a live run is kept until that run closes, and the scan at the cap then removes it", async () => {

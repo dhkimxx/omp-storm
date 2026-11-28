@@ -2249,7 +2249,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				artifactRoot: artifactsOf(ctx),
 				parentId: ctx.agent.parentId,
 				childId: ctx.agent.id,
-				stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 				...(workerRun === undefined ? {} : { runId: workerRun.runId }),
 			});
 			const spendRefusal = spendToolRefusal(spend, { toolName: "task" });
@@ -3426,9 +3425,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		ctx.abort();
 	};
 	/**
-	 * Reads this run's own admission records for the children it admitted and tells the director, once per worker attempt,
-	 * the sentence for the reason each stopped itself. The record's build, run and attempt are checked by its reader; the
-	 * record is not deleted, so a repeated read is harmless and the shared seen-attempt set is what makes it once.
+	 * Adopts this run's exact stopped attempts once. Spawn-backed stops are rendered by the bounded tally; a reused
+	 * worker with no spawn row still gets its reason through the ordinary notice queue.
 	 */
 	const adoptChildStops = async (ctx: ExtensionContext, runId: string): Promise<void> => {
 		if (getLedgerRun(runId) === undefined) return;
@@ -3444,16 +3442,18 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		} catch {
 			return;
 		}
-		const spawns = runSpawns(runId).filter(spawn => spawn.outcome !== "blocked" && spawn.spawnKey !== undefined);
+		const spawnKeys = new Set(runSpawns(runId).flatMap(spawn =>
+			spawn.outcome === "blocked" || spawn.spawnKey === undefined ? [] : [spawn.spawnKey]));
 		for (const stop of stops) {
 			const key = `${runId}\0${stop.childId}\0${stop.attempt}`;
 			if (adoptedStops.has(key)) continue;
 			// Claim it before anything else can read the same attempt in this turn.
 			adoptedStops.set(key, true);
-			const agent = spawns.find(spawn => spawn.spawnKey === stop.childId)?.agent ?? stop.childId;
-			noteRunStopped(runId, stop.childId, { attempt: stop.attempt, reason: stop.reason, at: stop.at });
-			noteRunNotice(runId, threadPolicy.workerStopNotice(agent, stop.reason));
-			touchRun(runId);
+			if (spawnKeys.has(stop.childId)) {
+				noteRunStopped(runId, stop.childId, { attempt: stop.attempt, reason: stop.reason, at: stop.at });
+			} else {
+				noteRunNotice(runId, threadPolicy.workerStopNotice(stop.childId, stop.reason));
+			}
 		}
 	};
 
@@ -3495,7 +3495,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			artifactRoot: artifactsOf(ctx),
 			parentId: ctx.agent.parentId,
 			childId: ctx.agent.id,
-			stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 			...(ledger === undefined ? {} : { runId: ledger.runId }),
 		});
 		const spendStop = spendRequestStop(spend, ctx.agent.id);
@@ -3773,7 +3772,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				artifactRoot: artifactsOf(ctx),
 				parentId: ctx.agent.parentId,
 				childId: ctx.agent.id,
-				stormRole: ctx.agent.name.startsWith(ROLE_AGENT_PREFIX),
 				...(ledger === undefined ? {} : { runId: ledger.runId }),
 			});
 			const spendRefusal = spendToolRefusal(spend, { toolName: event.toolName, input: event.input });

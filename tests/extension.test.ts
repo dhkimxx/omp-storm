@@ -6138,11 +6138,12 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 		const admitted = await readWorkerAdmission({ agentDir: project.env.agentDir, artifactRoot: project.root, parentId: "Main", childId: look });
 		if (admitted.kind !== "record") throw new Error(JSON.stringify(admitted));
 		expect(await admissionModule.recordWorkerStop(project.env.agentDir, { key: admitted.key, runId, childId: look, attempt: admitted.record.attempt, reason: "pooled-thread" })).toBe(true);
-		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).toContain(threadPolicy.workerStopNotice("storm-explorer", "pooled-thread").slice(0, 30));
+		const stopLine = closeoutModule.stormStopLine({ count: 1, first: look, reason: "pooled-thread" });
+		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).toContain(stopLine);
 		expect(await omp.emit("context", { messages: [] }, main)).toBeUndefined();
 		const unrelated = fakeOmp(project);
 		await unrelated.emit("session_shutdown", {}, unrelated.ctx({ ...MAIN, id: `unrelated-${randomUUID()}` }));
-		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).not.toContain(threadPolicy.workerStopNotice("storm-explorer", "pooled-thread").slice(0, 30));
+		expect(JSON.stringify(await omp.emit("context", { messages: [] }, main) ?? "")).not.toContain(stopLine);
 		await omp.emit("session_shutdown", {}, main);
 	});
 
@@ -6266,7 +6267,7 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 				]);
 				answers.push(await omp.emit("context", { messages: [] }, main));
 				const told = answers.find(answer => answer !== undefined) as { messages: Array<{ content: Array<{ text: string }> }> } | undefined;
-				expect(told?.messages.at(-1)?.content[0]?.text).toContain(threadPolicy.pooledThreadNotice("storm-explorer"));
+				expect(told?.messages.at(-1)?.content[0]?.text).toBe(`[storm] ${closeoutModule.stormStopLine({ count: 1, first: worker.agent.id, reason: "pooled-thread" })}`);
 				expect(noticesIn(answers)).toBe(1);
 				expect(getLedgerRun(runId)?.costUsd).toBe(0);
 				// The reason stays readable on the record: reading twice is harmless, and a run's old record is not deleted by a read.
@@ -6426,7 +6427,7 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 				expect((await admissionOf(worker.agent.id)).stop?.reason).toBe("state-not-shared");
 				const answer = await omp.emit("context", { messages: [] }, main);
 				const text = JSON.stringify(answer ?? "");
-				expect(text).toContain(threadPolicy.workerStopNotice("storm-explorer", "state-not-shared"));
+				expect(text).toContain(closeoutModule.stormStopLine({ count: 1, first: worker.agent.id, reason: "state-not-shared" }));
 				expect(text).not.toContain("풀 스레드");
 				expect(getLedgerRun(runId)?.costUsd).toBe(0);
 			} finally {
@@ -6690,8 +6691,10 @@ describe("hardening through the hooks: approved models and cost (G2, G3)", () =>
 describe("phase 2 through the hooks: the director's path edits", () => {
 	const openRun = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, plan: object): Promise<string> => {
 		await omp.command("manual task", main);
+		const run = activeLedgerRun(project.sessionDir);
+		if (run === undefined) throw new Error(`The director's run did not open: ${omp.notices.map(notice => notice.text).join("\n")}`);
 		expect(await omp.tool({ action: "plan", plan }, main)).toBe("ok");
-		return activeLedgerRun(project.sessionDir)?.runId as string;
+		return run.runId;
 	};
 	const writerLane = (name: string, file: string) => ({ name, kind: "code" as const, role: "implementer", files: [file], goal: `Write ${file}`, results: changeFor(`${name}-change`) });
 	const taskCall = (name: string, callId: string, agent = "storm-implementer") => ({ toolName: "task", toolCallId: callId, input: { agent, name, task: `work ${name}` } });

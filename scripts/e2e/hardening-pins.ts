@@ -25,6 +25,7 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { APPROVE } from "../../src/proposals/present.ts";
+import { STORM_STOP_LABEL } from "../../src/runtime/closeout.ts";
 import { PINNED_NOTE_TAG } from "../../src/runtime/lanes.ts";
 import type { StormConfig } from "../../src/types.ts";
 import { contractPlan, requiredResult } from "./contract-fixture.ts";
@@ -258,7 +259,7 @@ async function aWorkerOnAPooledThreadStopsBeforeItsRequest(): Promise<void> {
 		});
 	}, 180_000);
 
-	await suite.step("pooled: no spawn is refused; the workers the host pools never reach the provider and are each told once, while the main-thread workers finish", async () => {
+	await suite.step("pooled: no spawn is refused; pooled workers stop before the provider, the director sees a bounded tally, and main-thread workers finish", async () => {
 		await sessions.open(cancelAll, async (rpc, files) => {
 			const names = Array.from({ length: COUNT }, (_, index) => `F${index}`);
 			const lanes = names.map(name => ({ name, kind: "explore" as const, role: "explorer", goal: "read one file", results: [requiredResult(`${name.toLowerCase()}-answer`, "answer", `report what ${FACT_FILE} line 1 says, from source`, { path: FACT_FILE, contains: FACT_LINE })] }));
@@ -289,14 +290,20 @@ async function aWorkerOnAPooledThreadStopsBeforeItsRequest(): Promise<void> {
 			check("the main-thread workers each ran and were checked on this thread", mainThread.length > 0 && verified.length === mainThread.length && mainThread.every(entry => entry.spawn.ran?.verdict === "verified"), `main=${mainThread.map(entry => entry.name).join(",")} verified=${verified.join(",")}`);
 			check("the main-thread workers' answers were accepted: they were not disturbed", mainThread.every(entry => (run.results ?? []).some(row => row.id === `${entry.name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
 			check("the pooled workers' answers were not accepted: nothing ran to produce them", pooled.every(name => !(run.results ?? []).some(row => row.id === `${name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
-			// One sentence per stopped worker, injected once. The host reports both the start and the end of the same
-			// developer message, and the message stays in later history; count the injected message, not every echo.
-			const told = rpc.frames
-				.filter(frame => frame.type === "message_start")
-				.map(frame => JSON.stringify(frame.message ?? ""))
-				.join("\n")
-				.match(/풀 스레드/g)?.length ?? 0;
-			check("the director was told why and both ways out once per pooled worker", told === pooled.length, `notices=${told} pooled=${pooled.length}`);
+			const noticePrefix = `[storm] ${STORM_STOP_LABEL} `;
+			const notices = rpc.frames.filter(frame => frame.type === "message_start" && (frame.message as { role?: string } | undefined)?.role === "developer")
+				.flatMap(frame => JSON.stringify(frame.message ?? "").split("\\n"))
+				.filter(line => line.includes("풀 스레드에 배치해") && line.includes("G2·G3·기록"));
+			const tallies = notices.map(line => {
+				const at = line.indexOf(noticePrefix);
+				return at < 0 ? undefined : /^(\d+)개 —/u.exec(line.slice(at + noticePrefix.length))?.[1];
+			});
+			check("each pooled worker is recorded and the director gets one bounded notice for each changed tally, with both remedies",
+				spawned.filter(entry => pooled.includes(entry.name)).every(entry => entry.spawn.stop?.reason === "pooled-thread") &&
+					tallies.length > 0 && tallies.every(count => count !== undefined && Number(count) <= pooled.length) &&
+					new Set(tallies).size === tallies.length && tallies.at(-1) === String(pooled.length) &&
+					notices.every(line => line.includes("더 적은 수로 다시 스폰") && line.includes("task.workerThreads를 0")),
+				`notices=${JSON.stringify(tallies)} pooled=${pooled.length}`);
 		});
 	}, 420_000);
 

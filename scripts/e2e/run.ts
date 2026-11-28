@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
+import { shortHash } from "../../src/config/canonical.ts";
 import { docPromptFor } from "../../src/policy/docs.ts";
 import { NEEDS_APPROVAL } from "../../src/proposals/decide.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
@@ -460,7 +461,8 @@ async function main(): Promise<void> {
 		check("one side turn classified it", llm.of("route").length === 1, `route=${llm.of("route").length}`);
 		check("the handoff is the only user message Storm sends", sent.size === 1 && director[0]?.messageCount === 1, `user messages=${sent.size}`);
 		const firstLine = handoff.split("\n", 1)[0] ?? "";
-		check("the handoff opens with the run tag, no keyword", /^<storm-run id="run-\d{8}-\d{6}-[0-9a-f]{4}" config="[0-9a-f]{12}">$/.test(firstLine), firstLine);
+		check("the handoff opens with the exact persisted run tag, no keyword",
+			typeof run.configHash === "string" && firstLine === `<storm-run id="${run.runId}" config="${shortHash(run.configHash)}">`, firstLine);
 		check("no omp keyword notice rides along", director.length > 0 && director.every(entry => !entry.keywordNotice));
 		check("the task is passed on verbatim", handoff.includes(request));
 		const frame = handoff.length - request.length;
@@ -1153,7 +1155,8 @@ async function main(): Promise<void> {
 		await session(cancelAll, async (rpc, files) => {
 			let frames = await rpc.turn('E2E-TOOL {"action":"status"}');
 			const offered = mains(llm.all())[0]?.stormTool;
-			check("run tool offers execute and brief but no team mutations", same(offered?.actions, ["run", "plan", "execute", "brief", "status", "agents", "continue"]), JSON.stringify(offered?.actions));
+			check("run tool offers integration actions but no team mutations",
+				same(offered?.actions, ["run", "plan", "execute", "brief", "status", "agents", "continue", "candidates", "integrate"]), JSON.stringify(offered?.actions));
 			check("its description stays within 900 chars", (offered?.descriptionChars ?? 0) > 0 && (offered?.descriptionChars ?? 0) <= 900, `chars=${offered?.descriptionChars}`);
 			check("status: ok", same(toolOutcomes(frames), [{ action: "status", outcome: "ok", isError: false }]), JSON.stringify(toolOutcomes(frames)));
 			frames = await rpc.turn('E2E-TOOL {"action":"agents"}');

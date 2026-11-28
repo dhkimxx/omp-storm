@@ -1545,11 +1545,9 @@ export async function readWorkerSpendClose(input: {
 	runId?: string;
 	/** The child's host id: a record of this build for it makes a missing marker a managed worker's unknown state. */
 	childId?: string;
-	/** The host identified a Storm-role definition even when it cannot supply the storage identity. */
-	stormRole?: boolean;
 }): Promise<SpendCloseRead> {
 	const unavailable = (reason: string): SpendCloseRead =>
-		input.runId !== undefined || input.stormRole === true ? { kind: "unknown", reason } : { kind: "open" };
+		input.runId === undefined ? { kind: "open" } : { kind: "unknown", reason };
 	try {
 		if (input.parentId === undefined) return unavailable("부모 에이전트 id를 확인하지 못했습니다");
 		const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
@@ -1562,7 +1560,7 @@ export async function readWorkerSpendClose(input: {
 			// A managed worker cannot establish the fact: a run id of its own, or its own admission record, proves the
 			// worker is Storm's, so the missing marker is treated as closed. An ordinary native child has neither and
 			// keeps the ordinary answer; its writes are still fenced by the managed tree's own authority check.
-			if (input.runId !== undefined || input.stormRole === true) return { kind: "unknown", reason: "관리 실행 표시가 없어 예산 한도 상태를 확인하지 못했습니다" };
+			if (input.runId !== undefined) return { kind: "unknown", reason: "관리 실행 표시가 없어 예산 한도 상태를 확인하지 못했습니다" };
 			if (input.childId !== undefined) {
 				const record = await readWorkerAdmission({ agentDir: input.agentDir, artifactRoot, parentId: input.parentId, childId: input.childId });
 				if (record.kind !== "missing") return { kind: "unknown", reason: "관리 실행 표시가 없어 예산 한도 상태를 확인하지 못했습니다" };

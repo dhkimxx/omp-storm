@@ -200,12 +200,14 @@ async function main(): Promise<void> {
 				chg?.state === "unmet" && (chg.reason ?? "").includes(ISOLATED_CHANGE_REASON) && !existsSync(join(env.project, "chg.txt")),
 				JSON.stringify({ row: chg ?? null, parent: existsSync(join(env.project, "chg.txt")) }),
 			);
-			const framesText = frames.map(frame => JSON.stringify(frame)).join("\n");
+			const refusal = taskText(frames);
 			const dep = (run.results ?? []).find(row => row.id === "dep-answer");
 			check(
-				"the integration-required consumer starts with the version's shortfall note and is not accepted on it",
-				framesText.includes("통합 반영 조건이 충족되기 전에 시작했습니다") && framesText.includes("이 버전은 격리 작업을 부모 트리로 가져오지 않으므로") && dep?.state !== "accepted" && run.endReason !== "verified",
-				`dep=${JSON.stringify(dep ?? null)} end=${run.status}/${run.endReason ?? "?"} note=${framesText.includes("통합 반영 조건이 충족되기 전에 시작했습니다")}`,
+				"without a current receipt the isolated producer's integration-required consumer never starts or gets accepted",
+				refusal.includes("[storm:lane-dependency]") && refusal.includes("현재 통합 영수증으로 확인되지 않았습니다") &&
+					!run.spawns.some(spawn => spawn.lane === "dep" && spawn.outcome !== "blocked") &&
+					dep?.state !== "accepted" && run.endReason !== "verified",
+				`dep=${JSON.stringify(dep ?? null)} end=${run.status}/${run.endReason ?? "?"} task=${refusal.slice(0, 1400)}`,
 			);
 			const escCwd = readMarker(dir, "esc-cwd");
 			check(
