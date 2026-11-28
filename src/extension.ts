@@ -28,6 +28,7 @@ import {
 	observeDirectorIsolation,
 	readExplicitSettings,
 } from "./discovery/settings.ts";
+import { supportsGuardedIsolation } from "./discovery/integration-host.ts";
 import {
 	agentsFlow,
 	approveAndSave,
@@ -195,9 +196,13 @@ import {
 import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationRead, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
 import type { ByteWindow, IntegrationDeltaPort } from "./runtime/integration-delta.ts";
 import type { CandidateQuery, IntegrationAttemptPort, IntegrationControllerPort, IntegrationSelectionReply, IntegrationViewPort } from "./runtime/integration-controller-port.ts";
-import type { IntegrationCapturePort, RegistrySnapshotInput } from "./runtime/integration-capture.ts";
+import type { IntegrationCapturePort } from "./runtime/integration-capture.ts";
+import { IntegrationAdmissionStore } from "./runtime/integration-artifacts.ts";
+import { GitDelta } from "./runtime/integration-git.ts";
+import { IsolationCapture } from "./runtime/isolation-capture.ts";
 import type { SyncResultFact } from "./runtime/attempt-report.ts";
-import type { IntegrationJournalPort, IntegrationWriterPort } from "./runtime/integration-record.ts";
+import { IntegrationJournal, IntegrationWriter, type IntegrationJournalPort, type IntegrationWriterPort } from "./runtime/integration-record.ts";
+import { formatIntegrationCandidates, formatIntegrationSelection } from "./runtime/views.ts";
 import { INTEGRATION_CANDIDATE_ID_RE, INTEGRATION_RUN_ID_RE, integrationIdListProblem } from "./tool/host.ts";
 
 /**
@@ -839,7 +844,16 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	pi = instrument(pi);
 	const timings = timingsOf(options.timings);
 	const exec = execPort(pi);
-	let integrationRegistryStop: (() => void) | undefined;
+	const integrationCapable = supportsGuardedIsolation(pi);
+	const ownedIntegration = new Map<string, IntegrationRuntimePorts & { readonly capture: IsolationCapture }>();
+	let integrationClosing = false;
+	const disposeIntegration = (): void => {
+		for (const [sessionDir, ports] of ownedIntegration) {
+			ports.capture.stop();
+			if (boundIntegrationRuntime(sessionDir) === ports) bindIntegrationRuntime(sessionDir, undefined);
+		}
+		ownedIntegration.clear();
+	};
 	// Per director instance: a different session's shutdown must not stop this run's capture or settings observation.
 	const preAuthorizedIsolation = new Map<string, DirectorIsolationObservation>();
 	/**
@@ -1469,6 +1483,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	let announcedResultPlan: string | undefined;
 	const runs = new RunController({
 		pi,
+		integration: boundIntegrationRuntime,
 		ui: ctx => createUiPort(pi, ctx),
 		loadState: async ctx => {
 			rememberMainAgent(ctx);
@@ -1534,12 +1549,44 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				for (const [key, baseline] of reviewerBaselines) if (baseline.runId === ended) reviewerBaselines.delete(key);
 				endRevokes.delete(ended);
 			}
+			if (integrationClosing) disposeIntegration();
 			liveStatus.clear();
 			// Finalization already dropped the controller's keys; the session's records only existed to close them.
 			openWaits.clear();
 			void syncSession(ctx).catch(() => undefined);
 		},
 	});
+
+	const composeIntegration = (sessionDir: string): void => {
+		if (!integrationCapable || integrationClosing || boundIntegrationRuntime(sessionDir) !== undefined) return;
+		const admission = new IntegrationAdmissionStore({ agentDir: workerAdmissionAgentDir() });
+		const journal = new IntegrationJournal({ sessionDir });
+		const delta = new GitDelta({ bytes: admission.artifacts });
+		const writer = new IntegrationWriter({ journal, bytes: admission.artifacts, delta });
+		const capture = new IsolationCapture({
+			artifacts: admission.artifacts,
+			journal,
+			delta,
+			registry: () => AgentRegistry.global(),
+			publish: update => runs.observe(update),
+		});
+		const ports = {
+			admission, capture, journal, delta, writer,
+			controller: {
+				project: (query, window) => runs.project(query, window, sessionDir),
+				select: input => input.live.audit.director.sessionDir === sessionDir
+					? runs.select(input)
+					: Promise.resolve({ kind: "refused", problem: { code: "run-foreign", reason: "이 세션의 통합 선택이 아닙니다." } }),
+				observe: update => runs.observe(update),
+				reconcile: (input, window) => runs.reconcile(input, window),
+			},
+			attempt: runs,
+			view: { formatIntegrationCandidates, formatIntegrationSelection },
+		} satisfies IntegrationRuntimePorts;
+		capture.start();
+		ownedIntegration.set(sessionDir, ports);
+		bindIntegrationRuntime(sessionDir, ports);
+	};
 
 	/**
 	 * Host-attested attempt capture for this session. The controller keeps the lane contract, pre-write baseline and
@@ -1549,7 +1596,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	const attempts = new AttemptCollector({
 		port: {
 			prepare: input => runs.prepareAttempt(input),
-			settle: input => runs.settleAttempt(input),
+			settle: input => {
+				const owner = getLedgerRun(input.runId);
+				if (owner !== undefined) ownedIntegration.get(owner.sessionDir)?.capture.noteSettlement(input);
+				return runs.settleAttempt(input);
+			},
 			discard: input => runs.discardAttempt(input),
 			// A delivery no dispatch of this run was waiting for (a woken worker, a lane without declared results): kept in the
 			// record and told to the director in one line; it is never a result row and never acceptance.
@@ -1890,7 +1941,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					if (input.candidateRunId !== undefined && !INTEGRATION_RUN_ID_RE.test(input.candidateRunId)) {
 						return { outcome: "rejected", text: INTEGRATION_TOOL_BAD_RUN };
 					}
-					const runId = input.candidateRunId ?? runs.runId();
+					const active = getLedgerRun(runs.runId());
+					const runId = input.candidateRunId ?? (active?.sessionId === sessionId ? active.runId : undefined);
 					const query: CandidateQuery =
 						input.candidateId === undefined
 							? {
@@ -4547,8 +4599,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		if (ctx.agent.kind === "main") {
-			integrationRegistryStop?.();
-			integrationRegistryStop = undefined;
+			integrationClosing = true;
 			for (const observation of new Set(preAuthorizedIsolation.values())) observation.stop();
 			preAuthorizedIsolation.clear();
 		}
@@ -4584,6 +4635,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		liveStatus.beginSession();
 		openWaits.clear();
 		await runs.finish("shutdown");
+		if (ctx.agent.kind === "main" && runs.runId() === undefined) disposeIntegration();
 		// The run's record has its agents; the live rows of this session store are gone with the session that described
 		// them, including rows of runs that finished before this shutdown (RF4-10). A conversation switch keeps them
 		// so the next run can follow a worker up; this is the real end of the session lifetime. A host that cannot name
@@ -4793,6 +4845,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// change at once, and a failed read keeps the last enabled guard instead of unfencing direct tools.
 		await refreshAuto(ctx, async () => state);
 		if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;
+		if (state.config.status !== "missing") composeIntegration(state.sessionDir);
 		const auto = autos.get(sessionId);
 		// A missing config needs no tool normally; under automatic delegation the plan must be reachable to report
 		// the missing team as an actionable refusal instead of leaving the main session to direct tools. A fresh
@@ -4850,47 +4903,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		try {
 			const state = await loadProjectState(projectEnv(ctx));
 			if (generation !== sessionGeneration) return;
-			// A's registry subscription is installed before this session can spawn, so no first registered/metadata
-			// event is missed. The listener snapshots primitives synchronously; the capture port owns all joining.
-			const ports = boundIntegrationRuntime(state.sessionDir);
-			const director = ports === undefined ? undefined : directorIdentityFor({ sessionId, sessionDir: state.sessionDir, parentId: ctx.agent.id });
-			integrationRegistryStop?.();
-			integrationRegistryStop = undefined;
-			if (ports !== undefined && director?.kind === "known") {
-				integrationRegistryStop = AgentRegistry.global().onChange(event => {
-					if (generation !== sessionGeneration) return;
-					const ref = event.ref;
-					if (ref.kind !== "sub" || ref.parentId !== director.value.parentId ||
-						(ref.parentSessionKey != null && ref.parentSessionKey !== director.value.sessionInstance)) return;
-					const history = isRecord(ref.history) ? ref.history : undefined;
-					const patchPath = typeof history?.patchPath === "string" ? history.patchPath : undefined;
-					const nested = Array.isArray(history?.nestedPatchPaths)
-						? history.nestedPatchPaths.filter((item): item is string => typeof item === "string")
-						: undefined;
-					const branchName = typeof history?.branchName === "string" ? history.branchName : undefined;
-					const snapshot: RegistrySnapshotInput = {
-						director: director.value,
-						registryInstance: ref.session?.instanceKey ?? "",
-						event: event.type,
-						handle: ref.id,
-						parentId: ref.parentId ?? null,
-						parentSessionKey: ref.parentSessionKey ?? null,
-						generation: ref.generation,
-						childSessionFile: ref.sessionFile,
-						history: {
-							...(patchPath === undefined ? {} : { patchPath }),
-							...(nested === undefined ? {} : { nestedPatchPaths: nested }),
-							...(branchName === undefined ? {} : { branchName }),
-						},
-						observedAt: Date.now(),
-					};
-					try {
-						ports.capture.observeRegistry(snapshot);
-					} catch {
-						// Capture is an observation; a failing adapter must not break the native registry or the session.
-					}
-				});
-			}
 			// A run whose process died stays `running` until a later run ends; here it becomes the last run and resumable.
 			await stopDeadRuns({ sessionDir: state.sessionDir });
 			if (generation !== sessionGeneration || !liveStatus.isCurrent(epoch)) return;

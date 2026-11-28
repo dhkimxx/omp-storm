@@ -1176,9 +1176,9 @@ export interface RunControllerDeps {
 	closeSpend?(runId: string, onExceed: BudgetConfig["onExceed"]): void | Promise<void>;
 	/**
 	 * Isolated-integration ports (journal, exact delta, exclusive writer). Absent until the host boundary is proved:
-	 * every existing attempt/evaluation path then keeps its 0.29.0 behavior. E attaches the same ports once enabled.
+	 * every existing attempt/evaluation path then keeps its 0.29.0 behavior. The run's captured session owns the ports.
 	 */
-	integration?: IntegrationPorts;
+	integration?(sessionDir: string): IntegrationPorts | undefined;
 }
 
 /** The three external seams C consumes; A/B/E own their implementations. */
@@ -1214,24 +1214,13 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	/** One finalization per run: a second stop during drain joins it instead of writing a second record. */
 	#finishing: Promise<RunRecord | undefined> | undefined;
 	readonly #timings: StormTimings;
-	/** Isolated-integration seams; absent keeps every existing behavior. */
-	#integration: IntegrationPorts | undefined;
 	/** Read-only projection of the run that just closed in this process, so its candidates remain inspectable. */
-	#recentIntegration: { runId: string; state: IntegrationRunState; rows?: readonly RunResult[] } | undefined;
+	#recentIntegration: { sessionDir: string; runId: string; state: IntegrationRunState; rows?: readonly RunResult[] } | undefined;
 	/** The last exact projection C computed for the live run; views never read the journal themselves. */
 	#lastProjection: { runId: string; projection: CandidateProjection } | undefined;
 
 	constructor(private readonly deps: RunControllerDeps) {
 		this.#timings = deps.timings ?? DEFAULT_TIMINGS;
-		this.#integration = deps.integration;
-	}
-
-	/**
-	 * E attaches the journal/delta/writer once the host boundary is proved. Late attachment is the supported path: no
-	 * earlier attempt or evaluation gains integration state, and a repeated call replaces only the seams.
-	 */
-	attachIntegration(ports: IntegrationPorts | undefined): void {
-		this.#integration = ports;
 	}
 
 	/** Wake one consumer admission when a prerequisite's settlement finishes or times out. */
@@ -1734,9 +1723,9 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 					// The earlier run's final facts are history for an explicit resume or a chosen follow-up only; an
 					// unrelated task carries none.
 					const earlier = continued ?? followUp;
-					const earlierProjection = earlier === undefined || this.#integration === undefined
+					const earlierProjection = earlier === undefined || this.deps.integration?.(own.sessionDir) === undefined
 						? undefined
-						: await this.project({ kind: "overview", runId: earlier.runId }, this.#readWindow()).catch(() => undefined);
+						: await this.project({ kind: "overview", runId: earlier.runId }, this.#readWindow(), own.sessionDir).catch(() => undefined);
 					const history = earlier === undefined
 						? undefined
 						: (closeoutHandoff as unknown as (run: RunRecord, integration?: CandidateProjection) => string)(
@@ -2045,7 +2034,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				(handle !== undefined && agents.some(agent => agent.id === handle && agent.state === "running"));
 			const resultlessIntegrated = sharedTeam && lane.isolationReason === undefined
 				? settled
-				: this.#integration !== undefined && isolated
+				: this.deps.integration?.(own.sessionDir) !== undefined && isolated
 					? (await this.#currentFootprint(own, name, this.#readWindow())) !== undefined
 					: false;
 			view.set(name, {
@@ -2090,7 +2079,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		let receiptVerified = false;
 		if (result.kind === "change") {
 			const recorded = own.integration?.receipts.get(row.id);
-			if (this.#integration === undefined) {
+			if (this.deps.integration?.(own.sessionDir) === undefined) {
 				if (isolated === true) return { ok: false, reason: ISOLATED_CHANGE_REASON };
 			} else if (isolated === true || recorded !== undefined) {
 				if (recorded === undefined || recorded.attemptId !== row.attemptId) {
@@ -3503,7 +3492,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	/** Evaluates one settled attempt against its stored before state and writes the run-scoped rows. */
 	async #evaluateAttempt(own: OwnRun, settled: SettledAttempt): Promise<void> {
 		const prepared = settled.prepared;
-		const integrationChanges = this.#integration !== undefined && prepared.isolated === true
+		const integrationChanges = this.deps.integration?.(own.sessionDir) !== undefined && prepared.isolated === true
 			? prepared.results.filter(result => result.kind === "change")
 			: [];
 		const judgeable = integrationChanges.length === 0 ? prepared.results : prepared.results.filter(result => result.kind !== "change");
@@ -4201,7 +4190,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		if (conflict !== undefined) return { ok: false, reason: conflict };
 		const revision = own.planRevision;
 		const previousPlan = own.record.plan;
-		if (own.integration !== undefined && this.#integration !== undefined) {
+		if (own.integration !== undefined && this.deps.integration?.(own.sessionDir) !== undefined) {
 			await this.#revokeStaleIntegratedReceipts(own);
 			if (this.#own !== own || own.record.plan !== previousPlan) {
 				return { ok: false, reason: "실행이나 계획이 바뀌어 계획을 적용하지 않았습니다." };
@@ -5673,9 +5662,9 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			return undefined;
 		}
 		let integrationProjection: CandidateProjection | undefined;
-		if (own.integration !== undefined && this.#integration !== undefined) {
+		if (own.integration !== undefined && this.deps.integration?.(own.sessionDir) !== undefined) {
 			own.finalizing = true;
-			integrationProjection = await this.project({ kind: "overview" }, this.#readWindow()).catch(() => undefined);
+			integrationProjection = await this.project({ kind: "overview" }, this.#readWindow(), own.sessionDir).catch(() => undefined);
 		}
 		const integrationState = own.integration;
 		this.#own = undefined;
@@ -5855,8 +5844,9 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		}
 		// What the run's shared entries described has ended with its record: they must not outlive it in a long-lived host.
 		// Agent rows are process state a later run may still write to, so only the session shutdown removes them.
-		if (this.#integration !== undefined && integrationState !== undefined) {
+		if (this.deps.integration?.(own.sessionDir) !== undefined && integrationState !== undefined) {
 			this.#recentIntegration = {
+				sessionDir: own.sessionDir,
 				runId: record.runId,
 				state: integrationState,
 				...(record.results === undefined ? {} : { rows: record.results }),
@@ -6096,10 +6086,10 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		readonly admission: Omit<FrozenIntegrationAdmission, "subject">;
 		readonly placement: { readonly kind: "planned"; readonly lane: string } | { readonly kind: "unplanned" };
 	}): Promise<IntegrationRead<FrozenIntegrationAdmission>> {
-		const ports = this.#integration;
 		const own = this.#own;
-		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트 경계에서는 격리 통합이 아직 켜지지 않았습니다.");
 		if (own === undefined) return integrationUnknown("run-not-active", "진행 중인 실행이 없어 통합 수락을 준비하지 못했습니다.");
+		const ports = this.deps.integration?.(own.sessionDir);
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트 경계에서는 격리 통합이 아직 켜지지 않았습니다.");
 		const { admission } = input;
 		const key = admission.key;
 		if (key === null || typeof key !== "object" || key.schema !== INTEGRATION_KEY_SCHEMA ||
@@ -6219,8 +6209,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	/** E's final synchronous step: only a committed admission may appear in the candidate queue. */
 	commitAdmission(key: AdmissionKey): IntegrationCheck {
 		const own = this.#own;
-		if (this.#integration === undefined) return integrationFail("integration-disabled", "이 호스트에서는 격리 통합이 켜지지 않았습니다.");
 		if (own === undefined || key.runId !== own.record.runId) return integrationFail("run-not-active", "이 실행의 통합 수락이 아닙니다.");
+		if (this.deps.integration?.(own.sessionDir) === undefined) return integrationFail("integration-disabled", "이 호스트에서는 격리 통합이 켜지지 않았습니다.");
 		const state = own.integration?.admissions.get(key.dispatch);
 		if (state === undefined || state.admission.candidateId !== candidateIdFor(key)) {
 			return integrationFail("admission-not-prepared", "준비되지 않은 통합 수락은 게시할 수 없습니다.");
@@ -6456,9 +6446,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	 * starts work, adds a result row, writes the target or issues a receipt. Replays are idempotent by admission key.
 	 */
 	async observe(update: CaptureUpdate): Promise<void> {
-		const ports = this.#integration;
 		const own = this.#own;
-		if (ports === undefined || own === undefined || own.finalizing === true) return;
+		if (own === undefined || own.finalizing === true || this.deps.integration?.(own.sessionDir) === undefined) return;
 		this.#lastProjection = undefined;
 		const state = this.#integrationStateFor(own);
 		if (update.kind === "sealed") {
@@ -6533,9 +6522,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	}
 
 	/** One bounded keyed replay per run; null is the journal's own "no record", never an empty candidate list. */
-	async #replayIntegration(state: IntegrationRunState, runId: string): Promise<IntegrationRead<{ readonly lastSequence: number } | null>> {
-		const ports = this.#integration;
-		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 기록을 읽지 않습니다.");
+	async #replayIntegration(ports: IntegrationPorts, state: IntegrationRunState, runId: string): Promise<IntegrationRead<{ readonly lastSequence: number } | null>> {
 		if (state.replayDone) {
 			return integrationKnown(state.lastSequence === undefined ? null : { lastSequence: state.lastSequence });
 		}
@@ -6550,7 +6537,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** Stored candidate from B, merged into the active projection; unknown store content is never an empty record. */
 	async #storedCandidate(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState): Promise<IntegrationRead<StoredCandidate>> {
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(admitted.admission.director.sessionDir);
 		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 기록을 읽지 않습니다.");
 		const runId = own?.record.runId ?? admitted.admission.key.runId;
 		const read = await ports.journal.readCandidate(runId, admitted.admission.candidateId);
@@ -6587,7 +6574,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** The one candidate's postimage presence; exact paths only, never a worktree scan. */
 	async #presenceFor(admitted: IntegrationAdmissionState, window: ByteWindow): Promise<Presence> {
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(admitted.admission.director.sessionDir);
 		if (ports === undefined) return { kind: "unknown", problem: integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 확인하지 않습니다.") };
 		const seal = admitted.seal;
 		if (seal === undefined) return { kind: "unknown", problem: integrationProblem("awaiting-native", "네이티브 캡처를 기다립니다.") };
@@ -6600,7 +6587,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	async #readinessFor(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState, window: ByteWindow): Promise<QueueReadiness> {
 		const base = this.#sealBaseReadiness(own, admitted);
 		if (base.kind !== "ready") return base;
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(admitted.admission.director.sessionDir);
 		if (ports === undefined) return { kind: "unknown", problem: integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 선택하지 않습니다.") };
 		if (own !== undefined) {
 			const consumed = await this.#consumedProblem(own, admitted, window);
@@ -6648,23 +6635,24 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	}
 
 	/** Read-only candidate projection; it never starts a target effect, wake, check or reviewer. */
-	async project(query: CandidateQuery, window: ByteWindow): Promise<CandidateProjection> {
+	async project(query: CandidateQuery, window: ByteWindow, sessionDir = this.#own?.sessionDir ?? this.#recentIntegration?.sessionDir): Promise<CandidateProjection> {
 		if (query.kind !== "overview" && query.kind !== "detail") {
 			return { kind: "unknown", problem: integrationProblem("query-invalid", "후보 조회의 종류가 올바르지 않습니다.") };
 		}
-		const ports = this.#integration;
+		const ports = sessionDir === undefined ? undefined : this.deps.integration?.(sessionDir);
 		if (ports === undefined) return { kind: "not-recorded" };
 		let own: OwnRun | undefined;
 		let state: IntegrationRunState;
 		let rows: readonly RunResult[] = [];
 		let runId: string | undefined;
 		const active = this.#own;
-		if (active !== undefined && (query.runId === undefined || query.runId === active.record.runId)) {
+		if (active !== undefined && active.sessionDir === sessionDir && (query.runId === undefined || query.runId === active.record.runId)) {
 			own = active;
 			state = this.#integrationStateFor(active);
 			rows = active.record.results ?? [];
 			runId = active.record.runId;
-		} else if (this.#recentIntegration !== undefined && (query.runId === undefined || query.runId === this.#recentIntegration.runId)) {
+		} else if (this.#recentIntegration !== undefined && this.#recentIntegration.sessionDir === sessionDir &&
+			(query.runId === undefined || query.runId === this.#recentIntegration.runId)) {
 			state = this.#recentIntegration.state;
 			rows = this.#recentIntegration.rows ?? [];
 			runId = this.#recentIntegration.runId;
@@ -6676,7 +6664,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			return { kind: "not-recorded" };
 		}
 		if (runId === undefined) return { kind: "not-recorded" };
-		const replay = await this.#replayIntegration(state, runId);
+		const replay = await this.#replayIntegration(ports, state, runId);
 		if (replay.kind !== "known") return { kind: "unknown", problem: replay.problem };
 		if (replay.value === null && state.candidates.size === 0) return { kind: "not-recorded" };
 
@@ -6941,7 +6929,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		recorded: IntegrationResultState,
 		window: ByteWindow,
 	): Promise<IntegrationCheck> {
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(own.sessionDir);
 		if (ports === undefined) return integrationFail("integration-disabled", "이 호스트에서는 격리 통합 영수증을 확인하지 않습니다.");
 		const admitted = own.integration?.candidates.get(recorded.candidateId);
 		if (admitted === undefined || admitted.seal === undefined) {
@@ -7019,7 +7007,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		attemptId: string,
 		window: ByteWindow,
 	): Promise<IntegrationRead<AttemptWriteWitness>> {
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(admitted.admission.director.sessionDir);
 		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 근거를 읽지 않습니다.");
 		if (admitted.status !== "committed" || admitted.problem !== undefined) {
 			return integrationUnknown("candidate-not-current", "현재 게시 상태가 아닌 후보는 통합 근거가 되지 않습니다.");
@@ -7065,10 +7053,9 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** Internal C adapter to the original evaluator; unknown/stale/outside-scope bytes yield no witness. */
 	async readWitness(settlement: AttemptSettlement, resultId: string, window: ByteWindow): Promise<IntegrationRead<AttemptWriteWitness>> {
-		const ports = this.#integration;
 		const own = this.#own;
-		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 근거를 읽지 않습니다.");
 		if (own === undefined || settlement.runId !== own.record.runId) return integrationUnknown("run-not-active", "이 실행의 정산이 아닙니다.");
+		if (this.deps.integration?.(own.sessionDir) === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 근거를 읽지 않습니다.");
 		const admitted = own.integration?.admissions.get(settlement.dispatch);
 		if (admitted === undefined || admitted.status !== "committed" || admitted.seal === undefined) {
 			return integrationUnknown("candidate-missing", "이 시도에 결속된 통합 후보가 없습니다.");
@@ -7189,9 +7176,10 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** B's durable receipt re-enters the evaluator once, only for the exact attempt and attributable paths. */
 	async #onIntegrationReceipt(receipt: WriteReceipt): Promise<void> {
-		const ports = this.#integration;
 		const own = this.#own;
-		if (ports === undefined || own === undefined || receipt.ref.key.runId !== own.record.runId) return;
+		if (own === undefined || receipt.ref.key.runId !== own.record.runId) return;
+		const ports = this.deps.integration?.(own.sessionDir);
+		if (ports === undefined) return;
 		const admitted = own.integration?.candidates.get(receipt.ref.candidateId);
 		if (admitted === undefined || admitted.seal === undefined) return;
 		if (receipt.ref.manifestDigest !== admitted.seal.digest || !sameKey(receipt.ref.key, admitted.admission.key)) return;
@@ -7244,7 +7232,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** The synchronous revalidation B's segment publishes before an effect. */
 	async #revalidateCandidate(own: OwnRun, revision: CandidateRevision, window: ByteWindow): Promise<LiveCheck> {
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(own.sessionDir);
 		if (ports === undefined) return { ok: false, reason: "이 호스트에서는 격리 통합을 적용하지 않습니다." };
 		const admitted = own.integration?.candidates.get(revision.candidateId);
 		if (admitted === undefined || admitted.seal === undefined || admitted.status !== "committed") {
@@ -7310,8 +7298,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		readonly candidateIds: readonly string[];
 		readonly live: Omit<IntegrationLiveGrant, "revalidateCandidate" | "checkCandidate">;
 	}): Promise<IntegrationSelectionReply> {
-		const ports = this.#integration;
 		const own = this.#own;
+		const ports = own === undefined ? undefined : this.deps.integration?.(own.sessionDir);
 		const refused = (problem: IntegrationProblem): IntegrationSelectionReply => ({ kind: "refused", problem });
 		if (ports === undefined) return refused(integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 선택하지 않습니다."));
 		if (own === undefined) return refused(integrationProblem("run-not-active", "진행 중인 실행이 없어 통합을 선택하지 않았습니다."));
@@ -7345,7 +7333,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		this.#lastProjection = undefined;
 
 		const state = this.#integrationStateFor(own);
-		const replay = await this.#replayIntegration(state, own.record.runId);
+		const replay = await this.#replayIntegration(ports, state, own.record.runId);
 		if (replay.kind !== "known") return refused(replay.problem);
 		const selectionSignal = AbortSignal.any([own.abort.signal, input.live.signal]);
 		const window = this.#windowFor(selectionSignal, audit.deadline);
@@ -7618,8 +7606,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	/** Operator fence reconciliation; only the directly confirmed user flow reaches this, never the model tool. */
 	async reconcile(input: FenceResolutionRequest, window: ByteWindow): Promise<FenceResolution> {
-		const ports = this.#integration;
 		const own = this.#own;
+		const ports = own === undefined ? undefined : this.deps.integration?.(own.sessionDir);
 		if (ports === undefined || own === undefined) {
 			return { kind: "kept", problem: integrationProblem("integration-disabled", "이 호스트에서는 통합 펜스를 해결하지 않습니다.") };
 		}
@@ -7647,8 +7635,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	/** Same-run integrated inputs for B's dependency gate; only a current receipt and located verdict count. */
 	readIntegratedProducer(query: { readonly runId: string; readonly lane: string }): IntegrationRead<readonly IntegratedInput[]> {
 		const own = this.#own;
-		if (this.#integration === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 의존성을 읽지 않습니다.");
 		if (own === undefined || query.runId !== own.record.runId) return integrationUnknown("run-not-active", "이 실행의 통합 의존성이 아닙니다.");
+		if (this.deps.integration?.(own.sessionDir) === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 의존성을 읽지 않습니다.");
 		const state = own.integration;
 		if (state === undefined) return integrationUnknown("producer-not-integrated", "이 실행에는 아직 통합 기록이 없습니다.");
 		const lane = own.record.plan?.lanes.find(candidate => candidate.name === query.lane);
@@ -7734,7 +7722,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 
 	async #currentFootprint(own: OwnRun, lane: string, window: ByteWindow): Promise<IntegrationFootprintState | undefined> {
 		const state = own.integration;
-		const ports = this.#integration;
+		const ports = this.deps.integration?.(own.sessionDir);
 		if (state === undefined || ports === undefined) return undefined;
 		const candidates = [...state.candidates.values()].filter(candidate =>
 			candidate.status === "committed" &&

@@ -2,7 +2,7 @@
 import type { AsyncJobSnapshot, ExtensionContext, SessionModeRequest, SessionModeResult, SessionModeState } from "@oh-my-pi/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
-import type { RunTimers } from "../src/runtime/controller.ts";
+import type { RunControllerDeps, RunTimers } from "../src/runtime/controller.ts";
 import { RunController } from "../src/runtime/controller.ts";
 import type {
 	AcquireRunLeaseInput,
@@ -379,6 +379,7 @@ export interface SessionOptions {
 	now?: () => number;
 	/** The runtime's waits when this host is a test host that should not sit on the product's clock; product defaults when absent. */
 	timings?: StormTimings;
+	integration?: RunControllerDeps["integration"];
 }
 
 /** A run controller over a fake main session. */
@@ -480,6 +481,7 @@ export function fakeSession(opts: SessionOptions): FakeSession {
 		...(opts.ledger ? { ledger: opts.ledger } : {}),
 		agentDir: profile.agentDir,
 		...(opts.live ? { live: opts.live } : {}),
+		...(opts.integration === undefined ? {} : { integration: opts.integration }),
 	});
 	// The controller hands ctx to its own deps and reads only these members of it.
 	const ctx = {

@@ -84,7 +84,7 @@ async function harness(lanes: readonly LaneSpec[]): Promise<Harness> {
 			await writeFile(path.join(root, file), "before\n");
 		}
 	}
-	const h = fakeSession({ root });
+	const h: FakeSession = fakeSession({ root, integration: sessionDir => sessionDir === h.sessionDir ? ports : undefined });
 	const applied: CandidateRevision[] = [];
 	const contents = new Map<string, string | undefined>();
 	const frozen: FrozenIntegrationAdmission[] = [];
@@ -183,7 +183,6 @@ async function harness(lanes: readonly LaneSpec[]): Promise<Harness> {
 			finishSegment: async () => ({ ok: true }),
 		},
 	};
-	h.controller.attachIntegration(ports);
 	const started = await h.controller.startWithPlan(h.ctx, { task: "integrate exact work" }, planFor(lanes));
 	if (!started.ok) throw new Error(started.reason);
 	return { h, ports, applied, contents, frozen, settlements };
@@ -491,6 +490,11 @@ describe("integration controller", () => {
 		if (detail.kind !== "detail") throw new Error("expected detail");
 		expect(detail.value.line.readiness.kind).toBe("unknown");
 		expect(detail.value.provenance.checkoutClaim.kind).toBe("unknown");
+		expect(await run.h.controller.project(
+			{ kind: "detail", runId: admission.key.runId, candidateId: admission.candidateId },
+			{ maxBytes: 1_000_000, deadline: Date.now() + 10_000, signal: new AbortController().signal },
+			`${run.h.sessionDir}-other`,
+		)).toEqual({ kind: "not-recorded" });
 
 		const skipped = await run.h.controller.select({ candidateIds: [admission.candidateId], live: grant(run.h) });
 		if (skipped.kind !== "selection") throw new Error(skipped.problem.reason);
