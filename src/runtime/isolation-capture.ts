@@ -165,6 +165,17 @@ export interface IsolationCaptureOptions {
 	readonly onNativeEnded?: ((admission: FrozenIntegrationAdmission) => void | Promise<void>) | undefined;
 }
 
+/** One raw sync row as the host delivered it; payload validity never filters duplicate detection. */
+type SyncObservationRow = SyncResultFact & {
+	readonly index?: unknown;
+	readonly isolated?: unknown;
+	readonly branchName?: unknown;
+	readonly branchBaseSha?: unknown;
+	readonly hasRootChanges?: unknown;
+	readonly nestedPatches?: unknown;
+	readonly nestedPatchPaths?: unknown;
+};
+
 interface SyncFacts {
 	readonly isolated: boolean | undefined;
 	readonly rootPath: string | undefined;
@@ -269,6 +280,8 @@ interface TrackedCapture {
 	lateJournalSent: boolean;
 	deadlineTimer?: NodeJS.Timeout;
 	deadlineReached: boolean;
+	/** Bumped on each accepted evidence mutation of this candidate; its seal revalidates only this counter. */
+	revision: number;
 	job?: Promise<void>;
 	dirty: boolean;
 	lateKeys: Set<string>;
@@ -311,8 +324,6 @@ export class IsolationCapture implements IntegrationCapturePort {
 	readonly #unmatched = new Map<string, number>();
 	#unsubscribe: (() => void) | undefined;
 	#stopped = false;
-	/** Bumped on every accepted evidence mutation; a seal revalidates it after every await. */
-	#revision = 0;
 
 	constructor(options: IsolationCaptureOptions) {
 		this.#artifacts = options.artifacts;
@@ -448,6 +459,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			nativeEnded: false,
 			lateJournalSent: false,
 			deadlineReached: false,
+			revision: 0,
 			dirty: false,
 			lateKeys: new Set(),
 			abandoned: false,
@@ -498,14 +510,15 @@ export class IsolationCapture implements IntegrationCapturePort {
 
 	observeRegistry(snapshot: RegistrySnapshotInput): void {
 		if (this.#stopped) return;
-		const candidates = [...this.#tracked.values()].filter(
-			tracked =>
-				!tracked.abandoned &&
-				tracked.handle === snapshot.handle &&
-				(snapshot.parentId === null || tracked.admission.director.parentId === snapshot.parentId) &&
-				(snapshot.parentSessionKey === null || tracked.admission.director.sessionInstance === snapshot.parentSessionKey) &&
-				sameDirector(tracked.admission.director, snapshot.director),
-		);
+		const candidates: TrackedCapture[] = [];
+		for (const candidateId of this.#byHandle.get(snapshot.handle) ?? []) {
+			const tracked = this.#tracked.get(candidateId);
+			if (tracked === undefined || tracked.abandoned) continue;
+			if (snapshot.parentId !== null && tracked.admission.director.parentId !== snapshot.parentId) continue;
+			if (snapshot.parentSessionKey !== null && tracked.admission.director.sessionInstance !== snapshot.parentSessionKey) continue;
+			if (!sameDirector(tracked.admission.director, snapshot.director)) continue;
+			candidates.push(tracked);
+		}
 		if (candidates.length === 0) {
 			this.#bump("registry-unbound");
 			return;
@@ -559,7 +572,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		if (identityProblem !== undefined) {
 			const before = tracked.registryProblem?.code;
 			tracked.registryProblem ??= identityProblem;
-			if (before !== tracked.registryProblem.code) this.#revision += 1;
+			if (before !== tracked.registryProblem.code) tracked.revision += 1;
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 			else this.#schedule(tracked);
 			return;
@@ -569,7 +582,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (prior.patchPath !== undefined && patchPath !== undefined && prior.patchPath !== patchPath) {
 				const before = tracked.registryProblem?.code;
 				tracked.registryProblem ??= problem("registry-parts-changed", "같은 후보에 다른 루트 패치 경로가 관측되었습니다");
-				if (before !== tracked.registryProblem.code) this.#revision += 1;
+				if (before !== tracked.registryProblem.code) tracked.revision += 1;
 				if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 				else this.#schedule(tracked);
 				return;
@@ -577,7 +590,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (prior.nestedList === "explicit" && nestedList === "explicit" && canonicalJson(prior.nestedPaths) !== canonicalJson(nestedPaths)) {
 				const before = tracked.registryProblem?.code;
 				tracked.registryProblem ??= problem("registry-parts-changed", "같은 후보에 다른 중첩 패치 목록이 관측되었습니다");
-				if (before !== tracked.registryProblem.code) this.#revision += 1;
+				if (before !== tracked.registryProblem.code) tracked.revision += 1;
 				if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 				else this.#schedule(tracked);
 				return;
@@ -606,7 +619,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			positive: positive || prior?.positive === true,
 		};
 		tracked.registry = evidence;
-		this.#revision += 1;
+		tracked.revision += 1;
 		if (positive) this.#armDeadline(tracked);
 		if (tracked.manifest !== undefined) {
 			this.#scheduleLate(tracked);
@@ -620,25 +633,29 @@ export class IsolationCapture implements IntegrationCapturePort {
 	observeSync(input: {
 		readonly director: DirectorIdentity;
 		readonly toolCallId: string;
-		readonly results: readonly (SyncResultFact & {
-			readonly index?: unknown;
-			readonly isolated?: unknown;
-			readonly branchName?: unknown;
-			readonly branchBaseSha?: unknown;
-			readonly hasRootChanges?: unknown;
-			readonly nestedPatches?: unknown;
-			readonly nestedPatchPaths?: unknown;
-		})[];
+		readonly results: readonly SyncObservationRow[];
 		readonly observedAt: number;
 	}): void {
 		if (this.#stopped) return;
 		const results = Array.isArray(input.results) ? input.results : [];
+		// The host compacts the batch but keeps each spawn's original-call `index`; position in this array is not the
+		// item index. Index the raw rows once for every tracked candidate: the typed index and the handle count are the
+		// only bindings, and an ill-typed payload is still a duplicate when its index or handle collides.
+		const byIndex = new Map<number, SyncObservationRow[]>();
+		const handleCounts = new Map<string, number>();
+		for (const item of results) {
+			if (!record(item)) continue;
+			if (typeof item.index === "number") {
+				const rows = byIndex.get(item.index);
+				if (rows === undefined) byIndex.set(item.index, [item]);
+				else rows.push(item);
+			}
+			if (typeof item.id === "string") handleCounts.set(item.id, (handleCounts.get(item.id) ?? 0) + 1);
+		}
 		for (const tracked of [...this.#tracked.values()]) {
 			if (tracked.abandoned) continue;
 			if (tracked.toolCallId !== input.toolCallId || !sameDirector(tracked.admission.director, input.director)) continue;
-			// The host compacts the batch but keeps each spawn's original-call `index`; position in this array is not the
-			// item index. Bind the typed index and the exact handle together, and refuse a duplicate handle anywhere.
-			const exact = results.filter(item => record(item) && item.index === tracked.itemIndex);
+			const exact = byIndex.get(tracked.itemIndex) ?? [];
 			if (exact.length !== 1) {
 				this.#bump(exact.length === 0 ? "sync-item-unbound" : "sync-item-duplicate");
 				continue;
@@ -648,7 +665,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 				this.#bump("sync-item-unbound");
 				continue;
 			}
-			if (results.filter(item => record(item) && item.id === tracked.handle).length !== 1) {
+			if (handleCounts.get(tracked.handle) !== 1) {
 				this.#bump("sync-item-duplicate");
 				continue;
 			}
@@ -667,7 +684,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 					if (before !== after) {
 						if (before !== undefined) tracked.terminalProblem = problem("terminal-contradicted", "같은 승인에 다른 동기 종료 사실이 도착했습니다");
 						tracked.terminal = terminal.value;
-						this.#revision += 1;
+						tracked.revision += 1;
 						if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 						else this.#schedule(tracked);
 					}
@@ -677,7 +694,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 					const before = tracked.terminalProblem?.code;
 					tracked.terminalProblem = terminal.problem;
 					if (before !== terminal.problem.code) {
-						this.#revision += 1;
+						tracked.revision += 1;
 						if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 						else this.#schedule(tracked);
 					}
@@ -687,13 +704,13 @@ export class IsolationCapture implements IntegrationCapturePort {
 					if (canonicalJson(syncParts(next)) !== canonicalJson(syncParts(tracked.sync))) {
 						const before = tracked.syncProblem?.code;
 						tracked.syncProblem = problem("sync-parts-changed", "같은 승인에 다른 동기 캡처 부품이 도착했습니다");
-						if (before !== tracked.syncProblem.code) this.#revision += 1;
+						if (before !== tracked.syncProblem.code) tracked.revision += 1;
 						this.#schedule(tracked);
 					}
 				} else if (canonicalJson(syncParts(next)) !== canonicalJson(syncParts(tracked.lateSync ?? tracked.sync))) {
 					// A late envelope can name a patch/ref the seal never saw. It is copied into recovery only.
 					tracked.lateSync = next;
-					this.#revision += 1;
+					tracked.revision += 1;
 					this.#scheduleLate(tracked);
 				}
 				continue;
@@ -709,7 +726,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			tracked.terminalAt = observedAt;
 			tracked.sync = syncFacts(result);
 			tracked.syncProblem = undefined;
-			this.#revision += 1;
+			tracked.revision += 1;
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 			else this.#schedule(tracked);
 		}
@@ -795,7 +812,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 							matched.length === 0 ? "async-ack-unbound" : "async-ack-ambiguous",
 							"확인 응답을 이 승인의 호출/항목에 정확히 결합하지 못했습니다",
 						);
-						if (before !== state.ackProblem.code) this.#revision += 1;
+						if (before !== state.ackProblem.code) only.revision += 1;
 						if (only.manifest !== undefined) this.#scheduleLate(only);
 						else this.#schedule(only);
 					}
@@ -853,7 +870,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 					? "확인 응답에 항목별 타입 실행 증명이 없습니다"
 					: "확인 응답의 실행 증명이 이 승인의 소유자/호출/항목과 다릅니다",
 			);
-			if (before !== state.ackProblem.code) this.#revision += 1;
+			if (before !== state.ackProblem.code) tracked.revision += 1;
 			this.#bump(proof === undefined ? "async-ack-stock" : "async-ack-unproven");
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 			else this.#schedule(tracked);
@@ -864,7 +881,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (state.bound.jobId !== proof.jobId || state.bound.executionToken !== proof.executionToken) {
 				const before = state.ackProblem?.code;
 				state.ackProblem ??= problem("async-ack-conflict", "같은 승인에 다른 실행 증명이 도착했습니다");
-				if (before !== state.ackProblem.code) this.#revision += 1;
+				if (before !== state.ackProblem.code) tracked.revision += 1;
 				this.#bump("async-ack-conflict");
 				if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 				else this.#schedule(tracked);
@@ -879,7 +896,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			ackAt: observedAt,
 		};
 		state.ackProblem = undefined;
-		this.#revision += 1;
+		tracked.revision += 1;
 		this.#joinPending(tracked);
 		if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 		else this.#schedule(tracked);
@@ -927,7 +944,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		const bound = state.bound;
 		if (bound === undefined) {
 			// Too early to know whose execution this is. Keep the typed row; only an exact acknowledgement can redeem it.
-			if (this.#rememberPending(state, pending)) this.#revision += 1;
+			if (this.#rememberPending(state, pending)) tracked.revision += 1;
 			this.#armDeadline(tracked);
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 			else this.#schedule(tracked);
@@ -996,7 +1013,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		const after = terminalStatus(carried);
 		if (before !== undefined && before !== after) {
 			tracked.terminalProblem ??= problem("terminal-contradicted", "같은 승인에 다른 비동기 종료 사실이 도착했습니다");
-			this.#revision += 1;
+			tracked.revision += 1;
 			this.#bump("terminal-contradicted");
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 			else this.#schedule(tracked);
@@ -1007,7 +1024,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			return;
 		}
 		tracked.terminal = carried;
-		this.#revision += 1;
+		tracked.revision += 1;
 		this.#noteNativeEnded(tracked);
 		this.#armDeadline(tracked);
 		if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
@@ -1036,7 +1053,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		) {
 			const before = tracked.claimProblem?.code;
 			tracked.claimProblem ??= problem("claim-admission-mismatch", "자식 진입 주장이 이 승인과 다릅니다");
-			if (before !== tracked.claimProblem.code) this.#revision += 1;
+			if (before !== tracked.claimProblem.code) tracked.revision += 1;
 			this.#bump("claim-admission-mismatch");
 			this.#armDeadline(tracked);
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
@@ -1046,7 +1063,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		if (canonicalJson(entry) !== canonicalJson(claim.entry)) {
 			const before = tracked.claimProblem?.code;
 			tracked.claimProblem ??= problem("claim-observation-conflict", "자식 진입 관측과 주장이 다릅니다");
-			if (before !== tracked.claimProblem.code) this.#revision += 1;
+			if (before !== tracked.claimProblem.code) tracked.revision += 1;
 			this.#bump("claim-entry-mismatch");
 			this.#armDeadline(tracked);
 			if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
@@ -1057,7 +1074,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (canonicalJson(tracked.claim) !== canonicalJson(claim)) {
 				const before = tracked.claimProblem?.code;
 				tracked.claimProblem ??= problem("claim-conflict", "같은 승인에 다른 자식 진입 주장이 있습니다");
-				if (before !== tracked.claimProblem.code) this.#revision += 1;
+				if (before !== tracked.claimProblem.code) tracked.revision += 1;
 				this.#bump("claim-conflict");
 				this.#armDeadline(tracked);
 				if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
@@ -1069,7 +1086,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			tracked.claimProblem ??= problem("claim-registry-mismatch", "자식 진입 신원이 관측된 레지스트리 세대와 다릅니다");
 		}
 		tracked.claim = claim;
-		this.#revision += 1;
+		tracked.revision += 1;
 		if (tracked.manifest !== undefined) this.#scheduleLate(tracked);
 		else this.#schedule(tracked);
 	}
@@ -1241,7 +1258,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 	async #seal(tracked: TrackedCapture): Promise<void> {
 		if (tracked.manifest !== undefined || tracked.abandoned || this.#stopped) return;
 		clearTimeout(tracked.deadlineTimer);
-		const revision = this.#revision;
+		const revision = tracked.revision;
 		let bundle = this.#bundle(tracked);
 		const rootRef = tracked.rootCopy?.kind === "known" ? tracked.rootCopy.value : undefined;
 		let delta: IntegrationRead<ExactDeltaProof> = unknown("delta-not-root-only", "루트 전용 성공 후보가 아니라 델타를 증명하지 않았습니다");
@@ -1263,9 +1280,10 @@ export class IsolationCapture implements IntegrationCapturePort {
 				window,
 			);
 			if (this.#stopped || tracked.abandoned || tracked.manifest !== undefined) return;
-			if (this.#revision !== revision) {
-				// A claim, terminal or part changed during the proof. Never publish a ready manifest built from the older
-				// snapshot: reschedule and seal from the new revision (or fail closed if it is a contradiction).
+			if (tracked.revision !== revision) {
+				// This candidate's claim, terminal or part changed during the proof. Never publish a ready manifest
+				// built from the older snapshot: reschedule and seal from the new revision (or fail closed if it is a
+				// contradiction). Another candidate's evidence never invalidates this proof.
 				this.#schedule(tracked);
 				return;
 			}
@@ -1282,7 +1300,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		} else if (bundle.kind !== "root-only" && delta.kind === "known") {
 			delta = unknown("delta-not-root-only", "루트 전용 성공 후보가 아니라 델타를 증명하지 않았습니다");
 		}
-		if (this.#revision !== revision) {
+		if (tracked.revision !== revision) {
 			this.#schedule(tracked);
 			return;
 		}
@@ -1313,7 +1331,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			recovery,
 		};
 		const manifest: SealedCaptureManifest = { ...payload, digest: captureManifestDigest(payload) };
-		const appendRevision = this.#revision;
+		const appendRevision = tracked.revision;
 		let sequence: IntegrationRead<number>;
 		try {
 			sequence = await this.#journal.appendManifest(manifest);
@@ -1340,9 +1358,9 @@ export class IsolationCapture implements IntegrationCapturePort {
 				: { kind: "sealed", manifest, journalSequence: sequence.value, settlement: tracked.settlement };
 		tracked.settlementPublished = tracked.settlement !== undefined;
 		this.#deliver(update);
-		// The manifest is immutable, so a fact that changed while the append ran is recorded as its own late recovery
-		// observation, never folded into a rewrite or a second seal.
-		if (this.#revision !== appendRevision) this.#scheduleLate(tracked);
+		// The manifest is immutable, so this candidate's fact that changed while the append ran is recorded as its own
+		// late recovery observation, never folded into a rewrite or a second seal.
+		if (tracked.revision !== appendRevision) this.#scheduleLate(tracked);
 	}
 
 	#bundle(tracked: TrackedCapture): EmittedBundle {
@@ -1566,7 +1584,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			nestedCopy = known(parts);
 		}
 		tracked.lateParts = { rootPath, rootCopy, nestedPaths: nestedPaths ?? [], nestedCopy };
-		this.#revision += 1;
+		tracked.revision += 1;
 	}
 
 	async #lateObservation(tracked: TrackedCapture): Promise<void> {

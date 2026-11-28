@@ -214,11 +214,15 @@ class FakeJournal implements CaptureJournalPort {
 	readonly recoveries: LateRecoveryObservation[] = [];
 	sequence = 0;
 	fail = false;
+	/** Test hook: hold one append after its payload is fixed and before it is recorded. */
+	beforeAppend: ((manifest: SealedCaptureManifest) => Promise<void> | undefined) | undefined = undefined;
 
 	#waiters: Array<{ count: number; resolve: () => void }> = [];
 
 	async appendManifest(manifest: SealedCaptureManifest): Promise<{ kind: "known"; value: number } | { kind: "unknown"; problem: { code: string; reason: string } }> {
 		if (this.fail) return { kind: "unknown", problem: { code: "disk-full", reason: "test refusal" } };
+		const hold = this.beforeAppend?.(manifest);
+		if (hold !== undefined) await hold;
 		this.manifests.push(manifest);
 		this.sequence += 1;
 		this.#resolveWaiters();
@@ -1398,6 +1402,98 @@ describe("async carrier join", () => {
 		expect(manifests[0]?.bundle.kind).toBe("unknown");
 		if (manifests[0]?.bundle.kind === "unknown") expect(manifests[0].bundle.problem.code).toBe("terminal-contradicted");
 		expect(manifests[0]?.recovery.root.kind).toBe("known");
+	});
+
+	test("another candidate's evidence never re-proves a waiting root capture or adds recovery", async () => {
+		const f = await fixture();
+		const proofGate = Promise.withResolvers<void>();
+		const proofEntered = Promise.withResolvers<void>();
+		const appendGate = Promise.withResolvers<void>();
+		const appendEntered = Promise.withResolvers<void>();
+		let firstProofs = 0;
+		const delta: IntegrationDeltaPort = {
+			async proveRoot(request) {
+				if (request.key.dispatch === "attempt:A") {
+					firstProofs += 1;
+					if (firstProofs === 1) {
+						proofEntered.resolve();
+						await proofGate.promise;
+					}
+				}
+				return {
+					kind: "known",
+					value: {
+						...request,
+						schema: "storm.integration-delta/v1",
+						digest: "d".repeat(64),
+						entries: [],
+						expandedBytes: 0,
+					},
+				};
+			},
+			async verifyCheckoutInputs() {
+				return { ok: true };
+			},
+			async observePresence() {
+				return { kind: "unknown", problem: { code: "test", reason: "test" } };
+			},
+			async observeDirtyPaths() {
+				return { kind: "unknown", problem: { code: "test", reason: "test" } };
+			},
+		};
+		const rig = captureRig(f, { delta });
+		rig.journal.beforeAppend = manifest => {
+			if (manifest.admission.key.dispatch !== "attempt:A") return undefined;
+			appendEntered.resolve();
+			return appendGate.promise;
+		};
+		const first = await admissionFor(f, { handle: "W1", dispatch: "attempt:A", toolCallId: "call-a" });
+		const second = await admissionFor(f, { handle: "W2", dispatch: "attempt:B", toolCallId: "call-b" });
+		const firstPath = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const secondPath = await patch(f, "W2", "diff --git a/b b/b\n+B\n");
+		rig.capture.track(first.admission);
+		rig.capture.track(second.admission);
+		claimCapture(rig, f, first);
+		claimCapture(rig, f, second);
+		rig.capture.observeSync({
+			director: first.admission.director,
+			toolCallId: "call-a",
+			results: [syncResult({ handle: "W1", patchPath: firstPath, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		await proofEntered.promise;
+		// B completes while A's root proof waits. That is B's evidence; A's revision and bundle are unchanged.
+		rig.capture.observeSync({
+			director: second.admission.director,
+			toolCallId: "call-b",
+			results: [syncResult({ handle: "W2", patchPath: secondPath, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		proofGate.resolve();
+		await appendEntered.promise;
+		// B changes again while A's journal append is in flight; A must not mint a recovery observation for it.
+		rig.capture.observeSync({
+			director: second.admission.director,
+			toolCallId: "call-b",
+			results: [syncResult({
+				handle: "W2",
+				patchPath: secondPath,
+				hasRootChanges: true,
+				branchName: "omp/task/W2-late",
+				branchBaseSha: "b".repeat(40),
+				nestedPatchPaths: [],
+				nestedPatches: [],
+			})],
+			observedAt: f.clock.now + 1,
+		});
+		appendGate.resolve();
+		const manifests = await sealed(rig);
+		expect(firstProofs).toBe(1);
+		expect(manifests.filter(manifest => manifest.admission.key.dispatch === "attempt:A")).toHaveLength(1);
+		expect(manifests.filter(manifest => manifest.admission.key.dispatch === "attempt:B")).toHaveLength(1);
+		const firstManifest = manifests.find(manifest => manifest.admission.key.dispatch === "attempt:A");
+		expect(firstManifest?.bundle.kind).toBe("root-only");
+		expect(rig.journal.recoveries.filter(observation => observation.key.dispatch === "attempt:A")).toHaveLength(0);
 	});
 
 	test("a mixed task envelope feeds both the sync row and the async acknowledgement", async () => {
