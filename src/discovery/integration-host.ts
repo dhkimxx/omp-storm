@@ -15,7 +15,7 @@ interface NativeDefinitionIdentity {
 	readonly sourceDigest?: string;
 }
 
-interface NativeDispatch {
+export interface NativeDispatch {
 	readonly token: string;
 	readonly backend: string;
 	readonly sourceRoot: string;
@@ -31,6 +31,52 @@ export function supportsGuardedIsolation(api: unknown): boolean {
 	const isolation = capabilities.subagentIsolation;
 	return isRecord(isolation) && Object.isFrozen(isolation) && isolation.version === 1 && isolation.spawnPolicy === true &&
 		isolation.childEntryGuard === true && isolation.entryGuard === true && isolation.agentDefinitionIdentity === true;
+}
+
+/** The host-owned first-turn contract, as advertised by the exact loaded build. */
+export interface ManagedWorkerTurnCapability {
+	readonly version: 1;
+	readonly admission: true;
+	readonly ownerValidated: true;
+	readonly childScope: true;
+	readonly typedEnd: true;
+	/** This slice authorizes no wake or pooled managed route. */
+	readonly wake: false;
+	readonly pooled: false;
+}
+
+/**
+ * Read the frozen `managedWorkerTurn` capability. This is a gate input only: it says which native Z1/Z2 routes the loaded
+ * host enforces, not that Storm may enable them. A missing, mutable or partially advertised block is no capability at all.
+ */
+export function managedWorkerTurnCapability(api: unknown): ManagedWorkerTurnCapability | undefined {
+	if (!supportsGuardedIsolation(api)) return undefined;
+	if (!isRecord(api)) return undefined;
+	const capabilities = api.capabilities;
+	if (!isRecord(capabilities)) return undefined;
+	const managed = capabilities.managedWorkerTurn;
+	if (!isRecord(managed) || !Object.isFrozen(managed)) return undefined;
+	if (managed.version !== 1 || managed.admission !== true || managed.ownerValidated !== true ||
+		managed.childScope !== true || managed.typedEnd !== true || managed.wake !== false || managed.pooled !== false) {
+		return undefined;
+	}
+	return Object.freeze({
+		version: 1,
+		admission: true,
+		ownerValidated: true,
+		childScope: true,
+		typedEnd: true,
+		wake: false,
+		pooled: false,
+	});
+}
+
+/**
+ * Both halves of the native gate must be present: the guarded isolation dispatch and the owner-bound managed first turn.
+ * A missing capability keeps the old fail-closed route; this function never enables D5 removal by itself.
+ */
+export function supportsManagedWorkerAdmission(api: unknown): boolean {
+	return managedWorkerTurnCapability(api) !== undefined;
 }
 
 function missing<T>(code: string, reason: string): IntegrationRead<T> {

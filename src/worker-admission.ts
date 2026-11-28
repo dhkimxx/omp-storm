@@ -8,11 +8,11 @@
  * only those host-supplied facts: never cwd alone, a model reply, or a bare id. The record is a claimable, revocable
  * capability, not a second team approval: a missing or invalid record never grants anything.
  */
-import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, chmod } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, chmod, type FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { buildId } from "./build.ts";
-import { sha256Hex } from "./config/canonical.ts";
+import { canonicalJson, sha256Hex } from "./config/canonical.ts";
 import { ADMISSION_CLOSING_ROOM, MAX_ADMISSION_BYTES, validModelSelector } from "./config/schema.ts";
 import { serialized, writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
@@ -138,6 +138,495 @@ export type WorkerAdmissionRead =
 	| { kind: "missing" }
 	| { kind: "invalid"; reason: string }
 	| { kind: "record"; key: string; record: WorkerAdmissionRecord };
+
+// ── exact managed worker turn ────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The native host mints one immutable `ManagedWorkerTurnScope` for an isolated child's exact first turn. The shape below is a
+// structural mirror of the host type; it is evidence, never authority. The owner's live router is the only place that can
+// validate the token against the actual owner/actor/registry, and the native paid-attempt gate is the only place that can
+// refuse a send. Storm's disk record below proves only that this exact durable worker attempt was bound to that exact
+// native tuple and the physical child/session it named. A missing, replaced, revoked or expired record always refuses; there
+// is no unmanaged fallback on this path.
+
+/** Structural mirror of the host's `ManagedWorkerTurnScope` v1. */
+export interface ManagedWorkerTurnScope {
+	readonly revision: 1;
+	readonly token: string;
+	readonly guard: string;
+	readonly runId: string;
+	readonly admissionKey: string;
+	readonly admissionAttempt: string;
+	readonly ownerSessionId: string;
+	readonly ownerInstanceKey: string;
+	readonly parentAgentId: string;
+	readonly agentId: string;
+	readonly actorSessionId: string;
+	readonly actorInstanceKey: string;
+	readonly generation: number;
+	readonly dispatchId: string;
+	readonly kind: "first" | "wake";
+}
+
+export const WORKER_TURN_SCHEMA = "storm.worker-turn/v1" as const;
+const TURN_TEXT_LIMIT = 512;
+const TURN_TOKEN_LIMIT = 128;
+const TURN_PATH_LIMIT = 1024;
+const TURN_MAX_BYTES = 64 * 1024;
+const TURN_DIGEST = /^[0-9a-f]{64}$/;
+const TURN_DEVICE = /^[0-9]{1,32}$/;
+
+/** One exact physical file identity from the host's entry tuple. */
+export interface WorkerTurnFileIdentity {
+	readonly canonicalPath: string;
+	readonly device: string;
+	readonly inode: string;
+}
+
+/** The physical child incarnation this durable attempt was bound to. */
+export interface WorkerTurnChildIdentity {
+	/** sha256 of the exact native child session id, never the id itself. */
+	readonly sessionIdSha256: string;
+	readonly sessionFile: WorkerTurnFileIdentity;
+	readonly checkout: WorkerTurnFileIdentity;
+	/** Exact child registry instance key at entry. */
+	readonly registryInstance: string;
+	readonly generation: number;
+}
+
+/** Cross-reference to the already-published integration admission this turn belongs to. */
+export interface WorkerTurnIntegrationRef {
+	readonly runId: string;
+	readonly dispatch: string;
+	readonly candidateId: string;
+	readonly policyProofId: string;
+	readonly slotOwnerToken: string;
+	readonly guardBuild: string;
+}
+
+/** Host process identity the integration claim proved at entry. */
+export interface WorkerTurnHostOwner {
+	readonly pid: number;
+	readonly processStart: number;
+	readonly host: string;
+}
+
+/**
+ * One durable, immutable worker-turn claim. It is keyed by the exact admission key and attempt and written only while that
+ * attempt is current. The record is a tombstone after end/revoke; readers still compare the exact tuple.
+ */
+export interface WorkerAdmissionTurn {
+	readonly schema: typeof WORKER_TURN_SCHEMA;
+	readonly build: string;
+	readonly key: string;
+	readonly attempt: string;
+	readonly turn: ManagedWorkerTurnScope;
+	readonly child: WorkerTurnChildIdentity;
+	readonly integration?: WorkerTurnIntegrationRef;
+	readonly host: WorkerTurnHostOwner;
+	readonly boundAt: number;
+}
+
+export type WorkerTurnBindResult =
+	| { readonly kind: "bound" | "already-bound"; readonly record: WorkerAdmissionRecord; readonly binding: WorkerAdmissionTurn }
+	| { readonly kind: "refused"; readonly code: string; readonly reason: string };
+
+/** Exact optional expectations the caller's current native context must still satisfy. */
+export interface WorkerTurnExpectation {
+	readonly runId?: string;
+	readonly actorSessionId?: string;
+	readonly actorInstanceKey?: string;
+	readonly generation?: number;
+	readonly dispatchId?: string;
+	readonly kind?: ManagedWorkerTurnScope["kind"];
+}
+
+/** Disk proof of the exact entitlement; it is not the native owner's live authority. */
+export type WorkerTurnReadResult =
+	| { readonly kind: "proved"; readonly record: WorkerAdmissionRecord; readonly binding: WorkerAdmissionTurn }
+	| { readonly kind: "refused"; readonly code: string; readonly reason: string };
+
+export type WorkerTurnEndResult =
+	| { readonly kind: "ended" | "already-ended"; readonly record: WorkerAdmissionRecord; readonly binding: WorkerAdmissionTurn }
+	| { readonly kind: "refused"; readonly code: string; readonly reason: string };
+
+function boundedTurnText(value: unknown, limit = TURN_TEXT_LIMIT): string | undefined {
+	return typeof value === "string" && value.length > 0 && value.length <= limit && !CONTROL_CHARS.test(value) ? value : undefined;
+}
+
+/** Validate and clone one native scope. Shape alone never grants anything; the native owner validates the live binding. */
+export function parseWorkerTurnScope(value: unknown): ManagedWorkerTurnScope | undefined {
+	if (!isRecord(value) || value.revision !== 1) return undefined;
+	const token = boundedTurnText(value.token, TURN_TOKEN_LIMIT);
+	const guard = boundedTurnText(value.guard);
+	const runId = boundedTurnText(value.runId);
+	const admissionKey = boundedTurnText(value.admissionKey);
+	const admissionAttempt = boundedTurnText(value.admissionAttempt);
+	const ownerSessionId = boundedTurnText(value.ownerSessionId);
+	const ownerInstanceKey = boundedTurnText(value.ownerInstanceKey);
+	const parentAgentId = boundedTurnText(value.parentAgentId);
+	const agentId = boundedTurnText(value.agentId);
+	const actorSessionId = boundedTurnText(value.actorSessionId);
+	const actorInstanceKey = boundedTurnText(value.actorInstanceKey);
+	const generation = typeof value.generation === "number" && Number.isSafeInteger(value.generation) && value.generation >= 0 ? value.generation : undefined;
+	const dispatchId = boundedTurnText(value.dispatchId);
+	if (token === undefined || guard === undefined || runId === undefined || admissionKey === undefined ||
+		admissionAttempt === undefined || ownerSessionId === undefined || ownerInstanceKey === undefined ||
+		parentAgentId === undefined || agentId === undefined || actorSessionId === undefined ||
+		actorInstanceKey === undefined || generation === undefined || dispatchId === undefined ||
+		(value.kind !== "first" && value.kind !== "wake")) {
+		return undefined;
+	}
+	return Object.freeze({
+		revision: 1, token, guard, runId, admissionKey, admissionAttempt, ownerSessionId, ownerInstanceKey,
+		parentAgentId, agentId, actorSessionId, actorInstanceKey, generation, dispatchId, kind: value.kind,
+	});
+}
+
+function parseTurnFileIdentity(value: unknown): WorkerTurnFileIdentity | undefined {
+	if (!isRecord(value)) return undefined;
+	const canonicalPath = boundedTurnText(value.canonicalPath, TURN_PATH_LIMIT);
+	const device = value.device;
+	const inode = value.inode;
+	if (canonicalPath === undefined || !path.isAbsolute(canonicalPath)) return undefined;
+	if (typeof device !== "string" || !TURN_DEVICE.test(device) || typeof inode !== "string" || !TURN_DEVICE.test(inode)) return undefined;
+	return Object.freeze({ canonicalPath, device, inode });
+}
+
+function parseTurnChildIdentity(value: unknown): WorkerTurnChildIdentity | undefined {
+	if (!isRecord(value)) return undefined;
+	const sessionIdSha256 = value.sessionIdSha256;
+	const registryInstance = boundedTurnText(value.registryInstance);
+	const generation = typeof value.generation === "number" && Number.isSafeInteger(value.generation) && value.generation >= 0 ? value.generation : undefined;
+	const sessionFile = parseTurnFileIdentity(value.sessionFile);
+	const checkout = parseTurnFileIdentity(value.checkout);
+	if (typeof sessionIdSha256 !== "string" || !TURN_DIGEST.test(sessionIdSha256) || registryInstance === undefined ||
+		generation === undefined || sessionFile === undefined || checkout === undefined) {
+		return undefined;
+	}
+	return Object.freeze({ sessionIdSha256, sessionFile, checkout, registryInstance, generation });
+}
+
+function parseTurnIntegrationRef(value: unknown): WorkerTurnIntegrationRef | undefined {
+	if (!isRecord(value)) return undefined;
+	const runId = boundedTurnText(value.runId);
+	const dispatch = boundedTurnText(value.dispatch);
+	const candidateId = boundedTurnText(value.candidateId);
+	const policyProofId = boundedTurnText(value.policyProofId);
+	const slotOwnerToken = boundedTurnText(value.slotOwnerToken);
+	const guardBuild = boundedTurnText(value.guardBuild);
+	if (runId === undefined || dispatch === undefined || candidateId === undefined || policyProofId === undefined ||
+		slotOwnerToken === undefined || guardBuild === undefined) {
+		return undefined;
+	}
+	return Object.freeze({ runId, dispatch, candidateId, policyProofId, slotOwnerToken, guardBuild });
+}
+
+function parseTurnHostOwner(value: unknown): WorkerTurnHostOwner | undefined {
+	if (!isRecord(value)) return undefined;
+	const pid = value.pid;
+	const processStart = value.processStart;
+	const host = boundedTurnText(value.host);
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return undefined;
+	if (typeof processStart !== "number" || !Number.isSafeInteger(processStart) || processStart < 0) return undefined;
+	if (host === undefined) return undefined;
+	return Object.freeze({ pid, processStart, host });
+}
+
+function parseTurnBinding(value: unknown, key?: string, attempt?: string, token?: string): WorkerAdmissionTurn | undefined {
+	if (!isRecord(value) || value.schema !== WORKER_TURN_SCHEMA) return undefined;
+	if (typeof value.build !== "string" || value.build.length === 0 || value.build.length > MAX_ID) return undefined;
+	const bindingKey = boundedTurnText(value.key);
+	const bindingAttempt = boundedTurnText(value.attempt);
+	const boundAt = value.boundAt;
+	const turn = parseWorkerTurnScope(value.turn);
+	// Reject unknown/extra fields in the mutable turn object: a revalidated native tuple is rebuilt from the exact fields.
+	if (turn === undefined || value.turn === undefined || canonicalJson(turn) !== canonicalJson(value.turn)) return undefined;
+	const child = parseTurnChildIdentity(value.child);
+	const host = parseTurnHostOwner(value.host);
+	const integration = value.integration === undefined ? undefined : parseTurnIntegrationRef(value.integration);
+	if (bindingKey === undefined || bindingAttempt === undefined || child === undefined || host === undefined ||
+		typeof boundAt !== "number" || !Number.isFinite(boundAt) || boundAt <= 0) {
+		return undefined;
+	}
+	if (value.integration !== undefined && integration === undefined) return undefined;
+	if (key !== undefined && bindingKey !== key) return undefined;
+	if (attempt !== undefined && bindingAttempt !== attempt) return undefined;
+	if (token !== undefined && turn.token !== token) return undefined;
+	// The stored scope and child identity must be one internally consistent tuple; a tampered clone never reads as one attempt.
+	if (sha256Hex(turn.actorSessionId) !== child.sessionIdSha256 || turn.actorInstanceKey !== child.registryInstance ||
+		turn.generation !== child.generation) {
+		return undefined;
+	}
+	return Object.freeze({
+		schema: WORKER_TURN_SCHEMA,
+		build: value.build,
+		key: bindingKey,
+		attempt: bindingAttempt,
+		turn,
+		child,
+		...(integration === undefined ? {} : { integration }),
+		host,
+		boundAt,
+	});
+}
+
+/** `boundAt` is the first binding's clock reading; a retry of the same exact tuple is idempotent, not a conflict. */
+function sameTurnBinding(a: WorkerAdmissionTurn, b: WorkerAdmissionTurn): boolean {
+	return a.schema === b.schema && a.build === b.build && a.key === b.key && a.attempt === b.attempt &&
+		canonicalJson(a.turn) === canonicalJson(b.turn) && canonicalJson(a.child) === canonicalJson(b.child) &&
+		canonicalJson(a.integration ?? null) === canonicalJson(b.integration ?? null) && canonicalJson(a.host) === canonicalJson(b.host);
+}
+
+function turnFile(dir: string, key: string, attempt: string): string {
+	if (!KEY.test(key) || !ATTEMPT.test(attempt)) throw new Error("자식 턴 기록의 키나 시도가 올바르지 않습니다");
+	return path.join(dir, `${key}.${attempt}.turn`);
+}
+
+/** Why this exact attempt is not currently open. It never looks up a newer attempt. */
+function openTurnProblem(record: WorkerAdmissionRecord, key: string, attempt: string, now: number): { code: string; reason: string } | undefined {
+	if (record.build !== buildId()) return { code: "record-build", reason: "다른 빌드의 Storm이 쓴 자식 권한 기록입니다" };
+	if (record.key !== key) return { code: "record-key", reason: "자식 권한 키가 다릅니다" };
+	if (record.attempt !== attempt) return { code: "attempt-replaced", reason: "이 자식 작업 시도는 더 새로운 시도로 교체됐습니다" };
+	if (record.revokedAt !== undefined) return { code: "revoked", reason: "이 작업의 실행 권한이 취소됐습니다" };
+	if (record.endedAt !== undefined) return { code: "ended", reason: "이 작업의 실행 권한은 이번 턴에서 끝났습니다" };
+	if (record.expiresAt <= now) return { code: "expired", reason: "이 작업의 실행 권한이 만료됐습니다" };
+	return undefined;
+}
+
+/** Scope-to-record relations only; the caller has already checked the record's own open state. */
+function turnRecordProblem(record: WorkerAdmissionRecord, turn: ManagedWorkerTurnScope, key: string, attempt: string): { code: string; reason: string } | undefined {
+	if (turn.admissionKey !== key || turn.admissionAttempt !== attempt) {
+		return { code: "turn-admission", reason: "네이티브 턴이 이 자식 작업 시도와 다릅니다" };
+	}
+	if (turn.runId !== record.runId) return { code: "run-mismatch", reason: "네이티브 턴의 실행 id가 자식 권한 기록과 다릅니다" };
+	if (turn.ownerSessionId !== record.sessionId) return { code: "owner-session", reason: "네이티브 턴의 소유 세션이 자식 권한 기록과 다릅니다" };
+	if (turn.parentAgentId !== record.parentId) return { code: "parent-agent", reason: "네이티브 턴의 부모 에이전트가 자식 권한 기록과 다릅니다" };
+	if (turn.agentId !== record.childId) return { code: "actor-agent", reason: "네이티브 턴의 자식 에이전트가 자식 권한 기록과 다릅니다" };
+	return undefined;
+}
+
+function expectationProblem(turn: ManagedWorkerTurnScope, expect: WorkerTurnExpectation | undefined): { code: string; reason: string } | undefined {
+	if (expect === undefined) return undefined;
+	if (expect.runId !== undefined && expect.runId !== turn.runId) return { code: "expect-run", reason: "현재 네이티브 실행 id가 결속된 턴과 다릅니다" };
+	if (expect.actorSessionId !== undefined && expect.actorSessionId !== turn.actorSessionId) return { code: "expect-actor-session", reason: "현재 자식 세션 id가 결속된 턴과 다릅니다" };
+	if (expect.actorInstanceKey !== undefined && expect.actorInstanceKey !== turn.actorInstanceKey) return { code: "expect-actor-instance", reason: "현재 자식 세션 인스턴스가 결속된 턴과 다릅니다" };
+	if (expect.generation !== undefined && expect.generation !== turn.generation) return { code: "expect-generation", reason: "현재 자식 레지스트리 세대가 결속된 턴과 다릅니다" };
+	if (expect.dispatchId !== undefined && expect.dispatchId !== turn.dispatchId) return { code: "expect-dispatch", reason: "현재 네이티브 디스패치가 결속된 턴과 다릅니다" };
+	if (expect.kind !== undefined && expect.kind !== turn.kind) return { code: "expect-kind", reason: "현재 턴 종류가 결속된 턴과 다릅니다" };
+	return undefined;
+}
+
+async function readTurnFile(file: string, key: string, attempt: string, token?: string): Promise<WorkerAdmissionTurn | "missing" | "invalid"> {
+	const read = await readRecordFile(file, TURN_MAX_BYTES);
+	if (read.kind === "missing") return "missing";
+	if (read.kind !== "value") return "invalid";
+	const binding = parseTurnBinding(read.value, key, attempt, token);
+	return binding === undefined || binding.build !== buildId() ? "invalid" : binding;
+}
+
+async function publishTurnFile(
+	file: string,
+	binding: WorkerAdmissionTurn,
+	held: () => Promise<boolean>,
+): Promise<"created" | "exists" | "failed" | "lost"> {
+	const dir = path.dirname(file);
+	const temp = path.join(dir, `.${path.basename(file)}.${randomUUID()}.tmp`);
+	let handle: FileHandle | undefined;
+	try {
+		handle = await open(temp, "wx", 0o600);
+		await handle.writeFile(`${JSON.stringify(binding, null, 2)}\n`, "utf8");
+	} catch {
+		return "failed";
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+	try {
+		// The lock's new owner may have replaced this attempt while the content was being written. A holder that no longer
+		// owns the token publishes nothing.
+		if (!(await held())) return "lost";
+		await link(temp, file);
+		await chmod(file, 0o600).catch(() => undefined);
+		return "created";
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EEXIST" ? "exists" : "failed";
+	} finally {
+		await rm(temp, { force: true }).catch(() => undefined);
+	}
+}
+
+/**
+ * Bind one exact native first-turn tuple to the current durable worker attempt and physical child/session identity. The
+ * record is re-read under its per-key lock after every caller await; a replacement, revoke, end or expiry writes nothing.
+ * A second bind of the same attempt may return `already-bound` only for the byte-identical tuple.
+ */
+export async function bindWorkerAdmissionTurn(input: {
+	agentDir: string;
+	key: string;
+	attempt: string;
+	turn: unknown;
+	child: WorkerTurnChildIdentity;
+	integration?: WorkerTurnIntegrationRef;
+	host: WorkerTurnHostOwner;
+	now?: number;
+}): Promise<WorkerTurnBindResult> {
+	const turn = parseWorkerTurnScope(input.turn);
+	const child = parseTurnChildIdentity(input.child);
+	const integration = input.integration === undefined ? undefined : parseTurnIntegrationRef(input.integration);
+	const host = parseTurnHostOwner(input.host);
+	if (!KEY.test(input.key) || !ATTEMPT.test(input.attempt)) return { kind: "refused", code: "identity-invalid", reason: "자식 권한 키나 시도가 올바르지 않습니다" };
+	if (turn === undefined) return { kind: "refused", code: "turn-invalid", reason: "네이티브 턴의 형식이 올바르지 않습니다" };
+	if (turn.admissionKey !== input.key || turn.admissionAttempt !== input.attempt) {
+		return { kind: "refused", code: "turn-admission", reason: "네이티브 턴이 이 자식 작업 시도와 다릅니다" };
+	}
+	if (child === undefined) return { kind: "refused", code: "child-invalid", reason: "물리 자식 신원이 올바르지 않습니다" };
+	if (sha256Hex(turn.actorSessionId) !== child.sessionIdSha256 || turn.actorInstanceKey !== child.registryInstance ||
+		turn.generation !== child.generation) {
+		return { kind: "refused", code: "child-mismatch", reason: "물리 자식 신원이 네이티브 턴의 액터, 인스턴스 또는 세대와 다릅니다" };
+	}
+	if (host === undefined) return { kind: "refused", code: "host-invalid", reason: "자식 호스트 신원이 올바르지 않습니다" };
+	if (input.integration !== undefined && integration === undefined) return { kind: "refused", code: "integration-invalid", reason: "통합 승인 참조가 올바르지 않습니다" };
+	if (integration !== undefined && (integration.runId !== turn.runId || integration.guardBuild !== turn.guard)) {
+		return { kind: "refused", code: "integration-mismatch", reason: "통합 승인 참조의 실행 id나 가드가 네이티브 턴과 다릅니다" };
+	}
+	const now = input.now ?? Date.now();
+	const initial = await readWorkerAdmissionByKey(input.agentDir, input.key);
+	if (initial.kind !== "record") {
+		return { kind: "refused", code: initial.kind === "missing" ? "record-missing" : "record-invalid", reason: initial.kind === "missing" ? "이 자식 작업 시도의 권한 기록이 없습니다" : initial.reason };
+	}
+	let dir: string;
+	try {
+		dir = await ensureAdmissionsDir(input.agentDir, initial.record.targetRoot);
+	} catch (error) {
+		return { kind: "refused", code: "store-unavailable", reason: error instanceof Error ? error.message : "자식 권한 저장소를 확인하지 못했습니다" };
+	}
+	const binding: WorkerAdmissionTurn = Object.freeze({
+		schema: WORKER_TURN_SCHEMA,
+		build: buildId(),
+		key: input.key,
+		attempt: input.attempt,
+		turn,
+		child,
+		...(integration === undefined ? {} : { integration }),
+		host,
+		boundAt: now,
+	});
+	const file = turnFile(dir, input.key, input.attempt);
+	return withRecordLock(dir, input.key, async held => {
+		const read = await readRecordFile(admissionFile(dir, input.key));
+		if (read.kind !== "value" || !isAdmission(read.value)) return { kind: "refused" as const, code: "record-invalid", reason: "자식 권한 기록을 읽지 못했습니다" };
+		const record = read.value;
+		const open = openTurnProblem(record, input.key, input.attempt, now);
+		if (open !== undefined) return { kind: "refused" as const, ...open };
+		const relation = turnRecordProblem(record, turn, input.key, input.attempt);
+		if (relation !== undefined) return { kind: "refused" as const, ...relation };
+		const existing = await readTurnFile(file, input.key, input.attempt);
+		if (existing === "invalid") return { kind: "refused" as const, code: "turn-file-invalid", reason: "기존 자식 턴 기록이 올바르지 않습니다" };
+		if (existing === "missing") {
+			const published = await publishTurnFile(file, binding, held);
+			if (published === "created") return { kind: "bound" as const, record, binding };
+			if (published === "lost") return { kind: "refused" as const, code: "lock-lost", reason: "자식 권한 기록의 잠금이 다른 사본으로 넘어가 턴을 기록하지 않았습니다" };
+			if (published === "failed") return { kind: "refused" as const, code: "turn-write-failed", reason: "자식 턴 기록을 저장하지 못했습니다" };
+			const raced = await readTurnFile(file, input.key, input.attempt);
+			if (raced === "invalid") return { kind: "refused" as const, code: "turn-file-invalid", reason: "기존 자식 턴 기록이 올바르지 않습니다" };
+			if (raced === "missing") return { kind: "refused" as const, code: "turn-write-failed", reason: "자식 턴 기록을 저장하지 못했습니다" };
+			return sameTurnBinding(raced, binding)
+				? { kind: "already-bound" as const, record, binding: raced }
+				: { kind: "refused" as const, code: "turn-conflict", reason: "이 자식 작업 시도에 다른 네이티브 턴이 이미 결속됐습니다" };
+		}
+		return sameTurnBinding(existing, binding)
+			? { kind: "already-bound" as const, record, binding: existing }
+			: { kind: "refused" as const, code: "turn-conflict", reason: "이 자식 작업 시도에 다른 네이티브 턴이 이미 결속됐습니다" };
+	});
+}
+
+/** Prove only the exact attempt/token, with optional live-context expectations. Missing is a refusal, not "unmanaged". */
+export async function readWorkerAdmissionTurn(input: {
+	agentDir: string;
+	key: string;
+	attempt: string;
+	turnToken: string;
+	expect?: WorkerTurnExpectation;
+	now?: number;
+}): Promise<WorkerTurnReadResult> {
+	if (!KEY.test(input.key) || !ATTEMPT.test(input.attempt) || typeof input.turnToken !== "string" ||
+		input.turnToken.length === 0 || input.turnToken.length > TURN_TOKEN_LIMIT) {
+		return { kind: "refused", code: "identity-invalid", reason: "자식 권한 키, 시도 또는 턴 토큰이 올바르지 않습니다" };
+	}
+	const read = await readWorkerAdmissionByKey(input.agentDir, input.key);
+	if (read.kind !== "record") {
+		return { kind: "refused", code: read.kind === "missing" ? "record-missing" : "record-invalid", reason: read.kind === "missing" ? "이 자식 작업 시도의 권한 기록이 없습니다" : read.reason };
+	}
+	const record = read.record;
+	const now = input.now ?? Date.now();
+	const open = openTurnProblem(record, input.key, input.attempt, now);
+	if (open !== undefined) return { kind: "refused", ...open };
+	const readBinding = await readTurnFile(turnFile(admissionsDir(input.agentDir), input.key, input.attempt), input.key, input.attempt, input.turnToken);
+	if (readBinding === "missing") return { kind: "refused", code: "turn-missing", reason: "이 자식 작업 시도의 결속된 네이티브 턴이 없습니다" };
+	if (readBinding === "invalid") return { kind: "refused", code: "turn-file-invalid", reason: "자식 턴 기록이 올바르지 않습니다" };
+	const relation = turnRecordProblem(record, readBinding.turn, input.key, input.attempt);
+	if (relation !== undefined) return { kind: "refused", ...relation };
+	const expected = expectationProblem(readBinding.turn, input.expect);
+	if (expected !== undefined) return { kind: "refused", ...expected };
+	return { kind: "proved", record, binding: readBinding };
+}
+
+/**
+ * End exactly the attempt and turn that were bound. The record CAS compares the full prior record, so a replaced attempt,
+ * a revoked record, changed scope or missing turn writes nothing and never ends the newest attempt.
+ */
+export async function endWorkerAdmissionTurn(input: {
+	agentDir: string;
+	key: string;
+	attempt: string;
+	turnToken: string;
+	childSessionId: string;
+	now?: number;
+}): Promise<WorkerTurnEndResult> {
+	if (!KEY.test(input.key) || !ATTEMPT.test(input.attempt) || typeof input.turnToken !== "string" ||
+		input.turnToken.length === 0 || input.turnToken.length > TURN_TOKEN_LIMIT) {
+		return { kind: "refused", code: "identity-invalid", reason: "자식 권한 키, 시도 또는 턴 토큰이 올바르지 않습니다" };
+	}
+	const session = boundedTurnText(input.childSessionId);
+	if (session === undefined) return { kind: "refused", code: "session-invalid", reason: "자식 세션 id가 올바르지 않습니다" };
+	const read = await readWorkerAdmissionByKey(input.agentDir, input.key);
+	if (read.kind !== "record") {
+		return { kind: "refused", code: read.kind === "missing" ? "record-missing" : "record-invalid", reason: read.kind === "missing" ? "이 자식 작업 시도의 권한 기록이 없습니다" : read.reason };
+	}
+	const readBinding = await readTurnFile(turnFile(admissionsDir(input.agentDir), input.key, input.attempt), input.key, input.attempt, input.turnToken);
+	if (readBinding === "missing") return { kind: "refused", code: "turn-missing", reason: "이 자식 작업 시도의 결속된 네이티브 턴이 없습니다" };
+	if (readBinding === "invalid") return { kind: "refused", code: "turn-file-invalid", reason: "자식 턴 기록이 올바르지 않습니다" };
+	if (readBinding.turn.actorSessionId !== session || readBinding.child.sessionIdSha256 !== sha256Hex(session)) {
+		return { kind: "refused", code: "session-mismatch", reason: "이 자식 세션이 결속된 턴의 세션과 다릅니다" };
+	}
+	const now = input.now ?? Date.now();
+	const record = read.record;
+	if (record.key !== input.key || record.build !== buildId()) return { kind: "refused", code: "record-invalid", reason: "자식 권한 기록의 신원이 올바르지 않습니다" };
+	if (record.attempt !== input.attempt) return { kind: "refused", code: "attempt-replaced", reason: "이 자식 작업 시도는 더 새로운 시도로 교체됐습니다" };
+	if (record.revokedAt !== undefined) return { kind: "refused", code: "revoked", reason: "이 작업의 실행 권한이 취소됐습니다" };
+	const relation = turnRecordProblem(record, readBinding.turn, input.key, input.attempt);
+	if (relation !== undefined) return { kind: "refused", ...relation };
+	if (record.endedAt !== undefined) return { kind: "already-ended", record, binding: readBinding };
+	if (record.expiresAt <= now) return { kind: "refused", code: "expired", reason: "이 작업의 실행 권한이 만료됐습니다" };
+	const dir = admissionsDir(input.agentDir);
+	const file = admissionFile(dir, input.key);
+	const changed = await mutateRecord(dir, file, input.key, current => {
+		if (current.attempt !== input.attempt || current.build !== buildId()) return undefined;
+		if (current.revokedAt !== undefined || current.endedAt !== undefined) return undefined;
+		if (current.expiresAt <= now) return undefined;
+		if (turnRecordProblem(current, readBinding.turn, input.key, input.attempt) !== undefined) return undefined;
+		return { ...current, endedAt: now };
+	});
+	const after = await readWorkerAdmissionByKey(input.agentDir, input.key);
+	if (after.kind !== "record") return { kind: "refused", code: "end-unproved", reason: "턴을 끝낸 뒤 자식 권한 기록을 다시 읽지 못했습니다" };
+	if (after.record.attempt !== input.attempt) return { kind: "refused", code: "attempt-replaced", reason: "턴을 끝내는 사이 더 새로운 시도가 열렸습니다" };
+	if (!changed) {
+		if (after.record.endedAt !== undefined) return { kind: "already-ended", record: after.record, binding: readBinding };
+		if (after.record.revokedAt !== undefined) return { kind: "refused", code: "revoked", reason: "이 작업의 실행 권한이 취소됐습니다" };
+		if (after.record.expiresAt <= now) return { kind: "refused", code: "expired", reason: "이 작업의 실행 권한이 만료됐습니다" };
+		return { kind: "refused", code: "end-not-applied", reason: "이 자식 작업 시도의 턴을 끝내지 못했습니다" };
+	}
+	return { kind: "ended", record: after.record, binding: readBinding };
+}
 
 function identity(value: unknown, what: string): string {
 	if (typeof value !== "string" || value.trim() === "" || CONTROL_CHARS.test(value) || value.length > MAX_ID) {
@@ -586,6 +1075,11 @@ async function prune(dir: string, now: number, admittedNames?: readonly string[]
 				}
 			}
 			records.push({ name, at: record.createdAt, closed, live, record });
+			continue;
+		}
+		if (name.endsWith(".turn")) {
+			// A turn binding lives as long as the admission it belongs to can; the 24h claim sweep must not remove it.
+			if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true });
 			continue;
 		}
 		if (name.endsWith(".claim") && now - info.mtimeMs > CLOSED_TTL_MS) await rm(file, { force: true });
@@ -1246,6 +1740,28 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	return { key, record };
 }
 
+/**
+ * Read one record by its exact durable key, never by a newest-row lookup. The caller must still compare its parent/child/
+ * artifact identity; this is the only lookup the managed-turn path uses.
+ */
+export async function readWorkerAdmissionByKey(agentDir: string, key: string): Promise<WorkerAdmissionRead> {
+	if (!KEY.test(key)) return { kind: "invalid", reason: "자식 권한 키가 올바르지 않습니다" };
+	let dir: string;
+	try {
+		dir = admissionsDir(agentDir);
+	} catch {
+		return { kind: "invalid", reason: "에이전트 디렉터리가 올바르지 않습니다" };
+	}
+	const read = await readRecordFile(admissionFile(dir, key));
+	if (read.kind === "missing") return { kind: "missing" };
+	if (read.kind === "invalid") return read;
+	if (!isAdmission(read.value)) return { kind: "invalid", reason: "자식 권한 기록의 형식이 올바르지 않습니다" };
+	const record = read.value;
+	if (record.build !== buildId()) return { kind: "invalid", reason: "다른 빌드의 Storm이 쓴 자식 권한 기록입니다" };
+	if (record.key !== key) return { kind: "invalid", reason: "자식 권한 기록의 신원이 일치하지 않습니다" };
+	return { kind: "record", key, record };
+}
+
 /** A record for exactly this host parent/child/artifact identity; missing is unmanaged, invalid is fail-closed. */
 export async function readWorkerAdmission(input: {
 	agentDir: string;
@@ -1264,18 +1780,13 @@ export async function readWorkerAdmission(input: {
 	}
 	const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 	if (artifactRoot === undefined) return { kind: "missing" };
-	const dir = admissionsDir(input.agentDir);
 	const key = workerAdmissionKey(artifactRoot, parentId, childId);
-	const read = await readRecordFile(admissionFile(dir, key));
-	if (read.kind === "missing") return { kind: "missing" };
-	if (read.kind === "invalid") return read;
-	if (!isAdmission(read.value)) return { kind: "invalid", reason: "자식 권한 기록의 형식이 올바르지 않습니다" };
-	const record = read.value;
-	if (record.build !== buildId()) return { kind: "invalid", reason: "다른 빌드의 Storm이 쓴 자식 권한 기록입니다" };
-	if (record.key !== key || record.parentId !== parentId || record.childId !== childId || record.artifactRoot !== artifactRoot) {
+	const read = await readWorkerAdmissionByKey(input.agentDir, key);
+	if (read.kind !== "record") return read;
+	if (read.record.parentId !== parentId || read.record.childId !== childId || read.record.artifactRoot !== artifactRoot) {
 		return { kind: "invalid", reason: "자식 권한 기록의 신원이 일치하지 않습니다" };
 	}
-	return { kind: "record", key, record };
+	return read;
 }
 
 /**
