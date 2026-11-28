@@ -1,0 +1,32 @@
+{
+	"w": 72,
+	"h": 63,
+	"anchor": {
+		"x": 36,
+		"y": 57
+	},
+	"frameMs": 83,
+	"durationMs": 1200,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "gather.a.svg"
+		},
+		{
+			"at": 500,
+			"svg": "gather.b.svg",
+			"ease": "out"
+		},
+		{
+			"at": 900,
+			"svg": "gather.c.svg",
+			"ease": "out"
+		},
+		{
+			"at": 1200,
+			"svg": "gather.d.svg",
+			"ease": "out"
+		}
+	]
+}

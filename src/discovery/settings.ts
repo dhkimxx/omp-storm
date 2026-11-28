@@ -4,6 +4,7 @@ import {
 	cfgTaskIsolationApply,
 	cfgTaskIsolationEnabled,
 	cfgTaskMaxConcurrency,
+	cfgTaskWorkerThreads,
 } from "@oh-my-pi/pi-coding-agent/task/settings";
 import type { Exec, ExplicitSettings } from "../types.ts";
 
@@ -108,6 +109,22 @@ export function taskMaxConcurrencyOf(settings: Settings | undefined): number | u
 export function liveTaskMaxConcurrency(): number | undefined {
 	try {
 		return taskMaxConcurrencyOf(findScopedSettings());
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The live session's `task.workerThreads`: above zero, omp 19.2.1 may put concurrent subagent runs past its first eight on
+ * pooled threads (`thread/subagent-worker.ts`), where Storm stops them; 0 keeps every run on the main thread. An
+ * uninitialised host or a value the getter rejects is unknown.
+ */
+export function liveTaskWorkerThreads(): number | undefined {
+	try {
+		const settings = findScopedSettings();
+		if (settings === undefined) return undefined;
+		const value = cfgTaskWorkerThreads.get(settings);
+		return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
 	} catch {
 		return undefined;
 	}
@@ -394,12 +411,11 @@ export function observeDirectorIsolation(input: {
 }
 
 /**
- * The proof a later host seam would mint once it can carry the resolved backend/factory token. This
- * pin cannot: it returns the fail-closed problem instead of fabricating a `backendProofId`. Kept as
- * one function so the seam changes only here.
+ * The first explicit isolation setting a managed private launch needs and `snapshot` does not hold: enabled, apply off,
+ * patch merge, no AI commit helper, and an explicit backend. Undefined when all hold. The launch proof and the preflight
+ * report read this one answer; an unknown value counts as not held.
  */
-function proofProblem(observation: DirectorIsolationObservation): IntegrationProblem {
-	const { snapshot } = observation;
+export function isolationPolicyProblem(snapshot: Partial<IsolationPolicySnapshot>): IntegrationProblem | undefined {
 	if (snapshot.enabled !== true) return isolationProblem("isolation-disabled", "task.isolation.enabled가 true가 아닙니다.");
 	if (snapshot.apply !== false) return isolationProblem("isolation-apply-on", "task.isolation.apply가 false가 아닙니다.");
 	if (snapshot.merge !== "patch") return isolationProblem("isolation-merge-not-patch", "task.isolation.merge가 patch가 아닙니다.");
@@ -407,7 +423,29 @@ function proofProblem(observation: DirectorIsolationObservation): IntegrationPro
 	if (snapshot.backend === undefined || snapshot.backend === "auto") {
 		return isolationProblem(ISOLATION_BACKEND_UNPROVEN, "isolation.backend가 auto이거나 읽히지 않아 ovnfs 경로를 배제하지 못했습니다.");
 	}
-	return backendProblem();
+	return undefined;
+}
+
+/**
+ * The isolation values of the settings instance the current extension scope sees, without a subprocess. Fields this
+ * host cannot read are absent (unknown), never off.
+ */
+export function liveIsolationPolicy(): Partial<IsolationPolicySnapshot> {
+	try {
+		const settings = findScopedSettings();
+		return settings === undefined ? {} : snapshotOf(settings);
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * The proof a later host seam would mint once it can carry the resolved backend/factory token. This
+ * pin cannot: it returns the fail-closed problem instead of fabricating a `backendProofId`. Kept as
+ * one function so the seam changes only here.
+ */
+function proofProblem(observation: DirectorIsolationObservation): IntegrationProblem {
+	return isolationPolicyProblem(observation.snapshot) ?? backendProblem();
 }
 
 /** The launch problem for one armed observation, without minting a proof or a new listener. */

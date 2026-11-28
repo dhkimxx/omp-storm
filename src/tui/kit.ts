@@ -27,11 +27,12 @@ import {
 } from "@oh-my-pi/pi-tui";
 import { singleLine } from "@oh-my-pi/pi-tui/text/sanitize";
 import { truncate, visibleWidth, wrap } from "@oh-my-pi/pi-tui/text/width";
-import type { Block, Hit, PaintContext, Painter } from "@oh-my-pi/pi-tui/term/paint";
+import type { Block, Hit, PaintContext, PaintImages, Painter } from "@oh-my-pi/pi-tui/term/paint";
+import type { ImageRows, ImageSource } from "@oh-my-pi/pi-tui/driver/images/store";
 import type { Theme } from "@oh-my-pi/pi-tui/theme/contract";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 
-export type { Accessor, Block, Hit, JSXNode, KeyEvent, PaintContext, Painter, ScrollRequest, Signal, Theme, UiEvent, UiNode };
+export type { Accessor, Block, Hit, ImageRows, ImageSource, JSXNode, KeyEvent, PaintContext, PaintImages, Painter, ScrollRequest, Signal, Theme, UiEvent, UiNode };
 /** Whether this process draws natively (Tern) right now; reactive when read inside a node prop. */
 export { batch, computed, nativeRendering, signal, singleLine, truncate, visibleWidth, wrap };
 
@@ -94,5 +95,55 @@ export async function registerRolePainters(
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+/** What the stage needs to know about the terminal it draws in. */
+export interface TerminalFacts {
+	images: "kitty" | "sixel" | "iterm" | null;
+	multiplexer: "tmux" | "zellij" | "screen" | null;
+	truecolor: boolean;
+	/** Kitty draws images as placeholder cells. */
+	placeholders: boolean;
+}
+
+type SessionModule = {
+	terminalCapabilities(): { images: TerminalFacts["images"]; multiplexer: TerminalFacts["multiplexer"]; truecolor: boolean };
+	terminalIdentity(): { id: string };
+};
+type KittyModule = { kittyPlaceholdersSupported(terminal: string, env: Readonly<Record<string, string | undefined>>): boolean };
+
+let terminalModules: { session: SessionModule; kitty: KittyModule } | null | undefined;
+
+/**
+ * Loads the host's terminal facts (internal subpaths, imported dynamically like the role painters: a failure only
+ * leaves `terminalFacts` undefined). Safe to call more than once.
+ */
+export async function loadTerminalFacts(): Promise<boolean> {
+	if (terminalModules !== undefined) return terminalModules !== null;
+	try {
+		const session = (await import("@oh-my-pi/pi-tui/driver/session")) as unknown as SessionModule;
+		const kitty = (await import("@oh-my-pi/pi-tui/driver/images/kitty")) as unknown as KittyModule;
+		terminalModules = { session, kitty };
+	} catch {
+		terminalModules = null;
+	}
+	return terminalModules !== null;
+}
+
+/** The running terminal's facts (the driver's after its probes, else the environment's); undefined until loaded. */
+export function terminalFacts(): TerminalFacts | undefined {
+	if (!terminalModules) return undefined;
+	try {
+		const caps = terminalModules.session.terminalCapabilities();
+		const id = terminalModules.session.terminalIdentity().id;
+		return {
+			images: caps.images,
+			multiplexer: caps.multiplexer,
+			truecolor: caps.truecolor,
+			placeholders: caps.images === "kitty" && terminalModules.kitty.kittyPlaceholdersSupported(id, process.env),
+		};
+	} catch {
+		return undefined;
 	}
 }

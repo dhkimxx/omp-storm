@@ -159,6 +159,22 @@ export interface TaskIsolationHost {
 	apply?: boolean;
 }
 
+/**
+ * An isolated placement is refused while omp's isolation is not proven on (`task.isolation.enabled`): unknown is off.
+ * The placement gate and the preflight report read this one answer.
+ */
+export function isolationOff(host: { readonly enabled?: boolean | undefined } | undefined): boolean {
+	return host?.enabled !== true;
+}
+
+/**
+ * An isolated placement is refused while omp may merge an isolated worker's changes into the parent tree after it ended
+ * (`task.isolation.apply` not proven false): unknown is on. The placement gate and the preflight report read this one answer.
+ */
+export function isolationApplies(host: { readonly apply?: boolean | undefined } | undefined): boolean {
+	return host?.apply !== false;
+}
+
 export interface TaskPlacementOptions {
 	/** Automatic delegation reserves and rewrites task names; manual direction keeps the director's handles. */
 	rewriteNames?: boolean;
@@ -1474,7 +1490,7 @@ function describePlacement(
 		placed.push({ item, lane, agent, desired, requiresIsolation, selective, scope, toolsCarried, ...(note === undefined ? {} : { note }) });
 	}
 	const needing = placed.find(entry => entry.requiresIsolation);
-	if (needing !== undefined && options.host?.enabled !== true) {
+	if (needing !== undefined && isolationOff(options.host)) {
 		return {
 			ok: false,
 			reason: needing.lane === undefined
@@ -1485,7 +1501,7 @@ function describePlacement(
 	// Every isolated placement, a lane with an isolation reason and a team that says isolated alike, needs omp's merge of
 	// an isolated worker's changes into the parent tree off: it happens after the worker ended, with nothing reserved.
 	const merged = placed.find(entry => entry.requiresIsolation);
-	if (merged !== undefined && options.host?.apply !== false) {
+	if (merged !== undefined && isolationApplies(options.host)) {
 		return {
 			ok: false,
 			reason: merged.lane === undefined

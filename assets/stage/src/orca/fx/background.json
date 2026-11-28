@@ -1,0 +1,38 @@
+{
+	"w": 432,
+	"h": 90,
+	"anchor": {
+		"x": 0,
+		"y": 0
+	},
+	"frameMs": 667,
+	"durationMs": 4000,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "background.a.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1000,
+			"svg": "background.b.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2000,
+			"svg": "background.c.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 3000,
+			"svg": "background.d.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 4000,
+			"svg": "background.a.svg",
+			"ease": "linear"
+		}
+	]
+}

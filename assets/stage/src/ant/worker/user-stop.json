@@ -1,0 +1,42 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 83,
+	"durationMs": 1200,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "user-stop.a.svg"
+		},
+		{
+			"at": 300,
+			"svg": "user-stop.b.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 550,
+			"svg": "user-stop.c.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 800,
+			"svg": "user-stop.d.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1000,
+			"svg": "user-stop.e.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1200,
+			"svg": "user-stop.f.svg",
+			"ease": "linear"
+		}
+	]
+}

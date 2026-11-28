@@ -6,6 +6,7 @@ import { assertSessionStoreSafe } from "../session-scope.ts";
 import { serializeConfig } from "../config/store.ts";
 import { readJson, writeJsonAtomic, writeTextAtomic } from "../fsutil.ts";
 import type { ApprovalRecord, ApprovalScope, RepoIdentity, StormConfig } from "../types.ts";
+import { saveLastTeam } from "./last-team.ts";
 
 const HASH_PREFIX = "jcs-sha256:";
 const LOCK_STALE_MS = 30_000;
@@ -185,6 +186,10 @@ export class ApprovalStore {
 			};
 			await writeTextAtomic(this.snapshotPath(hex), serializeConfig(input.config));
 			await writeJsonAtomic(this.approvedPath(hex), record);
+			// The next session for this target suggests this team. A suggestion is not consent, so a profile that cannot take
+			// it leaves the approval as it is: the session's `<agentDir>/storm/sessions/<id>` names the profile.
+			const agentDir = path.dirname(path.dirname(path.dirname(this.sessionDir)));
+			await saveLastTeam(agentDir, this.targetKey, input.config, new Date(record.approvedAt)).catch(() => undefined);
 			return record;
 		});
 	}

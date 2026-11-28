@@ -1,0 +1,54 @@
+{
+	"w": 36,
+	"h": 27,
+	"anchor": {
+		"x": 18,
+		"y": 13
+	},
+	"frameMs": 83,
+	"durationMs": 2400,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "gather.a.svg"
+		},
+		{
+			"at": 180,
+			"svg": "gather.b.svg"
+		},
+		{
+			"at": 360,
+			"svg": "gather.c.svg"
+		},
+		{
+			"at": 540,
+			"svg": "gather.b.svg"
+		},
+		{
+			"at": 720,
+			"svg": "gather.c.svg"
+		},
+		{
+			"at": 900,
+			"svg": "gather.b.svg"
+		},
+		{
+			"at": 1080,
+			"svg": "gather.c.svg"
+		},
+		{
+			"at": 1260,
+			"svg": "gather.b.svg"
+		},
+		{
+			"at": 1700,
+			"svg": "gather.d.svg",
+			"ease": "out"
+		},
+		{
+			"at": 2400,
+			"svg": "gather.e.svg"
+		}
+	]
+}

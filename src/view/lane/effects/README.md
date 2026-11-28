@@ -13,9 +13,11 @@ below are constants at the top of the file that uses them (`timing.ts` for the d
   "Flash white" is white on dark and a deep saturated tone of the hue (L 0.34) on light.
 - Fixed meanings carry their own lightness: green L 0.80/0.56 (hue 152), amber L 0.84/0.68 (hue 78), red L 0.66/0.54
   (hue 24, chroma 0.225).
-- Lane hue is `laneHue(slot)` (golden angle from 250); the slot is the timeline's stable `slot` for the lane (its index when
-  absent), so a replan does not recolour the others. Watch out: slot 1 lands on hue 27, close to the
-  fixed red. Red is told apart by its deeper lightness and by the cross, not by hue alone.
+- Lane hue is `laneHue(slot)`; the slot is the timeline's stable `slot` for the lane (its index when absent), so a replan
+  does not recolour the others. No lane hue comes within ±20° (`MEANING_KEEP_OUT`) of the three meaning hues: the
+  wheel is shrunk by those bands, the golden angle spreads the slots evenly over the 240° that is left (starting at
+  250), and the result is mapped back onto the allowed arcs. A working lane never reads as blocked, waiting or accepted
+  by hue; the stage's individuals take the same colours.
 - Colour is never the only signal: state also shows in shape (dotted, double rail, thickness) and in brightness.
 
 ## Clocks

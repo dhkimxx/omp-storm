@@ -1,0 +1,26 @@
+{
+	"w": 54,
+	"h": 36,
+	"anchor": {
+		"x": 16,
+		"y": 15
+	},
+	"frameMs": 83,
+	"durationMs": 1200,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "user-stop.a.svg"
+		},
+		{
+			"at": 450,
+			"svg": "user-stop.b.svg"
+		},
+		{
+			"at": 1200,
+			"svg": "user-stop.c.svg",
+			"ease": "in"
+		}
+	]
+}

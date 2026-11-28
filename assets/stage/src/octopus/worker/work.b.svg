@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="45" viewBox="0 0 36 45">
+<defs>
+<filter id="halo" filterUnits="userSpaceOnUse" x="-12" y="-12" width="60" height="69"><feGaussianBlur stdDeviation="2.2"/></filter>
+<filter id="soft" filterUnits="userSpaceOnUse" x="-12" y="-12" width="60" height="69"><feGaussianBlur stdDeviation="0.9"/></filter>
+<filter id="wide" filterUnits="userSpaceOnUse" x="-12" y="-12" width="60" height="69"><feGaussianBlur stdDeviation="3"/></filter>
+<path id="arm" d="M-0.5 29.5 C-0.1 28.5 1.9 29.1 3 28.9 C4.2 28.7 5.4 28.5 6.5 28.2 C7.6 28 8.7 27.7 9.7 27.3 C10.7 26.9 11.6 26.4 12.5 25.8 C13.3 25.2 14.1 24.5 14.6 23.7 C15.1 22.9 15.5 21.9 15.6 21 C15.6 20.1 15.4 19 14.9 18.3 C14.5 17.6 13.5 16.9 12.7 16.8 C11.9 16.7 10.6 17.1 10.1 17.7 C9.7 18.3 9.5 19.9 9.9 20.5 C10.3 21.1 12 21.2 12.6 21.4 C13.2 21.6 13.3 21.4 13.3 21.6 C13.4 21.7 13.8 22.3 13 22.3 C12.3 22.2 9.5 22.2 8.8 21.2 C8.1 20.3 8.1 17.8 8.7 16.7 C9.4 15.6 11.5 14.7 12.8 14.7 C14.2 14.7 16 15.7 16.9 16.8 C17.9 17.8 18.4 19.6 18.5 21 C18.5 22.4 18 24 17.4 25.3 C16.8 26.6 15.8 27.7 14.8 28.6 C13.7 29.6 12.5 30.3 11.3 30.9 C10.2 31.6 8.9 32 7.7 32.5 C6.5 32.9 5.3 33.2 4.1 33.6 C2.9 33.9 1.3 35.2 0.5 34.5 C-0.2 33.9 -1 30.4 -0.5 29.5 Z"/>
+</defs>
+<g opacity="1">
+<use href="#arm" fill="rgb(100%,100%,100%)" stroke="rgb(100%,100%,100%)" stroke-width="1.5" opacity="0.62" filter="url(#halo)"/>
+<use href="#arm" fill="rgb(40%,40%,40%)" fill-opacity="0.95" stroke="rgb(90%,90%,90%)" stroke-width="0.75"/>
+<path d="M0 32 C0.6 31.9 2.4 31.5 3.6 31.2 C4.7 31 5.9 30.7 7.1 30.3 C8.2 30 9.4 29.6 10.5 29.1 C11.6 28.6 12.7 28 13.6 27.2 C14.5 26.5 15.4 25.5 16 24.5 C16.6 23.5 17 22.2 17 21 C17 19.8 16.6 18.4 15.9 17.5 C15.2 16.7 13.8 15.8 12.8 15.7 C11.7 15.7 10 16.4 9.4 17.2 C8.9 18.1 8.8 20.1 9.3 20.9 C9.9 21.6 12.2 21.7 12.8 21.8" fill="none" stroke="rgb(100%,100%,100%)" stroke-opacity="0.3" stroke-width="0.8" stroke-linecap="round"/>
+<g fill="rgb(100%,100%,100%)" opacity="0.9" filter="url(#soft)"><circle cx="6.77" cy="29.29" r="1.59"/><circle cx="13.04" cy="26.52" r="1.31"/><circle cx="15.31" cy="24.09" r="1.17"/><circle cx="16.31" cy="21" r="1.03"/><circle cx="15.44" cy="17.92" r="0.9"/><circle cx="12.73" cy="16.27" r="0.76"/><circle cx="9.79" cy="17.47" r="0.62"/><circle cx="9.59" cy="20.66" r="0.5"/></g>
+<g fill="rgb(100%,100%,100%)" opacity="1"><circle cx="6.77" cy="29.29" r="0.88"/><circle cx="13.04" cy="26.52" r="0.73"/><circle cx="15.31" cy="24.09" r="0.65"/><circle cx="16.31" cy="21" r="0.57"/><circle cx="15.44" cy="17.92" r="0.5"/><circle cx="12.73" cy="16.27" r="0.42"/><circle cx="9.79" cy="17.47" r="0.35"/><circle cx="9.59" cy="20.66" r="0.35"/></g>
+<g opacity="1">
+<circle cx="12.43" cy="20.39" r="4.4" fill="rgb(100%,100%,100%)" opacity="0.45" filter="url(#wide)"/>
+<path d="M13.59 17.89 L14.02 21.13 L11.27 22.88 L10.83 19.64 Z" fill="rgb(78%,78%,78%)" stroke="rgb(100%,100%,100%)" stroke-width="0.6"/>
+<path d="M13.01 19.14 L13.23 20.76 L11.85 21.63 L11.63 20.01 Z" fill="rgb(100%,100%,100%)"/>
+</g>
+<g fill="rgb(100%,100%,100%)" opacity="0.9"><circle cx="8.93" cy="15.89" r="0.6"/><circle cx="17.43" cy="18.39" r="0.5"/><circle cx="14.93" cy="24.89" r="0.5"/></g>
+</g>
+<g id="accent">
+<use href="#arm" fill="none" stroke="rgb(100%,100%,100%)" stroke-width="1.3" opacity="0"/>
+<circle cx="14" cy="20" r="2" fill="none" stroke="rgb(100%,100%,100%)" stroke-width="1.6" opacity="0"/>
+<circle cx="14" cy="20" r="1.1" fill="rgb(100%,100%,100%)" opacity="0" filter="url(#soft)"/>
+<rect x="13.4" y="15.39" width="1.2" height="10" fill="rgb(100%,100%,100%)" opacity="0"/>
+<path d="M14 16 L14.7 19.3 L18 20 L14.7 20.7 L14 24 L13.3 20.7 L10 20 L13.3 19.3 Z" fill="rgb(100%,100%,100%)" opacity="0"/>
+</g>
+</svg>

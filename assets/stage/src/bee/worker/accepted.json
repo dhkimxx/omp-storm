@@ -1,0 +1,30 @@
+{
+	"w": 54,
+	"h": 36,
+	"anchor": {
+		"x": 16,
+		"y": 15
+	},
+	"frameMs": 83,
+	"durationMs": 1300,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "accepted.a.svg"
+		},
+		{
+			"at": 350,
+			"svg": "accepted.b.svg",
+			"ease": "out"
+		},
+		{
+			"at": 800,
+			"svg": "accepted.c.svg"
+		},
+		{
+			"at": 1300,
+			"svg": "accepted.d.svg"
+		}
+	]
+}

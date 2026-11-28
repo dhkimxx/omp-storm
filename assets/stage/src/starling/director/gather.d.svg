@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="27" viewBox="0 0 36 27">
+<defs>
+<filter id="halo" filterUnits="userSpaceOnUse" x="-10" y="-10" width="56" height="47"><feGaussianBlur stdDeviation="1.6"/></filter>
+</defs>
+<g opacity="1">
+<path d="M18.6 11.7 Q11.4 10.8 5.33 13.08 Q11.4 16.5 18.6 16.2 Z M17.4 11.7 Q24.6 10.8 30.67 13.08 Q24.6 16.5 17.4 16.2 Z M15.6 15.3 L18 20.7 L20.4 15.3 Z" fill="rgb(100%,100%,100%)" opacity="0.7" filter="url(#halo)"/>
+<path d="M18.6 11.7 Q11.4 10.8 5.33 13.08 Q11.4 16.5 18.6 16.2 Z M17.4 11.7 Q24.6 10.8 30.67 13.08 Q24.6 16.5 17.4 16.2 Z" fill="rgb(82%,82%,82%)"/>
+<path d="M15.6 15.3 L18 20.7 L20.4 15.3 Z" fill="rgb(70%,70%,70%)"/>
+<ellipse cx="18" cy="13.5" rx="2.4" ry="3.75" fill="rgb(100%,100%,100%)"/>
+</g>
+</svg>

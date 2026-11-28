@@ -1,0 +1,32 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 83,
+	"durationMs": 600,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "unmet.a.svg"
+		},
+		{
+			"at": 130,
+			"svg": "unmet.b.svg",
+			"ease": "out"
+		},
+		{
+			"at": 380,
+			"svg": "unmet.c.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 600,
+			"svg": "unmet.a.svg",
+			"ease": "inOut"
+		}
+	]
+}

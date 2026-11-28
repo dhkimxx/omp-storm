@@ -257,8 +257,13 @@ export function modelMismatchNotice(agent: string, check: Extract<ChildCheck, { 
 		return `${agent} 워커를 멈췄습니다. 호스트가 이 워커의 추론 강도를 알려 주지 않아${role} 승인된 강도(${check.approved.join(", ")}) 이하로 도는지 확인할 수 없습니다. 사용자에게 알리고, 확인되기 전에는 같은 스폰을 다시 보내지 마세요.`;
 	}
 	const what = check.reason === "effort" ? "추론 강도" : "모델";
-	return `${agent} 워커를 멈췄습니다. 실제로 쓰인 ${what}: ${check.observed}. 이 값이${role} 승인 목록(${check.approved.join(", ")})에 없습니다. 보통 승인된 모델의 인증이 끊겼을 때 호스트가 상위 세션의 모델로 바꿉니다. 사용자에게 모델 로그인과 팀 설정을 확인해 달라고 알리고, 확인되기 전에는 같은 스폰을 다시 보내지 마세요.`;
+	const approve = roleId === undefined ? "/storm 메뉴의 승인" : `/storm 메뉴의 '역할 ${roleTitle(roleId)}에 … 승인'`;
+	return `${agent} 워커를 멈췄습니다. 실제로 쓰인 ${what}: ${check.observed}. 이 값이${role} 승인 목록(${check.approved.join(", ")})에 없습니다. ${MODEL_CHANGE_CAUSES} 사용자에게 알리고, 확인되기 전에는 같은 스폰을 다시 보내지 마세요. 사용자가 이 값을 쓰려면 ${approve} 항목으로 승인 창을 거쳐 승인하고, 아니면 허브에서 원래 모델로 되돌린 뒤 이어 가면 됩니다.`;
 }
+
+/** Why a worker can run on what its role does not approve: the user's hub, a later extension, or the host's fallback. */
+export const MODEL_CHANGE_CAUSES =
+	"사용자가 허브의 워커 화면에서 /model 선택창, /switch <모델>, /effort 로 바꿨거나, 나중에 불러온 확장이 바꿨거나, 승인된 모델의 인증이 끊겨 호스트가 상위 세션의 모델로 바꿨을 수 있습니다.";
 
 export type { RanModel };
 

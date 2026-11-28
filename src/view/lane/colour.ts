@@ -95,12 +95,52 @@ export function grey(rgb: Rgb): Rgb {
 	return pack(v, v, v);
 }
 
-/** Hue of the first lane; the golden angle then walks the wheel from here. */
-const FIRST_HUE = 250;
-const GOLDEN_ANGLE = 137.50776405003785;
+/** Hues with a fixed meaning: red blocked, amber waiting for the user, green accepted. */
+export const HUE_RED = 24;
+export const HUE_AMBER = 78;
+export const HUE_GREEN = 152;
+/** No lane colour comes this close (in degrees) to a meaning hue, so a working lane never reads as one. */
+export const MEANING_KEEP_OUT = 20;
 
-/** Hue in degrees for a lane index, golden-angle spaced. */
+/** Hue of the first lane; the golden angle then walks what is left of the wheel from here. */
+const FIRST_HUE = 250;
+/** The golden angle as a share of a turn: consecutive slots land as far apart as the arc allows. */
+const GOLDEN_SHARE = 137.50776405003785 / 360;
+
+/** The arcs a lane hue may take: the wheel without the keep-out bands, each `[from, width]`, from `FIRST_HUE` round. */
+const LANE_ARCS: readonly (readonly [number, number])[] = (() => {
+	const bands = [HUE_RED, HUE_AMBER, HUE_GREEN].map(h => [h - MEANING_KEEP_OUT, h + MEANING_KEEP_OUT] as const).sort((a, b) => a[0] - b[0]);
+	const arcs: [number, number][] = [];
+	for (let i = 0; i < bands.length; i++) {
+		const from = bands[i]![1];
+		const to = i + 1 < bands.length ? bands[i + 1]![0] : bands[0]![0] + 360;
+		if (to > from) arcs.push([from, to - from]);
+	}
+	return arcs;
+})();
+const LANE_ARC_TOTAL = LANE_ARCS.reduce((sum, [, width]) => sum + width, 0);
+
+/** Where a hue sits on the shrunken wheel of allowed arcs (0 to `LANE_ARC_TOTAL`). */
+function arcOffset(hue: number): number {
+	let offset = 0;
+	for (const [from, width] of LANE_ARCS) {
+		const into = (((hue - from) % 360) + 360) % 360;
+		if (into < width) return offset + into;
+		offset += width;
+	}
+	return 0;
+}
+const FIRST_OFFSET = arcOffset(FIRST_HUE);
+
+/**
+ * Hue in degrees for a lane slot. The wheel is shrunk by the keep-out bands around the meaning hues, the golden angle
+ * spreads slots evenly over what is left, and the result is mapped back onto the allowed arcs.
+ */
 export function laneHue(index: number): number {
-	const h = (FIRST_HUE + index * GOLDEN_ANGLE) % 360;
-	return h < 0 ? h + 360 : h;
+	let p = (((FIRST_OFFSET + index * GOLDEN_SHARE * LANE_ARC_TOTAL) % LANE_ARC_TOTAL) + LANE_ARC_TOTAL) % LANE_ARC_TOTAL;
+	for (const [from, width] of LANE_ARCS) {
+		if (p < width) return (from + p) % 360;
+		p -= width;
+	}
+	return FIRST_HUE;
 }

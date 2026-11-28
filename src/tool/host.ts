@@ -3,6 +3,7 @@
  * plan past the approved bounds is refused: the tool never reads the UI, prepares analysis, or writes config or
  * approvals.
  */
+import type { PreflightReport } from "../report/preflight.ts";
 import type { CloseoutDraft } from "../runtime/closeout.ts";
 import type { ProjectState } from "../state.ts";
 import type { AgentEntry, RunPlan, RunSpec } from "../types.ts";
@@ -111,6 +112,13 @@ export interface StormToolHost {
 	 * absent or undefined means unknown, which the plan reply never reports as off.
 	 */
 	isolationEnabled?(): boolean | undefined;
+	/**
+	 * Whether omp's plan mode is on right now. While it is, `plan` only previews: it validates against the approved
+	 * team and answers what Storm would run, opening no run and putting no plan in force. Absent means off.
+	 */
+	planMode?(): boolean;
+	/** The start checks the plan preview lists (`src/report/preflight.ts`); absent when the host cannot gather them. */
+	preflight?(state: ProjectState): PreflightReport | Promise<PreflightReport> | undefined;
 	/** The main session's automatic-delegation policy; absent hosts behave as if it were never opted in. */
 	auto?(): AutoDelegationState;
 	/** Final authorization of an automatic start, after tool reply construction. */

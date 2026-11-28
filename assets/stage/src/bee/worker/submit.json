@@ -1,0 +1,101 @@
+{
+	"w": 54,
+	"h": 36,
+	"anchor": {
+		"x": 16,
+		"y": 15
+	},
+	"frameMs": 83,
+	"durationMs": 2400,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "submit.a.svg"
+		},
+		{
+			"at": 200,
+			"svg": "submit.b.svg"
+		},
+		{
+			"at": 350,
+			"svg": "submit.c.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 500,
+			"svg": "submit.d.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 650,
+			"svg": "submit.e.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 800,
+			"svg": "submit.f.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1000,
+			"svg": "submit.g.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1150,
+			"svg": "submit.h.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1300,
+			"svg": "submit.i.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1400,
+			"svg": "submit.j.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1500,
+			"svg": "submit.k.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1600,
+			"svg": "submit.l.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1700,
+			"svg": "submit.m.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1800,
+			"svg": "submit.n.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1950,
+			"svg": "submit.o.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2100,
+			"svg": "submit.p.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2250,
+			"svg": "submit.q.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2400,
+			"svg": "submit.r.svg",
+			"ease": "out"
+		}
+	]
+}

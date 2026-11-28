@@ -1,0 +1,47 @@
+{
+	"w": 36,
+	"h": 45,
+	"anchor": {
+		"x": 0,
+		"y": 32
+	},
+	"frameMs": 83,
+	"durationMs": 2900,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "review.a.svg"
+		},
+		{
+			"at": 300,
+			"svg": "review.b.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1250,
+			"svg": "review.c.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1450,
+			"svg": "review.d.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1750,
+			"svg": "review.e.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2700,
+			"svg": "review.f.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 2900,
+			"svg": "review.a.svg",
+			"ease": "linear"
+		}
+	]
+}

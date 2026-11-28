@@ -450,12 +450,15 @@ export function layout(snapshot: LaneSnapshot, cols: number, maxRows: number): S
 	const word = phaseWord(phase, rw);
 	labels.push({ side: "right", lane: -1, cx: cols - rw, cy: 0, width: textWidth(word), text: word });
 
-	// The role word sits in a column of its own, so every lane's word starts at the same cell.
+	// The role word sits in a column of its own, so every lane's word starts at the same cell. The lane's name is the
+	// row's identity and keeps the room it had: the hub's name for a worker (`run-…-lane-N`) is long and only its tail
+	// tells workers apart, so the way to the hub is the status row's hint and `/storm agents`, not the row.
 	const roleW = clamp(Math.ceil(lw * 0.3), 4, 7);
 	for (const laneIndex of shown) {
 		const lane = lanes[laneIndex]!;
 		const row = rowOf[laneIndex]!;
-		const note = lane.label === "" ? "" : ` ${clip(lane.label, roleW)}`;
+		const second = lane.label;
+		const note = second === "" ? "" : ` ${clip(second, roleW)}`;
 		const primary = padEnd(clip(lane.name, note === "" ? lw : lw - 1 - roleW), note === "" ? 0 : lw - 1 - roleW);
 		const left = clip(primary + note, lw);
 		labels.push({ side: "left", lane: laneIndex, cx: 0, cy: row, width: textWidth(left), text: left, split: primary.length });

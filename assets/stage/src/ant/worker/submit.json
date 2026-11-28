@@ -1,0 +1,26 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 83,
+	"durationMs": 900,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "submit.a.svg"
+		},
+		{
+			"at": 380,
+			"svg": "submit.b.svg",
+			"ease": "out"
+		},
+		{
+			"at": 900,
+			"svg": "submit.c.svg"
+		}
+	]
+}

@@ -553,7 +553,7 @@ describe("status", () => {
 	test("for the model: no commands, no cost flags and no paths, with the shadowing definition still named", () => {
 		const busy = view({
 			shadows: [{ agent: "storm-reviewer", path: "/home/u/.omp/agent/agents/x.md", scope: "user", sha256: "s" }],
-			ompAdvice: [{ key: "retry.fallbackChains", message: "advice-text", command: "omp config set retry.fallbackChains '{}'" }],
+			preflight: { items: [{ key: "retry.fallbackChains", status: "notice", label: "retry.fallbackChains", detail: "advice-text", command: "omp config set retry.fallbackChains '{}'" }], blocked: 0 },
 			newerVersion: "99.0.0",
 		});
 		const user = renderStatus(busy, NOW);

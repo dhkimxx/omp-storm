@@ -340,6 +340,18 @@ export function noCredentialsBlock(agent: string, roleId: string, selectors: rea
 	};
 }
 
+/**
+ * The refusal a spawn of `agent` meets when none of the role's approved `models` can authenticate now; undefined when one
+ * can, or when the credentials were not looked at (`facts.authenticated` absent). `decideSpawn` and the preflight report
+ * read this one answer.
+ */
+export function roleCredentialBlock(agent: string, roleId: string, models: readonly string[], facts: SpawnFacts): SpawnBlock | undefined {
+	const authenticated = facts.authenticated;
+	if (authenticated === undefined) return undefined;
+	if (models.some(model => hasCredentials(authenticated, stripEffort(model)))) return undefined;
+	return noCredentialsBlock(agent, roleId, models.map(stripEffort), facts.slow);
+}
+
 /** Marker of a record whose answer dropped models without credentials; the dropped entries follow it. */
 export const CREDENTIAL_DROP_NOTE = "인증 없는 모델 제외";
 
@@ -413,6 +425,8 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		// exactly an approved entry of this role (model and effort), otherwise the role's approved list is given. Either
 		// way only entries that can authenticate are given, and none left is a refusal.
 		const approved = roleEntries(checked.config, target);
+		const noCredentials = roleCredentialBlock(event.agent, target, checked.config.roles[target]?.models ?? [], facts);
+		if (noCredentials) return block(noCredentials, counted);
 		const authenticated = facts.authenticated;
 		const live =(entries: readonly ApprovedEntry[]): ApprovedEntry[] =>
 			authenticated === undefined ? [...entries] : entries.filter(entry => hasCredentials(authenticated, entry.selector));
@@ -422,7 +436,6 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		const ordered = orderByQuota(approved.map(entryPattern), runtime.quotaMarks);
 		const given = live(approved);
 		const givenPatterns = ordered.filter(pattern => given.some(entry => entryPattern(entry) === pattern));
-		if (givenPatterns.length === 0) return block(noCredentialsBlock(event.agent, target, approved.map(entry => entry.selector), facts.slow), counted);
 		const dropped = approved.length - given.length;
 		const why = exact === undefined ? `승인 밖 모델 ${requested || "없음"}` : "요청한 모델에 인증이 없음";
 		return route(givenPatterns, {
@@ -475,8 +488,9 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 	const keep = (models: readonly string[]): string[] =>
 		authenticated === undefined ? [...models] : models.filter(m => hasCredentials(authenticated, stripEffort(m)));
 	const all = orderByQuota(role.models, runtime.quotaMarks).map(m => withEffort(m, role.effort));
+	const noCredentials = roleCredentialBlock(event.agent, roleKey, role.models, facts);
+	if (noCredentials) return block(noCredentials, { role: roleKey });
 	const ordered = keep(all);
-	if (ordered.length === 0) return block(noCredentialsBlock(event.agent, roleKey, role.models.map(stripEffort), facts.slow), { role: roleKey });
 	const droppedNote = ordered.length < all.length ? ` (${CREDENTIAL_DROP_NOTE} ${all.length - ordered.length}개)` : "";
 	if (standIn) {
 		return route(ordered, { outcome: "substituted", role: roleKey, reason: `설정에 없는 역할 → ${roleTitle(roleKey)} 역할 모델${droppedNote}` });

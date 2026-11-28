@@ -435,9 +435,10 @@ describe("TUI", () => {
 				const plan = { submittedAt: new Date(0).toISOString(), workers: { implementer: 3 }, lanes };
 				live.show(liveCtx, runRecord({ runId: "run-dock", status: "running", plan }), "working");
 				mounted?.text();
-				// The status row, the trunk and three lanes: what the widget draws is what it reports, with no padding.
+				// The status row, then the stage's five rows beside the trunk and three lanes (the stage's own picture and
+				// phrase, not padding): what the widget draws is what it reports.
 				widgetRows = mounted!.screen().length;
-				expect(widgetRows).toBe(5);
+				expect(widgetRows).toBe(6);
 				expect(liveWidgetRows()).toBe(widgetRows);
 			}
 			try {

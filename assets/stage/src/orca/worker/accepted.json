@@ -1,0 +1,51 @@
+{
+	"w": 90,
+	"h": 117,
+	"anchor": {
+		"x": 46,
+		"y": 93
+	},
+	"frameMs": 83,
+	"durationMs": 1900,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "accepted.a.svg"
+		},
+		{
+			"at": 260,
+			"svg": "accepted.b.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 620,
+			"svg": "accepted.c.svg",
+			"ease": "out"
+		},
+		{
+			"at": 900,
+			"svg": "accepted.d.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 1180,
+			"svg": "accepted.e.svg",
+			"ease": "in"
+		},
+		{
+			"at": 1320,
+			"svg": "accepted.f.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 1560,
+			"svg": "accepted.g.svg",
+			"ease": "out"
+		},
+		{
+			"at": 1900,
+			"svg": "accepted.h.svg"
+		}
+	]
+}

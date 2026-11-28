@@ -8,9 +8,9 @@
  * - bounce: a lane's result was found not met; light recoils from the hollow circle.
  * - round wipe: a new round starts; a bar of light sweeps the whole view.
  */
-import { mix, type Rgb } from "../colour.ts";
+import { HUE_GREEN, HUE_RED, mix, type Rgb } from "../colour.ts";
 import type { Mark } from "../scene.ts";
-import { greenOf, HUE_GREEN, HUE_RED, hot, lineColour, redOf } from "./colours.ts";
+import { greenOf, hot, lineColour, redOf } from "./colours.ts";
 import { ageOf, dot, type Fx, marksOf } from "./fx.ts";
 import { clamp, hash, lerp, smooth, TAU } from "./math.ts";
 import { nearest, pulse, type Route, beside } from "./routes.ts";

@@ -17,15 +17,19 @@ import { prepareAnalysis } from "./context.ts";
 import { readQuota } from "./discovery/quota.ts";
 import { readUsage, statsDbPath } from "./history/stats.ts";
 import { STORM_MARK, type RunPhase } from "./view/appearance.ts";
-import { renderStatus, renderStatusBrief, renderTrial, resumeRunLine, targetScopeLine, visible } from "./view/render.ts";
+import { isoText, renderStatus, renderStatusBrief, renderTrial, resumeRunLine, targetScopeLine, visible } from "./view/render.ts";
 import { runRollback } from "./view/review.ts";
 import { recommendedConfig } from "./view/setup.ts";
 import { buildTrialEnd, modelWarnings } from "./proposals/build.ts";
 import { type DecideHost, type Decision, decideProposal, movedSince } from "./proposals/decide.ts";
 import { APPROVE, CANCEL, renderApproval } from "./proposals/present.ts";
 import { agentRows, renderAgentReport } from "./report/agents.ts";
+import { modelStopLabel, newestModelStop, type ModelStop } from "./report/model-stop.ts";
 import { renderModelCheck } from "./report/models.ts";
-import { ompSettingsAdvice } from "./report/omp-settings.ts";
+import { gatherPreflight, type PreflightHost } from "./report/preflight.ts";
+import { preflightApprovalText } from "./report/preflight-text.ts";
+import { clearLastTeam, lastTeamPath, loadLastTeam } from "./approval/last-team.ts";
+import { teamSelectors } from "./policy/model-check.ts";
 import { roleTitle } from "./roles.ts";
 import { closeoutHandoff } from "./runtime/closeout.ts";
 import { acquireSessionLease } from "./runtime/lease.ts";
@@ -75,6 +79,8 @@ export interface FlowEnv extends ProjectEnv {
 	startRun?: (spec: RunSpec) => Promise<RunRequestResult>;
 	/** The user's opt-in to automatic delegation for this session: the director may then continue an interrupted run. */
 	autoEnabled?: () => boolean;
+	/** What the host can tell for the preflight report (modes, isolation, credentials); absent where it cannot say. */
+	preflightHost?: () => PreflightHost;
 }
 
 type OkState = ProjectState & { config: Extract<ConfigLoad, { status: "ok" }> };
@@ -154,11 +160,27 @@ async function decideOwned(
 		return undefined;
 	}
 	try {
-		return await decideProposal(decideHost(env, ui), state, proposal, opts);
+		const preflight = await preflightContext(env, state, proposal.config);
+		const context = [opts.context, preflight].filter(Boolean).join("\n\n");
+		return await decideProposal(decideHost(env, ui), state, proposal, { ...opts, ...(context ? { context } : {}) });
 	} catch (error) {
 		if (!(error instanceof StaleOwnerError)) throw error;
 		ui.notify(STALE_ACTION, "warning");
 		return undefined;
+	}
+}
+
+/**
+ * The preflight part of an approval dialog for `config`: the summary and what would still refuse a start once it is
+ * approved. Empty where the host cannot say; a failed read is no reason to withhold the dialog.
+ */
+async function preflightContext(env: FlowEnv, state: ProjectState, config: StormConfig): Promise<string> {
+	const host = env.preflightHost?.();
+	if (host === undefined) return "";
+	try {
+		return preflightApprovalText(await gatherPreflight(state, host, { proposed: config }));
+	} catch {
+		return "";
 	}
 }
 
@@ -415,6 +437,8 @@ interface SlotEditOptions {
 	context: string;
 	/** Model warnings for the draft; the hub's one-slot edit has no analysis context to check against. */
 	warnings?: (config: StormConfig) => readonly string[];
+	/** I3: open straight on the stopped role's primary slot with what the worker ran on preselected in the picker. */
+	prefill?: ModelStop;
 }
 
 /**
@@ -429,21 +453,30 @@ async function editModelSlots(env: FlowEnv, ui: UiPort, base: StormConfig, opts:
 	if (!pickModel) return false;
 	const kind: ProposalKind = isApproved(opts.state) ? "reselect" : "setup";
 	let draft = base;
+	let prefill = opts.prefill;
 	while (true) {
 		const slots = modelSlotRows(draft);
 		if (!slots.length) {
 			ui.notify("바꿀 모델 슬롯이 없습니다.", "warning");
 			return false;
 		}
-		const choice = await selectChoiceRow(ui, "바꿀 모델 슬롯을 고르세요", [...slots, { value: "cancel", label: CANCEL }]);
-		if (stopIfStale(env, ui)) return false;
-		if (choice === undefined || choice === "cancel") {
-			ui.notify("모델·effort를 바꾸지 않았습니다.");
-			return false;
+		// A prefilled edit opens once on its role's primary slot; afterwards (keep editing, a cancelled picker) it is the plain list.
+		const preset = prefill === undefined ? undefined : slots.find((candidate) => candidate.roleId === prefill?.roleId && candidate.index === 0);
+		const ran = preset === undefined ? undefined : prefill;
+		prefill = undefined;
+		let slot = preset;
+		if (slot === undefined) {
+			const choice = await selectChoiceRow(ui, "바꿀 모델 슬롯을 고르세요", [...slots, { value: "cancel", label: CANCEL }]);
+			if (stopIfStale(env, ui)) return false;
+			if (choice === undefined || choice === "cancel") {
+				ui.notify("모델·effort를 바꾸지 않았습니다.");
+				return false;
+			}
+			slot = slots.find((candidate) => candidate.value === choice);
+			if (!slot) continue;
 		}
-		const slot = slots.find((candidate) => candidate.value === choice);
-		if (!slot) continue;
-		const picked = await pickModel(slot.label, slotCurrent(draft.roles[slot.roleId], slot.index));
+		const current = ran === undefined ? slotCurrent(draft.roles[slot.roleId], slot.index) : { selector: ran.model, ...(ran.effort === undefined ? {} : { effort: ran.effort }) };
+		const picked = await pickModel(slot.label, current);
 		if (stopIfStale(env, ui)) return false;
 		// A cancelled picker is not an invalid pick: it goes back to the slot list.
 		if (!picked) continue;
@@ -680,7 +713,9 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 	/** Only an active run has a phase; an absent callback or undefined means no phase is claimed. */
 	const runPhase = run ? env.activePhase?.() : undefined;
 	const agents = env.agents?.() ?? [];
-	const ompAdvice = config && settings ? ompSettingsAdvice(config, settings) : [];
+	// The preflight report needs the host's own reads (modes, isolation, credentials); a host that cannot give them shows none.
+	const host = opts.user ? env.preflightHost?.() : undefined;
+	const preflight = host ? await gatherPreflight(state, host, settings ? { explicit: settings } : {}) : undefined;
 	const newerVersion = opts.user ? env.newerVersion?.() : undefined;
 	const autoModeProblem = autoChoice === "on" && isApproved(state) ? env.autoModeProblem?.() : undefined;
 	return {
@@ -700,7 +735,7 @@ async function statusView(env: FlowEnv, state: ProjectState, opts: { quota: bool
 		...(trials.length ? { trials } : {}),
 		...(quotaMarks.length ? { quotaMarks } : {}),
 		...(agents.length ? { agents } : {}),
-		...(ompAdvice.length ? { ompAdvice } : {}),
+		...(preflight ? { preflight } : {}),
 		...(newerVersion ? { newerVersion } : {}),
 	};
 }
@@ -886,6 +921,7 @@ const HUB = {
 	resume: "resume",
 	setup: "setup",
 	editModels: "edit-models",
+	approveStop: "approve-stop",
 	models: "models",
 	agents: "agents",
 	auto: "auto",
@@ -957,7 +993,7 @@ async function unapprovedFlow(env: FlowEnv, ui: UiPort, state: OkState): Promise
 	const previous = records[0] ? await approvedSnapshot(state, records[0].configHash) : undefined;
 	const info: InfoLine[] = [];
 	const markdown = renderApproval(undefined, previous, config, {
-		context: [...(firstApproval ? [AUTO_DISCLOSURE] : []), targetScopeLine(state.repo.root)].join("\n\n"),
+		context: [...(firstApproval ? [AUTO_DISCLOSURE] : []), targetScopeLine(state.repo.root), await preflightContext(env, state, config)].filter(Boolean).join("\n\n"),
 		warnings: [...warnings, ...modelWarnings(config, ctx)],
 		shadows: state.shadows,
 	}, info);
@@ -994,6 +1030,50 @@ async function unapprovedFlow(env: FlowEnv, ui: UiPort, state: OkState): Promise
 	await activateAutoAfterApproval(env, state, ui, firstApproval);
 }
 
+/** The last-team approval's summary and its extra choice, which leaves for the recommendation; tests pick the same labels. */
+export const LAST_TEAM = { summary: "지난번 팀", recommend: "Storm 추천 팀 보기" } as const;
+
+/** The roles of a team on one line: each role's models (and effort), or that the team does not use it. */
+function teamSummaryLine(config: StormConfig): string {
+	const roles = Object.entries(config.roles).map(([id, role]) => `${roleTitle(id)} ${role.models.join(", ")}${role.effort ? `(${role.effort})` : ""}`);
+	for (const id of config.disabledRoles ?? []) roles.push(`${roleTitle(id)} 사용 안 함`);
+	return `역할별 모델: ${roles.join(" · ")}`;
+}
+
+/**
+ * A session without a team config, for a target this profile approved a team for before: that team opens straight in
+ * the ordinary approval dialog, one step, with when it was saved and its models per role. It is a suggestion, not
+ * consent: "승인" approves it fresh in this session (the first approval's auto-delegation disclosure included), and
+ * "취소" changes nothing. Models that do not authenticate now are a warning, and 「Storm 추천 팀 보기」 leaves for the
+ * recommendation. No saved team, or one that no longer validates, goes straight to the recommendation as before.
+ */
+async function lastTeamFlow(env: FlowEnv, ui: UiPort, state: ProjectState): Promise<void> {
+	const saved = await loadLastTeam(env.agentDir, state.store.targetKey).catch(() => undefined);
+	if (saved === undefined) return setupFlow(env, ui);
+	const selectors = teamSelectors(saved.config);
+	const probe = await env.preflightHost?.().credentials(selectors).catch(() => undefined);
+	if (stopIfStale(env, ui)) return;
+	const missing = probe === undefined ? [] : selectors.filter(selector => !probe.ok.has(selector.toLowerCase()));
+	const missingLine = `지금 인증되지 않는 모델: ${missing.join(", ")}. 그 모델은 빼고 실행하고, 한 역할의 모델이 모두 인증되지 않으면 그 역할의 워커는 시작하지 않습니다. 「Storm 추천 팀 보기」로 지금 쓸 수 있는 모델의 추천 팀을 볼 수 있습니다.`;
+	const firstApproval = await firstLocalApproval(state);
+	const lastTeam = [
+		`이 작업 대상에서 지난번에 승인한 팀입니다(저장 시각 ${isoText(saved.savedAt)}). 추천일 뿐이라 승인하면 이 세션에 새로 승인합니다.`,
+		teamSummaryLine(saved.config),
+	].join("\n");
+	const decision = await decideOwned(env, ui, state, { kind: "setup", summary: LAST_TEAM.summary, config: saved.config }, {
+		context: [...(firstApproval ? [AUTO_DISCLOSURE] : []), targetScopeLine(state.repo.root), lastTeam].join("\n\n"),
+		...(missing.length > 0 ? { warnings: [missingLine] } : {}),
+		extraOptions: [LAST_TEAM.recommend],
+	});
+	if (!decision) return;
+	if (decision.outcome === "extra") {
+		if (decision.extra === LAST_TEAM.recommend) await setupFlow(env, ui);
+		return;
+	}
+	notifySetup(ui, decision);
+	if (decision.outcome === "approved") await activateAutoAfterApproval(env, state, ui, firstApproval);
+}
+
 /**
  * Bare `/storm`: sets up this session without a config, shows the errors of an invalid one, asks for approval while
  * something is unapproved for the current target, and otherwise opens the menu with the status in view. Returns true
@@ -1003,7 +1083,7 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	let state = await loadProjectState(env);
 	if (stopIfStale(env, ui)) return false;
 	if (state.config.status === "missing") {
-		await setupFlow(env, ui);
+		await lastTeamFlow(env, ui, state);
 		return false;
 	}
 	if (state.config.status === "invalid") {
@@ -1032,6 +1112,11 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	if (resume) rows.push({ value: HUB.resume, label: MENU.resume, description: resumeRunLine(resume).replace(/^- /, "") });
 	rows.push({ value: HUB.setup, label: MENU.setup });
 	if (ui.pickModel) rows.push({ value: HUB.editModels, label: EDIT_MODELS });
+	// I3: a worker the model check stopped ran on what its role does not approve; offer exactly that, through the approval.
+	const modelStop = ui.pickModel && state.config.status === "ok"
+		? await newestModelStop(state.sessionDir, state.config.config).catch(() => undefined)
+		: undefined;
+	if (modelStop) rows.push({ value: HUB.approveStop, label: modelStopLabel(modelStop), description: "승인 밖 모델로 워커가 멈췄습니다" });
 	rows.push({ value: HUB.models, label: MENU.models });
 	// The status view already read this session's agents; do not query the same trusted list again.
 	if (view.agents?.length) rows.push({ value: HUB.agents, label: MENU.agents });
@@ -1053,6 +1138,8 @@ export async function hubFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	else if (choice === HUB.editModels) {
 		// The approved team as it is, never a recommendation: this change only replaces the picked slot.
 		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: EDIT_MODELS, context: targetScopeLine(state.repo.root) });
+	} else if (choice === HUB.approveStop && modelStop) {
+		await editModelSlots(env, ui, (state as OkState).config.config, { state, summary: modelStopLabel(modelStop), context: targetScopeLine(state.repo.root), prefill: modelStop });
 	} else if (choice === HUB.models) await modelsFlow(env, ui);
 	else if (choice === HUB.agents) await agentsFlow(env, ui);
 	else if (choice === HUB.auto) await autoDelegationFlow(env, ui);
@@ -1146,7 +1233,9 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	};
 	if (blockedByRun()) return false;
 	const sessionDir = state.sessionDir;
-	if (!(await hasEntries(sessionDir))) {
+	// The target's last-team suggestion is reset's too, even in a session that holds nothing else yet.
+	const suggested = await pathExists(lastTeamPath(env.agentDir, state.store.targetKey));
+	if (!suggested && !(await hasEntries(sessionDir))) {
 		ui.notify("초기화할 Storm 세션 데이터가 없습니다.");
 		return false;
 	}
@@ -1172,6 +1261,7 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 	if (index.length) lines.push(`- 실행 요약 색인 ${index.length}줄`);
 	lines.push("- 시험 사용 카운터, 쿼터 소진 표시, 이어 가기 표시");
 	if (autoChoice !== "unset") lines.push("- 자동 위임 선택");
+	if (suggested) lines.push("- 이 작업 대상의 지난번 팀 추천(프로필에 저장되어 새 세션이 먼저 내놓는 팀)");
 	lines.push(
 		"",
 		"### 그대로 두는 것",
@@ -1216,6 +1306,7 @@ export async function resetFlow(env: FlowEnv, ui: UiPort): Promise<boolean> {
 		// Recheck after the awaited guard, immediately before the only destructive call.
 		if (stopIfStale(env, ui)) return false;
 		await rm(sessionDir, { recursive: true, force: true });
+		await clearLastTeam(env.agentDir, state.store.targetKey);
 		ui.notify("이 OMP 세션의 Storm 팀 설정과 기록을 지웠습니다. 다른 세션과 이 작업 트리의 예전 `.omp/storm/` 파일은 그대로입니다. 다시 쓰려면 /storm 으로 팀을 설정하세요.");
 		return true;
 	} finally {

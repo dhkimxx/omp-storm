@@ -7,12 +7,12 @@
  * moves.
  */
 import type { RunPhase } from "../../appearance.ts";
-import { mix, type Rgb } from "../colour.ts";
+import { HUE_AMBER, HUE_GREEN, HUE_RED, mix, type Rgb } from "../colour.ts";
 import type { LaneState } from "../model.ts";
 import type { Label, Mark } from "../scene.ts";
 import { aurora } from "./trunk.ts";
 import {
-	BASE_HUE, greenOf, greyOf, HUE_AMBER, HUE_GREEN, HUE_RED, hot, lineColour, redOf, textColour, textGrey, white,
+	BASE_HUE, greenOf, greyOf, hot, lineColour, redOf, textColour, textGrey, white,
 } from "./colours.ts";
 import { roundWipe } from "./events.ts";
 import { ageOf, dot, type Fx, text } from "./fx.ts";

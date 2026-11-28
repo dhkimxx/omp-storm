@@ -21,7 +21,7 @@ import { currentTheme, setCurrentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { signal } from "../src/tui/kit.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "../src/view/appearance.ts";
 import * as frameModule from "../src/view/lane/frame.ts";
-import { LANE_MIN_ROWS, laneHeight, LIVE_WIDGET_KEY, LiveStatus, liveWidgetRows } from "../src/view/live.ts";
+import { LANE_HUB_HINT, LANE_MIN_ROWS, laneHeight, LIVE_WIDGET_KEY, LiveStatus, liveWidgetRows } from "../src/view/live.ts";
 import { liveMetricFacts } from "../src/view/live-metrics.ts";
 import { NO_DECLARED_RESULTS } from "../src/runtime/result-facts.ts";
 import type { RunRecord, RunResult } from "../src/types.ts";
@@ -198,7 +198,7 @@ const liveHeader = (phase: RunPhase): string => `${STORM_MARK} · ${RUN_APPEARAN
 const radar = /\[[⠁-⣿]{18}\]$/;
 
 const activeWidgets: LiveStatus[] = [];
-const realLaneFrame = frameModule.laneFrame;
+const realLaneViewFrame = frameModule.laneViewFrame;
 const SSH_VARIABLES = ["SSH_CONNECTION", "SSH_TTY"] as const;
 const savedEnv = new Map<string, string | undefined>(SSH_VARIABLES.map(name => [name, process.env[name]]));
 const defaultTheme = currentTheme();
@@ -1031,7 +1031,7 @@ describe("the live run widget in lane mode", () => {
 		fits.live.clear();
 	});
 
-	test("the view is as tall as its plan: a lane more or fewer is a row more or fewer, with nothing blank under it", () => {
+	test("the view is as tall as its plan (at least the stage's five rows): a lane more or fewer is a row more or fewer, with nothing blank under it", () => {
 		const lane = laneSetup({ rows: 50 });
 		const heights: number[] = [];
 		for (const count of [1, 3, 8, 2, 5]) {
@@ -1043,7 +1043,8 @@ describe("the live run widget in lane mode", () => {
 			// What the context panel subtracts from its budget is what the host really gives this widget.
 			expect(liveWidgetRows()).toBe(drawn.length);
 		}
-		expect(heights).toEqual([3, 5, 10, 4, 7]);
+		// At 120 columns the stage stands left of the graph: the picture is never shorter than its five rows.
+		expect(heights).toEqual([6, 6, 10, 6, 7]);
 		lane.live.clear();
 		expect(liveWidgetRows()).toBe(0);
 	});
@@ -1056,6 +1057,34 @@ describe("the live run widget in lane mode", () => {
 		const narrow = plain(lane.component().render(60))[0]!;
 		expect(visibleWidth(narrow)).toBeLessThanOrEqual(60);
 		expect(narrow).toStartWith(STORM_MARK);
+	});
+
+	test("I1 and T4: the status row offers the agent hub when a lane has a worker, and the stage's phrase reaches both drawings", () => {
+		const lane = laneSetup();
+		lane.show(laneRun());
+		const wide = plain(lane.component().render(120));
+		expect(wide[0]).toStartWith(STORM_MARK);
+		expect(wide[0]).toEndWith(LANE_HUB_HINT);
+		expect(visibleWidth(wide[0]!)).toBe(120);
+		// Three writers at work: the stage's last row says so.
+		expect(wide.at(-1)).toStartWith("문어 · 일을 나눠 맡기는 중");
+		// No room: the chips keep the row, the offer goes.
+		expect(plain(lane.component().render(60))[0]).not.toContain(LANE_HUB_HINT);
+		lane.live.clear();
+		// A run without lane workers offers nothing to talk to.
+		const idle = laneSetup();
+		idle.show(RUN);
+		expect(plain(idle.component().render(120))[0]).not.toContain(LANE_HUB_HINT);
+		idle.live.clear();
+
+		// The single line carries the phrase between the phase and the radar when it fits.
+		const host = widgetHost();
+		const live = liveForTest();
+		live.show(host.ctx, RUN);
+		const [title] = plain(host.widgets.get(LIVE_WIDGET_KEY)!.render(120));
+		expect(title).toStartWith(`${liveHeader("working")} · 올빼미 · 직접 들여다보는 중`);
+		expect(title).toMatch(RADAR_ROW);
+		live.clear();
 	});
 
 	test("the boundary values: 18 rows and 60 columns are lane mode, one less is the single line", () => {
@@ -1350,9 +1379,9 @@ describe("the live run widget in lane mode", () => {
 		vi.useFakeTimers();
 		const lane = laneSetup();
 		const times: number[] = [];
-		const spy = spyOn(frameModule, "laneFrame").mockImplementation((snapshot, cols, t, options) => {
+		const spy = spyOn(frameModule, "laneViewFrame").mockImplementation((snapshot, cols, t, options) => {
 			times.push(t);
-			return realLaneFrame(snapshot, cols, t, options);
+			return realLaneViewFrame(snapshot, cols, t, options);
 		});
 		try {
 			lane.show(laneRun());
@@ -1393,9 +1422,9 @@ describe("the live run widget in lane mode", () => {
 		vi.useFakeTimers();
 		const lane = laneSetup();
 		const times: number[] = [];
-		const spy = spyOn(frameModule, "laneFrame").mockImplementation((snapshot, cols, t, options) => {
+		const spy = spyOn(frameModule, "laneViewFrame").mockImplementation((snapshot, cols, t, options) => {
 			times.push(t);
-			return realLaneFrame(snapshot, cols, t, options);
+			return realLaneViewFrame(snapshot, cols, t, options);
 		});
 		try {
 			lane.show(laneRun());

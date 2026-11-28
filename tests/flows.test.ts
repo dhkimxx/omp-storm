@@ -1098,6 +1098,15 @@ describe("status and agents", () => {
 					return { modelRoles: {}, fallbackChains: {} };
 				},
 				newerVersion: () => "99.0.0",
+				// Every model logs in; isolation unread: the report still carries omp's fallback-chain advice.
+				preflightHost: () => ({
+					modes: () => undefined,
+					isolation: async () => ({}),
+					maxConcurrency: () => 4,
+					workerThreads: () => 4,
+					credentials: async selectors => ({ ok: new Set(selectors.map(s => s.toLowerCase())), slow: new Set() }),
+					integration: false,
+				}),
 			},
 		};
 	}

@@ -1,0 +1,27 @@
+{
+	"w": 9,
+	"h": 9,
+	"anchor": {
+		"x": 4,
+		"y": 4
+	},
+	"frameMs": 83,
+	"durationMs": 166,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "fly.a.svg"
+		},
+		{
+			"at": 83,
+			"svg": "fly.b.svg",
+			"ease": "linear"
+		},
+		{
+			"at": 166,
+			"svg": "fly.a.svg",
+			"ease": "linear"
+		}
+	]
+}

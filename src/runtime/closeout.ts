@@ -31,7 +31,7 @@ import { goalTotals } from "./goal.ts";
 import { integrationHandoffLine, integrationHasObservations, OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type IntegrationFacts, type ResultFacts, type RetainedFacts, type StormStopFact, type StormStopFacts } from "./result-facts.ts";
 import { HANDOFF_RESUME_LABEL } from "./resume.ts";
 import { endLabel, NO_PARENT_CHANGE_HANDOFF, STATUS_LABEL } from "./rounds.ts";
-import { handoffOutcomes, outOfPlanLine, spendText, unplannedLine, unplannedSplit } from "./unplanned.ts";
+import { handoffOutcomes, outOfPlanLine, spendText, unplannedLine, unplannedSplit, userDirectedLine } from "./unplanned.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
@@ -480,7 +480,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean; in
 	// Work that happened outside the declared results is a fact the card names, not a risk: it shapes neither the tier
 	// nor the tone, and it takes a place on the card only from the lowest-ranked risk. Asked-for work and unsolicited
 	// arrivals are two different facts and are never merged into one count (B8).
-	const unplannedLines = [outOfPlanLine(run), unplannedLine(run)].filter((line): line is string => line !== undefined);
+	const unplannedLines = [outOfPlanLine(run), unplannedLine(run), userDirectedLine(run)].filter((line): line is string => line !== undefined);
 	const shownResidual = [...residual.slice(0, Math.max(0, RESIDUAL_MAX - unplannedLines.length)), ...unplannedLines];
 	const minutes = minutesOf(run);
 	const settled =

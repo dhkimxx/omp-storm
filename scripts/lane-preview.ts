@@ -1,20 +1,32 @@
 /**
- * A plain terminal player for the lane view: the product renderer (`laneFrame`) fed with scripted runs.
+ * A plain terminal player for the lane view: the product renderer (`laneViewFrame`: the stage and the lane graph) fed
+ * with scripted runs.
  *
- *   node_modules/.bin/bun scripts/lane-preview.ts [--scenario full|happy|crowd] [--width N] [--rows N] [--speed X]
- *       [--no-motion] [--light] [--colour auto|truecolor|256] [--still MS] [--svg FILE]
+ *   node_modules/.bin/bun scripts/lane-preview.ts [--scenario full|happy|crowd|octopus|bee|ant|orca|owl|tour|handoffs]
+ *       [--width N] [--rows N] [--speed X] [--no-motion] [--light] [--colour auto|truecolor|256] [--tier t2|t3]
+ *       [--still MS] [--svg FILE] [--png FILE]
  *
  * It redraws in place at the widget's 85 ms tick and restores the terminal on exit; under the picture it prints the
- * run clock and how lively the renderer says the picture is. The colour mode follows the environment (`COLORTERM`,
- * `TERM`, `NO_COLOR`); `--colour` forces one, `--light` draws for a light terminal. `--still MS` prints the one frame
+ * run clock, how lively the renderer says the picture is, the stage's tier and art, and its one-line phrase. The stage
+ * shows from 89 columns. The colour mode follows the environment (`COLORTERM`,
+ * `TERM`, `NO_COLOR`); `--colour` forces one, `--light` draws for a light terminal. `--tier` picks the stage's text
+ * tier: `t3` braille (default) or `t2` half blocks. The art is the baked art when `assets/stage/index.json` exists
+ * (sequences not baked yet fall back to the placeholder shapes), else the placeholder. `--still MS` prints the one frame
  * the scenario shows at MS milliseconds and exits: without colour codes unless `--colour` is given. `--svg FILE` (with
  * `--still`) writes the frame as an SVG picture instead: one glyph per cell in its colour, on the terminal background
- * colour (truecolor unless `--colour` says otherwise), and prints the two commands that turn it into a PNG.
+ * colour (truecolor unless `--colour` says otherwise), and prints the two commands that turn it into a PNG. `--png FILE`
+ * (with `--still`) writes the T1 stage picture at that moment as the indexed PNG the terminal would receive, and prints
+ * its size against the 32 KiB frame budget.
  */
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { textWidth } from "../src/view/lane/canvas.ts";
 import { lookOf } from "../src/view/lane/colour.ts";
-import { type LaneFrameOptions, laneFrame, laneLiveliness } from "../src/view/lane/frame.ts";
+import { type LaneFrameOptions, laneViewFrame, laneViewLiveliness, laneViewParts } from "../src/view/lane/frame.ts";
+import { STAGE_ASSETS_DIR } from "../src/view/stage/baked.ts";
+import { castLine } from "../src/view/stage/cast.ts";
+import { stageLaneColours, stagePicture } from "../src/view/stage/render-pixels.ts";
+import { stageAt } from "../src/view/stage/sequencer.ts";
+import { encodeStageFrame, FRAME_BUDGET_BYTES } from "../src/view/stage/t1.ts";
 import { type ScenarioName, SCENARIOS, scenarioMs, snapshotAt } from "./lane-preview-scenario.ts";
 
 export const TICK_MS = 85;
@@ -30,12 +42,14 @@ interface Args {
 	dark: boolean;
 	colour: Colour | undefined;
 	svg: string | undefined;
+	png: string | undefined;
+	tier: "t2" | "t3";
 }
 
-const USAGE = "usage: bun scripts/lane-preview.ts [--scenario full|happy|crowd] [--width N] [--rows N] [--speed X] [--no-motion] [--light] [--colour auto|truecolor|256] [--still MS] [--svg FILE]";
+const USAGE = `usage: bun scripts/lane-preview.ts [--scenario ${SCENARIOS.join("|")}] [--width N] [--rows N] [--speed X] [--no-motion] [--light] [--colour auto|truecolor|256] [--tier t2|t3] [--still MS] [--svg FILE] [--png FILE]`;
 
 function parseArgs(argv: readonly string[]): Args | string {
-	const args: Args = { width: undefined, rows: 10, motion: true, speed: 1, still: undefined, scenario: "full", dark: true, colour: undefined, svg: undefined };
+	const args: Args = { width: undefined, rows: 10, motion: true, speed: 1, still: undefined, scenario: "full", dark: true, colour: undefined, svg: undefined, png: undefined, tier: "t3" };
 	const numbers = new Set(["--width", "--rows", "--speed", "--still"]);
 	for (let i = 0; i < argv.length; i++) {
 		const flag = argv[i]!;
@@ -54,9 +68,14 @@ function parseArgs(argv: readonly string[]): Args | string {
 			if (next !== "auto" && next !== "truecolor" && next !== "256") return "--colour needs auto, truecolor or 256";
 			args.colour = next === "auto" ? undefined : next;
 			i++;
-		} else if (flag === "--svg") {
-			if (next === undefined || next.startsWith("--")) return "--svg needs a file name";
-			args.svg = next;
+		} else if (flag === "--svg" || flag === "--png") {
+			if (next === undefined || next.startsWith("--")) return `${flag} needs a file name`;
+			if (flag === "--svg") args.svg = next;
+			else args.png = next;
+			i++;
+		} else if (flag === "--tier") {
+			if (next !== "t2" && next !== "t3") return "--tier needs t2 or t3";
+			args.tier = next;
 			i++;
 		} else if (flag === "--light") args.dark = false;
 		else if (flag === "--no-motion") args.motion = false;
@@ -67,6 +86,7 @@ function parseArgs(argv: readonly string[]): Args | string {
 		else return `unknown argument ${flag}`;
 	}
 	if (args.svg !== undefined && args.still === undefined) return "--svg needs --still MS";
+	if (args.png !== undefined && args.still === undefined) return "--png needs --still MS";
 	return args;
 }
 
@@ -195,6 +215,21 @@ export function svgOf(lines: readonly string[], cols: number, dark: boolean): st
 // Player
 // ---------------------------------------------------------------------------------------------------------------
 
+/** Which art the stage draws with: the baked index's sequence count, or the placeholder shapes. */
+function artName(): string {
+	const index = new URL("index.json", STAGE_ASSETS_DIR);
+	if (!existsSync(index)) return "placeholder art";
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(index, "utf8"));
+		const sequences = typeof parsed === "object" && parsed !== null && "sequences" in parsed && typeof parsed.sequences === "object" && parsed.sequences !== null
+			? Object.keys(parsed.sequences).length
+			: 0;
+		return `baked art (${sequences} sequences, the rest placeholder)`;
+	} catch {
+		return "placeholder art (unreadable index)";
+	}
+}
+
 function main(): void {
 	const parsed = parseArgs(process.argv.slice(2));
 	if (typeof parsed === "string") {
@@ -209,7 +244,21 @@ function main(): void {
 		const t = args.still;
 		const width = columns();
 		const colour: Colour = args.colour ?? "truecolor";
-		const lines = laneFrame(snapshotAt(t, args.scenario), width, t, options(colour));
+		const snapshot = snapshotAt(t, args.scenario);
+		if (args.png !== undefined) {
+			const parts = laneViewParts(snapshot, width, t, options(colour));
+			if (parts === undefined) {
+				process.stderr.write(`no stage at ${width} columns and ${args.rows} rows\n`);
+				process.exit(2);
+			}
+			const picture = stagePicture(snapshot, parts.stageCols, parts.rows - 1, t, { motion: args.motion, dark: args.dark }, "t1");
+			const data = encodeStageFrame({ w: picture.w, h: picture.h, rgb: picture.rgb, dark: args.dark, laneColours: stageLaneColours(snapshot, args.dark) });
+			writeFileSync(args.png, Buffer.from(data, "base64"));
+			const kib = (data.length / 1024).toFixed(1);
+			process.stderr.write(`wrote ${args.png} (${picture.w}x${picture.h} px, stage ${parts.stageCols}x${parts.rows - 1} cells + phrase row, ${kib} KiB base64 of the ${FRAME_BUDGET_BYTES / 1024} KiB frame budget, ${artName()}): ${picture.phrase}\n`);
+			return;
+		}
+		const lines = laneViewFrame(snapshot, width, t, options(colour), args.tier);
 		if (args.svg !== undefined) {
 			writeFileSync(args.svg, svgOf(lines, width, args.dark));
 			process.stderr.write(`wrote ${args.svg} (${width} columns, ${lines.length} rows)\n${svgHint(args.svg, width, lines.length)}\n`);
@@ -222,14 +271,16 @@ function main(): void {
 
 	const colour = args.colour ?? detectColour();
 	const length = scenarioMs(args.scenario);
+	const art = artName();
 	const startedAt = Date.now();
 	let drawn = 0;
 	let stopped = false;
 	const draw = (): void => {
 		const t = (Date.now() - startedAt) * args.speed;
 		const snapshot = snapshotAt(t, args.scenario);
-		const lines = [...laneFrame(snapshot, columns(), t, options(colour))];
-		lines.push(`\x1b[2m${(snapshot.now / 1000).toFixed(1).padStart(4)}s / ${length / 1000}s  ×${args.speed}  ${args.scenario}  ${laneLiveliness(snapshot)}  (Ctrl+C: 종료)\x1b[0m`);
+		const lines = [...laneViewFrame(snapshot, columns(), t, options(colour), args.tier)];
+		const phrase = castLine(stageAt(snapshot).cast);
+		lines.push(`\x1b[2m${(snapshot.now / 1000).toFixed(1).padStart(4)}s / ${length / 1000}s  ×${args.speed}  ${args.scenario}  ${laneViewLiveliness(snapshot, columns(), args.rows)}  ${args.tier} ${art}  ${phrase}  (Ctrl+C: 종료)\x1b[0m`);
 		let out = drawn > 0 ? `\x1b[${drawn}A\r` : "";
 		out += lines.map((line) => `${line}\x1b[K`).join("\n") + "\n";
 		if (lines.length < drawn) out += "\x1b[J";

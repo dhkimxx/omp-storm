@@ -14,6 +14,7 @@ import type { ApprovalStore } from "../approval/store.ts";
 import { MAX_CHECK_NAME_LENGTH } from "../config/schema.ts";
 import { docsEnabled } from "../policy/docs.ts";
 import { clearRunReads, openRunReads } from "../policy/reads.ts";
+import { ompModeBlock } from "../policy/omp-mode.ts";
 import { clearWorkerSlots, formatUsd, reservedWorkers, shadowBlock, teamGate, usableRole } from "../policy/spawn.ts";
 import { tokens } from "../report/agents.ts";
 import { MID_RUN_WINDOW_SHARE, RUN_START_WINDOW_SHARE, roleTitle, windowThreshold, workerRange } from "../roles.ts";
@@ -1341,6 +1342,15 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	}
 
 	/**
+	 * View-only evidence like `phase`: the director's own path edit holds this run's write table right now (from its
+	 * commit to the end of its turn). Never persisted; nothing about the run reads it.
+	 */
+	directorEditing(): boolean {
+		const own = this.#own;
+		return own !== undefined && own.lanes.liveHolders(["director-path"]) > 0;
+	}
+
+	/**
 	 * Checks the approved team and omp's session modes, compacts a heavy main context, records the run and sends the
 	 * handoff. The session must be idle. It can take as long as a dialog or a compaction: callers inside an omp event
 	 * handler use `launch`.
@@ -1908,13 +1918,14 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		const modes = ctx.sessionModes;
 		if (!modes) return { ok: true };
 		const state = modes.getState();
-		if (state.goal.status === "active") {
+		const blocked = ompModeBlock(state);
+		if (blocked === "goal") {
 			return refuse("omp 목표 모드가 켜져 있어 시작하지 않았습니다. 목표를 끝내거나 일시 정지한 뒤 다시 하세요.");
 		}
-		if (state.loop.status !== "inactive") return refuse("omp 반복 모드가 켜져 있어 시작하지 않았습니다. 반복을 끈 뒤 다시 하세요.");
+		if (blocked === "loop") return refuse("omp 반복 모드가 켜져 있어 시작하지 않았습니다. 반복을 끈 뒤 다시 하세요.");
 		// Plan mode holds the session to planning. The automatic start already refuses in it; a hand start follows suit.
-		if (state.plan.status === "active") return refuse(PLAN_MODE_START_REFUSAL);
-		if (state.vibe.status !== "active") return { ok: true };
+		if (blocked === "plan") return refuse(PLAN_MODE_START_REFUSAL);
+		if (blocked !== "vibe") return { ok: true };
 		// A tool call cannot ask the user to change modes: an automatic start refuses and leaves the session as it is.
 		if (!allowDialog) return refuse("omp vibe 모드가 켜져 있어 자동 실행을 시작하지 않았습니다. vibe 모드를 끈 뒤 다시 하세요.");
 		const choice = await ui.select("omp vibe 모드에서는 Storm 팀을 쓸 수 없습니다. vibe 모드를 끄고 시작할까요?", [START.vibeOff, START.cancel]);
@@ -8059,7 +8070,11 @@ export function summarizeRun(run: RunRecord): string {
 	if (agents.length) {
 		const followUps = agents.reduce((sum, agent) => sum + agent.followUps, 0);
 		const reused = agents.filter(agent => agent.followUps > 0).length;
-		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)${cleanup ? ` · ${cleanup}` : ""}`);
+		// Turns the user started in the hub, and stops made there, are counted apart from the director's follow-ups.
+		const userTurns = agents.reduce((sum, agent) => sum + (agent.userTurns ?? 0), 0);
+		const userStops = agents.reduce((sum, agent) => sum + (agent.userStops ?? 0), 0);
+		const user = [...(userTurns > 0 ? [`사용자 지시 ${userTurns}회`] : []), ...(userStops > 0 ? [`사용자 정지 ${userStops}회`] : [])];
+		lines.push(`- 서브에이전트: ${agents.length}개 · 재사용 ${reused}개(후속 지시 ${followUps}회)${user.length ? ` · ${user.join(" · ")}` : ""}${cleanup ? ` · ${cleanup}` : ""}`);
 	} else if (cleanup) {
 		lines.push(`- ${cleanup}`);
 	}

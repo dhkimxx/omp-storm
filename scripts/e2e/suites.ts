@@ -62,6 +62,7 @@ export const E2E_SUITES: readonly E2eSuite[] = [
 	{ name: "rework", script: "rework.ts", env: { E2E_REWORK_MODE: "accept" }, group: "qa", note: "a reviewable result that must be reworked" },
 	{ name: "unplanned", script: "unplanned.ts", group: "e2e-guarantees", note: "a woken worker's answer is recorded" },
 	{ name: "plan-mode", script: "plan-mode.ts", group: "e2e-tui", note: "plan mode refuses a manual start" },
+	{ name: "hub-intervention", script: "hub-intervention.ts", group: "e2e-tui", note: "the user directs or stops a worker from omp's Agent Hub" },
 	{ name: "checkpoint-resume", script: "checkpoint-resume.ts", group: "e2e", note: "a checkpoint across a native omp restart" },
 	{ name: "continue", script: "continue.ts", group: "e2e", note: "the director continues a run the host cut off" },
 	{ name: "early-start", script: "early-start.ts", group: "e2e-guarantees", note: "a lane starts before its prerequisite is accepted" },

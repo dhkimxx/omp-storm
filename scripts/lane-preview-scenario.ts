@@ -6,16 +6,27 @@
  *   that retries, a user exclusion, a blocked lane, a job lane, an idle lane and two round boundaries.
  * - `happy`: every lane is accepted, so the run ends in the finale and then holds a calm picture.
  * - `crowd`: twelve lanes with staggered starts for folding and for the shared stems; it ends in lights out.
+ *
+ * The stage's species, one each, after the starlings gather at the start:
+ * - `octopus`: readers and writers at once. `bee`: readers only. `ant`: a job, then one unscoped writer with another
+ *   waiting for its turn. `orca`: submissions under review. `owl`: no worker busy, the director alone.
+ * - `tour`: every species and transition in one loop: a start, bee to octopus to ant to orca to owl, a replan, a wait
+ *   for the user, a blocked lane and a complete finish.
+ * - `handoffs`: every handoff of the plan's species-change table, each species standing longer than three seconds so
+ *   the change plays in full: bee to octopus (water rises), octopus to ant (sinks into soil), ant to orca (water
+ *   rises), orca to octopus, octopus to owl (lights dim), owl to bee (the owl's light spreads).
  */
-import type { LaneSnapshot, LaneSpan, LaneState, LaneTrack, PhaseSpan } from "../src/view/lane/model.ts";
+import type { LaneIntent, LaneMilestone, LaneSnapshot, LaneSpan, LaneState, LaneTrack, PhaseSpan } from "../src/view/lane/model.ts";
 import type { RunPhase } from "../src/view/appearance.ts";
 
-export const SCENARIOS = ["full", "happy", "crowd"] as const;
+export const SCENARIOS = ["full", "happy", "crowd", "octopus", "bee", "ant", "orca", "owl", "tour", "handoffs"] as const;
 export type ScenarioName = (typeof SCENARIOS)[number];
 
 type Step = readonly [from: number, state: LaneState];
 type Role = "explorer" | "implementer" | "reviewer" | "quick" | "architect";
 const ROLE_WORD: Record<Role, string> = { explorer: "탐색", implementer: "구현", reviewer: "검토", quick: "빠른", architect: "설계" };
+/** What a scripted lane's worker may do, from its role the way the timeline reads a plan lane's kind. */
+const ROLE_INTENT: Record<Role, LaneIntent> = { explorer: "read", implementer: "write", reviewer: "review", quick: "write", architect: "read" };
 
 interface LaneScript {
 	name: string;
@@ -26,6 +37,10 @@ interface LaneScript {
 	results?: number;
 	/** Each entry starts at `from` and ends where the next one starts; the last one stays open. */
 	steps: readonly Step[];
+	/** A writer without a file list. */
+	unscoped?: true;
+	/** The worker's hub name. */
+	agent?: string;
 }
 
 interface Scenario {
@@ -34,6 +49,9 @@ interface Scenario {
 	rounds: readonly number[];
 	phases: ReadonlyArray<readonly [from: number, phase: RunPhase]>;
 	lanes: readonly LaneScript[];
+	/** When the team gathered; the start at 0 when absent. */
+	milestones?: readonly LaneMilestone[];
+	budgetWarnAt?: number;
 }
 
 const FULL: Scenario = {
@@ -159,7 +177,95 @@ const CROWD: Scenario = {
 	],
 };
 
-const SCRIPTS: Record<ScenarioName, Scenario> = { full: FULL, happy: HAPPY, crowd: CROWD };
+/** A loop that stays on one species after the start's gathering: lanes appear at 1 s and run from 3 s to the end. */
+function species(lanes: readonly LaneScript[]): Scenario {
+	return { ms: 30_000, rounds: [0], phases: [[0, "working"], [3_000, "workers"]], lanes };
+}
+
+const OCTOPUS = species([
+	{ name: "탐색-구조", role: "explorer", dependsOn: [], agent: "Explore", steps: [[1_000, "reserved"], [3_000, "running"]] },
+	{ name: "구현-API", role: "implementer", dependsOn: [], agent: "ApiImpl", results: 2, steps: [[1_000, "reserved"], [3_000, "running"], [14_000, "submitted"], [18_000, "running"]] },
+	{ name: "구현-UI", role: "implementer", dependsOn: [], agent: "UiImpl", steps: [[1_000, "reserved"], [3_000, "running"], [11_000, "quiet"], [16_000, "running"]] },
+	{ name: "설계-자문", role: "architect", dependsOn: [], agent: "Advisor", steps: [[1_000, "reserved"], [4_000, "running"]] },
+]);
+
+const BEE = species([
+	{ name: "탐색-구조", role: "explorer", dependsOn: [], agent: "Structure", steps: [[1_000, "reserved"], [3_000, "running"]] },
+	{ name: "탐색-의존", role: "explorer", dependsOn: [], agent: "Deps", steps: [[1_000, "reserved"], [3_000, "running"], [12_000, "quiet"], [15_000, "running"]] },
+	{ name: "탐색-문서", role: "explorer", dependsOn: [], agent: "Docs", steps: [[1_000, "reserved"], [3_500, "running"]] },
+	{ name: "설계-자문", role: "architect", dependsOn: [], agent: "Advisor", steps: [[1_000, "reserved"], [4_000, "running"]] },
+]);
+
+const ANT = species([
+	{ name: "빌드-잡", role: "quick", job: true, dependsOn: [], steps: [[1_000, "reserved"], [3_000, "running"], [12_000, "accepted"]] },
+	{ name: "구현-마이그", role: "implementer", unscoped: true, dependsOn: [], agent: "Migrate", steps: [[1_000, "reserved"], [12_000, "running"]] },
+	{ name: "구현-정리", role: "implementer", unscoped: true, dependsOn: [], agent: "Cleanup", steps: [[1_000, "reserved"]] },
+]);
+
+const ORCA = species([
+	{ name: "구현-API", role: "implementer", dependsOn: [], agent: "ApiImpl", results: 2, steps: [[1_000, "reserved"], [3_000, "running"], [9_000, "submitted"], [10_000, "reviewing"], [22_000, "accepted"]] },
+	{ name: "구현-UI", role: "implementer", dependsOn: [], agent: "UiImpl", steps: [[1_000, "reserved"], [3_000, "running"], [8_000, "submitted"], [10_000, "reviewing"], [24_000, "unmet"]] },
+	{ name: "리뷰", role: "reviewer", dependsOn: ["구현-API"], agent: "Review", steps: [[1_000, "waiting"], [9_500, "running"]] },
+]);
+
+const OWL: Scenario = {
+	ms: 24_000,
+	rounds: [0, 12_000],
+	phases: [[0, "working"], [12_000, "between-rounds"], [14_000, "working"]],
+	lanes: [
+		{ name: "탐색-구조", role: "explorer", dependsOn: [], agent: "Explore", results: 2, steps: [[0, "accepted"]] },
+		{ name: "구현-API", role: "implementer", dependsOn: [], agent: "ApiImpl", results: 3, steps: [[0, "idle"]] },
+		{ name: "구현-UI", role: "implementer", dependsOn: [], agent: "UiImpl", steps: [[0, "submitted"]] },
+	],
+};
+
+/** Every species and transition in one loop; the times are where the record would change. */
+const TOUR: Scenario = {
+	ms: 64_000,
+	rounds: [0, 33_000],
+	milestones: [{ at: 0, kind: "start" }, { at: 36_000, kind: "replan" }],
+	budgetWarnAt: 40_000,
+	phases: [
+		[0, "working"], [2_500, "workers"], [27_000, "working"], [33_000, "between-rounds"], [35_000, "working"], [37_000, "workers"],
+		[46_000, "waiting-user"], [50_000, "workers"], [55_000, "stopping"],
+	],
+	lanes: [
+		// Bee: two readers from 2.5 s.
+		{ name: "탐색-구조", role: "explorer", dependsOn: [], agent: "Structure", results: 1, steps: [[1_000, "reserved"], [2_500, "running"], [16_000, "submitted"], [20_000, "reviewing"], [26_000, "accepted"]] },
+		{ name: "탐색-의존", role: "explorer", dependsOn: [], agent: "Deps", results: 1, steps: [[1_000, "reserved"], [2_500, "running"], [15_000, "submitted"], [20_000, "reviewing"], [25_500, "accepted"]] },
+		// Octopus from 9 s: a writer joins the readers.
+		{ name: "구현-API", role: "implementer", dependsOn: [], agent: "ApiImpl", results: 2, steps: [[1_000, "reserved"], [9_000, "running"], [15_500, "submitted"], [20_000, "reviewing"], [26_500, "accepted"]] },
+		// Ant from 16 s: the job runs while the others wait for their verdict.
+		{ name: "빌드-잡", role: "quick", job: true, dependsOn: [], steps: [[1_000, "reserved"], [16_000, "running"], [20_000, "accepted"]] },
+		// Orca from 20 s: the reviews; one lane is refused at 23 s (a blocked act).
+		{ name: "설계-검토", role: "architect", dependsOn: [], agent: "Design", steps: [[1_000, "reserved"], [9_500, "running"], [14_000, "idle"], [23_000, "blocked"], [30_000, "excluded"]] },
+		// After the replan at 36 s: a new writer and reader, octopus again; then a wait for the user and the finale.
+		{ name: "구현-UI", role: "implementer", dependsOn: [], agent: "UiImpl", results: 1, steps: [[36_000, "reserved"], [38_000, "running"], [52_000, "submitted"], [53_000, "accepted"]] },
+		{ name: "탐색-테스트", role: "explorer", dependsOn: [], agent: "Tests", results: 1, steps: [[36_000, "reserved"], [38_500, "running"], [51_000, "submitted"], [53_500, "accepted"]] },
+	],
+};
+
+/** One full handoff after another; the comments give the second each species takes the stage. */
+const HANDOFFS: Scenario = {
+	ms: 44_000,
+	rounds: [0],
+	phases: [[0, "working"], [2_000, "workers"], [33_000, "working"], [38_000, "workers"]],
+	lanes: [
+		// Bee from the end of the gathering: readers only; at 33 s they submit (owl) and at 38 s they are sent back to read (bee again).
+		{ name: "탐색-구조", role: "explorer", dependsOn: [], agent: "Structure", steps: [[1_000, "reserved"], [2_000, "running"], [33_000, "submitted"], [38_000, "running"]] },
+		{ name: "탐색-의존", role: "explorer", dependsOn: [], agent: "Deps", steps: [[1_000, "reserved"], [2_000, "running"], [33_000, "submitted"], [38_000, "running"]] },
+		// Octopus from 9 s: a writer joins the readers.
+		{ name: "구현-API", role: "implementer", dependsOn: [], agent: "ApiImpl", steps: [[1_000, "reserved"], [9_000, "running"], [33_000, "submitted"]] },
+		// Ant from 15 s: the job runs.
+		{ name: "빌드-잡", role: "quick", job: true, dependsOn: [], steps: [[1_000, "reserved"], [15_000, "running"], [21_000, "accepted"]] },
+		// Orca from 21 s: the reviewer runs; octopus again from 27 s when it is done.
+		{ name: "리뷰", role: "reviewer", dependsOn: [], agent: "Review", steps: [[1_000, "reserved"], [21_000, "running"], [27_000, "idle"]] },
+	],
+};
+
+const SCRIPTS: Record<ScenarioName, Scenario> = {
+	full: FULL, happy: HAPPY, crowd: CROWD, octopus: OCTOPUS, bee: BEE, ant: ANT, orca: ORCA, owl: OWL, tour: TOUR, handoffs: HANDOFFS,
+};
 
 /** Length in ms of one loop of a scenario. */
 export function scenarioMs(name: ScenarioName = "full"): number {
@@ -196,8 +302,17 @@ export function snapshotAt(t: number, name: ScenarioName = "full"): LaneSnapshot
 		const spans = cutSpans(laneScript.steps, now);
 		const current = spans[spans.length - 1];
 		if (current === undefined) return;
-		const track: LaneTrack = { name: laneScript.name, label: ROLE_WORD[laneScript.role], dependsOn: laneScript.dependsOn, spans };
+		const track: LaneTrack = {
+			name: laneScript.name,
+			label: ROLE_WORD[laneScript.role],
+			dependsOn: laneScript.dependsOn,
+			spans,
+			slot: i,
+			intent: laneScript.job ? "job" : ROLE_INTENT[laneScript.role],
+		};
 		if (laneScript.job) track.job = true;
+		if (laneScript.unscoped) track.unscoped = true;
+		if (laneScript.agent !== undefined) track.agent = laneScript.agent;
 		const activity = activityOf(current.state, i, now);
 		if (activity !== undefined) track.activity = activity;
 		if (laneScript.results !== undefined && laneScript.results > 1) {
@@ -212,5 +327,7 @@ export function snapshotAt(t: number, name: ScenarioName = "full"): LaneSnapshot
 		rounds: script.rounds.filter((offset) => offset <= now),
 		lanes,
 		complete: inScope.length > 0 && inScope.every((lane) => lane.spans[lane.spans.length - 1]!.state === "accepted"),
+		milestones: (script.milestones ?? [{ at: 0, kind: "start" }]).filter((milestone) => milestone.at <= now),
+		...(script.budgetWarnAt !== undefined && script.budgetWarnAt <= now ? { budgetWarnAt: script.budgetWarnAt } : {}),
 	};
 }

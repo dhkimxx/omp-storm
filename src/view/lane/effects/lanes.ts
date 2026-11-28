@@ -2,9 +2,9 @@
  * A lane's line: its colour flows along the path with the worker's activity, comets run along a running stretch, and
  * every state has its own shape (dotted, double rail, thin, solid) so colour is never the only signal.
  */
-import { mix } from "../colour.ts";
+import { HUE_GREEN, mix } from "../colour.ts";
 import {
-	greenOf, greyOf, HUE_GREEN, hot, lineColour, redOf, white,
+	greenOf, greyOf, hot, lineColour, redOf, white,
 } from "./colours.ts";
 import { finaleFlash } from "./ending.ts";
 import { ageOf, type Fx, marksOf } from "./fx.ts";

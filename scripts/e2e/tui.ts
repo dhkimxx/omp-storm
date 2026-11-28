@@ -32,14 +32,16 @@
  * so no key of them means anything to the composer.
  */
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { lastTeamPath } from "../../src/approval/last-team.ts";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { APPROVE } from "../../src/proposals/present.ts";
 import { ROLES, STORM_VERSION } from "../../src/roles.ts";
 import { parseModelEntry } from "../../src/selector.ts";
 import type { RunRecord, StormConfig } from "../../src/types.ts";
 import { idleAppearance, RUN_APPEARANCE, type RunPhase, STORM_MARK } from "../../src/view/appearance.ts";
-import { LANE_MIN_COLUMNS } from "../../src/view/lane/frame.ts";
+import { LANE_MIN_COLUMNS, stageColumns } from "../../src/view/lane/frame.ts";
+import { STAGE_MIN_ROWS } from "../../src/view/stage/render-braille.ts";
 import { STATE_WORD, TRUNK_LABEL } from "../../src/view/lane/layout.ts";
 import type { LaneState } from "../../src/view/lane/model.ts";
 import { LANE_MIN_ROWS, laneHeight } from "../../src/view/live.ts";
@@ -132,20 +134,31 @@ function radarFrames(text: string, phase: RunPhase): Set<string> {
 	}));
 }
 // The lane view (the default live view where the terminal is big enough): a status row, the director's trunk row,
-// one row per lane. Its rows are found by the trunk label and Braille, never by colour.
+// one row per lane. Its rows are found by the trunk label and Braille, never by colour. From 89 columns the stage stands
+// left of the graph, so a graph row starts after the stage's cells and a blank column: its label follows a space.
 const BRAILLE = /[\u2800-\u28ff]/u;
+/** Whether a row's graph part starts with `label` (at the row's start, or after the stage and its blank column). */
+const graphStartsWith = (row: string, label: string): boolean => row.trimStart().startsWith(label) || row.includes(` ${label}`);
 /** Whether `row` is the director's trunk row of the lane view. */
-const isTrunkRow = (row: string): boolean => row.trimStart().startsWith(TRUNK_LABEL) && BRAILLE.test(row);
+const isTrunkRow = (row: string): boolean => graphStartsWith(row, TRUNK_LABEL) && BRAILLE.test(row);
+/** Whether `row` is the lane view's row of `lane`. */
+const isLaneRow = (row: string, lane: string): boolean => graphStartsWith(row, `${lane} `) && BRAILLE.test(row);
 /** The distinct trunk rows painted in `text`: the picture moves, so a live run shows more than one. */
 function trunkFrames(text: string): Set<string> {
 	return new Set(text.split("\n").map(row => row.trimEnd()).filter(isTrunkRow));
 }
+/**
+ * The rows the lane view draws for `laneCount` lanes on a `columns` by `rows` terminal: the status row, the trunk and
+ * a row per lane, at least the stage's five rows when the stage stands beside the graph, never past the cap.
+ */
+const laneViewRows = (columns: number, rows: number, laneCount: number): number =>
+	Math.min(laneHeight(rows), Math.max(2 + laneCount, stageColumns(columns) > 0 ? 1 + STAGE_MIN_ROWS : 0));
 /** The states a lane's row showed, in order of appearance, without consecutive repeats. */
 function laneSequence(text: string, lane: string): LaneState[] {
 	const sequence: LaneState[] = [];
 	for (const row of text.split("\n")) {
 		const line = row.trim();
-		if (!line.startsWith(`${lane} `) || !BRAILLE.test(line)) continue;
+		if (!isLaneRow(line, lane)) continue;
 		const state = (Object.entries(STATE_WORD) as Array<[LaneState, string]>).find(([, word]) => line.endsWith(word) || new RegExp(`${word} \\d+/\\d+$`, "u").test(line))?.[0];
 		if (state !== undefined && sequence.at(-1) !== state) sequence.push(state);
 	}
@@ -160,7 +173,7 @@ const inOrder = (sequence: readonly LaneState[], wanted: readonly LaneState[]): 
 
 /** The state word a lane's row ends with on the screen a person sees now, if the row is there. */
 function shownState(tui: Tui, lane: string): LaneState | undefined {
-	const row = liveScreen(tui)?.viewport.find(line => line.trim().startsWith(`${lane} `) && BRAILLE.test(line));
+	const row = liveScreen(tui)?.viewport.find(line => isLaneRow(line, lane));
 	if (row === undefined) return undefined;
 	return (Object.entries(STATE_WORD) as Array<[LaneState, string]>).find(([, word]) => row.trimEnd().endsWith(word) || new RegExp(`${word} \\d+/\\d+$`, "u").test(row.trimEnd()))?.[0];
 }
@@ -585,6 +598,10 @@ async function ensureApprovedTeam(): Promise<void> {
 
 const scenario = (name: string, body: () => Promise<void>, timeoutMs?: number): Promise<void> =>
 	suite.step(name, async () => {
+		// The suite shares one profile, and a new session offers the target's last approved team (0.32 O2). Every scenario
+		// here starts its new sessions from the recommendation, so an earlier scenario's team (its required checks, its
+		// models) must not carry over: the suggestion is cleared between scenarios.
+		rmSync(dirname(lastTeamPath(env.agentDir, "0".repeat(64))), { recursive: true, force: true });
 		await ensureApprovedTeam();
 		await body();
 	}, timeoutMs);
@@ -1277,8 +1294,8 @@ async function main(): Promise<void> {
 		async () => {
 			const [origin, api, ui] = ["origin", "api-verify", "ui-preview"] as const;
 			const view = { columns: 120, rows: 36 };
-			// The status row, the trunk and one row per lane: three lanes, well under the cap.
-			const drawn = 2 + 3;
+			// The status row, the trunk and one row per lane (three lanes, well under the cap), at least the stage's rows.
+			const drawn = laneViewRows(view.columns, view.rows, 3);
 			const answerResult = (id: string, criterion: string): Record<string, unknown> => ({ id, kind: "answer", criterion, path: FACT_FILE, contains: FACT_LINE });
 			const retryRelease = "release-lane-view-retry";
 			const steps: Step[] = [
@@ -1329,7 +1346,7 @@ async function main(): Promise<void> {
 						return screen;
 					};
 					const first = await until(() => sample(), 20_000, "the live widget on the screen");
-					check("the lane view sits under the editor: status row, trunk, then one row per lane", first.lanes && [origin, api, ui].every(lane => first.rows.some(row => row.trim().startsWith(`${lane} `))), first.rows.join("\n"));
+					check("the lane view sits under the editor: status row, trunk, then one row per lane", first.lanes && [origin, api, ui].every(lane => first.rows.some(row => isLaneRow(row, lane))), first.rows.join("\n"));
 					check(
 						"the view is as tall as what it draws, within the cap, and every row fits the terminal",
 						first.rows.length === drawn && first.rows.length <= laneHeight(view.rows) && first.viewport.every(row => Bun.stringWidth(row) <= view.columns),
@@ -1384,7 +1401,7 @@ async function main(): Promise<void> {
 						const screen = sample();
 						return screen?.lanes === true ? screen : undefined;
 					}, 20_000, "the lane view back after the second /storm view");
-					check("switching it on again restores the picture at its own size", back.status === first.status && back.blankUnder === 0 && [origin, api, ui].every(lane => back.rows.some(row => row.trim().startsWith(`${lane} `))), `${back.status} vs ${first.status}`);
+					check("switching it on again restores the picture at its own size", back.status === first.status && back.blankUnder === 0 && [origin, api, ui].every(lane => back.rows.some(row => isLaneRow(row, lane))), `${back.status} vs ${first.status}`);
 
 					// The user's two inputs: the unstarted lane leaves the plan, the unmet one is retried.
 					await tui.submit("UI는 빼고 API만 계속해");
@@ -1507,14 +1524,14 @@ async function main(): Promise<void> {
 					await Bun.sleep(1_000);
 					const screen = await until(() => liveScreen(tui), 20_000, named("the live widget on the screen"));
 					const cap = laneHeight(rows);
-					const expected = Math.min(cap, 2 + laneCount);
+					const expected = laneViewRows(columns, rows, laneCount);
 					check(named(`the view is ${expected} rows: its own size, never past the cap of ${cap}`), screen.lanes && screen.rows.length === expected, `${screen.rows.length} rows\n${screen.rows.join("\n")}`);
 					check(named("no blank row under the view: its last row is the bottom row of the screen"), screen.blankUnder === 0 && (screen.viewport.at(-1) ?? "").trim() !== "", `${screen.blankUnder} blank rows under\n${screen.viewport.slice(-expected - 2).join("\n")}`);
 					check(named("the status row and the director's trunk are on the screen and every row fits the width"), screen.rows[0]!.startsWith(STORM_MARK) && isTrunkRow(screen.rows[1] ?? "") && screen.rows.every(row => Bun.stringWidth(row) <= columns), screen.rows.join("\n"));
 					if (2 + laneCount <= cap) {
-						check(named("every lane has its row"), names.every(name => screen.rows.some(row => row.trim().startsWith(`${name} `))), screen.rows.join("\n"));
+						check(named("every lane has its row"), names.every(name => screen.rows.some(row => isLaneRow(row, name))), screen.rows.join("\n"));
 					} else {
-						check(named("lanes past the cap are folded into one summary row"), (screen.rows.at(-1) ?? "").trim().startsWith("+") && screen.rows.slice(2, -1).every(row => names.some(name => row.trim().startsWith(`${name} `))), screen.rows.join("\n"));
+						check(named("lanes past the cap are folded into one summary row"), /(^|\s)\+\d+ 레인/u.test(screen.rows.at(-1) ?? "") && screen.rows.slice(2, -1).every(row => names.some(name => isLaneRow(row, name))), screen.rows.join("\n"));
 					}
 					// The editor is usable with the view that size: typed text shows above the status row, and the view stays put.
 					const typed = "fit-typing";

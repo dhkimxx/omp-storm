@@ -1,0 +1,25 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 113,
+	"durationMs": 3400,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "rest.a.svg"
+		},
+		{
+			"at": 1700,
+			"svg": "rest.b.svg"
+		},
+		{
+			"at": 3400,
+			"svg": "rest.a.svg"
+		}
+	]
+}

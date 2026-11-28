@@ -3,7 +3,7 @@
  * (dark terminal) or deeper (light terminal) so labels read on both. The three colours with a fixed meaning carry their
  * own lightness: a deep red reads as danger, a bright amber as a call, green as done.
  */
-import { mix, oklch, type Rgb } from "../colour.ts";
+import { HUE_AMBER, HUE_GREEN, HUE_RED, mix, oklch, type Rgb } from "../colour.ts";
 import { hueMod } from "./math.ts";
 
 /** What the colours depend on: the terminal's brightness and its assumed background. */
@@ -13,9 +13,6 @@ export interface Tint { dark: boolean; bg: Rgb }
 export const BASE_HUE = 218;
 /** The start colour is a pale ice blue, so every accepted lane's hue arrives as a visible colour. */
 export const BASE_CHROMA = 0.15;
-export const HUE_GREEN = 152;
-export const HUE_AMBER = 78;
-export const HUE_RED = 24;
 export const CHROMA = 0.2;
 const LIGHTNESS_DARK = 0.76;
 const LIGHTNESS_LIGHT = 0.54;

@@ -1,0 +1,25 @@
+{
+	"w": 63,
+	"h": 72,
+	"anchor": {
+		"x": 31,
+		"y": 36
+	},
+	"frameMs": 121,
+	"durationMs": 2900,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "review.a.svg"
+		},
+		{
+			"at": 1450,
+			"svg": "review.b.svg"
+		},
+		{
+			"at": 2900,
+			"svg": "review.a.svg"
+		}
+	]
+}

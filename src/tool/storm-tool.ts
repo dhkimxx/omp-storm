@@ -52,7 +52,7 @@ import {
 	type ContinuedRun,
 	type StormToolHost,
 } from "./host.ts";
-import { renderPlanView } from "./plan-view.ts";
+import { planPreviewLanes, renderPlanView } from "./plan-view.ts";
 
 type Zod = ExtensionAPI["zod"];
 /** The parsed shape is checked against `StormToolInput` where the schema is built. */
@@ -534,6 +534,62 @@ function outOfBoundsReply(config: StormConfig, gaps: readonly PlanGap[]): StormT
 	);
 }
 
+/** The first line of every plan-mode preview: nothing opened, nothing started, and what ends the preview. */
+export const PLAN_PREVIEW_HEAD =
+	"[계획 미리 보기] omp 계획 모드라 실행을 열지 않고 계획도 적용하지 않았습니다. 아무것도 시작하지 않았습니다. 계획 모드가 끝난 뒤 같은 계획으로 storm plan을 부르면 실행이 열립니다.";
+/** The writer-order section when the policy puts no lane in a one-at-a-time order. */
+export const PLAN_PREVIEW_TOGETHER =
+	"- 함께 돌기: 한 번에 하나씩 시작해야 하는 레인은 없습니다. 선행 관계를 기다리는 레인과 파일이 겹치는 쓰기는 시작 때 순서가 정해집니다.";
+
+/** Approved models per role the plan uses, in attempt order, as the start would hand them to the workers. */
+function roleModelLines(config: StormConfig, plan: RunPlan): string[] {
+	const roles = [...new Set(plan.lanes.filter(lane => lane.job === undefined).map(lane => lane.role))];
+	return roles.map(role => {
+		const models = config.roles[role]?.models ?? [];
+		const effort = config.roles[role]?.effort;
+		const shown = models.length === 0 ? "승인된 모델 없음" : models.join(" → ");
+		return `- ${roleTitle(role)}(${role}): ${shown}${effort === undefined ? "" : ` · 기본 effort ${effort}`}`;
+	});
+}
+
+/** The isolation the plan needs: the team's own setting, the lanes that ask for a checkout, and omp's switch when proven. */
+function isolationNeedLines(config: StormConfig, plan: RunPlan, enabled: boolean | undefined): string[] {
+	const lanes = plan.lanes.filter(lane => lane.isolationReason !== undefined).map(lane => lane.name);
+	if (config.isolation !== "isolated" && lanes.length === 0) return ["- 격리: 필요 없음(모든 레인이 부모 트리에서 돕니다)."];
+	const who = config.isolation === "isolated" ? "팀 설정이 모든 워커를 격리합니다" : `${lanes.join(", ")} 레인이 격리를 요청합니다`;
+	const state = enabled === true ? "켜져 있음" : enabled === false ? "꺼져 있음" : "확인하지 못함";
+	return [`- 격리: ${who}. omp 격리(task.isolation.enabled)가 필요합니다 — 지금 ${state}.`];
+}
+
+/**
+ * omp plan mode means the user asked for a plan only (G4): the validated plan is answered as a preview and nothing
+ * else happens. The order line comes from the same `writerOrderLine` the applied plan's reply uses.
+ */
+async function planPreviewReply(host: StormToolHost, cur: Current, plan: RunPlan, warnings: readonly string[], order: string | undefined): Promise<StormToolReply> {
+	const config = cur.config;
+	const out = [PLAN_PREVIEW_HEAD, `레인 ${plan.lanes.length}개와 결과:`, ...planPreviewLanes(plan), "역할별 모델:", ...roleModelLines(config, plan)];
+	out.push("함께 돌 수 있는 레인:", order ?? PLAN_PREVIEW_TOGETHER);
+	out.push(...isolationNeedLines(config, plan, host.isolationEnabled?.()));
+	const off = isolationOffLine(plan, host.isolationEnabled?.());
+	if (off !== undefined) out.push(off);
+	if (warnings.length) out.push("경고:", ...warnings.map(w => `- ${w}`));
+	const report = await host.preflight?.(cur.state);
+	if (report === undefined) {
+		if (cur.state.approval?.status !== "active") out.push("시작 전 점검:", "- 막힘: 이 팀 설정은 아직 승인되지 않았습니다. 사용자가 /storm에서 승인해야 시작할 수 있습니다.");
+	} else {
+		// The preview exists because plan mode is on; that block is the preview's own premise, not a blocker to fix.
+		const blocked = report.items.filter(item => item.status === "blocked" && item.mode !== "plan");
+		out.push("시작 전 점검:");
+		if (blocked.length === 0) out.push("- 막힘 없음.");
+		for (const item of blocked) {
+			const detail = item.detail === undefined ? "" : ` — ${item.detail}`;
+			const command = item.command === undefined ? "" : ` (${item.command})`;
+			out.push(`- 막힘: ${item.label}${detail}${command}`);
+		}
+	}
+	return { outcome: "ok", text: out.join("\n") };
+}
+
 /**
  * Validates a run plan. Past the approved bounds it is refused before it can reach the config, approval or run; a
  * valid plan goes in force for the active run, and outside a run it is only checked.
@@ -557,6 +613,8 @@ async function submitPlan(host: StormToolHost, raw: PlanRequest | undefined): Pr
 	const auto = host.auto?.();
 	const order = writerOrderLine(config, plan, cur.state.shadows, auto?.enabled === true);
 	if (order !== undefined) body.push(order);
+	// Plan mode: the user asked for a plan only. Preview it and touch nothing: no run, no plan in force, no start.
+	if (host.planMode?.() === true) return planPreviewReply(host, cur, plan, check.warnings, order);
 	const off = isolationOffLine(plan, host.isolationEnabled?.());
 	if (off !== undefined) body.push(off);
 	if (auto?.enabled === true && host.runtime.runActive?.() === false) {

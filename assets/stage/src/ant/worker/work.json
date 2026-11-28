@@ -1,0 +1,61 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 83,
+	"durationMs": 2100,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "work.a.svg"
+		},
+		{
+			"at": 210,
+			"svg": "work.b.svg"
+		},
+		{
+			"at": 420,
+			"svg": "work.c.svg"
+		},
+		{
+			"at": 630,
+			"svg": "work.d.svg"
+		},
+		{
+			"at": 840,
+			"svg": "work.a.svg"
+		},
+		{
+			"at": 1050,
+			"svg": "work.b.svg"
+		},
+		{
+			"at": 1260,
+			"svg": "work.c.svg"
+		},
+		{
+			"at": 1470,
+			"svg": "work.e.svg"
+		},
+		{
+			"at": 1680,
+			"svg": "work.f.svg"
+		},
+		{
+			"at": 1680,
+			"svg": "work.g.svg"
+		},
+		{
+			"at": 1890,
+			"svg": "work.h.svg"
+		},
+		{
+			"at": 2100,
+			"svg": "work.a.svg"
+		}
+	]
+}

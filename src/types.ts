@@ -10,6 +10,7 @@
  */
 
 import type { CloseoutDraft } from "./runtime/closeout.ts";
+import type { PreflightReport } from "./report/preflight.ts";
 import type { ResultProof } from "./runtime/checkpoint-import.ts";
 import type { ReviewEvidence } from "./runtime/review.ts";
 import type { RunPhase } from "./view/appearance.ts";
@@ -703,8 +704,8 @@ export interface StatusView {
 	quotaMarks?: QuotaMark[];
 	/** Subagents of this session. */
 	agents?: AgentEntry[];
-	/** omp settings that do not fit the approved team; shown, never changed. */
-	ompAdvice?: OmpAdvice[];
+	/** What would refuse a start now (`report/preflight.ts`), with the commands that fix it; shown, never changed. */
+	preflight?: PreflightReport;
 	/** A newer Storm installed on disk than the one this process runs (`/restart` loads it). */
 	newerVersion?: string;
 }
@@ -1463,6 +1464,10 @@ export interface AgentEntry {
 	costUsd: number;
 	/** Messages the director delivered to it with `write agent://<id>`. */
 	followUps: number;
+	/** Turns the user started by typing to it in omp's Agent Hub while a run of this session admitted it. */
+	userTurns?: number;
+	/** Turns the user stopped from the hub (not one of Storm's own stops). */
+	userStops?: number;
 	/** Reviews it yielded (omp reviewer output schema), counted per verdict. */
 	review?: ReviewTally;
 	/** Bounded structured evidence, not the reviewer's commentary or raw output. */

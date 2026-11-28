@@ -1,0 +1,32 @@
+{
+	"w": 90,
+	"h": 54,
+	"anchor": {
+		"x": 46,
+		"y": 30
+	},
+	"frameMs": 110,
+	"durationMs": 2200,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "finale.a.svg"
+		},
+		{
+			"at": 450,
+			"svg": "finale.b.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 900,
+			"svg": "finale.c.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 2200,
+			"svg": "finale.d.svg",
+			"ease": "out"
+		}
+	]
+}

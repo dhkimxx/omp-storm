@@ -6,6 +6,7 @@ import { STORM_VERSION } from "../src/roles.ts";
 import { credentialNotice, fallbackQuotaMark, quotaNotice } from "../src/runtime/quota-auto.ts";
 import { newerInstalledVersion } from "../src/runtime/version.ts";
 import type { ExplicitSettings, StatusView, StormConfig } from "../src/types.ts";
+import type { PreflightReport } from "../src/report/preflight.ts";
 import { teamOf } from "./fixtures.ts";
 
 const config: StormConfig = teamOf({ explorer: ["a/x:low", "b/y:high", "a/x:max"], implementer: "c/z:high" }, { contract: "workflowz", runtime: "omp" });
@@ -62,17 +63,9 @@ describe("ompSettingsAdvice", () => {
 		expect(keys(known({ modelFallback: false }), single)).toEqual([]);
 	});
 
-	test("isolated config warns until omp isolation is on, unknown counting as off", () => {
+	test("isolation is left to the preflight report", () => {
 		const isolated: StormConfig = { ...config, isolation: "isolated" };
-		const { isolationEnabled: _unset, ...unset } = known();
-		for (const settings of [known({ isolationEnabled: false }), unset]) {
-			const [advice] = ompSettingsAdvice(isolated, settings);
-			expect(advice?.key).toBe("task.isolation.enabled");
-			expect(advice?.command).toBe("omp config set task.isolation.enabled true");
-			expect(advice?.message).toContain("공유 작업 트리로 대신 실행하지 않습니다");
-		}
-		expect(keys(known({ isolationEnabled: true }), isolated)).toEqual([]);
-		expect(keys(known({ isolationEnabled: false }))).toEqual([]);
+		expect(keys(known({ isolationEnabled: false, isolationApply: true }), isolated)).toEqual([]);
 	});
 });
 
@@ -93,19 +86,35 @@ describe("renderStatus omp sections", () => {
 		dataAsOf: null,
 	};
 
-	test("advice shows each message and its command", () => {
-		const command = "omp config set task.maxConcurrency 4";
-		const md = renderStatus({ ...base, ompAdvice: [{ key: "task.maxConcurrency", message: "ADVICE-ONE", command }, { key: "x", message: "ADVICE-TWO" }] }, 0);
+	const report: PreflightReport = {
+		items: [
+			{ key: "team", status: "ok", label: "팀 승인", detail: "승인됨" },
+			{ key: "task.isolation.apply", status: "blocked", label: "LABEL-ONE", detail: "ADVICE-ONE", command: "omp config set task.isolation.apply false" },
+			{ key: "budget", status: "notice", label: "LABEL-TWO", detail: "ADVICE-TWO" },
+		],
+		blocked: 1,
+	};
+
+	test("the preflight section shows the summary, each open item and its command, but not passed items", () => {
+		const md = renderStatus({ ...base, preflight: report }, 0, "user");
+		const command = "omp config set task.isolation.apply false";
+		expect(md).toContain("통과 1 · 막힘 1 · 알림 1");
 		expect(md.indexOf("ADVICE-ONE")).toBeGreaterThan(-1);
 		expect(md.indexOf(`\`${command}\``)).toBeGreaterThan(md.indexOf("ADVICE-ONE"));
 		expect(md.indexOf("ADVICE-TWO")).toBeGreaterThan(md.indexOf(command));
+		expect(md).not.toContain("승인됨");
+		expect(md).not.toContain("omp 설정 점검");
 	});
 
-	test("no advice adds nothing to the status", () => {
+	test("the model's status carries no preflight commands", () => {
+		expect(renderStatus({ ...base, preflight: report }, 0, "model")).not.toContain("omp config set");
+	});
+
+	test("no report adds nothing to the status", () => {
 		const plain = renderStatus(base, 0);
-		expect(renderStatus({ ...base, ompAdvice: [] }, 0)).toBe(plain);
 		expect(plain.split("\n")[0]).toContain(STORM_VERSION);
 		expect(plain).not.toContain("omp config set");
+		expect(plain).not.toContain("시작 전 점검");
 	});
 
 	test("a newer installed version shows on the first line", () => {

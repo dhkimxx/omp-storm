@@ -21,6 +21,7 @@
  *   E2E_PORT=18809 E2E_WORK=/tmp/storm-e2e-plan-mode ./node_modules/.bin/bun scripts/e2e/plan-mode.ts
  */
 import { PLAN_MODE_START_REFUSAL } from "../../src/runtime/controller.ts";
+import { PLAN_PREVIEW_HEAD } from "../../src/tool/storm-tool.ts";
 import { SUPERVISOR_REASONS } from "../../src/policy/supervisor.ts";
 import { focused, KEY, LlmCursor, prepare, startFakeLlm, type Step, StormFiles, Suite, Tui, until } from "./harness.ts";
 import { installProfile, MAIN, Sessions } from "./phase1-kit.ts";
@@ -84,6 +85,23 @@ async function main(): Promise<void> {
 			await until(() => (screenHas(tui, PLAN_MODE_START_REFUSAL) ? true : undefined), 30_000, "the refusal to start in plan mode");
 			check("a manual start while plan mode is on is refused, and the screen says why", screenHas(tui, PLAN_MODE_START_REFUSAL));
 			check("no run was opened and the director got no request", files.runIds().size === before.size && llm.of("main").length === 0, JSON.stringify({ runs: files.runIds().size, main: llm.of("main").length }));
+
+			// 1b. O4: the director previews its plan with `storm plan`; the tool is offered in plan mode, answers the preview, and
+			// opens no run and spawns nothing.
+			const previewing = new LlmCursor(env);
+			const previewRuns = files.runIds();
+			await tui.submit(`preview the plan E2E-STEPS ${b64([START_STEPS[0]])}`);
+			const preview = await until(() => {
+				const main = previewing.of("main");
+				const at = main.findIndex(entry => entry.decision.tool === "storm");
+				return at < 0 ? undefined : main[at + 1]?.lastTool;
+			}, 90_000, "the answer to storm plan in plan mode");
+			check("storm plan in plan mode answers the preview", preview.includes(PLAN_PREVIEW_HEAD) && preview.includes("Probe0") && preview.includes("probe-answer"), preview);
+			check(
+				"the preview opened no run and spawned no worker",
+				files.runIds().size === previewRuns.size && !previewing.of("main").some(entry => entry.decision.tool === "task"),
+				JSON.stringify({ runs: files.runIds().size }),
+			);
 
 			// 2. The director, under automatic delegation with plan mode on, writes its plan note and submits it.
 			const directed = new LlmCursor(env);

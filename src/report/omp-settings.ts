@@ -19,7 +19,10 @@ export function wantedFallbackChains(config: StormConfig): Record<string, string
 	return chains;
 }
 
-/** omp settings that do not fit the approved team. Unknown settings give no advice, except isolation (omp's default is off). */
+/**
+ * omp retry settings that do not fit the approved team. Unknown settings give no advice. Isolation is the preflight
+ * report's (`report/preflight.ts`), which reads the same checks the start refuses with.
+ */
 export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSettings): OmpAdvice[] {
 	const advice: OmpAdvice[] = [];
 	const wanted = wantedFallbackChains(config);
@@ -45,14 +48,6 @@ export function ompSettingsAdvice(config: StormConfig, settings: ExplicitSetting
 				command: "omp config set retry.modelFallback true",
 			});
 		}
-	}
-	if (config.isolation === "isolated" && settings.isolationEnabled !== true) {
-		advice.push({
-			key: "task.isolation.enabled",
-			message:
-				"팀 설정이 팀 격리인데 omp 격리가 꺼져 있거나 확인되지 않아 격리 실행이 거부됩니다. 공유 작업 트리로 대신 실행하지 않습니다. 격리를 쓸 팀이면 아래 명령으로 켜세요.",
-			command: "omp config set task.isolation.enabled true",
-		});
 	}
 	return advice;
 }

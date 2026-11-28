@@ -1,0 +1,32 @@
+{
+	"w": 36,
+	"h": 45,
+	"anchor": {
+		"x": 0,
+		"y": 32
+	},
+	"frameMs": 83,
+	"durationMs": 900,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "submit.a.svg"
+		},
+		{
+			"at": 260,
+			"svg": "user-steer.a.svg",
+			"ease": "out"
+		},
+		{
+			"at": 480,
+			"svg": "user-steer.b.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 900,
+			"svg": "submit.a.svg",
+			"ease": "inOut"
+		}
+	]
+}

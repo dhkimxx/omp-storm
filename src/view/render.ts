@@ -2,6 +2,7 @@ import { shortHash } from "../config/canonical.ts";
 import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
+import { PREFLIGHT_HANDS_OFF, preflightItemLines, preflightSummary } from "../report/preflight-text.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE, PLANLESS_PLACEMENT_NOTE, RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
 import { CAPTURE_UNKNOWN_LABEL, WORKER_STOP_LABEL } from "../runtime/closeout.ts";
@@ -793,15 +794,18 @@ export function renderStatus(
 		if (model) out.push(...renderAgentRows(agents, now).split("\n"));
 		else for (const agent of agents) for (const spans of agentStatusSpans(agent, now)) styled(spans);
 	}
-	if (audience === "user" && view.ompAdvice?.length) {
+	if (audience === "user" && view.preflight) {
+		const report = view.preflight;
+		const open = report.items.filter(item => item.status !== "ok");
 		out.push("");
-		heading("omp 설정 점검", "runtime", "status.warning");
-		for (const a of view.ompAdvice) {
+		heading(preflightSummary(report), "runtime", report.blocked > 0 ? "status.warning" : open.length > 0 ? "status.info" : "status.success");
+		for (const item of open) {
+			const [line = "", ...command] = preflightItemLines(item).map(visible);
 			const messageIndex = out.length;
-			out.push(`- ${visible(a.message)}`, ...(a.command ? [`  - \`${visible(a.command)}\``] : []));
-			if (info) info.push({ index: messageIndex, spans: [{ text: `- ${visible(a.message)}`, tone: "warning" }], icon: "status.warning" });
+			out.push(line, ...command);
+			if (info) info.push({ index: messageIndex, spans: [{ text: line, tone: item.status === "blocked" ? "warning" : "muted" }], icon: item.status === "blocked" ? "status.warning" : "status.info" });
 		}
-		out.push("- Storm 은 omp 설정을 바꾸지 않습니다. 필요하면 위 명령을 직접 실행하세요.");
+		if (open.some(item => item.command !== undefined)) out.push(`- ${PREFLIGHT_HANDS_OFF}`);
 	}
 	if (view.quota) {
 		out.push("");
@@ -976,7 +980,7 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 	const notes: Array<{ text: string; tone?: InfoTone }> = [];
 	if (view.trials?.length) notes.push({ text: `시험 사용 ${view.trials.length}건`, tone: "accent" });
 	if (view.quotaMarks?.length) notes.push({ text: `쿼터 소진 표시 ${view.quotaMarks.map((m) => m.provider).join(", ")}`, tone: "warning" });
-	if (view.ompAdvice?.length) notes.push({ text: `omp 설정 점검 ${view.ompAdvice.length}건`, tone: "warning" });
+	if (view.preflight?.blocked) notes.push({ text: `시작 전 점검 막힘 ${view.preflight.blocked}건`, tone: "warning" });
 	if (notes.length) {
 		const noteIndex = out.length;
 		out.push(`- 확인할 것: ${notes.map((note) => note.text).join(" · ")}`);

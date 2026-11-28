@@ -182,6 +182,21 @@ export function unplannedLine(run: DeliveryRun): string | undefined {
 }
 
 /**
+ * `사용자 직접 지시 2회 · 사용자 정지 1회`: turns the user started or stopped from omp's hub, counted apart from the
+ * director's work. Undefined when the user did neither.
+ */
+export function userDirectedLine(run: Pick<RunRecord, "agents">): string | undefined {
+	let turns = 0;
+	let stops = 0;
+	for (const agent of run.agents ?? []) {
+		turns += agent.userTurns ?? 0;
+		stops += agent.userStops ?? 0;
+	}
+	const parts = [...(turns > 0 ? [`사용자 직접 지시 ${turns}회`] : []), ...(stops > 0 ? [`사용자 정지 ${stops}회(판정 전 종료)`] : [])];
+	return parts.length === 0 ? undefined : parts.join(" · ");
+}
+
+/**
  * The run's total spend as one phrase. A floor says so: Storm saw model calls it could not read back. A record from
  * before 0.27 has no note and reads as it always did.
  */

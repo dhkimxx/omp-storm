@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="45" height="36" viewBox="0 0 45 36">
+<defs><filter id="h" filterUnits="userSpaceOnUse" x="-10" y="-10" width="65" height="56"><feGaussianBlur stdDeviation="1.7"/></filter>
+<g id="a" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M2.5 30.5 C1.5 26 3.5 21.5 7.5 21 C11.5 20.6 13.3 25 12.8 30.5 Z" fill="dimgray" fill-opacity="1" stroke="gray" stroke-opacity="1" stroke-width=".6"/>
+<path d="M18.5 23.2 12.3 22.9 14.8 29.4 M20.9 23.6 26.9 25.1 21.4 29.4 M23.3 23.4 29.4 22.6 31 29.4" stroke="darkgray" stroke-opacity=".55" stroke-width=".8"/>
+<path d="M12.2 18.1 9.5 14.9 4.2 13.9" stroke="darkgray" stroke-opacity=".6" stroke-width=".7"/>
+<g fill="darkgray" stroke="white" stroke-width=".6"><ellipse cx="31.8" cy="23.6" rx="6" ry="4.1" transform="rotate(0 31.8 23.6)"/><circle cx="25.6" cy="22.9" r="1.3"/><ellipse cx="20.4" cy="22.5" rx="4.6" ry="2.5" transform="rotate(0 20.4 22.5)"/><ellipse cx="12.8" cy="20.7" rx="3.5" ry="2.9" transform="rotate(0 12.8 20.7)"/></g>
+<g fill="white" opacity=".75"><ellipse cx="32.4" cy="22.7" rx="3" ry="1.7" transform="rotate(0 31.8 23.6)"/><ellipse cx="20.4" cy="22.1" rx="2.2" ry="1" transform="rotate(0 20.4 22.5)"/><circle cx="11.5" cy="20.2" r=".8"/></g>
+<path d="M9.6 21.3 L7.4 22 M9.6 21.9 L7.6 23.1" stroke="white" stroke-width=".7"/>
+<path d="M17.8 23.9 11.7 23 12 30 M20.2 24.3 26.1 26.2 20.2 30 M22.6 24.1 28.7 23 28.6 30" stroke="gainsboro" stroke-width="1"/>
+<path d="M11.4 18.4 8.2 15.7 2.8 15.7" stroke="white" stroke-width=".8"/>
+<path d="M4.8 18.4 10.4 18.4 10.4 22.8 4.8 22.8Z" fill="lightgray" fill-opacity="1" stroke="white" stroke-opacity="1" stroke-width=".7" stroke-linejoin="round"/>
+<path d="M6.3 19.7 8.9 19.7 8.9 21.5 6.3 21.5Z" fill="white" fill-opacity="1"/>
+</g></defs>
+<g opacity="1"><use xlink:href="#a" filter="url(#h)" opacity="0.6"/><use xlink:href="#a"/></g>
+<g id="accent">
+<path d="M12.6 20.7 12.6 20.8 12.7 20.8 12.6 20.8 12.6 20.9 12.6 20.8 12.5 20.8 12.6 20.8Z" fill="white" opacity="0"/>
+</g>
+</svg>

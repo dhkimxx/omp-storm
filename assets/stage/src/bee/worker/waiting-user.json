@@ -1,0 +1,21 @@
+{
+	"w": 54,
+	"h": 36,
+	"anchor": {
+		"x": 16,
+		"y": 15
+	},
+	"frameMs": 2400,
+	"durationMs": 2400,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "waiting-user.a.svg"
+		},
+		{
+			"at": 2400,
+			"svg": "waiting-user.b.svg"
+		}
+	]
+}

@@ -4,8 +4,8 @@
  * scan while verifying) and the end of a run paints it with a full rainbow.
  */
 import type { RunPhase } from "../../appearance.ts";
-import { mix, type Rgb } from "../colour.ts";
-import { BASE_CHROMA, BASE_HUE, greenOf, greyOf, HUE_GREEN, hot, lineColour } from "./colours.ts";
+import { HUE_GREEN, mix, type Rgb } from "../colour.ts";
+import { BASE_CHROMA, BASE_HUE, greenOf, greyOf, hot, lineColour } from "./colours.ts";
 import { densify } from "./routes.ts";
 import { dot, type Fx, type AuroraEntry, STILL_T } from "./fx.ts";
 import { clamp, lerp, mod, pingPong, smooth, TAU } from "./math.ts";

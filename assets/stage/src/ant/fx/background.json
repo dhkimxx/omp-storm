@@ -1,0 +1,29 @@
+{
+	"w": 432,
+	"h": 90,
+	"anchor": {
+		"x": 0,
+		"y": 0
+	},
+	"frameMs": 400,
+	"durationMs": 4800,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "background.a.svg"
+		},
+		{
+			"at": 1600,
+			"svg": "background.b.svg"
+		},
+		{
+			"at": 3200,
+			"svg": "background.c.svg"
+		},
+		{
+			"at": 4800,
+			"svg": "background.a.svg"
+		}
+	]
+}

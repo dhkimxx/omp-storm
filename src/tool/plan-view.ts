@@ -29,18 +29,23 @@ const STATE_LABEL: Readonly<Record<RunResultState, string>> = {
 
 const quote = (text: string): string => JSON.stringify(text);
 
-function resultLine(spec: PlanLaneResult, row: RunResult | undefined): string {
+function resultSpec(spec: PlanLaneResult): string {
 	const parts = [`${spec.id} (${spec.kind}) 기준 ${quote(spec.criterion)}`];
 	if (spec.path !== undefined) parts.push(`경로 ${spec.path}`);
 	if (spec.contains !== undefined) parts.push(`포함 ${quote(spec.contains)}`);
 	if (spec.check !== undefined) parts.push(`검사 ${spec.check}`);
+	return `  · ${parts.join(" · ")}`;
+}
+
+function resultLine(spec: PlanLaneResult, row: RunResult | undefined): string {
 	const state = row === undefined ? "아직 기록 없음" : STATE_LABEL[row.state];
 	const excluded = row?.scope === "excluded-by-user" ? ", 사용자가 범위에서 뺌" : "";
 	const reason = row?.reason === undefined ? "" : ` — ${row.reason}`;
-	return `  · ${parts.join(" · ")} → ${state}${excluded}${reason}`;
+	return `${resultSpec(spec)} → ${state}${excluded}${reason}`;
 }
 
-function laneLines(lane: PlanLane, rows: ReadonlyMap<string, RunResult>, isolatedProducers: ReadonlySet<string>): string[] {
+/** `rows` undefined: a plan not in force (the plan-mode preview), whose results have no state to show. */
+function laneLines(lane: PlanLane, rows: ReadonlyMap<string, RunResult> | undefined, isolatedProducers: ReadonlySet<string>): string[] {
 	const head = [`- ${lane.name} (${lane.kind}, ${roleTitle(lane.role)})`];
 	if (lane.goal !== undefined) head.push(`목표: ${lane.goal}`);
 	if (lane.job !== undefined) head.push(`정형 작업: ${lane.job}`);
@@ -54,7 +59,28 @@ function laneLines(lane: PlanLane, rows: ReadonlyMap<string, RunResult>, isolate
 		});
 		head.push(`선행: ${edges.join(", ")}`);
 	}
-	return [head.join(" · "), ...(lane.results ?? []).map(spec => resultLine(spec, rows.get(spec.id)))];
+	const results = (lane.results ?? []).map(spec => (rows === undefined ? resultSpec(spec) : resultLine(spec, rows.get(spec.id))));
+	return [head.join(" · "), ...results];
+}
+
+/**
+ * A validated plan's lanes and their results as the preview shows them, under the same length cap as the plan view.
+ * Nothing here is in force, so no result carries a state.
+ */
+export function planPreviewLanes(plan: RunPlan): string[] {
+	const isolatedProducers = new Set(plan.lanes.filter(lane => lane.isolationReason !== undefined).map(lane => lane.name));
+	const out: string[] = [];
+	let size = 0;
+	for (const lane of plan.lanes) {
+		const lines = laneLines(lane, undefined, isolatedProducers);
+		size += lines.join("\n").length + 1;
+		if (size > MAX_PLAN_VIEW_CHARS && out.length > 0) {
+			out.push(`- 외 ${plan.lanes.length - plan.lanes.indexOf(lane)}개 레인은 길이 때문에 표시하지 않았습니다.`);
+			break;
+		}
+		out.push(...lines);
+	}
+	return out;
 }
 
 /**

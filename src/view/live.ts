@@ -17,12 +17,16 @@ import {
 	h,
 	isDark,
 	type JSXNode,
+	loadTerminalFacts,
 	nativeRendering,
+	type PaintImages,
 	presetOf,
+	registerRolePainters,
 	signal,
 	span,
 	type Span,
 	symbolOf,
+	terminalFacts,
 	type Theme,
 	truncate,
 	type UiNode,
@@ -31,9 +35,13 @@ import {
 import type { CandidateProjection } from "../runtime/integration-controller-port.ts";
 import type { RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, STORM_MARK, type RunPhase } from "./appearance.ts";
-import { LANE_MIN_COLUMNS, laneFrame, laneLiveliness } from "./lane/frame.ts";
+import { LANE_MIN_COLUMNS, type LaneFrameOptions, laneViewFrame, laneViewLiveliness, laneViewParts } from "./lane/frame.ts";
 import type { LaneSnapshot } from "./lane/model.ts";
 import { LaneTimeline } from "./lane/timeline.ts";
+import { SPECIES_NAME } from "./stage/cast.ts";
+import { stageAt } from "./stage/sequencer.ts";
+import { phraseRow, stageLaneColours, stagePhrase, stagePicture } from "./stage/render-pixels.ts";
+import { joinStageRows, selectStageTier, type StageDrawTier, type StageImage, StageImageChannel, type StageTerminal } from "./stage/t1.ts";
 import {
 	type LiveMetricChip,
 	type LiveMetricFacts,
@@ -48,6 +56,8 @@ const RADAR_TICK_MS = 85;
 const RADAR_COLUMNS = 52;
 /** The lane view needs this many terminal rows; below it the single line stays. */
 export const LANE_MIN_ROWS = 18;
+/** The end of the lane view's status row when a lane has a worker: omp's agent hub key and what it is for here. */
+export const LANE_HUB_HINT = "alt+a 워커와 대화";
 /** Lane frames repaint at the radar's pace, a little slower over SSH where the view's ~70 KB/s is felt. */
 const LANE_TICK_MS = 85;
 const LANE_SSH_TICK_MS = 120;
@@ -82,10 +92,55 @@ export function laneHeight(terminalRows: number): number {
 	return Math.min(LANE_MAX_HEIGHT, Math.max(LANE_MIN_HEIGHT, Math.floor(terminalRows / 3)));
 }
 
-function laneTickMs(): number {
+function sshSession(): boolean {
 	const env = process.env;
-	return (env.SSH_CONNECTION ?? "") !== "" || (env.SSH_TTY ?? "") !== "" ? LANE_SSH_TICK_MS : LANE_TICK_MS;
+	return (env.SSH_CONNECTION ?? "") !== "" || (env.SSH_TTY ?? "") !== "";
 }
+
+function laneTickMs(): number {
+	return sshSession() ? LANE_SSH_TICK_MS : LANE_TICK_MS;
+}
+
+/** The role of the lane view's node: its painter draws the stage image and the lane text together (B0). */
+const STAGE_ROLE = "storm.lane-view";
+/** How long the widget stays after its transparent frame was asked for, so the host paints it before removal. */
+const STAGE_CLEAR_MS = 150;
+
+/** The lane view nodes mounted in the terminal, with the widget and mount each one draws. */
+const stageMounts = new WeakMap<object, { widget: LiveRunWidget; token: object; mount: Mount }>();
+let stagePainter: "loading" | "ready" | "missing" | undefined;
+
+/** Registers the lane view's role painter and loads the terminal's facts, once per process; the result arrives later. */
+function prepareStagePainter(): void {
+	if (stagePainter !== undefined) return;
+	stagePainter = "loading";
+	void Promise.all([
+		registerRolePainters([[
+			"canvas",
+			STAGE_ROLE,
+			(node, cx) => {
+				const entry = stageMounts.get(node);
+				return { rows: entry === undefined ? [] : entry.widget.paintRows(entry.token, entry.mount, cx.width, cx.images) };
+			},
+		]]),
+		loadTerminalFacts(),
+	]).then(([painted, facts]) => {
+		stagePainter = painted && facts ? "ready" : "missing";
+	});
+}
+
+/**
+ * The terminal as the stage sees it. Undefined without a terminal on stdout (a pipe, a test run): the stage then keeps
+ * the braille drawing every terminal can show.
+ */
+function stageTerminal(): StageTerminal | undefined {
+	if (process.stdout.isTTY !== true) return undefined;
+	const facts = terminalFacts();
+	return facts === undefined ? undefined : { ...facts, ssh: sshSession() };
+}
+
+/** One stage, one image key (B0): the run's id keeps a new run from reusing the last run's picture. */
+const stageKey = (runId: string): string => `storm-stage:${runId}`;
 
 /** The ASCII preset keeps Storm's identity without a glyph the terminal cannot render. */
 const ASCII_MARK = "~ STORM";
@@ -143,6 +198,8 @@ function radarFrame(phase: RunPhase, frame: number, theme: Theme, track: string)
 interface RadarLayout {
 	columns: number;
 	theme: Theme;
+	/** The stage's one-line phrase the header carries, when it fits. */
+	phrase: string;
 	prefix: string;
 	metrics: string;
 	track: string;
@@ -397,6 +454,7 @@ export class LiveStatus {
 	constructor(options: { now?: () => number; laneView?: (ctx: ExtensionContext) => boolean } = {}) {
 		this.#now = options.now ?? Date.now;
 		this.#laneView = options.laneView ?? (() => true);
+		prepareStagePainter();
 	}
 
 	/** The current session generation; `syncSession` checks it again after every await. */
@@ -417,10 +475,17 @@ export class LiveStatus {
 
 	/**
 	 * Shows `run` in the editor widget when this host can draw one. The phase is view-only evidence from the
-	 * controller and defaults to `working`. Returns false for every other host, whose caller keeps the plain
-	 * `setStatus` text. Updates reuse the one widget and only ask it to repaint.
+	 * controller and defaults to `working`; so is `evidence.directorEditing` (the director's own path edit holds the
+	 * tree now). Returns false for every other host, whose caller keeps the plain `setStatus` text. Updates reuse the
+	 * one widget and only ask it to repaint.
 	 */
-	show(ctx: ExtensionContext, run: RunRecord, phase: RunPhase = "working", integration?: CandidateProjection): boolean {
+	show(
+		ctx: ExtensionContext,
+		run: RunRecord,
+		phase: RunPhase = "working",
+		integration?: CandidateProjection,
+		evidence: { directorEditing?: boolean } = {},
+	): boolean {
 		if (!isLiveTui(ctx)) return false;
 		const ui = ctx.ui;
 		if (this.#ui !== undefined && this.#ui !== ui) {
@@ -438,13 +503,14 @@ export class LiveStatus {
 			laneView,
 			settings: scopedSettings(),
 			...(integration === undefined ? {} : { integration }),
+			directorEditing: evidence.directorEditing === true,
 			onDropped: () => {
 				// The host removed or replaced the widget underneath us: the next `show` installs it again.
 				this.#installed = undefined;
 				this.#statusCleared = false;
 			},
 		}));
-		if (!fresh) widget.update(run, now, phase, laneView, integration);
+		if (!fresh) widget.update(run, now, phase, laneView, integration, evidence.directorEditing === true);
 		const drawing = nativeRendering() ? "native" : "rows";
 		if (this.#installed !== drawing && !this.#install(ui, widget, drawing)) {
 			if (fresh) {
@@ -470,14 +536,26 @@ export class LiveStatus {
 		this.#ui = undefined;
 		this.#installed = undefined;
 		this.#statusCleared = false;
-		widget?.stop();
+		// A stage picture on screen is deleted by one transparent frame under its key before the widget goes.
+		const clearing = widget?.stop() === "clearing";
 		if (ui === undefined) return;
-		try {
-			ui.setWidget(LIVE_WIDGET_KEY, undefined);
-		} catch {
-			// The host is going away or no longer accepts widgets; the widget's timer is already stopped.
-		}
+		const remove = (): void => {
+			try {
+				ui.setWidget(LIVE_WIDGET_KEY, undefined);
+			} catch {
+				// The host is going away or no longer accepts widgets; the widget's timer is already stopped.
+			}
+		};
+		if (!clearing) return remove();
+		const removal = ++this.#removals;
+		const timer = setTimeout(() => {
+			if (this.#removals === removal && this.#widget === undefined) remove();
+		}, STAGE_CLEAR_MS);
+		timer.unref?.();
 	}
+
+	/** Bumped by every `clear`; a delayed removal only runs when nothing came after it. */
+	#removals = 0;
 
 	#install(ui: ExtensionContext["ui"], widget: LiveRunWidget, drawing: "rows" | "native"): boolean {
 		try {
@@ -502,6 +580,8 @@ interface Mount {
 interface StatusRow {
 	columns: number;
 	theme: Theme;
+	/** Whether the row ends with `LANE_HUB_HINT`'s offer (some lane has a worker). */
+	hub: boolean;
 	row: string;
 }
 
@@ -543,6 +623,12 @@ class LiveRunWidget {
 	#animAt: number | undefined;
 	/** Bumped when the native tree has to be built again (a native host's nodes read it). */
 	readonly #revision = signal(0);
+	/** The stage's image stream (T1): one key per run. */
+	#channel: StageImageChannel;
+	/** A transparent frame still to paint under an old key before the picture may go. */
+	#clearing: StageImage | undefined;
+	/** The cells the last stage picture took, so the transparent frame covers the same box. */
+	#imageBox = { columns: 1, rows: 1 };
 
 	constructor(
 		run: RunRecord,
@@ -554,6 +640,7 @@ class LiveRunWidget {
 			laneView?: boolean;
 			settings?: Settings | undefined;
 			integration?: CandidateProjection;
+			directorEditing?: boolean;
 		} = {},
 	) {
 		this.#phase = phase;
@@ -564,7 +651,8 @@ class LiveRunWidget {
 		this.#laneView = options.laneView ?? true;
 		this.#settings = options.settings;
 		this.#runId = run.runId;
-		this.#timeline.observe(run, phase, now, options.integration);
+		this.#channel = new StageImageChannel(stageKey(run.runId));
+		this.#timeline.observe(run, phase, now, options.integration, options.directorEditing === true);
 		this.#motion = motionEffectsEnabled(this.#settings);
 		this.#offMotion = onMotionChange(this.#settings, () => this.#motionChanged());
 	}
@@ -585,11 +673,33 @@ class LiveRunWidget {
 			node.onDispose(() => this.#detach(token));
 			return node;
 		}
+		// A terminal that draws images gets a node: its role painter reaches the host's images (B0). The node's own
+		// `paint` is the same drawing without them, for a host that did not take the painter.
+		if (stagePainter === "ready" && stageTerminal()?.images != null) {
+			const node = h("canvas", { role: STAGE_ROLE, paint: (width: number) => this.#render(token, mount, width) });
+			stageMounts.set(node, { widget: this, token, mount });
+			node.onDispose(() => this.#detach(token));
+			return node;
+		}
 		const rows: ExtensionRows = {
 			render: width => this.#render(token, mount, width),
 			dispose: () => this.#detach(token),
 		};
 		return rows;
+	}
+
+	/**
+	 * What the lane view's role painter draws: the transparent frame when one is due, else the widget's rows with the
+	 * host's images at hand. Reads the revision, so the widget's own repaint requests reach the node.
+	 */
+	paintRows(token: object, mount: Mount, width: number, images: PaintImages | undefined): readonly string[] {
+		this.#revision();
+		const clearing = this.#clearing;
+		if (clearing !== undefined && images !== undefined) {
+			this.#clearing = undefined;
+			return images.rows(clearing, { maxColumns: this.#imageBox.columns, maxRows: this.#imageBox.rows, fallback: "" }).rows;
+		}
+		return this.#render(token, mount, width, images);
 	}
 
 	/** The host dropped a mount. Only the current one counts: an older one was replaced by a rebuild. */
@@ -600,31 +710,52 @@ class LiveRunWidget {
 		if (!this.#stopped) this.#onDropped?.();
 	}
 
-	/** Stopped for good: the run ended, the session switched or the host was replaced. Idempotent. */
-	stop(): void {
-		if (this.#stopped) return;
+	/**
+	 * Stopped for good: the run ended, the session switched or the host was replaced. Idempotent. Returns "clearing"
+	 * when a stage picture is on screen: the node paints its transparent frame once more, so the caller removes the
+	 * widget a moment later.
+	 */
+	stop(): "clearing" | undefined {
+		if (this.#stopped) return undefined;
+		const clearing = this.#channel.showing ? this.#channel.clear() : undefined;
+		const ui = this.#mount?.mount.ui;
 		this.#stopped = true;
 		this.#mount = undefined;
 		drawnRows.delete(this);
 		this.#stopTimer();
 		this.#offMotion();
 		this.#invalidate();
+		if (clearing === undefined) return undefined;
+		this.#clearing = clearing;
+		this.#revision.set(this.#revision.peek() + 1);
+		ui?.requestRender();
+		return "clearing";
 	}
 
 	/**
 	 * The controller's live record, phase or the lane view switch changed: repaint, but keep the one widget. The
 	 * timeline sees every update, even one that changes no chip, because lanes move without them.
 	 */
-	update(run: RunRecord, now: number, phase: RunPhase, laneView: boolean = this.#laneView, integration?: CandidateProjection): void {
+	update(
+		run: RunRecord,
+		now: number,
+		phase: RunPhase,
+		laneView: boolean = this.#laneView,
+		integration?: CandidateProjection,
+		directorEditing = false,
+	): void {
 		if (this.#stopped) return;
 		if (run.runId !== this.#runId) {
 			// One timeline belongs to one run.
 			this.#runId = run.runId;
 			this.#integration = undefined;
 			this.#timeline = new LaneTimeline();
+			// The last run's picture goes with a transparent frame under its key; the new run draws under its own.
+			if (this.#channel.showing) this.#clearing = this.#channel.clear();
+			this.#channel = new StageImageChannel(stageKey(run.runId));
 		}
 		if (integration !== undefined) this.#integration = integration;
-		this.#timeline.observe(run, phase, now, this.#integration);
+		this.#timeline.observe(run, phase, now, this.#integration, directorEditing);
 		const switched = laneView !== this.#laneView;
 		this.#laneView = laneView;
 		const facts = liveMetricFacts(run, phase, now, this.#integration === undefined ? {} : { integration: this.#integration });
@@ -664,14 +795,14 @@ class LiveRunWidget {
 		return rows !== undefined && rows >= LANE_MIN_ROWS;
 	}
 
-	#render(token: object, mount: Mount, width: number): readonly string[] {
+	#render(token: object, mount: Mount, width: number, images?: PaintImages): readonly string[] {
 		if (this.#stopped || this.#mount?.token !== token) return [];
 		const columns = Math.max(0, Math.floor(width));
 		this.#columns = columns;
 		const theme = this.#themeOf(mount);
 		const terminalRows = this.#terminalRows(mount.ui);
 		const lane = columns > 0 && this.#laneEligible(columns, theme, terminalRows);
-		const rows = lane ? this.#laneRows(columns, theme, laneHeight(terminalRows ?? LANE_MIN_ROWS)) : this.#singleRows(columns, theme);
+		const rows = lane ? this.#laneRows(columns, theme, laneHeight(terminalRows ?? LANE_MIN_ROWS), images) : this.#singleRows(columns, theme);
 		drawnRows.set(this, rows.length);
 		return rows;
 	}
@@ -683,7 +814,7 @@ class LiveRunWidget {
 	}
 
 	/** The status row, then the trunk and the lanes: as many rows as the picture needs, at most `height`. */
-	#laneRows(columns: number, theme: Theme, height: number): readonly string[] {
+	#laneRows(columns: number, theme: Theme, height: number, images?: PaintImages): readonly string[] {
 		const now = this.#clock();
 		const snapshot = this.#timeline.snapshot(now);
 		this.#syncTimer(snapshot);
@@ -691,28 +822,85 @@ class LiveRunWidget {
 			if (this.#animAt !== undefined) this.#animTime += Math.min(LANE_MAX_STEP_MS, Math.max(0, now - this.#animAt));
 			this.#animAt = now;
 		}
-		const frame = laneFrame(snapshot, columns, this.#animTime, {
+		const options: LaneFrameOptions = {
 			motion: this.#motion,
 			maxRows: height - 1,
 			colour: depthOf(theme) === "truecolor" ? "truecolor" : "256",
 			dark: isDark(theme),
-		});
-		return [this.#statusRow(columns, theme), ...frame];
+		};
+		const status = this.#statusRow(columns, theme, snapshot.lanes.some(lane => lane.agent !== undefined));
+		const tier = this.#stageTier(theme, images);
+		const image = tier === "t1" && images !== undefined ? this.#imageRows(snapshot, columns, options, images, now) : undefined;
+		if (image !== undefined) return [status, ...image];
+		return [status, ...laneViewFrame(snapshot, columns, this.#animTime, options, tier === "t3" ? "t3" : "t2")];
 	}
 
-	/** Row 0 of the lane view: mark, phase and chips, without the radar (the trunk carries the motion). */
-	#statusRow(columns: number, theme: Theme): string {
+	/** The tier the stage draws in now: the terminal's (B0), never T1 without the host's images or past the budget. */
+	#stageTier(theme: Theme, images: PaintImages | undefined): StageDrawTier {
+		const terminal = stageTerminal();
+		if (terminal === undefined) return "t3";
+		const tier = selectStageTier({ ...terminal, truecolor: terminal.truecolor && depthOf(theme) === "truecolor" }, this.#motion);
+		return tier === "t1" && (images === undefined || this.#channel.demoted) ? "t2" : tier;
+	}
+
+	/**
+	 * The lane view with the stage as an image: the picture rows (placements step the cursor over the stage), the
+	 * phrase row, and the graph beside them. Undefined when there is no stage or the host shows no picture: the caller
+	 * draws T2 then. A still picture (motion off) is encoded again only when the record changes.
+	 */
+	#imageRows(snapshot: LaneSnapshot, columns: number, options: LaneFrameOptions, images: PaintImages, now: number): readonly string[] | undefined {
+		const parts = laneViewParts(snapshot, columns, this.#animTime, options);
+		if (parts === undefined) return undefined;
+		const pictureRows = parts.rows - 1;
+		const still = options.motion
+			? undefined
+			: `${parts.stageCols}x${pictureRows}|${options.dark}|${snapshot.complete}|${snapshot.phases.at(-1)?.phase}|${snapshot.lanes.map(lane => `${lane.spans.length}${lane.spans.at(-1)?.state}`).join(",")}`;
+		const source = this.#channel.frame(now, laneTickMs(), () => {
+			const picture = stagePicture(snapshot, parts.stageCols, pictureRows, this.#animTime, options, "t1");
+			return { w: picture.w, h: picture.h, rgb: picture.rgb, dark: options.dark, laneColours: stageLaneColours(snapshot, options.dark) };
+		}, still);
+		if (source === undefined) return undefined;
+		const phrase = stagePhrase(snapshot, parts.stageCols, pictureRows, options.motion);
+		const got = images.rows(source, { maxColumns: parts.stageCols, maxRows: pictureRows, fallback: phrase });
+		if (got.state === "fallback") return undefined;
+		this.#imageBox = { columns: parts.stageCols, rows: pictureRows };
+		return joinStageRows(
+			got,
+			parts.stageCols,
+			pictureRows,
+			phraseRow(phrase, parts.stageCols, options.dark, options.colour),
+			parts.graph,
+			parts.graphCols,
+			visibleWidth,
+			this.#channel.frames % 2 === 1,
+		);
+	}
+
+	/**
+	 * Row 0 of the lane view: mark, phase and chips, without the radar (the trunk carries the motion). When some lane has
+	 * a worker the hub shows and the row has room, it ends with the way to talk to it.
+	 */
+	#statusRow(columns: number, theme: Theme, hub: boolean): string {
 		const cached = this.#status;
-		if (cached?.columns === columns && cached.theme === theme) return cached.row;
-		const row = singleRow(this.#facts, columns, theme)[0] ?? "";
-		this.#status = { columns, theme, row };
+		if (cached?.columns === columns && cached.theme === theme && cached.hub === hub) return cached.row;
+		let row = singleRow(this.#facts, columns, theme)[0] ?? "";
+		const room = columns - visibleWidth(row) - visibleWidth(LANE_HUB_HINT);
+		if (hub && room >= 2) row += `${" ".repeat(room)}${theme.fg("dim", LANE_HUB_HINT)}`;
+		this.#status = { columns, theme, hub, row };
 		return row;
 	}
 
-	/** The single status line with its radar, exactly as before the lane view existed. */
+	/** The stage's phrase for the one-line drawings (T4): `문어 · 일을 나눠 맡기는 중`. */
+	#phrase(theme: Theme): string {
+		const cast = stageAt(this.#timeline.snapshot(this.#clock()), undefined, false).cast;
+		return `${SPECIES_NAME[cast.species]}${sepOf(theme)}${cast.phrase}`;
+	}
+
+	/** The single status line with its radar, as before the lane view existed, with the stage's phrase where it fits. */
 	#lineRows(columns: number, theme: Theme): readonly string[] {
-		const layout = this.#layout?.columns === columns && this.#layout.theme === theme
-			? this.#layout : (this.#layout = this.#buildLayout(columns, theme));
+		const phrase = columns >= RADAR_COLUMNS ? this.#phrase(theme) : "";
+		const layout = this.#layout?.columns === columns && this.#layout.theme === theme && this.#layout.phrase === phrase
+			? this.#layout : (this.#layout = this.#buildLayout(columns, theme, phrase));
 		if (!this.#ticking()) return layout.still;
 		return (layout.frames[this.#frame] ??= [
 			`${layout.prefix}${radarFrame(this.#phase, this.#frame, theme, layout.track)}${theme.fg("dim", "]")}`,
@@ -720,17 +908,20 @@ class LiveRunWidget {
 		]);
 	}
 
-	#buildLayout(columns: number, theme: Theme): RadarLayout {
+	#buildLayout(columns: number, theme: Theme, phrase: string): RadarLayout {
 		const track = isAscii(theme) ? RADAR_ASCII[this.#phase] : RADAR[this.#phase];
 		const header = `${strong(theme, theme.fg("accent", markFor(theme)))}${theme.fg("dim", sepOf(theme))}${theme.fg(this.#facts.phase.tone, this.#facts.phase.label)}`;
 		if (columns < RADAR_COLUMNS) {
-			return { columns, theme, prefix: "", metrics: "", track, still: singleRow(this.#facts, columns, theme), frames: [] };
+			return { columns, theme, phrase, prefix: "", metrics: "", track, still: singleRow(this.#facts, columns, theme), frames: [] };
 		}
 		const headerWidth = visibleWidth(markFor(theme)) + visibleWidth(sepOf(theme)) + visibleWidth(this.#facts.phase.label);
-		const prefix = `${header}${" ".repeat(Math.max(1, columns - headerWidth - visibleWidth(track) - 2))}${theme.fg("dim", "[")}`;
+		const free = columns - headerWidth - visibleWidth(track) - 2;
+		const said = phrase !== "" && free - 1 >= visibleWidth(sepOf(theme)) + visibleWidth(phrase) ? `${sepOf(theme)}${phrase}` : "";
+		const gap = free - visibleWidth(said);
+		const prefix = `${header}${said === "" ? "" : theme.fg("dim", said)}${" ".repeat(Math.max(1, gap))}${theme.fg("dim", "[")}`;
 		const metrics = ansiMetrics(this.#facts.chips, columns, theme);
 		const still = [`${prefix}${theme.fg(this.#facts.phase.tone, track)}${theme.fg("dim", "]")}`, metrics];
-		return { columns, theme, prefix, metrics, track, still, frames: [] };
+		return { columns, theme, phrase, prefix, metrics, track, still, frames: [] };
 	}
 
 	/**
@@ -762,7 +953,7 @@ class LiveRunWidget {
 				"row",
 				{ align: "baseline", gap: "none" },
 				header,
-				h("text", { text: " ", grow: 1, min: { w: "0ch" } }),
+				h("text", { spans: [span(` ${this.#phrase(theme)} `, "dim")], wrap: "none", truncate: "end", grow: 1, min: { w: "0ch" } }),
 				h("text", { spans: [span("[", "dim")], shrink: 0 }),
 				field,
 				h("text", { spans: [span("]", "dim")], shrink: 0 }),
@@ -787,7 +978,8 @@ class LiveRunWidget {
 		if (this.#stopped || this.#mount === undefined || this.#columns === 0) return undefined;
 		if (this.#laneShown()) {
 			if (!this.#motion) return undefined;
-			const liveliness = laneLiveliness(snapshot ?? this.#timeline.snapshot(this.#clock()));
+			const terminalRows = this.#terminalRows(this.#mount.mount.ui);
+			const liveliness = laneViewLiveliness(snapshot ?? this.#timeline.snapshot(this.#clock()), this.#columns, laneHeight(terminalRows ?? LANE_MIN_ROWS) - 1);
 			return liveliness === "still" ? undefined : liveliness === "slow" ? LANE_SLOW_TICK_MS : laneTickMs();
 		}
 		return this.#ticking() ? RADAR_TICK_MS : undefined;

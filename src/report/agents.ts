@@ -47,7 +47,7 @@ export function renderAgentRows(rows: readonly AgentRow[], now: number): string 
 		const idle = e.state === "running" ? "—" : duration(now - e.lastActivityAt);
 		const role = e.role === undefined ? e.name : roleTitle(e.role);
 		out.push(
-			`| ${cell(e.id)} | ${cell(role)} | ${cell(e.model ?? "—")} | ${STATE_LABEL[e.state]} | ${idle} | ${tokens(e.contextTokens)} | ${e.followUps} | ${FOLLOW_UP_LABEL[followUp]} |`,
+			`| ${cell(e.id)} | ${cell(role)} | ${cell(e.model ?? "—")} | ${STATE_LABEL[e.state]} | ${idle} | ${tokens(e.contextTokens)} | ${e.followUps}${userDirected(e)} | ${FOLLOW_UP_LABEL[followUp]} |`,
 		);
 	}
 	return out.join("\n");
@@ -65,9 +65,21 @@ export function agentStatusSpans({ entry, followUp }: AgentRow, now: number): re
 			{ text: ` · ${role} · ${state}`, tone: entry.state === "running" ? "success" : "muted" },
 		],
 		[{ text: `  ${entry.model ?? "—"} · 컨텍스트 ${tokens(entry.contextTokens)}`, tone: "muted" }],
-		[{ text: `  후속 지시 ${entry.followUps}회 · ${FOLLOW_UP_LABEL[followUp]}`, tone: followUp === "cleaned" ? "warning" : "muted" }],
+		[{ text: `  후속 지시 ${entry.followUps}회${userDirected(entry)} · ${FOLLOW_UP_LABEL[followUp]}`, tone: followUp === "cleaned" ? "warning" : "muted" }],
 	];
 }
+
+/** User-directed turns and hub stops beside the director's follow-ups; nothing when there were none. */
+function userDirected(entry: AgentEntry): string {
+	const parts = [
+		...(entry.userTurns ? [`사용자 지시 ${entry.userTurns}회`] : []),
+		...(entry.userStops ? [`사용자 정지 ${entry.userStops}회`] : []),
+	];
+	return parts.length === 0 ? "" : ` · ${parts.join(" · ")}`;
+}
+
+/** Where the user talks to a worker directly: omp's Agent Hub. Storm only points the way. */
+export const HUB_HINT = "alt+a 허브에서 대화";
 
 /** Control characters, bidi marks and line separators: the same class `visible()` in `view/render.ts` escapes. */
 const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g;
@@ -110,7 +122,9 @@ export function renderAgentReport(rows: readonly AgentRow[], now: number, info: 
 		return out.join("\n");
 	}
 	for (const row of rows) {
-		for (const spans of agentStatusSpans(row, now)) styled(spans);
+		const spans = agentStatusSpans(row, now);
+		// A cleaned worker has no omp records left to focus; every other row points to the hub.
+		spans.forEach((line, index) => styled(index === spans.length - 1 && row.followUp !== "cleaned" ? [...line, { text: ` · ${HUB_HINT}`, tone: "muted" }] : line));
 		const evidence = agentEvidenceSpans(row.entry);
 		if (evidence.length) styled(evidence);
 	}

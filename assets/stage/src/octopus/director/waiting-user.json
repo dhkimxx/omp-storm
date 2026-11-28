@@ -1,0 +1,36 @@
+{
+	"w": 63,
+	"h": 72,
+	"anchor": {
+		"x": 31,
+		"y": 36
+	},
+	"frameMs": 83,
+	"durationMs": 2400,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "waiting-user.a.svg"
+		},
+		{
+			"at": 950,
+			"svg": "waiting-user.b.svg",
+			"ease": "inOut"
+		},
+		{
+			"at": 1100,
+			"svg": "waiting-user.c.svg",
+			"ease": "in"
+		},
+		{
+			"at": 1300,
+			"svg": "waiting-user.d.svg",
+			"ease": "out"
+		},
+		{
+			"at": 2400,
+			"svg": "waiting-user.a.svg"
+		}
+	]
+}

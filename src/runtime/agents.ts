@@ -178,6 +178,20 @@ export function noteAgentFollowUp(id: string, scope: string): void {
 	if (record) record.entry.followUps++;
 }
 
+/** The user typed to it in the hub and the run admitted that turn: one more user-directed turn. */
+export function noteAgentUserTurn(id: string, scope: string): void {
+	if (!validScope(scope)) return;
+	const record = recordOf(id, scope);
+	if (record) record.entry.userTurns = (record.entry.userTurns ?? 0) + 1;
+}
+
+/** The user stopped its turn from the hub: one more user stop. */
+export function noteAgentUserStop(id: string, scope: string): void {
+	if (!validScope(scope)) return;
+	const record = recordOf(id, scope);
+	if (record) record.entry.userStops = (record.entry.userStops ?? 0) + 1;
+}
+
 export function noteAgentEnd(input: {
 	id: string;
 	scope: string;

@@ -48,6 +48,7 @@ import { sharedMap } from "../src/runtime/thread-state.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
 import { treeAgainst } from "../src/runtime/tree.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
+import { PLAN_PREVIEW_HEAD } from "../src/tool/storm-tool.ts";
 import { loadProjectState } from "../src/state.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
 import * as admissionModule from "../src/worker-admission.ts";
@@ -2987,7 +2988,7 @@ describe("automatic delegation", () => {
 		await omp.emit("session_shutdown", {}, main);
 	});
 
-	test("public plan mode cannot auto-start a run", async () => {
+	test("public plan mode previews a storm plan and opens no run", async () => {
 		await approve(TEAM);
 		await enableAuto();
 		const omp = fakeOmp(project);
@@ -3005,8 +3006,12 @@ describe("automatic delegation", () => {
 		expect(omp.statuses.at(-1)).toContain("자동 위임 막힘");
 		await omp.emit("before_agent_start", { reason: "prompt", prompt: "fix it", systemPrompt: [] }, main);
 		const reply = await omp.toolReply({ action: "plan", plan: { lanes: [fixLane] } }, main);
-		expect(reply.outcome).toBe("rejected");
-		expect(reply.text).toContain("계획 모드");
+		expect(reply.outcome).toBe("ok");
+		expect(reply.text.split("\n")[0]).toBe(PLAN_PREVIEW_HEAD);
+		expect(reply.text).toContain(`- ${fixLane.name} (`);
+		// Plan mode is the reason nothing starts, not a blocker to fix: the preview never lists it.
+		expect(reply.text).not.toContain("- 막힘: omp 모드");
+		expect(omp.sent).toEqual([]);
 		expect(activeLedgerRun((await loadProjectState(project.env)).sessionDir)).toBeUndefined();
 	});
 
@@ -4297,8 +4302,9 @@ describe("the lane view switch", () => {
 		await omp.emit("session_start", {}, host.ctx);
 		await omp.command("fix it", host.ctx);
 		const lane = host.draw();
-		// Nothing is padded: a run without a plan yet draws the status row and the trunk, no more.
-		expect(lane).toHaveLength(2);
+		// Nothing is padded: a run without a plan yet draws the status row, the trunk and, at 100 columns, the stage's
+		// five rows beside it. The rows under the trunk are the stage's picture and phrase, not blank filler.
+		expect(lane).toHaveLength(6);
 		expect(lane[0]).toStartWith(STORM_MARK);
 		expect(lane[0]).not.toMatch(RADAR);
 		expect(lane[1]!.trim()).not.toBe("");
@@ -4313,7 +4319,7 @@ describe("the lane view switch", () => {
 
 		await omp.command("view", host.ctx);
 		const back = host.draw();
-		expect(back).toHaveLength(2);
+		expect(back).toHaveLength(6);
 		expect(back[0]).not.toMatch(RADAR);
 		expect(back[1]!.trim()).not.toBe("");
 		expect(noticesAbout(omp).includes("error")).toBe(false);
@@ -8331,5 +8337,149 @@ describe("native paid attempts through the hooks", () => {
 		await omp.emit("session_shutdown", {}, main);
 		expect(paid.authorizeCalls.at(-1)).toBeUndefined();
 		expect(getLedgerRun(runId)).toBeUndefined();
+	});
+});
+
+describe("direct user intervention through the hooks (I2, I4)", () => {
+	type ContextAnswer = { messages: Array<{ role: string; content: Array<{ type: string; text: string }> }> };
+	/** A prompt the user typed to the worker focused in omp's hub: omp attributes it to the user. */
+	const typed = (content: string) => ({ role: "user", content, attribution: "user", timestamp: Date.now() });
+	const answered = { role: "assistant", content: [], stopReason: "stop", timestamp: 1 };
+	const write = (child: ReturnType<typeof fakeOmp>, on: ExtensionContext, file: string) =>
+		child.emit("tool_call", { toolName: "write", input: { path: file, content: "x" } }, on) as Promise<{ block?: boolean; reason?: string } | undefined>;
+	/** What the director's next request carries beyond its history. */
+	const directorReads = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext): Promise<string> => {
+		const answer = (await omp.emit("context", { messages: [{ role: "user", content: "go on", timestamp: 1 }] }, main)) as ContextAnswer | undefined;
+		return JSON.stringify(answer ?? {});
+	};
+
+	/** A run with the path-only lane `fix`, its worker placed, run once and settled. */
+	async function settledFix() {
+		await pathOnlyImplementer();
+		await approveShadows(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.emit("session_start", {}, main);
+		await omp.command("task", main);
+		await applyRunPlan(omp, main, { lanes: [{ ...fixLane, files: ["allowed.txt"] }] });
+		const placed = await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name: "fix", task: "edit" } }, main);
+		expect(verdict(placed)).toBe("pass");
+		const fix = placedName(placed, "fix");
+		expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", fix), main))).toBe("route:a/i");
+		const impl = child.ctx(sub("fix"));
+		await child.emit("before_agent_start", { systemPrompt: [] }, impl);
+		await child.emit("agent_end", {}, impl);
+		// The settled turn ended its authority.
+		expect(verdict(await write(child, impl, "allowed.txt"))).toBe("authority");
+		return { omp, child, main, impl, fix };
+	}
+
+	test("a hub prompt to a worker this run approved opens a new attempt under its approval and write place, and the director reads one line", async () => {
+		const { omp, child, main, impl, fix } = await settledFix();
+		const before = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: fix });
+		// A director steer is not the user's: the woken turn keeps its ended authority.
+		await child.emit("agent_start", {}, impl);
+		await child.emit("context", { messages: [answered, { role: "user", content: "s", attribution: "agent", parentIrc: { from: "Main", body: "s" }, timestamp: Date.now() }] }, impl);
+		expect(verdict(await write(child, impl, "allowed.txt"))).toBe("authority");
+		await child.emit("agent_end", {}, impl);
+
+		await child.emit("agent_start", {}, impl);
+		await child.emit("context", { messages: [answered, typed("please also handle the empty case")] }, impl);
+		const after = await readWorkerAdmission({ agentDir: project.agentDir, artifactRoot: project.root, parentId: "Main", childId: fix });
+		expect(after).toMatchObject({ kind: "record", record: { lane: "fix" } });
+		if (after.kind === "record") expect([after.record.endedAt, after.record.revokedAt]).toEqual([undefined, undefined]);
+		if (before.kind !== "record" || after.kind !== "record") throw new Error("expected admission records");
+		// A new attempt, under the approved models this run already wrote for the worker (G2).
+		expect(after.record.attempt).not.toBe(before.record.attempt);
+		expect(after.record.approved).toEqual(before.record.approved);
+		// The lane's own scope holds, nothing wider (G1).
+		expect(verdict(await write(child, impl, "allowed.txt"))).toBe("pass");
+		expect(verdict(await write(child, impl, "outside.txt"))).toBe("lane-scope");
+		expect(listAgents().find(agent => agent.id === fix)?.userTurns).toBe(1);
+
+		let read = "";
+		await until(async () => {
+			read = await directorReads(omp, main);
+			return read.includes("직접 지시함");
+		});
+		expect(read).toContain(`사용자가 fix의 워커에게 직접 지시함 (history://${fix})`);
+		// No body copy.
+		expect(read).not.toContain("empty case");
+		// The same request again (a retry) asks nothing twice.
+		await child.emit("context", { messages: [answered, typed("please also handle the empty case")].map((message, index) => index === 1 ? { ...message, timestamp: 0 } : message) }, impl);
+		expect(listAgents().find(agent => agent.id === fix)?.userTurns).toBe(1);
+	});
+
+	test("a hub prompt to a worker whose write place another lane holds goes on read-only, and its first refused write names the holder", async () => {
+		await approve(TEAM);
+		const omp = fakeOmp(project);
+		const child = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		await omp.command("manual task", main);
+		expect(await omp.tool({
+			action: "plan",
+			plan: {
+				lanes: [
+					{ name: "A0", kind: "code", role: "implementer", files: ["a.txt"], goal: "Write a.txt", results: changeFor("a0-change") },
+					{ name: "B0", kind: "code", role: "implementer", files: ["b.txt"], goal: "Write b.txt", results: changeFor("b0-change") },
+				],
+				workers: { implementer: 2 },
+			},
+		}, main)).toBe("ok");
+		const idle: Record<string, ExtensionContext> = {};
+		for (const name of ["A0", "B0"]) {
+			const placed = await omp.emit("tool_call", { toolName: "task", input: { agent: "storm-implementer", name, task: "Write" } }, main);
+			const handle = placedName(placed, name);
+			expect(verdict(await omp.emit("before_subagent_spawn", spawnOf("storm-implementer", handle), main))).toBe("route:a/i");
+			idle[name] = child.ctx(sub(handle));
+			await child.emit("before_agent_start", { systemPrompt: [] }, idle[name]!);
+			await child.emit("agent_end", {}, idle[name]!);
+		}
+		// The director's follow-up makes B0 the live writer (bash: an unknown scope).
+		expect(verdict(await omp.emit("tool_call", { toolName: "write", input: { path: "agent://B0", content: "more work" } }, main))).toBe("pass");
+		await child.emit("agent_start", {}, idle.B0!);
+
+		await child.emit("agent_start", {}, idle.A0!);
+		await child.emit("context", { messages: [answered, typed("write a.txt now")] }, idle.A0!);
+		const refused = await write(child, idle.A0!, "a.txt");
+		expect(verdict(refused)).toBe("user-turn");
+		expect(refused?.reason).toContain("읽기 전용");
+		expect(refused?.reason).toContain("B0");
+		// Only the first refusal carries the reason; the authority refusal itself is unchanged.
+		expect(verdict(await write(child, idle.A0!, "a.txt"))).toBe("authority");
+		expect(child.notices.some(notice => notice.text.includes("[storm:user-turn]"))).toBe(true);
+		// Read-only is not a user-directed attempt.
+		expect(listAgents().find(agent => agent.id === idle.A0!.agent.id)?.userTurns).toBeUndefined();
+	});
+
+	test("a hub prompt to a worker the run has no approval record for stays read-only and points to /storm or a new worker", async () => {
+		const { child, impl } = await settledFix();
+		const stray = child.ctx(sub("Stray", "unrelated"));
+		await child.emit("agent_start", {}, stray);
+		await child.emit("context", { messages: [answered, typed("change stray.txt")] }, stray);
+		const refused = await write(child, stray, "stray.txt");
+		expect(verdict(refused)).toBe("user-turn");
+		expect(refused?.reason).toContain("승인한 기록이 없어");
+		expect(refused?.reason).toContain("/storm");
+		// The approved worker is untouched by another worker's turn.
+		expect(verdict(await write(child, impl, "allowed.txt"))).toBe("authority");
+	});
+
+	test("a hub stop of a running worker is recorded as the user's and told to the director; a host abort is not", async () => {
+		const { omp, child, main, impl, fix } = await settledFix();
+		await child.emit("agent_start", {}, impl);
+		await child.emit("agent_end", { messages: [{ role: "assistant", content: [], stopReason: "aborted", errorMessage: "Request was aborted", timestamp: 2 }] }, impl);
+		expect(listAgents().find(agent => agent.id === fix)?.userStops).toBeUndefined();
+
+		await child.emit("agent_start", {}, impl);
+		await child.emit("agent_end", { messages: [{ role: "assistant", content: [], stopReason: "aborted", errorMessage: "Interrupted by user", timestamp: 3 }] }, impl);
+		expect(listAgents().find(agent => agent.id === fix)?.userStops).toBe(1);
+		let read = "";
+		await until(async () => {
+			read = await directorReads(omp, main);
+			return read.includes("허브에서");
+		});
+		expect(read).toContain(`사용자가 허브에서 fix의 워커를 멈춤`);
 	});
 });

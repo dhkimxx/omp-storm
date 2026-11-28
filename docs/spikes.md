@@ -432,9 +432,67 @@ pty 위의 실제 omp에서 에디터 아래에 달고 화면을 터미널 에�
 - 창 크기 변경은 pty 창 크기와 SIGWINCH로만 했다. 스크롤백 재구성(`tui.resizeScrollback`)은 다루지 않았다.
 - 움직임이 눈으로 어떻게 보이는지는 정지 그림과 프레임 덤프로만 판단했다.
 
+## S0. 동물 무대의 이미지 애니메이션(0.32.0)
+
+측정일 2026-11-28, 호스트 omp 19.2.1(`node_modules/@oh-my-pi/*`, 설치된 omp 바이너리 19.2.1), 측정 런타임 Bun 1.4.4(바이너리 내장 1.4.5), Apple Silicon. 탐침은 `scripts/stage/`에 있다.
+
+**구현에서 바뀐 점.** 아래는 스파이크 때의 판단이다. 구현은 아트 시트를 256색이 아니라 회색조+알파로 굽고(색은 실행 때 레인 색으로 칠한다), 팔레트를 종별이 아니라 프레임마다 활성 레인 색의 명도 램프로 만든다. 나머지 결정(프레임마다 한 장 합성, 고정 키, 전송 예산, 단계 강등)은 그대로다. 구현 규칙은 [설계](design.md#동물-무대0320)에 있다.
+
+| 탐침 | 하는 일 |
+|---|---|
+| `frame-cost.ts` | 합성 무대(배경 1장, 개체 7, 빛 조각 24, 비)를 한 장으로 합성하고 PNG로 굽는 CPU와 크기, 프로토콜별 바이트 |
+| `terminal-bytes.ts` | 호스트의 실제 터미널 드라이버·이미지 저장소·프레임 작성기를 메모리 위에서 돌려, 터미널별로 프레임마다 쓰이는 바이트를 센다 |
+| `pty-probe.ts` + `pty-probe-extension.ts` | 설치된 omp를 PTY에서 확장 하나만 싣고 띄워, 편집기 아래 위젯이 85ms/40ms마다 무대 그림을 바꿀 때의 실제 출력 |
+| `svg-bake.ts` | 키 포즈 SVG 2장 → 위상 고정 보간 → resvg 래스터화 → T1·T2 시트, 80 시퀀스 크기 추정 |
+
+### 결론
+
+| 항목 | 결정 |
+|---|---|
+| T1 애니메이션 | 진행. kitty 계열(kitty, Ghostty, WezTerm 등)과 iTerm2에서 85ms(약 12fps). 40×8칸 무대 한 프레임은 약 23~26 KiB, 초당 약 275~310 KiB, 프레임당 CPU 약 0.9ms |
+| 프레임률 | 레인 뷰 틱 85ms. 호스트는 40ms(24.5fps)도 따라오지만(초당 570~640 KiB) 이득보다 전송량이 크다 |
+| 전송 예산 | 프레임당 32 KiB, 초당 400 KiB. 넘으면 프레임 간격을 늘리고(최대 4배), 그래도 넘으면 T2 |
+| SIXEL | 정지 프레임(사건 때만 새로 그림). 움직임은 T2 |
+| SSH, tmux 통과 꺼짐, 이미지 없음 | T2 |
+| 합성 | 프레임마다 한 장으로 합성 → 256색 인덱스 PNG(RGB565 조회표, 4×4 순서 디더) → 이미지 노드 하나 |
+| 화면 연결 | 위젯이 터미널에서도 노드를 돌려주고(`canvas` + `term.role`), 역할 페인터가 `cx.images.rows`로 무대 줄을 받아 레인 줄과 함께 그린다. 무대 하나에 이미지 키 하나 |
+| 래스터화 도구 | `@resvg/resvg-js` 개발 의존성(굽기 전용) |
+| 크기 상한 | 배포되는 구운 결과(`index.json` + 시트) 4 MiB, 시퀀스 하나 96 KiB. 원본(`assets/stage/src`)은 배포하지 않는다 |
+
+### 호스트 UI 라이브러리로 움직이는 그림 보이기
+
+- 확장 위젯이 줄 객체(`{ render(width) }`)를 돌려주면 `canvas`로 그려지고 그 페인터는 폭만 받는다(`pi-tui/src/term/painters/layout.ts:213`, `pi-coding-agent/src/ui/dock/widgets.tsx:107`). 위젯이 노드를 돌려주면(`widgets.tsx:106`) 역할 페인터가 `PaintContext.images`(`term/paint.ts:131`)를 받는다. PTY 탐침에서 페인터는 `images=yes cell={"w":9,"h":18}`을 봤다(kitty·WezTerm·iTerm2). Terminal.app은 대체 문구 한 줄이었다.
+- `row(image, 레인 글)`은 쓸 수 없다. 이미지 블록은 폭 0으로 재지고 `paintRow`가 폭 0 자식을 빈 블록으로 바꾼다(`layout.ts:105-112, 138`). 그래서 무대와 레인 그래프를 한 페인터가 그리고, 0칸으로 재지는 무대 줄은 공백 대신 커서 이동(`CSI n C`)으로 건너뛴다. 공백을 쓰면 iTerm2/SIXEL 픽셀이 지워진다.
+- 페인터는 Storm 신호를 읽어야 다시 그려진다. `requestRender`만으로는 노드가 다시 칠해지지 않는다.
+- 프로토콜은 환경으로 정한다(`driver/caps/env.ts:115-130`, `caps/identity.ts:69-91`). kitty, Ghostty, WezTerm, Warp, rio, otty, tern → kitty 그래픽, iTerm2 → OSC 1337, 그 밖은 DA1이 SIXEL을 알리고 셀 크기 답이 있을 때만 SIXEL. VS Code, Alacritty, Terminal.app → 없음. `PI_FORCE_IMAGE_PROTOCOL`로 강제할 수 있다.
+- 저장소(`driver/images/store.ts`)는 같은 키에 새 픽셀이 오면 옛 이미지를 지우고 같은 번호로 다시 보낸다(`store.ts:385-390`). 새 키는 동시 이미지 예산(기본 8)을 넘을 때만 옛 것을 지워, 직접 배치 모드(WezTerm)에서 지난 7장이 겹쳐 남고 무대를 치운 뒤에도 8장이 남는다. 그래서 무대 하나에 키 하나를 쓰고, 직접 배치 모드에서는 프레임마다 효과 없는 SGR(`\x1b[22m`)을 붙였다 떼 작성기가 배치를 다시 쓰게 하며(없으면 그림이 사라진다: 배치 0), 치울 때는 같은 키로 투명 프레임을 먼저 그린다(삭제 1, 0.9~1.2 KiB).
+- 실제 omp(PTY, 120×36, 무대 40×8): 85ms 틱 4초에 kitty 전송 47번, 초당 kitty 309 KiB, WezTerm·iTerm2 275 KiB. 40ms 틱에서 98번, 초당 567~643 KiB. 호스트는 프레임을 버리지 않았다(프레임 상한 16ms, `term/backend.ts:71`).
+- 한 프레임(40×8칸, 9×18 셀, `frame-cost.ts` 중앙값): 320×136 RGB PNG는 1.2ms에 79 KiB, 인덱스 PNG는 0.53ms에 20 KiB, 360×144 인덱스 PNG는 0.61ms에 kitty 24 KiB·iTerm2 23 KiB·SIXEL 69 KiB(오프스레드 2ms), T2 반블록은 0.1ms에 글자 10 KiB. 장치 픽셀로 그리면 전송량이 2.5배라 칸당 9×18 논리 픽셀로 그리고 터미널이 늘린다.
+- SIXEL은 새 픽셀마다 `@oh-my-pi/pi-natives` 인코더가 스레드 밖에서 2~16ms 돌고, 크기가 프레임당 58~69 KiB라 85ms면 초당 약 800 KiB다. 투명도도 0/1뿐이라 옛 그림이 비친다.
+- tmux는 `allow-passthrough`가 꺼져 있지 않을 때만 통과 봉투로 보낸다(`driver/caps/detect.ts:38-40`, `driver/mux/tmux.ts:74-78`). kitty/Ghostty 클라이언트는 자리표시 문자라 격자 안에서 움직이지만, 직접 배치(WezTerm 클라이언트)는 창 분할·스크롤에서 어긋날 수 있어 T2로 둔다.
+
+### 합성 방식
+
+개체마다 따로 놓는 방식은 이 호스트에서 성립하지 않는다. 배치가 칸 상자 단위라 픽셀 오프셋과 z 순서를 고를 수 없고(`kitty.ts:125-157`), 동시에 그리는 이미지는 기본 8장이며, iTerm2와 SIXEL은 겹쳐 놓을 수 없다. 한 장 합성은 320×136에서 배경·개체 7·조각 24·비를 0.18ms에 합친다.
+
+### 래스터화
+
+`@resvg/resvg-js` 2.6.2는 0.7초에 설치되고(darwin-arm64 3.4 MB, 사전 빌드 12개 플랫폼, MPL-2.0) 경로, 3차 베지어, 방사형 그러데이션, `feGaussianBlur`를 그린다. 72×72 한 장에 중앙값 0.47ms. `font: { loadSystemFonts: false }`를 빼면 렌더마다 시스템 글꼴을 훑어 한 장에 300ms가 든다. 구현 중에 확인한 한계: 내용이 모두 보이지 않는 블러 그룹과 일부 반투명 그룹에서 resvg가 패닉해 굽기 전체가 끝난다(`scripts/stage/art/bee.ts` 머리말의 우회).
+
+### 사람이 확인할 것
+
+여기서는 실제 화면을 볼 수 없었다.
+
+1. kitty, Ghostty, WezTerm, iTerm2에서 85ms 교체가 깜빡이지 않는지, 터미널 CPU가 얼마인지(iTerm2는 프레임마다 PNG를 새로 해독한다).
+2. WezTerm에서 같은 키 + 줄 표시 방식이 옛 프레임 없이 바뀌는지, 무대를 치운 뒤 그림이 남지 않는지.
+3. iTerm2에서 커서 이동으로 건너뛴 줄의 레인 글이 무대 픽셀을 건드리지 않는지, 편집기가 커져 위젯이 밀릴 때 그림이 따라오는지.
+4. tmux(통과 켬)에서 kitty 자리표시 문자가 창 분할·스크롤 뒤에도 맞는지.
+5. 인덱스 PNG의 띠가 빛 번짐에서 거슬리지 않는지, 레티나에서 9×18 논리 픽셀이 충분히 선명한지.
+
 ## 재현
 
 - P0: 하네스는 지웠다. 같은 경로는 `npm run e2e`와 `npm run e2e:tui`가 확인한다.
 - B0: [spikes/b0/README.md](../spikes/b0/README.md)
 - M0: [spikes/m0/README.md](../spikes/m0/README.md)
 - L0: 하네스는 지웠다. 그림은 `scripts/lane-preview.ts`로 본다(사용법은 파일 머리말).
+- S0: 탐침은 `scripts/stage/`(`frame-cost.ts`, `terminal-bytes.ts`, `pty-probe.ts`, `svg-bake.ts`), 무대 검수는 `scripts/stage/qa-bench.ts`, `scripts/stage/qa-accents.ts`, 그림은 `scripts/lane-preview.ts --scenario <종>|tour|handoffs [--tier t2|t3] [--png 파일]`.

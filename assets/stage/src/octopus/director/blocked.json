@@ -1,0 +1,26 @@
+{
+	"w": 63,
+	"h": 72,
+	"anchor": {
+		"x": 31,
+		"y": 36
+	},
+	"frameMs": 83,
+	"durationMs": 600,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "ready.a.svg"
+		},
+		{
+			"at": 140,
+			"svg": "blocked.a.svg",
+			"ease": "out"
+		},
+		{
+			"at": 600,
+			"svg": "blocked.b.svg"
+		}
+	]
+}

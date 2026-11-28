@@ -54,6 +54,10 @@
  *   E2E-CHILD-429-ONCE <key>
  *                           fail this child's first provider request with a retryable 429, once per key, so a retry
  *                           can be watched without duplicating its native job/result
+ *   E2E-CHILD-UNTIL <name>  hold the first reply until the file `<name>` exists beside the request log (at most
+ *                           LONG_HOLD_MAX_MS), so a worker stays running for as long as a scenario needs it to
+ *   E2E-USER-WRITE <path>   in a message the user typed to the worker in omp's hub (not the assignment): call `write`
+ *                           on that path once in that turn, then answer `E2E-USER-DONE`
  *   E2E-CHILD-DELAY <ms>    wait that long before the first reply (bounded by HOLD_MAX_MS), so a live phase can be
  *                           observed deterministically while the child really runs
  *   E2E-CHILD-FINAL-PAUSE <ms> <marker>
@@ -298,6 +302,8 @@ const ROUTE_TAG = "<storm-request>";
 const DOC_RULES = "## Storm doc rules";
 /** How long a held reply waits for its event; a missing event must not hang the suite. */
 const HOLD_MAX_MS = 60_000;
+/** The longest a worker's first reply waits for its release file (`E2E-CHILD-UNTIL`). */
+const LONG_HOLD_MAX_MS = 600_000;
 /** What the server has seen so far: the events held replies wait for. */
 const seen = { children: 0, childrenAtTask: 0, compactions: 0 };
 /** Keys whose one-time hold is spent: a resumed request must not hold again or it could never finish. */
@@ -792,6 +798,13 @@ function childDecision(request: ChatRequest): Decision {
 			return bashCall(request.tools, Buffer.from(command, "base64").toString("utf8"));
 		}
 	}
+	// A prompt the user typed in omp's hub, in the turn still open (no plain answer after it): one write, then the answer.
+	const userAt = messages.findLastIndex(message => message.role === "user" && textOf(message.content).includes("E2E-USER-WRITE "));
+	if (userAt >= 0 && !messages.slice(userAt + 1).some(message => message.role === "assistant" && !hasCalls(message))) {
+		const target = /E2E-USER-WRITE[ \t]+(\S+)/u.exec(textOf(messages[userAt]?.content))?.[1] ?? "";
+		if (!callNames(messages.slice(userAt + 1)).includes("write")) return writeCall(target, "storm user change\n");
+		return { kind: "text", text: "E2E-USER-DONE" };
+	}
 	const reads = (lastCapture(text, /E2E-CHILD-READ[ \t]+(\S+)/) ?? "").split(",").filter(Boolean);
 	const write = lastCapture(text, /E2E-CHILD-WRITE[ \t]+(\S+)/);
 	const send = /E2E-CHILD-SEND[ \t]+(\S+)[ \t]+(\S+)/.exec(text) ?? undefined;
@@ -1078,6 +1091,13 @@ Bun.serve({
 				waitingChildren.delete(gate);
 				return gateError(`Child gate was never released: ${gate}`);
 			}
+		}
+		const until = who === "child" && !request.messages.some(message => message.role === "assistant")
+			? /E2E-CHILD-UNTIL[ \t]+([a-z][a-z0-9-]*)/u.exec(userText(request.messages))?.[1]
+			: undefined;
+		if (until !== undefined) {
+			const deadline = Date.now() + LONG_HOLD_MAX_MS;
+			while (!existsSync(join(dirname(LOG), until)) && Date.now() < deadline) await Bun.sleep(50);
 		}
 		if (decision.kind === "tool" && decision.name === "task") seen.childrenAtTask = seen.children;
 		if (decision.waitFile !== undefined && !(await hold(() => existsSync(decision.waitFile as string)))) {

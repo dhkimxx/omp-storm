@@ -1,0 +1,33 @@
+{
+	"w": 36,
+	"h": 45,
+	"anchor": {
+		"x": 0,
+		"y": 32
+	},
+	"frameMs": 83,
+	"durationMs": 2000,
+	"loop": true,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "work.a.svg"
+		},
+		{
+			"at": 500,
+			"svg": "work.b.svg"
+		},
+		{
+			"at": 1000,
+			"svg": "work.c.svg"
+		},
+		{
+			"at": 1500,
+			"svg": "work.d.svg"
+		},
+		{
+			"at": 2000,
+			"svg": "work.a.svg"
+		}
+	]
+}

@@ -1,0 +1,25 @@
+{
+	"w": 45,
+	"h": 36,
+	"anchor": {
+		"x": 22,
+		"y": 18
+	},
+	"frameMs": 166,
+	"durationMs": 4000,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "lights-out.a.svg"
+		},
+		{
+			"at": 1800,
+			"svg": "lights-out.b.svg"
+		},
+		{
+			"at": 4000,
+			"svg": "lights-out.c.svg"
+		}
+	]
+}

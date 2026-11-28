@@ -1,0 +1,26 @@
+{
+	"w": 54,
+	"h": 36,
+	"anchor": {
+		"x": 16,
+		"y": 15
+	},
+	"frameMs": 83,
+	"durationMs": 1200,
+	"loop": false,
+	"keys": [
+		{
+			"at": 0,
+			"svg": "excluded.a.svg"
+		},
+		{
+			"at": 500,
+			"svg": "excluded.b.svg"
+		},
+		{
+			"at": 1200,
+			"svg": "excluded.c.svg",
+			"ease": "in"
+		}
+	]
+}
