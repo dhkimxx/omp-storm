@@ -1,7 +1,7 @@
 /** Real disk-only integration store + temporary checkout for the managed first-turn proof. */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256Hex } from "../src/config/canonical.ts";
@@ -24,11 +24,14 @@ import type { ByteWindow } from "../src/runtime/integration-delta.ts";
 import { managedWorkerTurnCapability, supportsManagedWorkerAdmission } from "../src/discovery/integration-host.ts";
 import {
 	bindManagedWorkerEntry,
+	bindManagedWorkerWake,
 	createManagedWorkerAdmissionPort,
 	endManagedWorkerTurn,
 	managedWorkerAdmissionReference,
 	parseManagedWorkerEntry,
+	parseManagedWorkerWakeEntry,
 	readManagedWorkerTurn,
+	type BoundManagedWorkerSource,
 	type ManagedWorkerCheckoutProof,
 	type ManagedWorkerTurnExpectation,
 } from "../src/runtime/managed-worker-admission.ts";
@@ -268,6 +271,159 @@ async function bind(tuple: { ctx: unknown; event: unknown }, live = () => ({ ok:
 		window,
 		live,
 	});
+}
+
+/** A fresh durable follow-up grant for the same worker identity, as the owner writes before a warm wake. */
+async function followUpRecord(over: {
+	policy?: { kind: "private"; reason: string };
+	lane?: string;
+	hold?: string;
+} = {}): Promise<WorkerAdmissionRecord> {
+	const { record } = await persistWorkerAdmission({
+		agentDir,
+		artifactRoot: artifacts,
+		parentId,
+		childId,
+		runId,
+		sessionId: "main-session",
+		sessionDir,
+		repoId: "repo-1",
+		targetRoot: repo,
+		policy: over.policy ?? { kind: "private", reason: "managed test worker" },
+		...(over.lane === undefined ? {} : { lane: over.lane }),
+		...(over.hold === undefined ? {} : { hold: over.hold }),
+		approved: [],
+	});
+	return record;
+}
+
+function wakeScopeFor(p: Prepared, record: WorkerAdmissionRecord, over: Partial<ManagedWorkerTurnScope> = {}): ManagedWorkerTurnScope {
+	return scopeFor(p, {
+		token: randomUUID(),
+		admissionAttempt: record.attempt,
+		dispatchId: `wake-${randomUUID()}`,
+		kind: "wake",
+		...over,
+	});
+}
+
+async function wakeTuple(p: Prepared, scope: ManagedWorkerTurnScope, over: {
+	actorSessionId?: string;
+	actorSessionFile?: string;
+	cwd?: string;
+	sessionFile?: string;
+	sessionDevice?: string;
+	sessionInode?: string;
+	checkoutDevice?: string;
+	checkoutInode?: string;
+	ctxWorkerTurn?: unknown;
+} = {}): Promise<{ ctx: unknown; event: unknown }> {
+	const actor = over.actorSessionId ?? actorSessionId;
+	const cwd = over.cwd ?? p.checkout;
+	const contextSessionFile = over.actorSessionFile ?? childSessionFile;
+	const sessionFile = over.sessionFile ?? contextSessionFile;
+	const sessionIdentity = await identity(contextSessionFile);
+	const checkoutIdentity = await identity(cwd);
+	const event = {
+		type: "managed_worker_wake_entry",
+		workerTurn: scope,
+		capture: {
+			sessionFile,
+			sessionFileIdentity: {
+				device: over.sessionDevice ?? sessionIdentity.device,
+				inode: over.sessionInode ?? sessionIdentity.inode,
+			},
+			checkout: {
+				cwd,
+				device: over.checkoutDevice ?? checkoutIdentity.device,
+				inode: over.checkoutInode ?? checkoutIdentity.inode,
+			},
+		},
+	};
+	const ctx = {
+		agent: { kind: "sub", id: childId, name: "task", parentId, depth: 1 },
+		cwd,
+		sessionManager: {
+			getSessionId: () => actor,
+			getSessionFile: () => contextSessionFile,
+		},
+		...(over.ctxWorkerTurn === undefined ? {} : { workerTurn: over.ctxWorkerTurn }),
+	};
+	return { ctx, event };
+}
+
+async function wakeBind(prior: BoundManagedWorkerSource, tuple: { ctx: unknown; event: unknown }, over: {
+	delta?: ManagedWorkerCheckoutProof;
+	live?: () => { ok: true } | { ok: false; reason: string };
+} = {}) {
+	return bindManagedWorkerWake({
+		agentDir,
+		guard,
+		ctx: tuple.ctx,
+		event: tuple.event,
+		prior,
+		store,
+		delta: over.delta ?? delta,
+		window,
+		live: over.live ?? (() => ({ ok: true } as const)),
+	});
+}
+
+const wakeRead = (p: Prepared, scope: ManagedWorkerTurnScope, over: {
+	turnToken?: string;
+	expect?: ManagedWorkerTurnExpectation;
+	live?: () => { ok: true } | { ok: false; reason: string };
+	delta?: ManagedWorkerCheckoutProof;
+} = {}) =>
+	readManagedWorkerTurn({
+		agentDir,
+		guard,
+		key: p.record.key,
+		attempt: scope.admissionAttempt,
+		turnToken: over.turnToken ?? scope.token,
+		store,
+		delta: over.delta ?? delta,
+		window,
+		live: over.live ?? (() => ({ ok: true } as const)),
+		...(over.expect === undefined ? {} : { expect: over.expect }),
+	});
+
+const wakeFinish = (p: Prepared, scope: ManagedWorkerTurnScope, over: {
+	turnToken?: string;
+	session?: string;
+	delta?: ManagedWorkerCheckoutProof;
+} = {}) =>
+	endManagedWorkerTurn({
+		agentDir,
+		guard,
+		key: p.record.key,
+		attempt: scope.admissionAttempt,
+		turnToken: over.turnToken ?? scope.token,
+		childSessionId: over.session ?? actorSessionId,
+		store,
+		delta: over.delta ?? delta,
+		window,
+		live: () => ({ ok: true }),
+	});
+
+function recordFile(record: Pick<WorkerAdmissionRecord, "key">): string {
+	return join(agentDir, "storm", "admissions", `${record.key}.json`);
+}
+
+function turnFile(record: Pick<WorkerAdmissionRecord, "key" | "attempt">): string {
+	return join(agentDir, "storm", "admissions", `${record.key}.${record.attempt}.turn`);
+}
+
+async function writeRecord(record: WorkerAdmissionRecord): Promise<void> {
+	await mkdir(join(agentDir, "storm", "admissions"), { recursive: true });
+	await writeFile(recordFile(record), `${JSON.stringify(record, null, 2)}\n`);
+}
+
+async function firstBound(p: Prepared): Promise<{ scope: ManagedWorkerTurnScope; bound: BoundManagedWorkerSource }> {
+	const scope = scopeFor(p);
+	const bound = await bind(await nativeTuple(p, scope));
+	if (bound.kind !== "known") throw new Error(bound.problem.reason);
+	return { scope, bound: bound.value };
 }
 
 
@@ -585,6 +741,289 @@ describe("real disk-only bind/read/end", () => {
 		})).toMatchObject({ kind: "known" });
 		expect(await port.end({
 			key: p.record.key, attempt: p.record.attempt, turnToken: scope.token, childSessionId: actorSessionId, window, live: () => ({ ok: true }),
+		})).toMatchObject({ kind: "ended" });
+	});
+});
+
+describe("warm wake child proof", () => {
+	test("a retained private worker wakes on its first admitted claim and keeps the original custody", async () => {
+		const p = await prepared();
+		const { scope: firstScope, bound } = await firstBound(p);
+		await writeFile(join(p.checkout, "first-edit.txt"), "legitimate first-turn edit\n");
+		expect(await finish(p, firstScope)).toMatchObject({ kind: "ended" });
+		const firstTurnFile = turnFile(p.record);
+		const firstTurnBefore = await readFile(firstTurnFile, "utf8");
+		const admissionBefore = await store.readPrepared({ key: p.record.key, attempt: p.record.attempt });
+		const claimBefore = await store.readClaim(p.key);
+		if (admissionBefore.kind !== "known" || claimBefore.kind !== "known") throw new Error("first custody is unreadable");
+		const slotMarker = join(p.admission.slot.slotPath, ".omp-isolation-owner.json");
+		const nativeMarker = await readFile(slotMarker);
+		expect(await store.releaseSlot(p.admission.slot, "native-ended")).toEqual({ ok: true });
+		expect(await store.readPrepared({ key: p.record.key, attempt: p.record.attempt }))
+			.toMatchObject({ kind: "unknown", problem: { code: "slot-not-held" } });
+
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const hostPath = join(tmp, "warm-native-cwd");
+		await symlink(p.checkout, hostPath);
+		const tuple = await wakeTuple(p, scope, { cwd: hostPath });
+		expect(parseManagedWorkerWakeEntry({ ctx: tuple.ctx, event: tuple.event, guard })).toMatchObject({
+			kind: "known",
+			value: {
+				scope: { kind: "wake", admissionAttempt: record.attempt },
+				acknowledgement: { workerTurnToken: scope.token, dispatchId: scope.dispatchId },
+			},
+		});
+		const boundWake = await wakeBind(bound, tuple);
+		if (boundWake.kind !== "known") throw new Error(boundWake.problem.reason);
+		expect(boundWake.value.record.attempt).toBe(record.attempt);
+		expect(boundWake.value.binding).toMatchObject({
+			attempt: record.attempt,
+			turn: { kind: "wake", token: scope.token, dispatchId: scope.dispatchId },
+			wake: { sourceAttempt: p.record.attempt },
+		});
+		expect(boundWake.value.source).toEqual({ attempt: p.record.attempt });
+		expect(boundWake.value.acknowledgement).toEqual({ workerTurnToken: scope.token, dispatchId: scope.dispatchId });
+		expect(boundWake.value.admission).toEqual(admissionBefore.value);
+		expect(boundWake.value.claim).toEqual(claimBefore.value);
+		expect(await wakeRead(p, scope, { expect: {
+			runId, actorSessionId, actorInstanceKey: actorInstance, generation, dispatchId: scope.dispatchId, kind: "wake",
+		} })).toMatchObject({
+			kind: "known",
+			value: { record: { attempt: record.attempt }, binding: { wake: { sourceAttempt: p.record.attempt } } },
+		});
+		// A warm wake reads the original bytes as history; it must not reacquire their released slot.
+		expect(await store.readRetainedPrepared({ key: p.record.key, attempt: p.record.attempt })).toEqual(admissionBefore);
+		expect(await store.readClaim(p.key)).toEqual(claimBefore);
+		expect(await readFile(firstTurnFile, "utf8")).toBe(firstTurnBefore);
+		expect(await readFile(slotMarker)).toEqual(nativeMarker);
+		expect((await stat(join(p.checkout, "first-edit.txt"))).isFile()).toBe(true);
+
+		expect(await wakeFinish(p, scope)).toMatchObject({ kind: "ended" });
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "ended" } });
+		expect(await wakeFinish(p, scope)).toMatchObject({ kind: "already-ended" });
+	});
+
+	test("wake parsing refuses a different context turn, event type or physical capture", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const tuple = await wakeTuple(p, scope);
+		const ctx = tuple.ctx as Record<string, unknown>;
+		const event = tuple.event as Record<string, unknown>;
+		expect(parseManagedWorkerWakeEntry({
+			ctx: { ...ctx, workerTurn: { ...scope, token: randomUUID() } }, event, guard,
+		})).toMatchObject({ kind: "unknown", problem: { code: "wake-context-scope" } });
+		expect(parseManagedWorkerWakeEntry({
+			ctx, event: { ...event, type: "subagent_entry" }, guard,
+		})).toMatchObject({ kind: "unknown", problem: { code: "wake-event-invalid" } });
+		const capture = event.capture as Record<string, unknown>;
+		expect(parseManagedWorkerWakeEntry({
+			ctx, event: { ...event, capture: { ...capture, sessionFileIdentity: { device: "x", inode: "1" } } }, guard,
+		})).toMatchObject({ kind: "unknown", problem: { code: "wake-event-invalid" } });
+		const changed = await wakeTuple(p, scope, { sessionInode: "999999" });
+		expect(await wakeBind(bound, changed)).toMatchObject({
+			kind: "unknown", problem: { code: "wake-session-file" },
+		});
+	});
+
+	test("actor, session, generation and a reused token or delivery refuse before any wake binding", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const otherSession = wakeScopeFor(p, record, { actorSessionId: "other-session" });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, otherSession, { actorSessionId: "other-session" },
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-actor-session" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, record, { generation: generation + 1 }),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-actor-identity" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, record, { actorInstanceKey: "other:1" }),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-actor-identity" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, record, { token: bound.binding.turn.token }),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-token-reused" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, record, { dispatchId: bound.binding.turn.dispatchId }),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-dispatch-reused" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, scope, { checkoutInode: "999999" },
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-checkout" } });
+		expect(await wakeBind(bound, await wakeTuple(p, scope, {
+			cwd: p.admission.target.gitRoot.canonicalPath,
+			checkoutDevice: bound.claim.checkout.device,
+			checkoutInode: bound.claim.checkout.inode,
+		}))).toMatchObject({ kind: "unknown", problem: { code: "wake-checkout" } });
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "turn-missing" } });
+	});
+
+	test("a changed private policy, role or hold refuses the wake grant", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const changedPolicy = await followUpRecord({ policy: { kind: "private", reason: "different policy" } });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, changedPolicy),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-grant" } });
+		const changedLane = await followUpRecord({ lane: "other-lane" });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, changedLane),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-grant" } });
+		const changedHold = await followUpRecord({ hold: "other-hold" });
+		expect(await wakeBind(bound, await wakeTuple(
+			p, wakeScopeFor(p, changedHold),
+		))).toMatchObject({ kind: "unknown", problem: { code: "wake-grant" } });
+	});
+
+	test("missing, foreign, expired, revoked and rotated wake records fail closed before a binding is written", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const missing = await followUpRecord();
+		const missingScope = wakeScopeFor(p, missing);
+		await rm(recordFile(missing));
+		expect(await wakeBind(bound, await wakeTuple(p, missingScope))).toMatchObject({
+			kind: "unknown", problem: { code: "record-missing" },
+		});
+
+		const foreign = await followUpRecord();
+		const foreignScope = wakeScopeFor(p, foreign);
+		await writeRecord({ ...foreign, childId: "ForeignChild" });
+		expect(await wakeBind(bound, await wakeTuple(p, foreignScope))).toMatchObject({
+			kind: "unknown", problem: { code: "wake-record-identity" },
+		});
+
+		const expired = await followUpRecord();
+		const expiredScope = wakeScopeFor(p, expired);
+		await writeRecord({ ...expired, expiresAt: 1 });
+		expect(await wakeBind(bound, await wakeTuple(p, expiredScope))).toMatchObject({
+			kind: "unknown", problem: { code: "expired" },
+		});
+
+		const revoked = await followUpRecord();
+		const revokedScope = wakeScopeFor(p, revoked);
+		expect(await revokeWorkerAdmissions(agentDir, { key: revoked.key, attempt: revoked.attempt })).toBe(1);
+		expect(await wakeBind(bound, await wakeTuple(p, revokedScope))).toMatchObject({
+			kind: "unknown", problem: { code: "revoked" },
+		});
+
+		const rotated = await followUpRecord();
+		const rotatedScope = wakeScopeFor(p, rotated);
+		const newer = await followUpRecord();
+		expect(await wakeBind(bound, await wakeTuple(p, rotatedScope))).toMatchObject({
+			kind: "unknown", problem: { code: "wake-attempt" },
+		});
+		expect(await wakeRead(p, rotatedScope)).toMatchObject({
+			kind: "unknown", problem: { code: "attempt-replaced" },
+		});
+		const newerScope = wakeScopeFor(p, newer);
+		expect(await wakeBind(bound, await wakeTuple(p, newerScope))).toMatchObject({ kind: "known" });
+	});
+
+	test("a record revoked during the awaited checkout proof is rechecked and refuses", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const checkoutProof = {
+			verifyCheckoutInputs: async (claim: ChildEntryClaim, inputs: readonly ConsumedInput[], byteWindow: ByteWindow) => {
+				const verified = await delta.verifyCheckoutInputs(claim, inputs, byteWindow);
+				await revokeWorkerAdmissions(agentDir, { key: record.key, attempt: record.attempt });
+				return verified;
+			},
+		};
+		expect(await wakeBind(bound, await wakeTuple(p, scope), { delta: checkoutProof })).toMatchObject({
+			kind: "unknown", problem: { code: "revoked" },
+		});
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "revoked" } });
+	});
+
+	test("repeated wakes keep the invariant first claim, a newer attempt replaces the old, and exact end closes the newest", async () => {
+		const p = await prepared();
+		const { scope: firstScope, bound: first } = await firstBound(p);
+		expect(await finish(p, firstScope)).toMatchObject({ kind: "ended" });
+		const admissionBefore = await store.readPrepared({ key: p.record.key, attempt: p.record.attempt });
+		const claimBefore = await store.readClaim(p.key);
+		if (admissionBefore.kind !== "known" || claimBefore.kind !== "known") throw new Error("first custody is unreadable");
+		const firstTurnFile = turnFile(p.record);
+		const firstTurnBefore = await readFile(firstTurnFile, "utf8");
+
+		const secondRecord = await followUpRecord();
+		const secondScope = wakeScopeFor(p, secondRecord);
+		const second = await wakeBind(first, await wakeTuple(p, secondScope));
+		if (second.kind !== "known") throw new Error(second.problem.reason);
+		const thirdRecord = await followUpRecord();
+		const thirdScope = wakeScopeFor(p, thirdRecord);
+		const third = await wakeBind(second.value, await wakeTuple(p, thirdScope));
+		if (third.kind !== "known") throw new Error(third.problem.reason);
+		expect(third.value.source).toEqual({ attempt: p.record.attempt });
+		expect(third.value.binding.wake).toMatchObject({ sourceAttempt: p.record.attempt });
+		expect(third.value.admission).toEqual(admissionBefore.value);
+		expect(third.value.claim).toEqual(claimBefore.value);
+		expect(await wakeRead(p, secondScope)).toMatchObject({ kind: "unknown", problem: { code: "attempt-replaced" } });
+		expect(await wakeRead(p, thirdScope)).toMatchObject({
+			kind: "known",
+			value: { admission: admissionBefore.value },
+		});
+		expect(await readFile(firstTurnFile, "utf8")).toBe(firstTurnBefore);
+
+		expect(await wakeFinish(p, thirdScope)).toMatchObject({ kind: "ended" });
+		expect(await wakeFinish(p, thirdScope, { turnToken: randomUUID() })).toMatchObject({
+			kind: "unknown", problem: { code: "turn-file-invalid" },
+		});
+		expect(await wakeFinish(p, secondScope)).toMatchObject({ kind: "unknown", problem: { code: "attempt-replaced" } });
+		expect(await wakeRead(p, thirdScope)).toMatchObject({ kind: "unknown", problem: { code: "ended" } });
+	});
+
+	test("read and end recheck the fresh wake record after a bound grant", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const boundWake = await wakeBind(bound, await wakeTuple(p, scope));
+		if (boundWake.kind !== "known") throw new Error(boundWake.problem.reason);
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "known" });
+
+		await writeRecord({ ...record, hold: "other-hold" });
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "wake-grant" } });
+		expect(await wakeFinish(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "wake-grant" } });
+
+		await writeRecord({ ...record, childId: "ForeignChild" });
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "actor-agent" } });
+
+		await writeRecord(record);
+		expect(await revokeWorkerAdmissions(agentDir, { key: record.key, attempt: record.attempt })).toBe(1);
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "revoked" } });
+		expect(await wakeFinish(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "revoked" } });
+
+		await writeRecord({ ...record, expiresAt: 1 });
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "expired" } });
+		expect(await wakeFinish(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "expired" } });
+
+		const newer = await followUpRecord();
+		expect(newer.attempt).not.toBe(record.attempt);
+		expect(await wakeRead(p, scope)).toMatchObject({ kind: "unknown", problem: { code: "attempt-replaced" } });
+	});
+
+	test("the curried port exposes bindWake with the same acknowledgement and exact end", async () => {
+		const p = await prepared();
+		const { bound } = await firstBound(p);
+		const record = await followUpRecord();
+		const scope = wakeScopeFor(p, record);
+		const tuple = await wakeTuple(p, scope);
+		const port = createManagedWorkerAdmissionPort({ agentDir, guard, store, delta });
+		const boundWake = await port.bindWake({
+			ctx: tuple.ctx, event: tuple.event, prior: bound, window, live: () => ({ ok: true }),
+		});
+		if (boundWake.kind !== "known") throw new Error(boundWake.problem.reason);
+		expect(boundWake.value.acknowledgement).toEqual({ workerTurnToken: scope.token, dispatchId: scope.dispatchId });
+		expect(await port.read({
+			key: p.record.key, attempt: record.attempt, turnToken: scope.token, window, live: () => ({ ok: true }),
+		})).toMatchObject({ kind: "known", value: { binding: { wake: { sourceAttempt: p.record.attempt } } } });
+		expect(await port.end({
+			key: p.record.key, attempt: record.attempt, turnToken: scope.token, childSessionId: actorSessionId,
+			window, live: () => ({ ok: true }),
 		})).toMatchObject({ kind: "ended" });
 	});
 });

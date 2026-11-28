@@ -8,6 +8,7 @@
  * only those host-supplied facts: never cwd alone, a model reply, or a bare id. The record is a claimable, revocable
  * capability, not a second team approval: a missing or invalid record never grants anything.
  */
+import { FileLock } from "@oh-my-pi/pi-natives";
 import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat, chmod, type FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
@@ -33,9 +34,8 @@ export const MAX_ADMISSION_RECORDS = 512;
 const ACTIVE_TTL_MS = 7 * 24 * 60 * 60_000;
 const CLOSED_TTL_MS = 24 * 60 * 60_000;
 const LOCK_RETRY_MS = 10;
-/** How long a conditional record update waits for another copy's short critical section, and when a leftover lock is abandoned. */
+/** How long a conditional update waits for another copy's short critical section before refusing. */
 const LOCK_WAIT_MS = 2_000;
-const LOCK_STALE_MS = 5_000;
 /** Schema tags an older release wrote. Housekeeping recognizes them only to remove them after their own lifetime; never to grant. */
 const OBSOLETE_ADMISSION_SCHEMAS: readonly string[] = ["storm.worker-admission/v1"];
 const OBSOLETE_RUN_SCHEMAS: readonly string[] = ["storm.worker-run/v1"];
@@ -132,6 +132,8 @@ export interface WorkerAdmissionInput {
 	hold?: string;
 	/** See `WorkerAdmissionRecord.approved`. */
 	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
+	/** A managed warm reentry replaces only this exact, ended, unrevoked prior attempt. */
+	replaceEnded?: WorkerAdmissionRecord;
 }
 
 export type WorkerAdmissionRead =
@@ -211,8 +213,25 @@ export interface WorkerTurnHostOwner {
 }
 
 /**
+ * The immutable source of one warm wake's physical proof. A wake attempt carries no new integration admission: it keeps
+ * pointing at the first attempt's admitted candidate and claim, and these digests make that exact custody checkable after
+ * the first record was replaced.
+ */
+export interface WorkerTurnWakeSource {
+	/** The first worker attempt whose admission/claim remain this actor's invariant physical source. */
+	readonly sourceAttempt: string;
+	/** sha256 of the canonical source `FrozenIntegrationAdmission`. */
+	readonly admissionDigest: string;
+	/** sha256 of the canonical source `ChildEntryClaim`. */
+	readonly claimDigest: string;
+	/** sha256 of the current wake record's `{policy, lane, hold, approved}` authority. */
+	readonly grantDigest: string;
+}
+
+/**
  * One durable, immutable worker-turn claim. It is keyed by the exact admission key and attempt and written only while that
- * attempt is current. The record is a tombstone after end/revoke; readers still compare the exact tuple.
+ * attempt is current. The record is a tombstone after end/revoke; readers still compare the exact tuple. A `wake` claim
+ * names the first attempt's admission/claim as its physical source; a first-turn claim has none.
  */
 export interface WorkerAdmissionTurn {
 	readonly schema: typeof WORKER_TURN_SCHEMA;
@@ -222,6 +241,7 @@ export interface WorkerAdmissionTurn {
 	readonly turn: ManagedWorkerTurnScope;
 	readonly child: WorkerTurnChildIdentity;
 	readonly integration?: WorkerTurnIntegrationRef;
+	readonly wake?: WorkerTurnWakeSource;
 	readonly host: WorkerTurnHostOwner;
 	readonly boundAt: number;
 }
@@ -332,6 +352,23 @@ function parseTurnHostOwner(value: unknown): WorkerTurnHostOwner | undefined {
 	return Object.freeze({ pid, processStart, host });
 }
 
+function parseTurnWakeSource(value: unknown): WorkerTurnWakeSource | undefined {
+	if (!isRecord(value)) return undefined;
+	const sourceAttempt = boundedTurnText(value.sourceAttempt);
+	const admissionDigest = value.admissionDigest;
+	const claimDigest = value.claimDigest;
+	const grantDigest = value.grantDigest;
+	if (sourceAttempt === undefined || !ATTEMPT.test(sourceAttempt)) return undefined;
+	if (typeof admissionDigest !== "string" || !TURN_DIGEST.test(admissionDigest) ||
+		typeof claimDigest !== "string" || !TURN_DIGEST.test(claimDigest) ||
+		typeof grantDigest !== "string" || !TURN_DIGEST.test(grantDigest)) {
+		return undefined;
+	}
+	const parsed = Object.freeze({ sourceAttempt, admissionDigest, claimDigest, grantDigest });
+	// A wake source is a closed record; an added field could claim more custody than these four digests prove.
+	return canonicalJson(parsed) === canonicalJson(value) ? parsed : undefined;
+}
+
 function parseTurnBinding(value: unknown, key?: string, attempt?: string, token?: string): WorkerAdmissionTurn | undefined {
 	if (!isRecord(value) || value.schema !== WORKER_TURN_SCHEMA) return undefined;
 	if (typeof value.build !== "string" || value.build.length === 0 || value.build.length > MAX_ID) return undefined;
@@ -344,11 +381,15 @@ function parseTurnBinding(value: unknown, key?: string, attempt?: string, token?
 	const child = parseTurnChildIdentity(value.child);
 	const host = parseTurnHostOwner(value.host);
 	const integration = value.integration === undefined ? undefined : parseTurnIntegrationRef(value.integration);
+	const wake = value.wake === undefined ? undefined : parseTurnWakeSource(value.wake);
 	if (bindingKey === undefined || bindingAttempt === undefined || child === undefined || host === undefined ||
 		typeof boundAt !== "number" || !Number.isFinite(boundAt) || boundAt <= 0) {
 		return undefined;
 	}
 	if (value.integration !== undefined && integration === undefined) return undefined;
+	if (value.wake !== undefined && wake === undefined) return undefined;
+	// A wake source belongs only to a wake turn and never names its own attempt; a first turn has no source.
+	if (wake !== undefined && (turn.kind !== "wake" || wake.sourceAttempt === bindingAttempt)) return undefined;
 	if (key !== undefined && bindingKey !== key) return undefined;
 	if (attempt !== undefined && bindingAttempt !== attempt) return undefined;
 	if (token !== undefined && turn.token !== token) return undefined;
@@ -365,6 +406,7 @@ function parseTurnBinding(value: unknown, key?: string, attempt?: string, token?
 		turn,
 		child,
 		...(integration === undefined ? {} : { integration }),
+		...(wake === undefined ? {} : { wake }),
 		host,
 		boundAt,
 	});
@@ -374,7 +416,8 @@ function parseTurnBinding(value: unknown, key?: string, attempt?: string, token?
 function sameTurnBinding(a: WorkerAdmissionTurn, b: WorkerAdmissionTurn): boolean {
 	return a.schema === b.schema && a.build === b.build && a.key === b.key && a.attempt === b.attempt &&
 		canonicalJson(a.turn) === canonicalJson(b.turn) && canonicalJson(a.child) === canonicalJson(b.child) &&
-		canonicalJson(a.integration ?? null) === canonicalJson(b.integration ?? null) && canonicalJson(a.host) === canonicalJson(b.host);
+		canonicalJson(a.integration ?? null) === canonicalJson(b.integration ?? null) &&
+		canonicalJson(a.wake ?? null) === canonicalJson(b.wake ?? null) && canonicalJson(a.host) === canonicalJson(b.host);
 }
 
 function turnFile(dir: string, key: string, attempt: string): string {
@@ -427,8 +470,7 @@ async function readTurnFile(file: string, key: string, attempt: string, token?: 
 async function publishTurnFile(
 	file: string,
 	binding: WorkerAdmissionTurn,
-	held: () => Promise<boolean>,
-): Promise<"created" | "exists" | "failed" | "lost"> {
+): Promise<"created" | "exists" | "failed"> {
 	const dir = path.dirname(file);
 	const temp = path.join(dir, `.${path.basename(file)}.${randomUUID()}.tmp`);
 	let handle: FileHandle | undefined;
@@ -441,9 +483,6 @@ async function publishTurnFile(
 		await handle?.close().catch(() => undefined);
 	}
 	try {
-		// The lock's new owner may have replaced this attempt while the content was being written. A holder that no longer
-		// owns the token publishes nothing.
-		if (!(await held())) return "lost";
 		await link(temp, file);
 		await chmod(file, 0o600).catch(() => undefined);
 		return "created";
@@ -466,17 +505,23 @@ export async function bindWorkerAdmissionTurn(input: {
 	turn: unknown;
 	child: WorkerTurnChildIdentity;
 	integration?: WorkerTurnIntegrationRef;
+	wake?: WorkerTurnWakeSource;
 	host: WorkerTurnHostOwner;
 	now?: number;
 }): Promise<WorkerTurnBindResult> {
 	const turn = parseWorkerTurnScope(input.turn);
 	const child = parseTurnChildIdentity(input.child);
 	const integration = input.integration === undefined ? undefined : parseTurnIntegrationRef(input.integration);
+	const wake = input.wake === undefined ? undefined : parseTurnWakeSource(input.wake);
 	const host = parseTurnHostOwner(input.host);
 	if (!KEY.test(input.key) || !ATTEMPT.test(input.attempt)) return { kind: "refused", code: "identity-invalid", reason: "자식 권한 키나 시도가 올바르지 않습니다" };
 	if (turn === undefined) return { kind: "refused", code: "turn-invalid", reason: "네이티브 턴의 형식이 올바르지 않습니다" };
 	if (turn.admissionKey !== input.key || turn.admissionAttempt !== input.attempt) {
 		return { kind: "refused", code: "turn-admission", reason: "네이티브 턴이 이 자식 작업 시도와 다릅니다" };
+	}
+	if (input.wake !== undefined && wake === undefined) return { kind: "refused", code: "wake-invalid", reason: "웜 웨이크의 원본 물리 증명이 올바르지 않습니다" };
+	if (wake !== undefined && (turn.kind !== "wake" || wake.sourceAttempt === input.attempt)) {
+		return { kind: "refused", code: "wake-turn", reason: "웜 웨이크 원본은 첫 턴이 아닌 새 웨이크 시도에만 붙습니다" };
 	}
 	if (child === undefined) return { kind: "refused", code: "child-invalid", reason: "물리 자식 신원이 올바르지 않습니다" };
 	if (sha256Hex(turn.actorSessionId) !== child.sessionIdSha256 || turn.actorInstanceKey !== child.registryInstance ||
@@ -507,11 +552,12 @@ export async function bindWorkerAdmissionTurn(input: {
 		turn,
 		child,
 		...(integration === undefined ? {} : { integration }),
+		...(wake === undefined ? {} : { wake }),
 		host,
 		boundAt: now,
 	});
 	const file = turnFile(dir, input.key, input.attempt);
-	return withRecordLock(dir, input.key, async held => {
+	return withRecordLock(dir, input.key, async () => {
 		const read = await readRecordFile(admissionFile(dir, input.key));
 		if (read.kind !== "value" || !isAdmission(read.value)) return { kind: "refused" as const, code: "record-invalid", reason: "자식 권한 기록을 읽지 못했습니다" };
 		const record = read.value;
@@ -522,9 +568,8 @@ export async function bindWorkerAdmissionTurn(input: {
 		const existing = await readTurnFile(file, input.key, input.attempt);
 		if (existing === "invalid") return { kind: "refused" as const, code: "turn-file-invalid", reason: "기존 자식 턴 기록이 올바르지 않습니다" };
 		if (existing === "missing") {
-			const published = await publishTurnFile(file, binding, held);
+			const published = await publishTurnFile(file, binding);
 			if (published === "created") return { kind: "bound" as const, record, binding };
-			if (published === "lost") return { kind: "refused" as const, code: "lock-lost", reason: "자식 권한 기록의 잠금이 다른 사본으로 넘어가 턴을 기록하지 않았습니다" };
 			if (published === "failed") return { kind: "refused" as const, code: "turn-write-failed", reason: "자식 턴 기록을 저장하지 못했습니다" };
 			const raced = await readTurnFile(file, input.key, input.attempt);
 			if (raced === "invalid") return { kind: "refused" as const, code: "turn-file-invalid", reason: "기존 자식 턴 기록이 올바르지 않습니다" };
@@ -795,58 +840,24 @@ async function readRecordFile(file: string, maxBytes = MAX_ADMISSION_BYTES): Pro
 }
 
 /**
- * One record's short critical section, shared by every loaded copy of this build on every thread: an exclusive create
- * under the profile. The section itself is a read and a rename, never a slow write, because the content that precedes it
- * is a temp file made outside the lock. A lock a writer left behind by dying is abandoned after `LOCK_STALE_MS`; a live
- * one is waited for only `LOCK_WAIT_MS`, then the caller fails closed.
- *
- * The lock file carries a random owner token. A writer that was paused past `LOCK_STALE_MS` lost the lock: its release
- * removes nothing, and its last check before the rename sees a token that is not its own and publishes nothing. Without
- * both checks a late writer could overwrite a record written by the lock's new owner.
+ * The OS owns the advisory lock until release or process exit. Never reclaim it by age: a paused writer can still
+ * resume between its final comparison and rename. Stable stripes bound the number of persistent lock sidecars.
  */
-async function withRecordLock<T>(dir: string, key: string, task: (held: () => Promise<boolean>) => Promise<T>): Promise<T> {
+async function withRecordLock<T>(dir: string, key: string, task: () => Promise<T>): Promise<T> {
 	await mkdir(dir, { recursive: true, mode: 0o700 });
-	const lock = path.join(dir, `.${key}.lock`);
-	const token = randomUUID();
+	const file = path.join(dir, `.record-lock-${key.slice(0, 2)}`);
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	for (;;) {
-		try {
-			const handle = await open(lock, "wx", 0o600);
+		const lock = FileLock.tryAcquire(file);
+		if (lock.acquired) {
 			try {
-				await handle.writeFile(token, "utf8");
+				return await task();
 			} finally {
-				await handle.close().catch(() => undefined);
+				lock.release();
 			}
-			break;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const info = await lstat(lock).catch(() => undefined);
-			if (info !== undefined && Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-				await rm(lock, { force: true }).catch(() => undefined);
-				continue;
-			}
-			if (Date.now() >= deadline) throw new Error("자식 권한 기록의 잠금을 기다리다 시간이 지났습니다");
-			const { promise, resolve } = Promise.withResolvers<void>();
-			setTimeout(resolve, LOCK_RETRY_MS);
-			await promise;
 		}
-	}
-	const held = async (): Promise<boolean> => {
-		try {
-			return (await readFile(lock, "utf8")) === token;
-		} catch {
-			return false;
-		}
-	};
-	try {
-		return await task(held);
-	} finally {
-		// Only the owner of the token may release the lock. A holder that was taken over must not delete the new one.
-		try {
-			if ((await readFile(lock, "utf8")) === token) await rm(lock, { force: true });
-		} catch {
-			// Already gone, or replaced: either way not this holder's to remove.
-		}
+		if (Date.now() >= deadline) throw new Error("자식 권한 기록의 잠금을 기다리다 시간이 지났습니다");
+		await Bun.sleep(LOCK_RETRY_MS);
 	}
 }
 
@@ -860,15 +871,12 @@ async function publishRecord(dir: string, file: string, key: string, expected: W
 	const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
 	await writeJsonAtomic(temp, next);
 	try {
-		return await withRecordLock(dir, key, async held => {
+		return await withRecordLock(dir, key, async () => {
 			const read = await readRecordFile(file);
 			if (read.kind !== "value" || !isAdmission(read.value)) return false;
 			const current = read.value;
 			if (current.build !== expected.build || current.attempt !== expected.attempt) return false;
 			if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
-			// The lock may have been taken over while this writer was paused past `LOCK_STALE_MS`; a holder that no
-			// longer owns it publishes nothing, so a late write can never land over the new owner's record.
-			if (!(await held())) return false;
 			await rename(temp, file);
 			await chmod(file, 0o600).catch(() => undefined);
 			return true;
@@ -919,12 +927,11 @@ async function mutateMarker(
 		const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
 		await writeJsonAtomic(temp, next);
 		try {
-			const published = await withRecordLock(dir, key, async held => {
+			const published = await withRecordLock(dir, key, async () => {
 				const again = await readRecordFile(file);
 				if (again.kind !== "value" || !isRunMarker(again.value)) return false;
 				if (again.value.build !== current.build || again.value.key !== current.key) return false;
 				if (JSON.stringify(again.value) !== JSON.stringify(current)) return false;
-				if (!(await held())) return false;
 				await rename(temp, file);
 				await chmod(file, 0o600).catch(() => undefined);
 				return true;
@@ -1178,14 +1185,12 @@ async function writeWorkerRunMarker(input: WorkerRunMarkerFacts): Promise<void> 
 		expiresAt: input.now + ACTIVE_TTL_MS,
 	};
 	const file = path.join(dir, `${marker.key}.json`);
-	// The content is complete before the lock: the section only re-reads the marker and renames, so a writer paused
-	// past `LOCK_STALE_MS` never holds the lock through a slow write and never lands its stale marker over the one the
-	// lock's new owner wrote (RD2o F5).
+	// The content is complete before the lock: the section only re-reads the marker and renames.
 	const temp = path.join(dir, `.${marker.key}.${randomUUID()}.tmp`);
 	await writeJsonAtomic(temp, marker);
 	let published = false;
 	try {
-		await withRecordLock(dir, marker.key, async held => {
+		await withRecordLock(dir, marker.key, async () => {
 			const existing = await readRecordFile(file);
 			// Another build's marker means this profile is shared with a copy whose state this build cannot read: never replace it.
 			if (existing.kind === "invalid") throw new Error(`기존 관리 실행 표시를 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}`);
@@ -1199,8 +1204,6 @@ async function writeWorkerRunMarker(input: WorkerRunMarkerFacts): Promise<void> 
 					throw new Error("기존 관리 실행 표시의 형식이 올바르지 않아 덮어쓰지 않았습니다");
 				}
 			}
-			// A writer that lost the lock publishes nothing: a late rename would rename the newer run's marker away.
-			if (!(await held())) throw new Error("관리 실행 표시를 쓰는 중에 잠금이 다른 사본으로 넘어가 표시를 남기지 않았습니다. 다시 스폰하세요");
 			await rename(temp, file);
 			published = true;
 		});
@@ -1684,7 +1687,7 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	// The marker is written only after the record can fit: a live marker for an admission that can never be stored
 	// would make every other unrecorded child of the run read as unknown. One read when the run's marker is already
 	// readable and current; a write (and its lock) only when it is missing or names another run of this tree.
-	await ensureRunMarker({
+	if (input.replaceEnded === undefined) await ensureRunMarker({
 		dir,
 		artifactRoot,
 		parentId,
@@ -1703,8 +1706,14 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	await writeJsonAtomic(temp, record);
 	let published = false;
 	try {
-		await withRecordLock(dir, key, async held => {
+		await withRecordLock(dir, key, async () => {
 			const existing = await readRecordFile(file);
+			const prior = input.replaceEnded;
+			if (prior !== undefined && (prior.key !== key || prior.build !== record.build || prior.runId !== record.runId ||
+				prior.endedAt === undefined || prior.revokedAt !== undefined ||
+				existing.kind !== "value" || JSON.stringify(existing.value) !== JSON.stringify(prior))) {
+				throw new Error("종료가 확인된 이전 자식 권한이 바뀌어 후속 작업을 열지 않았습니다");
+			}
 			// A record this build cannot read is not replaced: it may belong to another build sharing the profile, and a copy
 			// of another build must not replace what it cannot read. A missing file, this build's own record, or an older
 			// release's record are the only states a new attempt is written over.
@@ -1717,9 +1726,6 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 					throw new Error("기존 자식 권한 기록의 형식이 올바르지 않아 덮어쓰지 않았습니다");
 				}
 			}
-			// A writer paused past `LOCK_STALE_MS` lost the lock; it publishes nothing rather than a stale attempt over
-			// the record the new owner wrote.
-			if (!(await held())) throw new Error("자식 권한 기록을 쓰는 중에 잠금이 다른 사본으로 넘어가 기록을 남기지 않았습니다. 다시 스폰하세요");
 			await rename(temp, file);
 			published = true;
 		});

@@ -1287,6 +1287,17 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 	}
 
 	async readPrepared(worker: Pick<Readonly<WorkerAdmissionRecord>, "key" | "attempt">): Promise<IntegrationRead<FrozenIntegrationAdmission>> {
+		const checked = await this.readRetainedPrepared(worker);
+		if (checked.kind === "unknown") return checked;
+		const owner = await this.#slotOwner(checked.value.slot.slotPath);
+		if (owner.kind === "unknown") return owner;
+		if (owner.value === null || !slotOwnedBy(owner.value, checked.value.slot, checked.value.key, checked.value.item.handle)) {
+			return unknown("slot-not-held", "승인 레코드의 슬롯이 더 이상 이 승인 소유가 아닙니다", checked.value.slot.slotPath);
+		}
+		return checked;
+	}
+
+	async readRetainedPrepared(worker: Pick<Readonly<WorkerAdmissionRecord>, "key" | "attempt">): Promise<IntegrationRead<FrozenIntegrationAdmission>> {
 		if (typeof worker.key !== "string" || !SHA256.test(worker.key) || typeof worker.attempt !== "string" || !ATTEMPT.test(worker.attempt)) {
 			return unknown("worker-identity-invalid", "작업자 키나 시도가 올바르지 않습니다");
 		}
@@ -1299,11 +1310,6 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		if (checked.kind === "unknown") return checked;
 		if (checked.value.workerAdmission.key !== worker.key || checked.value.workerAdmission.attempt !== worker.attempt) {
 			return unknown("admission-worker-mismatch", "승인 레코드가 다른 작업자 시도를 가리킵니다", file);
-		}
-		const owner = await this.#slotOwner(checked.value.slot.slotPath);
-		if (owner.kind === "unknown") return owner;
-		if (owner.value === null || !slotOwnedBy(owner.value, checked.value.slot, checked.value.key, checked.value.item.handle)) {
-			return unknown("slot-not-held", "승인 레코드의 슬롯이 더 이상 이 승인 소유가 아닙니다", checked.value.slot.slotPath);
 		}
 		return checked;
 	}

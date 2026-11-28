@@ -785,6 +785,13 @@ function scriptedSteps(messages: Message[], tools: Tool[] | undefined): Decision
 function childDecision(request: ChatRequest): Decision {
 	const messages = request.messages;
 	const text = userText(messages);
+	const wakeShellAt = messages.findLastIndex(message => message.role === "user" && textOf(message.content).includes("E2E-WAKE-SH "));
+	if (wakeShellAt >= 0) {
+		const command = /E2E-WAKE-SH[ \t]+(\S+)/u.exec(textOf(messages[wakeShellAt]?.content))?.[1];
+		if (command !== undefined && !callNames(messages.slice(wakeShellAt + 1)).includes("bash")) {
+			return bashCall(request.tools, Buffer.from(command, "base64").toString("utf8"));
+		}
+	}
 	const reads = (lastCapture(text, /E2E-CHILD-READ[ \t]+(\S+)/) ?? "").split(",").filter(Boolean);
 	const write = lastCapture(text, /E2E-CHILD-WRITE[ \t]+(\S+)/);
 	const send = /E2E-CHILD-SEND[ \t]+(\S+)[ \t]+(\S+)/.exec(text) ?? undefined;
@@ -1081,6 +1088,19 @@ Bun.serve({
 		if (finalPause?.[1] !== undefined && finalPause[2] !== undefined) {
 			writeFileSync(finalPause[2], String(Date.now()));
 			await Bun.sleep(Math.min(Number(finalPause[1]), HOLD_MAX_MS));
+		}
+		const scaleLane = who === "child" && !request.messages.some(message => message.role === "assistant")
+			? /\bE2E-SCALE-PROVIDER (scale-guarded-[0-9]+-[0-9]+)\b/u.exec(userText(request.messages))?.[1]
+			: undefined;
+		if (scaleLane !== undefined) {
+			const dir = join(dirname(LOG), "scale-provider");
+			const start = Date.now();
+			mkdirSync(dir, { recursive: true });
+			const arrival = join(dir, `arrived-${scaleLane}`);
+			if (existsSync(arrival)) return gateError(`Repeated first scale provider request: ${scaleLane}`);
+			writeFileSync(arrival, `${start}\n`);
+			if (!(await hold(() => existsSync(join(dir, "release"))))) return gateError(`Scale provider window was never released: ${scaleLane}`);
+			writeFileSync(join(dir, `window-${scaleLane}.json`), JSON.stringify({ start, end: Date.now() }));
 		}
 		const delay = childDelayMs(who, request.messages);
 		if (delay > 0) await Bun.sleep(delay);

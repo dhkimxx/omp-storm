@@ -207,7 +207,7 @@ import { IntegrationAdmissionStore, integrationCandidateId } from "./runtime/int
 import { GitDelta, spawnGit } from "./runtime/integration-git.ts";
 import { canonicalWorktree } from "./runtime/lease.ts";
 import { IsolationCapture } from "./runtime/isolation-capture.ts";
-import { createManagedWorkerAdmissionPort, type BoundManagedWorkerEntry } from "./runtime/managed-worker-admission.ts";
+import { createManagedWorkerAdmissionPort, type BoundManagedWorkerSource } from "./runtime/managed-worker-admission.ts";
 import { IntegrationJournal, IntegrationWriter, type IntegrationJournalPort, type IntegrationWriterPort } from "./runtime/integration-record.ts";
 import { formatIntegrationCandidates, formatIntegrationSelection } from "./runtime/views.ts";
 import { INTEGRATION_CANDIDATE_ID_RE, INTEGRATION_RUN_ID_RE, integrationIdListProblem } from "./tool/host.ts";
@@ -873,13 +873,26 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		advertised.childScope === true && advertised.typedEnd === true && advertised.ownerEffectEnd === true &&
 		advertised.finalToolEffect === true && advertised.paidTransport === true && advertised.wake === true &&
 		advertised.pooled === true;
-	const managedGrants = new Map<string, Map<string, {
+	interface ManagedGrant {
 		readonly admission: FrozenIntegrationAdmission;
 		readonly models: ReturnType<typeof approvedEntries>;
 		readonly expiresAt: number;
 		readonly live: ReturnType<RunController["liveCheck"]>;
-	}>>();
-	let managedChild: BoundManagedWorkerEntry | undefined;
+		readonly kind: ManagedWorkerTurnScope["kind"];
+		readonly attempt: string;
+		endedToken?: string;
+	}
+	interface WakeProposal {
+		readonly previous: ManagedGrant;
+		readonly bodyDigest: string;
+		readonly open: () => ReturnType<typeof reopenChildAdmission>;
+		opened?: boolean;
+		issued?: ManagedGrant;
+	}
+	const managedGrants = new Map<string, Map<string, ManagedGrant>>();
+	const wakeProposals = new Map<string, WakeProposal>();
+	let managedChild: BoundManagedWorkerSource | undefined;
+	let pendingManagedChild: BoundManagedWorkerSource | undefined;
 	let managedWorkerStorage: ReturnType<typeof createManagedWorkerAdmissionPort> | undefined;
 	const managedStorage = () => {
 		if (managedWorkerStorage === undefined) {
@@ -893,11 +906,13 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	};
 	const currentManagedChild = (ctx: ExtensionContext): ManagedWorkerTurnScope | undefined => {
 		const scope = parseWorkerTurnScope((ctx as unknown as { readonly workerTurn?: unknown }).workerTurn);
-		const bound = managedChild?.binding.turn;
-		if (ctx.agent.kind !== "sub" || !scope || !bound || scope.token !== bound.token ||
-			scope.agentId !== ctx.agent.id || scope.parentAgentId !== ctx.agent.parentId ||
-			scope.actorSessionId !== closeoutSessionId(ctx)) return undefined;
-		return scope;
+		if (ctx.agent.kind !== "sub" || !scope || scope.agentId !== ctx.agent.id ||
+			scope.parentAgentId !== ctx.agent.parentId || scope.actorSessionId !== closeoutSessionId(ctx)) return undefined;
+		if (pendingManagedChild?.binding.turn.token === scope.token) {
+			managedChild = pendingManagedChild;
+			pendingManagedChild = undefined;
+		}
+		return managedChild?.binding.turn.token === scope.token ? scope : undefined;
 	};
 	const ownedIntegration = new Map<string, IntegrationRuntimePorts & { readonly capture: IsolationCapture }>();
 	let integrationClosing = false;
@@ -1518,7 +1533,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		hold?: string;
 		/** The live approval for this agent's role: read now, never the run's starting list. A failed read names its cause. */
 		approved: () => Promise<{ ok: true; entries: ReadonlyArray<{ selector: string; effort?: Effort }> } | { ok: false; reason: string }>;
-	}): Promise<{ ok: true } | { ok: false; reason: string }> => {
+		previous?: Pick<WorkerAdmissionRecord, "key" | "attempt">;
+	}): Promise<{ ok: true; record: WorkerAdmissionRecord } | { ok: false; reason: string }> => {
 		return serialized(admissionKey(input.run.runId, input.childId), async () => {
 			const read = await readWorkerAdmission({
 				agentDir: workerAdmissionAgentDir(),
@@ -1528,6 +1544,16 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			});
 			if (read.kind === "invalid") {
 				return { ok: false as const, reason: "이 워커의 실행 기록을 읽지 못해 후속 작업의 모델 승인을 확인할 수 없습니다. 실행 상태를 확인한 뒤 다시 보내세요." };
+			}
+			if (input.previous !== undefined && (read.kind !== "record" || read.key !== input.previous.key ||
+				read.record.attempt !== input.previous.attempt || read.record.runId !== input.run.runId ||
+				read.record.endedAt === undefined || read.record.revokedAt !== undefined)) {
+				return { ok: false as const, reason: "네이티브 종료가 확인된 이전 워커 시도에만 후속 작업을 보낼 수 있습니다." };
+			}
+			const frozen = input.previous !== undefined && read.kind === "record" ? read.record : undefined;
+			if (frozen !== undefined && (frozen.policy.kind !== "private" || input.authority.policy.kind !== "private" ||
+				input.authority.policy.reason !== frozen.policy.reason)) {
+				return { ok: false as const, reason: "격리 워커의 이전 승인 범위가 현재 지시와 다릅니다." };
 			}
 			const spawned = runSpawns(input.run.runId).some(spawn => spawn.spawnKey === input.childId && spawn.outcome !== "blocked");
 			const known = spawned || admittedChildren.has(`${input.run.runId}\u0000${input.childId}`);
@@ -1547,7 +1573,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (approved.entries.length === 0) {
 				return { ok: false as const, reason: "이 워커의 승인 모델 기록이 남아 있지 않아 후속 작업을 보내지 않았습니다. 실행을 새로 시작하세요." };
 			}
-			await persistWorkerAdmission({
+			const lane = frozen === undefined ? input.lane?.name : frozen.lane;
+			const hold = frozen === undefined ? input.hold : frozen.hold;
+			const saved = await persistWorkerAdmission({
 				agentDir: workerAdmissionAgentDir(),
 				artifactRoot: input.artifacts,
 				parentId: input.ctx.agent.id,
@@ -1558,13 +1586,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				sessionDir: input.run.sessionDir,
 				repoId: input.run.repoId,
 				targetRoot: input.run.root,
-				...(input.lane === undefined ? {} : { lane: input.lane.name }),
+				...(lane === undefined ? {} : { lane }),
 				policy: input.authority.policy,
-				...(input.hold === undefined ? {} : { hold: input.hold }),
+				...(hold === undefined ? {} : { hold }),
 				approved: approved.entries.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) })),
+				...(frozen === undefined ? {} : { replaceEnded: frozen }),
 			});
 			admittedChildren.set(`${input.run.runId}\u0000${input.childId}`, true);
-			return { ok: true as const };
+			return { ok: true as const, record: saved.record };
 		});
 	};
 
@@ -1577,11 +1606,12 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		authorizeWorkerTurn: (attempt, rawTurn) => {
 			const turn = parseWorkerTurnScope(rawTurn);
 			if (!managedPool || turn === undefined) return false;
-			const grant = managedGrants.get(turn.runId)?.get(turn.admissionKey);
+			const grant = managedGrants.get(turn.runId)?.get(turn.agentId);
 			const admission = grant?.admission;
-			if (!grant || !admission || turn.kind !== "first" || turn.admissionAttempt !== admission.workerAdmission.attempt ||
-				turn.dispatchId !== admission.key.dispatch || turn.guard !== admission.policy.guardBuild ||
-				turn.agentId !== admission.item.handle || turn.parentAgentId !== admission.director.parentId ||
+			if (!grant || !admission || grant.endedToken !== undefined || turn.kind !== grant.kind ||
+				turn.admissionKey !== admission.workerAdmission.key || turn.admissionAttempt !== grant.attempt ||
+				(turn.kind === "first" && turn.dispatchId !== admission.key.dispatch) ||
+				turn.guard !== admission.policy.guardBuild || turn.parentAgentId !== admission.director.parentId ||
 				turn.ownerSessionId !== admission.director.sessionId || turn.ownerInstanceKey !== admission.director.sessionInstance ||
 				grant.expiresAt <= Date.now() || !grant.live().ok) return false;
 			return checkChildModelAgainst(grant.models, {
@@ -1649,6 +1679,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			announcedResultPlan = undefined;
 			if (ended !== undefined) {
 				managedGrants.delete(ended);
+				for (const [callId, proposal] of wakeProposals) {
+					if (proposal.previous.admission.key.runId === ended) wakeProposals.delete(callId);
+				}
 				void revokeWorkerAdmissionsFor({ runId: ended });
 				for (const key of adoptedStops.keys()) if (key.startsWith(`${ended}\0`)) adoptedStops.delete(key);
 				for (const key of admittedChildren.keys()) if (key.startsWith(`${ended}\0`)) admittedChildren.delete(key);
@@ -2792,7 +2825,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 										const { admission, managed } = pending;
 										let grants = managedGrants.get(admission.key.runId);
 										if (grants === undefined) managedGrants.set(admission.key.runId, (grants = new Map()));
-										grants.set(admission.workerAdmission.key, { ...managed, admission, live: runs.liveCheck(ctx) });
+										grants.set(admission.item.handle, {
+											...managed, admission, live: runs.liveCheck(ctx), kind: "first", attempt: admission.workerAdmission.attempt,
+										});
 										return { ...decision, requireChildEntry: {
 											guard: admission.policy.guardBuild,
 											admission: {
@@ -2862,7 +2897,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (!isRecord(event) || event.kind !== "native_end" || !isRecord(event.capture)) return;
 			const turn = parseWorkerTurnScope(event.workerTurn);
 			const owner = captureOwner(ctx);
-			if (!turn || turn.kind !== "first" || !owner || owner.director.sessionId !== turn.ownerSessionId ||
+			if (!turn || !owner || owner.director.sessionId !== turn.ownerSessionId ||
 				owner.director.sessionInstance !== turn.ownerInstanceKey || owner.director.parentId !== turn.parentAgentId) return;
 			const { sessionFile, sessionFileIdentity, checkout } = event.capture;
 			if (typeof sessionFile !== "string" || !isRecord(sessionFileIdentity) || !isRecord(checkout) ||
@@ -2871,8 +2906,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				typeof event.observedAt !== "number") return;
 			const ports = boundIntegrationRuntime(owner.director.sessionDir);
 			if (!ports) return;
-			const claim = await ports.admission.readClaim({ schema: "storm.integration-admission/v1", runId: turn.runId, dispatch: turn.dispatchId });
-			if (claim.kind !== "known" || mainSessionId(ctx) !== turn.ownerSessionId || boundIntegrationRuntime(owner.director.sessionDir) !== ports) return;
+			const claim = turn.kind === "first" ? await ports.admission.readClaim({
+				schema: "storm.integration-admission/v1", runId: turn.runId, dispatch: turn.dispatchId,
+			}) : undefined;
+			if ((turn.kind === "first" && claim?.kind !== "known") || mainSessionId(ctx) !== turn.ownerSessionId ||
+				boundIntegrationRuntime(owner.director.sessionDir) !== ports) return;
 			const closed = await endWorkerAdmissionTurn({
 				agentDir: workerAdmissionAgentDir(), key: turn.admissionKey, attempt: turn.admissionAttempt,
 				turnToken: turn.token, childSessionId: turn.actorSessionId,
@@ -2883,19 +2921,82 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				sessionFile, sessionFileIdentity: { device: sessionFileIdentity.device, inode: sessionFileIdentity.inode },
 				checkout: { cwd: checkout.cwd, device: checkout.device, inode: checkout.inode },
 			};
-			if (!owner.capture.observeManagedEnd({
-				director: owner.director, workerTurn: turn, capture, observedAt: event.observedAt,
-				claim: claim.value, claimTurnToken: closed.binding.turn.token,
-			})) return;
-			const grants = managedGrants.get(turn.runId);
-			if (grants?.get(turn.admissionKey)?.admission.workerAdmission.attempt === turn.admissionAttempt) {
-				grants.delete(turn.admissionKey);
-			}
+			if (claim?.kind === "known") {
+				if (!owner.capture.observeManagedEnd({
+					director: owner.director, workerTurn: turn, capture, observedAt: event.observedAt,
+					claim: claim.value, claimTurnToken: closed.binding.turn.token,
+				})) return;
+			} else if (
+				closed.binding.child.checkout.device !== capture.checkout.device ||
+				closed.binding.child.checkout.inode !== capture.checkout.inode ||
+				closed.binding.child.sessionFile.device !== capture.sessionFileIdentity.device ||
+				closed.binding.child.sessionFile.inode !== capture.sessionFileIdentity.inode
+			) return;
+			const grant = managedGrants.get(turn.runId)?.get(turn.agentId);
+			if (grant?.attempt === turn.admissionAttempt && grant.kind === turn.kind) grant.endedToken = turn.token;
 			if (getLedgerRun(turn.runId)?.sessionId === turn.ownerSessionId) {
+				noteAgentEnd({ id: turn.agentId, scope: owner.director.sessionDir, now: event.observedAt, settled: true });
 				noteLaneAgentEnd(turn.runId, turn.agentId);
 				releaseWorkerSlot(turn.runId, turn.agentId);
 				touchRun(turn.runId);
 			}
+		});
+		const onWake = pi.on as unknown as (name: "managed_worker_wake", handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown>) => void;
+		onWake.call(pi, "managed_worker_wake", async (event, ctx) => {
+			const refuse = { block: true, reason: "[storm:authority] 이 관리 워커의 정확한 후속 지시와 종료된 시도를 확인하지 못했습니다." };
+			if (!isRecord(event) || event.revision !== 1 || event.toolName !== "write" ||
+				typeof event.toolCallId !== "string" || typeof event.recipient !== "string" ||
+				!isRecord(event.owner) || !isRecord(event.prior)) return refuse;
+			const proposal = wakeProposals.get(event.toolCallId);
+			if (!proposal || proposal.opened || event.bodyDigest !== proposal.bodyDigest) return refuse;
+			const previous = proposal.previous;
+			const { admission } = previous;
+			const grants = managedGrants.get(admission.key.runId);
+			if (!grants || grants.get(event.recipient) !== previous || !previous.endedToken ||
+				event.recipient !== admission.item.handle || event.prior.token !== previous.endedToken ||
+				event.prior.runId !== admission.key.runId || event.prior.admissionKey !== admission.workerAdmission.key ||
+				event.prior.admissionAttempt !== previous.attempt || event.prior.guard !== admission.policy.guardBuild ||
+				event.owner.agentId !== ctx.agent.id || event.owner.sessionId !== admission.director.sessionId ||
+				event.owner.instanceKey !== admission.director.sessionInstance || !previous.live().ok) return refuse;
+			const spend = spendSendBlock(admission.key.runId);
+			if (spend !== undefined) return { block: true, reason: spend };
+			const job = runs.jobGate();
+			if (job !== undefined) return { block: true, reason: job };
+			proposal.opened = true;
+			const opened = await proposal.open();
+			if (!opened.ok) return { block: true, reason: opened.reason };
+			const currentSpend = spendSendBlock(admission.key.runId);
+			const currentJob = runs.jobGate();
+			if (wakeProposals.get(event.toolCallId) !== proposal || grants.get(event.recipient) !== previous ||
+				mainSessionId(ctx) !== admission.director.sessionId || !previous.live().ok || currentSpend !== undefined || currentJob !== undefined ||
+				opened.record.key !== admission.workerAdmission.key || opened.record.attempt === previous.attempt) {
+				await revokeWorkerAdmissions(workerAdmissionAgentDir(), { key: opened.record.key, attempt: opened.record.attempt });
+				return currentSpend === undefined && currentJob === undefined ? refuse : { block: true, reason: currentSpend ?? currentJob };
+			}
+			const issued: ManagedGrant = {
+				admission, models: previous.models, expiresAt: opened.record.expiresAt, live: previous.live,
+				kind: "wake", attempt: opened.record.attempt,
+			};
+			proposal.issued = issued;
+			grants.set(event.recipient, issued);
+			return {
+				toolCallId: event.toolCallId, recipient: event.recipient, bodyDigest: proposal.bodyDigest,
+				guard: admission.policy.guardBuild,
+				admission: { runId: opened.record.runId, admissionKey: opened.record.key, admissionAttempt: opened.record.attempt },
+			};
+		});
+		const onWakeEntry = pi.on as unknown as (name: "managed_worker_wake_entry", handler: (event: unknown, ctx: ExtensionContext) => Promise<unknown>) => void;
+		onWakeEntry.call(pi, "managed_worker_wake_entry", async (event, ctx) => {
+			const prior = managedChild;
+			const turn = isRecord(event) ? parseWorkerTurnScope(event.workerTurn) : undefined;
+			if (!prior || !turn || turn.kind !== "wake") return { block: true, reason: "[storm:authority] 이전 관리 워커의 진입 증거가 없습니다." };
+			const result = await managedStorage().bindWake({
+				ctx, event, prior, window: integrationWindow(undefined),
+				live: () => closeoutSessionId(ctx) === turn.actorSessionId ? { ok: true } : { ok: false, reason: "관리 워커 세션이 바뀌었습니다." },
+			});
+			if (result.kind === "unknown") return { block: true, reason: result.problem.reason };
+			pendingManagedChild = result.value;
+			return result.value.acknowledgement;
 		});
 	}
 	const capturePush = (ctx: ExtensionContext, message: unknown): void => {
@@ -4229,6 +4330,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			? runSpawns(runId).findLast(spawn => spawn.outcome !== "blocked" && spawn.lane?.toLowerCase() === followTarget.toLowerCase() && spawn.spawnKey !== undefined)
 			: undefined;
 		const followAgent = byId ?? (laneSpawn?.spawnKey === undefined ? undefined : followUpAgent(followAgentsNow, laneSpawn.spawnKey));
+		const managedFollow = followAgent === undefined ? undefined : managedGrants.get(runId)?.get(followAgent.id);
+		if (managedFollow && (progress || !managedFollow.endedToken || !managedFollow.live().ok)) {
+			return { block: true, reason: "[storm:authority] 관리 워커는 현재 물리 체크아웃에서 종료가 확인된 뒤 정확한 작업 메시지로만 다시 시작할 수 있습니다." };
+		}
 		// B2: an address that no longer resolves to this run's agent list may still name a live worker of an earlier
 		// run. Its admission is the one cheap fact that says whether it was an unplanned worker; if so, this run never
 		// admitted it and the host must not be allowed to wake it.
@@ -4246,6 +4351,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const followLanes = runs.runLanes();
 		let followToken: string | undefined;
 		let followLane: PlanLane | undefined;
+		let openManagedWake: WakeProposal["open"] | undefined;
 		if (followAgent !== undefined && followLanes !== undefined) {
 			// A job batch starts only with no live workers; do not admit a message that can wake one into it.
 			const blockedByJob = runs.jobGate();
@@ -4422,13 +4528,21 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					}
 					return { ok: true, entries: approvedEntries(liveConfig, followAgent.name) };
 				};
-				const reopened = await reopenChildAdmission({ ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, ...(lane === undefined ? {} : { lane }), authority, ...(gate.hold === undefined ? {} : { hold: gate.hold }), approved: fallback }).catch((error: unknown) => ({
+				const open = () => reopenChildAdmission({
+					ctx, run, artifacts: artifactsOf(ctx), childId: followAgent.id, authority, approved: fallback,
+					...(lane === undefined ? {} : { lane }), ...(gate.hold === undefined ? {} : { hold: gate.hold }),
+					...(managedFollow === undefined ? {} : { previous: { key: managedFollow.admission.workerAdmission.key, attempt: managedFollow.attempt } }),
+				}).catch((error: unknown) => ({
 					ok: false as const,
 					reason: `후속 작업의 자식 실행 권한을 저장하지 못했습니다${error instanceof Error && error.message !== "" ? `: ${error.message}` : ". 프로필 경로와 권한을 확인하세요."}`,
 				}));
-				if (!reopened.ok) {
-					followLanes.finishFollowUp(followToken, false);
-					return { block: true, reason: `[storm:authority] ${reopened.reason}` };
+				if (managedFollow !== undefined) openManagedWake = open;
+				else {
+					const reopened = await open();
+					if (!reopened.ok) {
+						followLanes.finishFollowUp(followToken, false);
+						return { block: true, reason: `[storm:authority] ${reopened.reason}` };
+					}
 				}
 			}
 		}
@@ -4479,7 +4593,6 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				return { block: true, reason: blockedByJob };
 			}
 		}
-		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
 		const message = (event.input as { content?: unknown }).content;
 		let content = typeof message === "string" && message.trim() !== "" ? message : undefined;
 		// A work follow-up is new work under its lane's result contract: it carries the block again when the worker has not been
@@ -4516,6 +4629,15 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				rewrittenPath = `agent://${followAgent.id}${control}${query}`;
 			}
 		}
+		if (managedFollow !== undefined) {
+			if (!openManagedWake || content === undefined || typeof event.toolCallId !== "string") {
+				dropFollowDispatch();
+				if (followToken !== undefined) followLanes?.finishFollowUp(followToken, false);
+				return { block: true, reason: "[storm:authority] 관리 워커의 정확한 후속 호출과 본문이 확인되지 않았습니다." };
+			}
+			wakeProposals.set(event.toolCallId, { previous: managedFollow, bodyDigest: sha256Hex(content), open: openManagedWake });
+		}
+		if (followToken !== undefined) followLanes?.finishFollowUp(followToken, true);
 		const inputChanged = (content !== undefined && content !== message) || rewrittenPath !== undefined;
 		return inputChanged
 			? { input: { ...event.input, ...(content !== undefined && content !== message ? { content } : {}), ...(rewrittenPath === undefined ? {} : { path: rewrittenPath }) } }
@@ -4529,6 +4651,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		onEffect.call(pi, "managed_worker_tool", async (event, ctx) => {
 			const refuse = { block: true, reason: "[storm:authority] 이 도구 호출의 관리 워커 턴을 증명하지 못했습니다." };
 			if (!isRecord(event) || typeof event.toolName !== "string" || typeof event.toolCallId !== "string") return refuse;
+			if (typeof event.deadline !== "number" || !Number.isSafeInteger(event.deadline)) return refuse;
+			const now = Date.now();
+			const deadline = Math.min(now + 6_500, event.deadline - 250);
+			if (now >= deadline) return refuse;
 			const turn = currentManagedChild(ctx);
 			if (!turn || parseWorkerTurnScope(event.workerTurn)?.token !== turn.token) return refuse;
 			if (event.toolName === "eval" || (event.toolName === "bash" && isRecord(event.input) && event.input.async === true)) {
@@ -4540,15 +4666,15 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					runId: turn.runId, actorSessionId: turn.actorSessionId, actorInstanceKey: turn.actorInstanceKey,
 					generation: turn.generation, dispatchId: turn.dispatchId, kind: turn.kind,
 				},
-				window: { deadline: Date.now() + 1_600, maxBytes: 64 * 1024 * 1024, signal: AbortSignal.timeout(1_600) },
-				live: () => currentManagedChild(ctx)?.token === turn.token ? { ok: true } : { ok: false, reason: refuse.reason },
+				window: { deadline, maxBytes: 64 * 1024 * 1024, signal: AbortSignal.timeout(deadline - now) },
+				live: () => Date.now() < deadline && currentManagedChild(ctx)?.token === turn.token ? { ok: true } : { ok: false, reason: refuse.reason },
 			});
 			if (proof.kind === "unknown") return { block: true, reason: `[storm:authority] ${proof.problem.reason}` };
 			const verdict = await guardToolCall({
 				type: "tool_call", toolName: event.toolName, toolCallId: event.toolCallId, input: event.input,
 			} as ToolCallEvent, ctx, () => undefined, authorityFromAdmission(proof.value.record, proof.value.claim.checkout.canonicalPath));
 			if (verdict?.block === true) return verdict;
-			if (currentManagedChild(ctx)?.token !== turn.token) return refuse;
+			if (Date.now() >= deadline || currentManagedChild(ctx)?.token !== turn.token) return refuse;
 			return { workerTurnToken: turn.token, toolCallId: event.toolCallId };
 		});
 	}
@@ -4802,6 +4928,16 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const runId = ctx.agent.kind === "main" ? runs.runId() : undefined;
 		// The exact native conversation and proof identities this call belongs to, captured before any await.
 		const deliveryNativeId = runId === undefined ? undefined : mainSessionId(ctx);
+		if (ctx.agent.kind === "main" && typeof event.toolCallId === "string" && event.toolName === "write") {
+			const proposal = wakeProposals.get(event.toolCallId);
+			wakeProposals.delete(event.toolCallId);
+			const grant = proposal?.issued;
+			if (grant !== undefined && event.isError && grant.endedToken === undefined) {
+				const { admission } = grant;
+				await revokeWorkerAdmissions(workerAdmissionAgentDir(), { key: admission.workerAdmission.key, attempt: grant.attempt })
+					.catch(() => undefined);
+			}
+		}
 		const deliveryOwnersNow = runId === undefined ? [] : deliveryOwners(ctx);
 		// A follow-up that carried a result contract was delivered: its worker has now been sent it.
 		if (runId !== undefined && typeof event.toolCallId === "string") {

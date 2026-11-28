@@ -25,6 +25,12 @@
 이 문서의 나머지는 그 경계가 갖춰진 호스트에서의 계약이다. 고정 19.2.1에서 아래 명령을 "지금 되는 기능"으로
 읽지 않는다.
 
+풀 스레드 배치는 별도 경계다. 비공개 검증 호스트는 네이티브 소유자와 실제 자식의 세션·인스턴스·시도·물리
+체크아웃을 묶는다. 자식의 모델 전송과 최종 도구 인자가 그 턴에 맞고, 도구 영향이 끝났음을 소유자가 확인한
+뒤에만 슬롯을 풀고 캡처한다. 증명되지 않으면 슬롯을 유지한다. 직접 후속 메시지는 같은 물리 체크아웃에 남아
+대기 중인 자식에만 새 시도를 열며, 진행 메모·브로드캐스트·이미 실행 중인 턴 끼어들기·디스크 복원은 이 경로로
+깨우지 않는다. 배포본 omp 19.2.1과 일부 능력만 있는 빌드에는 기존 풀 정지가 적용된다.
+
 ## 사용자가 하는 일
 
 1. 격리 구현자를 계획 레인이나 계획 밖 `isolated: true` 항목으로 보낸다. 워커는 자기 체크아웃에서 일하고 끝나면
@@ -91,8 +97,9 @@
   한도가 아니라 입출력·저장 한도다.
 - 100개의 작은 후보 선택을 지원한다. 후보마다 전체 워크트리를 훑거나 작업 목록을 반복해 읽거나 인덱스 전체를
   해시하지 않는다. 개요는 개수·예·페이지로 제한하고, 정확한 상세만 더 보여 준다.
-- **16개 동시 워커는 주 스레드 구성에서만 주장한다.** `task.workerThreads: 0`이 통제이고, 기본 풀 스레드 구성에서는
-  기존 풀 스레드 정지가 그대로 적용된다. 0.30.0은 이 정지를 없애지 않으며 풀 스레드 동등성을 주장하지 않는다.
+- **동시 실행은 후보 수와 별개다.** `task.workerThreads: 0`은 주 스레드 통제다. 풀 검증은 유효 기본값
+  `task.workerThreads: 4`를 유지하고 시험용 프로필의 `task.maxConcurrency`만 바꾼다. 루프백 서버가
+  기록한 모델 요청 구간과 물리 체크아웃에서 기록한 셸 구간 둘 다 목표 수만큼 겹쳐야 한다.
 - **셸은 협조적이다.** 격리는 작업 위치이고 파일시스템 차단벽이 아니다. 워커의 셸이 절대 경로로 부모나 다른 곳을
   쓸 수 있고 Storm은 그것을 보지 못한다. 임의 셸을 파싱해 막지 않는다.
 - **네이티브 정리는 Storm의 일이 아니다.** 호스트가 체크아웃을 거둘 수 있고, 브랜치와 패치는 별개 수명이다.
@@ -112,6 +119,14 @@ INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP=write ./node_modules/.bin/bun scr
 
 # 격리·쓰기 경계가 있는 비공개 테스트 바이너리에서 실제 동시 실행과 기본 풀 정지 확인
 OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
+
+# 비공개 관리 호스트에서 기본 풀의 16/32/64/100을 별도로 검증
+OMP_BIN=/path/to/private/guarded-omp E2E_SCALE=1 E2E_SCALE_HOST=1 E2E_SCALE_GUARDED=1 E2E_SCALE_MODES=guarded \
+  ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
+
+# 같은 비공개 호스트에서 실제 후속 메시지의 진입·실행·종료를 검증
+OMP_BIN=/path/to/private/guarded-omp INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_MANAGED_WAKE=1 \
+  E2E_ONLY="carrier: authenticated warm wake" ./node_modules/.bin/bun scripts/e2e/integration.ts
 
 # 실제 후보 100개 조회 및 한 번의 선택, 최대 16개씩 격리 실행
 OMP_BIN=/path/to/private/omp INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP="judgment: candidate volume" ./node_modules/.bin/bun scripts/e2e/integration.ts

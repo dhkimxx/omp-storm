@@ -1,6 +1,6 @@
 {
   "name": "omp-storm",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "private": true,
   "description": "OMP Storm: plan, delegate, and verify coding, research, and operational work in omp",
   "type": "module",

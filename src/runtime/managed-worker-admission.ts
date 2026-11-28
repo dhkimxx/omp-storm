@@ -15,7 +15,7 @@
  * ending anything newer. The old `claimWorkerAdmission`/`resolveWorkerAdmission`/`endWorkerAdmission` fallbacks stay for
  * stock callers and are deliberately not used here.
  */
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { canonicalJson, sha256Hex } from "../config/canonical.ts";
 import { isRecord } from "../config/schema.ts";
@@ -42,6 +42,7 @@ import {
 	type WorkerTurnChildIdentity,
 	type WorkerTurnFileIdentity,
 	type WorkerTurnIntegrationRef,
+	type WorkerTurnWakeSource,
 } from "../worker-admission.ts";
 
 const MAX_TEXT = 512;
@@ -49,6 +50,7 @@ const MAX_PATH = 1024;
 const DEVICE = /^[0-9]{1,32}$/;
 const DISPATCH = /^[a-zA-Z0-9_-]{1,128}$/;
 const DEFINITION_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const ATTEMPT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** The exact native definition identity the host froze before the spawn hook. */
 export interface ManagedWorkerDefinitionIdentity {
@@ -92,7 +94,7 @@ export interface ManagedWorkerAdmissionReference {
 }
 
 /** Only the disk-only integration methods this proof needs; never the director/journal composition. */
-export type ManagedWorkerIntegrationStore = Pick<IntegrationAdmissionPort, "readPrepared" | "readClaim" | "claimAtEntry">;
+export type ManagedWorkerIntegrationStore = Pick<IntegrationAdmissionPort, "readPrepared" | "readRetainedPrepared" | "readClaim" | "claimAtEntry">;
 export type ManagedWorkerCheckoutProof = Pick<IntegrationDeltaPort, "verifyCheckoutInputs">;
 
 export interface ManagedWorkerEntryBindRequest extends ManagedWorkerEntryParseInput {
@@ -104,12 +106,56 @@ export interface ManagedWorkerEntryBindRequest extends ManagedWorkerEntryParseIn
 	readonly now?: number;
 }
 
-export interface BoundManagedWorkerEntry {
+/** The physical capture the native child hook re-presents for a warm wake. */
+export interface ManagedWorkerWakeCapture {
+	readonly sessionFile: WorkerTurnFileIdentity;
+	readonly checkout: Readonly<{ path: string; device: string; inode: string }>;
+}
+
+/** The exact wake tuple after shape, guard, context and physical-capture cross-checks. */
+export interface ManagedWorkerWakeEntryProof {
+	readonly scope: ManagedWorkerTurnScope;
+	readonly capture: ManagedWorkerWakeCapture;
+	/** The exact acknowledgement the child hook must echo for this wake. */
+	readonly acknowledgement: Readonly<{ workerTurnToken: string; dispatchId: string }>;
+}
+
+export interface ManagedWorkerWakeParseInput {
+	readonly ctx: unknown;
+	readonly event: unknown;
+	readonly guard: string;
+	/** Exact native child session id when the caller already read it from the session manager. */
+	readonly actorSessionId?: string;
+	/** Exact native child session file when the caller already read it from the session manager. */
+	readonly sessionFile?: string;
+}
+
+/** Every immutable proof field a later wake may re-use as its source; a first bind adds only its spawn reference. */
+export interface BoundManagedWorkerSource {
 	readonly record: WorkerAdmissionRecord;
 	readonly binding: WorkerAdmissionTurn;
 	readonly admission: FrozenIntegrationAdmission;
 	readonly claim: ChildEntryClaim;
+}
+
+export interface BoundManagedWorkerEntry extends BoundManagedWorkerSource {
 	readonly reference: ManagedWorkerAdmissionReference;
+}
+
+/** A wake grant has no new integration candidate, so it has no spawn reference: it keeps the first admission/claim. */
+export interface BoundManagedWorkerWakeEntry extends BoundManagedWorkerSource {
+	readonly source: Readonly<{ attempt: string }>;
+	readonly acknowledgement: Readonly<{ workerTurnToken: string; dispatchId: string }>;
+}
+
+export interface ManagedWorkerWakeBindRequest extends ManagedWorkerWakeParseInput {
+	readonly agentDir: string;
+	readonly prior: BoundManagedWorkerSource;
+	readonly store: ManagedWorkerIntegrationStore;
+	readonly delta: ManagedWorkerCheckoutProof;
+	readonly window: ByteWindow;
+	readonly live: () => LiveCheck;
+	readonly now?: number;
 }
 
 export interface ManagedWorkerTurnExpectation {
@@ -157,6 +203,7 @@ export interface ManagedWorkerAdmissionPort {
 	reference(admission: FrozenIntegrationAdmission, record: Pick<WorkerAdmissionRecord, "key" | "attempt">): IntegrationRead<ManagedWorkerAdmissionReference>;
 	parse(input: Omit<ManagedWorkerEntryParseInput, "guard">): IntegrationRead<ManagedWorkerEntryProof>;
 	bind(input: Omit<ManagedWorkerEntryBindRequest, "agentDir" | "guard" | "store" | "delta">): Promise<IntegrationRead<BoundManagedWorkerEntry>>;
+	bindWake(input: Omit<ManagedWorkerWakeBindRequest, "agentDir" | "guard" | "store" | "delta">): Promise<IntegrationRead<BoundManagedWorkerWakeEntry>>;
 	read(input: Omit<ManagedWorkerTurnRequest, "agentDir" | "guard" | "store" | "delta">): Promise<ManagedWorkerTurnRead>;
 	end(input: Omit<ManagedWorkerTurnEndRequest, "agentDir" | "guard" | "store" | "delta">): Promise<ManagedWorkerTurnEnd>;
 }
@@ -404,6 +451,73 @@ export function parseManagedWorkerEntry(input: ManagedWorkerEntryParseInput): In
 	return { kind: "known", value: proof };
 }
 
+interface ParsedWakeEvent {
+	readonly scope: ManagedWorkerTurnScope;
+	readonly capture: ManagedWorkerWakeCapture;
+}
+
+function parseWakeEvent(event: unknown): ParsedWakeEvent | undefined {
+	if (!isRecord(event) || event.type !== "managed_worker_wake_entry") return undefined;
+	const scope = parseWorkerTurnScope(event.workerTurn);
+	const capture = event.capture;
+	if (scope === undefined || scope.kind !== "wake" || !isRecord(capture)) return undefined;
+	const sessionFile = absolutePath(capture.sessionFile);
+	const sessionDevice = isRecord(capture.sessionFileIdentity) ? capture.sessionFileIdentity.device : undefined;
+	const sessionInode = isRecord(capture.sessionFileIdentity) ? capture.sessionFileIdentity.inode : undefined;
+	if (!isRecord(capture.checkout)) return undefined;
+	const checkoutPath = absolutePath(capture.checkout.cwd);
+	const sessionFileIdentity = sessionFile === undefined ? undefined : fileIdentity(sessionFile, sessionDevice, sessionInode);
+	const checkoutIdentity = checkoutPath === undefined
+		? undefined
+		: fileIdentity(checkoutPath, capture.checkout.device, capture.checkout.inode);
+	if (sessionFileIdentity === undefined || checkoutIdentity === undefined) return undefined;
+	return {
+		scope,
+		capture: Object.freeze({
+			sessionFile: sessionFileIdentity,
+			checkout: Object.freeze({
+				path: checkoutIdentity.canonicalPath,
+				device: checkoutIdentity.device,
+				inode: checkoutIdentity.inode,
+			}),
+		}),
+	};
+}
+
+/**
+ * Parse the exact native `managed_worker_wake_entry` tuple structurally. It proves the live child context, the wake scope
+ * and the re-presented physical session/checkout name the same warm actor. It confers no authority: the owner's live router
+ * validated the wake and the source record/admission/claim below still decide the durable grant.
+ */
+export function parseManagedWorkerWakeEntry(input: ManagedWorkerWakeParseInput): IntegrationRead<ManagedWorkerWakeEntryProof> {
+	const guard = text(input.guard);
+	if (guard === undefined) return unknown("wake-guard-invalid", "웨이크 진입 가드가 올바르지 않습니다");
+	const ctx = parseContext(input);
+	if (ctx === undefined) return unknown("wake-context-invalid", "웨이크 자식 컨텍스트의 신원이나 세션 파일이 올바르지 않습니다");
+	const event = parseWakeEvent(input.event);
+	if (event === undefined) return unknown("wake-event-invalid", "웨이크 자식 진입 이벤트의 신원이나 물리 파일이 올바르지 않습니다");
+	const scope = event.scope;
+	if (ctx.workerTurn !== undefined && canonicalJson(ctx.workerTurn) !== canonicalJson(scope)) {
+		return unknown("wake-context-scope", "웨이크 자식 컨텍스트의 턴이 진입 이벤트와 다릅니다");
+	}
+	if (scope.guard !== guard) return unknown("wake-guard-mismatch", "웨이크 진입 가드가 네이티브 턴과 다릅니다");
+	if (scope.agentId !== ctx.agentId) return unknown("wake-agent-mismatch", "웨이크 턴과 자식 에이전트 id가 다릅니다");
+	if (scope.parentAgentId !== ctx.parentAgentId) return unknown("wake-parent-mismatch", "웨이크 턴과 부모 에이전트 id가 다릅니다");
+	if (scope.actorSessionId !== ctx.actorSessionId) return unknown("wake-actor-session", "웨이크 턴과 자식 세션 id가 다릅니다");
+	if (event.capture.sessionFile.canonicalPath !== ctx.sessionFile) {
+		return unknown("wake-session-file", "웨이크 이벤트와 컨텍스트의 세션 파일이 다릅니다");
+	}
+	if (event.capture.checkout.path !== ctx.cwd) return unknown("wake-checkout-cwd", "웨이크 이벤트와 컨텍스트의 작업 경로가 다릅니다");
+	return {
+		kind: "known",
+		value: Object.freeze({
+			scope,
+			capture: event.capture,
+			acknowledgement: Object.freeze({ workerTurnToken: scope.token, dispatchId: scope.dispatchId }),
+		}),
+	};
+}
+
 /** The exact spawn-side reference the host accepts in `requireChildEntry.admission`; not a token. */
 export function managedWorkerAdmissionReference(
 	admission: FrozenIntegrationAdmission,
@@ -485,18 +599,20 @@ function verifyAdmissionAgainstRecord(input: {
 	return undefined;
 }
 
-function verifyClaimAgainstRecord(input: {
+/** The immutable claim-to-admission relations. `workerAttempt`/`childHandle` are the exact attempt/handle being proved. */
+function verifyClaimAgainstAdmission(input: {
 	claim: ChildEntryClaim;
 	admission: FrozenIntegrationAdmission;
-	record: WorkerAdmissionRecord;
 	guard: string;
+	workerAttempt: string;
+	childHandle: string;
 }): IntegrationProblem | undefined {
-	const { claim, admission, record, guard } = input;
+	const { claim, admission, guard, workerAttempt, childHandle } = input;
 	if (claim.key.schema !== admission.key.schema || claim.key.runId !== admission.key.runId ||
 		claim.key.dispatch !== admission.key.dispatch || claim.candidateId !== admission.candidateId) {
 		return problem("claim-admission", "자식 진입 주장이 통합 승인 키와 다릅니다");
 	}
-	if (claim.workerAttempt !== record.attempt || claim.childHandle !== record.childId) {
+	if (claim.workerAttempt !== workerAttempt || claim.childHandle !== childHandle) {
 		return problem("claim-worker", "자식 진입 주장이 이 자식 권한 시도와 다릅니다");
 	}
 	if (claim.policyProofId !== admission.policy.id || claim.slotOwnerToken !== admission.slot.ownerToken || claim.guardBuild !== guard) {
@@ -510,6 +626,36 @@ function verifyClaimAgainstRecord(input: {
 		return problem("claim-odb", "자식 진입 주장의 객체 저장소가 통합 승인과 다릅니다");
 	}
 	return undefined;
+}
+
+function verifyClaimAgainstRecord(input: {
+	claim: ChildEntryClaim;
+	admission: FrozenIntegrationAdmission;
+	record: WorkerAdmissionRecord;
+	guard: string;
+}): IntegrationProblem | undefined {
+	return verifyClaimAgainstAdmission({
+		claim: input.claim,
+		admission: input.admission,
+		guard: input.guard,
+		workerAttempt: input.record.attempt,
+		childHandle: input.record.childId,
+	});
+}
+
+/** The first attempt's claim is the invariant wake source: it must still name that first admission attempt and handle. */
+function verifyHistoricalClaim(input: {
+	claim: ChildEntryClaim;
+	admission: FrozenIntegrationAdmission;
+	guard: string;
+}): IntegrationProblem | undefined {
+	return verifyClaimAgainstAdmission({
+		claim: input.claim,
+		admission: input.admission,
+		guard: input.guard,
+		workerAttempt: input.admission.workerAdmission.attempt,
+		childHandle: input.admission.item.handle,
+	});
 }
 
 function verifyClaimAgainstProof(claim: ChildEntryClaim, proof: ManagedWorkerEntryProof): IntegrationProblem | undefined {
@@ -566,6 +712,269 @@ function settledEntitlementProblem(input: {
 		claim: input.claim, admission: input.admission, record: input.record, guard: input.guard,
 	});
 	return claimProblem ?? verifyClaimAgainstBinding(input.claim, input.binding);
+}
+
+/** The authority subset a wake must keep from the first grant: private policy, role/lane, hold and approved models. */
+function wakeGrantShape(record: WorkerAdmissionRecord): unknown {
+	return {
+		policy: record.policy,
+		lane: record.lane ?? null,
+		hold: record.hold ?? null,
+		approved: record.approved ?? null,
+	};
+}
+
+function wakeGrantDigest(record: WorkerAdmissionRecord): string {
+	return sha256Hex(canonicalJson(wakeGrantShape(record)));
+}
+
+/**
+ * The current wake record must be a fresh durable attempt of the same worker key, pointing at the invariant first admission
+ * and carrying exactly the private policy/role/hold authority this process already bound. It never reads a newer attempt
+ * or derives a source from the record it is checking.
+ */
+function wakeRecordProblem(input: {
+	record: WorkerAdmissionRecord;
+	admission: FrozenIntegrationAdmission;
+	scope: ManagedWorkerTurnScope;
+	wakeSource: WorkerTurnWakeSource;
+	guard: string;
+	now: number;
+}): IntegrationProblem | undefined {
+	const { record, admission, scope, wakeSource, guard, now } = input;
+	if (record.policy.kind !== "private") return problem("wake-record-not-private", "웨이크 권한 기록이 격리된 private 작업자가 아닙니다");
+	if (record.key !== scope.admissionKey) return problem("wake-key", "웨이크 턴과 자식 권한 키가 다릅니다");
+	if (record.attempt !== scope.admissionAttempt) return problem("wake-attempt", "웨이크 턴과 새 자식 권한 시도가 다릅니다");
+	if (record.attempt === wakeSource.sourceAttempt) return problem("wake-attempt-source", "웨이크 시도가 원본 시도와 같습니다");
+	if (record.runId !== scope.runId || record.runId !== admission.key.runId) {
+		return problem("wake-run", "웨이크 기록의 실행 id가 원본이나 네이티브 턴과 다릅니다");
+	}
+	if (record.sessionId !== scope.ownerSessionId || record.sessionId !== admission.director.sessionId) {
+		return problem("wake-owner-session", "웨이크 기록의 소유 세션이 원본이나 네이티브 턴과 다릅니다");
+	}
+	if (record.sessionDir !== admission.director.sessionDir) {
+		return problem("wake-owner-dir", "웨이크 기록의 세션 저장소가 원본 승인과 다릅니다");
+	}
+	if (record.parentId !== scope.parentAgentId || record.parentId !== admission.director.parentId) {
+		return problem("wake-parent", "웨이크 기록의 부모 에이전트가 원본이나 네이티브 턴과 다릅니다");
+	}
+	if (record.childId !== scope.agentId || record.childId !== admission.item.handle) {
+		return problem("wake-child", "웨이크 기록의 자식 핸들이 원본이나 네이티브 턴과 다릅니다");
+	}
+	if (record.targetRoot !== admission.target.authorizedRoot.canonicalPath) {
+		return problem("wake-target", "웨이크 기록의 대상 루트가 원본 승인과 다릅니다");
+	}
+	if (record.artifactRoot !== admission.artifactRoot.canonicalPath) {
+		return problem("wake-artifact", "웨이크 기록의 아티팩트 루트가 원본 승인과 다릅니다");
+	}
+	if (admission.workerAdmission.key !== record.key || admission.workerAdmission.attempt !== wakeSource.sourceAttempt) {
+		return problem("wake-source-admission", "웨이크 원본 승인이 다른 작업 시도를 가리킵니다");
+	}
+	if (canonicalJson(admission.workerAdmission.approved ?? null) !== canonicalJson(record.approved ?? null)) {
+		return problem("wake-approval", "웨이크 기록의 승인 모델이 원본 승인과 다릅니다");
+	}
+	if (scope.ownerInstanceKey !== admission.director.sessionInstance) {
+		return problem("wake-root-instance", "웨이크 턴의 루트 세션 인스턴스가 원본 승인 감독과 다릅니다");
+	}
+	if (scope.guard !== guard || admission.policy.guardBuild !== guard) {
+		return problem("wake-guard", "웨이크 가드가 원본 승인이나 현재 가드 빌드와 다릅니다");
+	}
+	if (wakeGrantDigest(record) !== wakeSource.grantDigest) {
+		return problem("wake-grant", "웨이크 기록의 정책, 역할, 홀드가 원본 권한과 다릅니다");
+	}
+	if (record.revokedAt !== undefined) return problem("revoked", "이 작업의 실행 권한이 취소됐습니다");
+	if (record.endedAt !== undefined) return problem("ended", "이 작업의 실행 권한은 이번 턴에서 끝났습니다");
+	if (record.expiresAt <= now) return problem("expired", "이 작업의 실행 권한이 만료됐습니다");
+	return undefined;
+}
+
+/**
+ * A durable wake binding adds the exact target attempt, the first source attempt and its admission/claim digests, and the
+ * integration reference that belongs to that immutable source. It never carries or implies a new candidate.
+ */
+function wakeBindingProblem(input: {
+	record: WorkerAdmissionRecord;
+	binding: WorkerAdmissionTurn;
+	admission: FrozenIntegrationAdmission;
+	guard: string;
+	now: number;
+}): IntegrationProblem | undefined {
+	const { record, binding, admission, guard, now } = input;
+	const wakeSource = binding.wake;
+	if (wakeSource === undefined) return problem("wake-source-missing", "웨이크 턴에 원본 물리 증명이 없습니다");
+	if (binding.turn.kind !== "wake") return problem("wake-kind", "웨이크 턴의 종류가 웨이크가 아닙니다");
+	const recordProblem = wakeRecordProblem({ record, admission, scope: binding.turn, wakeSource, guard, now });
+	if (recordProblem !== undefined) return recordProblem;
+	if (binding.key !== record.key || binding.attempt !== record.attempt) {
+		return problem("wake-binding-worker", "결속된 웨이크 턴이 다른 자식 권한 시도를 가리킵니다");
+	}
+	const integration = binding.integration;
+	if (integration === undefined) return problem("wake-integration", "결속된 웨이크 턴에 원본 통합 승인 참조가 없습니다");
+	if (integration.runId !== admission.key.runId || integration.dispatch !== admission.key.dispatch ||
+		integration.candidateId !== admission.candidateId || integration.policyProofId !== admission.policy.id ||
+		integration.slotOwnerToken !== admission.slot.ownerToken || integration.guardBuild !== guard) {
+		return problem("wake-integration-ref", "결속된 웨이크 턴의 통합 승인 참조가 원본 승인과 다릅니다");
+	}
+	return undefined;
+}
+
+async function wakeCaptureProblem(input: {
+	capture: ManagedWorkerWakeCapture;
+	claim: ChildEntryClaim;
+	binding: WorkerAdmissionTurn;
+}): Promise<IntegrationProblem | undefined> {
+	const { capture, claim, binding } = input;
+	const session = claim.entry.childSessionFile;
+	const sessionPath = capture.sessionFile.canonicalPath === session.canonicalPath ||
+		capture.sessionFile.canonicalPath === claim.entry.hostSessionFile;
+	if (!sessionPath || capture.sessionFile.device !== session.device || capture.sessionFile.inode !== session.inode) {
+		return problem("wake-session-file", "웨이크 세션 파일이 원본 진입 주장과 물리적으로 다릅니다");
+	}
+	const boundSession = binding.child.sessionFile;
+	const boundSessionPath = capture.sessionFile.canonicalPath === boundSession.canonicalPath ||
+		capture.sessionFile.canonicalPath === claim.entry.hostSessionFile;
+	if (!boundSessionPath || capture.sessionFile.device !== boundSession.device || capture.sessionFile.inode !== boundSession.inode) {
+		return problem("wake-session-binding", "웨이크 세션 파일이 이전에 결속된 물리 파일과 다릅니다");
+	}
+	const checkoutPath = capture.checkout.path === claim.checkout.canonicalPath
+		? capture.checkout.path
+		: await realpath(capture.checkout.path).catch(() => undefined);
+	if (checkoutPath !== claim.checkout.canonicalPath || capture.checkout.device !== claim.checkout.device ||
+		capture.checkout.inode !== claim.checkout.inode) {
+		return problem("wake-checkout", "웨이크 체크아웃이 원본 진입 주장과 물리적으로 다릅니다");
+	}
+	if (checkoutPath !== binding.child.checkout.canonicalPath ||
+		capture.checkout.device !== binding.child.checkout.device || capture.checkout.inode !== binding.child.checkout.inode) {
+		return problem("wake-checkout-binding", "웨이크 체크아웃이 이전에 결속된 물리 경로와 다릅니다");
+	}
+	return undefined;
+}
+
+function wakeActorProblem(scope: ManagedWorkerTurnScope, prior: BoundManagedWorkerSource): IntegrationProblem | undefined {
+	if (scope.actorSessionId !== prior.binding.turn.actorSessionId) {
+		return problem("wake-actor-session", "웨이크 턴의 자식 세션이 이전에 결속된 세션과 다릅니다");
+	}
+	if (scope.actorInstanceKey !== prior.binding.turn.actorInstanceKey || scope.generation !== prior.binding.turn.generation) {
+		return problem("wake-actor-identity", "웨이크 턴의 자식 인스턴스나 세대가 이전에 결속된 값과 다릅니다");
+	}
+	if (sha256Hex(scope.actorSessionId) !== prior.binding.child.sessionIdSha256) {
+		return problem("wake-actor-hash", "웨이크 턴의 자식 세션 해시가 이전에 결속된 값과 다릅니다");
+	}
+	// A distinct delivery must carry a newly minted opaque token and its own native delivery id, even on repeated wakes.
+	if (scope.token === prior.binding.turn.token) return problem("wake-token-reused", "웨이크 턴이 이전 턴의 토큰을 재사용했습니다");
+	if (scope.dispatchId === prior.binding.turn.dispatchId) {
+		return problem("wake-dispatch-reused", "웨이크 턴이 이전 턴의 네이티브 디렉션 id를 재사용했습니다");
+	}
+	return undefined;
+}
+
+/** The first attempt is invariant across every later wake, even when the caller passes its newest bound entry. */
+function priorWakeSourceAttempt(prior: BoundManagedWorkerSource): string | undefined {
+	const source = prior.binding.turn.kind === "wake" ? prior.binding.wake?.sourceAttempt : prior.record.attempt;
+	return source !== undefined && ATTEMPT.test(source) ? source : undefined;
+}
+
+function wakePriorProblem(input: {
+	record: WorkerAdmissionRecord;
+	prior: BoundManagedWorkerSource;
+	sourceAttempt: string;
+}): IntegrationProblem | undefined {
+	const { record, prior, sourceAttempt } = input;
+	if (record.key !== prior.record.key) return problem("wake-key", "웨이크 기록과 이전 권한의 키가 다릅니다");
+	if (record.attempt === prior.record.attempt) return problem("wake-attempt-duplicate", "웨이크 시도가 이전 시도와 같습니다");
+	if (prior.record.policy.kind !== "private") return problem("wake-prior-private", "이전 권한이 private 작업자가 아닙니다");
+	if (canonicalJson(wakeGrantShape(record)) !== canonicalJson(wakeGrantShape(prior.record))) {
+		return problem("wake-grant", "웨이크 기록의 정책, 역할, 홀드가 이전 권한과 다릅니다");
+	}
+	if (record.runId !== prior.record.runId || record.sessionId !== prior.record.sessionId ||
+		record.sessionDir !== prior.record.sessionDir || record.parentId !== prior.record.parentId ||
+		record.childId !== prior.record.childId || record.repoId !== prior.record.repoId ||
+		record.targetRoot !== prior.record.targetRoot || record.artifactRoot !== prior.record.artifactRoot) {
+		return problem("wake-record-identity", "웨이크 기록이 이전 권한의 실행, 소유자, 부모, 자식 또는 루트와 다릅니다");
+	}
+	if (prior.binding.key !== prior.record.key || prior.binding.attempt !== prior.record.attempt) {
+		return problem("wake-prior-binding", "이전 결속이 그 권한 기록과 다릅니다");
+	}
+	if (prior.binding.turn.kind === "wake") {
+		if (prior.binding.wake?.sourceAttempt !== sourceAttempt || sourceAttempt === prior.record.attempt) {
+			return problem("wake-prior-source", "이전 웨이크 결속의 원본 시도가 올바르지 않습니다");
+		}
+	} else if (prior.binding.wake !== undefined || sourceAttempt !== prior.record.attempt) {
+		return problem("wake-prior-source", "첫 턴 결속의 원본 시도가 올바르지 않습니다");
+	}
+	if (prior.claim.workerAttempt !== sourceAttempt) return problem("wake-prior-claim", "이전 진입 주장이 원본 시도를 가리키지 않습니다");
+	if (prior.admission.workerAdmission.key !== prior.record.key || prior.admission.workerAdmission.attempt !== sourceAttempt) {
+		return problem("wake-prior-admission", "이전 승인이 원본 시도를 가리키지 않습니다");
+	}
+	return undefined;
+}
+
+/**
+ * Re-read the invariant first admission and claim, prove the wake binding still names exactly them, and refresh only the
+ * live physical checkout/Git proof. Old consumed input bytes are deliberately not re-read: the first work turn may have
+ * legitimately changed them, while the claim stays the immutable source for every later wake.
+ */
+async function readWakeSource(input: {
+	record: WorkerAdmissionRecord;
+	binding: WorkerAdmissionTurn;
+	store: ManagedWorkerIntegrationStore;
+	delta: ManagedWorkerCheckoutProof;
+	guard: string;
+	window: ByteWindow;
+	live: () => LiveCheck;
+	now: number;
+}): Promise<IntegrationRead<Readonly<{ admission: FrozenIntegrationAdmission; claim: ChildEntryClaim }>>> {
+	const wakeSource = input.binding.wake;
+	if (wakeSource === undefined) return unknown("wake-source-missing", "웨이크 턴에 원본 물리 증명이 없습니다");
+	const sourceAttempt = wakeSource.sourceAttempt;
+	if (!ATTEMPT.test(sourceAttempt) || sourceAttempt === input.record.attempt) {
+		return unknown("wake-source-attempt", "웨이크 원본 시도가 올바르지 않습니다");
+	}
+	const prepared = await input.store.readRetainedPrepared({ key: input.record.key, attempt: sourceAttempt });
+	if (prepared.kind === "unknown") return prepared;
+	if (sha256Hex(canonicalJson(prepared.value)) !== wakeSource.admissionDigest) {
+		return unknown("wake-source-admission", "웨이크 원본 승인이 결속된 승인과 다릅니다");
+	}
+	const bindingProblem = wakeBindingProblem({
+		record: input.record, binding: input.binding, admission: prepared.value, guard: input.guard, now: input.now,
+	});
+	if (bindingProblem !== undefined) return unknown(bindingProblem.code, bindingProblem.reason);
+	const claim = await input.store.readClaim(prepared.value.key);
+	if (claim.kind === "unknown") return claim;
+	if (sha256Hex(canonicalJson(claim.value)) !== wakeSource.claimDigest) {
+		return unknown("wake-source-claim", "웨이크 원본 진입 주장이 결속된 주장과 다릅니다");
+	}
+	const historicalProblem = verifyHistoricalClaim({
+		claim: claim.value, admission: prepared.value, guard: input.guard,
+	});
+	if (historicalProblem !== undefined) return unknown(historicalProblem.code, historicalProblem.reason);
+	const bindingClaimProblem = verifyClaimAgainstBinding(claim.value, input.binding);
+	if (bindingClaimProblem !== undefined) return unknown(bindingClaimProblem.code, bindingClaimProblem.reason);
+	const before = input.live();
+	if (!before.ok) return unknown("live-refused", before.reason);
+	// The first claim remains the physical source. Only the live checkout/Git identity is re-proved; the entry-time
+	// consumed bytes were proven exactly once and legal first-turn edits must not make every wake fail.
+	const verified = await input.delta.verifyCheckoutInputs(claim.value, [], input.window);
+	if (!verified.ok) return { kind: "unknown", problem: verified.problem };
+	const after = input.live();
+	if (!after.ok) return unknown("live-refused", after.reason);
+	return { kind: "known", value: Object.freeze({ admission: prepared.value, claim: claim.value }) };
+}
+
+function settledWakeProblem(input: {
+	record: WorkerAdmissionRecord;
+	binding: WorkerAdmissionTurn;
+	admission: FrozenIntegrationAdmission;
+	claim: ChildEntryClaim;
+	guard: string;
+	now: number;
+}): IntegrationProblem | undefined {
+	const bindingProblem = wakeBindingProblem({
+		record: input.record, binding: input.binding, admission: input.admission, guard: input.guard, now: input.now,
+	});
+	if (bindingProblem !== undefined) return bindingProblem;
+	const historicalProblem = verifyHistoricalClaim({ claim: input.claim, admission: input.admission, guard: input.guard });
+	return historicalProblem ?? verifyClaimAgainstBinding(input.claim, input.binding);
 }
 
 /**
@@ -732,6 +1141,144 @@ export async function bindManagedWorkerEntry(input: ManagedWorkerEntryBindReques
 }
 
 /**
+ * Child-side warm wake bind. The native wake event is only a tuple: the durable first admission/claim and the retained
+ * worker record still decide. The new attempt must be a fresh private grant of the same key/run/owner/parent/child with the
+ * same policy/role/hold, a new opaque token, and the exact previously bound actor session/generation/session file/checkout.
+ * No new candidate or claim is created, and the first slot marker is neither released nor re-acquired.
+ */
+export async function bindManagedWorkerWake(input: ManagedWorkerWakeBindRequest): Promise<IntegrationRead<BoundManagedWorkerWakeEntry>> {
+	const parsed = parseManagedWorkerWakeEntry(input);
+	if (parsed.kind === "unknown") return parsed;
+	const proof = parsed.value;
+	const scope = proof.scope;
+	const sourceAttempt = priorWakeSourceAttempt(input.prior);
+	if (sourceAttempt === undefined) return unknown("wake-source-attempt", "이전 결속에서 원본 시도를 확인하지 못했습니다");
+	const now = input.now ?? Date.now();
+	const read = await readWorkerAdmissionByKey(input.agentDir, scope.admissionKey);
+	if (read.kind !== "record") {
+		return read.kind === "missing"
+			? unknown("record-missing", "이 자식 작업 시도의 권한 기록이 없습니다")
+			: unknown("record-invalid", read.reason);
+	}
+	const record = read.record;
+	const priorProblem = wakePriorProblem({ record, prior: input.prior, sourceAttempt });
+	if (priorProblem !== undefined) return unknown(priorProblem.code, priorProblem.reason);
+	const actorProblem = wakeActorProblem(scope, input.prior);
+	if (actorProblem !== undefined) return unknown(actorProblem.code, actorProblem.reason);
+	const prepared = await input.store.readRetainedPrepared({ key: record.key, attempt: sourceAttempt });
+	if (prepared.kind === "unknown") return prepared;
+	if (canonicalJson(prepared.value) !== canonicalJson(input.prior.admission)) {
+		return unknown("wake-source-admission", "웨이크 원본 승인이 이전에 결속된 승인과 다릅니다");
+	}
+	if (prepared.value.workerAdmission.key !== record.key || prepared.value.workerAdmission.attempt !== sourceAttempt) {
+		return unknown("wake-source-admission", "웨이크 원본 승인이 이 자식 권한 시도를 가리키지 않습니다");
+	}
+	const claimRead = await input.store.readClaim(prepared.value.key);
+	if (claimRead.kind === "unknown") return claimRead;
+	const claim = claimRead.value;
+	if (canonicalJson(claim) !== canonicalJson(input.prior.claim)) {
+		return unknown("wake-source-claim", "웨이크 원본 진입 주장이 이전에 결속된 주장과 다릅니다");
+	}
+	const historicalProblem = verifyHistoricalClaim({ claim, admission: prepared.value, guard: input.guard });
+	if (historicalProblem !== undefined) return unknown(historicalProblem.code, historicalProblem.reason);
+	const priorClaimProblem = verifyClaimAgainstBinding(claim, input.prior.binding);
+	if (priorClaimProblem !== undefined) return unknown(priorClaimProblem.code, priorClaimProblem.reason);
+	const captureProblem = await wakeCaptureProblem({ capture: proof.capture, claim, binding: input.prior.binding });
+	if (captureProblem !== undefined) return unknown(captureProblem.code, captureProblem.reason);
+	const wakeSource: WorkerTurnWakeSource = Object.freeze({
+		sourceAttempt,
+		admissionDigest: sha256Hex(canonicalJson(prepared.value)),
+		claimDigest: sha256Hex(canonicalJson(claim)),
+		grantDigest: wakeGrantDigest(record),
+	});
+	const recordProblem = wakeRecordProblem({
+		record, admission: prepared.value, scope, wakeSource, guard: input.guard, now,
+	});
+	if (recordProblem !== undefined) return unknown(recordProblem.code, recordProblem.reason);
+	const before = input.live();
+	if (!before.ok) return unknown("live-refused", before.reason);
+	// The first claim is the invariant physical source; old consumed input bytes are not re-tested after legal first edits.
+	const verified = await input.delta.verifyCheckoutInputs(claim, [], input.window);
+	if (!verified.ok) return { kind: "unknown", problem: verified.problem };
+	const after = input.live();
+	if (!after.ok) return unknown("live-refused", after.reason);
+	// Every source and physical proof awaited. Re-read the exact new record before committing the turn file; a replacement,
+	// revoke, end or expiry in that window must not leave a wake binding behind.
+	const recheck = await readWorkerAdmissionByKey(input.agentDir, record.key);
+	if (recheck.kind !== "record") {
+		return recheck.kind === "missing"
+			? unknown("wake-record-missing", "웨이크 결속 중 자식 권한 기록이 사라졌습니다")
+			: unknown("wake-record-invalid", recheck.reason);
+	}
+	const recheckProblem = wakeRecordProblem({
+		record: recheck.record, admission: prepared.value, scope, wakeSource, guard: input.guard, now,
+	});
+	if (recheckProblem !== undefined) return unknown(recheckProblem.code, recheckProblem.reason);
+	const commitLive = input.live();
+	if (!commitLive.ok) return unknown("live-refused", commitLive.reason);
+	const child: WorkerTurnChildIdentity = Object.freeze({
+		sessionIdSha256: sha256Hex(scope.actorSessionId),
+		sessionFile: Object.freeze({ ...claim.entry.childSessionFile }),
+		checkout: Object.freeze({ ...claim.checkout }),
+		registryInstance: claim.entry.registryInstance,
+		generation: claim.entry.generation,
+	});
+	const integration: WorkerTurnIntegrationRef = Object.freeze({
+		runId: prepared.value.key.runId,
+		dispatch: prepared.value.key.dispatch,
+		candidateId: prepared.value.candidateId,
+		policyProofId: prepared.value.policy.id,
+		slotOwnerToken: prepared.value.slot.ownerToken,
+		guardBuild: input.guard,
+	});
+	const bound = await bindWorkerAdmissionTurn({
+		agentDir: input.agentDir,
+		key: recheck.record.key,
+		attempt: recheck.record.attempt,
+		turn: scope,
+		child,
+		integration,
+		wake: wakeSource,
+		host: Object.freeze({ ...claim.hostOwner }),
+		...(input.now === undefined ? {} : { now: input.now }),
+	});
+	if (bound.kind === "refused") return unknown(bound.code, bound.reason);
+	const settled = await readWorkerAdmissionTurn({
+		agentDir: input.agentDir,
+		key: bound.record.key,
+		attempt: bound.record.attempt,
+		turnToken: scope.token,
+		expect: {
+			runId: scope.runId,
+			actorSessionId: scope.actorSessionId,
+			actorInstanceKey: scope.actorInstanceKey,
+			generation: scope.generation,
+			dispatchId: scope.dispatchId,
+			kind: "wake",
+		},
+		...(input.now === undefined ? {} : { now: input.now }),
+	});
+	if (settled.kind === "refused") return unknown(settled.code, settled.reason);
+	const settledProblem = settledWakeProblem({
+		record: settled.record, binding: settled.binding, admission: prepared.value, claim, guard: input.guard, now,
+	});
+	if (settledProblem !== undefined) return unknown(settledProblem.code, settledProblem.reason);
+	const live = input.live();
+	if (!live.ok) return unknown("live-refused", live.reason);
+	return {
+		kind: "known",
+		value: Object.freeze({
+			record: settled.record,
+			binding: settled.binding,
+			admission: prepared.value,
+			claim,
+			source: Object.freeze({ attempt: sourceAttempt }),
+			acknowledgement: proof.acknowledgement,
+		}),
+	};
+}
+
+/**
  * Read/work authorization: exact current worker record + binding + prepared admission + claim, with a fresh checkout proof.
  * Missing or foreign proof is a refusal, never an unmanaged fallback. The native paid gate still validates the scope.
  */
@@ -746,6 +1293,42 @@ export async function readManagedWorkerTurn(input: ManagedWorkerTurnRequest): Pr
 	});
 	if (read.kind === "refused") return unknown(read.code, read.reason);
 	if (read.record.policy.kind !== "private") return unknown("record-not-private", "관리 턴 읽기는 격리된 private 작업자에게만 허용됩니다");
+	const now = input.now ?? Date.now();
+	if (read.binding.turn.kind === "wake") {
+		const source = await readWakeSource({
+			record: read.record, binding: read.binding, store: input.store, delta: input.delta,
+			guard: input.guard, window: input.window, live: input.live, now,
+		});
+		if (source.kind === "unknown") return source;
+		// The historical admission/claim and live checkout proof awaited. Re-read the exact wake record/binding now; a
+		// replacement, revoke, end, expiry or changed grant after those awaits still refuses.
+		const settled = await readWorkerAdmissionTurn({
+			agentDir: input.agentDir,
+			key: input.key,
+			attempt: input.attempt,
+			turnToken: input.turnToken,
+			...(input.expect === undefined ? {} : { expect: input.expect }),
+			...(input.now === undefined ? {} : { now: input.now }),
+		});
+		if (settled.kind === "refused") return unknown(settled.code, settled.reason);
+		if (settled.binding.turn.kind !== "wake") return unknown("wake-binding", "결속된 턴이 더 이상 웨이크가 아닙니다");
+		const settledProblem = settledWakeProblem({
+			record: settled.record, binding: settled.binding, admission: source.value.admission,
+			claim: source.value.claim, guard: input.guard, now,
+		});
+		if (settledProblem !== undefined) return { kind: "unknown", problem: settledProblem };
+		const live = input.live();
+		if (!live.ok) return unknown("live-refused", live.reason);
+		return {
+			kind: "known",
+			value: Object.freeze({
+				record: settled.record,
+				binding: settled.binding,
+				admission: source.value.admission,
+				claim: source.value.claim,
+			}),
+		};
+	}
 	const prepared = await input.store.readPrepared({ key: read.record.key, attempt: read.record.attempt });
 	if (prepared.kind === "unknown") return prepared;
 	const admissionProblem = verifyAdmissionAgainstRecord({
@@ -818,6 +1401,40 @@ export async function endManagedWorkerTurn(input: ManagedWorkerTurnEndRequest): 
 	});
 	if (read.kind === "refused") return { kind: "unknown", problem: problem(read.code, read.reason) };
 	if (read.record.policy.kind !== "private") return { kind: "unknown", problem: problem("record-not-private", "관리 턴 종료는 격리된 private 작업자에게만 허용됩니다") };
+	const now = input.now ?? Date.now();
+	if (read.binding.turn.kind === "wake") {
+		const source = await readWakeSource({
+			record: read.record, binding: read.binding, store: input.store, delta: input.delta,
+			guard: input.guard, window: input.window, live: input.live, now,
+		});
+		if (source.kind === "unknown") return { kind: "unknown", problem: source.problem };
+		const settled = await readWorkerAdmissionTurn({
+			agentDir: input.agentDir,
+			key: input.key,
+			attempt: input.attempt,
+			turnToken: input.turnToken,
+			...(input.expect === undefined ? {} : { expect: input.expect }),
+			...(input.now === undefined ? {} : { now: input.now }),
+		});
+		if (settled.kind === "refused") return { kind: "unknown", problem: problem(settled.code, settled.reason) };
+		if (settled.binding.turn.kind !== "wake") return { kind: "unknown", problem: problem("wake-binding", "결속된 턴이 더 이상 웨이크가 아닙니다") };
+		const settledProblem = settledWakeProblem({
+			record: settled.record, binding: settled.binding, admission: source.value.admission,
+			claim: source.value.claim, guard: input.guard, now,
+		});
+		if (settledProblem !== undefined) return { kind: "unknown", problem: settledProblem };
+		const live = input.live();
+		if (!live.ok) return { kind: "unknown", problem: problem("live-refused", live.reason) };
+		const ended = await endWorkerAdmissionTurn({
+			agentDir: input.agentDir,
+			key: input.key,
+			attempt: input.attempt,
+			turnToken: input.turnToken,
+			childSessionId: input.childSessionId,
+			...(input.now === undefined ? {} : { now: input.now }),
+		});
+		return ended.kind === "refused" ? { kind: "unknown", problem: problem(ended.code, ended.reason) } : ended;
+	}
 	const prepared = await input.store.readPrepared({ key: read.record.key, attempt: read.record.attempt });
 	if (prepared.kind === "unknown") return { kind: "unknown", problem: prepared.problem };
 	const admissionProblem = verifyAdmissionAgainstRecord({
@@ -866,6 +1483,7 @@ export function createManagedWorkerAdmissionPort(options: ManagedWorkerAdmission
 		reference: (admission, record) => managedWorkerAdmissionReference(admission, record),
 		parse: input => parseManagedWorkerEntry({ ...input, guard }),
 		bind: input => bindManagedWorkerEntry({ ...input, agentDir, guard, store, delta }),
+		bindWake: input => bindManagedWorkerWake({ ...input, agentDir, guard, store, delta }),
 		read: input => readManagedWorkerTurn({ ...input, agentDir, guard, store, delta }),
 		end: input => endManagedWorkerTurn({ ...input, agentDir, guard, store, delta }),
 	};

@@ -324,6 +324,52 @@ async function carrierSync(): Promise<void> {
 	});
 }
 
+async function carrierManagedWake(): Promise<void> {
+	writeIsolationProfile(env, { enabled: true, apply: false, merge: "patch", backend: nativeBackend(), async: false });
+	const lane = "carrier-warm";
+	const file = "e2e-integration-warm.txt";
+	const marker = markerDir(lane);
+	const first = join(marker, "first");
+	const wake = join(marker, "wake");
+	const quiet = join(marker, "quiet");
+	const arg = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+	const before = parentState(env.project, [file]);
+	await sessions.open(cancelAll, async (rpc, files) => {
+		const { run, frames } = await plannedRun(rpc, files, [laneFor(lane, file, "carrier-warm-change")], [
+			{ tasks: [{ name: lane, agent: "storm-implementer", task: "Write one file", say: `${shellCommand(`pwd -P > ${arg(first)}; printf '%s\\n' 'storm child change' > ${arg(file)}`)}\nE2E-CHILD-CLAIM WARM-FIRST` }] },
+			{ wait: true },
+			{ edit: `agent://${lane}?progress`, content: shellCommand(`pwd -P > ${arg(quiet)}`) },
+			{ followUp: `agent://${lane}`, content: `E2E-WAKE-SH ${Buffer.from(`pwd -P > ${arg(wake)}`).toString("base64")}\nE2E-CHILD-CLAIM WARM-SECOND` },
+			{ wait: true },
+		], { implementer: 1 }, 25_000);
+		const dir = join(env.agentDir, "storm", "admissions");
+		const readRows = (suffix: string) => readdirSync(dir).filter(name => name.endsWith(suffix))
+			.flatMap(name => jsonObjects(readFileSync(join(dir, name), "utf8")));
+		const bindings = readRows(".turn").map(row => property(row, "turn")).filter(
+			(row): row is Record<string, unknown> => isRecord(row) && row.runId === run.runId,
+		);
+		const prior = bindings.find(row => row.kind === "first");
+		const second = bindings.find(row => row.kind === "wake");
+		const attempts = readRows(".json").filter(row => row.runId === run.runId);
+		const writes = frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "write");
+		const firstPath = existsSync(first) ? readFileSync(first, "utf8").trim() : "";
+		const wakePath = existsSync(wake) ? readFileSync(wake, "utf8").trim() : "";
+		check("carrier warm: a direct wake performs its tool effect in the same private checkout", firstPath !== "" && firstPath === wakePath && outsideProject(wakePath), JSON.stringify({ firstPath, wakePath, writes: writes.map(resultTextOf) }));
+		check("carrier warm: the quiet message is fenced on the known worker before any effect",
+			!existsSync(quiet) && writes[0]?.isError === true && !/Unknown agent/u.test(resultTextOf(writes[0])), JSON.stringify(writes.map(resultTextOf)));
+		check("carrier warm: the native wake keeps actor and worker key, changes token, dispatch, and grant attempt",
+			bindings.length === 2 && prior !== undefined && second !== undefined &&
+				prior.actorSessionId === second.actorSessionId && prior.actorInstanceKey === second.actorInstanceKey &&
+				prior.admissionKey === second.admissionKey && prior.admissionAttempt !== second.admissionAttempt &&
+				prior.token !== second.token && prior.dispatchId !== second.dispatchId, JSON.stringify(bindings));
+		check("carrier warm: the exact new grant reaches its own durable end",
+			second !== undefined && attempts.some(row => row.key === second.admissionKey && row.attempt === second.admissionAttempt && typeof row.endedAt === "number"), JSON.stringify(attempts.map(row => [row.attempt, row.endedAt])));
+		check("carrier warm: the wake does not remint or overwrite the first candidate",
+			journalAt(files.sessionDir, run.runId).filter(row => row.kind === "manifest").length === 1, JSON.stringify(journalAt(files.sessionDir, run.runId).map(row => row.kind)));
+		sameParent("carrier warm", before, parentState(env.project, [file]), [file]);
+	});
+}
+
 async function carrierWaitPush(): Promise<void> {
 	writeIsolationProfile(env, { enabled: true, apply: false, merge: "patch", backend: nativeBackend(), async: true, workerThreads: 0 });
 	await sessions.open(cancelAll, async (rpc, files) => {
@@ -1053,6 +1099,9 @@ async function main(): Promise<void> {
 
 	if (MANAGED_LAUNCH) {
 	if (include("carrier", "carrier: sync root-only")) await suite.step("carrier: sync root-only", carrierSync, 300_000);
+	if (process.env.INTEGRATION_MANAGED_WAKE === "1" && include("carrier", "carrier: authenticated warm wake")) {
+		await suite.step("carrier: authenticated warm wake", carrierManagedWake, 45_000);
+	}
 	if (include("carrier", "carrier: wait and push")) await suite.step("carrier: wait, push and push-then-empty-wait", carrierWaitPush, 420_000);
 	if (include("carrier", "carrier: mixed batch")) await suite.step("carrier: mixed wait/push batch", carrierMixedBatch, 420_000);
 	if (include("carrier", "carrier: empty")) await suite.step("carrier: confirmed empty is not root-only", carrierEmpty, 300_000);

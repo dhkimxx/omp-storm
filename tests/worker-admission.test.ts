@@ -65,6 +65,7 @@ const admit = (over: {
 	targetRoot?: string;
 	artifactRoot?: string;
 	approved?: ReadonlyArray<{ selector: string; effort?: string }>;
+	replaceEnded?: Parameters<typeof persistWorkerAdmission>[0]["replaceEnded"];
 } = {}) =>
 	persistWorkerAdmission({
 		agentDir,
@@ -81,6 +82,7 @@ const admit = (over: {
 		...(over.hold === undefined ? {} : { hold: over.hold }),
 		policy: over.policy ?? { kind: "paths", paths: ["allowed.txt"], reason: "test lane" },
 		...(over.approved === undefined ? {} : { approved: over.approved }),
+		...(over.replaceEnded === undefined ? {} : { replaceEnded: over.replaceEnded }),
 	});
 
 const resolve = (over: {
@@ -428,51 +430,25 @@ describe("worker admission records", () => {
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at: at + 1, onExceed: "stop" } });
 	});
 
-	test("RF6o case 1: a holder that lost the lock does not release the new holder's lock", async () => {
+	test("a warm reopen only replaces the exact ended record, never a revocation or successor", async () => {
 		const first = await admit();
-		const dir = join(agentDir, "storm", "admissions");
-		const file = join(dir, `${first.key}.json`);
-		const lock = join(dir, `.${first.key}.lock`);
-		const realRename = fsp.rename;
-		const entered: Array<() => void> = [];
-		const release: Array<() => void> = [];
-		let parked = 0;
-		const spy = spyOn(fsp, "rename").mockImplementation(async (from, to) => {
-			if (to === file && parked < 2) {
-				const gate = Promise.withResolvers<void>();
-				parked++;
-				release.push(() => gate.resolve());
-				entered[parked - 1]?.();
-				await gate.promise;
-			}
-			await realRename(from, to);
+		expect(await endWorkerAdmission(agentDir, first.key, first.record.attempt, "worker")).toBe(true);
+		const old = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (old.kind !== "record") throw new Error("the ended record is missing");
+		const next = await admit({ replaceEnded: old.record });
+		expect(next.record.attempt).not.toBe(first.record.attempt);
+		await expect(admit({ replaceEnded: old.record })).rejects.toThrow("이전 자식 권한이 바뀌어");
+		expect(await endWorkerAdmission(agentDir, next.key, next.record.attempt, "worker")).toBe(true);
+		const ended = await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId });
+		if (ended.kind !== "record") throw new Error("the ended successor is missing");
+		expect(await revokeWorkerAdmissions(agentDir, { key: next.key, attempt: next.record.attempt })).toBe(1);
+		await expect(admit({ replaceEnded: ended.record })).rejects.toThrow("이전 자식 권한이 바뀌어");
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).toMatchObject({
+			kind: "record", record: { attempt: next.record.attempt, revokedAt: expect.any(Number) },
 		});
-		const firstReached = Promise.withResolvers<void>();
-		entered[0] = () => firstReached.resolve();
-		const firstOp = endWorkerAdmission(agentDir, first.key, first.record.attempt, "worker");
-		try {
-			await firstReached.promise;
-			// The first holder was paused past the staleness bound; the second takes the lock over.
-			const stale = new Date(Date.now() - 6_000);
-			await utimes(lock, stale, stale);
-			const secondReached = Promise.withResolvers<void>();
-			entered[1] = () => secondReached.resolve();
-			const secondOp = recordWorkerStop(agentDir, { key: first.key, runId, childId, attempt: first.record.attempt, reason: "pooled-thread" });
-			await secondReached.promise;
-			release[0]?.();
-			await firstOp;
-			// The late holder's release must leave the lock the second holder still owns.
-			expect((await lstat(lock)).isFile()).toBe(true);
-			release[1]?.();
-			await secondOp;
-		} finally {
-			for (const open of release) open();
-			await firstOp.catch(() => undefined);
-			spy.mockRestore();
-		}
 	});
 
-	test("RF6o case 4: an obsolete record is removed under the record lock after it was read again", async () => {
+	test("an expired admission from an older schema makes room for a current attempt", async () => {
 		const dir = join(agentDir, "storm", "admissions");
 		await mkdir(dir, { recursive: true });
 		const key = "a".repeat(64);
@@ -482,30 +458,13 @@ describe("worker admission records", () => {
 		await utimes(target, stale, stale);
 		// The store is at its cap, so this admission is the one that scans and cleans.
 		await fillRecords(MAX_ADMISSION_RECORDS - 1);
-		const realRm = fsp.rm;
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		let parked = false;
-		const spy = spyOn(fsp, "rm").mockImplementation(async (path, options) => {
-			if (!parked && path === target) {
-				parked = true;
-				entered.resolve();
-				await release.promise;
-			}
-			await realRm(path, options);
-		});
-		const admission = admit({ childId: "AfterCleanup" });
-		try {
-			await entered.promise;
-			expect((await lstat(join(dir, `.${key}.lock`))).isFile()).toBe(true);
-		} finally {
-			release.resolve();
-			await admission;
-			spy.mockRestore();
-		}
+		const current = await admit({ childId: "AfterCleanup" });
+		expect(await lstat(target).catch(() => undefined)).toBeUndefined();
+		expect(await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId: "AfterCleanup" }))
+			.toMatchObject({ kind: "record", record: { attempt: current.record.attempt } });
 	});
 
-	test("RF6o case 5: an obsolete marker is removed under the marker lock after it was read again", async () => {
+	test("obsolete expired run markers do not survive a new run admission", async () => {
 		const dir = join(agentDir, "storm", "admissions", "runs");
 		await mkdir(dir, { recursive: true });
 		const key = "b".repeat(64);
@@ -513,27 +472,9 @@ describe("worker admission records", () => {
 		await writeFile(target, JSON.stringify({ schema: "storm.worker-run/v1", runId: "old" }));
 		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
 		await utimes(target, stale, stale);
-		const realRm = fsp.rm;
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		let parked = false;
-		const spy = spyOn(fsp, "rm").mockImplementation(async (path, options) => {
-			if (!parked && path === target) {
-				parked = true;
-				entered.resolve();
-				await release.promise;
-			}
-			await realRm(path, options);
-		});
-		const admission = admit({ childId: "AfterMarkerCleanup" });
-		try {
-			await entered.promise;
-			expect((await lstat(join(dir, `.${key}.lock`))).isFile()).toBe(true);
-		} finally {
-			release.resolve();
-			await admission;
-			spy.mockRestore();
-		}
+		await admit({ childId: "AfterMarkerCleanup" });
+		expect(await lstat(target).catch(() => undefined)).toBeUndefined();
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
 	});
 
 	test("a new run in the same tree and parent starts open, and a close names exactly its own run", async () => {
@@ -618,7 +559,7 @@ describe("worker admission records", () => {
 		const raw = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
 		await writeFile(file, JSON.stringify({ ...raw, build: "another-build" }));
 		const runs = join(agentDir, "storm", "admissions", "runs");
-		const [markerName] = await readdir(runs);
+		const [markerName] = (await readdir(runs)).filter(name => name.endsWith(".json"));
 		const markerFile = join(runs, markerName!);
 		const markerRaw = JSON.parse(await readFile(markerFile, "utf8")) as Record<string, unknown>;
 		await writeFile(markerFile, JSON.stringify({ ...markerRaw, build: "another-build" }));

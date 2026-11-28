@@ -178,6 +178,8 @@ export interface IntegrationAdmissionPort {
 	/** Prepare before E's final synchronous policy/live checks; aborted grants are rolled back by exact owner. */
 	persistPrepared(admission: FrozenIntegrationAdmission): Promise<IntegrationCheck>;
 	readPrepared(worker: Pick<Readonly<WorkerAdmissionRecord>, "key" | "attempt">): Promise<IntegrationRead<FrozenIntegrationAdmission>>;
+	/** Retained source bytes only: does not prove a live slot or authorize a first entry. */
+	readRetainedPrepared(worker: Pick<Readonly<WorkerAdmissionRecord>, "key" | "attempt">): Promise<IntegrationRead<FrozenIntegrationAdmission>>;
 	/** Revoke by exact admission/slot owner if the final grant did not publish; never touches a replacement. */
 	abandonPrepared(admission: FrozenIntegrationAdmission): Promise<IntegrationCheck>;
 	/** Child boundary. A anchors cwd, marker and Git admin, verifies actual input bytes via B before durable publish. */

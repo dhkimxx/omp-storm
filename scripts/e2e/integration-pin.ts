@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * 0.30.0 pinned-build and profile check — no model call.
+ * Release pin and effective profile check against stock omp — no model call.
  *
  * The release claims about isolated capture and parent writes rest on a pinned package, host build and disposable
  * profile. This script records that combination and cites the source review. Run real-host scenarios separately
@@ -34,7 +34,7 @@ import { type E2eEnv, prepare, ROOT, Suite } from "./harness.ts";
 const FROZEN_COMMIT = "ca4c3b7299c5d82961ab63fdbf18fc78bd915379";
 /** The commit that installed the five type-only integration interfaces; the feature build must descend from it. */
 const INTERFACE_COMMIT = "865f14393220857945a4ea7c45e990b517adccc9";
-const RELEASE_VERSION = "0.30.0";
+const RELEASE_VERSION = "0.31.0";
 const HOST_VERSION = "19.2.1";
 const INTERFACE_FILES = [
 	"integration-admission.ts",
@@ -45,7 +45,7 @@ const INTERFACE_FILES = [
 ] as const;
 
 const env = prepare("storm-e2e-integration-pin", 18830);
-const suite = new Suite("E2E (0.30.0 integration pin and profile proof)", env);
+const suite = new Suite(`E2E (${RELEASE_VERSION} integration pin and profile proof)`, env);
 const check = suite.check.bind(suite);
 
 type GateState = "source-reviewed" | "blocked" | "not-run";
@@ -154,7 +154,7 @@ async function main(): Promise<void> {
 	};
 	const lockVersion = (name: string): unknown => lock.packages?.[`node_modules/${name}`]?.version;
 
-	check("the release package version is 0.30.0", pkg.version === RELEASE_VERSION, `package.json=${String(pkg.version)}`);
+	check(`the release package version is ${RELEASE_VERSION}`, pkg.version === RELEASE_VERSION, `package.json=${String(pkg.version)}`);
 	check("the lockfile records the release version", lock.version === RELEASE_VERSION && lock.packages?.[""]?.version === RELEASE_VERSION, String(lock.version));
 	check("the lockfile is lockfileVersion 3", lock.lockfileVersion === 3, `lockfileVersion=${String(lock.lockfileVersion)}`);
 	for (const name of ["@oh-my-pi/pi-ai", "@oh-my-pi/pi-catalog", "@oh-my-pi/pi-coding-agent", "@oh-my-pi/pi-natives", "@oh-my-pi/pi-tui", "@oh-my-pi/pi-utils"]) {
