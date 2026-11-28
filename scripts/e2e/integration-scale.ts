@@ -1,15 +1,29 @@
 #!/usr/bin/env bun
 /**
- * 0.30.0 scale E2E: exactly N=4, 8 and 16 isolated implementers on the pinned omp, twice: the main-thread control
- * (`task.workerThreads: 0`) and omp's default pooled profile (no `task.workerThreads` override). Disposable HOME,
- * profile, Git repo, work dir and loopback port per mode/size; the scripted loopback provider is the only model.
+ * 0.30.0 scale E2E: the legacy main-thread/default-pool gate, plus a separate future guarded-pool fixture.
  *
- * What this proof is allowed to claim:
+ * Legacy gate (unchanged): exactly N=4, 8 and 16 isolated implementers on the pinned omp, twice: the main-thread
+ * control (`task.workerThreads: 0`) and omp's default pooled profile (no `task.workerThreads` override, effective 4).
+ * Its default pooled run must show the actual `pooled-thread` stop; parity is never inferred from the setting.
+ *
+ * Guarded-pool mode (fixture only; not proved at this commit): exactly N=16, 32, 64 and 100 isolated implementers in
+ * the same disposable, loopback-only setup. The private profile leaves `task.workerThreads` at its effective default
+ * (4) and sets only `task.maxConcurrency: N`. The mode is explicitly positive and is expected to pass only on a
+ * future host whose guarded native slot lets a Storm worker keep its run-bound state wherever native placement puts
+ * it. Every child is observed in its own live Storm hook with one exact home. Native placement intentionally starts
+ * on the main thread (eight main + eight off-main at N=16), so the record includes both the exact main and pooled
+ * distribution and requires pooled nonzero; it never asserts main==0 or pooled==N. No stop, withdrawal or unknown
+ * admission is accepted, and N provider intervals plus N physical shell windows must overlap. The shell windows use a
+ * deterministic file barrier: every child writes `arrived-<lane>`, waits for the harness's `release` file, then writes
+ * its start/end milliseconds and the lane effect from inside its own checkout. A bounded wait means a missing child
+ * fails the gate instead of hanging it. That barrier is the tool-effect proof, not the provider request count or a
+ * worker that only waits.
+ *
+ * What either mode is allowed to claim:
  *   - configured concurrency is read back through `omp config list --json` (`task.maxConcurrency`,
  *     `task.workerThreads`) and the plan's declared workers; it is never used as the observed overlap;
- *   - actual overlap is measured from real child provider request intervals (the first request is held for
- *     `E2E-CHILD-DELAY`) and from real shell windows whose start/end milliseconds are written from inside each
- *     checkout;
+ *   - actual overlap is measured from real child provider request intervals (the first request is held for a bounded
+ *     delay) and from real shell windows whose start/end milliseconds are written from inside each checkout;
  *   - every checkout claim is a durable `ChildEntryClaim` under
  *     `<profile>/agent/integration/v1/claims/<candidateId>.json`, is mapped to the worker admission claim
  *     (`<profile>/agent/storm/admissions/<key>.<attempt>.claim`), and the distinct `(device, inode)` pairs are counted
@@ -20,29 +34,34 @@
  *     must be byte-identical to their durable files, and every `bundle.root` / delta root object must exist at
  *     `<profile>/agent/integration/<objectKey>` with the exact byte count and SHA-256;
  *   - the parent HEAD, index, status and every lane path must be unchanged, and the journal must contain no selection,
- *     intent, step, receipt or fence-clear, because no `storm integrate` is run;
- *   - every worker admission is accounted for by a terminal `endedAt` and its worker claim, or by an exact recorded
- *     stop (`stop.reason`, `stop.at`) and no provider request, or (a failure) by a withdrawal with neither. The default
- *     pooled profile must show the actual `pooled-thread` stop; it is not inferred from `task.workerThreads`.
+ *     intent, step, receipt or fence-clear, because no `storm integrate` is run.
  *
  * Seam status at this commit: the combined private host binary built on 2026-11-28 (`/tmp/storm-host/omp-isolation-async`)
  * still needs X's exact native-slot fix. Its real sync run failed at child entry with
  * `SubagentEntryError: [storm:integration] 자식 작업 디렉터리나 슬롯 마운트를 확인하지 못했습니다`; the prepared
- * admission was rolled back and no claim, journal or object was written. This script therefore refuses to start a real
- * run unless `E2E_SCALE=1` **and** `E2E_SCALE_HOST=1` are both set, the second only after that fix is proved. It never
- * runs the slow baseline binary and never treats a stock-19.2.1 run (no guarded isolation) as a positive.
+ * admission was rolled back and no claim, journal or object was written. The legacy gate therefore refuses to start a
+ * real run unless `E2E_SCALE=1` **and** `E2E_SCALE_HOST=1` are both set, the second only after that fix is proved. It
+ * never runs the slow baseline binary and never treats a stock-19.2.1 run (no guarded isolation) as a positive.
+ * Guarded-pool mode needs the same two keys **and** `E2E_SCALE_GUARDED=1`, which is a fixture authorization, not a
+ * passing result: its gates stay NOT-RUN until a real host observes every fact above. At this commit no such host is
+ * claimed, so the guarded gates are never reported PASS.
  *
  * Usage:
  *   ./node_modules/.bin/bun scripts/e2e/integration-scale.ts --self-check
  *   ./node_modules/.bin/bun scripts/e2e/integration-scale.ts          # prints gates; no omp, no model
  *   E2E_SCALE=1 E2E_SCALE_HOST=1 OMP_BIN=/absolute/fixed-omp ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
+ *   E2E_SCALE=1 E2E_SCALE_HOST=1 E2E_SCALE_GUARDED=1 E2E_SCALE_MODES=guarded OMP_BIN=/absolute/guarded-omp \
+ *     ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
  *
  * Selection and repeatable work dirs:
- *   E2E_SCALE_NS=4,16            subset of {4,8,16}; default all three
- *   E2E_SCALE_MODES=main,pool    subset of {main,pool}; default both
+ *   E2E_SCALE_NS=16             supported sizes for the selected modes; default legacy {4,8,16} and guarded
+ *                               {16,32,64,100}. `E2E_SCALE_NS=16` plans only N=16 for every selected mode, so a first
+ *                               guarded run never silently adds 32/64/100.
+ *   E2E_SCALE_MODES=main,pool    legacy modes; `guarded` add the guarded fixture and needs the guard key
+ *   E2E_SCALE_GUARDED=1          authorize the guarded-pool mode (default off; never a gate pass by itself)
  *   E2E_SCALE_WORK_ROOT=<dir>    default `<tmp>/storm-e2e-scale`; the script always appends `<mode>-<n>`, so one gate
  *                                never overwrites another gate's logs. E2E_WORK itself is set per run, never shared.
- *   E2E_SCALE_PORT_BASE=21940    default; main uses +n, pool uses +100+n, so the six runs never share a port.
+ *   E2E_SCALE_PORT_BASE=21940    default; main uses +n, pool +100+n, guarded +200+n, so no combo shares a port.
  *
  * `INTEGRATION_REQUIRE_GATES=1` exits 2 while the real-host scale gates remain NOT-RUN/BLOCKED (the F/pin convention).
  * A green run is only a green run for the gate that ran; no unrun mode is reported as passing.
@@ -61,15 +80,29 @@ import { type E2eEnv, type Frame, type LlmEntry, LlmCursor, prepare, type Step, 
 import { effectiveSettings, isolationProfileYaml, nativeBackend, type IsolationProfile } from "./integration-profile.ts";
 import { installProfile, runRequest, Sessions } from "./phase1-kit.ts";
 
-const NS = [4, 8, 16] as const;
-type ScaleN = (typeof NS)[number];
-const MODES = ["main", "pool"] as const;
+const LEGACY_NS = [4, 8, 16] as const;
+const GUARDED_NS = [16, 32, 64, 100] as const;
+const ALL_NS = [4, 8, 16, 32, 64, 100] as const;
+type LegacyN = (typeof LEGACY_NS)[number];
+type GuardedN = (typeof GUARDED_NS)[number];
+type ScaleN = (typeof ALL_NS)[number];
+const LEGACY_MODES = ["main", "pool"] as const;
+const MODES = [...LEGACY_MODES, "guarded"] as const;
 type Mode = (typeof MODES)[number];
 
 const LANE_REASON = "E2E 규모: 부모 작업 트리와 분리된 구현 체크아웃";
 const FIRST_DELAY_MS = 10_000;
 const SHELL_HOLD_MS = 5_000;
 const RUN_TIMEOUT_MS = 420_000;
+/** The fake provider caps `E2E-CHILD-DELAY` at 60 s; guarded mode uses the whole bounded window for 100 starts. */
+const GUARDED_PROVIDER_HOLD_MS = 60_000;
+/** Long enough that 100 shells released by the same barrier are all open together on any supported host. */
+const GUARDED_SHELL_HOLD_MS = 15_000;
+/** The harness stops waiting for the last child after this; it then releases, and missing lanes fail the gate. */
+const GUARDED_BARRIER_TIMEOUT_MS = 240_000;
+/** The child's own bounded wait for the harness release, longer than the barrier timeout so the harness is the bound. */
+const GUARDED_CHILD_WAIT_MS = 300_000;
+const GUARDED_RUN_TIMEOUT_MS = 900_000;
 const JOURNAL_SCHEMA = "storm.integration-journal/v1";
 const CANDIDATE = /^c1_[0-9a-f]{64}$/u;
 const DIGEST = /^[0-9a-f]{64}$/u;
@@ -79,6 +112,7 @@ const ATTEMPT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 const SCALE = process.env.E2E_SCALE === "1";
 const HOST_READY = process.env.E2E_SCALE_HOST === "1";
+const GUARDED_READY = process.env.E2E_SCALE_GUARDED === "1";
 const REQUIRE_GATES = process.env.INTEGRATION_REQUIRE_GATES === "1";
 const SELF_CHECK_ONLY = process.argv.includes("--self-check") || (!SCALE && process.env.E2E_SCALE_SELFCHECK !== "0");
 
@@ -192,16 +226,27 @@ export interface Combo {
 	readonly n: ScaleN;
 	readonly work: string;
 	readonly port: number;
+	/** Guarded mode's private-profile cap; absent for the unchanged legacy profiles. Never read as an observation. */
+	readonly maxConcurrency?: number;
 }
-export function plannedCombos(root: string, portBase: number, modes: readonly Mode[] = MODES, ns: readonly ScaleN[] = NS): Combo[] {
+/**
+ * The legacy default stays exactly the six main/pool combos at 4, 8 and 16. Guarded combos are added only when that
+ * mode is asked for, and default to the fixed 16/32/64/100 fixture. An explicit `ns` filters every selected mode to
+ * its own supported sizes, so `E2E_SCALE_NS=16` never silently plans guarded 32/64/100.
+ */
+export function plannedCombos(root: string, portBase: number, modes: readonly Mode[] = LEGACY_MODES, ns?: readonly ScaleN[]): Combo[] {
+	const legacySizes = ns === undefined ? LEGACY_NS : ns.filter((value): value is LegacyN => LEGACY_NS.includes(value as LegacyN));
+	const guardedSizes = ns === undefined ? GUARDED_NS : ns.filter((value): value is GuardedN => GUARDED_NS.includes(value as GuardedN));
 	const combos: Combo[] = [];
 	for (const mode of modes) {
-		for (const n of ns) {
+		const sizes: readonly ScaleN[] = mode === "guarded" ? guardedSizes : legacySizes;
+		for (const n of sizes) {
 			combos.push({
 				mode,
 				n,
 				work: join(resolve(root), `${mode}-${n}`),
-				port: portBase + (mode === "pool" ? 100 : 0) + n,
+				port: portBase + (mode === "main" ? 0 : mode === "pool" ? 100 : 200) + n,
+				...(mode === "guarded" ? { maxConcurrency: n } : {}),
 			});
 		}
 	}
@@ -812,8 +857,10 @@ interface ShellMeasurement {
 	readonly cwds: readonly string[];
 	readonly intervals: readonly Interval[];
 	readonly overlap: OverlapResult;
+	/** Guarded mode's barrier evidence; absent for the unchanged legacy shell windows. */
+	readonly barrier?: BarrierResult;
 }
-function shellMeasurement(dir: string, lanes: readonly string[]): ShellMeasurement {
+function shellMeasurement(dir: string, lanes: readonly string[], barrier?: BarrierResult): ShellMeasurement {
 	const intervals: Interval[] = [];
 	const cwds: string[] = [];
 	const missing: string[] = [];
@@ -828,29 +875,60 @@ function shellMeasurement(dir: string, lanes: readonly string[]): ShellMeasureme
 		intervals.push({ key: lane, start, end });
 		if (cwd !== "") cwds.push(realOr(cwd));
 	}
-	return { lanes: intervals.map(interval => interval.key), missing, cwds, intervals, overlap: maxOverlap(intervals) };
+	return {
+		lanes: intervals.map(interval => interval.key),
+		missing,
+		cwds,
+		intervals,
+		overlap: maxOverlap(intervals),
+		...(barrier === undefined ? {} : { barrier }),
+	};
 }
 
 // ── e2e meter: actual home of each child ────────────────────────────────────────────────────────
 
-interface MeterAudit {
+/** One child's exact observed home: the one thread whose live Storm hook logged that child id. */
+export interface MeterHome {
+	readonly thread: string;
+	readonly pid: number;
+	readonly threadId: number;
+	readonly main: boolean;
+	readonly events: number;
+	readonly firstAt: number;
+	readonly lastAt: number;
+}
+/** The children whose unique home is one thread, for the recorded distribution. */
+export interface MeterDistribution {
+	readonly thread: string;
+	readonly pid: number;
+	readonly threadId: number;
+	readonly main: boolean;
+	readonly children: readonly string[];
+}
+export interface MeterAudit {
 	readonly present: boolean;
 	readonly threads: Readonly<Record<string, "main" | "pooled">>;
 	readonly children: Readonly<Record<string, readonly string[]>>;
 	readonly mainChildren: readonly string[];
 	readonly pooledChildren: readonly string[];
 	readonly unknownChildren: readonly string[];
+	/** Exactly one known thread per child; a child seen on more than one thread is only in `multiThread`. */
+	readonly homes: Readonly<Record<string, MeterHome>>;
+	readonly multiThread: readonly string[];
+	readonly distribution: readonly MeterDistribution[];
 }
 function meterAudit(dir: string, childIds: readonly string[]): MeterAudit {
 	const threads: Record<string, "main" | "pooled"> = {};
+	const boot: Record<string, { pid: number; threadId: number; main: boolean }> = {};
 	for (const name of readdirIf(dir)) {
 		if (!name.startsWith("boot-") || !name.endsWith(".json")) continue;
 		const value = readJson(join(dir, name));
 		if (!isObject(value) || typeof value.pid !== "number" || typeof value.threadId !== "number") continue;
-		threads[`${value.pid}:${value.threadId}`] = value.main === true ? "main" : "pooled";
+		const thread = `${value.pid}:${value.threadId}`;
+		threads[thread] = value.main === true ? "main" : "pooled";
+		boot[thread] = { pid: value.pid, threadId: value.threadId, main: value.main === true };
 	}
-	const children: Record<string, Set<string>> = {};
-	const present = Object.keys(threads).length > 0;
+	const seen = new Map<string, Map<string, { events: number; firstAt: number; lastAt: number }>>();
 	for (const name of readdirIf(dir)) {
 		if (!name.startsWith("hooks-") || !name.endsWith(".jsonl")) continue;
 		const match = /^hooks-(\d+)-(\d+)-/u.exec(name);
@@ -866,31 +944,115 @@ function meterAudit(dir: string, childIds: readonly string[]): MeterAudit {
 			}
 			if (!isObject(value) || typeof value.a !== "string" || value.a === "") continue;
 			if (!childIds.includes(value.a)) continue;
-			(children[value.a] ??= new Set()).add(thread);
+			const at = typeof value.t === "number" && Number.isFinite(value.t) ? value.t : 0;
+			const child = seen.get(value.a) ?? new Map<string, { events: number; firstAt: number; lastAt: number }>();
+			const stat = child.get(thread) ?? { events: 0, firstAt: at, lastAt: at };
+			stat.events++;
+			if (at > 0 && (stat.firstAt === 0 || at < stat.firstAt)) stat.firstAt = at;
+			if (at > stat.lastAt) stat.lastAt = at;
+			child.set(thread, stat);
+			seen.set(value.a, child);
 		}
 	}
 	const result: Record<string, string[]> = {};
+	const homes: Record<string, MeterHome> = {};
 	const mainChildren: string[] = [];
 	const pooledChildren: string[] = [];
 	const unknownChildren: string[] = [];
+	const multiThread: string[] = [];
 	for (const id of childIds) {
-		const set = children[id];
-		if (set === undefined || set.size === 0) {
+		const stat = seen.get(id);
+		if (stat === undefined || stat.size === 0) {
 			unknownChildren.push(id);
 			continue;
 		}
-		const list = [...set].sort();
+		const list = [...stat.keys()].sort();
 		result[id] = list;
 		for (const thread of list) {
 			if (threads[thread] === "pooled" && !pooledChildren.includes(id)) pooledChildren.push(id);
 			if (threads[thread] === "main" && !mainChildren.includes(id)) mainChildren.push(id);
 		}
+		if (list.length !== 1) {
+			multiThread.push(id);
+			continue;
+		}
+		const thread = list[0]!;
+		const known = boot[thread];
+		const observed = stat.get(thread);
+		if (known === undefined || observed === undefined) continue;
+		homes[id] = { thread, ...known, ...observed };
 	}
-	return { present, threads, children: result, mainChildren, pooledChildren, unknownChildren };
+	const byThread = new Map<string, string[]>();
+	for (const [id, home] of Object.entries(homes)) byThread.set(home.thread, [...(byThread.get(home.thread) ?? []), id]);
+	const distribution = [...byThread.entries()]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([thread, children]) => {
+			const home = boot[thread]!;
+			return { thread, ...home, children: [...children].sort() };
+		});
+	return {
+		present: Object.keys(threads).length > 0,
+		threads,
+		children: result,
+		mainChildren,
+		pooledChildren,
+		unknownChildren,
+		homes,
+		multiThread,
+		distribution,
+	};
+}
+/**
+ * The guarded mode's positive home test: every expected child has exactly one known live home, the recorded main and
+ * pooled lists/distribution cover all N exactly, and pooled is nonzero. Native placement intentionally starts the
+ * first workers on main (eight main + eight off-main at N=16), so it never asserts main==0 or pooled==N. Unknown,
+ * multi-home, or under/over-counted children fail.
+ */
+export function homeAuditProblems(meter: MeterAudit, expected: number, workerThreads: number): string[] {
+	const problems: string[] = [];
+	if (!meter.present) problems.push("no meter thread boot record");
+	const observed = Object.keys(meter.children).length;
+	if (observed !== expected) problems.push(`meter saw ${observed} children, expected ${expected}`);
+	if (meter.unknownChildren.length > 0) problems.push(`children without a live Storm hook: ${meter.unknownChildren.join(",")}`);
+	if (meter.multiThread.length > 0) problems.push(`children observed on more than one thread: ${meter.multiThread.join(",")}`);
+	const homes = Object.values(meter.homes);
+	if (homes.length !== expected) problems.push(`exact homes ${homes.length} != ${expected}`);
+	const mainCount = meter.mainChildren.length;
+	const pooledCount = meter.pooledChildren.length;
+	if (mainCount + pooledCount !== expected) problems.push(`main+pooled homes ${mainCount}+${pooledCount} != ${expected}`);
+	if (pooledCount === 0) problems.push("no pooled home (pooled is zero)");
+	const homeMain = homes.filter(home => home.main).length;
+	const homePooled = homes.length - homeMain;
+	if (homeMain !== mainCount) problems.push(`main home count ${homeMain} != observed main ${mainCount}`);
+	if (homePooled !== pooledCount) problems.push(`pooled home count ${homePooled} != observed pooled ${pooledCount}`);
+	const pooledThreads = new Set(homes.filter(home => !home.main).map(home => home.thread));
+	if (pooledThreads.size > workerThreads) problems.push(`pooled home threads ${pooledThreads.size} > task.workerThreads ${workerThreads}`);
+	const distributionMain = meter.distribution.filter(part => part.main).reduce((sum, part) => sum + part.children.length, 0);
+	const distributionPooled = meter.distribution.filter(part => !part.main).reduce((sum, part) => sum + part.children.length, 0);
+	const distributed = meter.distribution.reduce((sum, part) => sum + part.children.length, 0);
+	if (distributed !== expected) problems.push(`distribution covers ${distributed} children, not ${expected}`);
+	if (distributionMain !== homeMain || distributionPooled !== homePooled) {
+		problems.push(`distribution ${distributionMain} main + ${distributionPooled} pooled != homes ${homeMain} main + ${homePooled} pooled`);
+	}
+	const distributedIds = meter.distribution.flatMap(part => part.children);
+	if (new Set(distributedIds).size !== distributedIds.length) problems.push("a child appears twice in the distribution");
+	return problems;
 }
 
-// ── live observation while the run is open ─────────────────────────────────────────────────────
+// ── live observation and the guarded tool-effect barrier while the run is open ──────────────────
 
+export interface BarrierSpec {
+	readonly dir: string;
+	readonly lanes: readonly string[];
+	readonly timeoutMs: number;
+}
+export interface BarrierResult {
+	readonly arrived: readonly string[];
+	readonly missing: readonly string[];
+	readonly releasedAt?: number;
+	readonly timedOut: boolean;
+	readonly waitedMs: number;
+}
 function snapshotLive(env: E2eEnv, checkouts: Map<string, LiveCheckout>): void {
 	const now = Date.now();
 	const admissionsDir = join(env.agentDir, "storm", "admissions");
@@ -912,18 +1074,43 @@ function snapshotLive(env: E2eEnv, checkouts: Map<string, LiveCheckout>): void {
 		if (identity !== undefined) checkouts.set(identity.path, identity);
 	}
 }
-/** Poll the durable claims while the run is open, so a checkout reclaimed at session close still has a live inode. */
-async function observeDuring(turn: Promise<unknown>, env: E2eEnv, maxMs: number): Promise<LiveObservation> {
+/**
+ * Poll the durable claims while the run is open, so a checkout reclaimed at session close still has a live inode.
+ * In guarded mode also wait for every child's physical shell arrival, then write the one release file. The release is
+ * bounded: a missing lane is released too, so its absence becomes a failed gate rather than a hung run.
+ */
+async function observeDuring(turn: Promise<unknown>, env: E2eEnv, maxMs: number, barrier?: BarrierSpec): Promise<LiveObservation & { barrier?: BarrierResult }> {
 	const checkouts = new Map<string, LiveCheckout>();
 	let done = false;
 	void turn.then(() => { done = true; }, () => { done = true; });
 	const deadline = Date.now() + maxMs;
+	const startedAt = Date.now();
+	const barrierDeadline = barrier === undefined ? 0 : startedAt + barrier.timeoutMs;
+	let result: BarrierResult | undefined;
+	const release = (): void => {
+		if (barrier === undefined || result !== undefined) return;
+		const arrived = barrier.lanes.filter(lane => existsSync(join(barrier.dir, `arrived-${lane}`)));
+		const at = Date.now();
+		writeFileSync(join(barrier.dir, "release"), `${at}\n`);
+		result = {
+			arrived,
+			missing: barrier.lanes.filter(lane => !arrived.includes(lane)),
+			releasedAt: at,
+			timedOut: arrived.length !== barrier.lanes.length,
+			waitedMs: at - startedAt,
+		};
+	};
 	while (!done && Date.now() < deadline) {
 		snapshotLive(env, checkouts);
+		if (barrier !== undefined && result === undefined) {
+			const arrived = barrier.lanes.filter(lane => existsSync(join(barrier.dir, `arrived-${lane}`)));
+			if (arrived.length === barrier.lanes.length || Date.now() >= barrierDeadline) release();
+		}
 		await Bun.sleep(100);
 	}
 	snapshotLive(env, checkouts);
-	return { checkouts };
+	release();
+	return { checkouts, ...(result === undefined ? {} : { barrier: result }) };
 }
 
 // ── scenario ──────────────────────────────────────────────────────────────────────────────────
@@ -931,14 +1118,26 @@ async function observeDuring(turn: Promise<unknown>, env: E2eEnv, maxMs: number)
 function nowMsCommand(): string {
 	return `perl -MTime::HiRes=time -e 'printf("%d\\n", time*1000)'`;
 }
-function probeCommand(markerDir: string, lane: string, file: string, literal: string): string {
-	return [
-		`pwd -P > ${shq(join(markerDir, `cwd-${lane}`))}`,
+interface ProbeOptions {
+	readonly holdMs: number;
+	/** Guarded mode: write arrival, wait for the harness release, then measure the real shell window. */
+	readonly barrier?: { readonly dir: string; readonly lane: string };
+}
+function probeCommand(markerDir: string, lane: string, file: string, literal: string, options: ProbeOptions): string {
+	const lines = [`pwd -P > ${shq(join(markerDir, `cwd-${lane}`))}`];
+	if (options.barrier !== undefined) {
+		const release = join(options.barrier.dir, "release");
+		const iterations = Math.ceil(GUARDED_CHILD_WAIT_MS / 100);
+		lines.push(`${nowMsCommand()} > ${shq(join(markerDir, `arrived-${lane}`))}`);
+		lines.push(`i=0; while [ ! -e ${shq(release)} ] && [ "$i" -lt ${iterations} ]; do sleep 0.1; i=$((i+1)); done`);
+	}
+	lines.push(
 		`${nowMsCommand()} > ${shq(join(markerDir, `start-${lane}`))}`,
-		`sleep ${SHELL_HOLD_MS / 1000}`,
+		`sleep ${options.holdMs / 1000}`,
 		`printf '%s\\n' ${shq(literal)} > ${shq(file)}`,
 		`${nowMsCommand()} > ${shq(join(markerDir, `end-${lane}`))}`,
-	].join("; ");
+	);
+	return lines.join("; ");
 }
 function frameText(frame: Frame): string {
 	if (!isObject(frame.result) || !("content" in frame.result)) return "";
@@ -979,6 +1178,8 @@ interface ScaleFacts {
 	readonly host: string;
 	readonly profile: IsolationProfile;
 	readonly configured: Readonly<Record<string, unknown>>;
+	readonly maxConcurrency?: number;
+	readonly barrier?: BarrierResult;
 	readonly runId?: string;
 	readonly planWorkers?: number;
 	readonly admitted?: number;
@@ -1010,6 +1211,18 @@ async function scenario(
 ): Promise<void> {
 	const check = suite.check.bind(suite);
 	const n = combo.n;
+	const guarded = combo.mode === "guarded";
+	const providerHoldMs = guarded ? GUARDED_PROVIDER_HOLD_MS : FIRST_DELAY_MS;
+	const shellHoldMs = guarded ? GUARDED_SHELL_HOLD_MS : SHELL_HOLD_MS;
+	const runTimeoutMs = guarded ? GUARDED_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS;
+	// The patched host's native schema declares task.workerThreads as the placement ceiling. Read the effective value
+	// back (never the profile literal) and feed it to the home audit; guarded also asserts the unchanged default 4.
+	const effectiveWorkerThreads = numberOf(setting(settings, "task.workerThreads")) ?? 0;
+	const barrierDir = guarded ? join(env.work, "barrier", `${combo.mode}-${n}`) : undefined;
+	if (barrierDir !== undefined) {
+		rmSync(barrierDir, { recursive: true, force: true });
+		mkdirSync(barrierDir, { recursive: true });
+	}
 	const lanes = Array.from({ length: n }, (_, index) => `scale-${combo.mode}-${n}-${index}`);
 	const laneFiles = new Map(lanes.map(lane => [lane, `${lane}.txt`] as const));
 	const markerDir = join(env.work, "markers", `${combo.mode}-${n}`);
@@ -1041,10 +1254,21 @@ async function scenario(
 		JSON.stringify({ backend: configured.backend, ovnfs: setting(settings, "ovnfs.path") }),
 	);
 	check(
-		combo.mode === "main" ? "the main-thread control reports task.workerThreads 0" : "the default pooled profile reports task.workerThreads 4",
+		combo.mode === "main"
+			? "the main-thread control reports task.workerThreads 0"
+			: combo.mode === "pool"
+				? "the default pooled profile reports task.workerThreads 4"
+				: "the guarded private profile leaves task.workerThreads at the effective default 4",
 		setting(settings, "task.workerThreads") === (combo.mode === "main" ? 0 : 4),
 		`workerThreads=${String(setting(settings, "task.workerThreads"))}`,
 	);
+	if (guarded) {
+		check(
+			"the guarded private profile raises only task.maxConcurrency to exactly N",
+			setting(settings, "task.maxConcurrency") === n && setting(settings, "task.workerThreads") === 4,
+			`maxConcurrency=${String(setting(settings, "task.maxConcurrency"))} workerThreads=${String(setting(settings, "task.workerThreads"))}`,
+		);
+	}
 	check("sync delivery is off, so the only carrier is the typed sync result", setting(settings, "async.enabled") === false, `async=${String(setting(settings, "async.enabled"))}`);
 	check(
 		"the model endpoint is the loopback fake and not a real provider",
@@ -1077,20 +1301,31 @@ async function scenario(
 					name: lane,
 					agent: "storm-implementer",
 					task: `Implement ${lane} independently E2E-SCALE-LANE:${lane}`,
-					say: `E2E-CHILD-DELAY ${FIRST_DELAY_MS} E2E-CHILD-SH ${Buffer.from(probeCommand(markerDir, lane, laneFiles.get(lane)!, `LANE-${index}`), "utf8").toString("base64")} E2E-CHILD-CLAIM ${lane}-done`,
+					say: `E2E-CHILD-DELAY ${providerHoldMs} E2E-CHILD-SH ${Buffer.from(
+						probeCommand(markerDir, lane, laneFiles.get(lane)!, `LANE-${index}`, {
+							holdMs: shellHoldMs,
+							...(barrierDir === undefined ? {} : { barrier: { dir: barrierDir, lane } }),
+						}),
+						"utf8",
+					).toString("base64")} E2E-CHILD-CLAIM ${lane}-done`,
 				})),
 			},
 			{ wait: true },
 		];
-		const turn = rpc.turn(runRequest(steps, 1), RUN_TIMEOUT_MS);
-		const live = await observeDuring(turn, env, RUN_TIMEOUT_MS);
+		const turn = rpc.turn(runRequest(steps, 1), runTimeoutMs);
+		const live = await observeDuring(
+			turn,
+			env,
+			runTimeoutMs,
+			barrierDir === undefined ? undefined : { dir: barrierDir, lanes, timeoutMs: GUARDED_BARRIER_TIMEOUT_MS },
+		);
 		await turn;
 		const run: RunRecord = await files.finishedRun(before, 240_000);
 		const afterParent = snapshotParent(env.project, [...laneFiles.values()]);
 		const admissionAudit = verifyAdmissions({ agentDir: env.agentDir, project: env.project }, run.runId, live);
 		const journal = verifyJournal(journalFileOf(files.sessionDir, run.runId), env.agentDir, run.runId, laneFiles, env.project);
-		const provider = providerMeasurement(llm.of("child"), lanes, FIRST_DELAY_MS);
-		const shell = shellMeasurement(markerDir, lanes);
+		const provider = providerMeasurement(llm.of("child"), lanes, providerHoldMs);
+		const shell = shellMeasurement(markerDir, lanes, live.barrier);
 		const meter = meterAudit(join(env.work, "meter"), admissionAudit.lanes.map(lane => lane.childId));
 		const parentIssue = parentProblems(beforeParent, afterParent);
 		const resultIssue = resultProblems(run.results, lanes);
@@ -1131,7 +1366,7 @@ async function scenario(
 			`admission=${JSON.stringify(admissionAudit.stops.map(lane => [lane.lane, lane.stopReason, lane.stopAt]))} spawn=${JSON.stringify(spawnStops.map(spawn => [spawn.lane, spawn.stop?.reason, spawn.stop?.at]))}`,
 		);
 		const terminalLanes = admissionAudit.lanes.filter(lane => lane.state === "terminal");
-		const expectedRunning = admissionAudit.stopped === 0 ? n : admissionAudit.terminal;
+		const expectedRunning = guarded ? n : admissionAudit.stopped === 0 ? n : admissionAudit.terminal;
 		check(
 			"each terminal worker has a durable entry claim and a worker admission claim",
 			terminalLanes.length === admissionAudit.terminal && terminalLanes.every(lane => lane.integrationClaim !== undefined && lane.workerClaim !== undefined),
@@ -1179,23 +1414,85 @@ async function scenario(
 			claimedCheckouts.length === expectedRunning && shell.cwds.length === expectedRunning && shell.cwds.every(cwd => claimedCheckouts.includes(cwd)),
 			`claims=${JSON.stringify(claimedCheckouts)} shell=${JSON.stringify(shell.cwds)}`,
 		);
+		const barrierOk =
+			!guarded ||
+			(shell.barrier !== undefined && !shell.barrier.timedOut && shell.barrier.missing.length === 0 &&
+				shell.barrier.arrived.length === n && shell.barrier.releasedAt !== undefined);
 		check(
 			"the observed provider requests hold the running workers as simultaneous intervals on the offline endpoint",
 			provider.overlap.max === expectedRunning && provider.lanes.length === expectedRunning && provider.missing.length === n - expectedRunning &&
-				provider.ambiguous.length === 0 && (expectedRunning < 2 || provider.spread <= FIRST_DELAY_MS),
-			`max=${provider.overlap.max} expected=${expectedRunning} lanes=${provider.lanes.length} spread=${provider.spread} hold=${FIRST_DELAY_MS} missing=${JSON.stringify(provider.missing)} ambiguous=${JSON.stringify(provider.ambiguous)} starts=${JSON.stringify(provider.intervals.map(interval => interval.start - (provider.intervals[0]?.start ?? 0)))}`,
+				provider.ambiguous.length === 0 && (expectedRunning < 2 || (guarded ? provider.spread < providerHoldMs : provider.spread <= FIRST_DELAY_MS)),
+			`max=${provider.overlap.max} expected=${expectedRunning} lanes=${provider.lanes.length} spread=${provider.spread} hold=${providerHoldMs} missing=${JSON.stringify(provider.missing)} ambiguous=${JSON.stringify(provider.ambiguous)} starts=${JSON.stringify(provider.intervals.map(interval => interval.start - (provider.intervals[0]?.start ?? 0)))}`,
 		);
 		check(
 			"the observed shell windows physically overlap the running workers in distinct checkouts",
 			shell.overlap.max === expectedRunning && shell.lanes.length === expectedRunning && shell.missing.length === n - expectedRunning &&
-				new Set(shell.cwds).size === expectedRunning && shell.cwds.every(cwd => outside(cwd, env.project)),
-			`max=${shell.overlap.max} expected=${expectedRunning} missing=${JSON.stringify(shell.missing)} cwds=${shell.cwds.length} distinct=${new Set(shell.cwds).size}`,
+				new Set(shell.cwds).size === expectedRunning && shell.cwds.every(cwd => outside(cwd, env.project)) && barrierOk,
+			`max=${shell.overlap.max} expected=${expectedRunning} missing=${JSON.stringify(shell.missing)} cwds=${shell.cwds.length} distinct=${new Set(shell.cwds).size} barrier=${JSON.stringify(shell.barrier)}`,
 		);
 		check(
 			"the meter observed every child in a live Storm hook on a known thread",
 			meter.present && meter.unknownChildren.length === 0,
 			`present=${meter.present} main=${meter.mainChildren.length} pooled=${meter.pooledChildren.length} unknown=${JSON.stringify(meter.unknownChildren)}`,
 		);
+		if (guarded) {
+			const homeProblems = homeAuditProblems(meter, n, effectiveWorkerThreads);
+			const manifestLanes = new Set(journal.manifests.map(manifest => manifest.lane));
+			const providerLanes = new Set(provider.lanes);
+			const shellLanes = new Set(shell.lanes);
+			const objectKeys = journal.manifests.flatMap(manifest => manifest.objectKeys);
+			check(
+				"guarded: no stop, withdrawal or unknown admission; all N workers are terminal",
+				admissionAudit.terminal === n && admissionAudit.stopped === 0 && admissionAudit.withdrawn === 0 && admissionAudit.unknown === 0 &&
+					spawnStops.length === 0,
+				`terminal=${admissionAudit.terminal} stopped=${admissionAudit.stopped} withdrawn=${admissionAudit.withdrawn} unknown=${admissionAudit.unknown} spawnStops=${spawnStops.length}`,
+			);
+			check(
+				"guarded: N durable worker claims and N private entry claims, each pair distinct",
+				admissionAudit.workerClaims === n && admissionAudit.integrationClaims === n &&
+					admissionAudit.workerInodes.total === n && admissionAudit.workerInodes.distinct === n && admissionAudit.workerInodes.duplicates.length === 0 &&
+					admissionAudit.inodes.total === n && admissionAudit.inodes.distinct === n && admissionAudit.inodes.duplicates.length === 0,
+				`worker=${admissionAudit.workerClaims}/${admissionAudit.workerInodes.total} entry=${admissionAudit.integrationClaims}/${admissionAudit.inodes.total} workerDistinct=${admissionAudit.workerInodes.distinct} entryDistinct=${admissionAudit.inodes.distinct}`,
+			);
+			check(
+				"guarded: every checkout inode is outside the parent and each lane keeps its own checkout",
+				admissionAudit.inodes.paths.every(path => path !== "" && outside(path, env.project)) &&
+					admissionAudit.workerInodes.paths.every(path => path !== "" && outside(path, env.project)) &&
+					lanes.every(lane => terminalLanes.find(entry => entry.lane === lane)?.integrationCheckout !== undefined),
+				`entryPaths=${JSON.stringify(admissionAudit.inodes.paths)} workerPaths=${JSON.stringify(admissionAudit.workerInodes.paths)}`,
+			);
+			check(
+				"guarded: N exact owned object manifests, one distinct object per lane",
+				journal.manifests.length === n && manifestLanes.size === n && objectKeys.length === n && new Set(objectKeys).size === n &&
+					journal.objects.refs === n && journal.objects.digests.length === n && journal.objects.problems.length === 0 &&
+					journal.manifests.every(manifest => manifest.problems.length === 0 && manifest.objectKeys.length === 1 && manifest.entries >= 1),
+				`manifests=${journal.manifests.length} lanes=${manifestLanes.size} refs=${journal.objects.refs} objects=${journal.objects.digests.length} problems=${journal.objects.problems.join("; ")}`,
+			);
+			check(
+				"guarded: each of the N lanes produced a provider request, a physical shell window and an owned manifest",
+				lanes.every(lane => providerLanes.has(lane) && shellLanes.has(lane) && manifestLanes.has(lane)),
+				`missingProvider=${JSON.stringify(lanes.filter(lane => !providerLanes.has(lane)))} missingShell=${JSON.stringify(lanes.filter(lane => !shellLanes.has(lane)))} missingManifest=${JSON.stringify(lanes.filter(lane => !manifestLanes.has(lane)))}`,
+			);
+			check(
+				"guarded: N unique actual homes, exact observed main+pooled distribution, pooled nonzero",
+				homeProblems.length === 0,
+				`${homeProblems.join("; ")}; main=${meter.mainChildren.length} pooled=${meter.pooledChildren.length} homes=${JSON.stringify(meter.homes)} distribution=${JSON.stringify(meter.distribution)}`,
+			);
+			check(
+				"guarded: all N shells arrived at the file barrier before the one release, then overlapped in N distinct checkouts",
+				shell.barrier !== undefined && !shell.barrier.timedOut && shell.barrier.arrived.length === n && shell.barrier.missing.length === 0 &&
+					shell.barrier.releasedAt !== undefined && shell.intervals.length === n &&
+					shell.intervals.every(interval => interval.start >= (shell.barrier?.releasedAt ?? Number.POSITIVE_INFINITY)),
+				`barrier=${JSON.stringify(shell.barrier)} starts=${JSON.stringify(shell.intervals.map(interval => interval.start - (shell.barrier?.releasedAt ?? 0)))}`,
+			);
+			check(
+				"guarded: N provider and N shell overlap are observed, not inferred from the configured concurrency",
+				provider.overlap.max === n && provider.lanes.length === n && provider.missing.length === 0 && provider.ambiguous.length === 0 &&
+					shell.overlap.max === n && shell.lanes.length === n && shell.missing.length === 0 &&
+					configured.taskMaxConcurrency === n && configured.taskWorkerThreads === 4,
+				`provider=${provider.overlap.max}/${n} shell=${shell.overlap.max}/${n} configured=${JSON.stringify({ maxConcurrency: configured.taskMaxConcurrency, workerThreads: configured.taskWorkerThreads })}`,
+			);
+		}
 		if (combo.mode === "main") {
 			check(
 				"the main-thread control has N terminal admissions, N worker claims and no stop",
@@ -1244,6 +1541,8 @@ async function scenario(
 			host: process.platform,
 			profile,
 			configured,
+			...(combo.maxConcurrency === undefined ? {} : { maxConcurrency: combo.maxConcurrency }),
+			...(shell.barrier === undefined ? {} : { barrier: shell.barrier }),
 			runId: run.runId,
 			...(planWorkers === undefined ? {} : { planWorkers }),
 			admitted: admissionAudit.admitted,
@@ -1285,6 +1584,7 @@ async function runCombo(combo: Combo, root: string, portBase: number): Promise<n
 		backend: nativeBackend(),
 		async: false,
 		...(combo.mode === "main" ? { workerThreads: 0 } : {}),
+		...(combo.mode === "guarded" ? { maxConcurrency: combo.n } : {}),
 	};
 	const facts: { current: ScaleFacts } = {
 		current: {
@@ -1320,7 +1620,11 @@ async function runCombo(combo: Combo, root: string, portBase: number): Promise<n
 			{ always: true },
 		);
 		if (!approved) throw new Error("the team was not approved; the scale scenario cannot place workers");
-		await suite.step(`scale ${combo.mode} N=${combo.n}: ${combo.n} isolated implementers`, () => scenario(env, combo, suite, settings, profile, sessions, facts), RUN_TIMEOUT_MS + 120_000);
+		await suite.step(
+			`scale ${combo.mode} N=${combo.n}: ${combo.n} isolated implementers`,
+			() => scenario(env, combo, suite, settings, profile, sessions, facts),
+			(combo.mode === "guarded" ? GUARDED_RUN_TIMEOUT_MS : RUN_TIMEOUT_MS) + 120_000,
+		);
 		await suite.step(
 			"omp exit codes",
 			async () => {
@@ -1352,7 +1656,11 @@ async function runCombo(combo: Combo, root: string, portBase: number): Promise<n
 			`admitted=${facts.current.admitted ?? "-"} terminal=${facts.current.terminal ?? "-"} stopped=${facts.current.stopped ?? "-"} ` +
 			`claims=${facts.current.workerClaims ?? "-"}/${facts.current.integrationClaims ?? "-"} inodes=${facts.current.distinctCheckoutInodes ?? "-"} ` +
 			`provider=${facts.current.providerChildren ?? "-"} overlap=${facts.current.providerOverlap ?? "-"}/${facts.current.shellOverlap ?? "-"} spread=${facts.current.providerSpreadMs ?? "-"} ` +
-			`manifests=${facts.current.manifests ?? "-"} objects=${facts.current.objectDigests?.length ?? "-"} work=${env.work}`,
+			`manifests=${facts.current.manifests ?? "-"} objects=${facts.current.objectDigests?.length ?? "-"} ` +
+			(combo.mode === "guarded"
+				? `homes=${JSON.stringify(facts.current.meter?.distribution ?? [])} barrier=${JSON.stringify(facts.current.barrier ?? null)} `
+				: "") +
+			`work=${env.work}`,
 	);
 	return code;
 }
@@ -1385,6 +1693,107 @@ function selfCheck(): number {
 		const combos = plannedCombos(join(root, "work"), 21940);
 		ok("exactly six mode/size combos are planned", combos.length === 6 && combos.map(combo => `${combo.mode}-${combo.n}`).join(",") === "main-4,main-8,main-16,pool-4,pool-8,pool-16", JSON.stringify(combos));
 		ok("work dirs and ports are unique per mode and size", new Set(combos.map(combo => combo.work)).size === 6 && new Set(combos.map(combo => combo.port)).size === 6);
+		const guardedCombos = plannedCombos(join(root, "work"), 21940, ["guarded"]);
+		ok(
+			"guarded mode plans exactly 16, 32, 64 and 100 with only maxConcurrency set",
+			guardedCombos.length === 4 && guardedCombos.map(combo => combo.n).join(",") === "16,32,64,100" &&
+				guardedCombos.every(combo => combo.maxConcurrency === combo.n) &&
+				new Set([...combos, ...guardedCombos].map(combo => `${combo.work}`)).size === 10 &&
+				new Set([...combos, ...guardedCombos].map(combo => combo.port)).size === 10,
+			JSON.stringify(guardedCombos),
+		);
+		const guardedSixteen = plannedCombos(join(root, "work"), 21940, ["guarded"], [16]);
+		ok(
+			"E2E_SCALE_NS=16 runs only guarded 16, never 32/64/100",
+			guardedSixteen.length === 1 && guardedSixteen[0]?.mode === "guarded" && guardedSixteen[0]?.n === 16,
+			JSON.stringify(guardedSixteen),
+		);
+		const mixedSixteen = plannedCombos(join(root, "work"), 21940, ["main", "pool", "guarded"], [16]);
+		ok(
+			"E2E_SCALE_NS=16 keeps the selected legacy 16 gates and only guarded 16",
+			mixedSixteen.map(combo => `${combo.mode}-${combo.n}`).join(",") === "main-16,pool-16,guarded-16",
+			JSON.stringify(mixedSixteen),
+		);
+		ok(
+			"an explicit N filters legacy modes to the legacy sizes and preserves default modes",
+			plannedCombos(join(root, "work"), 21940, ["main", "pool"], [16]).map(combo => `${combo.mode}-${combo.n}`).join(",") === "main-16,pool-16" &&
+				plannedCombos(join(root, "work"), 21940).every(combo => combo.mode !== "guarded"),
+		);
+		const guardedProfileYaml = isolationProfileYaml({ enabled: true, apply: false, merge: "patch", backend: "apfs", async: false, maxConcurrency: 100 });
+		ok(
+			"the guarded profile sets maxConcurrency and leaves workerThreads unset",
+			guardedProfileYaml.includes("  maxConcurrency: 100") && !guardedProfileYaml.includes("workerThreads"),
+			guardedProfileYaml.replaceAll("\n", " | "),
+		);
+		ok(
+			"the legacy profile still writes the main-thread control",
+			isolationProfileYaml({ enabled: true, apply: false, merge: "patch", backend: "apfs", async: false, workerThreads: 0 }).includes("  workerThreads: 0"),
+		);
+		const hundred = Array.from({ length: 100 }, (_, index) => ({ key: `lane-${index}`, start: index * 100, end: index * 100 + 60_000 }));
+		ok("100 provider requests inside the bounded window measure 100", maxOverlap(hundred).max === 100, `max=${maxOverlap(hundred).max}`);
+		ok("a start at the hold boundary no longer overlaps the first request", maxOverlap([{ key: "a", start: 0, end: 60_000 }, { key: "b", start: 60_000, end: 120_000 }]).max === 1);
+		const guardedMarkers = join(root, "barrier");
+		mkdirSync(guardedMarkers, { recursive: true });
+		const barrierCommand = probeCommand(guardedMarkers, "lane-0", "lane-0.txt", "LANE-0", { holdMs: 15_000, barrier: { dir: guardedMarkers, lane: "lane-0" } });
+		ok(
+			"the guarded shell writes arrival, waits for release, then measures and writes the effect",
+			barrierCommand.includes("arrived-lane-0") && barrierCommand.includes("release") && barrierCommand.includes("start-lane-0") &&
+				barrierCommand.includes("sleep 15") && barrierCommand.includes("LANE-0") && barrierCommand.includes("end-lane-0"),
+			barrierCommand,
+		);
+		ok(
+			"the legacy shell has no barrier wait",
+			!probeCommand(guardedMarkers, "lane-0", "lane-0.txt", "LANE-0", { holdMs: 5_000 }).includes("release"),
+		);
+		const meterDir = join(root, "meter");
+		mkdirSync(meterDir, { recursive: true });
+		writeFileSync(join(meterDir, "boot-1-0-aaaa.json"), JSON.stringify({ pid: 1, threadId: 0, main: true }));
+		writeFileSync(join(meterDir, "boot-1-1-bbbb.json"), JSON.stringify({ pid: 1, threadId: 1, main: false }));
+		writeFileSync(join(meterDir, "boot-1-2-cccc.json"), JSON.stringify({ pid: 1, threadId: 2, main: false }));
+		const hookLine = (a: string, t: number): string => `${JSON.stringify({ t, ms: 1, e: "subagent_entry", k: "sub", a, x: "", s: "", f: 0 })}\n`;
+		writeFileSync(join(meterDir, "hooks-1-0-aaaa.jsonl"), hookLine("main-child", 10));
+		writeFileSync(join(meterDir, "hooks-1-1-bbbb.jsonl"), `${hookLine("pool-a", 20)}${hookLine("pool-b", 30)}${hookLine("split-child", 40)}`);
+		writeFileSync(join(meterDir, "hooks-1-2-cccc.jsonl"), `${hookLine("pool-c", 50)}${hookLine("split-child", 60)}`);
+		const poolMeter = meterAudit(meterDir, ["pool-a", "pool-b"]);
+		ok(
+			"a pooled-only distribution passes: main is not asserted nonzero",
+			homeAuditProblems(poolMeter, 2, 4).length === 0 && poolMeter.mainChildren.length === 0 && poolMeter.pooledChildren.length === 2 &&
+				poolMeter.distribution.length === 1 && poolMeter.distribution[0]?.children.length === 2,
+			JSON.stringify(poolMeter),
+		);
+		const mixedMeter = meterAudit(meterDir, ["main-child", "pool-a"]);
+		ok(
+			"exact main+pooled homes and distribution pass together",
+			homeAuditProblems(mixedMeter, 2, 4).length === 0 && mixedMeter.mainChildren.length === 1 && mixedMeter.pooledChildren.length === 1 &&
+				mixedMeter.distribution.length === 2 && mixedMeter.distribution.some(part => part.main) && mixedMeter.distribution.some(part => !part.main),
+			JSON.stringify(mixedMeter),
+		);
+		const mainMeter = meterAudit(meterDir, ["main-child"]);
+		const mainOnlyProblems = homeAuditProblems(mainMeter, 1, 4);
+		ok(
+			"a main home is allowed; only the zero pooled count fails it",
+			mainOnlyProblems.some(problem => problem.includes("pooled")) && !mainOnlyProblems.some(problem => problem.includes("main thread")),
+			JSON.stringify(mainOnlyProblems),
+		);
+		const nativeMain = Array.from({ length: 8 }, (_, index) => `native-main-${index}`);
+		const nativePool = Array.from({ length: 8 }, (_, index) => `native-pool-${index}`);
+		writeFileSync(join(meterDir, "hooks-1-0-aaaa.jsonl"), [hookLine("main-child", 10), ...nativeMain.map((id, index) => hookLine(id, 100 + index))].join(""));
+		writeFileSync(join(meterDir, "hooks-1-1-bbbb.jsonl"), [...[hookLine("pool-a", 20), hookLine("pool-b", 30), hookLine("split-child", 40)], ...nativePool.map((id, index) => hookLine(id, 200 + index))].join(""));
+		const nativeMeter = meterAudit(meterDir, [...nativeMain, ...nativePool]);
+		const nativeProblems = homeAuditProblems(nativeMeter, 16, 4);
+		ok(
+			"the observed N16 shape of eight main + eight pooled homes is a positive",
+			nativeProblems.length === 0 && nativeMeter.mainChildren.length === 8 && nativeMeter.pooledChildren.length === 8 &&
+				nativeMeter.distribution.reduce((sum, part) => sum + part.children.length, 0) === 16,
+			`${nativeProblems.join("; ")}; main=${nativeMeter.mainChildren.length} pooled=${nativeMeter.pooledChildren.length}`,
+		);
+		const unknownMeter = meterAudit(meterDir, ["missing-child"]);
+		ok("an unknown home is rejected", homeAuditProblems(unknownMeter, 1, 4).some(problem => problem.includes("without a live Storm hook")), JSON.stringify(unknownMeter));
+		const splitMeter = meterAudit(meterDir, ["split-child"]);
+		ok("a child observed on more than one thread is not a home", homeAuditProblems(splitMeter, 1, 4).some(problem => problem.includes("more than one thread")), JSON.stringify(splitMeter));
+		ok("a total below N is rejected even when every observed home is exact", homeAuditProblems(poolMeter, 3, 4).some(problem => problem.includes("exact homes 2 != 3")), JSON.stringify(homeAuditProblems(poolMeter, 3, 4)));
+		const tooManyThreads = meterAudit(meterDir, ["pool-a", "pool-b", "pool-c"]);
+		ok("the home check bounds pooled threads by task.workerThreads", homeAuditProblems(tooManyThreads, 3, 1).some(problem => problem.includes("task.workerThreads")), JSON.stringify(tooManyThreads));
 		const prefixRequests = [
 			{ who: "child", ts: 0, lastUser: "assignment E2E-SCALE-LANE:scale-main-16-1 (e2e child 1)" },
 			{ who: "child", ts: 10, lastUser: "assignment E2E-SCALE-LANE:scale-main-16-10 (e2e child 10)" },
@@ -1562,44 +1971,73 @@ function selfCheck(): number {
 
 // ── gates and main ────────────────────────────────────────────────────────────────────────────
 
-function printGates(real: boolean, passed: Readonly<Record<string, "PASS" | "FAIL" | "NOT-RUN">>, noRunLine = true): void {
+function printGates(real: boolean, passed: Readonly<Record<string, "PASS" | "FAIL" | "NOT-RUN">>, noRunLine = true, ns?: readonly ScaleN[]): void {
 	if (real) {
 		console.log("GATE scale-host-seam: CHECKED-BY-RUN — each scale gate requires observed claims, captures and exact policy checks.");
 	} else {
 		console.log("GATE scale-host-seam: NOT-RUN — real scale measurement requires OMP_BIN with the guarded native slot and child-entry capability.");
 	}
-	for (const combo of plannedCombos(process.env.E2E_SCALE_WORK_ROOT ?? join(tmpdir(), "storm-e2e-scale"), Number(process.env.E2E_SCALE_PORT_BASE ?? 21940))) {
+	const workRoot = process.env.E2E_SCALE_WORK_ROOT ?? join(tmpdir(), "storm-e2e-scale");
+	const portBase = Number(process.env.E2E_SCALE_PORT_BASE ?? 21940);
+	for (const combo of plannedCombos(workRoot, portBase, LEGACY_MODES, ns)) {
 		const id = `scale-${combo.mode}-${combo.n}`;
 		const state = passed[id] ?? "NOT-RUN";
 		console.log(`GATE ${id}: ${state} — ${state === "PASS" ? `observed ${combo.mode === "main" ? "main-thread" : "default pooled"} N=${combo.n}` : `requires E2E_SCALE=1 E2E_SCALE_HOST=1 against a host with the exact slot fix; work ${combo.work}, port ${combo.port}`}`);
 	}
+	for (const combo of plannedCombos(workRoot, portBase, ["guarded"], ns)) {
+		const id = `scale-${combo.mode}-${combo.n}`;
+		const state = passed[id] ?? "NOT-RUN";
+		console.log(`GATE ${id}: ${state} — ${state === "PASS" ? `observed guarded N=${combo.n} with exact main+pooled homes` : `fixture only; requires a future guarded native host that proves exact main+pooled homes, with E2E_SCALE=1 E2E_SCALE_HOST=1 E2E_SCALE_GUARDED=1; work ${combo.work}, port ${combo.port}`}`);
+	}
+	if (!real) console.log("GATE scale-guarded-pool: NOT-RUN — no guarded native host is claimed at this commit; the fixture never reports a pass from configuration or a provider request alone.");
 	if (!real && noRunLine) console.log("GATE scale-real-host: NOT-RUN — no omp process was started; only the deterministic self-check above ran in this invocation.");
+}
+
+function selectedModes(): Mode[] {
+	const raw = process.env.E2E_SCALE_MODES;
+	if (raw !== undefined && raw.trim() !== "") return parseSelection(raw, MODES, "E2E_SCALE_MODES");
+	return GUARDED_READY ? [...LEGACY_MODES, "guarded"] : [...LEGACY_MODES];
+}
+
+function selectedNs(): ScaleN[] | undefined {
+	const raw = process.env.E2E_SCALE_NS;
+	return raw === undefined || raw.trim() === "" ? undefined : parseSelection(raw, ALL_NS, "E2E_SCALE_NS");
 }
 
 async function main(): Promise<void> {
 	const selfCheckCode = selfCheck();
 	const workRoot = process.env.E2E_SCALE_WORK_ROOT ?? join(tmpdir(), "storm-e2e-scale");
 	const portBase = Number(process.env.E2E_SCALE_PORT_BASE ?? 21940);
-	const modes = parseSelection(process.env.E2E_SCALE_MODES, MODES, "E2E_SCALE_MODES");
-	const ns = parseSelection(process.env.E2E_SCALE_NS, NS, "E2E_SCALE_NS");
+	const modes = selectedModes();
+	const ns = selectedNs();
 	if (selfCheckCode !== 0) {
-		printGates(false, {});
+		printGates(false, {}, true, ns);
 		process.exit(1);
 	}
 	if (SELF_CHECK_ONLY) {
-		printGates(false, {});
+		printGates(false, {}, true, ns);
 		process.exit(REQUIRE_GATES ? 2 : 0);
 	}
 	if (!SCALE) {
-		printGates(false, {});
+		printGates(false, {}, true, ns);
 		process.exit(REQUIRE_GATES ? 2 : 0);
 	}
 	if (!HOST_READY) {
 		console.log("GATE scale-real-host: BLOCKED — set E2E_SCALE_HOST=1 only with an OMP_BIN that has the guarded native slot and child-entry capability.");
-		printGates(false, {}, false);
+		printGates(false, {}, false, ns);
+		process.exit(2);
+	}
+	if (modes.includes("guarded") && !GUARDED_READY) {
+		console.log("GATE scale-guarded-pool: BLOCKED — guarded mode is a future-host fixture; set E2E_SCALE_GUARDED=1 only with an OMP_BIN that can prove safe guarded execution.");
+		printGates(false, {}, false, ns);
 		process.exit(2);
 	}
 	const combos = plannedCombos(workRoot, portBase, modes, ns);
+	if (combos.length === 0) {
+		console.log(`GATE scale-selection: BLOCKED — no selected mode supports E2E_SCALE_NS=${ns?.join(",") ?? "(default)"}.`);
+		printGates(false, {}, false, ns);
+		process.exit(2);
+	}
 	const gates: Record<string, "PASS" | "FAIL" | "NOT-RUN"> = {};
 	let failed = 0;
 	for (const combo of combos) {
@@ -1613,7 +2051,7 @@ async function main(): Promise<void> {
 			failed++;
 		}
 	}
-	printGates(true, gates);
+	printGates(true, gates, true, ns);
 	process.exit(failed === 0 ? 0 : 1);
 }
 

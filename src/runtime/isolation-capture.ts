@@ -34,6 +34,7 @@ import type {
 	CheckoutObservation,
 	EmittedBundle,
 	LateRecoveryObservation,
+	ManagedCaptureEnd,
 	NativeJobExecution,
 	NestedPartRef,
 	PartRef,
@@ -244,6 +245,7 @@ interface TrackedCapture {
 	readonly handle: string;
 	readonly toolCallId: string;
 	readonly itemIndex: number;
+	readonly requiresManagedEnd: boolean;
 	claim?: ChildEntryClaim;
 	claimProblem?: IntegrationProblem;
 	registry?: RegistryEvidence;
@@ -433,7 +435,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		return { tracked: this.#tracked.size, unmatched: Object.fromEntries(this.#unmatched) };
 	}
 
-	track(admission: FrozenIntegrationAdmission): IntegrationCheck {
+	track(admission: FrozenIntegrationAdmission, requireManagedEnd = false): IntegrationCheck {
 		const checked = validateFrozenAdmission(admission);
 		if (checked.kind === "unknown") return { ok: false, problem: checked.problem };
 		const value = checked.value;
@@ -443,7 +445,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 		const candidateId = integrationCandidateId(value.key);
 		const existing = this.#tracked.get(candidateId);
 		if (existing !== undefined) {
-			if (canonicalJson(existing.admission) !== canonicalJson(value)) {
+			if (existing.requiresManagedEnd !== requireManagedEnd || canonicalJson(existing.admission) !== canonicalJson(value)) {
 				return { ok: false, problem: problem("capture-admission-conflict", "같은 후보 ID에 다른 승인이 있습니다") };
 			}
 			return { ok: true };
@@ -454,6 +456,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			handle: value.item.handle,
 			toolCallId: value.item.toolCallId,
 			itemIndex: value.item.itemIndex,
+			requiresManagedEnd: requireManagedEnd,
 			copyState: "none",
 			settlementPublished: false,
 			nativeEnded: false,
@@ -1091,6 +1094,40 @@ export class IsolationCapture implements IntegrationCapturePort {
 		else this.#schedule(tracked);
 	}
 
+	observeManagedEnd(end: ManagedCaptureEnd): boolean {
+		if (this.#stopped) return false;
+		const { workerTurn: turn, claim, capture, director } = end;
+		const tracked = this.#tracked.get(claim.candidateId);
+		if (!tracked?.requiresManagedEnd || tracked.abandoned) return false;
+		const { admission } = tracked;
+		const { childSessionFile } = claim.entry;
+		if (
+			turn.kind !== "first" || !EXECUTION_TOKEN.test(turn.token) || turn.token !== end.claimTurnToken ||
+			turn.runId !== admission.key.runId || turn.dispatchId !== admission.key.dispatch ||
+			turn.admissionKey !== admission.workerAdmission.key || turn.admissionAttempt !== admission.workerAdmission.attempt ||
+			turn.guard !== admission.policy.guardBuild || !sameDirector(admission.director, director) ||
+			turn.ownerSessionId !== director.sessionId || turn.ownerInstanceKey !== director.sessionInstance ||
+			turn.parentAgentId !== director.parentId || turn.agentId !== tracked.handle ||
+			turn.actorInstanceKey !== claim.entry.registryInstance || turn.generation !== claim.entry.generation ||
+			!Number.isSafeInteger(end.observedAt) || end.observedAt < claim.checkedAt || end.observedAt < admission.startedAt ||
+			!claimSessionMatches(claim.entry, capture.sessionFile) ||
+			capture.sessionFileIdentity.device !== childSessionFile.device || capture.sessionFileIdentity.inode !== childSessionFile.inode ||
+			absolutePath(capture.checkout.cwd) === undefined ||
+			capture.checkout.device !== claim.checkout.device || capture.checkout.inode !== claim.checkout.inode
+		) {
+			this.#bump("managed-end-unbound");
+			return false;
+		}
+		this.observeClaim(claim.entry, claim);
+		if (tracked.claim === undefined || tracked.claimProblem !== undefined) return false;
+		if (!tracked.nativeEnded) {
+			tracked.revision += 1;
+			this.#noteNativeEnded(tracked, true);
+			this.#schedule(tracked);
+		}
+		return true;
+	}
+
 	/** E binds the existing attempt settlement for the exact planned dispatch; A never calls the evaluator itself. */
 	noteSettlement(settlement: AttemptSettlement): void {
 		for (const tracked of this.#tracked.values()) {
@@ -1135,6 +1172,16 @@ export class IsolationCapture implements IntegrationCapturePort {
 	}
 
 	async #work(tracked: TrackedCapture): Promise<void> {
+		if (tracked.requiresManagedEnd && !tracked.nativeEnded) {
+			if (!tracked.deadlineReached) {
+				if (tracked.terminal !== undefined || tracked.sync !== undefined) this.#armDeadline(tracked);
+				return;
+			}
+			// Unproved end never permits reading a still-mutable native patch or releasing its slot.
+			tracked.copyState = "done";
+			await this.#maybeSeal(tracked);
+			return;
+		}
 		if (tracked.manifest !== undefined) {
 			await this.#lateObservation(tracked);
 			return;
@@ -1364,6 +1411,9 @@ export class IsolationCapture implements IntegrationCapturePort {
 	}
 
 	#bundle(tracked: TrackedCapture): EmittedBundle {
+		if (tracked.requiresManagedEnd && !tracked.nativeEnded) {
+			return { kind: "unknown", problem: problem("managed-end-unproved", "아직 이 워커 실행의 도구 종료를 확인하지 못했습니다") };
+		}
 		const terminal = tracked.terminal;
 		if (tracked.terminalProblem !== undefined) return { kind: "unknown", problem: tracked.terminalProblem };
 		if (terminal === undefined) {
@@ -1766,8 +1816,8 @@ export class IsolationCapture implements IntegrationCapturePort {
 	}
 
 	/** Deliver a proved native effect end to E once; a callback failure never rewrites capture evidence or retries. */
-	#noteNativeEnded(tracked: TrackedCapture): void {
-		if (tracked.nativeEnded) return;
+	#noteNativeEnded(tracked: TrackedCapture, managedProof = false): void {
+		if (tracked.nativeEnded || (tracked.requiresManagedEnd && !managedProof)) return;
 		tracked.nativeEnded = true;
 		const callback = this.#onNativeEnded;
 		if (callback === undefined) return;

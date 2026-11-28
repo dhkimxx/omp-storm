@@ -114,11 +114,40 @@ export interface AsyncObservationInput {
 	readonly observedAt: number;
 }
 
+/** A typed effect end emitted to the exact owner by the native managed worker router. */
+export interface ManagedCaptureEnd {
+	readonly director: DirectorIdentity;
+	readonly workerTurn: {
+		readonly kind: "first" | "wake";
+		readonly token: string;
+		readonly runId: string;
+		readonly admissionKey: string;
+		readonly admissionAttempt: string;
+		readonly dispatchId: string;
+		readonly guard: string;
+		readonly ownerSessionId: string;
+		readonly ownerInstanceKey: string;
+		readonly parentAgentId: string;
+		readonly agentId: string;
+		readonly actorInstanceKey: string;
+		readonly generation: number;
+	};
+	readonly capture: {
+		readonly sessionFile: string;
+		readonly sessionFileIdentity: { readonly device: string; readonly inode: string };
+		readonly checkout: { readonly cwd: string; readonly device: string; readonly inode: string };
+	};
+	readonly observedAt: number;
+	readonly claim: ChildEntryClaim;
+	/** Token read from the exact durable worker admission claim, not inferred from the callback alone. */
+	readonly claimTurnToken: string;
+}
+
 /** A implements; E attaches before dispatch, C receives durable updates or a fail-closed diagnostic. Never interprets
  * merge-summary as evidence, watches a mutable ref after the event, wakes a worker, repeats wait, or applies anything.
  * Unbound events get no candidate; missing facts are unknown, and copy/terminal can complete in either order. */
 export interface IntegrationCapturePort {
-	track(admission: FrozenIntegrationAdmission): IntegrationCheck;
+	track(admission: FrozenIntegrationAdmission, requireManagedEnd?: boolean): IntegrationCheck;
 	abandonBeforeDispatch(key: AdmissionKey): void;
 	/** Invoke in the registry listener stack, before any await; the adapter snapshots primitive data/part list here. */
 	observeRegistry(snapshot: RegistrySnapshotInput): void;
@@ -127,4 +156,5 @@ export interface IntegrationCapturePort {
 	observeAsync(input: AsyncObservationInput): void;
 	/** Called only for the matching first-execution admission, never from wake/arrival fallback. */
 	observeClaim(entry: ObservationIdentity, claim: ChildEntryClaim): void;
+	observeManagedEnd(end: ManagedCaptureEnd): boolean;
 }

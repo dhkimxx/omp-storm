@@ -523,6 +523,52 @@ describe("sync typed capture", () => {
 		expect(rig.updates.filter(update => update.kind === "sealed")).toHaveLength(1);
 	});
 
+	test("a managed sync result cannot release a slot or copy the patch before exact native effect end", async () => {
+		const f = await fixture();
+		let releases = 0;
+		const rig = captureRig(f, { onNativeEnded: () => { releases++; } });
+		const { admission } = await admissionFor(f);
+		const claim = claimFor(f, admission);
+		const path = await patch(f, "W1", "owned patch");
+		expect(rig.capture.track(admission, true).ok).toBe(true);
+		rig.capture.observeSync({
+			director: admission.director,
+			toolCallId: "call-1",
+			results: [syncResult({ handle: "W1", patchPath: path, hasRootChanges: true, nestedPatchPaths: [], nestedPatches: [] })],
+			observedAt: f.clock.now,
+		});
+		expect(await sealed(rig)).toEqual([]);
+		expect(releases).toBe(0);
+
+		const token = "587b5884-84cd-45de-a793-cd4b7968b96f";
+		const end = {
+			director: admission.director, observedAt: f.clock.now, claim, claimTurnToken: token,
+			workerTurn: {
+				kind: "first" as const, token, runId: admission.key.runId, dispatchId: admission.key.dispatch,
+				guard: admission.policy.guardBuild, admissionKey: admission.workerAdmission.key,
+				admissionAttempt: admission.workerAdmission.attempt, ownerSessionId: admission.director.sessionId,
+				ownerInstanceKey: admission.director.sessionInstance, parentAgentId: admission.director.parentId,
+				agentId: admission.item.handle, actorInstanceKey: claim.entry.registryInstance, generation: claim.entry.generation,
+			},
+			capture: {
+				sessionFile: claim.entry.childSessionFile.canonicalPath,
+				sessionFileIdentity: claim.entry.childSessionFile,
+				checkout: { cwd: claim.checkout.canonicalPath, device: claim.checkout.device, inode: claim.checkout.inode },
+			},
+		};
+		expect(rig.capture.observeManagedEnd({ ...end, claimTurnToken: "different-turn" })).toBe(false);
+		expect(rig.capture.observeManagedEnd({
+			...end, capture: { ...end.capture, checkout: { ...end.capture.checkout, inode: "wrong" } },
+		})).toBe(false);
+		expect(await sealed(rig)).toEqual([]);
+		expect(releases).toBe(0);
+		expect(rig.capture.observeManagedEnd(end)).toBe(true);
+		const [manifest] = await sealed(rig);
+		expect(manifest?.bundle.kind).toBe("root-only");
+		expect(rig.capture.observeManagedEnd(end)).toBe(true);
+		expect(releases).toBe(1);
+	});
+
 	test("explicit empty arrays and a zero-byte root are confirmed-empty, not absent", async () => {
 		const f = await fixture();
 		const rig = captureRig(f);

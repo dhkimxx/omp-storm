@@ -21,6 +21,12 @@ export interface IsolationProfile {
 	async: boolean;
 	/** `0` is the main-thread control; `undefined` leaves omp's pooled default (4 on 19.2.1). */
 	workerThreads?: number;
+	/**
+	 * Private-profile concurrency only; never used to claim a worker's thread or actual overlap. The patched host's
+	 * native schema is a plain number with no maximum, so a guarded run writes exactly N and reads the effective value
+	 * back instead of assuming a ceiling.
+	 */
+	maxConcurrency?: number;
 	/** For the failed-yield/cancelled structured scenarios. */
 	structured?: boolean;
 }
@@ -49,6 +55,7 @@ export function isolationProfileYaml(profile: IsolationProfile): string {
 		`    merge: ${profile.merge}`,
 	];
 	if (profile.workerThreads !== undefined) lines.push(`  workerThreads: ${profile.workerThreads}`);
+	if (profile.maxConcurrency !== undefined) lines.push(`  maxConcurrency: ${profile.maxConcurrency}`);
 	if (profile.structured !== undefined) lines.push(`  structured: ${profile.structured}`);
 	lines.push("isolation:", `  backend: ${profile.backend}`, "async:", `  enabled: ${profile.async}`);
 	return `${lines.join("\n")}\n`;
