@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { EffectiveExtensionRoots } from "@oh-my-pi/pi-coding-agent/capability/types";
 import { discoverAgents, getAgent } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { logger } from "@oh-my-pi/pi-utils";
 import { sha256Hex } from "../config/canonical.ts";
 import { BUILTIN_AGENT_ROLES, ROLES } from "../roles.ts";
 import type { ApprovalRecord, ShadowInfo } from "../types.ts";
@@ -90,7 +91,8 @@ export async function findShadows(opts: {
 	let agents: AgentDefinition[];
 	try {
 		({ agents } = await discoverAgents(opts.cwd, opts.home, opts.discovery.extensionRoots));
-	} catch {
+	} catch (error) {
+		logger.warn("Storm native role discovery failed", { error });
 		return unattestedShadows();
 	}
 	const candidates = [...agents, ...(opts.discovery.sessionAgents ?? [])];

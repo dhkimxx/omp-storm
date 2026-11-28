@@ -54,12 +54,13 @@ async function main(): Promise<void> {
 			const run = await files.finishedRun(before, 180_000);
 			const frames = rpc.frames.slice(from);
 			const routed = run.spawns.filter(spawn => spawn.outcome !== "blocked");
+			// Spawn records are appended as the asynchronous admission decisions complete, not in placement order.
 			const reader = routed.find(spawn => spawn.agent === "storm-explorer");
 			const writer = routed.find(spawn => spawn.agent === "storm-implementer");
 			const taskResults = frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "task").map(text).join("\n");
 			check(
-				"both items were routed under distinct handles, the reader first",
-				routed.length === 2 && reader !== undefined && writer !== undefined && reader.spawnKey !== writer.spawnKey && routed[0]?.agent === "storm-explorer" && routed[1]?.agent === "storm-implementer",
+				"both items were routed under distinct handles",
+				routed.length === 2 && !!reader?.spawnKey && !!writer?.spawnKey && reader.spawnKey !== writer.spawnKey,
 				JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.agent, spawn.outcome])),
 			);
 			check(

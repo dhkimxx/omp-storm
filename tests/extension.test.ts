@@ -12,7 +12,7 @@ import * as zod from "@oh-my-pi/omptype/zod";
 import { AgentRegistry, type CompactOptions, type ExtensionAPI, type ExtensionContext, type ExtensionUiFactory, type ExtensionUiHost } from "@oh-my-pi/pi-coding-agent";
 import { Settings, withActiveSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentSessionHandle } from "@oh-my-pi/pi-coding-agent/session/agent-session-handle";
-import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, logger, setAgentDir } from "@oh-my-pi/pi-utils";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig, configPath } from "../src/config/store.ts";
@@ -48,7 +48,7 @@ import { sharedMap } from "../src/runtime/thread-state.ts";
 import { resetTrialSpawns } from "../src/runtime/trials.ts";
 import { treeAgainst } from "../src/runtime/tree.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
-import { loadProjectState } from "../src/state.ts";
+import { liveDiscovery, loadProjectState } from "../src/state.ts";
 import { STORM_MARK } from "../src/view/appearance.ts";
 import * as admissionModule from "../src/worker-admission.ts";
 import { persistWorkerAdmission, readWorkerAdmission, revokeWorkerAdmissions, workerAdmissionKey } from "../src/worker-admission.ts";
@@ -451,12 +451,18 @@ function placedName(answer: unknown, fallback: string): string {
 
 let project: TestProject;
 let beforeAgentDir: string;
+let stopDiscoveryLog: () => void;
 
 beforeEach(async () => {
 	placedHandles.clear();
 	project = await makeProject();
 	beforeAgentDir = getAgentDir();
 	setAgentDir(project.agentDir);
+	stopDiscoveryLog = logger.registerLogSink(event => {
+		if (event.message === "Storm native role discovery failed") {
+			console.error(event.message, event.context?.error);
+		}
+	});
 });
 
 afterEach(async () => {
@@ -466,6 +472,7 @@ afterEach(async () => {
 		// Release real leases while the project still exists. Linux can reuse its directory inode in the next test.
 		await shutdownFakeSessions();
 	} finally {
+		stopDiscoveryLog();
 		resetLedger();
 		resetAgents();
 		resetTrialSpawns();
@@ -6692,7 +6699,10 @@ describe("phase 2 through the hooks: the director's path edits", () => {
 	const openRun = async (omp: ReturnType<typeof fakeOmp>, main: ExtensionContext, plan: object): Promise<string> => {
 		await omp.command("manual task", main);
 		const run = activeLedgerRun(project.sessionDir);
-		if (run === undefined) throw new Error(`The director's run did not open: ${omp.notices.map(notice => notice.text).join("\n")}`);
+		if (run === undefined) {
+			const registry = liveDiscovery(main.agent.id, project.sessionId) === undefined ? "unattested" : "live";
+			throw new Error(`The director's run did not open (registry: ${registry}): ${JSON.stringify(omp.transcript)}`);
+		}
 		expect(await omp.tool({ action: "plan", plan }, main)).toBe("ok");
 		return run.runId;
 	};
