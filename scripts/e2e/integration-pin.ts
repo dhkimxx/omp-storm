@@ -34,7 +34,7 @@ import { type E2eEnv, prepare, ROOT, Suite } from "./harness.ts";
 const FROZEN_COMMIT = "ca4c3b7299c5d82961ab63fdbf18fc78bd915379";
 /** The commit that installed the five type-only integration interfaces; the feature build must descend from it. */
 const INTERFACE_COMMIT = "865f14393220857945a4ea7c45e990b517adccc9";
-const RELEASE_VERSION = "0.31.0";
+const RELEASE_VERSION = "0.32.0";
 const HOST_VERSION = "19.2.1";
 const INTERFACE_FILES = [
 	"integration-admission.ts",

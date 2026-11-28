@@ -24,6 +24,7 @@ import { basename, join } from "node:path";
 import { readAutoDelegationChoice } from "../../src/approval/auto.ts";
 import { resolveRepo } from "../../src/approval/repo.ts";
 import { configHash, shortHash } from "../../src/config/canonical.ts";
+import { LAST_TEAM } from "../../src/flows.ts";
 import { APPROVE, CANCEL } from "../../src/proposals/present.ts";
 import { sessionStoreDir } from "../../src/session-scope.ts";
 import type { Exec } from "../../src/types.ts";
@@ -143,9 +144,16 @@ async function main(): Promise<void> {
 			const run = await first.files.finishedRun(before);
 			check("the first session owns the run record and its index line", first.files.runs().some(record => record.runId === run.runId) && first.files.index().some(line => line.runId === run.runId), run.runId);
 
-			// The second session: recommended team, automatic delegation on. A real turn materializes its transcript so a
-			// later `--resume` can open it.
-			await approveTeam(second.rpc, "on");
+			// The second session: the first session's team is only a suggestion there; it leaves it for the recommended
+			// team and turns automatic delegation on. A real turn materializes its transcript so a later `--resume` can open it.
+			const offered = second.rpc.dialogs.length;
+			second.rpc.answer = choose(LAST_TEAM.recommend, APPROVE);
+			await second.rpc.prompt("/storm");
+			check(
+				"the second session is offered the first session's team as a suggestion",
+				second.rpc.dialogs[offered]?.options.includes(LAST_TEAM.recommend) === true,
+				JSON.stringify(second.rpc.dialogs[offered]?.options),
+			);
 			second.rpc.answer = choose(AUTO_OFF_LABEL);
 			await second.rpc.prompt("/storm auto");
 			await second.rpc.turn("hello");
