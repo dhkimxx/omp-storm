@@ -17,7 +17,7 @@ import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { readAutoDelegation, writeAutoDelegation } from "../src/approval/auto.ts";
 import { writeConfig, configPath } from "../src/config/store.ts";
 import { prepareAnalysis } from "../src/context.ts";
-import storm from "../src/extension.ts";
+import storm, { bindIntegrationRuntime, type IntegrationRuntimePorts } from "../src/extension.ts";
 import { approveAndSave } from "../src/flows.ts";
 import { WHY_SHELL_READER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
 import { DIRECTOR_EDIT_LEAD } from "../src/policy/director.ts";
@@ -4358,6 +4358,35 @@ describe("the director reads what a delivery changed, in the place it reads the 
 		return { omp, child, main, worker, runId, rowOf, pushed, waited, request, pushedNotice };
 	}
 	const textOf = (answer: ContextAnswer): string => answer.messages.at(-1)?.content.map(part => part.text).join("") ?? "";
+
+	test("candidate lookup uses each conversation's own bound store across a switch", async () => {
+		const omp = fakeOmp(project);
+		const main = omp.ctx(MAIN);
+		const secondId = `${project.sessionId}-other`;
+		const secondDir = sessionStoreDir(project.agentDir, secondId);
+		const reader = (label: string): IntegrationRuntimePorts => ({
+			controller: { project: async () => ({ kind: "not-recorded" }) },
+			view: { formatIntegrationCandidates: () => label },
+		}) as unknown as IntegrationRuntimePorts;
+		bindIntegrationRuntime(project.sessionDir, reader("first-conversation-queue"));
+		bindIntegrationRuntime(secondDir, reader("other-conversation-queue"));
+		try {
+			expect(await omp.toolReply({ action: "candidates" }, main)).toMatchObject({
+				outcome: "ok", text: "first-conversation-queue",
+			});
+			omp.setSessionId(secondId);
+			expect(await omp.toolReply({ action: "candidates" }, main)).toMatchObject({
+				outcome: "ok", text: "other-conversation-queue",
+			});
+			bindIntegrationRuntime(project.sessionDir, undefined);
+			expect(await omp.toolReply({ action: "candidates" }, main)).toMatchObject({
+				outcome: "ok", text: "other-conversation-queue",
+			});
+		} finally {
+			bindIntegrationRuntime(project.sessionDir, undefined);
+			bindIntegrationRuntime(secondDir, undefined);
+		}
+	});
 
 	test("a pushed delivery Storm did not accept is on the director's next request: result, state, reason and the citation form", async () => {
 		const run = await lookRun();

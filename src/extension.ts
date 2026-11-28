@@ -220,16 +220,17 @@ export interface IntegrationRuntimePorts {
 	readonly guardBuild?: string;
 }
 
-let integrationRuntime: IntegrationRuntimePorts | undefined;
+// Child modules loaded separately on the same host thread join their director's capture by the attested store.
+const integrationRuntimes = sharedMap<string, IntegrationRuntimePorts>("storm.integration.bySession");
 
-/** Coordinator/composition entry point. Passing undefined leaves the actions refused, not silently permissive. */
-export function bindIntegrationRuntime(ports: IntegrationRuntimePorts | undefined): void {
-	integrationRuntime = ports;
+/** Composition binds the owner's lifetime, never whichever session most recently loaded the extension. */
+export function bindIntegrationRuntime(sessionDir: string, ports: IntegrationRuntimePorts | undefined): void {
+	if (ports === undefined) integrationRuntimes.delete(sessionDir);
+	else integrationRuntimes.set(sessionDir, ports);
 }
 
-/** Read-only diagnostics for the composition point and tests. */
-export function boundIntegrationRuntime(): IntegrationRuntimePorts | undefined {
-	return integrationRuntime;
+export function boundIntegrationRuntime(sessionDir: string | undefined): IntegrationRuntimePorts | undefined {
+	return sessionDir === undefined ? undefined : integrationRuntimes.get(sessionDir);
 }
 
 /** A directory/file identity, decimal strings so neither inode nor device is rounded through a JS number. */
@@ -1232,7 +1233,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 */
 	const integrationClaimed = new Set<string>();
 	const integrationChildEntry = async (ctx: ExtensionContext, ledger: LedgerRun): Promise<void> => {
-		const ports = integrationRuntime;
+		const ports = boundIntegrationRuntime(ledger.sessionDir);
 		if (ports === undefined) return;
 		const read = await readWorkerAdmission({
 			agentDir: workerAdmissionAgentDir(),
@@ -1756,8 +1757,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 * The target fence is consulted by every managed parent-write path E owns, before its own writer claim.
 	 * A fenced or unreadable target refuses the new effect; only `/storm reconcile` can release a proved fence.
 	 */
-	const integrationFenceRefusal = async (root: string): Promise<string | undefined> => {
-		const ports = integrationRuntime;
+	const integrationFenceRefusal = async (sessionDir: string, root: string): Promise<string | undefined> => {
+		const ports = boundIntegrationRuntime(sessionDir);
 		if (ports === undefined) return undefined;
 		try {
 			return fenceRefusal(await ports.journal.findFence({ canonicalRoot: root }));
@@ -1877,7 +1878,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			auto: () => autoSnapshot(sessionId),
 			integration: {
 				candidates: async (input, callSignal) => {
-					const ports = integrationRuntime;
+					const ports = boundIntegrationRuntime(agentScope(ctx));
 					if (ports === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_UNAVAILABLE };
 					if (!stillOwner()) return { outcome: "rejected", text: stale };
 					if (input.candidateId !== undefined && !INTEGRATION_CANDIDATE_ID_RE.test(input.candidateId)) {
@@ -1911,7 +1912,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					}
 				},
 				integrate: async (candidateIds, callSignal) => {
-					const ports = integrationRuntime;
+					const ports = boundIntegrationRuntime(agentScope(ctx));
 					if (ports === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_UNAVAILABLE };
 					if (!stillOwner()) return { outcome: "rejected", text: stale };
 					const listProblem = integrationIdListProblem(candidateIds);
@@ -2424,7 +2425,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// host-captured backend/factory. On 19.2.1 the latter does not exist, so this refuses before the child
 			// admission is written or the host materialises anything. A future host seam mints `known` here; nothing
 			// else in this hook may treat an unbound 0.29 private launch as an integration path.
-			if (prepared.privatePlacement && integrationRuntime !== undefined) {
+			const integration = prepared.privatePlacement ? boundIntegrationRuntime(current.sessionDir) : undefined;
+			if (integration !== undefined) {
 				const observation = preAuthorizedIsolation.get(spawnKey);
 				if (observation === undefined) {
 					return ledgerBlock("이 격리 스폰의 사전 설정 관찰을 찾지 못했습니다. 같은 task 호출을 새로 보내 배치와 정책을 함께 고정하세요.", current, Date.now());
@@ -2433,7 +2435,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				if (!observationCheck.ok) return ledgerBlock(observationCheck.problem.reason, current, Date.now());
 				const director = directorIdentityFor({ sessionId: current.sessionId, sessionDir: current.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "unknown") return ledgerBlock(director.problem.reason, current, Date.now());
-				const policy = integrationRuntime.policy ?? integrationApplyPolicy;
+				const policy = integration.policy ?? integrationApplyPolicy;
 				const proof = policy.arm({ director: director.value, toolCallId: spawnKey });
 				if (proof.kind === "unknown") return ledgerBlock(proof.problem.reason, current, Date.now());
 				const item: NativeTaskItem = { toolCallId: spawnKey, itemIndex: 0, handle: spawnKey };
@@ -2558,8 +2560,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		const observedAt = Date.now();
 		// A's capture sees the same immutable async envelope the attempt collector reads; it never repeats wait or
 		// watches a mutable ref. Unbound events are ignored by A.
-		const ports = integrationRuntime;
 		const ledger = getLedgerRun(runId);
+		const ports = boundIntegrationRuntime(ledger?.sessionDir);
 		if (ports !== undefined && ledger !== undefined) {
 			const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 			if (director.kind === "known") {
@@ -3557,7 +3559,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (!autoOn && directorNeedsTree(event.toolName, event.input, planModeOn(ctx))) {
 			// A service lives in omp's daemon: it is no job of this session, and nothing says when it ends.
 			if (startsService(event.toolName, event.input)) return { block: true, reason: `[storm:director-service] ${DIRECTOR_SERVICE_REASON}` };
-			const fenced = await integrationFenceRefusal(runLedger?.root ?? ctx.cwd);
+			const fenced = await integrationFenceRefusal(runScope, runLedger?.root ?? ctx.cwd);
 			if (fenced !== undefined) return { block: true, reason: fenced };
 			const writable = await runs.ensureWrite(ctx);
 			if (!writable.ok) return { block: true, reason: `[storm:lease] ${writable.reason}` };
@@ -3580,7 +3582,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		// table as the last step before the call runs, or a refusal with its cause. Every other file change stays refused. A call
 		// that is no file change now is remembered until it starts, so a later extension's rewrite into one still gets a hold (RF3).
 		if (directorFileChange(event.toolName, event.input) !== undefined) {
-			const fenced = await integrationFenceRefusal(runLedger?.root ?? ctx.cwd);
+			const fenced = await integrationFenceRefusal(runScope, runLedger?.root ?? ctx.cwd);
 			if (fenced !== undefined) return { block: true, reason: fenced };
 			return directorPathEdit(event, ctx, { runId, root: runLedger?.root ?? ctx.cwd, scope: runScope, generation, mainId, hookStart });
 		}
@@ -3710,8 +3712,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			// Arm the exact director Settings observation after placement, still before omp resolves policy/adopts the
 			// items. The spawn hook reads this same observation; a change through the hook (ABA included) refuses the
 			// launch. Without the bound integration runtime the row's existing 0.29 behavior is unchanged.
-			if (wantsIsolation && integrationRuntime !== undefined) {
-				const director = directorIdentityFor({ sessionId: mainId, sessionDir: getLedgerRun(runId)?.sessionDir ?? "", parentId: ctx.agent.id });
+			if (wantsIsolation && boundIntegrationRuntime(runScope) !== undefined) {
+				const director = directorIdentityFor({ sessionId: mainId, sessionDir: runScope, parentId: ctx.agent.id });
 				if (director.kind === "unknown") return { block: true, reason: director.problem.reason };
 				const armed = observeDirectorIsolation({ director: director.value, toolCallId: event.toolCallId });
 				if (armed.kind === "unknown") return { block: true, reason: armed.problem.reason };
@@ -4223,8 +4225,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				content: event.content,
 				observedAt,
 			});
-			const ports = integrationRuntime;
 			const ledger = getLedgerRun(runId);
+			const ports = boundIntegrationRuntime(ledger?.sessionDir);
 			if (ports !== undefined && ledger !== undefined) {
 				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "known") {
@@ -4258,8 +4260,8 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				observedAt,
 				jobs: jobsForRun(ctx, runId),
 			});
-			const ports = integrationRuntime;
 			const ledger = getLedgerRun(runId);
+			const ports = boundIntegrationRuntime(ledger?.sessionDir);
 			if (ports !== undefined && ledger !== undefined) {
 				const director = directorIdentityFor({ sessionId: ledger.sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "known") {
@@ -4665,7 +4667,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 * A clear or unknown target is left alone; release adds no receipt and restores no bytes.
 	 */
 	const reconcileFlow = async (ctx: ExtensionContext, ui: UiPort, arg: string): Promise<void> => {
-		const ports = integrationRuntime;
+		const ports = boundIntegrationRuntime(agentScope(ctx));
 		if (ports === undefined) {
 			ui.notify(INTEGRATION_TOOL_UNAVAILABLE, "warning");
 			return;
@@ -4849,7 +4851,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			if (generation !== sessionGeneration) return;
 			// A's registry subscription is installed before this session can spawn, so no first registered/metadata
 			// event is missed. The listener snapshots primitives synchronously; the capture port owns all joining.
-			const ports = integrationRuntime;
+			const ports = boundIntegrationRuntime(state.sessionDir);
 			const director = ports === undefined ? undefined : directorIdentityFor({ sessionId, sessionDir: state.sessionDir, parentId: ctx.agent.id });
 			integrationRegistryStop?.();
 			integrationRegistryStop = undefined;
