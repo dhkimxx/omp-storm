@@ -273,7 +273,7 @@ test("a job batch and a required check are refused while a settled worker's plac
 });
 
 test("a host that has job rows but cannot show them keeps a settled async worker's place, as it refuses a director command", () => {
-	const rows: { current: HostRows | undefined } = { current: undefined };
+	const rows: { current: HostRows | undefined } = { current: [] };
 	const p = plan(writer("A"), writer("B"));
 	const work = new RunLanes("rows-unreadable", () => rows.current);
 	const first = work.place({ agent: "storm-implementer", name: "A", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), callId: "async-1", now: T0 });
@@ -283,6 +283,7 @@ test("a host that has job rows but cannot show them keeps a settled async worker
 	work.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team });
 	work.callEnded("async-1");
 	work.agentStarted(key);
+	rows.current = undefined;
 	work.releaseAgent(key);
 	const settled = [agentEntry({ id: key, name: "storm-implementer", role: "implementer", state: "idle", requests: 2, lastActivityAt: T0 + 5 })];
 	expect(refusedWrite(work.place({ agent: "storm-implementer", name: "B", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), agents: settled, now: T0 + 10 }))).toBe(true);

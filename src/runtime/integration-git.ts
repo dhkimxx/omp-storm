@@ -518,7 +518,7 @@ async function verifySpaceIdentity(space: SpaceIdentity, what: string): Promise<
 	} catch {
 		refuse("delta-odb", `${what} 경로를 확인할 수 없습니다: ${space.canonicalPath}`);
 	}
-	if (!st.isDirectory()) refuse("delta-odb", `${what}가 디렉터리가 아닙니다: ${real}`);
+	if (!st.isDirectory()) refuse("delta-odb", `디렉터리가 아닙니다: ${what} (${real})`);
 	if (st.dev.toString() !== space.device || st.ino.toString() !== space.inode) {
 		refuse("delta-odb", `${what}의 물리 identity가 바뀌었습니다: ${real}`);
 	}

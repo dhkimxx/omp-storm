@@ -7106,10 +7106,10 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				continue;
 			}
 			if (consumed.need === "result" && row?.state !== "accepted") {
-				return integrationProblem("consumed-result-missing", `선행 결과 '${label}'가 더 이상 수용 상태가 아닙니다.`);
+				return integrationProblem("consumed-result-missing", `선행 결과 '${label}': 더 이상 수용 상태가 아닙니다.`);
 			}
 			if (consumed.need === "reviewable" && row?.state !== "accepted" && row?.state !== "reviewable") {
-				return integrationProblem("consumed-reviewable-missing", `선행 결과 '${label}'가 더 이상 검토 가능 상태가 아닙니다.`);
+				return integrationProblem("consumed-reviewable-missing", `선행 결과 '${label}': 더 이상 검토 가능 상태가 아닙니다.`);
 			}
 			if (consumed.need === "integrated" && row !== undefined) {
 				const result = this.#plannedResult(own, resultId) ?? row.contract;
@@ -7118,7 +7118,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				const isolated = lane !== undefined && (lane.isolationReason !== undefined || own.config.isolation === "isolated");
 				const location = await this.#acceptedLocation(own, result, isolated, row);
 				if (!location.ok) {
-					return integrationProblem("consumed-not-integrated", `선행 결과 '${label}'가 현재 부모에 통합되어 있지 않습니다.`);
+					return integrationProblem("consumed-not-integrated", `선행 결과 '${label}': 현재 부모에 통합되어 있지 않습니다.`);
 				}
 				if (!location.integrated) {
 					return integrationProblem("consumed-not-integrated", `선행 결과 '${label}'의 통합 위치를 현재 확인하지 못했습니다.`);
@@ -7878,7 +7878,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			if (row === undefined || row.state !== "accepted" || row.contentVersion === undefined ||
 				recorded === undefined || recorded.attemptId !== row.attemptId ||
 				recorded.manifestDigest !== own.integration?.candidates.get(recorded.candidateId)?.seal?.digest) {
-				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}'가 현재 통합 영수증과 함께 수용되어 있지 않습니다.`);
+				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}': 현재 통합 영수증과 함께 수용되어 있지 않습니다.`);
 			}
 			integrated.push({
 				producerLane: query.lane,
@@ -7918,7 +7918,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 		for (const result of results) {
 			const row = own.record.results?.find(candidate => candidate.id === result.id);
 			if (row === undefined || row.state !== "accepted") {
-				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}'가 수용 상태가 아닙니다.`);
+				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}': 수용 상태가 아닙니다.`);
 			}
 			const current = await this.#currentIntegratedResult(own, result.id, window);
 			if (current === undefined) {
