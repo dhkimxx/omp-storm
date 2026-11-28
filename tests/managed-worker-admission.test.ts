@@ -1,7 +1,7 @@
 /** Real disk-only integration store + temporary checkout for the managed first-turn proof. */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sha256Hex } from "../src/config/canonical.ts";
@@ -215,11 +215,13 @@ function scopeFor(p: Prepared, over: Partial<ManagedWorkerTurnScope> = {}): Mana
 	});
 }
 
-async function nativeTuple(p: Prepared, scope: ManagedWorkerTurnScope): Promise<{ ctx: unknown; event: unknown }> {
+async function nativeTuple(
+	p: Prepared, scope: ManagedWorkerTurnScope, sourceRoot = p.admission.target.gitRoot.canonicalPath,
+): Promise<{ ctx: unknown; event: unknown }> {
 	const sessionFileIdentity = await identity(childSessionFile);
 	const checkoutIdentity = await identity(p.checkout);
 	const workspace = Object.freeze({
-		kind: "native", backend: "apfs", sourceRoot: p.admission.target.gitRoot.canonicalPath, slotPath: p.admission.slot.slotPath,
+		kind: "native", backend: "apfs", sourceRoot, slotPath: p.admission.slot.slotPath,
 	});
 	const isolation = Object.freeze({
 		requested: true, enabled: true, merge: "patch", apply: false, commits: "generic", workspace,
@@ -410,6 +412,17 @@ describe("real disk-only bind/read/end", () => {
 		expect(await finish(p, scope)).toMatchObject({ kind: "ended" });
 		expect(await readWorkerAdmissionByKey(agentDir, p.record.key)).toMatchObject({ kind: "record", record: { endedAt: expect.any(Number) } });
 		expect(await finish(p, scope)).toMatchObject({ kind: "already-ended" });
+	});
+
+	test("accepts only a source alias naming the approved physical Git tree", async () => {
+		const p = await prepared();
+		const scope = scopeFor(p);
+		expect(await bind(await nativeTuple(p, scope, tmp))).toMatchObject({
+			kind: "unknown", problem: { code: "integration-source" },
+		});
+		const alias = join(tmp, "native-source-alias");
+		await symlink(p.admission.target.gitRoot.canonicalPath, alias);
+		expect(await bind(await nativeTuple(p, scope, alias))).toMatchObject({ kind: "known" });
 	});
 
 	test("wrong token, run, actor, instance, generation and dispatch refuse a bound turn", async () => {

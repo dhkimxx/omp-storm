@@ -15,6 +15,7 @@
  * ending anything newer. The old `claimWorkerAdmission`/`resolveWorkerAdmission`/`endWorkerAdmission` fallbacks stay for
  * stock callers and are deliberately not used here.
  */
+import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { canonicalJson, sha256Hex } from "../config/canonical.ts";
 import { isRecord } from "../config/schema.ts";
@@ -451,7 +452,6 @@ function verifyAdmissionAgainstRecord(input: {
 		if (admission.policy.backendProofId !== dispatch.token) return problem("integration-dispatch", "통합 승인의 네이티브 디스패치가 진입 이벤트와 다릅니다");
 		if (admission.policy.backendSetting !== dispatch.backend) return problem("integration-backend", "통합 승인의 격리 백엔드가 진입 이벤트와 다릅니다");
 		if (admission.slot.slotPath !== dispatch.slotPath) return problem("integration-slot", "통합 승인의 네이티브 슬롯이 진입 이벤트와 다릅니다");
-		if (admission.target.gitRoot.canonicalPath !== dispatch.sourceRoot) return problem("integration-source", "통합 승인의 소스 루트가 진입 이벤트와 다릅니다");
 		if (admission.approvedDefinitionDigest !== dispatch.definition.digest) {
 			return problem("integration-definition", "통합 승인의 정의 다이제스트가 진입 이벤트와 다릅니다");
 		}
@@ -651,6 +651,12 @@ export async function bindManagedWorkerEntry(input: ManagedWorkerEntryBindReques
 	}
 	const admissionProblem = verifyAdmissionAgainstRecord({ admission, record, guard: input.guard, dispatch: dispatch.value });
 	if (admissionProblem !== undefined) return { kind: "unknown", problem: admissionProblem };
+	// The native dispatch may name a real alias (/tmp on macOS). Require the same physical source, never just spelling.
+	const source = await stat(dispatch.value.sourceRoot, { bigint: true }).catch(() => undefined);
+	const expectedSource = admission.target.gitRoot;
+	if (!source?.isDirectory() || source.dev.toString() !== expectedSource.device || source.ino.toString() !== expectedSource.inode) {
+		return unknown("integration-source", "통합 승인의 실제 소스 루트가 진입 이벤트와 다릅니다");
+	}
 	const existing = await verifyExistingClaim({
 		admission, store: input.store, delta: input.delta, record, guard: input.guard, window: input.window, live: input.live, proof,
 	});
