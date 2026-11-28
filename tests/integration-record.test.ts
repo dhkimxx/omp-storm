@@ -10,20 +10,20 @@ import type {
 import type { ByteWindow, ExactDeltaProof, IntegrationBytePort, StoredPatchRef } from "../src/runtime/integration-delta.ts";
 import type { SealedCaptureManifest } from "../src/runtime/integration-capture.ts";
 import type {
-	IntegrationLiveGrant, ProvenEffectEnd, SelectionSnapshot, WriteIntent, WriteReceipt,
+	IntegrationLiveGrant, ProvenEffectEnd, SelectionSnapshot, SegmentHolder, WriteIntent, WriteReceipt,
 } from "../src/runtime/integration-record.ts";
-import type { Installer } from "../src/runtime/integration-git.ts";
+import type { InstallInput, InstallOutcome, Installer } from "../src/runtime/integration-git.ts";
 import {
 	IntegrationJournal, IntegrationWriter, integrationCandidateId, type IntegrationJournalStore,
 } from "../src/runtime/integration-record.ts";
 import { GitDelta, spawnGit } from "../src/runtime/integration-git.ts";
-import { acquireRunLease, canonicalWorktree } from "../src/runtime/lease.ts";
+import { acquireRunLease, canonicalWorktree, type RunLease } from "../src/runtime/lease.ts";
 import { RunLanes, forgetRunLanes } from "../src/runtime/lanes.ts";
 
 const sha256 = (bytes: Uint8Array | string): string => createHash("sha256").update(bytes).digest("hex");
 
-function window(maxBytes = 64 * 1024 * 1024): ByteWindow {
-	return { maxBytes, deadline: Date.now() + 120_000, signal: new AbortController().signal };
+function window(maxBytes = 64 * 1024 * 1024, signal: AbortSignal = new AbortController().signal): ByteWindow {
+	return { maxBytes, deadline: Date.now() + 120_000, signal };
 }
 
 async function space(dir: string): Promise<SpaceIdentity> {
@@ -200,8 +200,10 @@ function intentOf(item: Repo, sequence: number, token: string): WriteIntent {
 }
 
 const cleanups: Array<() => Promise<void>> = [];
+const laneKeepAlive: RunLanes[] = [];
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+	laneKeepAlive.length = 0;
 });
 
 describe("integration journal", () => {
@@ -571,6 +573,226 @@ describe("integration writer", () => {
 	});
 });
 
+describe("integration writer durability", () => {
+	test("the final gate rechecks live authority after the awaited apply check", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		let liveOk = true;
+		let dispatched = false;
+		const installer = gatedInstaller(
+			async () => {
+				liveOk = false;
+			},
+			async () => {
+				dispatched = true;
+				await installProof(item);
+				return { kind: "exited", code: 0, stderr: "" };
+			},
+		);
+		const live: IntegrationLiveGrant = {
+			...liveGrant(item),
+			check: () => liveOk ? { ok: true } : { ok: false, reason: "live ended" },
+		};
+		const { writer, reserved } = await writerFixture(item, journal, installer, live);
+		const result = await writer.applyCandidate({
+			holder: reserved,
+			candidate: { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) },
+			proof: item.proof,
+			window: window(),
+		});
+		expect(result.kind).toBe("no-effect");
+		if (result.kind === "no-effect") expect(result.problem.code).toBe("integration-live");
+		expect(dispatched).toBe(false);
+		expect(await readFile(path.join(item.root, "edit.txt"), "utf8")).toBe("base\nWIP\n");
+		expect(await journal.findFence({ canonicalRoot: item.root })).toEqual({ kind: "clear" });
+		const stored = await journal.readCandidate(item.key.runId, item.candidateId);
+		expect(stored.kind === "known" ? stored.value?.lastWrite?.kind : undefined).toBe("no-effect");
+		expect(await readFile(journalPath(item), "utf8")).toContain('"basis":"never-dispatched"');
+	});
+
+	test("a dispatched effect gets its own bounded readback after the caller window aborts", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		const controller = new AbortController();
+		const installer = gatedInstaller(async () => undefined, async () => {
+			await installProof(item);
+			controller.abort();
+			return { kind: "exited", code: 0, stderr: "" };
+		});
+		const { writer, reserved } = await writerFixture(item, journal, installer);
+		const result = await writer.applyCandidate({
+			holder: reserved,
+			candidate: { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) },
+			proof: item.proof,
+			window: window(64 * 1024 * 1024, controller.signal),
+		});
+		expect(result.kind).toBe("written");
+		if (result.kind === "written") expect(result.receipt.ref.candidateId).toBe(item.candidateId);
+		expect(await readFile(path.join(item.root, "edit.txt"), "utf8")).toBe("base\nWIP\nCHILD\n");
+		expect(await journal.findFence({ canonicalRoot: item.root })).toEqual({ kind: "clear" });
+	});
+
+	test("an unproved installer reap stays fenced and records no end", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		const installer = gatedInstaller(async () => undefined, async () => ({ kind: "effect-unknown", reason: "scripted reap" }));
+		const { writer, reserved } = await writerFixture(item, journal, installer);
+		const result = await writer.applyCandidate({
+			holder: reserved,
+			candidate: { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) },
+			proof: item.proof,
+			window: window(),
+		});
+		expect(result).toMatchObject({ kind: "recovery-required", problem: { code: "integration-effect-unknown" } });
+		expect(await journal.findFence({ canonicalRoot: item.root })).toMatchObject({ kind: "fenced" });
+		expect(await readFile(journalPath(item), "utf8")).not.toContain('"kind":"effect-end"');
+	});
+
+	test("a never-dispatched effect is fenced until its durable end is recorded", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new FaultJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } }, "effect-end");
+		await journal.appendManifest(manifestOf(item));
+		const installer = gatedInstaller(async () => undefined, async () => ({ kind: "never-dispatched", reason: "scripted stop" }));
+		const { writer, reserved } = await writerFixture(item, journal, installer);
+		const result = await writer.applyCandidate({
+			holder: reserved,
+			candidate: { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) },
+			proof: item.proof,
+			window: window(),
+		});
+		expect(result).toMatchObject({ kind: "recovery-required", problem: { code: "fault-effect-end" } });
+		expect(await journal.findFence({ canonicalRoot: item.root })).toMatchObject({ kind: "fenced" });
+		expect(await readFile(path.join(item.root, "edit.txt"), "utf8")).toBe("base\nWIP\n");
+	});
+
+	test("a present-unattributed clearance blocks same-candidate replay after restart", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		const before = await captureBefore(item);
+		const { writer, lease, reserved } = await writerFixture(item, journal, {
+			install: async () => {
+				throw new Error("must not dispatch");
+			},
+		});
+		const intentRead = await journal.appendIntent({ runId: item.key.runId, build: sequence => intentOf(item, sequence, "clearance-token") });
+		if (intentRead.kind === "unknown") throw new Error(intentRead.problem.reason);
+		const fenceRead = await journal.writeFence(intentRead.value);
+		if (fenceRead.kind === "unknown") throw new Error(fenceRead.problem.reason);
+		await journal.appendEffectEnd(item.key.runId, { token: fenceRead.value.effectToken, basis: "installer-exit-proved", observedAt: Date.now() });
+		await installProof(item);
+		const otherSession = path.join(item.tmp, "other-session");
+		await mkdir(otherSession, { recursive: true });
+		const other = new IntegrationJournal({ sessionDir: otherSession, leaseDeps: { dir: item.leaseDir } });
+		const resolved = await other.resolveFence({
+			fence: fenceRead.value,
+			audit: { sessionId: "session-1", userActionId: "user-1", acknowledgedAt: Date.now() },
+			checkOperator: () => ({ ok: true }),
+		}, window());
+		expect(resolved).toEqual({ kind: "released", disposition: "present-unattributed" });
+		await restoreImages(item, before);
+		await writer.finishSegment(reserved);
+		const restarted = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		const stored = await restarted.readCandidate(item.key.runId, item.candidateId);
+		expect(stored.kind === "known" ? stored.value?.lastWrite?.kind : undefined).toBe("present-unattributed");
+		let replayedLastWrite: string | undefined;
+		const replay = await restarted.replay(item.key.runId, entry => {
+			if (entry.manifest.admission.candidateId === item.candidateId) replayedLastWrite = entry.lastWrite?.kind;
+		});
+		expect(replay.kind).toBe("known");
+		expect(replayedLastWrite).toBe("present-unattributed");
+		const replayed = writerFor(item, restarted, {
+			install: async () => {
+				throw new Error("must not dispatch");
+			},
+		});
+		const reservedAgain = await replayed.reserveSegment({
+			lease,
+			target: item.target,
+			selection: selection(item),
+			live: liveGrant(item),
+			window: window(),
+		});
+		if (reservedAgain.kind === "unknown") throw new Error(reservedAgain.problem.reason);
+		const result = await replayed.applyCandidate({
+			holder: reservedAgain.value,
+			candidate: { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) },
+			proof: item.proof,
+			window: window(),
+		});
+		expect(result).toMatchObject({ kind: "refused", problem: { code: "integration-present-clearance" } });
+		expect(await readFile(path.join(item.root, "edit.txt"), "utf8")).toBe("base\nWIP\n");
+	});
+
+	test("stale operator confirmation keeps an otherwise coherent fence", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		const intentRead = await journal.appendIntent({ runId: item.key.runId, build: sequence => intentOf(item, sequence, "operator-token") });
+		if (intentRead.kind === "unknown") throw new Error(intentRead.problem.reason);
+		const fenceRead = await journal.writeFence(intentRead.value);
+		if (fenceRead.kind === "unknown") throw new Error(fenceRead.problem.reason);
+		await journal.appendEffectEnd(item.key.runId, { token: fenceRead.value.effectToken, basis: "never-dispatched", observedAt: Date.now() });
+		let calls = 0;
+		const resolved = await journal.resolveFence({
+			fence: fenceRead.value,
+			audit: { sessionId: "session-1", userActionId: "user-1", acknowledgedAt: Date.now() },
+			checkOperator: () => {
+				calls += 1;
+				return calls < 3 ? { ok: true } : { ok: false, reason: "stale" };
+			},
+		}, window());
+		expect(resolved).toMatchObject({ kind: "kept", problem: { code: "integration-fence-operator" } });
+		expect(calls).toBe(3);
+		expect(await journal.findFence({ canonicalRoot: item.root })).toMatchObject({ kind: "fenced" });
+	});
+
+	test("a foreign journal lock blocks append instead of writing beside it", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		const lock = `${journalPath(item)}.lock`;
+		await mkdir(lock, { recursive: true });
+		const locked = { key: { runId: item.key.runId, callId: "locked" }, chosen: [item.candidateId], ordered: [item.candidateId] };
+		expect(await journal.beginSelection(locked)).toMatchObject({ ok: false, problem: { code: "integration-journal-locked" } });
+		await rm(lock, { recursive: true, force: true });
+		expect(await journal.beginSelection(locked)).toEqual({ ok: true });
+	});
+
+	test("a no-effect dispatch can be retried in the same selection", async () => {
+		const item = await repo();
+		cleanups.push(item.remove);
+		const journal = new IntegrationJournal({ sessionDir: item.sessionDir, leaseDeps: { dir: item.leaseDir } });
+		await journal.appendManifest(manifestOf(item));
+		let calls = 0;
+		const installer = gatedInstaller(async () => undefined, async () => {
+			calls += 1;
+			if (calls === 1) return { kind: "never-dispatched", reason: "scripted" };
+			await installProof(item);
+			return { kind: "exited", code: 0, stderr: "" };
+		});
+		const { writer, reserved } = await writerFixture(item, journal, installer);
+		const candidate = { key: item.key, candidateId: item.candidateId, manifestDigest: "c".repeat(64) };
+		const first = await writer.applyCandidate({ holder: reserved, candidate, proof: item.proof, window: window() });
+		expect(first.kind).toBe("no-effect");
+		expect(await journal.findFence({ canonicalRoot: item.root })).toEqual({ kind: "clear" });
+		const second = await writer.applyCandidate({ holder: reserved, candidate, proof: item.proof, window: window() });
+		expect(second.kind).toBe("written");
+		expect(await readFile(path.join(item.root, "edit.txt"), "utf8")).toBe("base\nWIP\nCHILD\n");
+		expect(calls).toBe(2);
+	});
+});
+
 function writerFor(item: Repo, journal: IntegrationJournalStore, installer?: Installer): IntegrationWriter {
 	return new IntegrationWriter({
 		journal,
@@ -579,6 +801,84 @@ function writerFor(item: Repo, journal: IntegrationJournalStore, installer?: Ins
 		run: spawnGit,
 		...(installer === undefined ? {} : { installer }),
 	});
+}
+
+type GatedInstallInput = InstallInput & { readonly beforeDispatch?: () => IntegrationCheck };
+
+/** The Git installer's shape: awaited apply --check, the final synchronous gate, then the mutating effect. */
+function gatedInstaller(
+	check: () => Promise<void>,
+	effect: () => Promise<InstallOutcome | { readonly kind: "effect-unknown"; readonly reason: string }>,
+): Installer {
+	return {
+		async install(input: InstallInput): Promise<InstallOutcome> {
+			await check();
+			const gated = input as GatedInstallInput;
+			const gate = gated.beforeDispatch?.();
+			if (gate !== undefined && !gate.ok) return { kind: "never-dispatched", reason: gate.problem.reason };
+			return (await effect()) as InstallOutcome;
+		},
+	};
+}
+
+async function installProof(item: Repo): Promise<void> {
+	for (const entry of item.proof.entries) {
+		if (entry.after.state.kind === "absent") await rm(path.join(item.root, entry.targetPath), { force: true });
+		else await writeFile(path.join(item.root, entry.targetPath), await blobBytes(item, entry.after.state.sha256));
+	}
+}
+
+async function captureBefore(item: Repo): Promise<Map<string, Uint8Array | null>> {
+	const before = new Map<string, Uint8Array | null>();
+	for (const entry of item.proof.entries) {
+		before.set(entry.targetPath, entry.before.state.kind === "absent" ? null : new Uint8Array(await readFile(path.join(item.root, entry.targetPath))));
+	}
+	return before;
+}
+
+async function restoreImages(item: Repo, before: Map<string, Uint8Array | null>): Promise<void> {
+	for (const entry of item.proof.entries) {
+		const bytes = before.get(entry.targetPath);
+		if (bytes === null || bytes === undefined) await rm(path.join(item.root, entry.targetPath), { force: true });
+		else await writeFile(path.join(item.root, entry.targetPath), bytes);
+	}
+}
+
+function selection(item: Repo): SelectionSnapshot {
+	return { key: { runId: item.key.runId, callId: "call-1" }, chosen: [item.candidateId], ordered: [item.candidateId] };
+}
+
+function journalPath(item: Repo): string {
+	return path.join(item.sessionDir, "state", "integration", "runs", item.key.runId, "journal.jsonl");
+}
+
+async function writerFixture(
+	item: Repo,
+	journal: IntegrationJournalStore,
+	installer?: Installer,
+	live: IntegrationLiveGrant = liveGrant(item),
+): Promise<{ readonly writer: IntegrationWriter; readonly lease: RunLease; readonly reserved: SegmentHolder }> {
+	laneKeepAlive.push(new RunLanes(item.key.runId));
+	cleanups.push(async () => forgetRunLanes(item.key.runId));
+	const acquired = await acquireRunLease({
+		sessionDir: item.sessionDir,
+		sessionId: "session-1",
+		root: item.root,
+		runId: item.key.runId,
+		mode: "write",
+	}, { dir: item.leaseDir });
+	if (!acquired.ok) throw new Error(acquired.reason);
+	cleanups.push(() => acquired.lease.release());
+	const writer = writerFor(item, journal, installer);
+	const reserved = await writer.reserveSegment({
+		lease: acquired.lease,
+		target: item.target,
+		selection: selection(item),
+		live,
+		window: window(),
+	});
+	if (reserved.kind === "unknown") throw new Error(reserved.problem.reason);
+	return { writer, lease: acquired.lease, reserved: reserved.value };
 }
 
 function liveGrant(item: Repo): IntegrationLiveGrant {

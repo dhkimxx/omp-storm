@@ -7,7 +7,7 @@ import type { AdmissionKey, GitObjectSource, IntegrationTarget, SpaceIdentity } 
 import type { ByteWindow, ExactDeltaProof, IntegrationBytePort, StoredPatchRef } from "../src/runtime/integration-delta.ts";
 import {
 	ByteBudget, GitDelta, GitInstaller, observePostimages, parseRootPatch, readFootprint, readPathImage, spawnGit,
-	verifyFootprint,
+	statusForPaths, verifyFootprint, type GitRun,
 } from "../src/runtime/integration-git.ts";
 import { integrationCandidateId } from "../src/runtime/integration-record.ts";
 import { canonicalWorktree } from "../src/runtime/lease.ts";
@@ -139,6 +139,24 @@ async function prove(item: Fixture, overrides: Partial<IntegrationTarget> & { sc
 	return { delta, request, result };
 }
 
+async function writeBlob(item: Fixture, content: string): Promise<string> {
+	const run = await spawnGit(["hash-object", "-w", "--stdin"], { cwd: item.root, stdin: content });
+	if (!run.started || run.code !== 0) throw new Error(run.stderr);
+	return new TextDecoder().decode(run.stdout).trim();
+}
+
+async function provePatch(item: Fixture, patch: Uint8Array) {
+	const rootRef: StoredPatchRef = { ...item.rootRef, bytes: patch.byteLength, sha256: sha256(patch) };
+	return new GitDelta({ bytes: bytesPort(patch), run: spawnGit }).proveRoot({
+		key: item.key,
+		candidateId: integrationCandidateId(item.key),
+		target: item.target,
+		scope: { kind: "unbounded" },
+		sourceOdb: item.target.sourceOdb,
+		root: rootRef,
+	}, window());
+}
+
 describe("exact root delta", () => {
 	let item: Fixture;
 	const cleanups: Array<() => Promise<void>> = [];
@@ -183,7 +201,7 @@ describe("exact root delta", () => {
 		const beforeIndex = await readFile(path.join(item.root, ".git", "index"));
 		const pre = await verifyFootprint(footprint.value, request.target, spawnGit, budget, "pre");
 		expect(pre.ok).toBe(true);
-		const installed = await new GitInstaller(spawnGit).install({ target: request.target, patch: item.patch, window: window() });
+		const installed = await new GitInstaller(spawnGit).install({ target: request.target, patch: item.patch, window: window(), beforeDispatch: () => ({ ok: true }) });
 		expect(installed.kind).toBe("exited");
 		const post = await verifyFootprint(footprint.value, request.target, spawnGit, budget, "post");
 		expect(post.ok).toBe(true);
@@ -213,7 +231,7 @@ describe("exact root delta", () => {
 		const footprint = await readFootprint(result.value, request.target, spawnGit, budget);
 		if (footprint.kind === "unknown") throw new Error(footprint.problem.reason);
 		expect(await verifyFootprint(footprint.value, request.target, spawnGit, budget, "pre")).toEqual({ ok: true });
-		const installed = await new GitInstaller(spawnGit).install({ target: request.target, patch: item.patch, window: window() });
+		const installed = await new GitInstaller(spawnGit).install({ target: request.target, patch: item.patch, window: window(), beforeDispatch: () => ({ ok: true }) });
 		expect(installed.kind).toBe("exited");
 		expect(await verifyFootprint(footprint.value, request.target, spawnGit, budget, "post")).toEqual({ ok: true });
 		expect(await readFile(path.join(item.root, "unrelated.txt"), "utf8")).toBe("other\n");
@@ -360,5 +378,131 @@ describe("exact root delta", () => {
 		await writeFile(path.join(item.root, "delete.txt"), "delete me\nDIRTY\n");
 		const after = await delta.observeDirtyPaths(result.value, window());
 		expect(after.kind === "known" && after.value.dirtyDeletes).toContain("delete.txt");
+	});
+
+	test("refuses a delete whose exact old bytes are dirty but hidden by assume-unchanged", async () => {
+		item = await fixture();
+		cleanups.push(item.remove);
+		const dirty = "delete me\nWIP\n";
+		await writeFile(path.join(item.root, "delete.txt"), dirty);
+		await gitOut(item.root, "update-index", "--assume-unchanged", "delete.txt");
+		const oid = await writeBlob(item, dirty);
+		const patch = new TextEncoder().encode(
+			`diff --git a/delete.txt b/delete.txt\ndeleted file mode 100644\nindex ${oid}..0000000\n--- a/delete.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-delete me\n-WIP\n`,
+		);
+		const proved = await provePatch(item, patch);
+		if (proved.kind !== "known") throw new Error(proved.problem.reason);
+		const budget = new ByteBudget(window(), Date.now, 64 * 1024 * 1024);
+		const status = await statusForPaths(item.root, ["delete.txt"], spawnGit, budget);
+		expect(status.kind).toBe("known");
+		if (status.kind === "known") expect(status.paths.size).toBe(0);
+		const footprint = await readFootprint(proved.value, item.target, spawnGit, budget);
+		if (footprint.kind === "unknown") throw new Error(footprint.problem.reason);
+		const pre = await verifyFootprint(footprint.value, item.target, spawnGit, budget, "pre");
+		expect(pre).toMatchObject({ ok: false, problem: { code: "delta-dirty-delete", path: "delete.txt" } });
+	});
+
+	test("refuses a tracked ancestor or descendant of an absent-name add before effect", async () => {
+		item = await fixture();
+		cleanups.push(item.remove);
+		const budget = new ByteBudget(window(), Date.now, 64 * 1024 * 1024);
+
+		const childOid = await writeBlob(item, "child\n");
+		const childPatch = new TextEncoder().encode(
+			`diff --git a/blocker/child.txt b/blocker/child.txt\nnew file mode 100644\nindex 0000000..${childOid}\n--- /dev/null\n+++ b/blocker/child.txt\n@@ -0,0 +1 @@\n+child\n`,
+		);
+		const childProof = await provePatch(item, childPatch);
+		if (childProof.kind !== "known") throw new Error(childProof.problem.reason);
+		const childFootprint = await readFootprint(childProof.value, item.target, spawnGit, budget);
+		if (childFootprint.kind === "unknown") throw new Error(childFootprint.problem.reason);
+		// The ancestor becomes a tracked file only after the footprint read; the live child path stays absent.
+		await writeFile(path.join(item.root, "blocker"), "blocker\n");
+		await gitOut(item.root, "add", "blocker");
+		await gitOut(item.root, "commit", "-q", "-m", "tracked blocker");
+		await rm(path.join(item.root, "blocker"));
+		await mkdir(path.join(item.root, "blocker"));
+		const ancestorPre = await verifyFootprint(childFootprint.value, item.target, spawnGit, budget, "pre");
+		expect(ancestorPre).toMatchObject({ ok: false, problem: { code: "delta-absent-add-conflict", path: "blocker/child.txt" } });
+		const ancestorReread = await readFootprint(childProof.value, item.target, spawnGit, budget);
+		expect(ancestorReread).toMatchObject({ kind: "unknown", problem: { code: "delta-absent-add-conflict" } });
+
+		const nestOid = await writeBlob(item, "nest\n");
+		const nestPatch = new TextEncoder().encode(
+			`diff --git a/nest b/nest\nnew file mode 100644\nindex 0000000..${nestOid}\n--- /dev/null\n+++ b/nest\n@@ -0,0 +1 @@\n+nest\n`,
+		);
+		const nestProof = await provePatch(item, nestPatch);
+		if (nestProof.kind !== "known") throw new Error(nestProof.problem.reason);
+		const nestFootprint = await readFootprint(nestProof.value, item.target, spawnGit, budget);
+		if (nestFootprint.kind === "unknown") throw new Error(nestFootprint.problem.reason);
+		await mkdir(path.join(item.root, "nest"));
+		await writeFile(path.join(item.root, "nest", "leaf.txt"), "leaf\n");
+		await gitOut(item.root, "add", "nest/leaf.txt");
+		await gitOut(item.root, "commit", "-q", "-m", "tracked descendant");
+		await rm(path.join(item.root, "nest"), { recursive: true, force: true });
+		const descendantPre = await verifyFootprint(nestFootprint.value, item.target, spawnGit, budget, "pre");
+		expect(descendantPre).toMatchObject({ ok: false, problem: { code: "delta-absent-add-conflict", path: "nest" } });
+		const descendantReread = await readFootprint(nestProof.value, item.target, spawnGit, budget);
+		expect(descendantReread).toMatchObject({ kind: "unknown", problem: { code: "delta-absent-add-conflict" } });
+	});
+
+	test("withholds the mutating apply when the synchronous gate refuses", async () => {
+		item = await fixture();
+		cleanups.push(item.remove);
+		const calls: string[][] = [];
+		let gated = 0;
+		const run: GitRun = async args => {
+			calls.push([...args]);
+			return { stdout: new Uint8Array(), stderr: "", code: 0, started: true, ended: true };
+		};
+		const outcome = await new GitInstaller(run).install({
+			target: item.target,
+			patch: item.patch,
+			window: window(),
+			beforeDispatch: () => {
+				gated++;
+				const last = calls[calls.length - 1] ?? [];
+				expect(last).toContain("apply");
+				expect(last).toContain("--check");
+				return { ok: false, problem: { code: "integration-live", reason: "withheld" } };
+			},
+		});
+		expect(gated).toBe(1);
+		expect(outcome).toEqual({ kind: "never-dispatched", reason: "withheld" });
+		const applyCalls = calls.filter(args => args.includes("apply"));
+		expect(applyCalls).toHaveLength(1);
+		expect(applyCalls[0]).toContain("--check");
+	});
+
+	test("never reports exited when a started mutating apply's end is unproved", async () => {
+		item = await fixture();
+		cleanups.push(item.remove);
+		const calls: string[][] = [];
+		const run: GitRun = async args => {
+			calls.push([...args]);
+			if (args.includes("apply") && !args.includes("--check")) {
+				return { stdout: new Uint8Array(), stderr: "late", code: -2, started: true, ended: false };
+			}
+			return { stdout: new Uint8Array(), stderr: "", code: 0, started: true, ended: true };
+		};
+		const outcome = await new GitInstaller(run).install({
+			target: item.target,
+			patch: item.patch,
+			window: window(),
+			beforeDispatch: () => ({ ok: true }),
+		});
+		expect(outcome.kind).toBe("effect-unknown");
+		if (outcome.kind === "effect-unknown") expect(outcome.reason).toContain("종료를 확인하지 못했습니다");
+		expect(calls.filter(args => args.includes("apply") && !args.includes("--check"))).toHaveLength(1);
+	});
+
+	test("spawnGit waits for the real child end after a timeout kill", async () => {
+		item = await fixture();
+		cleanups.push(item.remove);
+		const started = Date.now();
+		const killed = await spawnGit(["-c", "alias.slow=!exec sleep 1 >/dev/null 2>&1", "slow"], { cwd: item.tmp, timeoutMs: 100 });
+		expect(killed.started).toBe(true);
+		expect(killed.ended).toBe(true);
+		expect(killed.code).not.toBe(-2);
+		expect(Date.now() - started).toBeLessThan(1_000);
 	});
 });

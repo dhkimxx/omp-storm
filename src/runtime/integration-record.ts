@@ -9,7 +9,7 @@
  * a timeout: only a coherent all-pre with a proved end, an all-post with a proved end, or a durable receipt releases it.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, lstatSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
@@ -25,7 +25,7 @@ import type {
 	ByteWindow, DeltaImage, ExactDeltaProof, IntegrationBytePort, IntegrationDeltaPort, Presence, StoredPatchRef,
 } from "./integration-delta.ts";
 import {
-	ByteBudget, cleanIntegrationPath, deltaDigest, GitInstaller, spawnGit, type GitRun, type InstallOutcome, type Installer,
+	ByteBudget, cleanIntegrationPath, deltaDigest, GitInstaller, spawnGit, type GitRun, type InstallInput, type InstallOutcome, type Installer,
 	type Footprint, readFootprint, verifyFootprint, observePostimages,
 } from "./integration-git.ts";
 import { runLanes } from "./lanes.ts";
@@ -40,6 +40,10 @@ const JOURNAL_MAX_BYTES = 64 * 1024 * 1024;
 const STORE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const CLOSURE_RESERVE = 16 * 1024;
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+/** A dispatched effect still needs its own bounded readback after the caller's pre-dispatch window may be over. */
+const POST_DISPATCH_READBACK_MS = 30_000;
+const JOURNAL_LOCK_WAIT_MS = 1_000;
+const JOURNAL_LOCK_POLL_MS = 10;
 const MAX_FENCE_BYTES = 16_384;
 const MAX_SELECTION = 128;
 const CANDIDATE_ID = /^c1_[0-9a-f]{64}$/u;
@@ -135,6 +139,13 @@ export interface FenceResolutionRequest {
 export type FenceResolution =
 	| { readonly kind: "released"; readonly disposition: "proved-no-effect" | "present-unattributed" | "durable-receipt" }
 	| { readonly kind: "kept"; readonly problem: IntegrationProblem };
+export type FenceClearDisposition = Extract<FenceResolution, { kind: "released" }>["disposition"];
+/** The durable operator decision; a later selection must consume `present-unattributed` as no replay. */
+export interface FenceClearance {
+	readonly fence: TargetFenceRef;
+	readonly disposition: FenceClearDisposition;
+	readonly audit: FenceResolutionRequest["audit"];
+}
 export type CandidateWriteResult =
 	| { readonly kind: "written"; readonly receipt: WriteReceipt }
 	| { readonly kind: "already-written"; readonly receipt: WriteReceipt; readonly presence: Presence }
@@ -379,6 +390,16 @@ function isFence(value: unknown): value is TargetFenceRef {
 		typeof value.effectToken === "string";
 }
 
+function isFenceClearance(value: unknown): value is FenceClearance {
+	if (!isIntegrationObject(value) || !isFence(value.fence)) return false;
+	if (value.disposition !== "proved-no-effect" && value.disposition !== "present-unattributed" && value.disposition !== "durable-receipt") return false;
+	const audit = value.audit;
+	return isIntegrationObject(audit) &&
+		typeof audit.sessionId === "string" &&
+		typeof audit.userActionId === "string" &&
+		typeof audit.acknowledgedAt === "number";
+}
+
 type JournalKind = "manifest" | "recovery" | "selection" | "step" | "intent" | "effect-end" | "receipt" | "fence-clear";
 
 interface JournalRecord {
@@ -449,6 +470,14 @@ function effectEndOf(record: JournalRecord): ProvenEffectEnd | undefined {
 function receiptOf(record: JournalRecord): WriteReceipt | undefined {
 	const payload = payloadOf(record);
 	return payload !== undefined && isReceipt(payload.receipt) ? payload.receipt : undefined;
+}
+
+function fenceClearanceOf(record: JournalRecord): FenceClearance | undefined {
+	if (record.kind !== "fence-clear") return undefined;
+	const payload = payloadOf(record);
+	if (payload === undefined) return undefined;
+	const clearance = { fence: payload.fence, disposition: payload.disposition, audit: payload.audit };
+	return isFenceClearance(clearance) ? clearance : undefined;
 }
 
 /** Order-independent equality for persisted records: object keys are sorted before comparison. */
@@ -684,61 +713,80 @@ export class IntegrationJournal implements IntegrationJournalStore {
 
 	async #append(runId: RunId, kind: JournalKind, build: (sequence: number) => unknown): Promise<IntegrationRead<JournalRecord>> {
 		const file = this.#journalFile(runId);
-		return serialized(file, async () => {
-			const head = await this.#head(runId);
-			if (head.kind === "unknown") return head;
-			if (head.value.torn !== undefined) return { kind: "unknown", problem: head.value.torn };
-			this.#markStoreDirty();
-			const sequence = head.value.seq + 1;
-			let payload: unknown;
-			try {
-				payload = build(sequence);
-			} catch (error) {
-				return { kind: "unknown", problem: problem("integration-journal-record", error instanceof Error ? error.message : String(error)) };
+		try {
+			await assertSessionPathSafe(this.sessionDir, file);
+			if (!(await ensureDurableDirectory(path.dirname(file)))) {
+				return { kind: "unknown", problem: problem("integration-journal", "통합 저널 디렉터리를 내구성 있게 준비하지 못했습니다.") };
 			}
-			const line = (record: JournalRecord): string => `${JSON.stringify(record)}\n`;
-			const base = {
-				schema: JOURNAL_SCHEMA as typeof JOURNAL_SCHEMA,
-				seq: sequence,
-				prev: head.value.prev,
-				at: this.now(),
-				kind,
-				payload,
+		} catch {
+			return { kind: "unknown", problem: problem("integration-journal", "통합 저널 경로를 확인하지 못했습니다.") };
+		}
+		return serialized(file, () => withFileLock(file, () => this.#appendLocked(runId, kind, build), () => ({
+			kind: "unknown" as const,
+			problem: problem("integration-journal-locked", "다른 프로세스가 통합 저널을 쓰고 있어 기록하지 않았습니다."),
+		})));
+	}
+
+	async #appendLocked(runId: RunId, kind: JournalKind, build: (sequence: number) => unknown): Promise<IntegrationRead<JournalRecord>> {
+		const file = this.#journalFile(runId);
+		const head = await this.#head(runId);
+		if (head.kind === "unknown") return head;
+		if (head.value.torn !== undefined) return { kind: "unknown", problem: head.value.torn };
+		this.#markStoreDirty();
+		const sequence = head.value.seq + 1;
+		let payload: unknown;
+		try {
+			payload = build(sequence);
+		} catch (error) {
+			return { kind: "unknown", problem: problem("integration-journal-record", error instanceof Error ? error.message : String(error)) };
+		}
+		const line = (record: JournalRecord): string => `${JSON.stringify(record)}\n`;
+		const base = {
+			schema: JOURNAL_SCHEMA as typeof JOURNAL_SCHEMA,
+			seq: sequence,
+			prev: head.value.prev,
+			at: this.now(),
+			kind,
+			payload,
+		};
+		const record: JournalRecord = { ...base, hash: recordHash(base) };
+		const text = line(record);
+		const bytes = Buffer.byteLength(text, "utf8");
+		if (bytes > MAX_RECORD_BYTES) return { kind: "unknown", problem: problem("integration-journal-record", "통합 저널 기록이 너무 큽니다.") };
+		// A dispatch intent reserves its whole terminal closure; the later effect end, receipt (which repeats the
+		// intent footprint), step and fence clear must fit without a second flat reserve. Terminal records themselves
+		// are the closure and never reserve again.
+		const closure = kind === "intent" ? bytes + CLOSURE_RESERVE : 0;
+		if (head.value.size + bytes + closure > JOURNAL_MAX_BYTES) {
+			return { kind: "unknown", problem: problem("integration-journal-capacity", "실행별 통합 저널 공간이 부족합니다. 남은 후보는 기록하지 않았습니다.") };
+		}
+		const store = await this.#storeBytes();
+		if (store + bytes + closure > STORE_MAX_BYTES) {
+			return { kind: "unknown", problem: problem("integration-store-capacity", "이 프로필의 통합 저장 공간이 부족합니다.") };
+		}
+		try {
+			await assertSessionPathSafe(this.sessionDir, file);
+			const openedNew = head.value.size === 0;
+			const handle = await fs.open(file, "a", 0o600);
+			try {
+				await handle.writeFile(text, "utf8");
+				await handle.sync();
+			} finally {
+				await handle.close().catch(() => undefined);
+			}
+			if (openedNew && !(await syncDirStrict(path.dirname(file)))) {
+				return { kind: "unknown", problem: problem("integration-journal", "통합 저널 디렉터리를 내구성 있게 확정하지 못했습니다.") };
+			}
+		} catch (error) {
+			return {
+				kind: "unknown",
+				problem: problem("integration-journal", `통합 저널 기록을 저장하지 못했습니다${errorCodeOf(error) === undefined ? "" : ` (${errorCodeOf(error)})`}.`),
 			};
-			const record: JournalRecord = { ...base, hash: recordHash(base) };
-			const text = line(record);
-			const bytes = Buffer.byteLength(text, "utf8");
-			if (bytes > MAX_RECORD_BYTES) return { kind: "unknown", problem: problem("integration-journal-record", "통합 저널 기록이 너무 큽니다.") };
-			if (head.value.size + bytes + CLOSURE_RESERVE > JOURNAL_MAX_BYTES) {
-				return { kind: "unknown", problem: problem("integration-journal-capacity", "실행별 통합 저널 공간이 부족합니다. 남은 후보는 기록하지 않았습니다.") };
-			}
-			const store = await this.#storeBytes();
-			if (store + bytes > STORE_MAX_BYTES) {
-				return { kind: "unknown", problem: problem("integration-store-capacity", "이 프로필의 통합 저장 공간이 부족합니다.") };
-			}
-			try {
-				await assertSessionPathSafe(this.sessionDir, file);
-				await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-				const openedNew = head.value.size === 0;
-				const handle = await fs.open(file, "a", 0o600);
-				try {
-					await handle.writeFile(text, "utf8");
-					await handle.sync();
-				} finally {
-					await handle.close().catch(() => undefined);
-				}
-				if (openedNew) await syncDir(path.dirname(file));
-			} catch (error) {
-				return {
-					kind: "unknown",
-					problem: problem("integration-journal", `통합 저널 기록을 저장하지 못했습니다${errorCodeOf(error) === undefined ? "" : ` (${errorCodeOf(error)})`}.`),
-				};
-			}
-			this.heads.set(runId, { size: head.value.size + Buffer.byteLength(text, "utf8"), seq: record.seq, prev: record.hash, torn: undefined });
-			const cached = this.runs.get(runId);
-			if (cached !== undefined) this.runs.set(runId, { size: cached.size + Buffer.byteLength(text, "utf8"), records: [...cached.records, record] });
-			return { kind: "known", value: record };
-		});
+		}
+		this.heads.set(runId, { size: head.value.size + Buffer.byteLength(text, "utf8"), seq: record.seq, prev: record.hash, torn: undefined });
+		const cached = this.runs.get(runId);
+		if (cached !== undefined) this.runs.set(runId, { size: cached.size + Buffer.byteLength(text, "utf8"), records: [...cached.records, record] });
+		return { kind: "known", value: record };
 	}
 
 	async appendManifest(manifest: SealedCaptureManifest): Promise<IntegrationRead<number>> {
@@ -844,6 +892,8 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		const recovery: LateRecoveryObservation[] = [];
 		let lastWrite: CandidateWriteResult | null = null;
 		let touched = false;
+		const intentCandidates = new Map<string, IntegrationCandidateId>();
+		const effectEnds = new Map<string, ProvenEffectEnd>();
 		for (const record of records.value) {
 			if (record.kind === "manifest") {
 				const found = manifestOf(record);
@@ -859,6 +909,40 @@ export class IntegrationJournal implements IntegrationJournalStore {
 				if (found !== undefined && found.candidateId === candidateId) {
 					touched = true;
 					recovery.push(found);
+				}
+				continue;
+			}
+			if (record.kind === "intent") {
+				const found = intentOf(record);
+				if (found !== undefined) intentCandidates.set(found.effectToken, found.candidate.candidateId);
+				continue;
+			}
+			if (record.kind === "effect-end") {
+				const found = effectEndOf(record);
+				if (found !== undefined) effectEnds.set(found.token, found);
+				continue;
+			}
+			if (record.kind === "fence-clear") {
+				const cleared = fenceClearanceOf(record);
+				if (cleared === undefined || intentCandidates.get(cleared.fence.effectToken) !== candidateId) continue;
+				touched = true;
+				if (cleared.disposition === "present-unattributed") {
+					lastWrite = {
+						kind: "present-unattributed",
+						observedAt: record.at,
+						problem: problem("integration-present-clearance", "영수증 없이 이후 상태로 정리된 후보입니다. 같은 후보를 다시 적용하지 않습니다."),
+					};
+				} else if (cleared.disposition === "proved-no-effect") {
+					const end = effectEnds.get(cleared.fence.effectToken) ?? {
+						token: cleared.fence.effectToken,
+						basis: "never-dispatched" as const,
+						observedAt: record.at,
+					};
+					lastWrite = {
+						kind: "no-effect",
+						end,
+						problem: problem("integration-no-effect", "효과가 없음이 증명되어 펜스가 정리된 후보입니다."),
+					};
 				}
 				continue;
 			}
@@ -882,28 +966,68 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		if (records.value.length === 0) return { kind: "known", value: null };
 		const manifests: SealedCaptureManifest[] = [];
 		const recovery = new Map<string, LateRecoveryObservation[]>();
-		const steps = new Map<string, CandidateWriteResult | null>();
+		const latest = new Map<string, CandidateWriteResult | null>();
+		const intentCandidates = new Map<string, IntegrationCandidateId>();
+		const effectEnds = new Map<string, ProvenEffectEnd>();
 		for (const record of records.value) {
 			if (record.kind === "manifest") {
 				const found = manifestOf(record);
 				if (found !== undefined) manifests.push(found);
-			} else if (record.kind === "recovery") {
+				continue;
+			}
+			if (record.kind === "recovery") {
 				const found = recoveryOf(record);
 				if (found !== undefined) {
 					const list = recovery.get(found.candidateId) ?? [];
 					list.push(found);
 					recovery.set(found.candidateId, list);
 				}
-			} else if (record.kind === "step") {
+				continue;
+			}
+			if (record.kind === "intent") {
+				const found = intentOf(record);
+				if (found !== undefined) intentCandidates.set(found.effectToken, found.candidate.candidateId);
+				continue;
+			}
+			if (record.kind === "effect-end") {
+				const found = effectEndOf(record);
+				if (found !== undefined) effectEnds.set(found.token, found);
+				continue;
+			}
+			if (record.kind === "step") {
 				const entry = stepOf(record);
-				if (entry !== undefined) steps.set(entry.step.candidateId, stepToResult(entry.step));
+				if (entry !== undefined) latest.set(entry.step.candidateId, stepToResult(entry.step));
+				continue;
+			}
+			if (record.kind === "fence-clear") {
+				const cleared = fenceClearanceOf(record);
+				if (cleared === undefined) continue;
+				const candidateId = intentCandidates.get(cleared.fence.effectToken);
+				if (candidateId === undefined) continue;
+				if (cleared.disposition === "present-unattributed") {
+					latest.set(candidateId, {
+						kind: "present-unattributed",
+						observedAt: record.at,
+						problem: problem("integration-present-clearance", "영수증 없이 이후 상태로 정리된 후보입니다. 같은 후보를 다시 적용하지 않습니다."),
+					});
+				} else if (cleared.disposition === "proved-no-effect") {
+					latest.set(candidateId, {
+						kind: "no-effect",
+						end: effectEnds.get(cleared.fence.effectToken) ?? {
+							token: cleared.fence.effectToken,
+							basis: "never-dispatched" as const,
+							observedAt: record.at,
+						},
+						problem: problem("integration-no-effect", "효과가 없음이 증명되어 펜스가 정리된 후보입니다."),
+					});
+				}
 			}
 		}
 		for (const manifest of manifests) {
 			onCandidate({
 				manifest,
 				recovery: recovery.get(manifest.admission.candidateId) ?? [],
-				lastWrite: steps.get(manifest.admission.candidateId) ?? null,
+				lastWrite: latest.get(manifest.admission.candidateId) ?? null,
 			});
 		}
 		return { kind: "known", value: { lastSequence: records.value[records.value.length - 1]!.seq } };
@@ -985,6 +1109,14 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		};
 	}
 
+	#operator(input: FenceResolutionRequest): LiveCheck {
+		try {
+			return input.checkOperator();
+		} catch {
+			return { ok: false, reason: "운영자 확인을 받지 못했습니다." };
+		}
+	}
+
 	async resolveFence(input: FenceResolutionRequest, window: ByteWindow): Promise<FenceResolution> {
 		const late = window.signal.aborted
 			? problem("integration-fence", "중단되어 펜스를 정리하지 않았습니다.")
@@ -992,44 +1124,54 @@ export class IntegrationJournal implements IntegrationJournalStore {
 				? problem("integration-fence", "시간이 지나 펜스를 정리하지 않았습니다.")
 				: undefined;
 		if (late !== undefined) return { kind: "kept", problem: late };
-		let live: LiveCheck;
-		try {
-			live = input.checkOperator();
-		} catch {
-			live = { ok: false, reason: "운영자 확인을 받지 못했습니다." };
-		}
-		if (!live.ok) return { kind: "kept", problem: problem("integration-fence-operator", live.reason) };
 		if (!isFence(input.fence)) return { kind: "kept", problem: problem("integration-fence", "펜스 형식이 올바르지 않습니다.") };
-		const inspected = await this.inspectFence(input.fence, window);
-		if (inspected.kind === "unknown") return { kind: "kept", problem: inspected.problem };
-		const value = inspected.value;
-		if (value.effectEnd.kind === "unknown" || value.images.kind === "unknown") {
-			return { kind: "kept", problem: problem("integration-fence", "효과 종료나 대상 이미지를 확인할 수 없어 펜스를 유지합니다.") };
-		}
-		if (value.receipt.kind === "unknown") return { kind: "kept", problem: value.receipt.problem };
-		const receipt = value.receipt.value;
-		const images = value.images.value;
-		let disposition: Extract<FenceResolution, { kind: "released" }>["disposition"] | undefined;
-		if (receipt !== null && images === "all-post") disposition = "durable-receipt";
-		else if (receipt === null && images === "all-post" && value.effectEnd.value.basis === "installer-exit-proved") disposition = "present-unattributed";
-		else if (images === "all-pre") disposition = "proved-no-effect";
-		if (disposition === undefined) {
-			return { kind: "kept", problem: problem("integration-fence-mixed", "대상 이미지가 일관된 이전/이후 상태가 아니어서 펜스를 유지합니다.") };
-		}
+		const first = this.#operator(input);
+		if (!first.ok) return { kind: "kept", problem: problem("integration-fence-operator", first.reason) };
 		const pointer = await this.fencePointer(input.fence);
 		if (pointer.kind === "unknown") return { kind: "kept", problem: pointer.problem };
-		const records = await readJournalFile(pointer.value.journalPath);
-		if (records.kind === "unknown") return { kind: "kept", problem: records.problem };
-		const clear = await appendJournalFile(pointer.value.journalPath, "fence-clear", {
-			fence: input.fence,
-			disposition,
-			audit: input.audit,
-		});
-		if (!clear.ok) return { kind: "kept", problem: clear.problem };
-		const cleared = await this.clearFence(input.fence);
-		if (!cleared.ok) return { kind: "kept", problem: cleared.problem };
-		this.fenceCache.set(input.fence.root, { kind: "clear" });
-		return { kind: "released", disposition };
+		// One cross-process lock covers the fresh proof, the durable decision and the clear, so another session
+		// cannot record a different disposition between our read and our unlink.
+		return serialized(pointer.value.journalPath, () => withFileLock(pointer.value.journalPath, async (): Promise<FenceResolution> => {
+			const inspected = await this.inspectFence(input.fence, window);
+			if (inspected.kind === "unknown") return { kind: "kept", problem: inspected.problem };
+			const value = inspected.value;
+			if (value.effectEnd.kind === "unknown" || value.images.kind === "unknown") {
+				return { kind: "kept", problem: problem("integration-fence", "효과 종료나 대상 이미지를 확인할 수 없어 펜스를 유지합니다.") };
+			}
+			if (value.receipt.kind === "unknown") return { kind: "kept", problem: value.receipt.problem };
+			const receipt = value.receipt.value;
+			const images = value.images.value;
+			let disposition: FenceClearDisposition | undefined;
+			if (receipt !== null && images === "all-post") disposition = "durable-receipt";
+			else if (receipt === null && images === "all-post" && value.effectEnd.value.basis === "installer-exit-proved") disposition = "present-unattributed";
+			else if (images === "all-pre") disposition = "proved-no-effect";
+			if (disposition === undefined) {
+				return { kind: "kept", problem: problem("integration-fence-mixed", "대상 이미지가 일관된 이전/이후 상태가 아니어서 펜스를 유지합니다.") };
+			}
+			const live = this.#operator(input);
+			if (!live.ok) return { kind: "kept", problem: problem("integration-fence-operator", live.reason) };
+			if (window.signal.aborted || !(Date.now() < window.deadline)) {
+				return { kind: "kept", problem: problem("integration-fence", "확인 중에 시간이 지나 펜스를 유지합니다.") };
+			}
+			const clear = await appendJournalFileLocked(pointer.value.journalPath, "fence-clear", {
+				fence: input.fence,
+				disposition,
+				audit: input.audit,
+			});
+			if (!clear.ok) return { kind: "kept", problem: clear.problem };
+			const cleared = await this.#clearFenceUnlocked(
+				input.fence,
+				pointer.value.file,
+				pointer.value.journalPath,
+				true,
+				() => this.#operator(input),
+			);
+			if (!cleared.ok) return { kind: "kept", problem: cleared.problem };
+			return { kind: "released", disposition };
+		}, () => ({
+			kind: "kept" as const,
+			problem: problem("integration-journal-locked", "다른 프로세스가 펜스를 정리하고 있어 유지합니다."),
+		})));
 	}
 
 	async appendIntent(input: { readonly runId: RunId; readonly build: (sequence: number) => WriteIntent }): Promise<IntegrationRead<WriteIntent>> {
@@ -1067,7 +1209,9 @@ export class IntegrationJournal implements IntegrationJournalStore {
 			writtenAt: this.now(),
 		};
 		try {
-			await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+			if (!(await ensureDurableDirectory(dir))) {
+				return { kind: "unknown", problem: problem("integration-fence", "펜스 디렉터리를 내구성 있게 준비하지 못했습니다.") };
+			}
 			const tmp = `${file}.${randomUUID().slice(0, 8)}.tmp`;
 			const handle = await fs.open(tmp, "wx", 0o600);
 			try {
@@ -1076,8 +1220,15 @@ export class IntegrationJournal implements IntegrationJournalStore {
 			} finally {
 				await handle.close().catch(() => undefined);
 			}
-			await fs.rename(tmp, file);
-			await syncDir(dir);
+			try {
+				// The exact effect token is unique; never overwrite a previously published owner.
+				await fs.link(tmp, file);
+			} finally {
+				await fs.unlink(tmp).catch(() => undefined);
+			}
+			if (!(await syncDirStrict(dir))) {
+				return { kind: "unknown", problem: problem("integration-fence", "펜스 파일을 디렉터리에 내구성 있게 확정하지 못했습니다.") };
+			}
 		} catch {
 			return { kind: "unknown", problem: problem("integration-fence", "대상 펜스를 쓰지 못했습니다.") };
 		}
@@ -1143,21 +1294,67 @@ export class IntegrationJournal implements IntegrationJournalStore {
 		return { kind: "known", value: { file, journalPath } };
 	}
 
-	async clearFence(fence: TargetFenceRef): Promise<IntegrationCheck> {
-		const pointer = await this.fencePointer(fence);
-		if (pointer.kind === "unknown") return { ok: false, problem: pointer.problem };
-		const read = await readFenceFile(pointer.value.file);
+	async #clearanceRecorded(fence: TargetFenceRef, journalPath: string): Promise<boolean> {
+		const records = await readJournalFile(journalPath);
+		if (records.kind === "unknown") return false;
+		return records.value.some(record => {
+			const cleared = fenceClearanceOf(record);
+			return cleared !== undefined && sameFence(cleared.fence, fence);
+		});
+	}
+
+	async #clearFenceUnlocked(
+		fence: TargetFenceRef,
+		file: string,
+		journalPath: string,
+		allowRecorded: boolean,
+		beforeUnlink?: () => LiveCheck,
+	): Promise<IntegrationCheck> {
+		const read = await readFenceFile(file);
 		if (read.kind !== "fenced" || !sameFence(read.fence, fence)) {
+			if (allowRecorded && (await pathMissing(file)) && (await this.#clearanceRecorded(fence, journalPath))) {
+				this.fenceCache.set(fence.root, { kind: "clear" });
+				return { ok: true };
+			}
 			return { ok: false, problem: problem("integration-fence", "펜스 파일이 확인 중에 바뀌었습니다.") };
 		}
+		if (beforeUnlink !== undefined) {
+			const live = beforeUnlink();
+			if (!live.ok) return { ok: false, problem: problem("integration-fence-operator", live.reason) };
+		}
 		try {
-			await fs.unlink(pointer.value.file);
-			await syncDir(path.dirname(pointer.value.file));
+			await fs.unlink(file);
 		} catch (error) {
 			if (errorCodeOf(error) !== "ENOENT") return { ok: false, problem: problem("integration-fence", "펜스 파일을 지우지 못했습니다.") };
+			if (!allowRecorded || !(await this.#clearanceRecorded(fence, journalPath))) {
+				return { ok: false, problem: problem("integration-fence", "펜스 파일이 확인 중에 사라졌습니다.") };
+			}
+		}
+		if (!(await syncDirStrict(path.dirname(file)))) {
+			return { ok: false, problem: problem("integration-fence", "펜스 삭제를 디렉터리에 내구성 있게 확정하지 못했습니다.") };
 		}
 		this.fenceCache.set(fence.root, { kind: "clear" });
 		return { ok: true };
+	}
+
+	async clearFence(fence: TargetFenceRef): Promise<IntegrationCheck> {
+		if (!isFence(fence)) return { ok: false, problem: problem("integration-fence", "펜스 형식이 올바르지 않습니다.") };
+		const pointer = await this.fencePointer(fence);
+		if (pointer.kind === "unknown") {
+			// A concurrent resolver may already have removed the exact file and recorded why. Never guess a clear
+			// from absence alone: the target must now read clear and the matching durable decision must exist.
+			const lookup = await this.findFence({ canonicalRoot: fence.root, leaseKey: fence.leaseKey });
+			if (lookup.kind === "clear" && (await this.#clearanceRecorded(fence, this.#journalFile(fence.runId)))) {
+				this.fenceCache.set(fence.root, { kind: "clear" });
+				return { ok: true };
+			}
+			return { ok: false, problem: pointer.problem };
+		}
+		return serialized(pointer.value.journalPath, () => withFileLock(
+			pointer.value.journalPath,
+			() => this.#clearFenceUnlocked(fence, pointer.value.file, pointer.value.journalPath, true),
+			() => ({ ok: false as const, problem: problem("integration-journal-locked", "다른 프로세스가 펜스를 정리하고 있어 지우지 않았습니다.") }),
+		));
 	}
 }
 
@@ -1203,15 +1400,82 @@ async function directoryBytes(root: string): Promise<number> {
 	return total;
 }
 
-async function syncDir(dir: string): Promise<void> {
+/** Whether the exact path is absent; any other error is unknown, never absence. */
+async function pathMissing(file: string): Promise<boolean> {
+	try {
+		await fs.lstat(file);
+		return false;
+	} catch (error) {
+		return errorCodeOf(error) === "ENOENT";
+	}
+}
+
+/** Fsyncs a directory, reporting whether the link itself is durable instead of swallowing a failure. */
+async function syncDirStrict(dir: string): Promise<boolean> {
 	let handle: FileHandle | undefined;
 	try {
 		handle = await fs.open(dir, fsConstants.O_RDONLY);
 		await handle.sync();
+		return true;
 	} catch {
-		// Directory fsync is unavailable on some hosts; the file itself was synced before publication.
+		return false;
 	} finally {
 		await handle?.close().catch(() => undefined);
+	}
+}
+
+/** Creates `dir` and proves every newly created link durable, including the existing ancestor's entry. */
+async function ensureDurableDirectory(dir: string): Promise<boolean> {
+	const target = path.resolve(dir);
+	const missing: string[] = [];
+	let existing: string | undefined;
+	for (let current = target;; current = path.dirname(current)) {
+		try {
+			const st = await fs.stat(current);
+			if (!st.isDirectory()) return false;
+			existing = current;
+			break;
+		} catch (error) {
+			if (errorCodeOf(error) !== "ENOENT") return false;
+			missing.push(current);
+			const parent = path.dirname(current);
+			if (parent === current) return false;
+		}
+	}
+	try {
+		await fs.mkdir(target, { recursive: true, mode: 0o700 });
+	} catch {
+		return false;
+	}
+	if (missing.length === 0) return true;
+	for (const created of missing) {
+		if (!(await syncDirStrict(created))) return false;
+	}
+	return existing === undefined || syncDirStrict(existing);
+}
+
+/**
+ * One cross-process append/clear lock: an atomic directory beside the journal. A crashed owner leaves it in place,
+ * which is a durable unknown, never a timeout-based release; callers fail closed instead of writing beside it.
+ */
+async function withFileLock<T>(file: string, task: () => Promise<T>, busy: () => T): Promise<T> {
+	const lock = `${file}.lock`;
+	const deadline = Date.now() + JOURNAL_LOCK_WAIT_MS;
+	for (;;) {
+		try {
+			await fs.mkdir(lock, { mode: 0o700 });
+			break;
+		} catch (error) {
+			if (errorCodeOf(error) !== "EEXIST" || Date.now() >= deadline) return busy();
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(() => resolve(), JOURNAL_LOCK_POLL_MS);
+			await promise;
+		}
+	}
+	try {
+		return await task();
+	} finally {
+		await fs.rmdir(lock).catch(() => undefined);
 	}
 }
 
@@ -1283,34 +1547,39 @@ async function readJournalFile(file: string): Promise<IntegrationRead<readonly J
 	return { kind: "known", value: records };
 }
 
-/** Appends one operator resolution to the owner's journal without changing any earlier byte. */
-async function appendJournalFile(file: string, kind: JournalKind, payload: unknown): Promise<IntegrationCheck> {
-	return serialized(file, async () => {
-		const records = await readJournalFile(file);
-		if (records.kind === "unknown") return { ok: false, problem: records.problem };
-		const last = records.value[records.value.length - 1];
-		const base = {
-			schema: JOURNAL_SCHEMA as typeof JOURNAL_SCHEMA,
-			seq: (last?.seq ?? 0) + 1,
-			prev: last?.hash ?? "",
-			at: Date.now(),
-			kind,
-			payload,
-		};
-		const record: JournalRecord = { ...base, hash: recordHash(base) };
-		try {
-			const handle = await fs.open(file, "a", 0o600);
-			try {
-				await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
-				await handle.sync();
-			} finally {
-				await handle.close().catch(() => undefined);
-			}
-			return { ok: true };
-		} catch {
-			return { ok: false, problem: problem("integration-journal", "펜스 정리 기록을 저장하지 못했습니다.") };
+/** Appends one operator resolution to the owner's journal without changing any earlier byte. Caller holds the lock. */
+async function appendJournalFileLocked(file: string, kind: JournalKind, payload: unknown): Promise<IntegrationCheck> {
+	const records = await readJournalFile(file);
+	if (records.kind === "unknown") return { ok: false, problem: records.problem };
+	const last = records.value[records.value.length - 1];
+	const base = {
+		schema: JOURNAL_SCHEMA as typeof JOURNAL_SCHEMA,
+		seq: (last?.seq ?? 0) + 1,
+		prev: last?.hash ?? "",
+		at: Date.now(),
+		kind,
+		payload,
+	};
+	const record: JournalRecord = { ...base, hash: recordHash(base) };
+	const text = `${JSON.stringify(record)}\n`;
+	const bytes = Buffer.byteLength(text, "utf8");
+	if (bytes > MAX_RECORD_BYTES) return { ok: false, problem: problem("integration-journal-record", "통합 저널 기록이 너무 큽니다.") };
+	try {
+		const size = (await fs.stat(file)).size;
+		if (size + bytes > JOURNAL_MAX_BYTES) {
+			return { ok: false, problem: problem("integration-journal-capacity", "실행별 통합 저널 공간이 부족해 펜스 정리 기록을 저장하지 않았습니다.") };
 		}
-	});
+		const handle = await fs.open(file, "a", 0o600);
+		try {
+			await handle.writeFile(text, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close().catch(() => undefined);
+		}
+		return { ok: true };
+	} catch {
+		return { ok: false, problem: problem("integration-journal", "펜스 정리 기록을 저장하지 못했습니다.") };
+	}
 }
 
 /** The wire image form of a PathImage; a file image keeps its exact mode, size and digest. */
@@ -1367,8 +1636,12 @@ interface HeldSegment {
 	readonly window: ByteWindow;
 	readonly leaseRoot: string;
 	closed: boolean;
-	readonly attempted: Set<string>;
 }
+
+/** The production installer takes the final synchronous gate; keep this local until the Git-side type lands. */
+type DispatchInstallInput = InstallInput & { readonly beforeDispatch: () => IntegrationCheck };
+/** `effect-unknown` is the Git port's unproved-reap outcome: fenced, never closed as a known end here. */
+type InstallerOutcome = InstallOutcome | { readonly kind: "effect-unknown"; readonly reason: string };
 
 export interface IntegrationWriterOptions {
 	readonly journal: IntegrationJournalStore;
@@ -1469,7 +1742,6 @@ export class IntegrationWriter implements IntegrationWriterPort {
 			window: request.window,
 			leaseRoot: request.lease.root,
 			closed: false,
-			attempted: new Set(),
 		});
 		// The brand is a compiler-only distinction; this object is constructed here and never parsed from storage.
 		const holder = { key: holderKey } as SegmentHolder;
@@ -1489,6 +1761,75 @@ export class IntegrationWriter implements IntegrationWriterPort {
 		} catch (error) {
 			return { ok: false, reason: error instanceof Error ? error.message : String(error) };
 		}
+	}
+
+	/**
+	 * The installer calls this after `git apply --check` has awaited and immediately before the mutating child starts.
+	 * It is the same lease/table/live/publication/fence/deadline gate the effect was accepted under, re-read at the
+	 * actual spawn boundary; no await separates these checks from the installer's decision.
+	 */
+	#dispatchGate(segment: HeldSegment, candidate: CandidateRevision, window: ByteWindow, fence: TargetFenceRef): IntegrationCheck {
+		if (segment.closed) return { ok: false, problem: problem("integration-holder", "통합 적용 자리가 더 이상 유효하지 않습니다.") };
+		if (window.signal.aborted || segment.live.signal.aborted) {
+			return { ok: false, problem: problem("integration-aborted", "통합 작업이 중단되었습니다.") };
+		}
+		if (!(this.now() < window.deadline)) return { ok: false, problem: problem("integration-deadline", "통합 작업 시간이 지났습니다.") };
+		if (!(this.now() < segment.live.audit.deadline)) return { ok: false, problem: problem("integration-deadline", "통합 적용 허용 시간이 지났습니다.") };
+		const lease = leaseStillHeld(segment.lease, segment.snapshot, segment.leaseRoot);
+		if (!lease.ok) return lease;
+		const lanes = runLanes(segment.selection.key.runId);
+		if (lanes === undefined || !lanes.integrationHeld(segment.key)) {
+			return { ok: false, problem: problem("integration-table", "통합 적용 자리가 더 이상 이 실행의 것이 아닙니다.") };
+		}
+		const live = this.#live(segment.live);
+		if (!live.ok) return { ok: false, problem: problem("integration-live", live.reason) };
+		let publication: LiveCheck;
+		try {
+			publication = segment.live.checkCandidate(candidate);
+		} catch (error) {
+			return { ok: false, problem: problem("integration-publish", error instanceof Error ? error.message : String(error)) };
+		}
+		if (!publication.ok) return { ok: false, problem: problem("integration-publish", publication.reason) };
+		try {
+			for (const identity of [segment.target.authorizedRoot, segment.target.gitDir]) {
+				const actual = lstatSync(identity.canonicalPath, { bigint: true });
+				if (!actual.isDirectory() || actual.dev.toString() !== identity.device || actual.ino.toString() !== identity.inode) {
+					return { ok: false, problem: problem("integration-target", "효과 직전에 대상 디렉터리 신원이 바뀌었습니다.") };
+				}
+			}
+		} catch {
+			return { ok: false, problem: problem("integration-target", "효과 직전에 대상 디렉터리 신원을 읽을 수 없습니다.") };
+		}
+		const cached = this.journal.cachedFence(segment.target.authorizedRoot.canonicalPath);
+		if (cached.kind !== "fenced" || !sameFence(cached.fence, fence)) {
+			return { ok: false, problem: problem("integration-fence", "효과 직전에 통합 펜스가 정확히 게시된 상태가 아닙니다.") };
+		}
+		return { ok: true };
+	}
+
+	#readbackWindow(window: ByteWindow): ByteWindow {
+		return {
+			maxBytes: window.maxBytes,
+			deadline: this.now() + POST_DISPATCH_READBACK_MS,
+			signal: new AbortController().signal,
+		};
+	}
+
+	/** The caller's pre-dispatch window may be gone; the post-effect proof still gets one bounded chance. */
+	#bounded<T>(window: ByteWindow, work: Promise<T>, late: () => T): Promise<T> {
+		const { promise, resolve } = Promise.withResolvers<T>();
+		const timer = setTimeout(() => resolve(late()), Math.max(0, window.deadline - this.now()));
+		void work.then(
+			value => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			() => {
+				clearTimeout(timer);
+				resolve(late());
+			},
+		);
+		return promise;
 	}
 
 	async applyCandidate(input: {
@@ -1565,6 +1906,12 @@ export class IntegrationWriter implements IntegrationWriterPort {
 			);
 			return { kind: "already-written", receipt: already.value, presence };
 		}
+		if (stored.value.lastWrite?.kind === "present-unattributed") {
+			return {
+				kind: "refused",
+				problem: problem("integration-present-clearance", "영수증 없이 이후 상태로 이미 정리된 후보는 같은 선택에서 다시 적용하지 않습니다."),
+			};
+		}
 		const fence = await this.journal.findFence({ canonicalRoot: segment.target.authorizedRoot.canonicalPath, leaseKey: segment.target.leaseKey });
 		if (fence.kind !== "clear") {
 			return {
@@ -1580,7 +1927,14 @@ export class IntegrationWriter implements IntegrationWriterPort {
 		const postObservation = await observePostimages(footprint.value, segment.target);
 		if (postObservation.kind === "unknown") return { kind: "refused", problem: postObservation.problem };
 		if (postObservation.value === "all-post") {
-			return { kind: "present-unattributed", observedAt: this.now(), problem: problem("integration-present", "선택 전에 대상이 이미 이후 상태와 같습니다. 영수증 없이 적용으로 기록하지 않습니다.") };
+			const present = problem("integration-present", "선택 전에 대상이 이미 이후 상태와 같습니다. 영수증 없이 적용으로 기록하지 않습니다.");
+			const observedAt = this.now();
+			await this.journal.recordStep(segment.selection.key, {
+				candidateId: input.candidate.candidateId,
+				state: "present-unattributed",
+				problem: present,
+			});
+			return { kind: "present-unattributed", observedAt, problem: present };
 		}
 		const pre = await verifyFootprint(footprint.value, segment.target, this.run, budget, "pre");
 		if (!pre.ok) return { kind: "conflict", problem: pre.problem };
@@ -1641,24 +1995,66 @@ export class IntegrationWriter implements IntegrationWriterPort {
 		if (!(this.now() < segment.live.audit.deadline)) {
 			return { kind: "recovery-required", fence: fenceRead, problem: problem("integration-deadline", "효과 직전에 허용 시간이 끝났습니다.") };
 		}
-		segment.attempted.add(input.candidate.candidateId);
-		const outcome: InstallOutcome = await this.installer.install({ target: segment.target, patch, window: input.window });
+		let gateProblem: IntegrationProblem | undefined;
+		const installInput: DispatchInstallInput = {
+			target: segment.target,
+			patch,
+			window: input.window,
+			beforeDispatch: () => {
+				const gate = this.#dispatchGate(segment, input.candidate, input.window, fenceRead.value);
+				if (!gate.ok) gateProblem = gate.problem;
+				return gate;
+			},
+		};
+		let outcome: InstallerOutcome;
+		try {
+			outcome = (await this.installer.install(installInput)) as InstallerOutcome;
+		} catch (error) {
+			return {
+				kind: "recovery-required",
+				fence: fenceRead,
+				problem: problem("integration-installer", error instanceof Error ? error.message : String(error)),
+			};
+		}
 		const observedAt = this.now();
+		if (outcome.kind === "effect-unknown") {
+			// The mutating child may have run; without a proved reap no effect end is recorded and the fence stays.
+			return {
+				kind: "recovery-required",
+				fence: fenceRead,
+				problem: problem("integration-effect-unknown", outcome.reason),
+			};
+		}
 		if (outcome.kind === "never-dispatched") {
-			await this.journal.appendEffectEnd(input.candidate.key.runId, { token: intent.effectToken, basis: "never-dispatched", observedAt });
-			await this.journal.clearFence(fenceRead.value);
-			await this.journal.recordStep(segment.selection.key, { candidateId: input.candidate.candidateId, state: "no-effect", problem: problem("integration-installer", outcome.reason) });
-			return { kind: "no-effect", end: { token: intent.effectToken, basis: "never-dispatched", observedAt }, problem: problem("integration-installer", outcome.reason) };
+			const noEffect = gateProblem ?? problem("integration-installer", outcome.reason);
+			const end: ProvenEffectEnd = { token: intent.effectToken, basis: "never-dispatched", observedAt };
+			const ended = await this.journal.appendEffectEnd(input.candidate.key.runId, end);
+			if (!ended.ok) return { kind: "recovery-required", fence: fenceRead, problem: ended.problem };
+			const cleared = await this.journal.clearFence(fenceRead.value);
+			if (!cleared.ok) return { kind: "recovery-required", fence: fenceRead, problem: cleared.problem };
+			await this.journal.recordStep(segment.selection.key, { candidateId: input.candidate.candidateId, state: "no-effect", problem: noEffect });
+			return { kind: "no-effect", end, problem: noEffect };
 		}
 		const end: ProvenEffectEnd = { token: intent.effectToken, basis: "installer-exit-proved", observedAt };
 		const endRecorded = await this.journal.appendEffectEnd(input.candidate.key.runId, end);
-		const post = await verifyFootprint(footprint.value, segment.target, this.run, budget, "post");
-		const images = await observePostimages(footprint.value, segment.target);
+		const readbackWindow = this.#readbackWindow(input.window);
+		const readbackBudget = new ByteBudget(readbackWindow, this.now, this.maxExpandedBytes);
+		const post = await this.#bounded(
+			readbackWindow,
+			verifyFootprint(footprint.value, segment.target, this.run, readbackBudget, "post"),
+			() => ({ ok: false, problem: problem("integration-readback", "효과 이후 확인이 제한 시간 안에 끝나지 않았습니다.") }),
+		);
+		const images = await this.#bounded(
+			readbackWindow,
+			observePostimages(footprint.value, segment.target),
+			() => ({ kind: "unknown" as const, problem: problem("integration-readback", "효과 이후 이미지 확인이 제한 시간 안에 끝나지 않았습니다.") }),
+		);
 		if (!endRecorded.ok) return { kind: "recovery-required", fence: fenceRead, problem: endRecorded.problem };
 		if (images.kind === "unknown") return { kind: "recovery-required", fence: fenceRead, problem: images.problem };
 		if (images.value === "all-pre") {
-			await this.journal.clearFence(fenceRead.value);
 			const noEffect = problem("integration-no-effect", `설치 프로그램이 종료됐지만 대상 바이트는 이전 상태 그대로입니다(종료 ${outcome.code}).`);
+			const cleared = await this.journal.clearFence(fenceRead.value);
+			if (!cleared.ok) return { kind: "recovery-required", fence: fenceRead, problem: cleared.problem };
 			await this.journal.recordStep(segment.selection.key, { candidateId: input.candidate.candidateId, state: "no-effect", problem: noEffect });
 			return { kind: "no-effect", end, problem: noEffect };
 		}

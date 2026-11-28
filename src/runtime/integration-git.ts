@@ -31,6 +31,8 @@ export const DELTA_MAX_PARTS = 8;
 const MAX_INDEX_HASH_BYTES = 8 * 1024 * 1024;
 const MAX_PATH_TEXT = 4_096;
 const SCRATCH_PREFIX = "storm-integration-delta-";
+/** After killing a timed-out child, how long its actual reap is awaited before the end stays unproved. */
+const EXIT_PROOF_GRACE_MS = 5_000;
 
 const REGULAR_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
 const HEADER = "diff --git ";
@@ -43,6 +45,8 @@ export interface GitRunResult {
 	readonly stderr: string;
 	readonly code: number;
 	readonly started: boolean;
+	/** False only when a child started but its actual process end was not observed. */
+	readonly ended?: boolean;
 }
 
 export interface GitRunOptions {
@@ -106,6 +110,19 @@ interface GitChild {
 	readonly stderr: ReadableStream<Uint8Array>;
 	readonly exited: Promise<number>;
 	kill(signal?: string | number): void;
+	unref?(): void;
+}
+
+/** Resolves true only when the child's own exited promise settles; a kill request alone proves no end. */
+function awaitReap(exited: Promise<number>, timeoutMs: number): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const timer = setTimeout(() => resolve(false), timeoutMs);
+	const settle = (reaped: boolean): void => {
+		clearTimeout(timer);
+		resolve(reaped);
+	};
+	void exited.then(() => settle(true), () => settle(false));
+	return promise;
 }
 
 /** The production runner: one `git` child with piped stdin/stdout and a hard timeout. */
@@ -135,16 +152,26 @@ export function spawnGit(args: readonly string[], options: GitRunOptions = {}): 
 			result = await exited;
 		} else {
 			const raced = Promise.withResolvers<number>();
+			let timedOut = false;
 			timer = setTimeout(() => {
+				timedOut = true;
 				proc.kill("SIGKILL");
 				raced.resolve(-2);
 			}, timeout);
 			void exited.then(raced.resolve);
 			result = await raced.promise;
+			if (timedOut) {
+				// The kill request is not an observed end: wait for the real reap before reporting any exit.
+				if (!(await awaitReap(exited, EXIT_PROOF_GRACE_MS))) {
+					proc.unref?.();
+					return { stdout: new Uint8Array(), stderr: "", code: -2, started: true, ended: false };
+				}
+				result = await exited;
+			}
 		}
 		clearTimeout(timer);
 		const [out, err] = await Promise.all([stdout, stderr]);
-		return { stdout: new Uint8Array(out), stderr: err, code: result, started: true };
+		return { stdout: new Uint8Array(out), stderr: err, code: result, started: true, ended: true };
 	})();
 }
 
@@ -1210,11 +1237,76 @@ function indexIdentity(filePath: string, st: { dev: bigint; ino: bigint }): Spac
 	return { canonicalPath: filePath, device: st.dev.toString(), inode: st.ino.toString() };
 }
 
+/** Every strict ancestor of a repo-relative path, root first. */
+function strictAncestorsOf(gitPath: string): string[] {
+	const parts = gitPath.split("/");
+	const out: string[] = [];
+	for (let index = 1; index < parts.length; index++) out.push(parts.slice(0, index).join("/"));
+	return out;
+}
+
+/** Adds every strict ancestor of a tracked path to the set of directories that contain a tracked entry. */
+function addTrackedParents(gitPath: string, parents: Set<string>): void {
+	for (const ancestor of strictAncestorsOf(gitPath)) parents.add(ancestor);
+}
+
+interface AncestorQuery {
+	readonly ancestor: string;
+	readonly source: "head" | "index";
+}
+
+/**
+ * Exact D/F topology for the touched paths. `ls-tree -r`/`ls-files` already name real descendants; a batched
+ * `cat-file --batch-check` names any tracked non-directory at a strict ancestor without listing a subtree.
+ */
+async function readBlockingAncestors(
+	gitRoot: string,
+	gitPaths: readonly string[],
+	headOid: string | null,
+	run: GitRun,
+	budget: ByteBudget,
+): Promise<IntegrationRead<ReadonlySet<string>>> {
+	const queries: AncestorQuery[] = [];
+	for (const ancestor of new Set(gitPaths.flatMap(strictAncestorsOf))) {
+		if (headOid !== null) queries.push({ ancestor, source: "head" });
+		queries.push({ ancestor, source: "index" });
+	}
+	if (queries.length === 0) return { kind: "known", value: new Set() };
+	const res = await run(["-C", gitRoot, "cat-file", "--batch-check"], {
+		stdin: queries.map(query => `${query.source === "head" ? "HEAD" : ""}:${query.ancestor}\n`).join(""),
+		env: { GIT_OPTIONAL_LOCKS: "0" },
+		timeoutMs: Math.max(1_000, budget.window.deadline - Date.now()),
+	});
+	if (!res.started || res.code !== 0) {
+		return { kind: "unknown", problem: problem("delta-topology", "대상의 상위 Git 경로 상태를 확인할 수 없습니다.") };
+	}
+	const lines = textOf(res.stdout).split("\n");
+	if (lines[lines.length - 1] === "") lines.pop();
+	if (lines.length !== queries.length) {
+		return { kind: "unknown", problem: problem("delta-topology", "상위 Git 경로 응답 수가 요청과 다릅니다.") };
+	}
+	const blocking = new Set<string>();
+	for (let index = 0; index < queries.length; index++) {
+		const query = queries[index]!;
+		const fields = lines[index]!.split(" ");
+		const type = fields.length >= 2 && fields[1] !== "missing" ? fields[1] : undefined;
+		if (type === undefined) continue;
+		// HEAD may legitimately name a tracked directory; every other resolved form is a file/gitlink ancestor.
+		if (query.source === "head" && type === "tree") continue;
+		blocking.add(query.ancestor);
+	}
+	return { kind: "known", value: blocking };
+}
+
 export interface GoldPath {
 	readonly gitPath: string;
 	readonly worktree: PathImage;
 	readonly head: FootprintHead | null;
 	readonly index: FootprintIndex | null;
+	/** A HEAD or index entry at a strict ancestor path that is not a directory, so an add below it is a D/F conflict. */
+	readonly blockingAncestor?: string;
+	/** True when HEAD or index tracks any entry strictly below this path, so an add here is a D/F conflict. */
+	readonly hasTrackedDescendant?: boolean;
 }
 
 export interface GoldState {
@@ -1231,6 +1323,7 @@ export async function readGoldState(
 	gitPaths: readonly string[],
 	run: GitRun,
 	budget: ByteBudget,
+	options: { readonly topology?: boolean } = {},
 ): Promise<GoldRead> {
 	try {
 		const early = budget.problem();
@@ -1260,6 +1353,16 @@ export async function readGoldState(
 		if (!files.started || files.code !== 0) return { kind: "unknown", problem: problem("delta-index", "index 경로 상태를 확인할 수 없습니다.") };
 		const parsed = parseLsFiles(textOf(files.stdout));
 		if (parsed.unmerged) return { kind: "unknown", problem: problem("delta-unmerged", "병합되지 않은 index 경로가 있습니다.") };
+		const topology = options.topology !== false;
+		const descendantParents = new Set<string>();
+		let blockingAncestors: ReadonlySet<string> = new Set();
+		if (topology) {
+			for (const key of headEntries.keys()) addTrackedParents(key, descendantParents);
+			for (const key of parsed.paths.keys()) addTrackedParents(key, descendantParents);
+			const blocking = await readBlockingAncestors(gitRoot, gitPaths, headOid, run, budget);
+			if (blocking.kind === "unknown") return blocking;
+			blockingAncestors = blocking.value;
+		}
 		const indexFile = path.join(target.gitDir.canonicalPath, "index");
 		let indexSpace: SpaceIdentity | null = null;
 		let indexSha: string | null = null;
@@ -1277,11 +1380,14 @@ export async function readGoldState(
 			const targetPath = target.targetPrefix === "" ? gitPath : gitPath.startsWith(`${target.targetPrefix}/`) ? gitPath.slice(target.targetPrefix.length + 1) : gitPath;
 			const read = await readPathImage(target.authorizedRoot.canonicalPath, targetPath);
 			if (read.kind === "unknown") return { kind: "unknown", problem: read.problem };
+			const blockingAncestor = topology ? strictAncestorsOf(gitPath).find(ancestor => blockingAncestors.has(ancestor)) : undefined;
 			paths.push({
 				gitPath,
 				worktree: read.kind === "absent" ? { kind: "absent" } : read.image,
 				head: headEntries.get(gitPath) ?? null,
 				index: parsed.paths.get(gitPath) ?? null,
+				...(blockingAncestor === undefined ? {} : { blockingAncestor }),
+				...(topology && descendantParents.has(gitPath) ? { hasTrackedDescendant: true } : {}),
 			});
 		}
 		return {
@@ -1310,26 +1416,67 @@ export async function readFootprint(
 	for (const entry of proof.entries) {
 		const live = byPath.get(entry.gitPath);
 		if (live === undefined) return { kind: "unknown", problem: problem("delta-footprint", `대상 경로를 다시 읽지 못했습니다: ${entry.targetPath}`) };
-		paths.push({
+		const footprintPath: FootprintPath = {
 			gitPath: entry.gitPath,
 			targetPath: entry.targetPath,
 			before: entry.before,
 			after: entry.after,
 			head: live.head,
 			index: live.index,
-		});
+		};
+		if (footprintPath.before.state.kind === "absent") {
+			const add = checkAddAllowed(footprintPath, live);
+			if (!add.ok) return { kind: "unknown", problem: add.problem };
+		}
+		paths.push(footprintPath);
 	}
 	return { kind: "known", value: { paths, head: gold.value.head, index: gold.value.index } };
 }
 
-function checkAddAllowed(path: FootprintPath): IntegrationCheck {
+/** A tracked non-directory ancestor or descendant conflicts with an absent-name add even if the live path is absent. */
+function checkAddTopology(live: GoldPath, targetPath: string): IntegrationCheck {
+	if (live.blockingAncestor !== undefined) {
+		return {
+			ok: false,
+			problem: problem(
+				"delta-absent-add-conflict",
+				`새 파일 경로의 상위가 Git에서 파일입니다: ${live.blockingAncestor} (${targetPath})`,
+				targetPath,
+			),
+		};
+	}
+	if (live.hasTrackedDescendant === true) {
+		return {
+			ok: false,
+			problem: problem(
+				"delta-absent-add-conflict",
+				`새 파일 경로 아래에 Git이 추적하는 항목이 있습니다: ${targetPath}`,
+				targetPath,
+			),
+		};
+	}
+	return { ok: true };
+}
+
+function checkAddAllowed(path: FootprintPath, live: GoldPath): IntegrationCheck {
 	if (path.head !== null || path.index !== null) {
 		return {
 			ok: false,
 			problem: problem("delta-absent-add-conflict", `새 파일 경로가 이미 Git에 있습니다: ${path.targetPath}`, path.targetPath),
 		};
 	}
-	return { ok: true };
+	return checkAddTopology(live, path.targetPath);
+}
+
+function dirtyDelete(path: FootprintPath): IntegrationCheck {
+	return {
+		ok: false,
+		problem: problem(
+			"delta-dirty-delete",
+			`삭제할 이전 바이트나 모드가 HEAD/index의 커밋된 값과 다릅니다: ${path.targetPath}`,
+			path.targetPath,
+		),
+	};
 }
 
 function checkDeleteClean(path: FootprintPath, status: ReadonlyMap<string, StatusEntry>): IntegrationCheck {
@@ -1345,6 +1492,9 @@ function checkDeleteClean(path: FootprintPath, status: ReadonlyMap<string, Statu
 			problem: problem("delta-staged-delete", `index에 다른 버전이 있는 파일은 통합으로 삭제할 수 없습니다: ${path.targetPath}`, path.targetPath),
 		};
 	}
+	// Status can hide an assume-unchanged/skip-worktree edit; the patch's exact old object must be the committed one.
+	if (!("oid" in path.before)) return dirtyDelete(path);
+	if (path.before.oid !== path.head.oid || path.before.state.mode !== path.head.mode) return dirtyDelete(path);
 	const entry = status.get(path.gitPath);
 	if (entry !== undefined) {
 		return {
@@ -1390,7 +1540,7 @@ export async function verifyFootprint(
 			if (read.kind === "unknown") return { ok: false, problem: read.problem };
 			status = read.paths;
 		}
-		const current = await readGoldState(target, gitPaths, run, budget);
+		const current = await readGoldState(target, gitPaths, run, budget, { topology: phase === "pre" });
 		if (current.kind === "unknown") return { ok: false, problem: current.problem };
 		const now = current.value;
 		for (const path of footprint.paths) {
@@ -1411,7 +1561,7 @@ export async function verifyFootprint(
 			}
 			if (phase === "pre") {
 				if (path.before.state.kind === "absent") {
-					const add = checkAddAllowed(path);
+					const add = checkAddAllowed(path, live);
 					if (!add.ok) return add;
 				} else if (path.after.state.kind === "absent") {
 					const removed = checkDeleteClean(path, status);
@@ -1466,12 +1616,16 @@ export async function observePostimages(footprint: Footprint, target: Integratio
 /** What the fixed installer proved about its own child process. */
 export type InstallOutcome =
 	| { readonly kind: "never-dispatched"; readonly reason: string }
-	| { readonly kind: "exited"; readonly code: number; readonly stderr: string };
+	| { readonly kind: "exited"; readonly code: number; readonly stderr: string }
+	| { readonly kind: "effect-unknown"; readonly reason: string };
 
 export interface InstallInput {
 	readonly target: IntegrationTarget;
 	readonly patch: Uint8Array;
 	readonly window: ByteWindow;
+	/** Synchronous final gate: called once after the awaited `apply --check` succeeds and before the mutating
+	 * `apply`, with no await in between. A refusal is a no-effect dispatch and must leave the fence to the writer. */
+	readonly beforeDispatch: () => IntegrationCheck;
 }
 
 /** The one fixed installer: `git apply --check`, then `git apply`, never staging, fuzz, 3-way or reject. */
@@ -1485,25 +1639,55 @@ export class GitInstaller implements Installer {
 	async install(input: InstallInput): Promise<InstallOutcome> {
 		const cwd = input.target.gitRoot.canonicalPath;
 		const timeoutMs = Math.max(1_000, input.window.deadline - Date.now());
-		if (input.window.signal.aborted) return { kind: "never-dispatched", reason: "통합 작업이 중단되었습니다." };
-		if (!(Date.now() < input.window.deadline)) return { kind: "never-dispatched", reason: "통합 작업 시간이 지났습니다." };
+		const early = this.#windowProblem(input);
+		if (early !== undefined) return { kind: "never-dispatched", reason: early };
 		const base = ["-c", "core.autocrlf=false", "-c", "core.eol=lf", "-c", "core.safecrlf=false", "-c", "core.quotePath=false", "-c", "apply.whitespace=nowarn"];
-		const check = await this.run([...base, "apply", "--check", "--binary", "--whitespace=nowarn"], {
-			cwd,
-			stdin: input.patch,
-			timeoutMs,
-			env: { GIT_ATTR_NOSYSTEM: "1" },
-		});
+		let check: GitRunResult;
+		try {
+			check = await this.run([...base, "apply", "--check", "--binary", "--whitespace=nowarn"], {
+				cwd,
+				stdin: input.patch,
+				timeoutMs,
+				env: { GIT_ATTR_NOSYSTEM: "1" },
+			});
+		} catch (error) {
+			return { kind: "never-dispatched", reason: `적용 전 검사 프로세스를 시작할 수 없습니다: ${error instanceof Error ? error.message : String(error)}` };
+		}
 		if (!check.started) return { kind: "never-dispatched", reason: `설치 프로세스를 시작할 수 없습니다: ${check.stderr}` };
+		if (check.ended === false) return { kind: "never-dispatched", reason: "적용 전 검사 프로세스의 종료를 확인하지 못했습니다." };
 		if (check.code !== 0) return { kind: "never-dispatched", reason: `적용 전 검사가 실패했습니다: ${check.stderr.trim().slice(0, 400)}` };
-		const applied = await this.run([...base, "apply", "--binary", "--whitespace=nowarn"], {
-			cwd,
-			stdin: input.patch,
-			timeoutMs,
-			env: { GIT_ATTR_NOSYSTEM: "1" },
-		});
+		// This is the last external callback before the mutation: the writer rechecks live/lease/table/deadline here.
+		let gate: IntegrationCheck;
+		try {
+			gate = input.beforeDispatch();
+		} catch (error) {
+			return { kind: "never-dispatched", reason: `적용 직전 검사를 실행할 수 없습니다: ${error instanceof Error ? error.message : String(error)}` };
+		}
+		if (!gate.ok) return { kind: "never-dispatched", reason: gate.problem.reason };
+		const final = this.#windowProblem(input);
+		if (final !== undefined) return { kind: "never-dispatched", reason: final };
+		let applied: GitRunResult;
+		try {
+			applied = await this.run([...base, "apply", "--binary", "--whitespace=nowarn"], {
+				cwd,
+				stdin: input.patch,
+				timeoutMs,
+				env: { GIT_ATTR_NOSYSTEM: "1" },
+			});
+		} catch (error) {
+			return { kind: "effect-unknown", reason: `설치 프로세스의 종료를 확인하지 못했습니다: ${error instanceof Error ? error.message : String(error)}` };
+		}
 		if (!applied.started) return { kind: "never-dispatched", reason: `설치 프로세스를 시작할 수 없습니다: ${applied.stderr}` };
+		if (applied.ended === false) {
+			return { kind: "effect-unknown", reason: `설치 프로세스가 시작됐지만 종료를 확인하지 못했습니다(코드 ${applied.code}).` };
+		}
 		return { kind: "exited", code: applied.code, stderr: applied.stderr };
+	}
+
+	#windowProblem(input: InstallInput): string | undefined {
+		if (input.window.signal.aborted) return "통합 작업이 중단되었습니다.";
+		if (!(Date.now() < input.window.deadline)) return "통합 작업 시간이 지났습니다.";
+		return undefined;
 	}
 }
 
