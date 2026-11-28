@@ -13,7 +13,7 @@
  */
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { CANCEL_IDENTITY_UNKNOWN, EMPTY_CAPTURE_REASON, ISOLATED_BRANCH_UNREAD } from "../../src/runtime/controller.ts";
+import { CANCEL_IDENTITY_UNKNOWN, EMPTY_UNKNOWN_REASON, ISOLATED_BRANCH_UNREAD } from "../../src/runtime/controller.ts";
 import { closeoutOf, LlmCursor, prepare, startFakeLlm, Suite, type Step, until } from "./harness.ts";
 import { installProfile, Sessions, setOmpSettings } from "./phase1-kit.ts";
 
@@ -62,7 +62,7 @@ async function main(): Promise<void> {
 		});
 	}, 300_000);
 
-	await suite.step("a worker that succeeds with nothing to keep is an empty capture, not a failed attempt", async () => {
+	await suite.step("a worker that succeeds with nothing to keep is capture-unknown, not a failed attempt", async () => {
 		setOmpSettings(env, ISOLATION);
 		await sessions.open(() => undefined, async (rpc, files) => {
 			const before = files.runIds();
@@ -72,8 +72,8 @@ async function main(): Promise<void> {
 			const run = await files.finishedRun(before, 240_000);
 			const row = (run.results ?? []).find(entry => entry.id === "empty-artifact");
 			check(
-				"the row names the successful run with nothing to retain, not a failed host attempt",
-				row?.state === "unmet" && (row.reason ?? "").includes(EMPTY_CAPTURE_REASON) && !(row.reason ?? "").includes("호스트 시도를 확인하지 못했습니다"),
+				"the row names the successful run whose capture is unknown, not a failed host attempt",
+				row?.state === "unmet" && (row.reason ?? "").includes(EMPTY_UNKNOWN_REASON) && !(row.reason ?? "").includes("호스트 시도를 확인하지 못했습니다"),
 				JSON.stringify(row ?? null),
 			);
 		});

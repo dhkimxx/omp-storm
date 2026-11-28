@@ -154,7 +154,9 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		const before = files.runIds();
 		await rpc.prompt(runRequest(steps), 240_000);
 		const run = await files.finishedRun(before);
-		const mine = deliveries(rpc.frames, PIN);
+		// A1-5: the lane name is the director's key; the host's agent and job id is the handle this run placed.
+		const pinNative = (run.spawns ?? []).find(spawn => spawn.lane === PIN && spawn.outcome !== "blocked")?.spawnKey;
+		const mine = pinNative === undefined ? [] : deliveries(rpc.frames, pinNative);
 		const jobIds = mine.map(delivery => delivery.jobId);
 		const pin = row(run, "pin-answer");
 		const dep = row(run, "dep-answer");
@@ -163,8 +165,8 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		// The precondition: the host really reused the agent id for the follow-up's job.
 		check(
 			`${label}: omp delivered the first answer and the follow-up under the same job id (the agent id)`,
-			mine.length === 2 && jobIds.every(id => id === PIN) && mine[0]?.channel === "async" && mine[1]?.channel === (how === "wait" ? "wait" : "async"),
-			JSON.stringify(mine),
+			pinNative !== undefined && mine.length === 2 && jobIds.every(id => id === pinNative) && mine[0]?.channel === "async" && mine[1]?.channel === (how === "wait" ? "wait" : "async"),
+			JSON.stringify({ pinNative, mine }),
 		);
 		// What the director read about the ledger, in its own requests: a developer message after the delivery.
 		// The session is resumed between cases, so an earlier case's notices stay in its history: only this case's lanes count.
@@ -185,7 +187,7 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		// "The next request": the first director request that carries the pushed first answer already carries its notice,
 		// and the request that starts the dependant carries the notice that it could.
 		const mainRequests = llm.of("main");
-		const afterFirstAnswer = mainRequests.find(entry => entry.users.some(text => text.includes(`Background job ${PIN} has completed`)));
+		const afterFirstAnswer = mainRequests.find(entry => entry.users.some(text => pinNative !== undefined && text.includes(`Background job ${pinNative} has completed`)));
 		check(
 			`${label}: the director's very next request after the pushed first answer carries the notice`,
 			afterFirstAnswer !== undefined && afterFirstAnswer.notes.some(text => text.includes(LEDGER_NOTICE_TAG) && text.includes("미충족")),
@@ -203,7 +205,7 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 		);
 		check(
 			`${label}: the follow-up's answer is the row's newest attempt: accepted, on its own stamped attempt id`,
-			pin?.state === "accepted" && stamped(pin.attemptId, PIN) && pin.attemptId !== `job:${PIN}:${PIN}`,
+			pin?.state === "accepted" && pinNative !== undefined && stamped(pin.attemptId, pinNative) && pin.attemptId !== `job:${pinNative}:${pinNative}`,
 			JSON.stringify({ state: pin?.state, attemptId: pin?.attemptId, reason: pin?.reason }),
 		);
 		check(
@@ -221,7 +223,7 @@ async function scenario(label: string, how: "wait" | "pushed"): Promise<void> {
 			(run.results ?? []).every(result => result.finalized !== "unsettled"),
 			JSON.stringify((run.results ?? []).map(result => [result.id, result.state, result.finalized])),
 		);
-		const pinAgent = (run.agents ?? []).find(agent => agent.id === PIN);
+		const pinAgent = (run.agents ?? []).find(agent => agent.id === pinNative);
 		check(`${label}: the worker ends idle with its follow-up counted`, pinAgent?.state === "idle" && (pinAgent.followUps ?? 0) >= 1, JSON.stringify(pinAgent));
 	});
 }

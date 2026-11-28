@@ -5,6 +5,7 @@ import {
 	SPEND_SEND_REASON,
 	SPEND_SPAWN_REASON,
 	SPEND_TAG,
+	SPEND_UNKNOWN_LEAD,
 	SPEND_UNKNOWN_TAG,
 	SPEND_USER_STOP_WORD,
 	spendRequestStop,
@@ -31,18 +32,19 @@ describe("a run whose spend is not closed", () => {
 });
 
 describe("under block-spawns", () => {
-	test("a work send to another agent is refused and a quiet progress note passes", () => {
+	test("no message of any kind reaches another agent, quiet notes included", () => {
 		const refused = spendToolRefusal(CLOSED_BLOCK, write("agent://Impl"));
 		expect(refused).toMatchObject({ code: "spend" });
 		expect(refused?.reason.startsWith(SPEND_TAG)).toBe(true);
 		expect(refused?.reason).toContain(SPEND_SEND_REASON);
-		// omp parses the flag, so any spelling it accepts is a quiet note.
-		expect(spendToolRefusal(CLOSED_BLOCK, write("agent://Impl?progress"))).toBeUndefined();
+		// A quiet progress note can start a turn on this host, so it is refused exactly like a work message (B3).
+		expect(spendToolRefusal(CLOSED_BLOCK, write("agent://Impl?progress"))).toMatchObject({ code: "spend" });
+		expect(spendToolRefusal(CLOSED_BLOCK, write("agent://all?progress"))).toMatchObject({ code: "spend" });
 		// An address is read the way omp reads it: a control write is a send, whatever its spelling.
 		expect(spendToolRefusal(CLOSED_BLOCK, write("Agent://Impl/%6Dodel"))).toMatchObject({ code: "spend" });
 	});
 
-	test("a nested spawn is refused; reads, notes and the worker's own work are not", () => {
+	test("a nested spawn is refused; reads, local notes and the worker's own work are not", () => {
 		const spawned = spendToolRefusal(CLOSED_BLOCK, { toolName: "task", input: { tasks: [] } });
 		expect(spawned).toMatchObject({ code: "spend" });
 		expect(spawned?.reason).toContain(SPEND_SPAWN_REASON);
@@ -78,13 +80,28 @@ describe("under stop", () => {
 	});
 });
 
-describe("a marker Storm cannot read", () => {
-	test("refuses new work and leaves the running turn alone", () => {
+describe("a close Storm cannot establish", () => {
+	test("is treated as closed: no message, no new work, and only the worker's own result runs", () => {
 		const send = spendToolRefusal(UNKNOWN, write("agent://Impl"));
 		expect(send).toMatchObject({ code: "spend-unknown" });
 		expect(send?.reason.startsWith(SPEND_UNKNOWN_TAG)).toBe(true);
+		expect(spendToolRefusal(UNKNOWN, write("agent://Impl?progress"))).toMatchObject({ code: "spend-unknown" });
 		expect(spendToolRefusal(UNKNOWN, { toolName: "task", input: {} })).toMatchObject({ code: "spend-unknown" });
-		expect(spendToolRefusal(UNKNOWN, { toolName: "read", input: { path: "a.ts" } })).toBeUndefined();
-		expect(spendRequestStop(UNKNOWN, "Impl")).toEqual({ stop: false });
+		// Treated as a close: every tool but the worker's own result is refused, with the unknown cause named.
+		for (const toolName of ["read", "grep", "bash"]) {
+			const refused = spendToolRefusal(UNKNOWN, { toolName, input: {} });
+			expect(refused).toMatchObject({ code: "spend-unknown" });
+			expect(refused?.reason).toContain(SPEND_UNKNOWN_LEAD);
+		}
+		expect(spendToolRefusal(UNKNOWN, { toolName: "yield", input: {} })).toBeUndefined();
+	});
+
+	test("the next request is not sent, and the notice names the unknown cause rather than a user stop", () => {
+		const decision = spendRequestStop(UNKNOWN, "Impl");
+		expect(decision.stop).toBe(true);
+		if (!decision.stop) throw new Error("expected a stopped request");
+		expect(decision.notice).toContain(SPEND_UNKNOWN_LEAD);
+		expect(decision.notice).toContain("Impl");
+		expect(decision.notice).not.toContain(SPEND_USER_STOP_WORD);
 	});
 });

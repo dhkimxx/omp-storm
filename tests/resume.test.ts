@@ -9,6 +9,10 @@ import {
 	CONTINUATION_HEAD,
 	EARLIER_REQUEST_MARKER,
 	findResumeCandidate,
+	HANDOFF_BACKGROUND_MARKER,
+	HANDOFF_FRESH_DEFAULT,
+	handoffSpec,
+	handoffTask,
 	noteResumePointer,
 	protectedResumeRunIds,
 	resumeCandidate,
@@ -446,5 +450,39 @@ describe("the task a continued run carries", () => {
 	test("the request's limits and the lineage still ride on the spec", () => {
 		const spec = resumeSpec(run({ request: "q", limits: { rounds: 3 }, plan: planned(lane("Pin")) }) as RunRecord & { request: string }, "계속");
 		expect(spec).toMatchObject({ ok: true, spec: { rounds: 3, resumeNote: "계속" } });
+	});
+});
+
+describe("the task a handoff carries (A2-6)", () => {
+	const old = (over: Partial<RunRecord> = {}) =>
+		run({
+			request: "finish the old login work",
+			plan: {
+				submittedAt: "2026-11-26T05:00:00.000Z",
+				workers: { reviewer: 1 },
+				lanes: [{ name: "old-review", kind: "review", role: "reviewer", goal: "judge the old login work", results: [{ id: "old-answer", kind: "answer", criterion: "the old answer" }] }],
+			},
+			...over,
+		}) as RunRecord & { request: string };
+
+	test("the fresh instruction comes first; the earlier material is labelled background, never a lane order", () => {
+		const task = handoffTask(old(), "now document the new retry path");
+		expect(task.startsWith("now document the new retry path")).toBe(true);
+		expect(task).toContain(`${HANDOFF_BACKGROUND_MARKER}\nfinish the old login work`);
+		expect(task).not.toContain("old-review");
+		expect(task).not.toContain("judge the old login work");
+		// A continue with no fresh words still starts with an instruction of this run, never the old plan.
+		const blank = handoffTask(old(), "   ");
+		expect(blank.startsWith(HANDOFF_FRESH_DEFAULT)).toBe(true);
+		expect(blank).not.toContain("old-review");
+	});
+
+	test("the handoff spec keeps the lineage and the request limits, and adds the user's note", () => {
+		const spec = handoffSpec(old({ limits: { rounds: 2, minutes: 5 } }), "새 범위");
+		expect(spec).toMatchObject({ ok: true, spec: { resumeOf: "run-20261120-100000-edit", rounds: 2, minutes: 5, resumeNote: "새 범위" } });
+		if (!spec.ok) return;
+		expect(spec.spec.task).toContain("새 범위");
+		expect(spec.spec.task).toContain(HANDOFF_BACKGROUND_MARKER);
+		expect(spec.spec.task).not.toContain("old-review");
 	});
 });

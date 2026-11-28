@@ -71,10 +71,13 @@ test("an exec-capable writer admitted late keeps its approved unknown scope agai
 		["B", { kind: "paths", paths: ["b.ts"], reason: "paths" }],
 	]);
 	const work = new RunLanes("late-policy");
-	expect(work.place({ agent: "storm-quick", name: "A", task: "a" }, p, team, { now: T0, policies }).ok).toBe(true);
+	const first = work.place({ agent: "storm-quick", name: "A", task: "a" }, p, team, { now: T0, policies });
+	expect(first.ok).toBe(true);
+	if (!first.ok) return;
+	const key = String(first.input.name);
 	work.place({ agent: "storm-explorer", name: "look", task: "look" }, p, team, { now: LATE, policies });
-	expect(at(LATE, () => work.admitChecked({ spawnKey: "A", agent: "storm-quick", outcome: "routed" }, { plan: p, config: team })).ok).toBe(true);
-	const running = [agentEntry({ id: "A", name: "storm-quick", role: "quick", state: "running" })];
+	expect(at(LATE, () => work.admitChecked({ spawnKey: key, agent: "storm-quick", outcome: "routed" }, { plan: p, config: team })).ok).toBe(true);
+	const running = [agentEntry({ id: key, name: "storm-quick", role: "quick", state: "running" })];
 	const second = work.place({ agent: "storm-implementer", name: "B", task: "b" }, p, team, { now: LATE + 1_000, agents: running, policies });
 	expect(refusedWrite(second)).toBe(true);
 });
@@ -250,11 +253,14 @@ const unknownPolicy = (...names: string[]) => new Map(names.map(name => [name, {
 test("a job batch and a required check are refused while a settled worker's place is held until its parent's call ends", () => {
 	const p = plan(writer("A"), writer("B"));
 	const work = new RunLanes("holders-held", () => []);
-	expect(work.place({ agent: "storm-implementer", name: "A", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), callId: "sync-1", now: T0 }).ok).toBe(true);
-	work.admit({ spawnKey: "A", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team });
-	work.agentStarted("A");
-	work.releaseAgent("A");
-	const settled = [agentEntry({ id: "A", name: "storm-implementer", role: "implementer", state: "idle", requests: 2, lastActivityAt: T0 + 5 })];
+	const first = work.place({ agent: "storm-implementer", name: "A", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), callId: "sync-1", now: T0 });
+	expect(first.ok).toBe(true);
+	if (!first.ok) return;
+	const key = String(first.input.name);
+	work.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team });
+	work.agentStarted(key);
+	work.releaseAgent(key);
+	const settled = [agentEntry({ id: key, name: "storm-implementer", role: "implementer", state: "idle", requests: 2, lastActivityAt: T0 + 5 })];
 	// The worker's place is held (its call is still open): the same table that refuses a second worker and a director command
 	// refuses a job batch and a required check.
 	expect(refusedWrite(work.place({ agent: "storm-implementer", name: "B", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), agents: settled, now: T0 + 10 }))).toBe(true);
@@ -270,12 +276,15 @@ test("a host that has job rows but cannot show them keeps a settled async worker
 	const rows: { current: HostRows | undefined } = { current: undefined };
 	const p = plan(writer("A"), writer("B"));
 	const work = new RunLanes("rows-unreadable", () => rows.current);
-	expect(work.place({ agent: "storm-implementer", name: "A", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), callId: "async-1", now: T0 }).ok).toBe(true);
-	work.admit({ spawnKey: "A", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team });
+	const first = work.place({ agent: "storm-implementer", name: "A", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), callId: "async-1", now: T0 });
+	expect(first.ok).toBe(true);
+	if (!first.ok) return;
+	const key = String(first.input.name);
+	work.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team });
 	work.callEnded("async-1");
-	work.agentStarted("A");
-	work.releaseAgent("A");
-	const settled = [agentEntry({ id: "A", name: "storm-implementer", role: "implementer", state: "idle", requests: 2, lastActivityAt: T0 + 5 })];
+	work.agentStarted(key);
+	work.releaseAgent(key);
+	const settled = [agentEntry({ id: key, name: "storm-implementer", role: "implementer", state: "idle", requests: 2, lastActivityAt: T0 + 5 })];
 	expect(refusedWrite(work.place({ agent: "storm-implementer", name: "B", task: "x" }, p, team, { policies: unknownPolicy("A", "B"), agents: settled, now: T0 + 10 }))).toBe(true);
 	expect(work.commitDirectorExec({ callId: "c1", now: T0 + 10 }).ok).toBe(false);
 	// The rows can be read again and show no running task job of A: the place is free.

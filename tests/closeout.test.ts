@@ -6,6 +6,8 @@ import {
 	CLOSEOUT_RESULT_MAX,
 	CLOSEOUT_TEXT_MAX,
 	CLOSEOUT_WHY_MAX,
+	HANDOFF_CHANGE_RECORD_NOTE,
+	SHARED_CHANGE_RISK,
 	type CloseoutDraft,
 	closeoutBrief,
 	closeoutHandoff,
@@ -17,6 +19,7 @@ import {
 	resetCloseoutChoices,
 	storedCloseout,
 	takeCloseoutChoice,
+	UNKNOWN_CHANGE_RISK,
 } from "../src/runtime/closeout.ts";
 import { HANDOFF_RESUME_LABEL } from "../src/runtime/resume.ts";
 import { NO_DECLARED_RESULTS } from "../src/runtime/result-facts.ts";
@@ -380,9 +383,10 @@ describe("a run with no declared result rows", () => {
 		});
 		const handoff = closeoutHandoff(run);
 		expect(handoff).toContain("- Results: none declared");
-		expect(handoff).toContain("- Out-of-plan deliveries: 2");
-		expect(handoff).toContain("storm-explorer (changed, $0.0300)");
-		expect(handoff).toContain("storm-implementer (change unknown, $0.0200)");
+		expect(handoff).toContain("- Unasked arrivals: 2");
+		expect(handoff).toContain("storm-explorer (changed files, $0.0300)");
+		expect(handoff).toContain("storm-implementer (file change unknown, $0.0200)");
+		expect(handoff).toContain(HANDOFF_CHANGE_RECORD_NOTE);
 		expect(Buffer.byteLength(handoff)).toBeLessThanOrEqual(CLOSEOUT_HANDOFF_MAX_BYTES);
 	});
 
@@ -402,21 +406,37 @@ describe("a run with no declared result rows", () => {
 		expect(brief.official.label.length).toBeLessThan(120);
 		const handoff = closeoutHandoff(run);
 		expect(Buffer.byteLength(handoff)).toBeLessThanOrEqual(CLOSEOUT_HANDOFF_MAX_BYTES);
-		expect(handoff).toContain("Out-of-plan deliveries: 200");
+		expect(handoff).toContain("Unasked arrivals: 200");
 		expect(handoff).toContain("197 not listed");
 		expect(handoff.match(/storm-explorer-/g)?.length ?? 0).toBeLessThanOrEqual(3);
 	});
 });
 
 describe("closeout residual and facts", () => {
-	test("F6: an interrupted run with writes reports unverified changes, never a fake completion", () => {
+	test("F6: an interrupted run with writes reports only what was positively placed, never a fake completion", () => {
+		// No plan, no spawn, no accepted parent-tree result: the worker's change counter does not say where it wrote.
 		const brief = closeoutBrief(
 			record({ status: "stopped", endReason: "interrupted", endedAt: after(4), agents: [agentEntry({ changes: 3 })] }),
 		);
 		expect(brief.tier).toBe("card");
-		expect(brief.residual).toEqual(["검증되지 않은 변경이 작업 트리에 남아 있을 수 있습니다(변경한 워커 1개)."]);
+		expect(brief.residual).toHaveLength(1);
+		expect(brief.residual[0]).toContain(UNKNOWN_CHANGE_RISK);
+		expect(brief.residual[0]).not.toContain(SHARED_CHANGE_RISK);
 		expect(brief.director).toBeUndefined();
 		expect(brief.actions).toEqual([]);
+		// Only an accepted parent-tree result of that exact worker places its writes in the shared tree.
+		const shared = closeoutBrief(
+			record({
+				status: "stopped",
+				endReason: "interrupted",
+				endedAt: after(4),
+				plan: plan(lane("work", "code", { results: [{ id: "r1", kind: "change", criterion: "changed", path: "a.ts" }] })),
+				spawns: [spawnRecord({ lane: "work" })],
+				results: [{ id: "r1", lane: "work", state: "accepted", attemptId: "job:J:Impl", contract: { id: "r1", kind: "change", criterion: "changed", path: "a.ts" } }],
+				agents: [agentEntry({ changes: 1 })],
+			}),
+		);
+		expect(shared.residual.some(line => line.includes(SHARED_CHANGE_RISK))).toBe(true);
 		// Quick-only work needs no review and leaves no such residual.
 		expect(closeoutBrief(record({ status: "ended", endReason: "unreviewed", agents: [agentEntry({ role: "quick", changes: 1 })] })).residual).toEqual([]);
 	});

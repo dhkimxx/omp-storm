@@ -302,11 +302,14 @@ async function main(): Promise<void> {
 	}, 120_000, { always: true });
 
 	await suite.step("spawn routing outside a run", async () => {
+		// Case 5 of 0.29.0: a Storm-role worker on a pooled thread is stopped even with no run on disk. This check is
+		// about the models a role's spawn is answered with, so it runs those spawns on the main thread.
+		writeFileSync(PROFILE_FILE, `${PROFILE_CONFIG}task:\n  workerThreads: 0\n`);
 		const llm = new LlmCursor(env);
 		const config = await session(cancelAll, async (rpc, files) => {
 			await rpc.turn("E2E-TASK storm-implementer storm-quick storm-architect");
 			return files.config();
-		});
+		}).finally(() => writeFileSync(PROFILE_FILE, PROFILE_CONFIG));
 		const kids = children(llm.all());
 		const primary = config.roles.implementer?.models[0];
 		const effort = /:(\w+)$/.exec(primary ?? "")?.[1];

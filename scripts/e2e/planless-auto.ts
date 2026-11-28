@@ -84,8 +84,8 @@ async function main(): Promise<void> {
 			);
 			check(
 				"a second call with two shared writers is refused as a batch and starts nothing",
-				toolResults(frames, "task").some(result => result.includes("[storm:lane-write]")) && delivered(llm, pairMarker) === 0,
-				`laneWrite=${toolResults(frames, "task").some(result => result.includes("[storm:lane-write]"))} pairChildren=${delivered(llm, pairMarker)}`,
+				toolResults(frames, "task").some(result => result.includes("[storm:lane-write]")) && delivered(llm, pairMarker) === 0 && run.spawns.length === 1 && files.runIds().size === before.size + 1,
+				`laneWrite=${toolResults(frames, "task").some(result => result.includes("[storm:lane-write]"))} pairChildren=${delivered(llm, pairMarker)} spawns=${run.spawns.length} runs=${files.runIds().size}/${before.size + 1}`,
 			);
 			check(
 				"the closeout says there are no declared results and shows the worker count",
@@ -96,6 +96,28 @@ async function main(): Promise<void> {
 		});
 		check("the solo worker's child request reached the provider", delivered(llm, "E2E-CHILD-WRITE " + SOLO) >= 1, `children=${delivered(llm, "E2E-CHILD-WRITE " + SOLO)}`);
 	}, 300_000);
+
+	await suite.step("a first batch refused as a whole opens no run and leaves no worker (A2-4)", async () => {
+		const llm = new LlmCursor(env);
+		const marker = "first-refused-pair";
+		await sessions.open(() => undefined, async (rpc, files) => {
+			const before = files.runIds();
+			const steps: Step[] = [
+				{
+					tasks: [
+						{ agent: "storm-implementer", task: "Write a", say: `${marker}-a` },
+						{ agent: "storm-implementer", task: "Write b", say: `${marker}-b` },
+					],
+				},
+			];
+			const frames = await rpc.turn(`E2E-STEPS ${JSON.stringify(steps)}`, 120_000);
+			const taskText = toolResults(frames, "task").join("\n");
+			check("the first call was refused for the whole batch", taskText.includes("[storm:lane-write]"), taskText.slice(-400) || "no task result");
+			check("no run was opened", files.runIds().size === before.size, `runs=${files.runIds().size} before=${before.size}`);
+			check("no worker of the refused batch reached the provider", delivered(llm, marker) === 0, `children=${llm.of("child").length}`);
+			check("nothing of the refused batch is on disk", !existsSync(join(env.project, "first-refused-a.txt")) && !existsSync(join(env.project, "first-refused-b.txt")), "");
+		});
+	}, 240_000);
 
 	await suite.step("a run that ends with its worker still running is stoppable, and continue hands it off", async () => {
 		const llm = new LlmCursor(env);

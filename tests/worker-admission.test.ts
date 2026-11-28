@@ -1,11 +1,12 @@
 /** The persisted parent-to-child admission bridge, exercised without any in-process authority map. */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildId, STORM_BUILD } from "../src/build.ts";
-import { MAX_APPROVED_BYTES } from "../src/config/schema.ts";
+import { ADMISSION_CLOSING_ROOM, MAX_ADMISSION_BYTES, MAX_APPROVED_BYTES } from "../src/config/schema.ts";
 import * as fsutil from "../src/fsutil.ts";
 import { lanePolicy } from "../src/policy/capability.ts";
 import { sessionStoreDir } from "../src/session-scope.ts";
@@ -316,9 +317,10 @@ describe("worker admission records", () => {
 	});
 
 	test("a marker without a close reads as open, and a written close is seen, cached and kept across later admissions", async () => {
-		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
+		// No admission record and no run: an ordinary native child is not fenced by a fact that never existed.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId, childId: "native" })).toEqual({ kind: "open" });
 		await admit({ childId: "A" });
-		// The read above cached an answer before the marker existed; the marker it now names is still open.
+		// A read that cached an answer before the marker existed still sees the new marker as open.
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "open" });
 		const at = 1_800_000_000_000;
 		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop", now: at })).toEqual({ ok: true });
@@ -327,11 +329,167 @@ describe("worker admission records", () => {
 		// A spawn admitted after the close does not erase it.
 		await admit({ childId: "B" });
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		// The first close stands: a later observation, even with the user's other option, never restates it.
 		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "block-spawns", now: at + 1 })).toEqual({ ok: true });
 		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({
 			kind: "closed",
-			close: { at: at + 1, onExceed: "block-spawns" },
+			close: { at, onExceed: "stop" },
 		});
+	});
+
+	test("B4: a descendant finds the close through the run named in its own admission, and a missing marker is unknown", async () => {
+		await admit({ childId: "Impl" });
+		// The unplanned worker's own eval child: the same run, a marker named by the worker rather than the director.
+		await admit({ parentId: "Impl", childId: "Inner", runId });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl" })).toEqual({ kind: "open" });
+		const at = 1_800_000_000_000;
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop", now: at })).toEqual({ ok: true });
+		// The grandchild's immediate-parent marker never carried the close; the run-keyed receipt is what it reads.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl" })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl", runId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		// The worker's own admission names a run the marker cannot answer for: never read as open.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl", runId: "run-other" })).toMatchObject({ kind: "unknown" });
+		// A marker that is gone is a fact the managed worker cannot establish, not an open run.
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		for (const name of await readdir(runs)) {
+			if (name.endsWith(".json")) await rm(join(runs, name), { force: true });
+		}
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId, childId: "Impl" })).toMatchObject({ kind: "unknown" });
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId: "Impl", childId: "Inner" })).toMatchObject({ kind: "unknown" });
+		// An ordinary native child of the same tree has no record and no run: it keeps the open answer.
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId, childId: "native" })).toEqual({ kind: "open" });
+	});
+
+	test("B4: a stale admission marker cannot erase a published close, and a replaced receipt is read again", async () => {
+		await admit();
+		const at = 1_800_000_000_000;
+		expect(await closeWorkerSpend({ agentDir, artifactRoot: artifacts, parentId, runId, onExceed: "stop", now: at })).toEqual({ ok: true });
+		// An admission that read the marker before the close can rewrite it afterwards; the close is not in that file.
+		const runs = join(agentDir, "storm", "admissions", "runs");
+		const [name] = (await readdir(runs)).filter(entry => entry.endsWith(".json"));
+		const file = join(runs, name!);
+		const marker = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		await writeFile(file, JSON.stringify({ ...marker, createdAt: Number(marker.createdAt) + 1 }));
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		// A receipt replaced atomically with the same size and modification time is still a different file: read again.
+		const closedDir = join(agentDir, "storm", "admissions", "closes");
+		const [closeName] = await readdir(closedDir);
+		const closeFile = join(closedDir, closeName!);
+		const fixed = new Date("2026-11-21T00:00:00Z");
+		const cached = await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId });
+		expect(cached).toEqual({ kind: "closed", close: { at, onExceed: "stop" } });
+		await utimes(closeFile, fixed, fixed);
+		const later = { ...JSON.parse(await readFile(closeFile, "utf8")) as Record<string, unknown>, close: { at: at + 1, onExceed: "stop" } };
+		await writeFile(`${closeFile}.new`, JSON.stringify(later));
+		await utimes(`${closeFile}.new`, fixed, fixed);
+		await rename(`${closeFile}.new`, closeFile);
+		expect(await readWorkerSpendClose({ agentDir, artifactRoot: artifacts, parentId })).toEqual({ kind: "closed", close: { at: at + 1, onExceed: "stop" } });
+	});
+
+	test("RF6o case 1: a holder that lost the lock does not release the new holder's lock", async () => {
+		const first = await admit();
+		const dir = join(agentDir, "storm", "admissions");
+		const file = join(dir, `${first.key}.json`);
+		const lock = join(dir, `.${first.key}.lock`);
+		const realRename = fsp.rename;
+		const entered: Array<() => void> = [];
+		const release: Array<() => void> = [];
+		let parked = 0;
+		const spy = spyOn(fsp, "rename").mockImplementation(async (from, to) => {
+			if (to === file && parked < 2) {
+				const gate = Promise.withResolvers<void>();
+				parked++;
+				release.push(() => gate.resolve());
+				entered[parked - 1]?.();
+				await gate.promise;
+			}
+			await realRename(from, to);
+		});
+		const firstReached = Promise.withResolvers<void>();
+		entered[0] = () => firstReached.resolve();
+		const firstOp = endWorkerAdmission(agentDir, first.key, first.record.attempt, "worker");
+		try {
+			await firstReached.promise;
+			// The first holder was paused past the staleness bound; the second takes the lock over.
+			const stale = new Date(Date.now() - 6_000);
+			await utimes(lock, stale, stale);
+			const secondReached = Promise.withResolvers<void>();
+			entered[1] = () => secondReached.resolve();
+			const secondOp = recordWorkerStop(agentDir, { key: first.key, runId, childId, attempt: first.record.attempt, reason: "pooled-thread" });
+			await secondReached.promise;
+			release[0]?.();
+			await firstOp;
+			// The late holder's release must leave the lock the second holder still owns.
+			expect((await lstat(lock)).isFile()).toBe(true);
+			release[1]?.();
+			await secondOp;
+		} finally {
+			for (const open of release) open();
+			await firstOp.catch(() => undefined);
+			spy.mockRestore();
+		}
+	});
+
+	test("RF6o case 4: an obsolete record is removed under the record lock after it was read again", async () => {
+		const dir = join(agentDir, "storm", "admissions");
+		await mkdir(dir, { recursive: true });
+		const key = "a".repeat(64);
+		const target = join(dir, `${key}.json`);
+		await writeFile(target, JSON.stringify({ schema: "storm.worker-admission/v1", runId: "old" }));
+		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
+		await utimes(target, stale, stale);
+		const realRm = fsp.rm;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let parked = false;
+		const spy = spyOn(fsp, "rm").mockImplementation(async (path, options) => {
+			if (!parked && path === target) {
+				parked = true;
+				entered.resolve();
+				await release.promise;
+			}
+			await realRm(path, options);
+		});
+		const admission = admit({ childId: "AfterCleanup" });
+		try {
+			await entered.promise;
+			expect((await lstat(join(dir, `.${key}.lock`))).isFile()).toBe(true);
+		} finally {
+			release.resolve();
+			await admission;
+			spy.mockRestore();
+		}
+	});
+
+	test("RF6o case 5: an obsolete marker is removed under the marker lock after it was read again", async () => {
+		const dir = join(agentDir, "storm", "admissions", "runs");
+		await mkdir(dir, { recursive: true });
+		const key = "b".repeat(64);
+		const target = join(dir, `${key}.json`);
+		await writeFile(target, JSON.stringify({ schema: "storm.worker-run/v1", runId: "old" }));
+		const stale = new Date(Date.now() - 9 * 24 * 3_600_000);
+		await utimes(target, stale, stale);
+		const realRm = fsp.rm;
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let parked = false;
+		const spy = spyOn(fsp, "rm").mockImplementation(async (path, options) => {
+			if (!parked && path === target) {
+				parked = true;
+				entered.resolve();
+				await release.promise;
+			}
+			await realRm(path, options);
+		});
+		const admission = admit({ childId: "AfterMarkerCleanup" });
+		try {
+			await entered.promise;
+			expect((await lstat(join(dir, `.${key}.lock`))).isFile()).toBe(true);
+		} finally {
+			release.resolve();
+			await admission;
+			spy.mockRestore();
+		}
 	});
 
 	test("a new run in the same tree and parent starts open, and a close names exactly its own run", async () => {
@@ -428,6 +586,17 @@ describe("worker admission records", () => {
 		expect(Buffer.byteLength(JSON.stringify(wide.map(selector => ({ selector, effort: "low" }))))).toBeGreaterThan(MAX_APPROVED_BYTES);
 		await expect(admit({ approved: wide.map(selector => ({ selector, effort: "low" })) })).rejects.toThrow(/바이트/);
 		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+		// The run marker is written only after the record is known to fit; a live marker for an unstorable admission
+		// would make every other unrecorded child of the run read as unknown (RF6o case 6).
+		expect(await readdir(join(agentDir, "storm", "admissions", "runs")).catch(() => [] as string[])).toEqual([]);
+	});
+
+	test("RF6o case 7: a record near the size bound leaves room to be closed, or is refused", async () => {
+		const id = "m".repeat(900);
+		const near = Array.from({ length: 4351 }, (_, index) => ({ selector: `a/${id}-${index}`, effort: "low" as const }));
+		await expect(admit({ approved: near })).rejects.toThrow(new RegExp(`${MAX_ADMISSION_BYTES - ADMISSION_CLOSING_ROOM}`));
+		expect((await readWorkerAdmission({ agentDir, artifactRoot: artifacts, parentId, childId })).kind).toBe("missing");
+		expect(await readdir(join(agentDir, "storm", "admissions", "runs")).catch(() => [] as string[])).toEqual([]);
 	});
 
 	test("RF4-11: housekeeping removes an aged record of an older schema and leaves a fresh one", async () => {

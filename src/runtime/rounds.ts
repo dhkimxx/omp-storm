@@ -24,10 +24,19 @@ export const STATUS_LABEL: Record<RunStatus, string> = {
 	stopped: "중단",
 };
 
+/**
+ * What a `no-changes` end records: Storm's own before/after read of the parent work tree found no difference. The read
+ * cannot see an isolated worker's own checkout, a retained patch, or work that never ran, so the label names the check
+ * instead of saying nothing changed anywhere (Run P §§4, 7).
+ */
+export const NO_PARENT_CHANGE_LABEL = "부모 트리 전후 비교에서 변경 없음";
+/** The same fact for the English handoff: what was compared, never a tree-wide claim. */
+export const NO_PARENT_CHANGE_HANDOFF = "no parent-tree change seen by Storm's before/after read";
+
 /** Korean labels for the reasons a run can end with. */
 export const END_LABEL: Readonly<Record<RunEndReason, string>> = {
 	verified: "리뷰 통과",
-	"no-changes": "변경 없음",
+	"no-changes": NO_PARENT_CHANGE_LABEL,
 	unreviewed: "리뷰 없이 끝남",
 	"no-reviewer": "리뷰 역할 없음",
 	interrupted: "사용자가 중단",
@@ -497,8 +506,9 @@ function outputSettled(
  */
 export interface GateFacts {
 	/**
-	 * A director path edit was committed during the run. The change may then be the director's own, so the gate must not
-	 * credit it to the cheap role: `quick-only` is refused and the integrated review is required (R10, F2).
+	 * The director committed a change of the shared tree itself during the run: a path edit, or a command that could
+	 * write which it ran while it held the tree. The change may then be the director's own, so the gate must not credit
+	 * it to the cheap role: `quick-only` is refused and the integrated review is required (R10, F2, B10).
 	 */
 	directorEdit?: boolean;
 }
@@ -529,8 +539,8 @@ function gateCore(
 	// A read that fails after a known start is a change Storm cannot rule out; a run without a start tree has no tree evidence.
 	const treeChanged = coverage?.restoredChange === true ||
 		(tree?.start !== undefined && (tree.now === undefined || tree.start.diff !== tree.now.diff || tree.start.files !== tree.now.files));
-	// A change the team can put down to the quick role alone needs no reviewer: quick agents do small, self-contained work.
-	// A director edit in the run removes that reading: the change may be the director's own, so only a review can settle it.
+	// A change the director made itself (a path edit or a command that could write) removes that reading: the change
+	// may be the director's own, so only a review can settle it.
 	const directorEdit = facts?.directorEdit === true;
 	const quickOnly = !directorEdit && agents.some(agent => agent.role === "quick") && !agents.some(agent => agent.role === "implementer" || agent.role === undefined);
 	const treeNow = tree?.now === undefined || tree.now.incomplete ? undefined : treeFingerprint(tree.now);
@@ -554,7 +564,8 @@ function gateCore(
 	};
 	const pendingLane = coverage?.lanes?.find(lane => lane.state !== "done");
 	if (writers.length === 0 && !treeChanged && changes === 0) {
-		// An unchanged tree is not success when planned work never ran; continue the lane, without a reviewer.
+		// No worker recorded a change and Storm's own before/after read of the parent tree differed in nothing. The code
+		// says only that: an isolated worker's checkout and a retained patch are outside that read.
 		if (pendingLane) return unverified("lanes", { lane: pendingLane.name });
 		return { state: "none", why: "no-changes" };
 	}

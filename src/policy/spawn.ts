@@ -374,6 +374,10 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		const builtinKey = BUILTIN_AGENT_ROLES[event.agent];
 		const builtin = builtinKey === undefined ? undefined : usableRole(checked.config, builtinKey);
 		const counted: Partial<SpawnRecord> = builtinKey === undefined ? {} : { role: builtinKey };
+		// B1: a project or user definition ahead of the bundled one under the name Storm routes runs instead of it, so
+		// the definition needs the same approval the role agents do. The model and effort check below stays the second layer.
+		const shadow = shadowBlock(state, event.agent);
+		if (shadow) return block(shadow, counted);
 		// A native agent outside omp's known role substitutes has no lane, role cap or capability decision. During a
 		// run that is an unattributed writer, not an ordinary spawn: refuse it rather than guess from its model or name.
 		const unmapped: SpawnBlock | undefined =
@@ -485,6 +489,26 @@ export function decideSpawn(event: SpawnEvent, state: SpawnState, runtime: Spawn
 		return route(models, { outcome: "trial", role: roleKey, ...trialTag });
 	}
 	return route(ordered, { outcome: "routed", role: roleKey, ...trialTag, ...(droppedNote === "" ? {} : { reason: `${CREDENTIAL_DROP_NOTE} ${all.length - ordered.length}개` }) });
+}
+
+/**
+ * What the team knows about one agent before any run exists: whether a spawn of it could be admitted at all. The same
+ * `decideSpawn` membership checks answer (team approval, role or stand-in, disabled role, routable name, approved
+ * definition), with no budget, concurrency or credential facts; those are decided at the spawn hook as before. A
+ * plan-less first batch runs this for every item before it opens a run, so an agent the team cannot run leaves nothing
+ * behind (A2-4).
+ */
+export function preflightSpawnBlock(state: SpawnState, agent: string, now: number): SpawnBlock | undefined {
+	const outcome = decideSpawn(
+		{ agent, invocationKind: "task", patterns: [], spawnKey: "preflight" },
+		state,
+		{ now, run: { runId: "preflight", costUsd: 0 }, quotaMarks: [], trials: {} },
+	);
+	const record = outcome.record;
+	if (record === undefined || record.outcome !== "blocked") return undefined;
+	const code = record.code;
+	if (code === undefined) return undefined;
+	return { code, reason: record.reason ?? "이 에이전트는 승인된 팀에서 실행할 수 없습니다." };
 }
 
 /** How long a spawn decision may take: under omp's 30 s handler budget, past which omp runs the spawn unseen. */

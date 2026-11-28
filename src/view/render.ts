@@ -3,13 +3,14 @@ import { unknownFields } from "../config/schema.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import { agentRows, agentStatusSpans, renderAgentRows } from "../report/agents.ts";
 import { ROLE_AGENT_PREFIX, roleTitle, STORM_VERSION, workerRange } from "../roles.ts";
-import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE } from "../runtime/contract-text.ts";
+import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, CHECKOUT_SNAPSHOT_NOTE, PLANLESS_PLACEMENT_NOTE, RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
+import { CAPTURE_UNKNOWN_LABEL } from "../runtime/closeout.ts";
 import { goalTotals } from "../runtime/goal.ts";
 import { resultFacts, workerCountText, type ResultFacts } from "../runtime/result-facts.ts";
 import { CONTINUATION_HEAD } from "../runtime/resume.ts";
 import { reviewLine } from "../runtime/review.ts";
 import { endLabel, STATUS_LABEL } from "../runtime/rounds.ts";
-import { unplannedLine } from "../runtime/unplanned.ts";
+import { outOfPlanLine, unplannedLine } from "../runtime/unplanned.ts";
 import { idleAppearance, RUN_APPEARANCE, STORM_MARK } from "./appearance.ts";
 import { GOAL_LABEL, goalText } from "./closeout.ts";
 import { resultRowText, type ResultProgress } from "./results.ts";
@@ -532,6 +533,27 @@ export function targetScopeLine(root: string): string {
 }
 
 /**
+ * §5: a plan-less placement's work location (whether it was an isolated checkout) is not in the record on this host.
+ * The host record is where to look, and Storm does not claim the checkout was cleaned. Fixed size, one line.
+ */
+export function planlessPlacementNote(facts: Pick<ResultFacts, "activity">): string | undefined {
+	return facts.activity.unplannedPlaced === 0 ? undefined : `- ${PLANLESS_PLACEMENT_NOTE} ${CHECKOUT_CLEANUP_NOTE}`;
+}
+
+/** Row 1/§5: one status line says what a retained acceptance's judged source is and is not. */
+export function retainedSourceLine(facts: Pick<ResultFacts, "retained">): string | undefined {
+	return facts.retained.count === 0 ? undefined : `- ${RETAINED_SOURCE_NOTE}`;
+}
+
+/** Row 8/§5: no bound recovery reference for a stopped or failed worker; the native delivery is the pointer. */
+export function captureUnknownLine(facts: Pick<ResultFacts, "captureUnknown">): string | undefined {
+	const unknown = facts.captureUnknown;
+	if (unknown === undefined) return undefined;
+	const native = unknown.native === undefined ? "" : ` 네이티브 기록: ${unknown.native}`;
+	return `- ${CAPTURE_UNKNOWN_LABEL}: 중단·실패한 워커 ${unknown.count}개의 패치·브랜치는 이 기록에 결속되어 있지 않습니다.${native}`;
+}
+
+/**
  * The whole status. For the user it leads with present state, version and a real next action, then the active and
  * last run, then everything else with the commands that fix what it points out. For the model (the storm tool) it is
  * the same facts without advice the director could act on (omp commands, /restart, cost flags) and without file
@@ -612,8 +634,16 @@ export function renderStatus(
 		// The model already reads the goal's earlier use in its resume handoff; the status line is for the user.
 		const goal = model ? undefined : goalLine(run, now);
 		if (goal !== undefined) styled([{ text: goal, tone: "muted" }]);
+		const unplannedWork = outOfPlanLine(run);
+		if (unplannedWork !== undefined) styled([{ text: `- ${unplannedWork}`, tone: "muted" }]);
 		const unplanned = unplannedLine(run);
 		if (unplanned !== undefined) styled([{ text: `- ${unplanned}`, tone: "muted" }]);
+		const keptNote = retainedSourceLine(outcome);
+		if (keptNote !== undefined) styled([{ text: keptNote, tone: "muted" }]);
+		const unknownCapture = captureUnknownLine(outcome);
+		if (unknownCapture !== undefined) styled([{ text: unknownCapture, tone: "warning" }], undefined, "status.warning");
+		const planless = planlessPlacementNote(outcome);
+		if (planless !== undefined) styled([{ text: planless, tone: "muted" }]);
 		if (run.plan) {
 			for (const line of isolationLaneLines(run.plan, run)) styled([{ text: line }], undefined, "status.warning");
 			const note = isolationNote(run.plan);
@@ -854,6 +884,8 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			out.push(outcomeLine.text);
 			if (info) info.push({ index: resultIndex, icon: outcomeLine.icon, spans: outcomeLine.spans });
 		}
+		const unknownCapture = captureUnknownLine(outcome);
+		if (unknownCapture !== undefined) out.push(unknownCapture);
 		const progress = runProgressParts(run, now);
 		const progressIndex = out.length;
 		out.push(`- ${progress.join(" · ")}`);
@@ -901,6 +933,8 @@ export function renderStatusBrief(view: StatusView, now: number, info?: InfoLine
 			out.push(outcomeLine.text);
 			if (info) info.push({ index: resultIndex, icon: outcomeLine.icon, spans: outcomeLine.spans });
 		}
+		const unknownCapture = captureUnknownLine(outcome);
+		if (unknownCapture !== undefined) out.push(unknownCapture);
 	}
 	const team = c.status === "ok" ? `팀 설정 ${shortHash(c.hash)}` : c.status === "missing" ? "팀 설정 없음" : "팀 설정 오류";
 	const approval = view.approval ? "승인됨" : "미승인";
@@ -1076,9 +1110,17 @@ function lastRunLines(run: RunRecord, details: boolean, now = 0): string[] {
 	const outcome = resultLine(facts, { detailed: details });
 	if (outcome !== undefined) out.push(outcome.text);
 	if (details) for (const row of facts.progress.rows) out.push(`- ${resultRowText(row, { includeScope: true })}`);
-	// Work that answered no declared result: a count, beside the result count it never changes.
+	// Work that answered no declared result: out-of-plan work and unasked arrivals are separate facts.
+	const unplannedWork = outOfPlanLine(run);
+	if (unplannedWork !== undefined) out.push(`- ${unplannedWork}`);
 	const unplanned = unplannedLine(run);
 	if (unplanned !== undefined) out.push(`- ${unplanned}`);
+	const keptNote = retainedSourceLine(facts);
+	if (keptNote !== undefined) out.push(keptNote);
+	const unknownCapture = captureUnknownLine(facts);
+	if (unknownCapture !== undefined) out.push(unknownCapture);
+	const planless = planlessPlacementNote(facts);
+	if (planless !== undefined) out.push(planless);
 	const goal = details ? goalLine(run, now) : undefined;
 	if (goal !== undefined) out.push(goal);
 	out.push(`- 스폰: ${spawns}`);

@@ -23,12 +23,12 @@ import type {
 import { MAX_RESULT_ID } from "../plan/validate.ts";
 import { formatUsd } from "../policy/spawn.ts";
 import type { ResultRow } from "../view/results.ts";
-import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE } from "./contract-text.ts";
+import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE, PLANLESS_PLACEMENT_NOTE } from "./contract-text.ts";
 import { goalTotals } from "./goal.ts";
-import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type ResultFacts, type RetainedFacts } from "./result-facts.ts";
+import { OUT_OF_PLAN_LABEL, resultFacts, workerCountText, type CaptureUnknown, type ResultFacts, type RetainedFacts } from "./result-facts.ts";
 import { HANDOFF_RESUME_LABEL } from "./resume.ts";
-import { endLabel, STATUS_LABEL } from "./rounds.ts";
-import { spendText, unplannedLine, unplannedTotal } from "./unplanned.ts";
+import { endLabel, NO_PARENT_CHANGE_HANDOFF, STATUS_LABEL } from "./rounds.ts";
+import { outOfPlanLine, spendText, unplannedLine, unplannedSplit } from "./unplanned.ts";
 
 /** Verification is detail, kept for status; it is never repeated on the card. */
 export const CLOSEOUT_TEXT_MAX = 400;
@@ -222,18 +222,40 @@ function acceptedOutput(run: RunRecord, result: RunResult): boolean {
  */
 export const NO_RESULTS_VERDICT = "리뷰 통과(결과 집계 없음)";
 /**
- * Row 1: when every accepted result is a retained artifact, the run met its artifact requirements outside the target.
- * The words never claim the tree holds the work; the tone is accent, so no tick is drawn.
+ * Row 1: when every accepted result is a retained artifact, the run met its artifact requirements outside the parent
+ * tree. The words say only what Storm did with them: it applied nothing. They never claim the tree did not change,
+ * because a worker or the director may have changed it (B7). The tone is accent, so no tick is drawn.
  */
-export const RETAINED_ONLY_VERDICT = "보존 산출물 충족 · 대상 트리 변경 없음";
+export const RETAINED_ONLY_VERDICT = "부모 밖 보존 산출물 충족 · Storm이 대상에 적용한 것 없음";
+/** Every declared row is out of the user's scope: there is no fraction and no success to show. */
+export const ALL_EXCLUDED_VERDICT = "결과 전부 사용자 제외";
 /** Row 2: a recorded stop is a separate fact from the final result evidence, and the card says so. */
 export const STOP_SEPARATE_NOTE = "실행 종료 사유는 결과 판정과 별개로 기록되었습니다";
+/**
+ * §5: a tree-write risk is stated only for a worker whose own accepted parent-tree result places its writes in the
+ * shared tree. A worker's change counter alone proves no location.
+ */
+export const SHARED_CHANGE_RISK = "검증되지 않은 변경이 공유 작업 트리에 남아 있을 수 있습니다";
+/** The same risk when the record does not establish where the changed worker wrote. */
+export const UNKNOWN_CHANGE_RISK = "작업 위치를 기록으로 확인하지 못했습니다";
+/** A stopped or failed worker's retained patch or branch is not bound to this record; the native record is the pointer. */
+export const CAPTURE_UNKNOWN_LABEL = "보존 캡처 미상";
+/** The same fact in the English handoff. */
+export const CAPTURE_UNKNOWN_HANDOFF = "capture unknown";
+/** Row 1/§5 in the handoff: the judged source is outside the parent, and what that does not prove. */
+export const RETAINED_OUTSIDE_HANDOFF = "judged outside the parent tree";
+/** The same count word for the handoff's result line, so a kept-only run never reads as tree work there either. */
+export const RETAINED_OUTSIDE_COUNT = "retained outside the parent";
+export const RETAINED_ABSENCE_HANDOFF = "that proves neither their bytes absent from the parent nor an unchanged tree";
+/** A delivery's change flag is a worker record, not a scan of the parent tree. */
+export const HANDOFF_CHANGE_RECORD_NOTE = "file-change records, not parent-tree proof";
 
 function runReasonLabel(run: RunRecord, facts: ResultFacts): string {
 	const reason = run.endReason;
 	if (reason === undefined) return "";
 	if (reason !== "verified") return endLabel(reason);
 	if (!facts.hasDeclared) return NO_RESULTS_VERDICT;
+	if (facts.allExcluded) return ALL_EXCLUDED_VERDICT;
 	// All accepted evidence is kept outside the target: the verdict says that instead of "required results met", which
 	// reads as if the tree held the candidates.
 	if (facts.retained.count > 0 && facts.retained.count === facts.progress.counts.accepted) return RETAINED_ONLY_VERDICT;
@@ -302,25 +324,37 @@ function namesText(names: readonly string[], shown = 2): string {
 }
 
 /**
- * Risks the record itself supports, never an inference about external state: writes that no verification covered,
- * host jobs whose end was never observed, planned lanes no open row already names, and a budget stop.
+ * Risks the record itself supports, never an inference about external state: writes positively placed in the shared tree
+ * that no verification covered, host jobs whose end was never observed, planned lanes no open row already names, and a
+ * budget stop. A worker's own change counter is not a tree claim: a plan-less placement, a team-isolated run and a
+ * worker without a bound parent-tree result are reported as unknown instead (Run P §§4, 7).
  */
-function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes: ReadonlySet<string>, retained: RetainedFacts): string[] {
+function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes: ReadonlySet<string>, result: ResultFacts): string[] {
 	const out: string[] = [];
-	const agents: readonly AgentEntry[] = Array.isArray(run.agents) ? run.agents : [];
-	const writers = agents.filter(agent => (agent.changes ?? 0) > 0 && agent.role !== "quick").length;
+	const retained = result.retained;
 	// §5/rows 9 and 11: an isolated run's closeout carries what a checkout is and is not, and that its cleanup is not
-	// Storm's claim. Fixed size, one line, whether one lane or a hundred.
+	// Storm's claim. A plan-less placement may have been isolated without a stored fact, so it carries the same
+	// qualification. Fixed size, one line, whether one lane or a hundred.
 	const isolatedLanes = (Array.isArray(run.plan?.lanes) ? run.plan.lanes : []).filter(
 		lane => typeof lane.isolationReason === "string" && lane.isolationReason.trim() !== "",
 	).length;
-	if (retained.count > 0 || isolatedLanes > 0) out.push(`${CHECKOUT_PLACEMENT_NOTE} ${CHECKOUT_CLEANUP_NOTE}`);
+	const planless = result.activity.unplannedPlaced;
+	if (retained.count > 0 || isolatedLanes > 0 || planless > 0) {
+		const planlessNote = planless > 0 ? ` ${PLANLESS_PLACEMENT_NOTE}` : "";
+		out.push(`${CHECKOUT_PLACEMENT_NOTE}${planlessNote} ${CHECKOUT_CLEANUP_NOTE}`);
+	}
 	// Row 2 (P7-B): the record's stop and its final evidence are separate facts; the card must not imply one judged the other.
 	if (run.status === "stopped" && (run.results ?? []).some(row => row.state === "accepted")) {
 		out.push(`${STOP_SEPARATE_NOTE}.`);
 	}
-	if (run.endReason !== "verified" && writers > 0) {
-		out.push(`검증되지 않은 변경이 작업 트리에 남아 있을 수 있습니다(변경한 워커 ${writers}개).`);
+	// §5: only a positively attributed parent-tree write may be called a shared-tree change. Anything the record cannot
+	// place says unknown and points at the native record; a private worker's changes are never a parent-tree warning.
+	const changes = result.changes;
+	if (run.endReason !== "verified" && changes.shared > 0) {
+		const unknownPart = changes.unknown > 0 ? `, 작업 위치 미상 ${changes.unknown}개` : "";
+		out.push(`${SHARED_CHANGE_RISK}(공유 트리에 쓴 워커 ${changes.shared}개${unknownPart}).`);
+	} else if (run.endReason !== "verified" && changes.unknown > 0) {
+		out.push(`변경을 기록한 워커 ${changes.unknown}개: ${UNKNOWN_CHANGE_RISK}. 부모 작업 트리 변경 여부는 알 수 없습니다. 네이티브 기록에서 확인하세요.`);
 	}
 	const jobs = (Array.isArray(run.jobs) ? run.jobs : []).filter(job => job?.status === "started" || job?.status === "unknown");
 	if (jobs.length > 0) {
@@ -334,8 +368,7 @@ function residualOf(run: RunRecord, facts: CloseoutFacts | undefined, openLanes:
 }
 
 /** Ends that settle without anything left to judge; every other end leaves a durable card. */
-const CLEAN_ENDS: ReadonlySet<string> = new Set(["verified", "no-changes", "unreviewed"]);
-
+const CLEAN_ENDS: Readonly<Record<string, true | undefined>> = { verified: true, "no-changes": true, unreviewed: true };
 function minutesOf(run: RunRecord): number | undefined {
 	const start = Date.parse(run.startedAt);
 	const end = typeof run.endedAt === "string" ? Date.parse(run.endedAt) : Number.NaN;
@@ -353,12 +386,14 @@ function toneOf(run: RunRecord, facts: ResultFacts, open: number, residual: numb
 	if (residual > 0) return "warning";
 	// A pass over changes is not a pass over declared results: no success mark when the record holds no result row.
 	if (!facts.hasDeclared) return "accent";
+	// All rows excluded: nothing was in scope, so nothing succeeded either.
+	if (facts.allExcluded) return "accent";
 	return run.status === "done" ? "success" : "accent";
 }
 
 /** The code-written resume label: what the existing resume path does, never a selective acceptance. */
 function resumeLabel(facts: ResultFacts): string {
-	if (!facts.hasDeclared) return HANDOFF_RESUME_LABEL;
+	if (!facts.hasDeclared || facts.allExcluded) return HANDOFF_RESUME_LABEL;
 	return `이어 가기 — 수용 ${facts.progress.counts.accepted}건은 현재 증거로 다시 확인하고 나머지 ${facts.progress.counts.inScope - facts.progress.counts.accepted}건을 다시 엽니다`;
 }
 
@@ -370,6 +405,12 @@ function runLabel(item: Extract<CloseoutNext, { kind: "run" }>): string {
 export interface CloseoutRetainedBrief extends CloseoutBrief {
 	/** Row 1: accepted retained artifacts kept outside the target, with one safe reference. */
 	readonly retained?: RetainedFacts;
+	/**
+	 * Row 8/§5: a stopped or failed worker's retained patch or branch is not bound to this record. When no bound retained
+	 * reference exists, the native delivery is the only pointer; the card says capture unknown rather than implying the
+	 * worker left nothing.
+	 */
+	readonly captureUnknown?: CaptureUnknown;
 }
 
 /**
@@ -398,20 +439,23 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		if (row.lane !== undefined) openLanes.add(row.lane);
 	}
 	const openTotal = Object.values(open).reduce((sum, n) => sum + n, 0);
-	const residual = residualOf(run, stored, openLanes, fact.retained);
+	const residual = residualOf(run, stored, openLanes, fact);
 	// Work that happened outside the declared results is a fact the card names, not a risk: it shapes neither the tier
-	// nor the tone, and it takes a place on the card only from the lowest-ranked risk.
-	const unplanned = unplannedLine(run);
-	const shownResidual = unplanned === undefined ? residual : [...residual.slice(0, RESIDUAL_MAX - 1), unplanned];
+	// nor the tone, and it takes a place on the card only from the lowest-ranked risk. Asked-for work and unsolicited
+	// arrivals are two different facts and are never merged into one count (B8).
+	const unplannedLines = [outOfPlanLine(run), unplannedLine(run)].filter((line): line is string => line !== undefined);
+	const shownResidual = [...residual.slice(0, Math.max(0, RESIDUAL_MAX - unplannedLines.length)), ...unplannedLines];
 	const minutes = minutesOf(run);
 	const settled =
 		run.status !== "budget-exceeded" &&
 		run.endReason !== undefined &&
-		CLEAN_ENDS.has(run.endReason) &&
+		CLEAN_ENDS[run.endReason] === true &&
 		openTotal === 0 &&
 		progress.counts.excluded === 0 &&
 		// A retained acceptance must show its patch reference; a one-line closeout would hide where the bytes are.
 		fact.retained.count === 0 &&
+		// A stopped or failed worker's unbound capture is named on the card; a one-line closeout would hide it.
+		fact.captureUnknown === undefined &&
 		residual.length === 0;
 	const tier: CloseoutBrief["tier"] =
 		run.status === "running" ? "none" : settled && (minutes === undefined || minutes < CLOSEOUT_CARD_MINUTES) ? "line" : "card";
@@ -458,6 +502,7 @@ export function closeoutBrief(run: RunRecord, options: { resumable?: boolean } =
 		runId: run.runId,
 		tier,
 		retained: fact.retained,
+		...(fact.captureUnknown === undefined ? {} : { captureUnknown: fact.captureUnknown }),
 		request: clean(run.task, REQUEST_MAX),
 		...(target ? { target } : {}),
 		startedAt: run.startedAt,
@@ -541,34 +586,60 @@ export function closeoutHandoff(run: RunRecord): string {
 	const runRef = /^run-[0-9A-Za-z-]+$/.test(run.runId) ? run.runId : "(unknown)";
 	const minutes = minutesOf(run);
 	const rounds = typeof run.turns === "number" ? `, ${run.turns}${typeof run.maxRounds === "number" ? `/${run.maxRounds}` : ""} rounds` : "";
-	const reason = typeof run.endReason === "string" ? ` (${scrub(run.endReason, NAME_MAX)})` : "";
+	// §5: the stored code `no-changes` is not repeated as if nothing changed; the label names Storm's own before/after
+	// read of the parent tree.
+	const reason =
+		typeof run.endReason !== "string"
+			? ""
+			: run.endReason === "no-changes"
+				? ` (${NO_PARENT_CHANGE_HANDOFF})`
+				: ` (${scrub(run.endReason, NAME_MAX)})`;
 	const duration = minutes === undefined ? "" : `, ${Math.max(1, Math.round(minutes))} min`;
 	const openParts = (Object.keys(OPEN_WORDS) as OpenKind[])
 		.filter(kind => official.open[kind] > 0)
 		.map(kind => `${OPEN_WORDS[kind]} ${official.open[kind]}`);
-	const results = official.hasResults
-		? `- Results: accepted ${official.accepted}/${official.inScope}${official.excluded > 0 ? `, excluded by user ${official.excluded}` : ""}${openParts.length > 0 ? `; open: ${openParts.join(", ")}` : ""}`
-		: "- Results: none declared";
-	// Row 1: retained artifact acceptance is not tree work. One bounded line names the count and the first safe patch
-	// reference; Storm applied nothing to the target.
 	const kept = brief.retained;
+	// A kept-only run's count says where its source is; the retained line below adds what that does not prove.
+	const keptAll = kept !== undefined && kept.count > 0 && kept.count === official.accepted;
+	const acceptedCount = keptAll ? `${official.accepted}/${official.inScope} ${RETAINED_OUTSIDE_COUNT}` : `accepted ${official.accepted}/${official.inScope}`;
+	const results =
+		official.inScope > 0
+			? `- Results: ${acceptedCount}${official.excluded > 0 ? `, excluded by user ${official.excluded}` : ""}${openParts.length > 0 ? `; open: ${openParts.join(", ")}` : ""}`
+			: official.hasResults
+				? `- Results: none in scope, excluded by user ${official.excluded}`
+				: "- Results: none declared";
+	// Row 1: retained artifact acceptance is not tree work. One bounded line names the count and the first safe patch
+	// reference; the judged source is outside the parent, and that proves neither absence there nor an unchanged tree.
 	const retainedLine =
 		kept === undefined || kept.count === 0
 			? undefined
-			: `- Retained: ${kept.count} accepted artifact${kept.count === 1 ? "" : "s"} kept outside the target${kept.capture === undefined ? "" : ` (${scrub(kept.capture, PROOF_MAX)}${kept.attempt === undefined ? "" : `, ${scrub(kept.attempt, NAME_MAX)}`})`}; Storm applied nothing to the target`;
+			: `- Retained: ${kept.count} accepted artifact${kept.count === 1 ? "" : "s"} ${RETAINED_OUTSIDE_HANDOFF}${kept.capture === undefined ? "" : ` (${scrub(kept.capture, PROOF_MAX)}${kept.attempt === undefined ? "" : `, ${scrub(kept.attempt, NAME_MAX)}`})`}; Storm applied nothing to the target; ${RETAINED_ABSENCE_HANDOFF}`;
+	// Row 8/§5: a stopped or failed worker's patch or branch is not bound to this record. The native delivery is named
+	// instead of implying the worker left nothing or inventing a capture.
+	const unknownCapture = brief.captureUnknown;
+	const recoveryLine =
+		unknownCapture === undefined
+			? undefined
+			: `- Recovery: ${CAPTURE_UNKNOWN_HANDOFF} for ${unknownCapture.count} stopped or failed worker${unknownCapture.count === 1 ? "" : "s"}; the record holds no bound patch or branch${unknownCapture.native === undefined ? "" : `, native delivery ${unknownCapture.native}`}`;
 	// Work that answers no declared result is part of the record a handoff carries: who delivered, whether it changed
-	// files and what it cost. The list is bounded like every other handoff line.
+	// files and what it cost. Asked-for out-of-plan work is stated apart from arrivals nobody asked for (B8). The list
+	// is bounded like every other handoff line.
 	const deliveries = Array.isArray(run.unplanned) ? run.unplanned : [];
-	const deliveryTotal = unplannedTotal(run);
+	const split = unplannedSplit(run);
+	const total = split.outOfPlan + split.unasked;
 	const shownDeliveries = deliveries.slice(0, 3).map(delivery => {
-		const changed = delivery.changed === true ? "changed" : delivery.changed === false ? "no change" : "change unknown";
+		// A worker's change flag records its own tool results; it is not a scan of the parent tree and is labelled so.
+		const changed = delivery.changed === true ? "changed files" : delivery.changed === false ? "no file change recorded" : "file change unknown";
 		const cost = typeof delivery.costUsd === "number" && Number.isFinite(delivery.costUsd) ? formatUsd(delivery.costUsd) : "cost unknown";
 		return `${scrub(delivery.agent, NAME_MAX)} (${changed}, ${cost})`;
 	});
+	// Details are listed only when every delivery is of the same class; a mixed record gets the two counts and no
+	// per-worker text, so the handoff stays bounded.
+	const detailText = shownDeliveries.length === 0 ? "" : `: ${shownDeliveries.join("; ")}${total > shownDeliveries.length ? ` (+${total - shownDeliveries.length} not listed)` : ""}`;
+	const recordNote = `; ${HANDOFF_CHANGE_RECORD_NOTE}`;
 	const outOfPlan =
-		deliveryTotal === 0
-			? undefined
-			: `- Out-of-plan deliveries: ${deliveryTotal}${shownDeliveries.length > 0 ? `: ${shownDeliveries.join("; ")}` : ""}${deliveryTotal > shownDeliveries.length ? ` (+${deliveryTotal - shownDeliveries.length} not listed)` : ""}`;
+		split.outOfPlan === 0 ? undefined : `- Out-of-plan work: ${split.outOfPlan}${split.unasked === 0 ? detailText : ""}${recordNote}`;
+	const unasked = split.unasked === 0 ? undefined : `- Unasked arrivals: ${split.unasked}${split.outOfPlan === 0 ? detailText : ""}${recordNote}`;
 	const stale = [...finalizedById(run).values()].some(marker => marker !== undefined);
 	const said = stale ? "director's words, written before the final judgment; the counts above prevail" : "director's words, not evidence";
 	const blockers = brief.userActions;
@@ -584,7 +655,9 @@ export function closeoutHandoff(run: RunRecord): string {
 		`- Status: ${scrub(run.status, NAME_MAX)}${reason}${rounds}${duration}`,
 		results,
 		retainedLine,
+		recoveryLine,
 		outOfPlan,
+		unasked,
 		goal,
 		brief.target ? `- Target: ${scrub(brief.target, TARGET_MAX)}` : undefined,
 		...brief.residual.map(text => `- Residual: ${scrub(text, 100)}`),

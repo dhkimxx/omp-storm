@@ -45,6 +45,8 @@ interface Derived {
 	readonly activityAt: number | undefined;
 	/** Wall-clock ms the lane's first worker or job started, when the record still knows it. */
 	readonly startedAt: number | undefined;
+	/** Every accepted result is kept outside the target: not applied work (B7). */
+	readonly retained?: true;
 }
 
 interface Tally {
@@ -57,6 +59,8 @@ interface Tally {
 	/** Over every row, scope aside: what a dependent lane needs from this one (the controller's rule). */
 	accepted: number;
 	submitted: number;
+	/** Accepted rows that are retained artifacts kept outside the target. */
+	kept: number;
 }
 
 function tallyResults(run: RunRecord, progress: ResultProgress): ReadonlyMap<string, Tally> {
@@ -71,11 +75,12 @@ function tallyResults(run: RunRecord, progress: ResultProgress): ReadonlyMap<str
 		if (lane === undefined) continue;
 		let tally = byLane.get(lane);
 		if (tally === undefined) {
-			tally = { rows: 0, inScope: 0, met: 0, reviewable: 0, unmet: 0, blocked: false, accepted: 0, submitted: 0 };
+			tally = { rows: 0, inScope: 0, met: 0, reviewable: 0, unmet: 0, blocked: false, accepted: 0, submitted: 0, kept: 0 };
 			byLane.set(lane, tally);
 		}
 		tally.rows++;
 		if (row.state === "accepted") tally.accepted++;
+		if (row.state === "accepted" && row.kept) tally.kept++;
 		if (row.state === "accepted" || row.state === "reviewable") tally.submitted++;
 		if (row.excluded) continue;
 		tally.inScope++;
@@ -193,7 +198,10 @@ function deriveLane(run: RunRecord, byName: ReadonlyMap<string, PlanLane>, lane:
 
 	// The user's scope decision is final for the picture, whatever the lane's worker is doing.
 	if (allExcluded) return done("excluded", undefined, startedAt);
-	if (allMet) return done("accepted", undefined, startedAt);
+	if (allMet) {
+		const acceptedRetained = tally !== undefined && tally.met > 0 && tally.kept === tally.met;
+		return { ...done("accepted", undefined, startedAt), ...(acceptedRetained ? { retained: true as const } : {}) };
+	}
 
 	if (isJob) {
 		if (receipt === undefined || receipt.status === "unrun") return done(waiting());
@@ -257,6 +265,8 @@ interface History {
 	job: boolean;
 	dependsOn: readonly string[];
 	progress: { met: number; total: number } | undefined;
+	/** The lane's accepted results are all retained: drawn as kept, never as an integrated acceptance. */
+	retained: boolean;
 	spans: LaneSpan[];
 	/** Wall-clock ms of the worker's last activity while the lane is running; its quiet moment follows from it. */
 	activityAt: number | undefined;
@@ -390,8 +400,10 @@ export class LaneTimeline {
 		if (!sameList(order, this.#order)) changed = true;
 		this.#order = order;
 
-		if (facts.complete !== this.#complete) {
-			this.#complete = facts.complete;
+		// A run whose every acceptance is a retained artifact applied nothing to the target: it has no finale to play.
+		const complete = facts.complete && !(facts.retained.count > 0 && facts.retained.count === facts.progress.counts.accepted);
+		if (complete !== this.#complete) {
+			this.#complete = complete;
 			changed = true;
 		}
 		if (changed) this.#rebuild();
@@ -436,11 +448,13 @@ export class LaneTimeline {
 		if (
 			history.label !== derived.label ||
 			history.job !== derived.job ||
+			history.retained !== (derived.retained === true) ||
 			!sameList(history.dependsOn, derived.dependsOn) ||
 			!sameProgress(history.progress, derived.progress)
 		) {
 			history.label = derived.label;
 			history.job = derived.job;
+			history.retained = derived.retained === true;
 			history.dependsOn = derived.dependsOn;
 			history.progress = derived.progress;
 			changed = true;
@@ -488,6 +502,7 @@ export class LaneTimeline {
 			job: derived.job,
 			dependsOn: derived.dependsOn,
 			progress: derived.progress,
+			retained: derived.retained === true,
 			spans,
 			activityAt,
 			slot: this.#slots++,
@@ -574,6 +589,7 @@ function trackOf(history: History): LaneTrack {
 		dependsOn: history.dependsOn,
 		spans: history.spans.map(span => ({ ...span })),
 		...(history.progress === undefined ? {} : { progress: { ...history.progress } }),
+		...(history.retained ? { retained: true as const } : {}),
 	};
 }
 

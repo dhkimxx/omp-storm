@@ -67,6 +67,14 @@ export const CHECKOUT_PLACEMENT_SHORT = "체크아웃은 작업 위치일 뿐 �
 export const CHECKOUT_SNAPSHOT_NOTE = "체크아웃은 만들어진 시점의 사본이며 사용자의 미커밋 변경도 들어갑니다. 깨끗한 공통 기준이라는 보장은 없습니다.";
 /** Row 11: Storm never claims a checkout cleanup it did not observe; the host owns it. */
 export const CHECKOUT_CLEANUP_NOTE = "체크아웃 정리는 호스트가 맡으며 Storm은 지워졌는지 확인하지 못합니다.";
+/**
+ * Row 1/§5: an accepted retained artifact is judged on its own retained bytes, which are not the parent work tree. The
+ * sentence says only that: it neither proves those bytes are absent from the parent nor that the parent is unchanged.
+ * Every retained surface carries this sentence or the retained word (`view/results.ts`).
+ */
+export const RETAINED_SOURCE_NOTE = "판정 근거는 부모 작업 트리가 아니라 보존 산출물입니다. 부모에 그 바이트가 없다는 뜻도, 부모 트리가 그대로라는 뜻도 아닙니다.";
+/** §5: a placement outside a plan has no recorded isolation fact on this host, so its work location is not established. */
+export const PLANLESS_PLACEMENT_NOTE = "계획 밖 배치의 작업 위치는 기록에 없을 수 있으니 호스트 기록에서 확인하세요.";
 
 /** What a result's per-result line says about who decides it once its conditions are met. */
 export const JUDGE_TEXT = {
@@ -78,12 +86,16 @@ export const JUDGE_TEXT = {
 
 const CHANGE_RULE =
 	"change: 작업 시작 때 잡은 기준선과 비교해 대상 파일의 내용이 실제로 바뀌어야 합니다. 대상은 path가 있으면 그 파일, 없으면 레인의 파일 범위입니다. 요구 문자열이 있으면 바뀐 파일 안에 공백까지 그대로 있어야 합니다.";
-const CHANGE_ISOLATED_RULE =
-	"격리 실행의 change는 이 버전에서 수용되지 않습니다. Storm은 격리 작업을 부모 작업 트리로 가져오지 않으므로 결과는 artifact로 선언하세요.";
+/**
+ * A target change is never judged on an isolated attempt. The advice names the real route for target work (a shared
+ * lane), so only work the user chose to keep outside the target is declared as an artifact.
+ */
+export const ISOLATED_CHANGE_RULE =
+	"격리 실행의 change는 이 버전에서 수용되지 않습니다. Storm은 격리 작업을 부모 작업 트리로 가져오지 않습니다. 대상 트리에 반영할 작업이면 공유 레인으로 계획하고, 반영하지 않고 보존할 작업만 artifact로 선언하세요.";
+/** The retained artifact's judged source is outside the parent tree; the note says what that does not prove. */
+export const ISOLATED_ARTIFACT_RULE = `artifact: 이 시도에 결속된 보존 산출물 안에서 path를 읽습니다. ${RETAINED_SOURCE_NOTE} 요구 문자열은 그 파일 내용에, 패치라면 추가된 줄에 있어야 합니다.`;
 const ARTIFACT_SHARED_RULE =
 	"artifact: 공유 작업 트리에서는 change와 같게 기준선과 비교해 판정하며 path가 있어야 합니다. path가 없으면 인정되지 않습니다.";
-const ARTIFACT_ISOLATED_RULE =
-	"artifact: 이 시도에 결속된 보존 산출물 안에서 path를 읽습니다(부모 작업 트리는 읽지 않습니다). 요구 문자열은 그 파일 내용에, 패치라면 추가된 줄에 있어야 합니다.";
 const ANSWER_RULE = `answer: 답에 근거 위치를 path:line 형식으로 적으세요(예: ${CITATION_EXAMPLE}). Storm이 인용한 줄을 다시 읽고, 답 전체가 그 줄과 같거나 답이 값 하나(숫자, true/false, null, 따옴표 문자열, 키: 값)이고 그 줄의 값과 같을 때만 기계로 인정합니다. 서술형 답이나 기계로 확인하지 못하는 답은 리뷰어가 판정합니다. ${CITATION_ALIAS_FORMS} 형식도 같은 위치로 읽고, 범위는 첫 줄을 기준으로 읽습니다. 읽을 수 없는 위치만 인용하면 인정되지 않고, 결과에 path가 있으면 그 경로를 인용해야 합니다. 요구 내용이 있는 결과는 인용한 줄에 그 내용이 있어야 하며, 답의 숫자·true/false 값이 어긋나면 인정되지 않습니다.`;
 const CHECK_RULE =
 	"검사: 이름이 붙은 승인된 검사를 Storm이 직접 실행해 통과해야 합니다. 통과하지 못했거나 아직 실행되지 못했으면 인정되지 않습니다.";
@@ -211,9 +223,9 @@ function ruleLines(results: readonly PlanLaneResult[], options: { isolated: bool
 	const lines: string[] = [];
 	if (kinds.has("change")) {
 		lines.push(CHANGE_RULE);
-		if (options.isolated) lines.push(CHANGE_ISOLATED_RULE);
+		if (options.isolated) lines.push(ISOLATED_CHANGE_RULE);
 	}
-	if (kinds.has("artifact")) lines.push(options.isolated ? ARTIFACT_ISOLATED_RULE : ARTIFACT_SHARED_RULE);
+	if (kinds.has("artifact")) lines.push(options.isolated ? ISOLATED_ARTIFACT_RULE : ARTIFACT_SHARED_RULE);
 	if (kinds.has("answer")) lines.push(ANSWER_RULE);
 	if (results.some(result => result.check !== undefined)) lines.push(CHECK_RULE);
 	return lines;

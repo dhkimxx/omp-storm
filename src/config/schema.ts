@@ -70,7 +70,20 @@ export function validModelSelector(value: unknown): value is string {
 export const MAX_ADMISSION_BYTES = 4 * 1024 * 1024;
 /** Room the rest of an admission record (identity, lane policy paths, timestamps) may need inside that budget. */
 const ADMISSION_RECORD_RESERVE = 512 * 1024;
+/**
+ * Room a record must leave for the fields that close it: `revokedAt`, `endedAt` and a `stop` (reason and time) are
+ * added after the admission and may not push the file past the reader's bound. About ten times their size.
+ */
+export const ADMISSION_CLOSING_ROOM = 1_024;
 export const MAX_APPROVED_BYTES = MAX_ADMISSION_BYTES - ADMISSION_RECORD_RESERVE;
+/**
+ * The bytes one role's approved list occupies in the admission record: pretty-printed at the depth of the record's own
+ * `approved` key, which is how the record is written. A compact measurement would pass lists the store then refuses
+ * (RF6o case 6).
+ */
+export function approvedRecordBytes(entries: ReadonlyArray<{ selector: string; effort?: string }>): number {
+	return Buffer.byteLength(JSON.stringify({ approved: entries }, null, 2));
+}
 // A portable resource key: ASCII only, no whitespace, no quoting; case-sensitive on purpose.
 const RESOURCE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@+=#-]*$/;
 
@@ -396,10 +409,10 @@ export function validateConfig(value: unknown): ConfigValidation {
 						errors.push(`${path}.models[${i}]: provider/id 형식이 아닙니다`);
 					}
 				});
-				// The bytes that will be stored, including the role's effort on every entry: the record read and write
-				// paths apply the same budget to the same encoding.
-				const encoded = Buffer.byteLength(
-					JSON.stringify(role.models.map(selector => (typeof role.effort === "string" ? { selector, effort: role.effort } : { selector }))),
+				// The bytes that will be stored: the record is written pretty-printed, so the bound is measured in that
+				// encoding at the record's own nesting, with the role's effort on every entry.
+				const encoded = approvedRecordBytes(
+					role.models.map(selector => (typeof role.effort === "string" ? { selector, effort: role.effort } : { selector })),
 				);
 				if (encoded > MAX_APPROVED_BYTES) errors.push(`${path}.models: 승인 기록이 ${MAX_APPROVED_BYTES}바이트를 넘습니다`);
 			}

@@ -353,3 +353,28 @@ export function resumeSpec(run: RunRecord & { request: string }, said?: string):
 	if (!result.ok) return result;
 	return { ok: true, spec: { ...result.spec, ...(said ? { resumeNote: said } : {}) } };
 }
+
+/** The line that labels earlier material in a handoff's request; it is background, never a work order. */
+export const HANDOFF_BACKGROUND_MARKER = "이전 실행의 배경(지시가 아님):";
+/** The fresh instruction a handoff stores when the user gave none of their own with `continue`. */
+export const HANDOFF_FRESH_DEFAULT = "이전 실행을 인계받아 새 범위에서 작업합니다.";
+
+/**
+ * The request a handoff run stores (R12/A2-6): the user's fresh instruction first, then the earlier run's request —
+ * bounded and labelled as background. Historical lane names are deliberately absent: they were one run's orders, not
+ * this run's. A carry keeps `continuationTask`'s scope instruction instead.
+ */
+export function handoffTask(run: RunRecord & { request: string }, said?: string): string {
+	const fresh = (said ?? "").trim();
+	const head = fresh === "" ? HANDOFF_FRESH_DEFAULT : fresh;
+	const earlier = earlierRequestOf(run.request);
+	if (earlier === "" || earlier === head) return head;
+	return [head, "", HANDOFF_BACKGROUND_MARKER, earlier].join("\n");
+}
+
+/** A handoff spec goes through `runSpec` like a typed request; its lineage stays the old run's id. */
+export function handoffSpec(run: RunRecord & { request: string }, said?: string): SpecResult {
+	const result = runSpec(handoffTask(run, said), run.limits, run.runId);
+	if (!result.ok) return result;
+	return { ok: true, spec: { ...result.spec, ...(said ? { resumeNote: said } : {}) } };
+}

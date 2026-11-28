@@ -45,11 +45,16 @@ const JOB_STEP = 10;
 
 /** What the trunk row is called. */
 export const TRUNK_LABEL = "감독";
-/** The word a lane row ends with for each state. */
+/** The word a lane row ends with for each state. A retained acceptance says so rather than reading as applied work. */
 export const STATE_WORD: Record<LaneState, string> = {
 	reserved: "예약", waiting: "선행 대기", running: "작업 중", quiet: "조용", submitted: "제출", reviewing: "검토 중",
 	accepted: "승인", unmet: "미충족", blocked: "막힘", excluded: "제외", idle: "유휴", refused: "거부",
 };
+/**
+ * The accepted state's word when every accepted result was kept outside the parent (B7, §5). It says where the judged
+ * source is; `부모 밖 보존` without the space is the longest form that still fits the narrow right column.
+ */
+export const RETAINED_STATE_WORD = "부모밖 보존";
 const PHASE_WORDS: Record<RunPhase, readonly string[]> = {
 	working: ["진행 중"],
 	workers: ["워커 작업 중", "워커 작업"],
@@ -327,7 +332,8 @@ export function layout(snapshot: LaneSnapshot, cols: number, maxRows: number): S
 	// --- Joins: accepted lanes climb to the trunk at their accept time ------------------------------------------------
 	interface Join { xj: number; rx: number; xl: number }
 	const joins = new Map<number, Join>();
-	const accepted = shown.filter((i) => lastState(lanes[i]!) === "accepted")
+	// A retained acceptance stays on its own lane: it was kept outside the target, never applied to the trunk (B7).
+	const accepted = shown.filter((i) => lastState(lanes[i]!) === "accepted" && lanes[i]!.retained !== true)
 		.sort((a, b) => lanes[b]!.spans[lanes[b]!.spans.length - 1]!.from - lanes[a]!.spans[lanes[a]!.spans.length - 1]!.from || b - a);
 	const columns: number[] = [];
 	for (const laneIndex of accepted) {
@@ -455,7 +461,7 @@ export function layout(snapshot: LaneSnapshot, cols: number, maxRows: number): S
 		labels.push({ side: "left", lane: laneIndex, cx: 0, cy: row, width: textWidth(left), text: left, split: primary.length });
 		// State word, then the progress when the lane has several results; the word gives way before the progress does.
 		const progress = lane.progress !== undefined && lane.progress.total > 1 ? ` ${lane.progress.met}/${lane.progress.total}` : "";
-		const state = clip(STATE_WORD[lastState(lane)], rw - progress.length);
+		const state = clip(lane.retained === true && lastState(lane) === "accepted" ? RETAINED_STATE_WORD : STATE_WORD[lastState(lane)], rw - progress.length);
 		const right = clip(state + progress, rw);
 		labels.push({ side: "right", lane: laneIndex, cx: cols - rw, cy: row, width: textWidth(right), text: right, split: state.length });
 	}

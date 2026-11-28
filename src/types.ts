@@ -1020,8 +1020,10 @@ export interface RunRecord {
  * started by someone else (a peer's message, a quiet note). Storm does not know who: it never names a sender.
  * `unplaced`: no dispatch of this run was waiting for the worker (a lane without declared results, a worker Storm did
  * not place, a worker of an earlier run).
+ * `out-of-plan`: an answer this run asked for (an admission it made, or a wake it sent) that no declared result waits
+ * for. It is activity, not an arrival nobody asked for, and the views label it separately (B8).
  */
-export type UnplannedKind = "woken" | "unplaced";
+export type UnplannedKind = "woken" | "unplaced" | "out-of-plan";
 
 /** One delivery that belongs to no declared result: host facts only, never model text. */
 export interface UnplannedDelivery {

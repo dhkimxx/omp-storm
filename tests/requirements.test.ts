@@ -67,7 +67,7 @@ const report = (over: Partial<AttemptReport> & Pick<AttemptReport, "runId" | "sp
 	...over,
 });
 
-/** Admits one planned lane the way manual direction does: unique handle, role-unique lane, checked late fence. */
+/** Admits one planned lane the way manual direction does: the host's unique handle, the lane's own table key, checked late fence. */
 async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneName: string, at = T0 + 1): Promise<string> {
 	const lane = plan.lanes.find(candidate => candidate.name === laneName);
 	if (lane === undefined) throw new Error(`no lane ${laneName}`);
@@ -76,10 +76,10 @@ async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneNa
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(plan.lanes.flatMap(candidate => (candidate.dependsOn ?? []).map(dependency => dependency.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	// R4: a manual planned item is keyed by its lane's own name; the placement and the spawn must use that one key.
-	const spawnKey = laneName;
+	// R4/A1-5: every placement gives the host a handle it has never issued; the lane's name stays the table key.
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
+	const spawnKey = String(bound.input.name);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);
 	agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: at }));

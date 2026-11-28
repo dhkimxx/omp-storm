@@ -146,10 +146,16 @@ describe("worker activity counted apart", () => {
 		expect(failed.activity).toMatchObject({ started: 2, settled: 2, failed: 1, changed: 1 });
 	});
 
-	test("unplanned deliveries count from the kept list and the full count", () => {
+	test("unplanned deliveries count from the kept list and the full count; only asked-for work is out-of-plan", () => {
 		const facts = resultFacts(runRecord({ unplanned: [delivery("a")], unplannedCount: 7 }));
 		expect(facts.activity.unplanned).toBe(7);
-		expect(facts.outOfPlan).toBe(7);
+		// Nobody this run placed delivered it: it is an arrival, not out-of-plan activity (B8).
+		expect(facts.outOfPlan).toBe(0);
+		const placed = resultFacts(runRecord({
+			spawns: [spawnRecord({ spawnKey: "a", agent: "storm-explorer" })],
+			unplanned: [delivery("a")],
+		}));
+		expect(placed.outOfPlan).toBe(1);
 	});
 });
 

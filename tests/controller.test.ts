@@ -16,6 +16,7 @@ import {
 	type CloseoutDraft,
 	resetCloseoutChoices,
 	takeCloseoutChoice,
+	UNKNOWN_CHANGE_RISK,
 } from "../src/runtime/closeout.ts";
 import { fenceAfterDiscard, noteRunSpawn, noteRunUserWait, runSpawns, summarizeRun, touchRun } from "../src/runtime/controller.ts";
 import { activeMs } from "../src/runtime/goal.ts";
@@ -638,6 +639,36 @@ describe("run start", () => {
 		} finally {
 			await rm(otherRoot, { recursive: true, force: true });
 		}
+	});
+
+	test("a continue with no rows hands off as a reader and stores the fresh instruction, not the old plan (A2-5/A2-6)", async () => {
+		const old = runRecord({
+			runId: "run-20261120-090000-hnd0",
+			startedAt: "2026-11-20T09:00:00.000Z",
+			endedAt: "2026-11-20T09:29:00.000Z",
+			status: "stopped",
+			endReason: "interrupted",
+			request: "finish the old login work",
+			plan: {
+				submittedAt: "2026-11-20T09:00:00.000Z",
+				workers: { reviewer: 1 },
+				lanes: [{ name: "old-review", kind: "review", role: "reviewer", goal: "judge the old login work", results: [{ id: "old-answer", kind: "answer", criterion: "the old answer" }] }],
+			},
+		});
+		const h = session();
+		await writeRun(h.sessionDir, old);
+		await noteResumePointer(h.sessionDir, { repoId: h.repo.repoId, root: h.repo.root }, old);
+		const started = await h.controller.continueInTurn(h.ctx, "now document the new retry path", Date.parse("2026-11-20T09:30:00Z"));
+		expect(started.ok).toBe(true);
+		if (!started.ok) return;
+		expect(started.continued?.mode).toBe("handoff");
+		const record = await readRun(h.sessionDir, started.runId);
+		expect(record?.plan).toBeUndefined();
+		expect(record?.results).toBeUndefined();
+		expect(record?.request).toContain("now document the new retry path");
+		expect(record?.request).toContain("이전 실행의 배경(지시가 아님):");
+		expect(record?.request).not.toContain("old-review");
+		await h.controller.finish("no-changes");
 	});
 
 	test("a resume handoff names the cut request limit and the user's note on one line", async () => {
@@ -1454,9 +1485,10 @@ describe("run end", () => {
 		noteRunSpawn(runId, spawn);
 		await h.turn();
 		expect(h.summaries()).toBe(1);
-		// A short clean end leaves one factual line; the ledger detail stays in status.
+		// A plan-less placement carries its placement qualification, so even a short clean end is a card; the ledger detail
+		// stays in status.
 		const settled = (await readRun(h.sessionDir, runId)) as RunRecord;
-		expect(closeoutBrief(settled).tier).toBe("line");
+		expect(closeoutBrief(settled).tier).toBe("card");
 		expect(h.ui.records[0]?.title).toBe(CLOSEOUT_TITLE);
 		expect(h.ui.records[0]?.markdown).toBe(renderCloseout(closeoutBrief(settled), false).markdown);
 		expect(activeLedgerRun(h.sessionDir)).toBeUndefined();
@@ -3062,7 +3094,7 @@ describe("closeout brief", () => {
 		expect(shown.tier).toBe("card");
 		expect(shown.director).toBeUndefined();
 		expect(shown.actions).toHaveLength(1);
-		expect(shown.residual.some(text => text.includes("검증되지 않은 변경"))).toBe(true);
+		expect(shown.residual.some(text => text.includes(UNKNOWN_CHANGE_RISK))).toBe(true);
 		expect(takeCloseoutChoice(tui, "2")).toBeUndefined();
 	});
 

@@ -7,7 +7,9 @@
  * and they can only restyle text the plain content already says — never add a word, a control or a button.
  */
 import { formatUsd } from "../policy/spawn.ts";
-import { NO_DECLARED_RESULTS, type RetainedFacts } from "../runtime/result-facts.ts";
+import { RETAINED_SOURCE_NOTE } from "../runtime/contract-text.ts";
+import { CAPTURE_UNKNOWN_LABEL } from "../runtime/closeout.ts";
+import { NO_DECLARED_RESULTS, type CaptureUnknown, type RetainedFacts } from "../runtime/result-facts.ts";
 import type { CloseoutBrief, CloseoutRecordStyle, InfoLine, InfoSpan, InfoTone } from "../types.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
 
@@ -107,11 +109,12 @@ function officialCounts(brief: CloseoutBrief & { readonly retained?: RetainedFac
 	const official = brief.official;
 	const retained = brief.retained?.count ?? 0;
 	const parts: string[] = [];
-	// No declared rows means no fraction: the card says what the record holds instead of `0/0`.
-	if (official.hasResults) {
+	// No in-scope rows means no fraction: the card says what the record holds instead of `0/0`. With declared rows but
+	// none in scope, the exclusion below is the fact; nothing reads as success.
+	if (official.hasResults && official.inScope > 0) {
 		parts.push(retained > 0 && retained === official.accepted ? `${RETAINED_ACCEPTED} ${official.accepted}/${official.inScope}` : `수용 ${official.accepted}/${official.inScope}`);
 		if (retained > 0 && retained !== official.accepted) parts.push(`${RETAINED_LABEL} ${retained}`);
-	} else parts.push(NO_DECLARED_RESULTS);
+	} else if (!official.hasResults) parts.push(NO_DECLARED_RESULTS);
 	for (const key of Object.keys(OPEN_LABEL) as Array<keyof typeof OPEN_LABEL>) {
 		const count = official.open[key];
 		if (Number.isInteger(count) && count > 0) parts.push(`${OPEN_LABEL[key]} ${count}`);
@@ -168,7 +171,10 @@ function officialLine(brief: CloseoutBrief, duration: string | undefined, out: B
  * when numbered actions were actually registered for this session; otherwise actions are listed unnumbered and no
  * input instruction appears. A `line` (or `none`) brief is one factual line.
  */
-export function renderCloseout(brief: CloseoutBrief & { readonly retained?: RetainedFacts }, showChoices: boolean): { markdown: string; info: InfoLine[] } {
+export function renderCloseout(
+	brief: CloseoutBrief & { readonly retained?: RetainedFacts; readonly captureUnknown?: CaptureUnknown },
+	showChoices: boolean,
+): { markdown: string; info: InfoLine[] } {
 	const out = new Builder();
 	const duration = closeoutDuration(brief.startedAt, brief.endedAt);
 	if (brief.tier !== "card") {
@@ -186,15 +192,29 @@ export function renderCloseout(brief: CloseoutBrief & { readonly retained?: Reta
 
 	officialLine(brief, duration, out);
 
-	// Row 1/row 4: where the accepted bytes are and how to reach them. One bounded line, first reference only.
+	// Row 1/row 4: where the accepted bytes are, how to reach them, and what that source does not prove. One bounded
+	// line, first reference only.
 	const kept = brief.retained;
 	if (kept !== undefined && kept.count > 0) {
 		const ref = [kept.capture, kept.attempt === undefined ? undefined : `시도: ${kept.attempt}`].filter((part): part is string => part !== undefined && part !== "").join(" · ");
 		out.item([
 			{ text: `${RETAINED_LABEL}: `, tone: "muted" },
-			{ text: `수용 ${kept.count}건은 부모 작업 트리 밖에 있습니다. Storm은 적용하지 않았습니다.` },
+			{ text: `수용 ${kept.count}건 — ${RETAINED_SOURCE_NOTE} Storm은 적용하지 않았습니다.` },
 			...(ref === "" ? [] : [{ text: ` · ${ref}` }]),
 		]);
+	}
+	// Row 8/§5: a stopped or failed worker can have left a patch or a branch that this record does not bind. Say capture
+	// unknown and name the native delivery; never imply the worker left nothing or invent a capture.
+	if (brief.captureUnknown !== undefined) {
+		const unknown = brief.captureUnknown;
+		out.item(
+			[
+				{ text: `${CAPTURE_UNKNOWN_LABEL}: `, tone: "warning" },
+				{ text: `중단·실패한 워커 ${unknown.count}개의 패치·브랜치는 이 기록에 결속되어 있지 않습니다.` },
+				...(unknown.native === undefined ? [] : [{ text: ` 네이티브 기록: ${unknown.native}` }]),
+			],
+			{ icon: "status.warning" },
+		);
 	}
 
 	// Known residual risk leads any prose, so no explanation can sit between the status and its warnings.

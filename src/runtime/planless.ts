@@ -26,11 +26,12 @@ export const PLANLESS_NO_TURN_TIME =
 export const PLANLESS_SAME_TURN =
 	"이번 사용자 요청과 같은 턴이거나 그 뒤에 끝난 실행이 있어 새 실행을 열지 않았습니다. 사용자에게 끝난 이유를 알리고, 사용자가 다시 말한 뒤에 시작하세요.";
 /**
- * The open outlived the host's budget for the `tool_call` handler: the host has already refused the call, so the run
- * was finished at once as stopped instead of holding the lease with no work.
+ * The open outlived Storm's allowance inside the host's budget for the `tool_call` handler, so the run was finished at
+ * once as stopped instead of holding the lease with no work. Storm cannot see whether the host has given up on the call
+ * yet, so the sentence names only what Storm knows: its own allowance expired.
  */
 export const PLANLESS_DEADLINE =
-	"task 호출의 처리 제한 시간이 지나 호스트가 이 호출을 이미 거절해, 연 실행을 곧바로 중단으로 마쳤습니다. 큰 저장소에서는 계획을 storm plan으로 제출해 실행을 여세요.";
+	"Storm이 이 task 호출을 처리할 시간이 지나 연 실행을 곧바로 중단으로 마쳤습니다. 큰 저장소에서는 계획을 storm plan으로 제출해 실행을 여세요.";
 
 /** Everything R9's checks read, gathered by the caller that is about to open a plan-less run. */
 export interface PlanlessFacts {

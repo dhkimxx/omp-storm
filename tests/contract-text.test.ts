@@ -21,10 +21,12 @@ import {
 	CONTRACT_MAX_BYTES,
 	CONTRACT_TAG,
 	contractDigest,
+	ISOLATED_ARTIFACT_RULE,
 	ISOLATED_SCOPE,
 	JUDGE_TEXT,
 	laneContract,
 	laneContractText,
+	RETAINED_SOURCE_NOTE,
 	type ResultJudge,
 	resultJudge,
 } from "../src/runtime/contract-text.ts";
@@ -561,7 +563,8 @@ describe("the acceptance lines against the real evaluator", () => {
 		expect(removedOnly.ok && removedOnly.report.results[0]?.state).toBe("unmet");
 		const text = laneContractText(lane({ results: [withPath] }), { isolated: true }) as string;
 		expect(text).toContain("추가된 줄");
-		expect(text).toContain("부모 작업 트리는 읽지 않습니다");
+		expect(text).toContain(RETAINED_SOURCE_NOTE);
+		expect(text).toContain(ISOLATED_ARTIFACT_RULE);
 	});
 });
 

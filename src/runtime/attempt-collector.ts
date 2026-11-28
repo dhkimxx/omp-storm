@@ -125,10 +125,12 @@ export interface AttemptCollectorDeps {
 	/** Bounded wait for an isolated async registry patch; tests tighten it. */
 	registryWaitMs?: number;
 	/**
-	 * The canonical target root, when the caller can read it: an absolute citation path inside it is read as its
-	 * relative path. Absent leaves absolute paths unread; the collector never guesses one from the process cwd.
+	 * The canonical target root for one attempt's own run, when the caller can read it: an absolute citation path
+	 * inside it is read as its relative path. The attempt is passed so the caller resolves the run that spawned this
+	 * worker, never whichever run happens to be current after an await. Absent leaves absolute paths unread; the
+	 * collector never guesses one from the process cwd.
 	 */
-	targetRoot?(): Promise<string | undefined> | string | undefined;
+	targetRoot?(attempt: { runId: string; parentId: string; spawnKey: string }): Promise<string | undefined> | string | undefined;
 }
 
 /** One open native `task` tool call; used only to attach the host's toolCallId to admitted sync children. */
@@ -723,8 +725,12 @@ const MAX_CITED_LINE = 10_000_000;
  * Markdown link (the `(` or `<` before it is the boundary). The greedy absolute form backtracks to leave the
  * coordinate in its own group; `safeRelativePath` and the root check decide whether the path is usable at all. A path
  * needs a directory segment or a file extension, so a clock time like `12:30` stays text.
+ *
+ * The coordinate must be the whole token: the trailing lookahead rejects another coordinate character. Without it the
+ * pattern backs off a malformed suffix (`#L2-Lx`, `#L2:0`, `#L2.5`, `#L2-L99999999`) and the valid prefix becomes a
+ * citation for a position the answer never named (B6).
  */
-const CITED = /(?:^|[\s(`"'<])((?:(?:[A-Za-z]:[\\/]|\/)[^\s`"'()\[\]{}<>]*|(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)))(?:#L(\d{1,7})(?:-L?(\d{1,7}))?|:(\d{1,7})(?:-(\d{1,7}))?)\b/g;
+const CITED = /(?:^|[\s(`"'<])((?:(?:[A-Za-z]:[\\/]|\/)[^\s`"'()\[\]{}<>]*|(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)))(?:#L(\d{1,7})(?:-L?(\d{1,7}))?|:(\d{1,7})(?:-(\d{1,7}))?)(?![0-9A-Za-z_:-]|\.\d)/g;
 
 /** What the caller can establish about a model-supplied citation path. */
 export interface AnswerCitationOptions {
@@ -1791,7 +1797,7 @@ export class AttemptCollector {
 			const reportText = final.text;
 			let root: string | undefined;
 			try {
-				root = await this.#deps.targetRoot?.();
+				root = await this.#deps.targetRoot?.({ runId: tracked.runId, parentId: tracked.parentId, spawnKey: tracked.spawnKey });
 			} catch {
 				root = undefined;
 			}

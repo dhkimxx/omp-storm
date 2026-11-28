@@ -12,6 +12,7 @@ import {
 	unplannedFacts,
 	unplannedIsolationApplyReason,
 	unplannedIsolationUnavailableReason,
+	WHY_ITEM_TOOLS,
 } from "../policy/unplanned-spawn.ts";
 import type {
 	AgentEntry,
@@ -50,6 +51,8 @@ interface Assignment {
 	placement?: number;
 	/** The shared-tree scope the placement froze (R3, R6); absent only for a legacy caller that passed no policy. */
 	scope?: WriteScope;
+	/** The item carried its own eval-defined `tools` (D7/R6): the hook must persist the reserved shared-writer effect. */
+	toolsCarried?: boolean;
 }
 
 /** A lane's logical reservation: a placed task awaiting spawn correlation, or a follow-up awaiting its turn's start. */
@@ -154,6 +157,12 @@ export interface TaskIsolationHost {
 export interface TaskPlacementOptions {
 	/** Automatic delegation reserves and rewrites task names; manual direction keeps the director's handles. */
 	rewriteNames?: boolean;
+	/**
+	 * Whether the caller holds the target's write claim for this batch (A2-1). `true`: the claim was taken; `false`: the
+	 * caller's own classification found no shared writer, so a shared writer here means the caller must not place it.
+	 * Absent: a legacy caller that makes no claim decision (tests). Production callers always pass it.
+	 */
+	writeClaim?: boolean;
 	/** Live host capability; omitted means unknown. */
 	host?: TaskIsolationHost;
 	/** Approved write authority per plan lane; when present it replaces role-name guesses. */
@@ -404,18 +413,57 @@ export function plannedTaskLanes(input: unknown, plan: RunPlan, config: StormCon
 /** Tag of the one-line note the call's result adds when a name that named a lane was placed unplanned (R5). */
 export const UNPLANNED_NOTE_TAG = "[storm:무계획]";
 
-function jobLaneNote(agent: string, name: string, job: string): string {
-	return `${UNPLANNED_NOTE_TAG} ${agent}: '${name}' 레인은 정형 작업 레인(job: ${job})이라 AI 워커에 배정할 수 없어 계획 밖 워커로 배치했습니다.`;
+/** Why an item that named a lane was placed unplanned (R5); the call's result counts these by cause (B9/D11). */
+export type PlacementNoteCause = "job-lane" | "role-mismatch";
+
+/** One note about an item that did not match a lane, with its cause so the call's result can bound the text. */
+export interface PlacementNote {
+	cause: PlacementNoteCause;
+	text: string;
 }
 
-function roleMismatchNote(agent: string, name: string, laneRole: string): string {
-	return `${UNPLANNED_NOTE_TAG} ${agent}: '${name}' 레인은 '${laneRole}' 역할의 레인이라 이 항목의 역할과 맞지 않아 계획 밖 워커로 배치했습니다.`;
+function jobLaneNote(agent: string, name: string, job: string): PlacementNote {
+	return { cause: "job-lane", text: `${UNPLANNED_NOTE_TAG} ${agent}: '${name}' 레인은 정형 작업 레인(job: ${job})이라 AI 워커에 배정할 수 없어 계획 밖 워커로 배치했습니다.` };
+}
+
+function roleMismatchNote(agent: string, name: string, laneRole: string): PlacementNote {
+	return { cause: "role-mismatch", text: `${UNPLANNED_NOTE_TAG} ${agent}: '${name}' 레인은 '${laneRole}' 역할의 레인이라 이 항목의 역할과 맞지 않아 계획 밖 워커로 배치했습니다.` };
+}
+
+/** How many examples of one mismatch cause the call's result shows before it counts the rest (B9/D11). */
+export const PLACEMENT_NOTE_EXAMPLES = 2;
+
+const NOTE_CAUSE_LABEL: Readonly<Record<PlacementNoteCause, string>> = {
+	"job-lane": "정형 작업 레인",
+	"role-mismatch": "역할이 다른 레인",
+};
+
+/**
+ * The call's result carries a bounded explanation, never one line per item: a batch of many names that all mismatched
+ * costs the director's context a constant amount (B9/D11). The count and the cause stay, and the per-item detail is
+ * the item's own placement in the run, not the context path.
+ */
+export function boundedPlacementNotes(notes: readonly PlacementNote[]): string[] {
+	const groups = new Map<PlacementNoteCause, string[]>();
+	for (const note of notes) {
+		const list = groups.get(note.cause);
+		if (list === undefined) groups.set(note.cause, [note.text]);
+		else list.push(note.text);
+	}
+	const out: string[] = [];
+	for (const [cause, texts] of groups) {
+		out.push(...texts.slice(0, PLACEMENT_NOTE_EXAMPLES));
+		if (texts.length > PLACEMENT_NOTE_EXAMPLES) {
+			out.push(`${UNPLANNED_NOTE_TAG} 같은 이유(${NOTE_CAUSE_LABEL[cause]})로 계획 밖에 둔 항목이 ${texts.length - PLACEMENT_NOTE_EXAMPLES}개 더 있습니다.`);
+		}
+	}
+	return out;
 }
 
 /** One task item's placement: a planned lane, or unplanned (no lane) with the note the call's result carries. */
 export interface TaskItemPlacement {
 	lane?: PlanLane;
-	note?: string;
+	note?: PlacementNote;
 }
 
 export type TaskPlacements =
@@ -543,8 +591,11 @@ function isolationCapabilityReason(agent: string, enabled: boolean | undefined):
 }
 
 function isolationApplyReason(agent: string, lane: string, apply: boolean | undefined): string {
-	const state = apply === true ? "켜져 있어(task.isolation.apply=true)" : "켜짐을 배제하지 못해";
-	return `${agent}: '${lane}' 레인은 부모 트리 밖에 남는 독립 결과가 필요한데 omp가 격리 결과를 부모 작업 트리에 자동 적용합니다(${state}). ` +
+	const head =
+		apply === true
+			? `${agent}: '${lane}' 레인은 부모 트리 밖에 남는 독립 결과가 필요한데 omp가 격리 결과를 부모 작업 트리에 자동 적용합니다(task.isolation.apply=true). `
+			: `${agent}: '${lane}' 레인은 부모 트리 밖에 남는 독립 결과가 필요한데 omp가 격리 결과를 부모 작업 트리에 자동 적용하는지 확인하지 못했습니다(task.isolation.apply 값을 읽지 못함). 적용이 켜져 있으면 워커가 끝난 뒤 예약 없이 부모 트리가 바뀝니다. `;
+	return head +
 		"`omp config set task.isolation.apply false`로 적용을 끄고, `omp config list --json`으로 값을 확인한 뒤 다시 스폰하세요. " +
 		"결과를 부모 트리에 합쳐도 되면 그 레인의 isolationReason을 빼고 공유 레인으로 계획하고, 별도 결과가 필요하면 격리 레인을 분리해 patch/branch 산출물 경로를 결과로 받으세요.";
 }
@@ -555,9 +606,11 @@ function isolationApplyReason(agent: string, lane: string, apply: boolean | unde
  * decides that, so the refusal names it; the other way out is a shared team, whose writers go one at a time.
  */
 function teamIsolationApplyReason(agent: string, apply: boolean | undefined): string {
-	const state = apply === true ? "켜져 있어(task.isolation.apply=true)" : "켜짐을 배제하지 못해";
-	return `${agent}: 팀 설정이 isolation: isolated인데 omp가 격리 워커의 변경을 워커가 끝난 뒤 부모 작업 트리에 자동으로 합칩니다(${state}). ` +
-		"그때는 이 트리를 지키는 예약이 없으므로 스폰하지 않았습니다. " +
+	const head =
+		apply === true
+			? `${agent}: 팀 설정이 isolation: isolated인데 omp가 격리 워커의 변경을 워커가 끝난 뒤 부모 작업 트리에 자동으로 합칩니다(task.isolation.apply=true). `
+			: `${agent}: 팀 설정이 isolation: isolated인데 omp가 격리 워커의 변경을 부모 작업 트리에 자동으로 합치는지 확인하지 못했습니다(task.isolation.apply 값을 읽지 못함). 합치기가 켜져 있으면 그때 이 트리를 지키는 예약이 없습니다. `;
+	return head +
 		"`omp config set task.isolation.apply false`로 적용을 끄고, `omp config list --json`으로 값을 확인한 뒤 다시 스폰하세요. " +
 		"결과를 부모 트리에 합쳐도 되면 사용자가 팀의 isolation을 shared로 바꾸어 다시 승인하세요. 공유 팀의 쓰기 레인은 한 번에 하나씩 시작합니다.";
 }
@@ -1097,8 +1150,10 @@ interface PlacedEntry {
 	selective: boolean;
 	/** The approved write scope decided once for this whole call; later phases reuse it. */
 	scope: WriteScope;
-	/** The line this item adds to the call's result when its name named a lane it cannot use (R5). */
-	note?: string;
+	/** The item carried its own eval-defined `tools` (D7/R6); the fact travels to its spawn hook. */
+	toolsCarried: boolean;
+	/** The bounded note this item adds to the call's result when its name named a lane it cannot use (R5/B9). */
+	note?: PlacementNote;
 }
 
 export interface FollowUpGateInput {
@@ -1188,6 +1243,8 @@ export interface FrozenPlacement {
 	authority: WriteAuthority;
 	/** The planned lane's name; absent for an unplanned placement. */
 	lane?: string;
+	/** The item carried its own eval-defined `tools` (D7/R6): what was reserved is what the hook must permit (A1-7). */
+	toolsCarried: boolean;
 }
 
 /** What the director session's own spawn hook must tell the admission step (R3, R4, R7). */
@@ -1249,9 +1306,129 @@ export function noteLaneAgentEnd(runId: string, agentId: string): void {
 	liveLanes.get(runId)?.deref()?.releaseAgent(agentId);
 }
 
+/** One call's items, resolved to lanes and classified, after every isolation capability check but before any name or reservation. */
+type DescribedPlacement =
+	| { ok: true; batch: boolean; items: unknown[]; placed: PlacedEntry[] }
+	| { ok: false; code?: LaneBlockCode | "lane" | "isolation"; reason: string };
+
 /**
- * Correlates director task items to the actual ids OMP allocates. The host emits the allocated id, not the
- * planned lane name, in before_subagent_spawn. Reserve distinct valid names for each task even across replans.
+ * Resolves and classifies one `task` call without side effects. The placement and the caller's pre-open/pre-lease check
+ * both use it, so what the caller proved is what the placement decides: a batch that needs the target's write claim
+ * here is exactly a batch that will reserve a shared writer below (A2-1, D11: one pass over the items).
+ */
+function describePlacement(
+	input: unknown,
+	plan: RunPlan | undefined,
+	config: StormConfig,
+	options: TaskPlacementOptions,
+): DescribedPlacement {
+	if (!object(input)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
+	const batch = Array.isArray(input.tasks);
+	const items: unknown[] = Array.isArray(input.tasks) ? input.tasks : [input];
+	if (!items.length) return { ok: false, code: "lane", reason: TASK_EMPTY_REASON };
+	const resolved = resolveTaskLanes(input, plan, config);
+	if (!resolved.ok) return { ok: false, code: resolved.code, reason: resolved.reason };
+	const teamIsolated = config.isolation === "isolated";
+	const placed: PlacedEntry[] = [];
+	for (const [index, item] of items.entries()) {
+		if (!object(item)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
+		const agent = typeof item.agent === "string" ? item.agent : "task";
+		const role = workerRole(config, agent);
+		const lane = resolved.items[index]?.lane;
+		const note = resolved.items[index]?.note;
+		const policy = lane === undefined ? undefined : options.policies?.get(lane.name);
+		if (policy?.kind === "blocked") return { ok: false, code: "lane-capability", reason: policy.reason };
+		const reason = lane?.isolationReason;
+		if (reason !== undefined && lane !== undefined && (lane.role === "reviewer" || lane.kind === "review")) {
+			return { ok: false, code: "isolation", reason: `${agent}: 최종 리뷰는 통합 트리를 봐야 하므로 격리 레인이 될 수 없습니다. isolationReason을 빼거나 독립 실험을 별도 code/run 레인으로 분리하세요.` };
+		}
+		let desired: boolean | undefined;
+		let requiresIsolation = false;
+		let selective = false;
+		if (teamIsolated) {
+			desired = true;
+			requiresIsolation = true;
+		} else if (reason !== undefined) {
+			desired = true;
+			requiresIsolation = true;
+			selective = true;
+		} else if (lane === undefined && item.isolated === true) {
+			// An unplanned item may ask for its own checkout (D10): it is private, and runs beside other writers.
+			desired = true;
+			requiresIsolation = true;
+		}
+		const toolsCarried = carriesEvalTools(item);
+		// eval-defined tools run in the director's kernel, outside any checkout (D7/HF-3): an isolated item that
+		// carries them would write beside other workers with no reservation, so it is refused on every lane.
+		if (requiresIsolation && toolsCarried) {
+			return { ok: false, code: "isolation", reason: isolatedToolsReason(agent) };
+		}
+		let scope: WriteScope;
+		if (lane !== undefined) {
+			// An item that carries its own tools is an exclusive shared writer on a planned lane too (D7/R6); the fact
+			// travels to the hook, which persists a policy that permits the reserved effect (A1-7).
+			scope = toolsCarried ? { kind: "unknown", why: WHY_ITEM_TOOLS } : writeScope(lane, role, requiresIsolation, policy, options.canonicalFiles?.get(lane.name));
+		} else {
+			const classified = classifyUnplannedItem(unplannedFacts(item, agent, teamIsolated, options.agentTools?.(agent)));
+			if (!classified.ok) return { ok: false, code: classified.code, reason: classified.reason };
+			scope = scopeOfAuthority(classified.item.authority, classified.item.policy);
+		}
+		placed.push({ item, lane, agent, desired, requiresIsolation, selective, scope, toolsCarried, ...(note === undefined ? {} : { note }) });
+	}
+	const needing = placed.find(entry => entry.requiresIsolation);
+	if (needing !== undefined && options.host?.enabled !== true) {
+		return {
+			ok: false,
+			reason: needing.lane === undefined
+				? unplannedIsolationUnavailableReason(needing.agent, options.host?.enabled)
+				: isolationCapabilityReason(needing.agent, options.host?.enabled),
+		};
+	}
+	// Every isolated placement, a lane with an isolation reason and a team that says isolated alike, needs omp's merge of
+	// an isolated worker's changes into the parent tree off: it happens after the worker ended, with nothing reserved.
+	const merged = placed.find(entry => entry.requiresIsolation);
+	if (merged !== undefined && options.host?.apply !== false) {
+		return {
+			ok: false,
+			reason: merged.lane === undefined
+				? unplannedIsolationApplyReason(merged.agent, options.host?.apply)
+				: merged.selective
+					? isolationApplyReason(merged.agent, merged.lane.name, options.host?.apply)
+					: teamIsolationApplyReason(merged.agent, options.host?.apply),
+		};
+	}
+	return { ok: true, batch, items, placed };
+}
+
+/**
+ * What one call needs before it may be placed: the agents whose shared write the table will reserve. A pure read of the
+ * same classification the placement uses; the caller takes the target's write claim when this names anyone (A2-1/R9).
+ */
+export type BatchWriteNeed =
+	| { ok: true; writers: readonly string[] }
+	| { ok: false; code?: LaneBlockCode | "lane" | "isolation"; reason: string };
+
+export function batchWriteNeed(
+	input: unknown,
+	plan: RunPlan | undefined,
+	config: StormConfig,
+	options: TaskPlacementOptions = {},
+): BatchWriteNeed {
+	const described = describePlacement(input, plan, config, options);
+	if (!described.ok) return described;
+	return {
+		ok: true,
+		writers: described.placed.filter(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown").map(entry => entry.agent),
+	};
+}
+
+/** Said when a placement would reserve a shared writer but the caller did not take (or prove) the target's write claim. */
+export const WRITE_CLAIM_REQUIRED =
+	"이 실행이 대상 작업 트리의 쓰기 권한을 가지고 있지 않아 공유 쓰기 작업을 배치하지 않았습니다. 읽기 작업만 보내거나 잠시 뒤 같은 호출을 다시 보내세요.";
+
+/**
+ * Correlates director task items to the actual ids OMP allocates. The host emits the allocated id, not the planned lane
+ * name, so every placement gives the host a handle it has never seen (the lane's name stays the table and ledger key).
  * Only the next matching spawn may consume a reservation. Nested children do not complete the director's lane.
  * Placement is also the one isolation authority: shared teams reserve the parent tree for every ordinary item,
  * a lane's isolationReason asks for a separate result, and legacy `isolation: isolated` teams isolate every spawn,
@@ -1288,8 +1465,6 @@ export class RunLanes {
 	 * allocates the first one's id. Cleared by the matching admission, cancel or release; expires like a pending write.
 	 */
 	readonly #held = new Map<string, LaneHold>();
-	/** Lanes this run has placed a name for, blocked or admitted: a later attempt must not reuse that name (R4/HF-2). */
-	readonly #lanePlaced = new Set<string>();
 	/** Follow-up admission tokens; only a failed preflight releases the write/capacity reservations it created. */
 	readonly #followTokens = new Map<
 		string,
@@ -1310,7 +1485,7 @@ export class RunLanes {
 	 * `hostJobs` is the one synchronous view of the director session's own async jobs. It is what makes a command the
 	 * director sent to the background a holder in this table, and what tells that a worker's task job is over.
 	 */
-	constructor(readonly runId: string, private readonly hostJobs?: HostJobSource, private readonly resumed = false) {
+	constructor(readonly runId: string, private readonly hostJobs?: HostJobSource) {
 		liveLanes.set(runId, new WeakRef(this));
 	}
 
@@ -1366,78 +1541,15 @@ export class RunLanes {
 	 * accepted, so a rejection leaves no reservations.
 	 */
 	place(input: unknown, plan: RunPlan | undefined, config: StormConfig, options: TaskPlacementOptions = {}): TaskBinding {
-		if (!object(input)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
-		const batch = Array.isArray(input.tasks);
-		const items: unknown[] = Array.isArray(input.tasks) ? input.tasks : [input];
-		if (!items.length) return { ok: false, code: "lane", reason: TASK_EMPTY_REASON };
-		const resolved = resolveTaskLanes(input, plan, config);
-		if (!resolved.ok) return { ok: false, code: resolved.code, reason: resolved.reason };
-		const rewrite = options.rewriteNames === true;
-		const teamIsolated = config.isolation === "isolated";
-		const placed: PlacedEntry[] = [];
-		for (const [index, item] of items.entries()) {
-			if (!object(item)) return { ok: false, code: "lane", reason: TASK_ITEM_INVALID_REASON };
-			const agent = typeof item.agent === "string" ? item.agent : "task";
-			const role = workerRole(config, agent);
-			const lane = resolved.items[index]?.lane;
-			const note = resolved.items[index]?.note;
-			const policy = lane === undefined ? undefined : options.policies?.get(lane.name);
-			if (policy?.kind === "blocked") return { ok: false, code: "lane-capability", reason: policy.reason };
-			const reason = lane?.isolationReason;
-			if (reason !== undefined && lane !== undefined && (lane.role === "reviewer" || lane.kind === "review")) {
-				return { ok: false, reason: `${agent}: 최종 리뷰는 통합 트리를 봐야 하므로 격리 레인이 될 수 없습니다. isolationReason을 빼거나 독립 실험을 별도 code/run 레인으로 분리하세요.` };
-			}
-			let desired: boolean | undefined;
-			let requiresIsolation = false;
-			let selective = false;
-			if (teamIsolated) {
-				desired = true;
-				requiresIsolation = true;
-			} else if (reason !== undefined) {
-				desired = true;
-				requiresIsolation = true;
-				selective = true;
-			} else if (lane === undefined && item.isolated === true) {
-				// An unplanned item may ask for its own checkout (D10): it is private, and runs beside other writers.
-				desired = true;
-				requiresIsolation = true;
-			}
-			// eval-defined tools run in the director's kernel, outside any checkout (D7/HF-3): an isolated item that
-			// carries them would write beside other workers with no reservation, so it is refused on every lane.
-			if (requiresIsolation && carriesEvalTools(item)) {
-				return { ok: false, code: "isolation", reason: isolatedToolsReason(agent) };
-			}
-			let scope: WriteScope;
-			if (lane !== undefined) {
-				scope = writeScope(lane, role, requiresIsolation, policy, options.canonicalFiles?.get(lane.name));
-			} else {
-				const classified = classifyUnplannedItem(unplannedFacts(item, agent, teamIsolated, options.agentTools?.(agent)));
-				if (!classified.ok) return { ok: false, code: classified.code, reason: classified.reason };
-				scope = scopeOfAuthority(classified.item.authority, classified.item.policy);
-			}
-			placed.push({ item, lane, agent, desired, requiresIsolation, selective, scope, ...(note === undefined ? {} : { note }) });
-		}
-		const needing = placed.find(entry => entry.requiresIsolation);
-		if (needing !== undefined && options.host?.enabled !== true) {
-			return {
-				ok: false,
-				reason: needing.lane === undefined
-					? unplannedIsolationUnavailableReason(needing.agent, options.host?.enabled)
-					: isolationCapabilityReason(needing.agent, options.host?.enabled),
-			};
-		}
-		// Every isolated placement, a lane with an isolation reason and a team that says isolated alike, needs omp's merge of
-		// an isolated worker's changes into the parent tree off: it happens after the worker ended, with nothing reserved.
-		const merged = placed.find(entry => entry.requiresIsolation);
-		if (merged !== undefined && options.host?.apply !== false) {
-			return {
-				ok: false,
-				reason: merged.lane === undefined
-					? unplannedIsolationApplyReason(merged.agent, options.host?.apply)
-					: merged.selective
-						? isolationApplyReason(merged.agent, merged.lane.name, options.host?.apply)
-						: teamIsolationApplyReason(merged.agent, options.host?.apply),
-			};
+		const described = describePlacement(input, plan, config, options);
+		if (!described.ok) return described;
+		const { batch, placed } = described;
+		// `describePlacement` proved the call is a plain object; the batch rewrite below needs that narrowing here.
+		const call = input as Record<string, unknown>;
+		// A2-1: a shared writer is never reserved unless the caller's classification took the target's write claim. A
+		// caller that proved "no writer" and then reaches one here is refused; nothing is placed or reserved.
+		if (options.writeClaim === false && placed.some(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown")) {
+			return { ok: false, code: "lane-write", reason: WRITE_CLAIM_REQUIRED };
 		}
 		// Dependencies and shared writes are decided for the whole call before any name or lane is reserved: a refused
 		// batch leaves no partial spawn, reservation or assignment behind.
@@ -1454,7 +1566,7 @@ export class RunLanes {
 		});
 		// A worker of this call that settles is free only when the call itself has ended (see `callEnded`).
 		if (options.callId !== undefined) this.#openCalls.add(options.callId);
-		const notes = [...gate.notes, ...placed.flatMap(entry => (entry.note === undefined ? [] : [entry.note]))];
+		const notes = [...gate.notes, ...boundedPlacementNotes(placed.flatMap(entry => (entry.note === undefined ? [] : [entry.note])))];
 		const now = options.now ?? Date.now();
 		const pinned = new Set<string>();
 		const mapped = placed.map((entry, index) => {
@@ -1468,22 +1580,27 @@ export class RunLanes {
 				// id: omp dedupes any name the native session has seen, including one an earlier process of the same
 				// session used, so an in-memory counter alone would hand a resumed session a `-2` key R4 must refuse.
 				handle = `${entry.agent}-${this.runId}-${++sessionHandleSerial}`;
-				this.#assigned.set(handle, { agent: entry.agent, placement, scope: entry.scope, ...call });
+				this.#assigned.set(handle, {
+					agent: entry.agent,
+					placement,
+					scope: entry.scope,
+					toolsCarried: entry.toolsCarried,
+					...call,
+				});
 				next = { ...next, name: handle };
-			} else if (rewrite) {
-				handle = `${this.runId}-lane-${++this.#serial}`;
-				this.#assigned.set(handle, { key: key(entry.lane), lane: entry.lane.name, agent: entry.agent, placement, scope: entry.scope, ...call });
-				next = { ...next, name: handle };
-			} else if (!this.resumed && !this.#lanePlaced.has(entry.lane.name) && !this.#agents.has(entry.lane.name) && !this.#held.has(entry.lane.name)) {
-				// Manual direction keeps the lane's own name, the one key its spawn is matched by (R4), for the lane's
-				// first attempt in this run.
-				handle = entry.lane.name;
-				if (next.name !== handle) next = { ...next, name: handle };
 			} else {
-				// A lane attempted again in this run would reach omp as `<lane>-2`, a name R4 must refuse; the re-attempt
-				// gets a run-unique handle that admits exactly as an automatic placement does. The lane stays the same.
+				// A1-5/R4: every planned placement, manual or automatic, gives the host a handle it has never issued. The
+				// run id makes it unique across processes; the lane's name stays the table, ledger and director's key.
 				handle = `${this.runId}-lane-${++this.#serial}`;
-				this.#assigned.set(handle, { key: key(entry.lane), lane: entry.lane.name, agent: entry.agent, placement, scope: entry.scope, ...call });
+				this.#assigned.set(handle, {
+					key: key(entry.lane),
+					lane: entry.lane.name,
+					agent: entry.agent,
+					placement,
+					scope: entry.scope,
+					toolsCarried: entry.toolsCarried,
+					...call,
+				});
 				next = { ...next, name: handle };
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
@@ -1510,19 +1627,12 @@ export class RunLanes {
 		}
 		// omp falls back to a top-level `isolated` for every batch item that omitted its own flag. Placement is
 		// per-item here, so the stale top-level shorthand must not isolate a shared item behind our back.
-		const next = withoutPinnedFields({ ...input, tasks: mapped }, pinned);
+		const next = withoutPinnedFields({ ...call, tasks: mapped }, pinned);
 		delete next.isolated;
 		const all = pinned.size === 0 ? notes : [...notes, pinnedFieldsNote(TASK_PINNED_FIELDS.filter(field => pinned.has(field)))];
 		return { ok: true, input: next, ...(all.length === 0 ? {} : { notes: all }) };
 	}
 
-	/**
-	 * The host named a spawn this run placed: remember a planned lane's name even when its hook refuses the spawn, so a
-	 * later attempt of the lane in this run uses a run-unique handle instead of the name the host already allocated.
-	 */
-	noteSpawnName(spawnKey: string): void {
-		if (this.#laneScopes.has(spawnKey) || this.#held.has(spawnKey) || this.#agents.has(spawnKey)) this.#lanePlaced.add(spawnKey);
-	}
 
 	/** Consume an approved spawn's reservation; the lane comes back when the placement matched one (R4/R5). */
 	admit(
@@ -1557,22 +1667,9 @@ export class RunLanes {
 		if (!spawn.spawnKey) return { ok: true };
 		let assignment = this.#assigned.get(spawn.spawnKey);
 		if (assignment !== undefined && assignment.agent !== spawn.agent) assignment = undefined;
-		// R4: a manual planned item is matched by its lane key, and only while that placement is pending (or lapsed).
-		if (assignment === undefined && manual !== undefined) {
-			const role = workerRole(manual.config, spawn.agent);
-			const lane = role === undefined
-				? undefined
-				: manual.plan.lanes.find(candidate => candidate.name === spawn.spawnKey && candidate.job === undefined && candidate.role === role);
-			const hold = lane === undefined ? undefined : this.#held.get(lane.name);
-			const pending = lane !== undefined && ((hold !== undefined && hold.agentId === undefined && hold.name === spawn.spawnKey) || this.#lapsed.has(`lane:${lane.name}`));
-			if (lane !== undefined && pending) {
-				const scope = this.#laneScopes.get(lane.name);
-				assignment = { lane: lane.name, key: key(lane), agent: spawn.agent, ...(scope === undefined ? {} : { scope }) };
-			}
-		}
+		// R4/A1-5: a planned or unplanned item is matched by the exact handle its placement gave the host. There is no
+		// lane-name or suffix guess left: the lane's name is the table key, never the child's name.
 		const matched = assignment !== undefined;
-		// The host allocated this lane's name even when the hook refuses the spawn; a later attempt must not reuse it.
-		if (assignment?.lane !== undefined) this.#lanePlaced.add(assignment.lane);
 		if (spawn.outcome === "blocked") {
 			// A blocked spawn never runs: the placement it would have used is consumed, and anything reserved for it ends.
 			if (matched) this.#assigned.delete(spawn.spawnKey);
@@ -1603,6 +1700,7 @@ export class RunLanes {
 				proven = options.directorTask.policy({
 					authority: reserved.authority,
 					...(assignment?.lane === undefined ? {} : { lane: assignment.lane }),
+					toolsCarried: assignment?.toolsCarried === true,
 				});
 			} catch {
 				this.#releaseSpawn(spawn.spawnKey, assignment?.lane, "refused");
@@ -1676,9 +1774,10 @@ export class RunLanes {
 			// lane, so it needs none.
 			return laneName === undefined ? { ok: true, hold: `private:${spawnKey}`, authority } : { ok: true, authority };
 		}
-		// An unplanned child with a live reservation was gated when it was placed, and anything placed since was gated
-		// against it; only a planned lane, or a placement that lapsed, is checked again.
-		if (recheck && (assignment?.key !== undefined || bound === undefined)) {
+		// A1-2: at admission every shared writer is checked again against everything that holds the tree now, its own
+		// reservation excepted. A host job or another call's writer can become visible between placement and this hook,
+		// and a timer lapse is never the only way into the check.
+		if (recheck) {
 			for (const [key, reservation] of this.#writes) {
 				if (key === bound?.key || key === ownKey || reservation.agentId === spawnKey) continue;
 				if (!scopesConflict(scope, reservation.scope)) continue;
@@ -1768,11 +1867,13 @@ export class RunLanes {
 				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `\`write agent://${handle}\` 명령으로`} 후속 지시를 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 			};
 		}
-		for (let i = 0; i < scopes.length; i++) {
-			const a = scopes[i]!;
-			for (let j = i + 1; j < scopes.length; j++) {
-				const b = scopes[j]!;
-				if ((a.scope.kind !== "paths" && a.scope.kind !== "unknown") || (b.scope.kind !== "paths" && b.scope.kind !== "unknown")) continue;
+		// D11: only shared writers are paired. A batch of readers or isolated workers costs no pair work, whatever the
+		// number of workers.
+		const shared = scopes.filter(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown");
+		for (let i = 0; i < shared.length; i++) {
+			const a = shared[i]!;
+			for (let j = i + 1; j < shared.length; j++) {
+				const b = shared[j]!;
 				if (!scopesConflict(a.scope, b.scope)) continue;
 				return {
 					ok: false,
@@ -2037,6 +2138,25 @@ export class RunLanes {
 	}
 
 	/**
+	 * Whether this run already admitted a worker under this exact key (A1-6). A second hook for the same key is refused
+	 * before anything else is decided and cleans up nothing: the key's admitted identity is the first hook's, not a time
+	 * stamp or a string guess.
+	 */
+	isAdmitted(spawnKey: string): boolean {
+		return this.#admitted.has(spawnKey);
+	}
+
+	/**
+	 * The host handle of this lane's pending placement, or of its lapsed one. The lane's name stays the table key; this
+	 * is the only name the host was given, so a caller that knows the lane can still name the placement it made.
+	 */
+	pendingHandle(laneName: string): string | undefined {
+		const hold = this.#held.get(laneName);
+		if (hold !== undefined && hold.agentId === undefined && hold.name !== undefined) return hold.name;
+		return this.#lapsed.get(`lane:${laneName}`)?.name;
+	}
+
+	/**
 	 * The identity of the placement a spawn key correlates to right now, read before the decision awaits anything.
 	 * A later cancel passes it back, so a refusal that lands after a newer call placed the same name removes nothing
 	 * of that newer call.
@@ -2044,6 +2164,9 @@ export class RunLanes {
 	placementOf(spawnKey: string): number | undefined {
 		const assigned = this.#assigned.get(spawnKey)?.placement;
 		if (assigned !== undefined) return assigned;
+		// A planned lane's placement can also be named by the lane's own name: the table key, never the host's handle.
+		const lanePending = this.#held.get(spawnKey)?.placement;
+		if (lanePending !== undefined) return lanePending;
 		for (const hold of this.#held.values()) {
 			if (hold.agentId === undefined && hold.name === spawnKey && hold.placement !== undefined) return hold.placement;
 		}
@@ -2062,7 +2185,15 @@ export class RunLanes {
 	cancel(spawnKey: string, placement: number | undefined): void {
 		const assignment = this.#assigned.get(spawnKey);
 		let reported = false;
-		if (placement !== undefined && assignment?.placement === placement) this.#assigned.delete(spawnKey);
+		// The placement identity is what the caller holds: a cancelled placement is removed whichever handle named it.
+		if (placement !== undefined) {
+			for (const [key, entry] of this.#assigned) {
+				if (entry.placement === placement) {
+					this.#assigned.delete(key);
+					break;
+				}
+			}
+		}
 		if (placement !== undefined) {
 			for (const [lane, hold] of this.#held) if (hold.agentId === undefined && hold.placement === placement) this.#held.delete(lane);
 		}
@@ -2307,7 +2438,16 @@ export class RunLanes {
 			if (scope.kind !== "paths" && scope.kind !== "unknown") continue;
 			// A lane that would start ahead of a prerequisite is allowed to, but it is not what "can start now" offers.
 			if (dependencyBlock(lane, options.readiness) !== undefined) continue;
-			const entry: PlacedEntry = { item: {}, lane, agent: lane.role, desired: undefined, requiresIsolation: isolated, selective: false, scope };
+			const entry: PlacedEntry = {
+				item: {},
+				lane,
+				agent: lane.role,
+				desired: undefined,
+				requiresIsolation: isolated,
+				selective: false,
+				scope,
+				toolsCarried: false,
+			};
 			if (!this.#gate([entry], options).ok) continue;
 			if (named.some(earlier => scopesConflict(scope, earlier.scope))) continue;
 			named.push({ lane, scope });

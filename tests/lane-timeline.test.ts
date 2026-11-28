@@ -615,6 +615,30 @@ test("a long quiet stretch adds exactly one span however often it is looked at",
 	expect(states(track(look(timeline, 2_000_000), "api").spans)).toEqual(["running", "quiet"]);
 });
 
+test("B7: a kept acceptance stays on its lane and is not the run's completion", () => {
+	const contract: NonNullable<PlanLane["results"]>[number] = { id: "a", kind: "artifact", criterion: "candidate", path: "a.txt" };
+	const kept = world({ lanes: [lane("iso", { isolationReason: "parallel experiment", results: [contract] })], results: [result("a", "iso", "accepted", { contract })] });
+	const timeline = new LaneTimeline();
+	timeline.observe(kept, "working", START);
+	const tick = timeline.snapshot(START);
+	expect(track(tick, "iso").retained).toBe(true);
+	expect(track(tick, "iso").spans.at(-1)?.state).toBe("accepted");
+	expect(tick.complete).toBe(false);
+
+	// One integrated acceptance beside a retained one is completion; the retained lane still says so.
+	const integrated: NonNullable<PlanLane["results"]>[number] = { id: "b", kind: "artifact", criterion: "implemented", path: "b.txt" };
+	const mixed = world({
+		lanes: [lane("iso", { isolationReason: "parallel experiment", results: [contract] }), lane("work", { results: [integrated] })],
+		results: [result("a", "iso", "accepted", { contract }), result("b", "work", "accepted", { contract: integrated })],
+	});
+	const second = new LaneTimeline();
+	second.observe(mixed, "working", START);
+	const mixedTick = second.snapshot(START);
+	expect(mixedTick.complete).toBe(true);
+	expect(track(mixedTick, "iso").retained).toBe(true);
+	expect(track(mixedTick, "work").retained).toBeUndefined();
+});
+
 test("a long mixed sequence keeps every lane's spans gapless, ordered and alternating", () => {
 	const timeline = new LaneTimeline();
 	const plan = [lane("a"), lane("b", { dependsOn: [{ lane: "a", need: "result" }] }), lane("c", { job: "c" })];

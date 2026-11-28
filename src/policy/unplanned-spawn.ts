@@ -70,8 +70,11 @@ export function unplannedIsolationUnavailableReason(agent: string, enabled: bool
 
 /** An isolated placement whose result omp would merge into the parent tree after the worker ended. */
 export function unplannedIsolationApplyReason(agent: string, apply: boolean | undefined): string {
-	const state = apply === true ? "켜져 있어(task.isolation.apply=true)" : "켜짐을 배제하지 못해";
-	return `${agent}: 이 작업은 부모 트리 밖에 남는 격리 결과를 요청했는데 omp가 격리 결과를 부모 작업 트리에 자동 적용합니다(${state}). ` +
+	const head =
+		apply === true
+			? `${agent}: 이 작업은 부모 트리 밖에 남는 격리 결과를 요청했는데 omp가 격리 결과를 부모 작업 트리에 자동 적용합니다(task.isolation.apply=true). `
+			: `${agent}: 이 작업은 부모 트리 밖에 남는 격리 결과를 요청했는데 omp가 격리 결과를 부모 작업 트리에 자동 적용하는지 확인하지 못했습니다(task.isolation.apply 값을 읽지 못함). 적용이 켜져 있으면 워커가 끝난 뒤 예약 없이 부모 트리가 바뀝니다. `;
+	return head +
 		"`omp config set task.isolation.apply false`로 적용을 끄고, `omp config list --json`으로 값을 확인한 뒤 다시 스폰하세요. " +
 		"결과를 부모 트리에 합쳐도 되면 isolated를 빼고 공유 작업으로 다시 보내세요.";
 }

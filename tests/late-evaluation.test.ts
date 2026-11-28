@@ -32,10 +32,10 @@ async function admit(h: FakeSession, plan: RunPlan, agents: AgentEntry[], laneNa
 	const agent = h.config.roles[lane.role]?.agent ?? `storm-${lane.role}`;
 	const needed = new Set(plan.lanes.flatMap(c => (c.dependsOn ?? []).map(d => d.lane)));
 	const readiness = needed.size === 0 ? undefined : await h.controller.laneReadiness(plan, needed);
-	// R4: manual planned items are keyed by their lane's own name.
-	const spawnKey = laneName;
+	// R4/A1-5: a placement gives the host a fresh handle; the lane's name stays the table key.
 	const bound = lanes.place({ name: laneName, agent, task: "do the lane" }, plan, h.config, readiness === undefined ? {} : { readiness });
 	if (!bound.ok) throw new Error(bound.reason);
+	const spawnKey = String(bound.input.name);
 	const admission = lanes.admitChecked({ spawnKey, agent, outcome: "routed" }, { plan, config: h.config });
 	if (!admission.ok) throw new Error(admission.reason);
 	agents.push(agentEntry({ id: spawnKey, name: agent, role: lane.role, state: "idle", requests: 1, lastActivityAt: T0 + 1 }));

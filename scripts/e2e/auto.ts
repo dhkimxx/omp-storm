@@ -51,6 +51,12 @@ const plan = {
 } as const;
 const probe = { task: ["storm-explorer"], as: "Probe", say: `E2E-CHILD-READ ${FACT_FILE} E2E-CHILD-CLAIM ${TRACKED_CLAIM}` };
 const scripted = (...steps: Step[]) => `E2E-STEPS ${JSON.stringify(steps)}`;
+/** The text of a tool result frame, joined from its content parts. */
+const textOf = (frame: Frame): string => {
+	const result = frame.result as { content?: unknown } | undefined;
+	if (result?.content === undefined) return "";
+	return Array.isArray(result.content) ? result.content.map(part => (part !== null && typeof part === "object" && "text" in part ? String(part.text) : "")).join("\n") : String(result.content);
+};
 
 /** Option labels Storm does not export. */
 const AUTO = { on: "자동 위임 켜기", off: "자동 위임 끄기" } as const;
@@ -387,12 +393,23 @@ try {
 			const live = await until(() => ownerFiles.runs().find(run => !ownerWrites.has(run.runId) && run.status === "running"), 10_000, "first process owns the write run");
 			const contenderRuns = blockedFiles.runIds();
 			const start = new LlmCursor(env);
-			await blocked.turn(scripted(writePlan("e2e-lease-contender.txt"), { task: ["storm-implementer"], as: "Lease", say: "E2E-CHILD-WRITE e2e-lease-contender.txt" }));
+			const contender = await blocked.turn(scripted(writePlan("e2e-lease-contender.txt"), { task: ["storm-implementer"], as: "Lease", say: "E2E-CHILD-WRITE e2e-lease-contender.txt" }));
 			const contenderChildren = start.of("child").filter(entry => entry.lastUser.includes("e2e-lease-contender.txt")).length;
+			const contenderText = contender.flatMap(frame => {
+				if (frame.type === "tool_execution_end" && frame.toolName === "task") return [textOf(frame)];
+				const message = frame.message;
+				if (message !== undefined && typeof message === "object" && message.content !== undefined) return [JSON.stringify(message.content)];
+				return typeof message === "string" ? [message] : [];
+			}).join("\n");
 			suite.check(
 				"the contender did not start a second write run or dispatch another child",
 				blockedFiles.runIds().size === contenderRuns.size && contenderChildren === 0 && ownerFiles.run(live.runId)?.status === "running",
 				`runs=${blockedFiles.runIds().size}/${contenderRuns.size} contenderChildren=${contenderChildren} owner=${ownerFiles.run(live.runId)?.status}`,
+			);
+			suite.check(
+				"the contender was refused with the cause: the other session's run holds the tree",
+				contenderText.includes("다른 Storm 실행") && contenderText.includes("쓰고 있습니다") && contenderText.includes(live.runId),
+				contenderText.slice(-500) || "no refusal text",
 			);
 			await owner.stop();
 			stopped = true;

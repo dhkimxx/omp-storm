@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { buildId } from "./build.ts";
 import { sha256Hex } from "./config/canonical.ts";
-import { MAX_ADMISSION_BYTES, validModelSelector } from "./config/schema.ts";
+import { ADMISSION_CLOSING_ROOM, MAX_ADMISSION_BYTES, validModelSelector } from "./config/schema.ts";
 import { serialized, writeJsonAtomic } from "./fsutil.ts";
 import { withJosa } from "./josa.ts";
 import { canonicalScope, normalizeScopePath, type LanePolicy } from "./policy/capability.ts";
@@ -307,14 +307,24 @@ async function readRecordFile(file: string, maxBytes = MAX_ADMISSION_BYTES): Pro
  * under the profile. The section itself is a read and a rename, never a slow write, because the content that precedes it
  * is a temp file made outside the lock. A lock a writer left behind by dying is abandoned after `LOCK_STALE_MS`; a live
  * one is waited for only `LOCK_WAIT_MS`, then the caller fails closed.
+ *
+ * The lock file carries a random owner token. A writer that was paused past `LOCK_STALE_MS` lost the lock: its release
+ * removes nothing, and its last check before the rename sees a token that is not its own and publishes nothing. Without
+ * both checks a late writer could overwrite a record written by the lock's new owner.
  */
-async function withRecordLock<T>(dir: string, key: string, task: () => Promise<T>): Promise<T> {
+async function withRecordLock<T>(dir: string, key: string, task: (held: () => Promise<boolean>) => Promise<T>): Promise<T> {
 	await mkdir(dir, { recursive: true, mode: 0o700 });
 	const lock = path.join(dir, `.${key}.lock`);
+	const token = randomUUID();
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	for (;;) {
 		try {
-			await (await open(lock, "wx", 0o600)).close();
+			const handle = await open(lock, "wx", 0o600);
+			try {
+				await handle.writeFile(token, "utf8");
+			} finally {
+				await handle.close().catch(() => undefined);
+			}
 			break;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -329,10 +339,22 @@ async function withRecordLock<T>(dir: string, key: string, task: () => Promise<T
 			await promise;
 		}
 	}
+	const held = async (): Promise<boolean> => {
+		try {
+			return (await readFile(lock, "utf8")) === token;
+		} catch {
+			return false;
+		}
+	};
 	try {
-		return await task();
+		return await task(held);
 	} finally {
-		await rm(lock, { force: true }).catch(() => undefined);
+		// Only the owner of the token may release the lock. A holder that was taken over must not delete the new one.
+		try {
+			if ((await readFile(lock, "utf8")) === token) await rm(lock, { force: true });
+		} catch {
+			// Already gone, or replaced: either way not this holder's to remove.
+		}
 	}
 }
 
@@ -346,12 +368,15 @@ async function publishRecord(dir: string, file: string, key: string, expected: W
 	const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
 	await writeJsonAtomic(temp, next);
 	try {
-		return await withRecordLock(dir, key, async () => {
+		return await withRecordLock(dir, key, async held => {
 			const read = await readRecordFile(file);
 			if (read.kind !== "value" || !isAdmission(read.value)) return false;
 			const current = read.value;
 			if (current.build !== expected.build || current.attempt !== expected.attempt) return false;
 			if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
+			// The lock may have been taken over while this writer was paused past `LOCK_STALE_MS`; a holder that no
+			// longer owns it publishes nothing, so a late write can never land over the new owner's record.
+			if (!(await held())) return false;
 			await rename(temp, file);
 			await chmod(file, 0o600).catch(() => undefined);
 			return true;
@@ -402,11 +427,12 @@ async function mutateMarker(
 		const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
 		await writeJsonAtomic(temp, next);
 		try {
-			const published = await withRecordLock(dir, key, async () => {
+			const published = await withRecordLock(dir, key, async held => {
 				const again = await readRecordFile(file);
 				if (again.kind !== "value" || !isRunMarker(again.value)) return false;
 				if (again.value.build !== current.build || again.value.key !== current.key) return false;
 				if (JSON.stringify(again.value) !== JSON.stringify(current)) return false;
+				if (!(await held())) return false;
 				await rename(temp, file);
 				await chmod(file, 0o600).catch(() => undefined);
 				return true;
@@ -458,6 +484,47 @@ async function removeRecordIf(
 	});
 }
 
+/**
+ * Removes one record of an older release under the record lock, and only when it is still the same file this scan read:
+ * the same modification time and still a schema of that older format. A bare removal could delete the fresh record a
+ * concurrent admission wrote in its place (RF6o case 4).
+ */
+async function removeObsoleteRecordIf(dir: string, file: string, expectedMtimeMs: number, schemas: readonly string[]): Promise<boolean> {
+	const key = path.basename(file, ".json");
+	return withRecordLock(dir, key, async () => {
+		const info = await lstat(file).catch(() => undefined);
+		if (info === undefined || !info.isFile() || info.mtimeMs !== expectedMtimeMs) return false;
+		const read = await readRecordFile(file);
+		if (read.kind !== "value" || !obsoleteSchema(read.value, schemas)) return false;
+		await rm(file, { force: true });
+		return true;
+	});
+}
+
+/**
+ * Removes one run marker under the marker's lock, only while it is still the same marker the scan read (build, key, run
+ * and creation time) and `due` says so of the current one. A marker removed bare could delete the live marker its own
+ * session rewrote in that instant (RF6o case 5).
+ */
+async function removeMarkerIf(
+	dir: string,
+	file: string,
+	expected: WorkerRunMarker,
+	due: (marker: WorkerRunMarker) => boolean,
+): Promise<boolean> {
+	const key = path.basename(file, ".json");
+	return withRecordLock(dir, key, async () => {
+		const read = await readRecordFile(file);
+		if (read.kind !== "value" || !isRunMarker(read.value)) return false;
+		const marker = read.value;
+		if (marker.build !== expected.build || marker.key !== expected.key || marker.runId !== expected.runId) return false;
+		if (marker.createdAt !== expected.createdAt) return false;
+		if (!due(marker)) return false;
+		await rm(file, { force: true });
+		return true;
+	});
+}
+
 async function prune(dir: string, now: number): Promise<void> {
 	let names: string[];
 	try {
@@ -478,7 +545,7 @@ async function prune(dir: string, now: number): Promise<void> {
 			// An older release's tombstone carries no authority in this build; housekeeping may remove it once its own
 			// active lifetime is over. It is never read as this build's admission.
 			if (obsoleteSchema(value, OBSOLETE_ADMISSION_SCHEMAS)) {
-				if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true });
+				if (now - info.mtimeMs > ACTIVE_TTL_MS) await removeObsoleteRecordIf(dir, file, info.mtimeMs, OBSOLETE_ADMISSION_SCHEMAS);
 				continue;
 			}
 			// A record of another build, or one this build cannot read, is never removed and never counted here.
@@ -531,9 +598,8 @@ interface WorkerRunMarker {
 	expiresAt: number;
 	revokedAt?: number;
 	/**
-	 * Set when the director's instance observed spend reach the user's limit; absent means the run has not closed its
-	 * spend. Workers read it from disk, often on another thread, through `readWorkerSpendClose` (D8, R15). The value
-	 * carries the user's own `budget.onExceed`, because the workers must know which stop the user chose.
+	 * The close written by the unreleased 0.29.0 build, which kept it on the marker. It is validated and read for
+	 * compatibility; this build writes no close here. The close itself is the run-keyed receipt (B4).
 	 */
 	spendClosedAt?: SpendClose;
 }
@@ -600,9 +666,8 @@ async function writeWorkerRunMarker(input: {
 			const value = existing.value;
 			if (isRunMarker(value)) {
 				if (value.build !== marker.build) throw new Error("다른 빌드의 Storm이 쓴 관리 실행 표시가 있어 덮어쓰지 않았습니다");
-				// A spawn admitted after the limit must not erase the close: the director refuses new spawns past it, but one
-				// already in flight can still reach here. A new run of the same tree and parent writes its own run id, so it is open.
-				if (value.runId === marker.runId && value.spendClosedAt !== undefined) marker.spendClosedAt = value.spendClosedAt;
+				// The close is not carried here: it lives in its own run-keyed receipt, which no admission rewrites. A
+				// marker that still names this run is simply rewritten with its current facts.
 			} else if (!obsoleteSchema(value, OBSOLETE_RUN_SCHEMAS)) {
 				throw new Error("기존 관리 실행 표시의 형식이 올바르지 않아 덮어쓰지 않았습니다");
 			}
@@ -620,7 +685,7 @@ async function pruneRunMarkers(dir: string, now: number): Promise<void> {
 	} catch {
 		return;
 	}
-	const kept: Array<{ name: string; at: number; closed: boolean }> = [];
+	const kept: Array<{ name: string; at: number; closed: boolean; record: WorkerRunMarker }> = [];
 	for (const name of names) {
 		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
 		const file = path.join(root, name);
@@ -628,9 +693,10 @@ async function pruneRunMarkers(dir: string, now: number): Promise<void> {
 		if (info === undefined || !info.isFile()) continue;
 		const read = await readRecordFile(file);
 		const value = read.kind === "value" ? read.value : undefined;
-		// An older release's marker is not this build's; housekeeping removes it only after its own active lifetime.
+		// An older release's marker is not this build's; housekeeping removes it only after its own active lifetime, and
+		// only under the marker's lock after reading it again, so a live marker rewritten in that instant survives.
 		if (obsoleteSchema(value, OBSOLETE_RUN_SCHEMAS)) {
-			if (now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true });
+			if (now - info.mtimeMs > ACTIVE_TTL_MS) await removeObsoleteRecordIf(root, file, info.mtimeMs, OBSOLETE_RUN_SCHEMAS);
 			continue;
 		}
 		// Another build's marker, or one this build cannot read: never removed, never counted.
@@ -638,24 +704,19 @@ async function pruneRunMarkers(dir: string, now: number): Promise<void> {
 		const marker = value;
 		const closed = marker.revokedAt !== undefined;
 		if ((closed && now - info.mtimeMs > CLOSED_TTL_MS) || marker.expiresAt < now) {
-			const key = path.basename(file, ".json");
-			await withRecordLock(root, key, async () => {
-				const again = await readRecordFile(file);
-				if (again.kind !== "value" || !isRunMarker(again.value)) return;
-				if (again.value.build !== marker.build || again.value.key !== marker.key || again.value.runId !== marker.runId) return;
-				if (again.value.createdAt !== marker.createdAt) return;
-				if (now - info.mtimeMs <= CLOSED_TTL_MS && again.value.expiresAt >= now) return;
-				await rm(file, { force: true });
-			});
+			await removeMarkerIf(root, file, marker, current =>
+				(current.revokedAt !== undefined && now - info.mtimeMs > CLOSED_TTL_MS) || current.expiresAt < now,
+			);
 			continue;
 		}
-		kept.push({ name, at: marker.createdAt, closed });
+		kept.push({ name, at: marker.createdAt, closed, record: marker });
 	}
 	if (kept.length <= MAX_RUN_MARKERS) return;
 	kept.sort((a, b) => (a.closed === b.closed ? a.at - b.at : a.closed ? -1 : 1));
 	for (const marker of kept.slice(0, kept.length - MAX_RUN_MARKERS)) {
 		if (!marker.closed) break;
-		await rm(path.join(root, marker.name), { force: true });
+		// The marker may have been rewritten as live since the scan; remove only what is still the closed marker read.
+		await removeMarkerIf(root, path.join(root, marker.name), marker.record, current => current.revokedAt !== undefined);
 	}
 }
 
@@ -681,19 +742,110 @@ async function readWorkerRunMarker(
 	return { kind: "record", marker: read.value };
 }
 
-/** One cached marker close, keyed by the marker file: a worker reads it on every tool call and every request. */
-interface SpendCloseCacheEntry {
+const SPEND_CLOSE_SCHEMA = "storm.worker-spend-close/v1";
+
+/**
+ * One run's close of its spend, keyed by the run id so every descendant finds the same fact through the run named in
+ * its own admission. Written once, by an exclusive link; no later write replaces or restates it (B4).
+ */
+interface WorkerSpendCloseRecord {
+	schema: typeof SPEND_CLOSE_SCHEMA;
+	build: string;
+	runId: string;
+	close: SpendClose;
+}
+
+function spendCloseDir(dir: string): string {
+	return path.join(dir, "closes");
+}
+
+function spendCloseKey(runId: string): string {
+	return sha256Hex(`closed\u0000${runId}`);
+}
+
+function isSpendCloseRecord(value: unknown): value is WorkerSpendCloseRecord {
+	if (!isRecord(value) || value.schema !== SPEND_CLOSE_SCHEMA) return false;
+	if (typeof value.build !== "string" || value.build === "" || value.build.length > MAX_ID) return false;
+	if (typeof value.runId !== "string" || value.runId.trim() === "" || CONTROL_CHARS.test(value.runId) || value.runId.length > MAX_ID) return false;
+	return isSpendClose(value.close);
+}
+
+/** One file as the cache sees it: identity and change facts, so an atomically replaced file is never served stale. */
+interface FileIdentity {
+	dev: number;
+	ino: number;
 	mtimeMs: number;
 	size: number;
+}
+
+type FileProbe = { kind: "file"; id: FileIdentity } | { kind: "missing" } | { kind: "error"; reason: string };
+
+async function probeFile(file: string): Promise<FileProbe> {
+	try {
+		const info = await lstat(file);
+		if (!info.isFile()) return { kind: "error", reason: "예산 한도 상태를 담은 파일이 일반 파일이 아닙니다" };
+		return { kind: "file", id: { dev: info.dev, ino: info.ino, mtimeMs: info.mtimeMs, size: info.size } };
+	} catch (error) {
+		// Only a missing file is a fact; any other failure means the state cannot be established.
+		if ((error as NodeJS.ErrnoException | null | undefined)?.code === "ENOENT") return { kind: "missing" };
+		return { kind: "error", reason: "예산 한도 상태를 담은 파일을 읽지 못했습니다" };
+	}
+}
+
+function identityOf(id: FileIdentity): string {
+	return `${id.dev}:${id.ino}:${id.mtimeMs}:${id.size}`;
+}
+
+/** One cached close receipt, keyed by the file's device, inode, modification time and size. */
+interface SpendCloseCacheEntry {
+	key: string;
 	read: SpendCloseRead;
 }
 
 const spendCloseCache = new Map<string, SpendCloseCacheEntry>();
 
 /**
- * Closes this run's spend in the marker the workers read. Called once, by the director's own instance, when observed
- * spend reaches the limit. The run id is checked so a stale caller cannot close another run's marker, and a missing
- * marker is a failure the caller must tell the user about rather than a silent no-op: no worker would see the stop.
+ * One run's receipt as this build reads it: absent, closed, or a file that exists but cannot be read as this build's
+ * close. The cache is keyed by the file identity, so an atomically replaced receipt is never served stale.
+ */
+async function readCloseReceipt(dir: string, runId: string): Promise<SpendCloseRead | undefined> {
+	const file = path.join(spendCloseDir(dir), `${spendCloseKey(runId)}.json`);
+	const probe = await probeFile(file);
+	if (probe.kind === "missing") {
+		spendCloseCache.delete(file);
+		return undefined;
+	}
+	if (probe.kind === "error") return { kind: "unknown", reason: probe.reason };
+	const key = identityOf(probe.id);
+	const cached = spendCloseCache.get(file);
+	if (cached !== undefined && cached.key === key) return cached.read;
+	const read = await readRecordFile(file);
+	const answer: SpendCloseRead =
+		read.kind === "value" && isSpendCloseRecord(read.value) && read.value.build === buildId() && read.value.runId === runId
+			? { kind: "closed", close: read.value.close }
+			: { kind: "unknown", reason: "예산 한도 기록의 형식이나 신원이 올바르지 않습니다" };
+	spendCloseCache.set(file, { key, read: answer });
+	return answer;
+}
+
+/** Old close receipts cannot outlive the marker expiry: one small file per closed run of the last seven days. */
+async function pruneSpendCloses(dir: string): Promise<void> {
+	const now = Date.now();
+	const names = await readdir(dir).catch(() => [] as string[]);
+	for (const name of names) {
+		if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+		const file = path.join(dir, name);
+		const info = await lstat(file).catch(() => undefined);
+		if (info !== undefined && info.isFile() && now - info.mtimeMs > ACTIVE_TTL_MS) await rm(file, { force: true }).catch(() => undefined);
+	}
+}
+
+/**
+ * Closes this run's spend where every worker of the run reads it. Called by the director's own instance when observed
+ * spend reaches the limit. The run marker proves this caller names the run that exists; the close itself is a separate,
+ * run-keyed receipt, because the marker is rewritten by every admission of the run and by a new run of the same parent.
+ * Once written the receipt never changes: a later call returns ok without touching it, so no admission, revocation or
+ * second close can undo a close a worker may already have read.
  */
 export async function closeWorkerSpend(input: {
 	agentDir: string;
@@ -710,7 +862,8 @@ export async function closeWorkerSpend(input: {
 		const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 		if (artifactRoot === undefined) return { ok: false, reason: "자식 산출물 루트를 확인하지 못해 예산 한도를 워커에게 알리지 못했습니다" };
 		const key = runMarkerKey(artifactRoot, input.parentId);
-		const file = path.join(runsDir(admissionsDir(input.agentDir)), `${key}.json`);
+		const dir = admissionsDir(input.agentDir);
+		const file = path.join(runsDir(dir), `${key}.json`);
 		const read = await readRecordFile(file);
 		if (read.kind === "missing") return { ok: false, reason: "이 실행의 관리 표시가 없어 예산 한도를 워커에게 알리지 못했습니다" };
 		if (read.kind === "invalid") return { ok: false, reason: read.reason };
@@ -720,14 +873,45 @@ export async function closeWorkerSpend(input: {
 		if (read.value.build !== buildId()) return { ok: false, reason: "다른 빌드의 Storm이 쓴 관리 실행 표시라 예산 한도를 워커에게 알리지 못했습니다" };
 		if (read.value.runId !== input.runId) return { ok: false, reason: "관리 실행 표시가 다른 실행을 가리켜 예산 한도를 워커에게 알리지 못했습니다" };
 		const at = input.now ?? Date.now();
-		// One conditional change, like every other marker write: published only onto the marker it was read from, under the
-		// record lock, so a marker another copy of this build replaced in between is never overwritten.
-		const closed = await mutateMarker(admissionsDir(input.agentDir), file, key, marker => {
-			if (marker.runId !== input.runId) return undefined;
-			return { ...marker, spendClosedAt: { at, onExceed: input.onExceed } };
-		});
-		if (!closed) return { ok: false, reason: "관리 실행 표시가 그 사이에 바뀌어 예산 한도를 워커에게 알리지 못했습니다" };
-		await chmod(file, 0o600).catch(() => undefined);
+		const root = spendCloseDir(dir);
+		await mkdir(root, { recursive: true, mode: 0o700 });
+		const [real, realDir] = await Promise.all([realpath(root), realpath(dir)]);
+		if (!real.startsWith(realDir + path.sep)) return { ok: false, reason: "예산 한도 기록이 프로필 밖으로 연결되어 있습니다" };
+		const closeFile = path.join(real, `${spendCloseKey(input.runId)}.json`);
+		const existing = await readRecordFile(closeFile);
+		if (existing.kind === "invalid") return { ok: false, reason: `이 실행의 예산 한도 기록을 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}` };
+		if (existing.kind === "value") {
+			if (!isSpendCloseRecord(existing.value) || existing.value.build !== buildId() || existing.value.runId !== input.runId) {
+				return { ok: false, reason: "이 실행의 예산 한도 기록의 형식이나 신원이 올바르지 않습니다" };
+			}
+			// The first close stands. A second observation of the limit, or a changed user option, never restates it.
+			return { ok: true };
+		}
+		const record: WorkerSpendCloseRecord = { schema: SPEND_CLOSE_SCHEMA, build: buildId(), runId: input.runId, close: { at, onExceed: input.onExceed } };
+		const temp = path.join(real, `.${spendCloseKey(input.runId)}.${randomUUID()}.tmp`);
+		// The content is complete before the exclusive link that publishes it, so a reader never sees a partial receipt.
+		const handle = await open(temp, "wx", 0o600);
+		try {
+			await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+		} finally {
+			await handle.close().catch(() => undefined);
+		}
+		try {
+			// Exclusive publication: two copies that both saw no close cannot both write one, and the loser re-reads the
+			// winner's fact instead of replacing it.
+			await link(temp, closeFile);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return { ok: false, reason: "예산 한도 기록을 쓰지 못했습니다" };
+			const raced = await readRecordFile(closeFile);
+			if (raced.kind === "value" && isSpendCloseRecord(raced.value) && raced.value.build === buildId() && raced.value.runId === input.runId) {
+				return { ok: true };
+			}
+			return { ok: false, reason: "예산 한도 기록이 그 사이에 바뀌어 덮어쓰지 않았습니다" };
+		} finally {
+			await rm(temp, { force: true }).catch(() => undefined);
+		}
+		await chmod(closeFile, 0o600).catch(() => undefined);
+		await pruneSpendCloses(real);
 		return { ok: true };
 	} catch {
 		return { ok: false, reason: "예산 한도를 실행 표시에 쓰지 못했습니다" };
@@ -735,53 +919,76 @@ export async function closeWorkerSpend(input: {
 }
 
 /**
- * What this run's marker says about the spend limit, for a worker's guard and the check before its requests. The marker
- * is looked up by the canonical artifact root and the parent id the host gave the child, never by memory: the worker may
- * run on another host thread (D8, HF-4). Reads are cached by the marker's modification time and size; the file is
- * replaced atomically, so a changed file changes the cache key.
+ * What this run says about the spend limit, for a worker's guard and the check before its requests. A worker may run on
+ * another host thread, so the answer comes from the profile: the marker its parent names supplies the run (or the
+ * caller's own `runId` checks it), and the run-keyed close receipt is the one fact the director writes at the limit.
+ *
+ * A missing or unreadable marker is `unknown` for a managed worker, never `open`: the marker is written before every
+ * admission, so its absence for a worker Storm admitted means the fact cannot be established, and that worker is then
+ * treated as closed. An ordinary native child (no run id and no admission record) keeps the open answer, so a tree
+ * without a Storm run is not fenced. `unknown` is likewise a close Storm could not read. The cache is keyed by both
+ * files' device, inode, modification time and size, so an atomically replaced file is always read again.
  */
 export async function readWorkerSpendClose(input: {
 	agentDir: string;
 	artifactRoot: string | undefined;
 	parentId: string | undefined;
+	/** The run named by the worker's own admission; when absent the run the parent's marker names is used. */
+	runId?: string;
+	/** The child's host id: a record of this build for it makes a missing marker a managed worker's unknown state. */
+	childId?: string;
 }): Promise<SpendCloseRead> {
 	try {
 		if (input.parentId === undefined) return { kind: "unknown", reason: "부모 에이전트 id를 확인하지 못했습니다" };
 		const artifactRoot = await canonicalWorkerArtifactRoot(input.artifactRoot);
 		if (artifactRoot === undefined) return { kind: "unknown", reason: "자식 산출물 루트를 확인하지 못했습니다" };
 		const key = runMarkerKey(artifactRoot, input.parentId);
-		const file = path.join(runsDir(admissionsDir(input.agentDir)), `${key}.json`);
-		const info = await lstat(file).catch(() => undefined);
-		if (info === undefined) {
-			spendCloseCache.delete(file);
+		const dir = admissionsDir(input.agentDir);
+		// The run named by the worker's own admission is the one that owns its close: read that receipt first, so a
+		// descendant reaches it even when its own parent's marker is gone (B4).
+		if (input.runId !== undefined) {
+			const direct = await readCloseReceipt(dir, input.runId);
+			if (direct !== undefined) return direct;
+		}
+		const file = path.join(runsDir(dir), `${key}.json`);
+		const markerProbe = await probeFile(file);
+		if (markerProbe.kind === "missing") {
+			// A managed worker cannot establish the fact: a run id of its own, or its own admission record, proves the
+			// worker is Storm's, so the missing marker is treated as closed. An ordinary native child has neither and
+			// keeps the ordinary answer; its writes are still fenced by the managed tree's own authority check.
+			if (input.runId !== undefined) return { kind: "unknown", reason: "관리 실행 표시가 없어 예산 한도 상태를 확인하지 못했습니다" };
+			if (input.childId !== undefined) {
+				const record = await readWorkerAdmission({ agentDir: input.agentDir, artifactRoot, parentId: input.parentId, childId: input.childId });
+				if (record.kind !== "missing") return { kind: "unknown", reason: "관리 실행 표시가 없어 예산 한도 상태를 확인하지 못했습니다" };
+			}
 			return { kind: "open" };
 		}
-		if (!info.isFile()) return { kind: "unknown", reason: "관리 실행 표시가 일반 파일이 아닙니다" };
-		const cached = spendCloseCache.get(file);
-		if (cached !== undefined && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.read;
+		if (markerProbe.kind === "error") return { kind: "unknown", reason: markerProbe.reason };
 		const read = await readRecordFile(file);
-		let answer: SpendCloseRead;
-		if (read.kind === "missing") {
-			spendCloseCache.delete(file);
-			return { kind: "open" };
-		} else if (read.kind === "invalid") {
-			answer = { kind: "unknown", reason: read.reason };
-		} else if (
+		if (
+			read.kind !== "value" ||
 			!isRunMarker(read.value) ||
+			read.value.build !== buildId() ||
 			read.value.key !== key ||
 			read.value.artifactRoot !== artifactRoot ||
 			read.value.parentId !== input.parentId
 		) {
-			answer = { kind: "unknown", reason: "관리 실행 표시의 형식이나 신원이 올바르지 않습니다" };
-		} else if (read.value.build !== buildId()) {
-			answer = { kind: "unknown", reason: "다른 빌드의 Storm이 쓴 관리 실행 표시입니다" };
-		} else if (read.value.spendClosedAt === undefined) {
-			answer = { kind: "open" };
-		} else {
-			answer = { kind: "closed", close: read.value.spendClosedAt };
+			return { kind: "unknown", reason: "관리 실행 표시의 형식이나 신원이 올바르지 않습니다" };
 		}
-		spendCloseCache.set(file, { mtimeMs: info.mtimeMs, size: info.size, read: answer });
-		return answer;
+		const marker = read.value;
+		// The caller's own run is the one its admission names; a marker for another run cannot answer for it.
+		if (input.runId !== undefined && marker.runId !== input.runId) {
+			return { kind: "unknown", reason: "관리 실행 표시가 워커의 실행과 다릅니다" };
+		}
+		const runId = input.runId ?? marker.runId;
+		const receipt = await readCloseReceipt(dir, runId);
+		if (receipt !== undefined) return receipt;
+		if (marker.spendClosedAt !== undefined) {
+			// A marker written by the unreleased 0.29.0 build carries the close itself; it is read for compatibility,
+			// never written, and no new close ever lands there.
+			return { kind: "closed", close: marker.spendClosedAt };
+		}
+		return { kind: "open" };
 	} catch {
 		return { kind: "unknown", reason: "관리 실행 표시를 읽지 못했습니다" };
 	}
@@ -834,17 +1041,6 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 	const runId = identity(input.runId, "실행 id");
 	const sessionId = identity(input.sessionId, "세션 id");
 	const repoId = identity(input.repoId, "저장소 id");
-	await writeWorkerRunMarker({
-		dir,
-		artifactRoot,
-		parentId,
-		runId,
-		sessionId,
-		sessionDir,
-		repoId,
-		targetRoot,
-		now,
-	});
 	const key = workerAdmissionKey(artifactRoot, parentId, childId);
 	const record: WorkerAdmissionRecord = {
 		schema: WORKER_ADMISSION_SCHEMA,
@@ -869,27 +1065,56 @@ export async function persistWorkerAdmission(input: WorkerAdmissionInput): Promi
 		if (!input.approved.every(isApprovedEntry)) throw new Error("승인된 모델 목록이 올바르지 않습니다");
 		record.approved = input.approved.map(entry => ({ selector: entry.selector, ...(entry.effort === undefined ? {} : { effort: entry.effort }) }));
 	}
+	// The bound is the record as it is written, less room for the fields a stop, end or revoke adds later: a record that
+	// fits only until it is closed would become unreadable exactly when its worker is stopped (RF6o cases 6 and 7).
 	const encoded = `${JSON.stringify(record, null, 2)}\n`;
-	if (Buffer.byteLength(encoded) > MAX_ADMISSION_BYTES) {
-		throw new Error(`자식 권한 기록이 ${MAX_ADMISSION_BYTES}바이트를 넘습니다. 역할의 모델 목록이나 레인 경로를 줄여 다시 승인하세요`);
+	if (Buffer.byteLength(encoded) > MAX_ADMISSION_BYTES - ADMISSION_CLOSING_ROOM) {
+		throw new Error(`자식 권한 기록이 ${MAX_ADMISSION_BYTES - ADMISSION_CLOSING_ROOM}바이트를 넘습니다. 역할의 모델 목록이나 레인 경로를 줄여 다시 승인하세요`);
 	}
-	const file = admissionFile(dir, key);
-	await withRecordLock(dir, key, async () => {
-		const existing = await readRecordFile(file);
-		// A record this build cannot read is not replaced: it may belong to another build sharing the profile, and a copy
-		// of another build must not replace what it cannot read. A missing file, this build's own record, or an older
-		// release's record are the only states a new attempt is written over.
-		if (existing.kind === "invalid") throw new Error(`기존 자식 권한 기록을 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}`);
-		if (existing.kind === "value") {
-			const value = existing.value;
-			if (isAdmission(value)) {
-				if (value.build !== record.build) throw new Error("다른 빌드의 Storm이 쓴 자식 권한 기록이 있어 덮어쓰지 않았습니다");
-			} else if (!obsoleteSchema(value, OBSOLETE_ADMISSION_SCHEMAS)) {
-				throw new Error("기존 자식 권한 기록의 형식이 올바르지 않아 덮어쓰지 않았습니다");
-			}
-		}
-		await writeJsonAtomic(file, record);
+	// The marker is written only after the record can fit: a live marker for an admission that can never be stored
+	// would make every other unrecorded child of the run read as unknown.
+	await writeWorkerRunMarker({
+		dir,
+		artifactRoot,
+		parentId,
+		runId,
+		sessionId,
+		sessionDir,
+		repoId,
+		targetRoot,
+		now,
 	});
+	// The content is written before the lock: the section only re-reads the record and renames, so a paused writer can
+	// never hold the lock through a slow write, and its temp is ready before anyone can observe it.
+	const file = admissionFile(dir, key);
+	const temp = path.join(dir, `.${key}.${randomUUID()}.tmp`);
+	await writeJsonAtomic(temp, record);
+	let published = false;
+	try {
+		await withRecordLock(dir, key, async held => {
+			const existing = await readRecordFile(file);
+			// A record this build cannot read is not replaced: it may belong to another build sharing the profile, and a copy
+			// of another build must not replace what it cannot read. A missing file, this build's own record, or an older
+			// release's record are the only states a new attempt is written over.
+			if (existing.kind === "invalid") throw new Error(`기존 자식 권한 기록을 읽을 수 없어 덮어쓰지 않았습니다: ${existing.reason}`);
+			if (existing.kind === "value") {
+				const value = existing.value;
+				if (isAdmission(value)) {
+					if (value.build !== record.build) throw new Error("다른 빌드의 Storm이 쓴 자식 권한 기록이 있어 덮어쓰지 않았습니다");
+				} else if (!obsoleteSchema(value, OBSOLETE_ADMISSION_SCHEMAS)) {
+					throw new Error("기존 자식 권한 기록의 형식이 올바르지 않아 덮어쓰지 않았습니다");
+				}
+			}
+			// A writer paused past `LOCK_STALE_MS` lost the lock; it publishes nothing rather than a stale attempt over
+			// the record the new owner wrote.
+			if (!(await held())) throw new Error("자식 권한 기록을 쓰는 중에 잠금이 다른 사본으로 넘어가 기록을 남기지 않았습니다. 다시 스폰하세요");
+			await rename(temp, file);
+			published = true;
+		});
+	} finally {
+		if (!published) await rm(temp, { force: true }).catch(() => undefined);
+	}
+	if (!published) throw new Error("자식 권한 기록을 쓰지 못했습니다. 다시 스폰하세요");
 	await chmod(file, 0o600).catch(() => undefined);
 	return { key, record };
 }

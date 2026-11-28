@@ -91,7 +91,8 @@ test("a call that carries neither field is untouched and gets no note", () => {
 	const p = plan(lane("a"));
 	const result = new RunLanes("clean").place({ agent: "storm-implementer", name: "a", task: "A" }, p, team);
 	expect(pinNotes(result)).toEqual([]);
-	expect(placed(result).input).toMatchObject({ agent: "storm-implementer", name: "a", task: "A" });
+	expect(placed(result).input).toMatchObject({ agent: "storm-implementer", task: "A" });
+	expect(String(placed(result).input.name)).toMatch(/^clean-lane-\d+$/);
 });
 
 test("only the field the director passed is named", () => {

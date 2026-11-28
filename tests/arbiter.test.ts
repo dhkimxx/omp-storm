@@ -148,25 +148,32 @@ describe("a worker that settled keeps its place until the host has finished with
 
 	test("its parent's call is the receipt: the place is free at the call's end, not at the settled turn", () => {
 		const lanes = table({ current: [] });
-		expect(lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "sync-1", now: T0 }).ok).toBe(true);
-		lanes.admit({ spawnKey: "A", agent: "storm-implementer", outcome: "routed" }, { plan, config });
-		lanes.agentStarted("A");
-		lanes.releaseAgent("A");
-		const again = lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [settled("A")], callId: "b-1", now: T0 + 10 });
+		const placed = lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "sync-1", now: T0 });
+		expect(placed.ok).toBe(true);
+		if (!placed.ok) return;
+		const key = String(placed.input.name);
+		lanes.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan, config });
+		lanes.agentStarted(key);
+		lanes.releaseAgent(key);
+		const again = lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [settled(key)], callId: "b-1", now: T0 + 10 });
 		expect(again).toMatchObject({ ok: false, code: "lane-write" });
 		lanes.callEnded("sync-1");
-		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [settled("A")], callId: "b-2", now: T0 + 20 }).ok).toBe(true);
+		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [settled(key)], callId: "b-2", now: T0 + 20 }).ok).toBe(true);
 	});
 
 	test("the host's task job for the worker is the receipt of an async call: the place is free once the job is gone", () => {
-		const rows = { current: [{ id: "job_a", type: "task", status: "running", agentId: "A" }] as readonly HostJobRow[] | undefined };
+		const rows = { current: [] as readonly HostJobRow[] | undefined };
 		const lanes = table(rows);
-		expect(lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "async-1", now: T0 }).ok).toBe(true);
-		lanes.admit({ spawnKey: "A", agent: "storm-implementer", outcome: "routed" }, { plan, config });
+		const placed = lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "async-1", now: T0 });
+		expect(placed.ok).toBe(true);
+		if (!placed.ok) return;
+		const key = String(placed.input.name);
+		rows.current = [{ id: "job_a", type: "task", status: "running", agentId: key }];
+		lanes.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan, config });
 		lanes.callEnded("async-1");
-		lanes.agentStarted("A");
-		lanes.releaseAgent("A");
-		const listed = [settled("A")];
+		lanes.agentStarted(key);
+		lanes.releaseAgent(key);
+		const listed = [settled(key)];
 		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: listed, now: T0 + 10 })).toMatchObject({ ok: false, code: "lane-write" });
 		rows.current = [];
 		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: listed, now: T0 + 20 }).ok).toBe(true);
@@ -174,11 +181,14 @@ describe("a worker that settled keeps its place until the host has finished with
 
 	test("a worker that is still running is never freed by a receipt", () => {
 		const lanes = table({ current: [] });
-		expect(lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "c-1", now: T0 }).ok).toBe(true);
-		lanes.admit({ spawnKey: "A", agent: "storm-implementer", outcome: "routed" }, { plan, config });
-		lanes.agentStarted("A");
+		const placed = lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "c-1", now: T0 });
+		expect(placed.ok).toBe(true);
+		if (!placed.ok) return;
+		const key = String(placed.input.name);
+		lanes.admit({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, { plan, config });
+		lanes.agentStarted(key);
 		lanes.callEnded("c-1");
-		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [running("A")], now: T0 + 10 })).toMatchObject({ ok: false, code: "lane-write" });
+		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, agents: [running(key)], now: T0 + 10 })).toMatchObject({ ok: false, code: "lane-write" });
 	});
 });
 
@@ -440,20 +450,25 @@ const put = (lanes: RunLanes, name: string, over: { now?: number; callId?: strin
 	lanes.place({ agent: AGENT_OF[name]!, name, task: `do ${name}` }, PLAN, TEAM, { policies: POLICIES, now: over.now ?? T0, ...(over.callId === undefined ? {} : { callId: over.callId }), ...(over.agents === undefined ? {} : { agents: over.agents }) });
 const auto = (lanes: RunLanes, name: string) =>
 	lanes.assign({ agent: AGENT_OF[name]!, name, task: `do ${name}` }, PLAN, TEAM, { policies: POLICIES, now: T0 });
-const admit = (lanes: RunLanes, name: string) => lanes.admitChecked({ spawnKey: name, agent: AGENT_OF[name]!, outcome: "routed" }, { plan: PLAN, config: TEAM });
-const runningAgent = (id: string): AgentEntry => agentEntry({ id, name: AGENT_OF[id]!, state: "running", requests: 2, lastActivityAt: T0 + 5 });
-const idleAgent = (id: string): AgentEntry => agentEntry({ id, name: AGENT_OF[id]!, state: "idle", requests: 2, lastActivityAt: T0 + 5 });
+const admit = (lanes: RunLanes, name: string) =>
+	lanes.admitChecked({ spawnKey: lanes.pendingHandle(name) ?? name, agent: AGENT_OF[name]!, outcome: "routed" }, { plan: PLAN, config: TEAM });
+/** The host id of a lane's worker: the handle the table gave the host, never the lane's table key. */
+const keyOf = (lanes: RunLanes, name: string): string => lanes.agentForLane(name) ?? lanes.pendingHandle(name) ?? name;
+const runningAgent = (lanes: RunLanes, id: string): AgentEntry =>
+	agentEntry({ id: keyOf(lanes, id), name: AGENT_OF[id]!, state: "running", requests: 2, lastActivityAt: T0 + 5 });
+const idleAgent = (lanes: RunLanes, id: string): AgentEntry =>
+	agentEntry({ id: keyOf(lanes, id), name: AGENT_OF[id]!, state: "idle", requests: 2, lastActivityAt: T0 + 5 });
 const edit = (lanes: RunLanes, callId: string, paths: string[], over: Partial<CommitWriterRequest> = {}) =>
 	lanes.commitWriter({ kind: "director-path", callId, paths, live: LIVE, now: T0, ...over });
 const followUp = (lanes: RunLanes, name: string, over: Partial<Parameters<RunLanes["checkFollowUp"]>[0]> = {}) =>
 	lanes.checkFollowUp({
-		agentId: name,
+		agentId: keyOf(lanes, name),
 		agent: AGENT_OF[name]!,
 		role: PLAN.lanes.find(lane => lane.name === name)!.role,
 		lane: PLAN.lanes.find(lane => lane.name === name)!,
 		policy: POLICIES.get(name)!,
 		isolated: false,
-		agents: [idleAgent(name)],
+		agents: [idleAgent(lanes, name)],
 		now: T0,
 		...over,
 	});
@@ -519,7 +534,12 @@ describe("a director path edit and the writers of the table", () => {
 			{ state: "admitted, not yet seen running", arrange: (lanes, name) => (put(lanes, name), admit(lanes, name), []), phrase: "레인 워커" },
 			{
 				state: "running",
-				arrange: (lanes, name) => (put(lanes, name), admit(lanes, name), lanes.agentStarted(name), [runningAgent(name)]),
+				arrange: (lanes, name) => {
+					put(lanes, name);
+					admit(lanes, name);
+					lanes.agentStarted(keyOf(lanes, name));
+					return [runningAgent(lanes, name)];
+				},
 				phrase: "레인 워커",
 			},
 			{
@@ -527,10 +547,10 @@ describe("a director path edit and the writers of the table", () => {
 				arrange: (lanes, name) => {
 					put(lanes, name);
 					admit(lanes, name);
-					lanes.agentStarted(name);
-					lanes.releaseAgent(name);
+					lanes.agentStarted(keyOf(lanes, name));
+					lanes.releaseAgent(keyOf(lanes, name));
 					expect(followUp(lanes, name).ok).toBe(true);
-					return [idleAgent(name)];
+					return [idleAgent(lanes, name)];
 				},
 				phrase: "후속 작업(시작 전)",
 			},
@@ -560,10 +580,10 @@ describe("a director path edit and the writers of the table", () => {
 		const lanes = table({ current: [] });
 		put(lanes, "X");
 		admit(lanes, "X");
-		lanes.agentStarted("X");
-		expect(edit(lanes, "e1", ["a.ts"], { agents: [runningAgent("X")] })).toMatchObject({ ok: false });
-		lanes.releaseAgent("X");
-		expect(edit(lanes, "e1", ["a.ts"], { agents: [idleAgent("X")] })).toEqual({ ok: true });
+		lanes.agentStarted(keyOf(lanes, "X"));
+		expect(edit(lanes, "e1", ["a.ts"], { agents: [runningAgent(lanes, "X")] })).toMatchObject({ ok: false });
+		lanes.releaseAgent(keyOf(lanes, "X"));
+		expect(edit(lanes, "e1", ["a.ts"], { agents: [idleAgent(lanes, "X")] })).toEqual({ ok: true });
 	});
 
 	test("[edit, task] and [task, edit] have opposite winners", () => {
@@ -635,23 +655,23 @@ describe("a director path edit and the writers of the table", () => {
 
 		const other = table({ current: [] });
 		expect(followUp(other, "A").ok).toBe(true);
-		expect(edit(other, "e1", ["src/a.ts"], { agents: [idleAgent("A")] })).toMatchObject({ ok: false, holder: { lane: "A", awaiting: true } });
+		expect(edit(other, "e1", ["src/a.ts"], { agents: [idleAgent(other, "A")] })).toMatchObject({ ok: false, holder: { lane: "A", awaiting: true } });
 		// A note to a worker that is running joins its open turn: the worker's own entry keeps refusing the edit.
 		const running = table({ current: [] });
 		put(running, "X");
 		admit(running, "X");
-		running.agentStarted("X");
-		expect(followUp(running, "X", { progress: true, agents: [runningAgent("X")] }).ok).toBe(true);
-		expect(edit(running, "e1", ["a.md"], { agents: [runningAgent("X")] })).toMatchObject({ ok: false, holder: { lane: "X" } });
+		running.agentStarted(keyOf(running, "X"));
+		expect(followUp(running, "X", { progress: true, agents: [runningAgent(running, "X")] }).ok).toBe(true);
+		expect(edit(running, "e1", ["a.md"], { agents: [runningAgent(running, "X")] })).toMatchObject({ ok: false, holder: { lane: "X" } });
 	});
 
 	test("a follow-up that failed its preflight leaves no hold behind for the edit to meet", () => {
 		const lanes = table({ current: [] });
 		const gate = followUp(lanes, "X");
 		if (!gate.ok) throw new Error("not admitted");
-		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent("X")] })).toMatchObject({ ok: false });
+		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent(lanes, "X")] })).toMatchObject({ ok: false });
 		lanes.finishFollowUp(gate.token, false);
-		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent("X")] })).toEqual({ ok: true });
+		expect(edit(lanes, "e1", ["a.md"], { agents: [idleAgent(lanes, "X")] })).toEqual({ ok: true });
 	});
 
 	test("a reservation placed by a call that failed is gone, and does not keep refusing the edit", () => {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { resolveRepo } from "../src/approval/repo.ts";
@@ -356,8 +356,8 @@ describe("findShadows", () => {
 		const user = path.join(tmp, "user-agents");
 		const plugin = path.join(tmp, "plugin", "agents");
 		for (const d of [outer, inner, cwd, user, plugin]) await mkdir(d, { recursive: true });
-		await writeFile(path.join(outer, "storm-outer.md"), agent("storm-outer"));
-		await writeFile(path.join(inner, "storm-inner.md"), agent("storm-inner"));
+		await writeFile(path.join(outer, "storm-architect.md"), agent("storm-architect"));
+		await writeFile(path.join(inner, "storm-quick.md"), agent("storm-quick"));
 		await writeFile(path.join(inner, "helper.md"), agent("helper"));
 		await writeFile(path.join(user, "storm-x.md"), agent("other"));
 		await writeFile(path.join(user, "foo.md"), agent("storm-reviewer"));
@@ -365,7 +365,7 @@ describe("findShadows", () => {
 
 		const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
 		expect(shadows.map((s) => [s.scope, s.agent, s.path])).toEqual([
-			["project", "storm-inner", path.join(inner, "storm-inner.md")],
+			["project", "storm-quick", path.join(inner, "storm-quick.md")],
 			["user", "storm-reviewer", path.join(user, "foo.md")],
 		]);
 		expect(shadows[1]?.sha256).toBe(new Bun.CryptoHasher("sha256").update(agent("storm-reviewer")).digest("hex"));
@@ -415,6 +415,40 @@ describe("findShadows", () => {
 		await mkdir(cwd);
 		expect(await findShadows({ cwd, userAgentsDir: link, pluginAgentsDir: plugin })).toEqual([]);
 		expect(await findShadows({ cwd, userAgentsDir: plugin, pluginAgentsDir: plugin })).toEqual([]);
+	});
+
+	test("a project definition under a bundled agent's name is a shadow the approval must cover (B1)", async () => {
+		const cwd = path.join(tmp, "b1", "work");
+		const agents = path.join(tmp, "b1", ".omp", "agents");
+		const user = path.join(tmp, "b1-user");
+		const plugin = path.join(tmp, "b1-plugin");
+		for (const d of [cwd, agents, user, plugin]) await mkdir(d, { recursive: true });
+		const file = path.join(agents, "task.md");
+		await writeFile(file, agent("task"));
+		const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		expect(shadows.map(s => [s.agent, s.path])).toEqual([["task", file]]);
+		// The file's basename is routed even when its frontmatter names something else: the host may load it by the file.
+		await writeFile(file, agent("something-else"));
+		const byFile = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+		expect(byFile.map(s => s.agent)).toEqual(["task"]);
+	});
+
+	test("a routed definition that cannot be read is an unapproved shadow, never assumed absent (B1)", async () => {
+		if (process.getuid?.() === 0) return;
+		const cwd = path.join(tmp, "b1-unreadable", "work");
+		const agents = path.join(tmp, "b1-unreadable", ".omp", "agents");
+		const user = path.join(tmp, "b1-unreadable-user");
+		const plugin = path.join(tmp, "b1-unreadable-plugin");
+		for (const d of [cwd, agents, user, plugin]) await mkdir(d, { recursive: true });
+		const file = path.join(agents, "task.md");
+		await writeFile(file, agent("task"));
+		await chmod(file, 0o000);
+		try {
+			const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
+			expect(shadows).toEqual([{ agent: "task", path: file, scope: "project", sha256: "" }]);
+		} finally {
+			await chmod(file, 0o600);
+		}
 	});
 
 	test("missing dirs yield nothing", async () => {

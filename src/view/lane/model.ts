@@ -23,6 +23,11 @@ export interface LaneTrack {
 	activity?: number;
 	/** Results of this lane that are met, of those in scope; shown when total is above 1. */
 	progress?: { met: number; total: number };
+	/**
+	 * Every accepted result is a retained artifact kept outside the target: the lane's work was not applied, so the
+	 * picture must not draw it as an integrated acceptance (B7).
+	 */
+	retained?: true;
 }
 export interface LaneSnapshot {
 	now: number;

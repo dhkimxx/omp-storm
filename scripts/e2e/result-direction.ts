@@ -336,7 +336,8 @@ async function main(): Promise<void> {
 					JSON.stringify(row(final, "api-check")?.proof),
 				);
 				check("the retry did not start a separate run", files.index().filter(line => line.runId === runId).length === 1, JSON.stringify(files.index().filter(line => line.runId === runId)));
-				check("the existing API worker received exactly one follow-up", final.agents?.find(agent => agent.id === "api-verify")?.followUps === 1, JSON.stringify(final.agents?.map(agent => [agent.id, agent.followUps])));
+				const apiNative = final.spawns?.find(spawn => spawn.lane === "api-verify" && spawn.outcome !== "blocked")?.spawnKey;
+				check("the existing API worker received exactly one follow-up", apiNative !== undefined && final.agents?.find(agent => agent.id === apiNative)?.followUps === 1, JSON.stringify({ apiNative, agents: final.agents?.map(agent => [agent.id, agent.followUps]) }));
 				check(
 					"only the two declared lanes started workers; retry reused the API worker",
 					(final.spawns ?? []).filter(spawn => spawn.outcome !== "blocked").length === 2 &&

@@ -77,6 +77,47 @@ async function main(): Promise<void> {
 		});
 	}, 300_000);
 
+	await suite.step("a manual lane placed twice in one session and again in a later run never reuses a handle (A1-5)", async () => {
+		const handles: Array<string | undefined> = [];
+		for (const round of [0, 1, 2]) {
+			await sessions.open(() => undefined, async (rpc, files) => {
+				const before = files.runIds();
+				const file = `manual-${round}.txt`;
+				// The same lane name every round: the table and the director's vocabulary keep it, the host never does.
+				const plan = {
+					storm: {
+						action: "plan",
+						plan: {
+							lanes: [{
+								name: "Manual",
+								kind: "code",
+								files: [file],
+								results: [{ id: `manual-${round}`, kind: "change", criterion: `${file} holds the change`, path: file, contains: "storm child change" }],
+							}],
+						},
+					},
+				};
+				const steps: Step[] = [
+					plan,
+					{ tasks: [{ name: "Manual", agent: "storm-implementer", task: "Write", say: `E2E-CHILD-WRITE ${file} E2E-CHILD-CLAIM manual-${round}` }] },
+					{ wait: true },
+				];
+				await rpc.prompt(`E2E-STEPS ${JSON.stringify(steps)}`, 180_000);
+				const run = await files.finishedRun(before, 180_000);
+				const routed = run.spawns.filter(spawn => spawn.outcome !== "blocked");
+				const spawnKey = routed[0]?.spawnKey;
+				handles.push(spawnKey);
+				check(
+					`round ${round}: the manual lane kept its name and placed its worker under a new handle`,
+					run.plan?.lanes[0]?.name === "Manual" && routed.length === 1 && routed[0]?.agent === "storm-implementer" && spawnKey !== undefined && !spawnKey.startsWith("Manual"),
+					JSON.stringify({ lanes: run.plan?.lanes.map(lane => lane.name), spawns: run.spawns.map(spawn => [spawn.spawnKey, spawn.outcome]) }),
+				);
+				check(`round ${round}: the manual worker wrote the file the lane declared`, existsSync(join(env.project, file)) && readFileSync(join(env.project, file), "utf8").includes("storm child change"), `exists=${existsSync(join(env.project, file))}`);
+			});
+		}
+		check("no two placements of the manual lane, across the session and the new process, share a handle", handles.every(key => key !== undefined) && new Set(handles).size === handles.length, JSON.stringify(handles));
+	}, 400_000);
+
 	await suite.step("every omp session exited cleanly", async () => {
 		check("no session exited non-zero", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);
 	}, 60_000, { always: true });

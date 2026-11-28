@@ -24,10 +24,13 @@ export const RESULT_STATE_LABEL: Readonly<Record<RunResultState, string>> = {
 	accepted: "이행",
 };
 
-/** Row 1: an accepted retained artifact is `kept` outside the target; the word every count uses for it. */
-export const RETAINED_LABEL = "보존";
-/** `보존 수용 N/M`: the acceptance count when every accepted row is a retained artifact, never read as a tree change. */
-export const RETAINED_ACCEPTED = "보존 수용";
+/**
+ * Row 1/§5: an accepted retained artifact is kept outside the parent work tree, and the word itself says so in every
+ * form, including the narrowest chip. It never means the parent is unchanged or lacks those bytes.
+ */
+export const RETAINED_LABEL = "부모 밖 보존";
+/** `부모 밖 보존 수용 N/M`: the acceptance count when every accepted row is a retained artifact, never tree work. */
+export const RETAINED_ACCEPTED = "부모 밖 보존 수용";
 /** An old or damaged row proves an isolated artifact acceptance but carries no bound capture reference: say unknown. */
 export const RETAINED_REF_UNKNOWN = "참조 미확인(호스트 시도 기록)";
 /** A retained artifact's form, then a safe file name and a digest prefix; no absolute host path. */

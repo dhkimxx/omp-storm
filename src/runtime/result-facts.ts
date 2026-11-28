@@ -12,9 +12,10 @@
  * view says so instead of drawing `0/0` or an acceptance mark. Nothing here reads plan text as proof; a plan only says
  * which ids are declared.
  */
-import type { AgentEntry, InfoTone, RunRecord, SpawnRecord } from "../types.ts";
+import type { AgentEntry, InfoTone, PlanLaneResult, RunRecord, RunResult, SpawnRecord } from "../types.ts";
+import { attemptAgentId } from "./attempt-report.ts";
 import { resultProgress, type ResultProgress } from "../view/results.ts";
-import { unplannedTotal } from "./unplanned.ts";
+import { unplannedSplit, unplannedTotal } from "./unplanned.ts";
 
 /** The head word every surface uses for a run whose record holds no declared result row. */
 export const NO_DECLARED_RESULTS = "선언된 결과 없음";
@@ -22,6 +23,10 @@ export const NO_DECLARED_RESULTS = "선언된 결과 없음";
 export const OUT_OF_PLAN_LABEL = "계획 밖";
 /** The unit word before a worker count; no particle follows an inserted value. */
 export const WORKER_LABEL = "워커";
+/** A worker's file-change record, never a tree count: the ledger counted that worker's changing tool results. */
+export const WORKER_CHANGE_LABEL = "변경 기록 워커";
+/** A parent-tree change count, shown only when the caller's named check actually read the tree. */
+export const TREE_CHANGE_LABEL = "부모 트리 변경";
 /** The one line a run says the first time it places a worker outside the plan, for the task result. */
 export const UNPLANNED_WORKER_NOTE = "계획 밖 워커: 결과 집계에 들어가지 않습니다. 결과로 세려면 계획의 레인 이름을 쓰세요.";
 
@@ -71,12 +76,33 @@ export interface WorkerActivity {
 	readonly settled: number;
 	/** Workers whose latest settled turn reported an error, abort or output limit. */
 	readonly failed: number;
-	/** Workers whose host record says they changed files; never a count of changed paths. */
+	/** Workers whose host record says they changed files; never a count of changed paths, and never a tree claim alone. */
 	readonly changed: number;
 	/** Deliveries that answer no declared result. */
 	readonly unplanned: number;
 	/** Placements without a lane: workers the director placed outside the plan. */
 	readonly unplannedPlaced: number;
+}
+
+/**
+ * Where the workers that recorded changes wrote. Only a worker's own accepted parent-tree result (a shared `change` or
+ * `artifact`) positively places its writes in the parent; a lane the plan marks isolated, or an accepted retained
+ * artifact, places them outside. Everything else — a plan-less placement, a team-isolated plan whose team fact the
+ * record does not store, or an accepted row that names no attempt — is unknown. Counts only, so this fact is the same
+ * size at any team size.
+ */
+export interface ChangeAttribution {
+	readonly shared: number;
+	readonly outside: number;
+	readonly unknown: number;
+}
+
+/** A stopped or failed worker whose retained patch or branch the record does not bind; the native record is the pointer. */
+export interface CaptureUnknown {
+	/** Distinct stopped/failed workers on work that could have a checkout, with no bound retained reference. */
+	readonly count: number;
+	/** The first such worker's native handle (`agent://<id>`); absent when no safe id was recorded. */
+	readonly native?: string;
 }
 
 export interface ResultFactOptions {
@@ -97,6 +123,8 @@ export interface ResultFacts {
 	 */
 	readonly noResultsNotice: boolean;
 	readonly progress: ResultProgress;
+	/** Declared rows exist, but every one is out of the user's scope: no fraction and no success may be shown. */
+	readonly allExcluded: boolean;
 	/**
 	 * Accepted retained artifacts, kept outside the target (row 1). `capture` and `attempt` are the first row's safe,
 	 * digest-bound reference; the count is all of them. Fixed size: no list grows with the number of workers.
@@ -105,6 +133,13 @@ export interface ResultFacts {
 	readonly rows: ResultRowFacts;
 	readonly coverage: ResultCoverage;
 	readonly activity: WorkerActivity;
+	/** Where the workers that recorded changes wrote: parent, outside, or not established. Counts only. */
+	readonly changes: ChangeAttribution;
+	/**
+	 * A stopped or failed worker on work that could have a checkout, with no bound retained reference. Absent when there
+	 * is nothing unbound to point at. One count and one native handle: no list grows with the number of workers.
+	 */
+	readonly captureUnknown?: CaptureUnknown;
 	/** Deliveries that answer no declared result; a mixed run shows this beside its declared rows. */
 	readonly outOfPlan: number;
 	/** Only when the caller supplied it. */
@@ -135,6 +170,97 @@ function planIds(run: RunRecord): { readonly declared: ReadonlySet<string>; read
 		if (laneHasResult) declaredLanes += 1;
 	}
 	return { declared, lanes: lanes.length, declaredLanes };
+}
+
+/** A text fact that is present and not blank. */
+const hasText = (value: unknown): value is string => typeof value === "string" && value.trim() !== "";
+
+/** The longest native id a surface will link; matches the host's id bound used by attempt reports. */
+const NATIVE_ID = /^[A-Za-z0-9._-]{1,120}$/u;
+
+/**
+ * Where each changed worker's writes went, from the record alone. A row's accepted parent-tree result names its attempt,
+ * so the worker id is its last segment; a retained artifact is read outside the parent whatever its lane says. A lane
+ * the plan marks isolated is outside; a plan-less placement or a lane whose team isolation was not stored is unknown.
+ * One pass over the plan, the rows, the spawns and the agents: linear, with keyed maps, never a per-worker scan.
+ */
+export function changeAttribution(run: RunRecord): ChangeAttribution {
+	const isolatedLanes = new Set<string>();
+	const plannedById = new Map<string, PlanLaneResult>();
+	for (const lane of Array.isArray(run.plan?.lanes) ? run.plan.lanes : []) {
+		if (!hasText(lane?.name)) continue;
+		if (hasText(lane.isolationReason)) isolatedLanes.add(lane.name);
+		for (const result of lane.results ?? []) {
+			if (hasText(result?.id) && !plannedById.has(result.id)) plannedById.set(result.id, result);
+		}
+	}
+	const sharedAgents = new Set<string>();
+	const outsideAgents = new Set<string>();
+	for (const value of Array.isArray(run.results) ? run.results : []) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+		const row = value as RunResult;
+		if (row.state !== "accepted") continue;
+		const agent = attemptAgentId(row.attemptId);
+		if (agent === undefined) continue;
+		const kind = row.contract?.kind ?? plannedById.get(row.id)?.kind;
+		const kept = row.proof?.item.artifact !== undefined ||
+			(hasText(row.lane) && isolatedLanes.has(row.lane) && kind === "artifact");
+		if (kept) outsideAgents.add(agent);
+		// 0.29.0 accepts a change only from the parent tree; a shared artifact is read there as well. An answer and a
+		// pending or unmet row place no writes.
+		else if (kind === "change" || kind === "artifact") sharedAgents.add(agent);
+	}
+	const laneByAgent = new Map<string, string>();
+	for (const spawn of Array.isArray(run.spawns) ? run.spawns : []) {
+		if (spawn.outcome === "blocked" || !hasText(spawn.spawnKey) || !hasText(spawn.lane)) continue;
+		laneByAgent.set(spawn.spawnKey, spawn.lane);
+	}
+	let shared = 0;
+	let outside = 0;
+	let unknown = 0;
+	for (const agent of Array.isArray(run.agents) ? run.agents : []) {
+		if (!((agent.changes ?? 0) > 0) || agent.role === "quick") continue;
+		if (sharedAgents.has(agent.id)) shared += 1;
+		else if (outsideAgents.has(agent.id)) outside += 1;
+		else if (isolatedLanes.has(laneByAgent.get(agent.id) ?? "\u0000")) outside += 1;
+		else unknown += 1;
+	}
+	return { shared, outside, unknown };
+}
+
+/**
+ * A stopped or failed worker's retained patch or branch is a native fact this version does not bind. When that exact
+ * worker's own accepted row carries a bound retained source, the record shows it as recovery and nothing is unknown;
+ * otherwise the surface says capture unknown and points at the native delivery (Run P §6). The line claims no capture:
+ * it says only what this record binds, and one native handle is enough to reach the host's own record. One pass over
+ * agents, spawns, deliveries and accepted rows, keyed by worker id.
+ */
+function captureUnknownFact(run: RunRecord): CaptureUnknown | undefined {
+	const ids = new Set<string>();
+	for (const agent of Array.isArray(run.agents) ? run.agents : []) {
+		if (agent.lastWorkFailed === true && hasText(agent.id)) ids.add(agent.id);
+	}
+	// A worker its own admission stopped (a closed spend) can have left a patch too; the stop is a spawn fact.
+	for (const spawn of Array.isArray(run.spawns) ? run.spawns : []) {
+		if (spawn?.stop !== undefined && hasText(spawn.spawnKey)) ids.add(spawn.spawnKey);
+	}
+	for (const delivery of Array.isArray(run.unplanned) ? run.unplanned : []) {
+		if ((delivery?.status === "failed" || delivery?.status === "cancelled") && hasText(delivery.agent)) ids.add(delivery.agent);
+	}
+	if (ids.size === 0) return undefined;
+	// A failed worker whose own attempt holds an accepted, bound retained source is recovery, not an unknown capture.
+	const recovered = new Set<string>();
+	for (const value of Array.isArray(run.results) ? run.results : []) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+		const row = value as RunResult;
+		if (row.state !== "accepted" || row.proof?.item.artifact === undefined) continue;
+		const agent = attemptAgentId(row.attemptId);
+		if (agent !== undefined) recovered.add(agent);
+	}
+	for (const id of [...ids]) if (recovered.has(id)) ids.delete(id);
+	if (ids.size === 0) return undefined;
+	const first = [...ids].find(id => NATIVE_ID.test(id));
+	return { count: ids.size, ...(first === undefined ? {} : { native: `agent://${first}` }) };
 }
 
 /**
@@ -177,9 +303,12 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 	const failed = agents.filter(agent => agent.lastWorkFailed === true).length;
 	const changed = agents.filter(agent => (agent.changes ?? 0) > 0).length;
 	const unplanned = unplannedTotal(run);
-	const outOfPlan = unplanned;
+	// `outOfPlan` is work this run asked for outside its declared results; unsolicited arrivals stay in the closeout's
+	// own line and never read as planned activity (B8).
+	const outOfPlan = unplannedSplit(run).outOfPlan;
 
 	const hasDeclared = declaredRows > 0;
+	const allExcluded = hasDeclared && progress.counts.inScope === 0;
 	const declaration: ResultDeclaration = !hasDeclared ? "none" : outOfPlan > 0 ? "mixed" : "declared";
 	const noResultsNotice =
 		!hasDeclared && (planned || placed > 0 || refused > 0 || unplanned > 0 || unplannedPlaced > 0);
@@ -220,15 +349,20 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 		...(firstKept?.capture === undefined ? {} : { capture: firstKept.capture }),
 		...(firstKept?.attempt === undefined ? {} : { attempt: firstKept.attempt }),
 	};
+	const changes = changeAttribution(run);
+	const captureUnknown = captureUnknownFact(run);
 	return {
 		declaration,
 		hasDeclared,
 		noResultsNotice,
 		progress,
 		retained,
+		allExcluded,
 		rows: { total: progress.rows.length, declared: declaredRows, removed, orphaned, excluded: progress.counts.excluded },
 		coverage,
 		activity,
+		changes,
+		...(captureUnknown === undefined ? {} : { captureUnknown }),
 		outOfPlan,
 		...(changedPaths === undefined ? {} : { changedPaths }),
 		headline,
@@ -246,7 +380,10 @@ export function resultFacts(run: RunRecord, options: ResultFactOptions = {}): Re
 			coverage.declared,
 			coverage.missing,
 			activity,
+			changes,
+			captureUnknown ?? null,
 			retained,
+			allExcluded,
 			outOfPlan,
 			changedPaths ?? null,
 		]),

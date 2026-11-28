@@ -54,7 +54,13 @@ export type AttemptChannel = "task-result" | "async-result" | "wait-result" | "r
  * - `exit-code-missing`: the host omitted the sync exit status this report needs.
  * - `artifact-capture-stale`: the capture predates this attempt.
  * - `artifact-path-mismatch`: the capture path differs from the host-declared path for its kind.
- * - `patch-artifact-missing` / `patch-artifact-empty`: no patch was captured, or not positive bytes.
+ * - `patch-artifact-missing`: no patch was captured for the declared path.
+ * - `patch-artifact-empty`: a zero-byte root patch whose same payload declared a complete, empty companion list: the
+ *   host supplied no root or nested delta. It is not evidence that the worker failed or that no work exists elsewhere.
+ * - `patch-artifact-nested-only`: a zero-byte root patch with declared nested companions: the capture is not empty, but
+ *   this version has no root delta to read.
+ * - `patch-artifact-empty-unknown`: a zero-byte root patch with no complete companion list: whether anything was
+ *   captured is unknown, never empty.
  * - `patch-artifact-unchanged` / `patch-artifact-unproven`: the registry patch cannot be shown to be new for this attempt.
  * - `attempt-replayed`: the derived native attempt id was already bound to this spawn.
  * - `attempt-not-current`: this first delivery is not the exact native attempt the caller is waiting for.
@@ -74,6 +80,8 @@ export type AttemptCaptureError =
 	| "artifact-path-mismatch"
 	| "patch-artifact-missing"
 	| "patch-artifact-empty"
+	| "patch-artifact-nested-only"
+	| "patch-artifact-empty-unknown"
 	| "patch-artifact-unchanged"
 	| "patch-artifact-unproven"
 	| "attempt-replayed"
@@ -131,6 +139,15 @@ export interface SyncResultFact {
 	aborted?: unknown;
 	outputPath?: unknown;
 	patchPath?: unknown;
+	/**
+	 * The host's declaration that the checkout's root has changes. Absent when this payload did not say; a root patch
+	 * with zero bytes and `true` is a contradiction, never an empty capture.
+	 */
+	hasRootChanges?: unknown;
+	/** Nested-repository parts the host listed for this capture (relative path + whole patch). Absent is unknown, never empty. */
+	nestedPatches?: unknown;
+	/** Nested patch file paths listed beside the root patch. Absent is unknown, never empty. */
+	nestedPatchPaths?: unknown;
 	structuredOutput?: {
 		status?: unknown;
 		error?: unknown;
@@ -195,6 +212,8 @@ export interface RegistryCapture {
 	history?: {
 		outputPath?: unknown;
 		patchPath?: unknown;
+		/** Nested patch paths published with the same history update. Absent is unknown, never empty. */
+		nestedPatchPaths?: unknown;
 	};
 	/** Parent captures of the exact `history` paths. */
 	artifacts?: readonly HostArtifactCapture[];
@@ -308,6 +327,18 @@ export function asyncAttemptId(jobId: string, agentId: string, startTime?: numbe
 	if (startTime !== undefined && !(Number.isSafeInteger(startTime) && startTime >= 0)) return undefined;
 	const id = `job:${job}${startTime === undefined ? "" : `.t${startTime}`}:${agent}`;
 	return id.length > ATTEMPT_ID_MAX_CHARS ? undefined : id;
+}
+
+/**
+ * The child id a native attempt reference names: the last `:`-separated segment (`task:<call>:<resultId>` or
+ * `job:<job>:<agent>`). Undefined for anything that is not a bounded native reference. The segment is the host's id for
+ * the child, so a recorded acceptance can be attributed to exactly one worker without parsing its text.
+ */
+export function attemptAgentId(attemptId: unknown): string | undefined {
+	if (typeof attemptId !== "string" || !ATTEMPT_REF.test(attemptId)) return undefined;
+	const parts = attemptId.split(":");
+	if (parts.length < 3 || (parts[0] !== "task" && parts[0] !== "job")) return undefined;
+	return nativeId(parts[parts.length - 1]);
 }
 
 /**
@@ -516,6 +547,11 @@ function unusable(report: AttemptReport, channel: AttemptChannel, state: Attempt
 	return report;
 }
 
+/**
+ * The capture state stays about usability, never about the worker: a confirmed empty capture was observed but holds no
+ * usable bytes (`invalid`); a non-empty nested-only capture and an unproven empty one have no usable root capture
+ * (`missing`). The outcome already says whether the attempt failed or was cancelled.
+ */
 function failCapture(report: AttemptReport, channel: AttemptChannel, error: AttemptCaptureError): AttemptReport {
 	const state = error === "artifact-capture-stale" ? "stale" : error === "patch-artifact-empty" ? "invalid" : "missing";
 	return unusable(report, channel, state, error);
@@ -590,7 +626,7 @@ function acceptSyncArtifacts(
 			continue;
 		}
 		if (candidate.kind === "patch") {
-			const problem = patchProblem(candidate);
+			const problem = patchProblem(candidate, result);
 			if (problem !== undefined) {
 				failure = problem;
 				continue;
@@ -637,7 +673,7 @@ function acceptRegistry(
 			failure = "patch-artifact-missing";
 			continue;
 		}
-		const problem = patchProblem(candidate);
+		const problem = patchProblem(candidate, registry.history);
 		if (problem !== undefined) {
 			failure = problem;
 			continue;
@@ -683,10 +719,42 @@ function registryIdentityProblem(registry: RegistryCapture, subject: AttemptSubj
 	return registry.event === "removed" ? "artifact-capture-stale" : undefined;
 }
 
-/** A patch is evidence only with positive bytes and a parent-computed digest. */
-function patchProblem(capture: HostArtifactCapture): AttemptCaptureError | undefined {
-	if (!(typeof capture.bytes === "number" && Number.isFinite(capture.bytes) && capture.bytes > 0)) return "patch-artifact-empty";
-	return stableDigest(capture.digest) === undefined ? "patch-artifact-unproven" : undefined;
+/** The host payload that may list a capture's companion parts: a sync result, or the registry history update. */
+interface PatchPartList {
+	readonly hasRootChanges?: unknown;
+	readonly nestedPatches?: unknown;
+	readonly nestedPatchPaths?: unknown;
+}
+
+/**
+ * The number of nested companions the host declared, or undefined when it declared no complete list. Every list present
+ * must agree; a disagreement is a malformed capture, not an empty one. Never infers empty from a missing list (`Run P` §1,
+ * §6: a nested-only child has a 0-byte root patch and a real nested patch).
+ */
+function nestedCompanionCount(part: PatchPartList | undefined): number | "conflict" | undefined {
+	const present = [part?.nestedPatches, part?.nestedPatchPaths].filter((list): list is unknown[] => Array.isArray(list));
+	if (present.length === 0) return undefined;
+	const lengths = new Set(present.map(list => list.length));
+	return lengths.size > 1 ? "conflict" : [...lengths][0]!;
+}
+
+/**
+ * Why a captured patch is not usable evidence. A root patch needs positive bytes and a digest. Zero bytes is a confirmed
+ * empty capture only when the same payload declared a complete, empty companion list; a nested-only capture is not
+ * empty, and a missing list leaves emptiness unknown. None of these says the worker failed or that nothing was captured
+ * anywhere (Run P §1, §6).
+ */
+function patchProblem(capture: HostArtifactCapture, part: PatchPartList | undefined): AttemptCaptureError | undefined {
+	if (typeof capture.bytes === "number" && Number.isFinite(capture.bytes) && capture.bytes > 0) {
+		return stableDigest(capture.digest) === undefined ? "patch-artifact-unproven" : undefined;
+	}
+	// The host said the root changed, yet its root patch is empty: the payload contradicts itself, whatever companions list.
+	if (part?.hasRootChanges === true) return "patch-artifact-unproven";
+	const companions = nestedCompanionCount(part);
+	if (companions === "conflict") return "patch-artifact-unproven";
+	if (companions === undefined) return "patch-artifact-empty-unknown";
+	if (companions > 0) return "patch-artifact-nested-only";
+	return "patch-artifact-empty";
 }
 
 function addCapture(report: AttemptReport, capture: HostArtifactCapture, source: "task-result" | "registry", version: string): void {

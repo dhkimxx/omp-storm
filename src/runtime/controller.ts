@@ -137,7 +137,7 @@ import { locateResult, projectAcceptedResult } from "./result-location.ts";
 import { buildHandoff, newRunId, pruneRuns, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
-import { findResumeCandidate, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
+import { findResumeCandidate, handoffSpec, noteResumePointer, protectedResumeRunIds, resumeSpec, trustedResume, type ResumeTarget } from "./resume.ts";
 import type { TreeReading, TreeState } from "./tree.ts";
 import { sharedMap } from "./thread-state.ts";
 import { DEFAULT_TIMINGS, type StormTimings } from "./timings.ts";
@@ -151,6 +151,36 @@ const spawnsByRun = sharedMap<string, SpawnRecord[]>("storm.controller.spawnsByR
  */
 const lastSpawnByKey = sharedMap<string, Map<string, SpawnRecord>>("storm.controller.lastSpawnByKey");
 const deliveryKindsByRun = sharedMap<string, Map<string, "lane" | "blocked" | "unplanned">>("storm.controller.deliveryKindsByRun");
+
+/** One delivery this run asked a worker for: its admission, or a work message that wakes a turn. */
+interface ExpectedDelivery {
+	kind: "admission" | "wake";
+	/** A wake Storm sent to a worker the list showed idle; the receipt may still say it joined an open turn. */
+	provisional?: true;
+}
+
+/**
+ * The deliveries each run has asked for and not received, per worker, in the order they were asked for (B8). A count
+ * would let a late receipt hide the next unrequested arrival; this queue is consumed one answer at a time.
+ */
+const expectedByRun = sharedMap<string, Map<string, ExpectedDelivery[]>>("storm.controller.expectedByRun");
+/** Bound per worker: a worker that never answers must not grow its queue without limit (D11; no scan of other workers). */
+const EXPECTED_PER_WORKER = 64;
+
+function noteExpected(runId: string, agentId: string, delivery: ExpectedDelivery): void {
+	let workers = expectedByRun.get(runId);
+	if (workers === undefined) {
+		workers = new Map();
+		expectedByRun.set(runId, workers);
+	}
+	let queue = workers.get(agentId);
+	if (queue === undefined) {
+		queue = [];
+		workers.set(agentId, queue);
+	}
+	queue.push(delivery);
+	if (queue.length > EXPECTED_PER_WORKER) queue.shift();
+}
 
 /**
  * When a run of one session and target last ended or stopped in this process, keyed by the session's own store and the
@@ -313,7 +343,15 @@ export function noteRunSpawn(runId: string, record: SpawnRecord): void {
 		const kinds = deliveryKindsByRun.get(runId);
 		if (last !== undefined && record.outcome !== "blocked") last.set(spawnKey, record);
 		if (kinds !== undefined) {
-			kinds.set(spawnKey, record.outcome === "blocked" ? "blocked" : record.lane !== undefined ? "lane" : "unplanned");
+			if (record.outcome === "blocked") {
+				// B8: a refusal under a key never replaces the live admission's kind. The admitted worker's first answer
+				// is still the work this run asked for.
+				if (!kinds.has(spawnKey)) kinds.set(spawnKey, "blocked");
+			} else {
+				kinds.set(spawnKey, record.lane !== undefined ? "lane" : "unplanned");
+				// The admission is the first delivery this run asked this worker for; a refusal adds no expectation.
+				noteExpected(runId, spawnKey, { kind: "admission" });
+			}
 		}
 	}
 	touchRun(runId);
@@ -565,8 +603,12 @@ export const ISOLATED_INTEGRATED_REASON = "이 버전은 격리 작업을 부모
 export const ISOLATED_BRANCH_UNREAD = "브랜치 결과는 이 버전이 읽지 못합니다";
 /** Row 3: the full capture reason; the native delivery is the only place the rest of the outcome is recorded. */
 export const ISOLATED_CAPTURE_UNREAD = `보존 패치를 받지 못했습니다. ${ISOLATED_BRANCH_UNREAD}`;
-/** Row 8: a proved successful attempt that captured nothing is "no change captured", never a failed host attempt. */
-export const EMPTY_CAPTURE_REASON = "성공으로 끝났지만 보존할 변경이 없었습니다";
+/** Row 8: a proved successful attempt the host reported as an empty root and companion capture: no delta to keep. */
+export const EMPTY_CAPTURE_REASON = "호스트가 루트와 중첩 모두 빈 캡처로 보고했습니다(보존할 델타 없음)";
+/** A zero-byte root patch whose companions were declared: the capture is not empty, this version reads no root delta. */
+export const NESTED_ONLY_REASON = "루트 패치가 비어 있지만 중첩 저장소에 보존 변경이 있습니다(이 버전은 중첩 캡처를 결과로 읽지 않음)";
+/** A zero-byte root patch with no complete companion list: emptiness is unknown, never empty. */
+export const EMPTY_UNKNOWN_REASON = "루트 패치가 비어 있지만 함께 캡처된 목록이 없어 캡처 여부를 알 수 없습니다";
 /** Row 8: a native cancel whose identity Storm could not bind says the cause is unconfirmed, not that the worker did nothing. */
 export const CANCEL_IDENTITY_UNKNOWN = "취소로 끝났지만 이 시도의 신원을 확인하지 못했습니다";
 /** The audit list is bounded like every other record list; the newest actions win. */
@@ -734,13 +776,6 @@ interface OwnRun {
 	notices: string[];
 	/** Dispatches whose evaluation was already reported: one attempt is reported once, however many ways it arrives. */
 	noticed: Set<string>;
-	/** How many deliveries of each worker reached the collector as ones no declared result waits for (see `noteUnplannedDelivery`). */
-	deliveries: Map<string, number>;
-	/**
-	 * How many turns Storm's own work messages woke for each worker (see `noteWakingFollowUp`): each of them delivers once, so
-	 * each is a delivery Storm asked for. A message omp folded into a turn that was already open wakes none. Memory only.
-	 */
-	wakes: Map<string, number>;
 	/** Waiting lanes the director was told can start and that have not started or stopped being startable since. */
 	startableTold: Set<string>;
 	/** Writing lanes the director was told the write order lets start, until they start or the order holds them again. */
@@ -1145,6 +1180,7 @@ export class RunController {
 			return refuse("계획을 검증한 팀 설정과 지금 승인된 팀 설정이 다릅니다. 계획을 다시 내세요.");
 		}
 		if (shadow) return refuse(shadow.reason);
+		let continuingFrom: (RunRecord & { request: string }) | undefined;
 		if (continuing !== undefined) {
 			// The candidate is the menu's own: the newest trusted unfinished run of this session and target.
 			const candidate = await findResumeCandidate(sessionDir, target).catch(() => undefined);
@@ -1159,9 +1195,10 @@ export class RunController {
 			// R9 says every run of this session and target, not only the candidate: a later run that ended after the
 			// prompt stands for the same rule, and the candidate's own recorded end is the same fact on disk.
 			if (stoppedInTurn(continuing.turnStartedAt, lastRunEndAt(sessionDir, root))) return refuse(CONTINUE_SAME_TURN);
-			const built = resumeSpec(candidate, continuing.said);
-			if (!built.ok) return refuse(built.error);
-			requested = built.spec;
+			// A2-5/A2-6: the mode decides first. The stored record is read below; only then is this a carry (a plan
+			// with rows to keep) or a handoff (no rows, no plan applied), and only then is the request built.
+			continuingFrom = candidate;
+			requested = { ...requested, resumeOf: candidate.runId };
 		}
 		// The host may mutate its session manager in place instead of emitting a switch: every await below must also
 		// prove that the context still names this same native session.
@@ -1244,11 +1281,6 @@ export class RunController {
 			// plan is held to); with nothing to carry there is no plan to hold, and the open becomes a handoff below.
 			const carriedRows = Array.isArray(continued?.results) ? continued.results.length : 0;
 			if (continuing !== undefined && carriedRows > 0 && restoredPlan === undefined) return refuse(CONTINUE_PLAN_REFUSED);
-			if (restoredPlan !== undefined && planNeedsWrite(restoredPlan)) {
-				const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
-				if (!upgraded.ok) return refuse(upgraded.reason);
-				if (stale()) return gone();
-			}
 			// A continuation keeps the user's exclusions: only a stored row whose shape and contract still validate may
 			// remove a lane from the effective plan. The record is untrusted input; an arbitrary scope marker cannot
 			// hide a planned lane.
@@ -1264,6 +1296,21 @@ export class RunController {
 			// caller now gets `continued.mode: "handoff"` and says 인계.
 			const handoffContinuation = continuing !== undefined && (carriedRows === 0 || plan === undefined);
 			if (handoffContinuation) plan = undefined;
+			// A2-5/A2-6: the request follows the mode. A carry keeps the old plan's scope instruction; a handoff stores
+			// the user's fresh instruction with the earlier material as bounded, labelled background. Only a carry of
+			// rows takes the write claim its restored plan needs; a handoff is a reader until it asks to write.
+			if (continuing !== undefined && continuingFrom !== undefined) {
+				const built = handoffContinuation
+					? handoffSpec(continuingFrom, continuing.said)
+					: resumeSpec(continuingFrom, continuing.said);
+				if (!built.ok) return refuse(built.error);
+				requested = built.spec;
+				if (!handoffContinuation && plan !== undefined && planNeedsWrite(plan)) {
+					const upgraded = await lease.upgrade({ scope: { kind: "unbounded" } });
+					if (stale()) return gone();
+					if (!upgraded.ok) return refuse(upgraded.reason);
+				}
+			}
 			// A resume continues its parent's goal; a follow-up and a fresh run start their own. Fixed here, never updated.
 			const goal = continued === undefined ? undefined : carryGoal(continued);
 			const resume =
@@ -1344,7 +1391,7 @@ export class RunController {
 				store: state.store,
 				// The run reads the director session's own background jobs through the lane table: a command the director sent to
 				// the background is a holder there, and a worker's task job that still runs keeps its reservation.
-				lanes: new RunLanes(runId, () => hostJobRows(ctx), continued !== undefined),
+				lanes: new RunLanes(runId, () => hostJobRows(ctx)),
 				attempts: new Map(),
 				attemptSerial: 0,
 				planRevision: 0,
@@ -1354,8 +1401,6 @@ export class RunController {
 				settledEpoch: new Map(),
 				notices: [],
 				noticed: new Set(),
-				deliveries: new Map(),
-				wakes: new Map(),
 				startableTold: new Set(),
 				writersTold: new Set(),
 				restoredLanes: new Set(),
@@ -1438,6 +1483,7 @@ export class RunController {
 				spawnsByRun.set(runId, []);
 				lastSpawnByKey.set(runId, new Map());
 				deliveryKindsByRun.set(runId, new Map());
+				expectedByRun.set(runId, new Map());
 				noticeSinks.set(runId, text => {
 					if (this.#own === own) own.notices.push(text);
 				});
@@ -2144,14 +2190,34 @@ export class RunController {
 	}
 
 	/**
-	 * A work message of the director started a turn of this worker (the receipt says `woken` or `revived`, or the worker was
-	 * idle when it went out): the delivery that turn makes is one Storm asked for. A message omp folded into the open turn
-	 * is not counted, or each one would hide a delivery that someone else's wake made (R-final N9).
+	 * A work message of the director asked this worker for a delivery. When the worker was idle at send time the caller
+	 * marks the expectation provisional: the receipt can still say omp folded the message into an open turn. Each wake
+	 * is its own token, in send order, so a late receipt never credits a later arrival (B8).
 	 */
-	noteWakingFollowUp(runId: string, agentId: string): void {
+	noteWakingFollowUp(runId: string, agentId: string, provisional = false): void {
 		const own = this.#own;
 		if (own === undefined || own.record.runId !== runId) return;
-		own.wakes.set(agentId, (own.wakes.get(agentId) ?? 0) + 1);
+		noteExpected(runId, agentId, { kind: "wake", ...(provisional ? { provisional: true as const } : {}) });
+	}
+
+	/**
+	 * A provisional wake's receipt said omp joined the message to a turn that was already open. An expectation an
+	 * answer already took stays consumed: that answer was still work the director sent. The unused token is removed so
+	 * it cannot hide the next arrival nobody asked for.
+	 */
+	discardWakingFollowUp(runId: string, agentId: string): void {
+		const own = this.#own;
+		if (own === undefined || own.record.runId !== runId) return;
+		const workers = expectedByRun.get(runId);
+		const queue = workers?.get(agentId);
+		if (workers === undefined || queue === undefined) return;
+		for (let i = queue.length - 1; i >= 0; i--) {
+			if (queue[i]?.provisional === true) {
+				queue.splice(i, 1);
+				break;
+			}
+		}
+		if (queue.length === 0) workers.delete(agentId);
 	}
 
 	/**
@@ -2173,12 +2239,18 @@ export class RunController {
 		// Only deliveries beyond those (someone else woke it) are recorded and told; a worker Storm never placed always is.
 		let expected = false;
 		if (input.kind === "unplaced") {
-			const seen = (own.deliveries.get(input.agent) ?? 0) + 1;
-			own.deliveries.set(input.agent, seen);
 			const placed = deliveryKindsByRun.get(input.runId)?.get(input.agent);
-			if (placed !== undefined && seen <= 1 + (own.wakes.get(input.agent) ?? 0)) {
-				if (placed !== "unplanned") return;
+			// A refused spawn's only delivery is the refusal the director was already promised: never re-labelled here.
+			if (placed === "blocked") return;
+			// One token per admission and per wake this run asked for, consumed in send order. A lane worker's answer on
+			// its own token reaches its row and is not an unplanned delivery; one with no token left is unsolicited.
+			const workers = expectedByRun.get(input.runId);
+			const queue = workers?.get(input.agent);
+			if (workers !== undefined && queue !== undefined && queue.length > 0) {
+				queue.shift();
 				expected = true;
+				if (queue.length === 0) workers.delete(input.agent);
+				if (placed === "lane") return;
 			}
 		}
 		const agent = this.deps.agents?.(own.record.runId, own.sessionDir).find(entry => entry.id === input.agent);
@@ -2188,7 +2260,8 @@ export class RunController {
 				: agent.lastChangeAt !== undefined && agent.lastChangeAt >= input.startedAt;
 		const entry: UnplannedDelivery = {
 			id: input.id,
-			kind: input.kind,
+			// B8: an answer this run asked for is out-of-plan activity; an arrival nobody asked for stays unplaced/woken.
+			kind: expected ? "out-of-plan" : input.kind,
 			agent: input.agent,
 			endedAt: input.endedAt,
 			...(input.parentId !== undefined ? { parentId: input.parentId } : { parentId: input.receiverId }),
@@ -2942,7 +3015,11 @@ export class RunController {
 					: exhausted
 						? `호스트 재시도·대체 경로가 소진되어(재시도 ${report.retry!.attempt})`
 						: "시도가 실패로 끝나";
-		const reason = compactResultReason(`${why} 필수 결과를 수용하지 않았습니다.`);
+		// A failed or cancelled attempt can still leave a positive, digest-bound patch. The record has no typed reference
+		// for it (the closeout says capture unknown), but the row can truthfully say a patch exists.
+		const captured = report.artifacts.find(artifact => artifact.kind === "patch" && artifact.path !== "" && (artifact.bytes ?? 0) > 0);
+		const recovery = captured === undefined ? "" : ` 보존 패치를 호스트가 캡처했습니다(시도: ${report.attemptId}).`;
+		const reason = compactResultReason(`${why} 필수 결과를 수용하지 않았습니다.${recovery}`);
 		const rows = own.record.results ?? [];
 		for (const result of prepared.results) {
 			const row = rows.find(candidate => candidate.id === result.id);
@@ -2986,9 +3063,13 @@ export class RunController {
 				? `${CANCEL_IDENTITY_UNKNOWN}(${code}). 네이티브 기록과 호스트의 취소 기록을 확인하세요.`
 				: report.outcome === "success" && code === "patch-artifact-empty"
 					? `${EMPTY_CAPTURE_REASON}(${code}).`
-					: report.outcome === "success" && prepared.isolated === true && prepared.results.some(result => result.kind === "artifact")
-						? `${ISOLATED_CAPTURE_UNREAD}(${code}). 네이티브 결과: agent://${prepared.spawnKey}`
-						: `호스트 시도를 확인하지 못했습니다(${code}).`,
+					: code === "patch-artifact-nested-only"
+						? `${NESTED_ONLY_REASON}(${code}). 네이티브 기록: agent://${prepared.spawnKey}`
+						: code === "patch-artifact-empty-unknown"
+							? `${EMPTY_UNKNOWN_REASON}(${code}). 네이티브 기록: agent://${prepared.spawnKey}`
+							: report.outcome === "success" && prepared.isolated === true && prepared.results.some(result => result.kind === "artifact")
+								? `${ISOLATED_CAPTURE_UNREAD}(${code}). 네이티브 결과: agent://${prepared.spawnKey}`
+								: `호스트 시도를 확인하지 못했습니다(${code}).`,
 		);
 		const rows = own.record.results ?? [];
 		for (const result of prepared.results) {
@@ -5124,6 +5205,7 @@ export class RunController {
 		spawnsByRun.delete(own.record.runId);
 		lastSpawnByKey.delete(own.record.runId);
 		deliveryKindsByRun.delete(own.record.runId);
+		expectedByRun.delete(own.record.runId);
 		noticeSinks.delete(own.record.runId);
 		clearRunReads(own.record.runId);
 		const record: RunRecord = {

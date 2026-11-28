@@ -206,14 +206,38 @@ describe("sync task result report", () => {
 			{ kind: "patch", path: "/tmp/storm/SyncIsolated.patch", bytes: 167, digest: DIGEST, capturedAt: 1_600, source: "task-result" },
 		]);
 
+		// A zero-byte root is a confirmed empty capture only when the same payload lists a complete, empty companion set.
+		const emptyBase = {
+			...base,
+			results: [{ ...result, hasRootChanges: false, nestedPatches: [], nestedPatchPaths: [] }],
+		};
 		const empty = syncAttemptReport(
 			isolated,
-			{ ...base, artifacts: [patch({ id: "SyncIsolated", path: "/tmp/storm/SyncIsolated.patch", bytes: 0 })] },
+			{ ...emptyBase, artifacts: [patch({ id: "SyncIsolated", path: "/tmp/storm/SyncIsolated.patch", bytes: 0 })] },
 			{ requirePatch: true },
 		);
 		expect(empty.capture).toBe("invalid");
 		expect(empty.captureError).toBe("patch-artifact-empty");
 		expect(empty.artifacts).toEqual([]);
+		// The same bytes without a companion list are not empty: nothing established that a nested part was not captured.
+		const unknown = syncAttemptReport(
+			isolated,
+			{ ...base, artifacts: [patch({ id: "SyncIsolated", path: "/tmp/storm/SyncIsolated.patch", bytes: 0 })] },
+			{ requirePatch: true },
+		);
+		expect(unknown.capture).toBe("missing");
+		expect(unknown.captureError).toBe("patch-artifact-empty-unknown");
+		// A nested-only capture is not empty either, and this version has no root delta to read.
+		const nestedOnly = syncAttemptReport(
+			isolated,
+			{
+				...base,
+				results: [{ ...result, hasRootChanges: false, nestedPatches: [{ relativePath: "nested-repo", patch: "diff" }], nestedPatchPaths: ["/tmp/storm/SyncIsolated.nested-0.patch"] }],
+				artifacts: [patch({ id: "SyncIsolated", path: "/tmp/storm/SyncIsolated.patch", bytes: 0 })],
+			},
+			{ requirePatch: true },
+		);
+		expect(nestedOnly.captureError).toBe("patch-artifact-nested-only");
 
 		const digestlessPatch = patch({ id: "SyncIsolated", path: "/tmp/storm/SyncIsolated.patch" });
 		delete digestlessPatch.digest;
@@ -569,14 +593,29 @@ describe("async isolated patch from the registry", () => {
 	});
 
 	test("zero bytes, no digest and no capture do not satisfy a required patch", () => {
+		// A zero-byte root is confirmed empty only with the same history update's complete, empty nested list.
 		const zero = asyncAttemptReport(isolatedSubject(), jobFor(), {
-			registry: registry({ artifacts: [patch({ bytes: 0 })] }),
+			registry: registry({ history: { patchPath: "/tmp/storm/WorkerIsolated.patch", nestedPatchPaths: [] }, artifacts: [patch({ bytes: 0 })] }),
 			admissionPatch: null,
 			requirePatch: true,
 		});
 		expect(zero.capture).toBe("invalid");
 		expect(zero.captureError).toBe("patch-artifact-empty");
 		expect(zero.artifacts).toEqual([]);
+		// Without that list the same bytes are not proved empty.
+		const unknown = asyncAttemptReport(isolatedSubject(), jobFor(), {
+			registry: registry({ artifacts: [patch({ bytes: 0 })] }),
+			admissionPatch: null,
+			requirePatch: true,
+		});
+		expect(unknown.captureError).toBe("patch-artifact-empty-unknown");
+		// A nested-only capture is not empty; the root part has no bytes this version can read.
+		const nestedOnly = asyncAttemptReport(isolatedSubject(), jobFor(), {
+			registry: registry({ history: { patchPath: "/tmp/storm/WorkerIsolated.patch", nestedPatchPaths: ["/tmp/storm/WorkerIsolated.nested-0.patch"] }, artifacts: [patch({ bytes: 0 })] }),
+			admissionPatch: null,
+			requirePatch: true,
+		});
+		expect(nestedOnly.captureError).toBe("patch-artifact-nested-only");
 
 		const digestlessPatch = patch();
 		delete digestlessPatch.digest;

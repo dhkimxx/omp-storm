@@ -16,6 +16,8 @@ import { join, sep } from "node:path";
 import { ISOLATED_CHANGE_REASON } from "../../src/runtime/result-evidence.ts";
 import { CHECKOUT_CLEANUP_NOTE, CHECKOUT_PLACEMENT_NOTE } from "../../src/runtime/contract-text.ts";
 import { NO_DECLARED_RESULTS } from "../../src/runtime/result-facts.ts";
+import { RETAINED_ONLY_VERDICT } from "../../src/runtime/closeout.ts";
+import { RETAINED_ACCEPTED, RETAINED_LABEL } from "../../src/view/results.ts";
 import { CHECKOUT_PLAN_NOTE, ISOLATED_INTEGRATED_WARNING } from "../../src/plan/validate.ts";
 import { closeoutOf, customMessage, LlmCursor, prepare, startFakeLlm, Suite, type Frame, type Step, until } from "./harness.ts";
 import { installProfile, Sessions } from "./phase1-kit.ts";
@@ -148,11 +150,11 @@ async function main(): Promise<void> {
 				JSON.stringify((run.results ?? []).map(row => [row.id, row.state, row.reason ?? ""])),
 			);
 			check(
-				"the card says retained 4/4, where the bytes are kept, and that the target was not changed",
+				"the card says retained 4/4, where the bytes are kept, and that Storm applied nothing",
 				closeout !== undefined &&
-					closeout.text.includes("보존 수용 4/4") &&
-					closeout.text.includes("보존:") &&
-					closeout.text.includes("대상 트리 변경 없음") &&
+					closeout.text.includes(`${RETAINED_ACCEPTED} 4/4`) &&
+					closeout.text.includes(`${RETAINED_LABEL}:`) &&
+					closeout.text.includes(RETAINED_ONLY_VERDICT) &&
 					closeout.text.includes(CHECKOUT_PLACEMENT_NOTE) &&
 					closeout.text.includes(CHECKOUT_CLEANUP_NOTE),
 				closeout?.text.slice(-900) ?? "no closeout",
@@ -261,13 +263,54 @@ async function main(): Promise<void> {
 			check("each isolated worker's native result names a retained patch outside the parent", kept.length >= WORKERS && kept.every(path => outsideProject(path)), JSON.stringify(kept));
 			check(
 				"the closeout says no declared results, counts the workers, and does not claim their work reached the tree",
-				closeout !== undefined && closeout.text.includes(NO_DECLARED_RESULTS) && closeout.text.includes("워커 5") && !closeout.text.includes("대상 트리 변경 없음"),
+				closeout !== undefined &&
+					closeout.text.includes(NO_DECLARED_RESULTS) &&
+					closeout.text.includes("워커 5") &&
+					!closeout.text.includes(RETAINED_ONLY_VERDICT) &&
+					!closeout.text.includes("보존할 변경이 없었습니다"),
 				closeout?.text.slice(-800) ?? "no closeout",
 			);
 			const noticed = llm.of("main").some(entry => entry.notes.some(note => note.includes("결과와 무관한 도착"))) || frames.some(frame => customMessage(frame) === "async-result" && JSON.stringify(frame).includes("결과와 무관한 도착"));
 			check("no placed worker's delivery is told as 결과와 무관한 도착", !noticed, "");
 		});
 	}, 500_000);
+
+	await suite.step("an isolated worker cannot start a named service (A1-4)", async () => {
+		const dir = markerDir("planless-service");
+		const service = join(dir, "service-started");
+		const llm = new LlmCursor(env);
+		await sessions.open(() => undefined, async (rpc, files) => {
+			const before = files.runIds();
+			const steps: Step[] = [
+				{
+					tasks: [{
+						agent: "storm-implementer",
+						task: "Start a service, then write",
+						isolated: true,
+						say: `E2E-CHILD-SERVICE ${b64(`printf svc > ${JSON.stringify(service)}; echo ready; sleep 20`)} E2E-CHILD-WRITE svc-own.txt E2E-CHILD-CLAIM svc-done`,
+					}],
+				},
+				{ wait: true },
+			];
+			await rpc.turn(`E2E-STEPS ${JSON.stringify(steps)}`, 240_000);
+			const run = await files.finishedRun(before, 240_000);
+			const routed = run.spawns.filter(spawn => spawn.outcome !== "blocked");
+			check(
+				"the isolated item ran as a private worker",
+				run.plan === undefined && routed.length === 1 && routed[0]?.lane === undefined,
+				JSON.stringify(run.spawns.map(spawn => [spawn.spawnKey, spawn.lane, spawn.outcome, spawn.code])),
+			);
+			const childRefusals = llm.of("child").map(entry => entry.lastTool).join("\n");
+			check(
+				"its named service was refused with the lane-service cause",
+				childRefusals.includes("[storm:lane-service]"),
+				childRefusals.slice(-600) || "no child refusal",
+			);
+			check("the service command never started", !existsSync(service), `marker=${existsSync(service)}`);
+			await Bun.sleep(1_000);
+			check("nothing of the service outlived the worker", !existsSync(join(env.project, "svc-own.txt")), "");
+		});
+	}, 300_000);
 
 	await suite.step("every omp session exited cleanly", async () => {
 		check("no session exited non-zero", sessions.exitCodes.length > 0 && sessions.exitCodes.every(code => code === 0), `exit=${sessions.exitCodes.join(",")}`);

@@ -28,16 +28,48 @@ export function unplannedNotice(delivery: Pick<UnplannedDelivery, "agent" | "kin
 }
 
 /** How many deliveries the run received that belong to no declared result (the list may hold fewer once it was cut). */
-export function unplannedTotal(run: Pick<RunRecord, "unplanned" | "unplannedCount">): number {
+export function unplannedTotal(run: { readonly unplanned?: RunRecord["unplanned"]; readonly unplannedCount?: RunRecord["unplannedCount"] }): number {
 	const kept = Array.isArray(run.unplanned) ? run.unplanned.length : 0;
 	const counted = typeof run.unplannedCount === "number" && Number.isFinite(run.unplannedCount) ? Math.max(0, Math.floor(run.unplannedCount)) : 0;
 	return Math.max(kept, counted);
 }
 
-/** `결과와 무관한 도착 3건`, or undefined when there were none. */
-export function unplannedLine(run: Pick<RunRecord, "unplanned" | "unplannedCount">): string | undefined {
+/** What the delivery views read: the record may hold any of these parts. */
+type DeliveryRun = {
+	readonly spawns?: RunRecord["spawns"];
+	readonly unplanned?: RunRecord["unplanned"];
+	readonly unplannedCount?: RunRecord["unplannedCount"];
+};
+
+/**
+ * The two kinds of delivery the record holds. Work the run asked for (a worker it placed without a lane, or a wake it
+ * sent) is out-of-plan activity; a delivery nobody asked for is an arrival. A caller marks the first with
+ * `kind: "out-of-plan"`; an `unplaced` delivery from a worker this run placed is also asked for, so the views stay
+ * honest for records written before that kind existed. One pass over spawns and deliveries, never a cross product.
+ */
+export function unplannedSplit(run: DeliveryRun): { outOfPlan: number; unasked: number } {
+	const placed = new Set<string>();
+	for (const spawn of Array.isArray(run.spawns) ? run.spawns : []) {
+		if (spawn.outcome !== "blocked" && spawn.lane === undefined && spawn.spawnKey !== undefined) placed.add(spawn.spawnKey);
+	}
+	let outOfPlan = 0;
+	for (const delivery of Array.isArray(run.unplanned) ? run.unplanned : []) {
+		if ((delivery.kind as string) === "out-of-plan" || (delivery.kind === "unplaced" && placed.has(delivery.agent))) outOfPlan++;
+	}
 	const total = unplannedTotal(run);
-	return total > 0 ? `결과와 무관한 도착 ${total}건(결과 행은 바뀌지 않음)` : undefined;
+	return { outOfPlan: Math.min(outOfPlan, total), unasked: Math.max(0, total - outOfPlan) };
+}
+
+/** `계획 밖 활동 3건`: deliveries of work this run asked for, counted apart from unsolicited arrivals. */
+export function outOfPlanLine(run: DeliveryRun): string | undefined {
+	const { outOfPlan } = unplannedSplit(run);
+	return outOfPlan > 0 ? `계획 밖 활동 ${outOfPlan}건(결과 행은 바뀌지 않음)` : undefined;
+}
+
+/** `결과와 무관한 도착 3건`, or undefined when nobody delivered unasked. */
+export function unplannedLine(run: DeliveryRun): string | undefined {
+	const { unasked } = unplannedSplit(run);
+	return unasked > 0 ? `결과와 무관한 도착 ${unasked}건(결과 행은 바뀌지 않음)` : undefined;
 }
 
 /**

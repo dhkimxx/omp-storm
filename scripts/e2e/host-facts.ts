@@ -191,7 +191,7 @@ async function main(): Promise<void> {
 			fact("E", { bash: bashResult.slice(0, 120), tasks: results.map(text => text.slice(0, 90)) });
 			check("the director's background command was admitted: omp gave a tool call id and the job rows were readable", !bashResult.includes("[storm:director-exec]") && !bashResult.includes("[storm:director-service]") && bashResult !== "", bashResult.slice(0, 200));
 			check("a writer placed while that command ran was refused for it", results[0]?.includes("백그라운드로 돌린 명령") === true || results[0]?.includes("[storm:lane-write]") === true, results[0]?.slice(0, 200) ?? "no result");
-			check("after the command ended the same writer was placed and ran", results[1]?.includes("Spawned agent `EB`") === true && run.results?.some(row => row.id === "e-change" && row.state === "accepted") === true, JSON.stringify({ second: results[1]?.slice(0, 120), results: run.results?.map(row => [row.id, row.state]) }));
+			check("after the command ended the same writer was placed and ran", results[1]?.includes("Spawned agent") === true && run.results?.some(row => row.id === "e-change" && row.state === "accepted") === true, JSON.stringify({ second: results[1]?.slice(0, 120), results: run.results?.map(row => [row.id, row.state]) }));
 		});
 	}, 300_000);
 

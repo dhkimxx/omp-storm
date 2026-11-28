@@ -12,6 +12,7 @@
  *   npm run e2e:all -- 8           # 8 at a time
  *   npm run e2e:all -- --group e2e # one CI job's group (also: e2e-guarantees, e2e-tui, qa)
  *   npm run e2e:all -- --only tui --jobs 1
+ *   npm run e2e:all -- --port-offset 40  # a second checkout beside this one, with its own ports
  */
 import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,6 +36,8 @@ interface Options {
 	only: readonly string[];
 	rerun: boolean;
 	list: boolean;
+	/** Added to every suite's port, so two checkouts can run their suites at the same time. */
+	portOffset: number;
 }
 
 function usage(problem: string): never {
@@ -49,12 +52,17 @@ function parseArgs(argv: readonly string[]): Options {
 	const only: string[] = [];
 	let rerun = true;
 	let list = false;
+	let portOffset = 0;
 	for (let at = 0; at < argv.length; at++) {
 		const arg = argv[at];
 		if (arg === undefined) continue;
 		if (arg === "--list") list = true;
 		else if (arg === "--no-rerun") rerun = false;
-		else if (arg === "--jobs" || arg === "-j") {
+		else if (arg === "--port-offset") {
+			const value = argv[++at];
+			if (value === undefined || !/^\d+$/.test(value)) usage(`--port-offset needs a non-negative number, got ${value ?? "nothing"}`);
+			portOffset = Number(value);
+		} else if (arg === "--jobs" || arg === "-j") {
 			const value = argv[++at];
 			if (value === undefined || !/^\d+$/.test(value)) usage(`--jobs needs a number, got ${value ?? "nothing"}`);
 			jobs = Number(value);
@@ -72,7 +80,8 @@ function parseArgs(argv: readonly string[]): Options {
 		else usage(`unknown argument ${arg}`);
 	}
 	if (jobs < 1) usage("jobs must be at least 1");
-	return { jobs, groups: groups.length === 0 ? E2E_GROUPS : groups, only, rerun, list };
+	if (portOffset > 60_000) usage("port-offset must stay below 60000");
+	return { jobs, groups: groups.length === 0 ? E2E_GROUPS : groups, only, rerun, list, portOffset };
 }
 
 function selected(options: Options): readonly E2eSuite[] {
@@ -86,19 +95,23 @@ function selected(options: Options): readonly E2eSuite[] {
 
 /** Every work folder this run created (a rerun alone adds its own); the cleanup touches only these. */
 const workDirs = new Set<string>();
+/** Added to every suite's port; set from `--port-offset` before any suite starts. */
+let portOffset = 0;
 
 function runSuite(suite: E2eSuite, workRoot: string, suffix: string): Promise<RunResult> {
-	const work = join(workRoot, `storm-e2e-${suite.name}${suffix}`);
+	// A nonzero offset is a second checkout on the same machine: its work folder and log must not be the first's.
+	const tag = portOffset > 0 ? `-p${portOffset}` : "";
+	const work = join(workRoot, `storm-e2e-${suite.name}${suffix}${tag}`);
 	workDirs.add(work);
 	const logDir = join(workRoot, "storm-e2e-logs");
 	mkdirSync(logDir, { recursive: true });
-	const log = join(logDir, `${suite.name}${suffix}.log`);
+	const log = join(logDir, `${suite.name}${suffix}${tag}.log`);
 	const fd = openSync(log, "w");
 	const began = performance.now();
 	try {
 		const child = Bun.spawn([process.execPath, join("scripts/e2e", suite.script)], {
 			cwd: ROOT,
-			env: { ...process.env, ...(suite.env ?? {}), E2E_WORK: work },
+			env: { ...process.env, ...(suite.env ?? {}), E2E_WORK: work, E2E_PORT_OFFSET: String(portOffset) },
 			stdout: fd,
 			stderr: fd,
 			stdin: "ignore",
@@ -162,6 +175,7 @@ function table(results: readonly RunResult[]): string {
 }
 
 const options = parseArgs(process.argv.slice(2));
+portOffset = options.portOffset;
 const suites = selected(options);
 if (options.list) {
 	for (const suite of suites) console.log(`${suite.group}\t${suite.name}\t${suite.env === undefined ? "" : Object.entries(suite.env).map(([key, value]) => `${key}=${value}`).join(" ")}\t${suite.script}\t${suite.note}`);

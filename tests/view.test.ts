@@ -6,6 +6,9 @@ import { changedFields, ISOLATION_ROUTED_STATE, renderConfigDiff, renderStatus, 
 import { rollbackLabels, runRollback } from "../src/view/review.ts";
 import { recommendedConfig } from "../src/view/setup.ts";
 import { agentRows, renderAgentRows } from "../src/report/agents.ts";
+import { ALL_EXCLUDED_VERDICT, closeoutBrief, closeoutHandoff } from "../src/runtime/closeout.ts";
+import { liveMetricFacts } from "../src/view/live-metrics.ts";
+import { RETAINED_ACCEPTED, RETAINED_LABEL } from "../src/view/results.ts";
 import { DEFAULT_WORKERS, roleTitle } from "../src/roles.ts";
 import type { InfoLine, RollbackOption, RunPlan, RunRecord, RunStatus, StatusView, StormConfig, TrialConfig, TrialView } from "../src/types.ts";
 import { agentEntry, approvalRecord, runRecord, spawnRecord } from "./fixtures.ts";
@@ -1061,5 +1064,48 @@ describe("resumeRunLine", () => {
 		const line = resumeRunLine(runRecord({ request: "before\u0007after", status: "stopped", endReason: "interrupted" }));
 		expect(line).toContain("\\u0007");
 		expect(line).not.toContain("\u0007");
+	});
+});
+
+describe("retained acceptance in every form (B7)", () => {
+	const contract: NonNullable<RunPlan["lanes"][number]["results"]>[number] = { id: "candidate", kind: "artifact", criterion: "candidate patch", path: "a.txt" };
+	const retainedRun = runRecord({
+		status: "done",
+		endReason: "verified",
+		plan: { submittedAt: "2026-11-20T09:00:00Z", workers: {}, lanes: [{ name: "iso", kind: "code", role: "implementer", isolationReason: "parallel experiment", results: [contract] }] },
+		results: [{ id: "candidate", lane: "iso", state: "accepted", contract }],
+		// Another worker changed the tree: the run cannot say the target is unchanged.
+		agents: [agentEntry({ id: "shared", role: "implementer", changes: 1 })],
+	});
+
+	test("no compact form drops the retained word, and the card says Storm applied nothing", () => {
+		const chip = liveMetricFacts(retainedRun, "working", NOW).chips.find(item => item.key === "results");
+		expect(chip?.forms.at(-1)?.value).toBe(`${RETAINED_ACCEPTED} 1/1`);
+		expect(chip?.forms.every(form => `${form.value}${form.suffix ?? ""}`.includes(RETAINED_LABEL))).toBe(true);
+		const brief = closeoutBrief(retainedRun);
+		expect(brief.official.label).toContain("Storm이 대상에 적용한 것 없음");
+		expect(brief.official.label).not.toContain("대상 트리 변경 없음");
+		expect(brief.official.tone).toBe("accent");
+	});
+
+	test("every row excluded says so instead of a zero fraction or success", () => {
+		const plan: RunPlan = {
+			submittedAt: "2026-11-20T09:00:00Z",
+			workers: {},
+			lanes: [{ name: "read", kind: "explore", role: "explorer", results: [{ id: "limit", kind: "answer", criterion: "read the limit", path: "src/a.ts" }] }],
+		};
+		const run = runRecord({
+			status: "done",
+			endReason: "verified",
+			plan,
+			results: [{ id: "limit", lane: "read", state: "unmet", scope: "excluded-by-user" }],
+		});
+		const brief = closeoutBrief(run, { resumable: true });
+		const handoff = closeoutHandoff(run);
+		expect(brief.official.tone).not.toBe("success");
+		expect(brief.official.label).toContain(ALL_EXCLUDED_VERDICT);
+		expect(handoff).not.toContain("accepted 0/0");
+		expect(handoff).toContain("none in scope");
+		expect(handoff).toContain("excluded by user 1");
 	});
 });

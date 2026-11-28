@@ -231,7 +231,9 @@ export const REVIEW_TEXT = "storm e2e review file\n";
 /** Resolves the environment and recreates the work dir: a git project with one commit, an isolated HOME and logs. */
 export function prepare(name: string, defaultPort: number): E2eEnv {
 	const omp = process.env.OMP_BIN ? resolve(process.env.OMP_BIN) : join(ROOT, "node_modules", ".bin", "omp");
-	const port = Number(process.env.E2E_PORT ?? defaultPort);
+	// A second checkout beside this one runs the same suites on its own port range (`--port-offset` on `e2e:all`).
+	const offset = Number(process.env.E2E_PORT_OFFSET ?? 0);
+	const port = Number(process.env.E2E_PORT ?? defaultPort) + (Number.isFinite(offset) && offset > 0 ? offset : 0);
 	const profile = process.env.E2E_PROFILE ?? "storm-e2e";
 	const work = resolve(process.env.E2E_WORK ?? join(tmpdir(), name));
 	const home = join(work, "home");

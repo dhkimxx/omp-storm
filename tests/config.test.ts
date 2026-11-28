@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ApprovalStore } from "../src/approval/store.ts";
 import { canonicalJson, configHash, escapeUnsafe, parseStrictJson } from "../src/config/canonical.ts";
-import { MAX_APPROVED_BYTES, MAX_JOB_TIMEOUT_MS, teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
+import { approvedRecordBytes, MAX_APPROVED_BYTES, MAX_JOB_TIMEOUT_MS, teamPriority, unknownFields, validateConfig } from "../src/config/schema.ts";
 import { configPath, loadConfig, serializeConfig, writeConfig } from "../src/config/store.ts";
 import type { StormConfig, TrialConfig } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
@@ -298,6 +298,20 @@ describe("validateConfig", () => {
 		const wide = clone();
 		wide.roles.explorer!.models = Array.from({ length: 4096 }, (_, index) => `a/${"m".repeat(1050)}-${index}`);
 		const rejected = validateConfig(wide);
+		expect(rejected.config).toBeUndefined();
+		expect(rejected.errors.some(error => error.includes(`${MAX_APPROVED_BYTES}바이트`))).toBe(true);
+	});
+
+	test("RF6o case 6: the approval bound is measured in the record's own pretty encoding", () => {
+		const c = clone();
+		const models = Array.from({ length: 40_000 }, (_, index) => `a/${"m".repeat(30)}-${index}`);
+		c.roles.explorer!.models = models;
+		c.roles.explorer!.effort = "low";
+		const entries = models.map(selector => ({ selector, effort: "low" }));
+		// The compact list fits the old bound; the record's own encoding does not.
+		expect(Buffer.byteLength(JSON.stringify(entries))).toBeLessThan(MAX_APPROVED_BYTES);
+		expect(approvedRecordBytes(entries)).toBeGreaterThan(MAX_APPROVED_BYTES);
+		const rejected = validateConfig(c);
 		expect(rejected.config).toBeUndefined();
 		expect(rejected.errors.some(error => error.includes(`${MAX_APPROVED_BYTES}바이트`))).toBe(true);
 	});

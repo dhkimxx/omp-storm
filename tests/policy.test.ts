@@ -10,6 +10,7 @@ import {
 	failClosed,
 	orderByQuota,
 	PENDING_SPAWN_MS,
+	preflightSpawnBlock,
 	stripEffort,
 	teamGate,
 	withEffort,
@@ -102,6 +103,18 @@ const baseTrial: TrialConfig = {
 	endsAt: "2026-11-27T00:00:00.000Z",
 	budgetUsd: 1,
 };
+
+describe("B1: a definition under a bundled name needs approval", () => {
+	test("a project `task` definition is refused with the shadow cause by the hook and by the pre-open gate", () => {
+		const bundledShadow: ShadowInfo = { agent: "task", path: "/r/.omp/agents/task.md", scope: "project", sha256: "2".repeat(64) };
+		const shadowed = state({ shadows: [bundledShadow] });
+		// The bundled substitute runs the project's definition, so the definition — not only its model — needs approval.
+		expect(code(decideSpawn(ev("task"), shadowed, inRun()))).toBe("shadow");
+		expect(preflightSpawnBlock(shadowed, "task", NOW)?.code).toBe("shadow");
+		// Once the user approved that exact definition, the second layer (the role's model) decides.
+		expect(code(decideSpawn(ev("task"), state({ shadows: [bundledShadow], approval: approval({}, [bundledShadow]) }), inRun()))).not.toBe("shadow");
+	});
+});
 
 describe("team gate", () => {
 	test("missing and invalid configs are no-config; another hash or no approval is unapproved", () => {

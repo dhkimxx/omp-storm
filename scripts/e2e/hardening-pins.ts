@@ -189,7 +189,7 @@ async function aSwappedAnswerNeverReachesTheProvider(): Promise<void> {
 			await rpc.prompt(runRequest(steps), 180_000);
 			const run = await files.finishedRun(before);
 			const kids = llm.of("child");
-			const spawn = run.spawns.find(row => row.spawnKey === LANE && row.outcome !== "blocked");
+			const spawn = run.spawns.find(row => row.lane === LANE && row.outcome !== "blocked");
 			console.log(`HOST-FACT swap: ${JSON.stringify({ answered: spawn?.models, ran: spawn?.ran, childRequests: kids.map(entry => [entry.model, entry.effort]) })}`);
 			check("Storm answered the spawn with approved models (the swap is a later extension's, not Storm's)", spawn !== undefined && (spawn.models ?? []).every(entry => !entry.startsWith("fake9/")), JSON.stringify(spawn));
 			check(
@@ -273,10 +273,11 @@ async function aWorkerOnAPooledThreadStopsBeforeItsRequest(): Promise<void> {
 			await rpc.prompt(runRequest(steps), 240_000);
 			const run = await files.finishedRun(before, 180_000);
 			const kids = llm.of("child");
-			const spawns = names.map(name => run.spawns.find(row => row.spawnKey === name && row.outcome !== "blocked"));
+			const spawns = names.map(name => run.spawns.find(row => row.lane === name && row.outcome !== "blocked"));
 			const blocked = run.spawns.filter(row => row.outcome === "blocked");
 			const spawned = spawns.flatMap((spawn, index) => (spawn === undefined ? [] : [{ spawn, name: names[index]! }]));
-			const pooled = spawned.filter(entry => pooledThreadOf(entry.name) !== undefined).map(entry => entry.name);
+			// A1-5: the lane's name is the table key; the host's agent id is the handle the placement gave it.
+			const pooled = spawned.filter(entry => entry.spawn.spawnKey !== undefined && pooledThreadOf(entry.spawn.spawnKey) !== undefined).map(entry => entry.name);
 			const mainThread = spawned.filter(entry => !pooled.includes(entry.name));
 			const verified = mainThread.filter(entry => entry.spawn.ran?.verdict === "verified").map(entry => entry.name);
 			console.log(`HOST-FACT pooled: ${JSON.stringify({ pooledWorkers: pooled, blocked: blocked.map(row => [row.spawnKey, row.code]), verified, childRequests: kids.length, results: run.results?.map(row => [row.id, row.state]) })}`);
@@ -284,7 +285,7 @@ async function aWorkerOnAPooledThreadStopsBeforeItsRequest(): Promise<void> {
 			check("no spawn was refused for a predicted placement", blocked.length === 0, JSON.stringify(blocked.map(row => [row.spawnKey, row.code, row.reason])));
 			check("the host really put at least one worker on a pooled thread in this run", pooled.length > 0, `pooled=${pooled.join(",") || "none"} spawns=${run.spawns.length}`);
 			// The rule: a pooled worker stops before its first request and is never recorded as having run.
-			check("no spawn the host put on a pooled thread reached a provider or got a model verdict", pooled.every(name => spawns.find(spawn => spawn?.spawnKey === name)?.ran === undefined), JSON.stringify({ pooled, ran: spawned.map(entry => [entry.name, entry.spawn.ran]) }));
+			check("no spawn the host put on a pooled thread reached a provider or got a model verdict", spawned.filter(entry => pooled.includes(entry.name)).every(entry => entry.spawn.ran === undefined), JSON.stringify({ pooled, ran: spawned.map(entry => [entry.name, entry.spawn.ran]) }));
 			check("the main-thread workers each ran and were checked on this thread", mainThread.length > 0 && verified.length === mainThread.length && mainThread.every(entry => entry.spawn.ran?.verdict === "verified"), `main=${mainThread.map(entry => entry.name).join(",")} verified=${verified.join(",")}`);
 			check("the main-thread workers' answers were accepted: they were not disturbed", mainThread.every(entry => (run.results ?? []).some(row => row.id === `${entry.name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
 			check("the pooled workers' answers were not accepted: nothing ran to produce them", pooled.every(name => !(run.results ?? []).some(row => row.id === `${name.toLowerCase()}-answer` && row.state === "accepted")), JSON.stringify(run.results?.map(row => [row.id, row.state])));
@@ -339,13 +340,14 @@ async function anIsolatedWorkerOnTheMainThreadIsStillChecked(): Promise<void> {
 			const before = files.runIds();
 			await rpc.prompt(runRequest(steps), 180_000);
 			const run = await files.finishedRun(before, 120_000);
-			const spawn = run.spawns.find(row => row.spawnKey === name && row.outcome !== "blocked");
+			const spawn = run.spawns.find(row => row.lane === name && row.outcome !== "blocked");
+			const native = spawn?.spawnKey;
 			const kids = llm.of("child");
-			console.log(`HOST-FACT isolated-main: ${JSON.stringify({ thread: pooledThreadOf(name) ?? "main", ran: spawn?.ran, childRequests: kids.length, costUsd: run.costUsd, results: run.results?.map(row => [row.id, row.state]) })}`);
-			check("the isolated worker reached the provider on the main thread", kids.length > 0 && pooledThreadOf(name) === undefined, `children=${kids.length} thread=${pooledThreadOf(name) ?? "main"}`);
+			console.log(`HOST-FACT isolated-main: ${JSON.stringify({ thread: native === undefined ? "none" : pooledThreadOf(native) ?? "main", ran: spawn?.ran, childRequests: kids.length, costUsd: run.costUsd, results: run.results?.map(row => [row.id, row.state]) })}`);
+			check("the isolated worker reached the provider on the main thread", kids.length > 0 && native !== undefined && pooledThreadOf(native) === undefined, `children=${kids.length} thread=${native === undefined ? "none" : pooledThreadOf(native) ?? "main"}`);
 			check("the isolated worker's request was checked and recorded as verified", spawn?.ran?.verdict === "verified", JSON.stringify(spawn?.ran));
 			check("the isolated worker's spend was counted in the run", (run.costUsd ?? 0) > 0, `cost=${run.costUsd}`);
-			check("the isolated worker settled into the run's agent ledger", (run.agents ?? []).some(agent => agent.id === name && agent.requests > 0), JSON.stringify(run.agents ?? []));
+			check("the isolated worker settled into the run's agent ledger", native !== undefined && (run.agents ?? []).some(agent => agent.id === native && agent.requests > 0), JSON.stringify(run.agents ?? []));
 		});
 	}, 300_000);
 

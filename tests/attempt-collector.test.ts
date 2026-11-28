@@ -197,6 +197,48 @@ describe("sync task results", () => {
 		h.collector.stop();
 	});
 
+	test("B5: the settlement reads an absolute citation with the root of the attempt's own run", async () => {
+		const dir = await tempDir("root");
+		const tree = path.join(dir, "tree");
+		await fs.mkdir(path.join(tree, "src"), { recursive: true });
+		await fs.writeFile(path.join(tree, "src", "a.ts"), "// header\nlimit: 42\n");
+		const seen: Array<{ runId: string; parentId: string; spawnKey: string }> = [];
+		const registry = new FakeRegistry();
+		let now = 1_000;
+		const recorded = recordingPort();
+		const collector = new AttemptCollector({
+			port: recorded.port,
+			registry: () => registry,
+			now: () => now,
+			targetRoot: attempt => {
+				seen.push(attempt);
+				return tree;
+			},
+		});
+		collector.observeTaskCall({ runId: "run-1", parentId: "Main", toolCallId: "call_1", startedAt: 990 });
+		await collector.admitSpawn({
+			runId: "run-1",
+			parentId: "Main",
+			spawnKey: "Impl",
+			lane: lane([{ id: "answer", kind: "answer", criterion: "the limit", path: "src/a.ts", contains: "limit: 42" }]),
+			artifactMode: "shared",
+			startedAt: 1_000,
+		});
+		now = 1_100;
+		await collector.observeTaskResult({
+			runId: "run-1",
+			parentId: "Main",
+			toolCallId: "call_1",
+			observedAt: 1_100,
+			details: { results: [{ id: "Impl", exitCode: 0, output: `limit: 42 (${tree}/src/a.ts#L2)` }] },
+		});
+		expect(recorded.settlements).toHaveLength(1);
+		// The caller can name the run that spawned this worker, not whichever run is current after an await.
+		expect(seen).toEqual([{ runId: "run-1", parentId: "Main", spawnKey: "Impl" }]);
+		expect(recorded.settlements[0]?.citations).toEqual([{ path: "src/a.ts", line: 2 }]);
+		collector.stop();
+	});
+
 	test("a result without the admitted child is a missing report, never silence", async () => {
 		const recorded = recordingPort();
 		const h = harness(recorded.port);
@@ -764,6 +806,10 @@ describe("async deliveries", () => {
 	});
 
 	test("an isolated job waits for a fresh registry patch and binds parent, home and digest", async () => {
+		// The bounded wait for a registry patch is a real timer; the harness shortens it to 30 ms. Without fake timers
+		// the machine's scheduling between the delivery and the registry event decides this test's outcome.
+		vi.useFakeTimers();
+		try {
 		const dir = await tempDir("isolated");
 		const patch = path.join(dir, "Impl.patch");
 		const recorded = recordingPort();
@@ -821,6 +867,9 @@ describe("async deliveries", () => {
 		expect(settlement.report.artifacts.find(artifact => artifact.kind === "patch")?.digest).toMatch(/^[0-9a-f]{64}$/);
 		expect(settlement.report.observations).toContainEqual(expect.objectContaining({ facet: "artifact" }));
 		h.collector.stop();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test("an unchanged registry patch is not new authority; the bounded wait fails it closed", async () => {
@@ -872,6 +921,9 @@ describe("async deliveries", () => {
 	});
 
 	test("a registry patch under another parent fails closed instead of becoming evidence", async () => {
+		// Same bounded wait as above: with a real 30 ms timer the timeout can win before the registry event is processed.
+		vi.useFakeTimers();
+		try {
 		const dir = await tempDir("parent");
 		const patch = path.join(dir, "Impl.patch");
 		await fs.writeFile(patch, "diff --git a/a.ts b/a.ts\n+wrong\n");
@@ -905,6 +957,9 @@ describe("async deliveries", () => {
 		expect(recorded.settlements).toHaveLength(1);
 		expect(recorded.settlements[0]?.report).toMatchObject({ attemptId: "job:job_1:Impl", captureError: "parent-mismatch" });
 		h.collector.stop();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -1460,6 +1515,9 @@ describe("citation candidates", () => {
 		]) {
 			expect(answerCitations(undefined, `see ${text} for it`)).toEqual(canonical);
 		}
+		// A sentence period after a valid coordinate is punctuation, not a partial decimal coordinate (B6).
+		expect(answerCitations(undefined, "The source of the offset is src/a.ts:12.")).toEqual(canonical);
+		expect(answerCitations(undefined, "The source of the offset is src/a.ts#L12.")).toEqual(canonical);
 		// A structured candidate keeps the path-only form only when it carries no coordinate at all.
 		expect(answerCitations({ citations: [{ path: "src/a.ts" }] }, undefined)).toEqual([{ path: "src/a.ts" }]);
 	});
@@ -1472,6 +1530,14 @@ describe("citation candidates", () => {
 			"src/a.ts#L9-L3",
 			"src/a.ts:9-3",
 			"[the line](src/a.ts#L0)",
+			// A malformed suffix must not leave its valid prefix as a citation (B6).
+			"src/a.ts#L2-Lx",
+			"src/a.ts#L2-L99999999",
+			"src/a.ts#L2:0",
+			"src/a.ts#L2.5",
+			"src/a.ts#L2-L3.5",
+			"src/a.ts:2x",
+			"src/a.ts:2-",
 		]) {
 			expect(answerCitations(undefined, `see ${text}`)).toEqual([]);
 		}

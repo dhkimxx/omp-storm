@@ -3,10 +3,9 @@
  * The budget stop written to disk and read by workers (R15), real host. Two runs set a limit with each of the user's
  * two choices:
  *
- * - `block-spawns`: the limit is reached while two workers run; the run marker carries `spendClosedAt` with that
- *   choice; a quiet `?progress` note to an idle worker passes, a work-bearing message is refused with `[storm:budget]`,
- *   and a new `task` is refused the same way.
- * - `stop`: the marker carries `stop`, and the director's own turn is aborted at the limit. omp then ends the jobs of
+ * - `block-spawns`: the limit is reached while two workers run; the run's close receipt carries that choice; every
+ *   `agent://` message is refused with `[storm:budget]`, a quiet `?progress` note included, and so is a new `task`.
+ * - `stop`: the receipt carries `stop`, and the director's own turn is aborted at the limit. omp then ends the jobs of
  *   that aborted turn, so no later request of theirs is sent: the worker guard's request abort is held by the unit
  *   tests and the hook tests; what this host shows is the marker and the ended turn.
  *
@@ -35,26 +34,28 @@ const text = (frame: Frame): string => {
 	return Array.isArray(content) ? content.map(part => (part && typeof part === "object" && "text" in part ? String(part.text) : "")).join("\n") : "";
 };
 
-/** Every worker run marker on disk, as the host writes them for this profile. */
-function runMarkers(): Array<Record<string, unknown>> {
-	const dir = join(env.agentDir, "storm", "admissions", "runs");
-	if (!existsSync(dir)) return [];
-	return readdirSync(dir)
-		.filter(name => name.endsWith(".json"))
-		.flatMap(name => {
-			try {
-				const value: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
-				return value !== null && typeof value === "object" ? [value as Record<string, unknown>] : [];
-			} catch {
-				return [];
-			}
-		});
+/** The one close receipt of this run on disk: written once, keyed by the run id, never in the run marker. */
+function closeOf(runId: string): { schema?: string; at?: number; onExceed?: string } | undefined {
+	const dir = join(env.agentDir, "storm", "admissions", "closes");
+	if (!existsSync(dir)) return undefined;
+	for (const name of readdirSync(dir)) {
+		if (!name.endsWith(".json")) continue;
+		try {
+			const value: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
+			if (typeof value !== "object" || value === null || !("runId" in value) || value.runId !== runId) continue;
+			if (!("close" in value) || typeof value.close !== "object" || value.close === null) return {};
+			const close = value.close;
+			return {
+				...( "schema" in value && typeof value.schema === "string" ? { schema: value.schema } : {}),
+				...( "at" in close && typeof close.at === "number" ? { at: close.at } : {}),
+				...( "onExceed" in close && typeof close.onExceed === "string" ? { onExceed: close.onExceed } : {}),
+			};
+		} catch {
+			// A receipt another run is writing, or a foreign file: not this run's fact.
+		}
+	}
+	return undefined;
 }
-const markerOf = (runId: string): Record<string, unknown> | undefined => runMarkers().find(marker => marker.runId === runId);
-const closed = (marker: Record<string, unknown> | undefined): { at?: number; onExceed?: string } | undefined => {
-	const value = marker?.spendClosedAt;
-	return value !== null && typeof value === "object" ? (value as { at?: number; onExceed?: string }) : undefined;
-};
 const taskResults = (frames: readonly Frame[]): string => frames.filter(frame => frame.type === "tool_execution_end" && (frame.toolName === "task" || frame.toolName === "write")).map(text).join("\n");
 
 async function main(): Promise<void> {
@@ -92,10 +93,15 @@ async function main(): Promise<void> {
 			await rpc.turn(`E2E-STEPS ${JSON.stringify(steps)}`, 240_000);
 			const run = await files.finishedRun(before, 120_000);
 			const frames = rpc.frames.slice(from);
-			const marker = await until(() => markerOf(run.runId), 10_000, "the worker run marker").catch(() => undefined);
-			check("the run marker carries the close with the user's block choice", closed(marker)?.onExceed === "block-spawns", JSON.stringify(marker?.spendClosedAt ?? null));
+			const close = await until(() => closeOf(run.runId), 10_000, "the run's close receipt").catch(() => undefined);
+			check("the run's close receipt carries the user's block choice", close?.schema === "storm.worker-spend-close/v1" && close.onExceed === "block-spawns", JSON.stringify(close ?? null));
 			const results = taskResults(frames);
-			check("the quiet progress note passed", !results.includes(SPEND_TAG) || !frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "write").map(text).some(value => value.includes(SPEND_TAG)), results.slice(-400));
+			// B3: after the close no message reaches a worker, a quiet progress note included.
+			const progressRefused = frames
+				.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "write")
+				.map(text)
+				.some(value => value.includes("[storm:budget]") || value.includes(SPEND_TAG));
+			check("the quiet progress note is refused too", progressRefused, results.slice(-400));
 			const refusedWork = frames
 				.filter(frame => frame.type === "tool_execution_end" && (frame.toolName === "write" || frame.toolName === "task"))
 				.map(text)
@@ -104,7 +110,7 @@ async function main(): Promise<void> {
 			check("the work-bearing message and the new task are refused at the limit", refusedWork.length >= 1 && budgetSpawn, JSON.stringify({ refusals: refusedWork.map(value => value.slice(0, 120)), spawns: run.spawns.map(spawn => [spawn.spawnKey, spawn.outcome, spawn.code]) }));
 			check("the woken worker did not run new work", !llm.of("child").some(entry => entry.lastUser.includes("wake-and-work") || entry.lastUser.includes("E2E-CHILD-CLAIM new-worker")), `children=${llm.of("child").length}`);
 			// block-spawns does not cut the current turn: the note, the work send and the new task all ran after the close.
-			const afterClose = llm.of("main").filter(entry => entry.ts > (closed(marker)?.at ?? 0)).length;
+			const afterClose = llm.of("main").filter(entry => entry.ts > (close?.at ?? 0)).length;
 			check("the current turn kept going after the close; only new work was refused", afterClose >= 3, `afterClose=${afterClose} status=${run.status}/${run.endReason ?? "?"}`);
 		});
 	}, 400_000);
@@ -121,9 +127,9 @@ async function main(): Promise<void> {
 			];
 			await rpc.prompt(`E2E-STEPS ${JSON.stringify(steps)}`, 240_000);
 			const run = await files.finishedRun(before, 120_000);
-			const marker = await until(() => markerOf(run.runId), 10_000, "the worker run marker").catch(() => undefined);
+			const close = await until(() => closeOf(run.runId), 10_000, "the run's close receipt").catch(() => undefined);
 			check("the run ended on the budget", run.status === "budget-exceeded" && run.endReason === "budget", `${run.status}/${run.endReason ?? "?"}`);
-			check("the marker carries the close with the user's stop choice", closed(marker)?.onExceed === "stop", JSON.stringify(marker?.spendClosedAt ?? null));
+			check("the close receipt carries the user's stop choice", close?.onExceed === "stop", JSON.stringify(close ?? null));
 			// The host aborts the turn's own jobs, so the worker is cancelled with the turn and never sends a request Storm
 			// could abort: the D9 notice is held by the unit and hook tests, not observable here (reported).
 			check("the stopped turn left no delivery claiming the user interrupted it by hand", !rpc.frames.some(frame => JSON.stringify(frame).includes(SPEND_USER_STOP_WORD)), "");

@@ -95,12 +95,17 @@ test("shared placement flags only planned isolation lanes and strips an unplanne
 	if (!placed.ok) return;
 	const tasks = placed.input.tasks as Array<Record<string, unknown>>;
 	expect(tasks[0]).not.toHaveProperty("isolated");
-	expect(tasks[1]).toMatchObject({ name: "probe", isolated: true });
+	expect(tasks[1]).toMatchObject({ isolated: true });
+	expect(String(tasks[1]!.name)).toMatch(/^run-placement-lane-\d+$/);
 	// The batch placement holds 'probe' until its spawn is correlated; the host never started it here.
 	work.cancel("probe", work.placementOf("probe"));
-	// The manual handle is kept: only a selected lane's placement changes.
+	// A manual placement of the selected lane gets its own handle too; only its isolation placement is decided here.
 	const flat = work.place({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
-	expect(flat.ok && flat.input).toMatchObject({ name: "probe", isolated: true });
+	expect(flat.ok).toBe(true);
+	if (flat.ok) {
+		expect(flat.input).toMatchObject({ isolated: true });
+		expect(String(flat.input.name)).toMatch(/^run-placement-lane-\d+$/);
+	}
 });
 
 test("a batch-wide isolated shorthand cannot leak into shared items", () => {
@@ -236,7 +241,8 @@ test("a planned batch resolves names to lanes and places everything else unplann
 	expect(mixed.ok).toBe(true);
 	if (mixed.ok) {
 		const tasks = mixed.input.tasks as Array<Record<string, unknown>>;
-		expect(tasks[0]).toMatchObject({ name: "A", isolated: true });
+		expect(tasks[0]).toMatchObject({ isolated: true });
+		expect(String(tasks[0]!.name)).toMatch(/^run-atomic-lane-\d+$/);
 		expect(tasks[1]).toMatchObject({ isolated: true });
 		expect(tasks[1]!.name).toMatch(/^storm-implementer-run-.+-\d+$/);
 	}
@@ -257,9 +263,8 @@ test("a planned batch resolves names to lanes and places everything else unplann
 	expect(approved.ok).toBe(true);
 	if (approved.ok) {
 		const tasks = approved.input.tasks as Array<Record<string, unknown>>;
-		expect(tasks[0]).toMatchObject({ name: "A", isolated: true });
-		expect(tasks[1]).toMatchObject({ name: "B", isolated: true });
-		expect(tasks[2]).toMatchObject({ name: "C", isolated: true });
+		for (const task of tasks) expect(task).toMatchObject({ isolated: true });
+		for (const task of tasks) expect(String(task.name)).toMatch(/^run-atomic-good-lane-\d+$/);
 	}
 
 	const selected = plan(
@@ -533,9 +538,12 @@ test("a shared-write batch is all-or-nothing and a settled worker frees its scop
 		{ name: "X1", kind: "code", role: "quick", files: ["other.txt"] },
 	);
 	const work = new RunLanes("run-write");
-	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
-	work.admit({ spawnKey: "W0", agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
-	const running = [agentEntry({ id: "W0", name: "storm-quick", role: "quick", state: "running" })];
+	const writer = work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team);
+	expect(writer.ok).toBe(true);
+	if (!writer.ok) return;
+	const writerKey = String(writer.input.name);
+	work.admit({ spawnKey: writerKey, agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
+	const running = [agentEntry({ id: writerKey, name: "storm-quick", role: "quick", state: "running" })];
 	const refused = work.place(
 		{
 			tasks: [
@@ -553,7 +561,7 @@ test("a shared-write batch is all-or-nothing and a settled worker frees its scop
 	expect(work.place({ agent: "storm-quick", name: "X1", task: "Independent" }, shared, team, { agents: running }).ok).toBe(true);
 	// The writer's own scope is still held; settling it frees the conflicting item.
 	expect(work.place({ agent: "storm-quick", name: "X0", task: "Conflict" }, shared, team, { agents: running }).ok).toBe(false);
-	work.releaseAgent("W0");
+	work.releaseAgent(writerKey);
 	expect(work.place({ agent: "storm-quick", name: "X0", task: "Conflict" }, shared, team, { agents: running }).ok).toBe(true);
 });
 
@@ -597,15 +605,18 @@ test("a cancelled placement releases its write and a work follow-up passes the s
 	const work = new RunLanes("run-follow");
 	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
 	work.cancel("W0", work.placementOf("W0"));
-	expect(work.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, team).ok).toBe(true);
-	work.admit({ spawnKey: "H0", agent: "storm-implementer", outcome: "routed" }, { plan: shared, config: team });
-	const running = [agentEntry({ id: "H0", state: "running" })];
+	const placed = work.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, team);
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const holder = String(placed.input.name);
+	work.admit({ spawnKey: holder, agent: "storm-implementer", outcome: "routed" }, { plan: shared, config: team });
+	const running = [agentEntry({ id: holder, state: "running" })];
 	expect(work.checkFollowUp({ agentId: "X0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: running }).ok).toBe(false);
 	expect(work.checkFollowUp({ agentId: "R0", agent: "storm-explorer", role: "explorer", lane: shared.lanes[2]!, isolated: false, agents: running }).ok).toBe(true);
-	const own = work.checkFollowUp({ agentId: "H0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: running });
+	const own = work.checkFollowUp({ agentId: holder, agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: running });
 	expect(own.ok).toBe(true);
 	if (own.ok) work.finishFollowUp(own.token, true);
-	work.releaseAgent("H0");
+	work.releaseAgent(holder);
 	expect(work.checkFollowUp({ agentId: "X0", agent: "storm-implementer", role: "implementer", lane: shared.lanes[0]!, isolated: false, agents: [] }).ok).toBe(true);
 });
 
@@ -617,7 +628,10 @@ test("a reserved or running lane refuses a second independent dispatch even when
 	const work = new RunLanes("run-busy");
 	const read = (name: string, agents?: ReturnType<typeof agentEntry>[]) =>
 		work.place({ agent: "storm-explorer", name, task: "Read" }, reads, team, agents === undefined ? {} : { agents });
-	expect(read("R0").ok).toBe(true);
+	const firstRead = read("R0");
+	expect(firstRead.ok).toBe(true);
+	if (!firstRead.ok) return;
+	const reader = String(firstRead.input.name);
 	// Before any spawn correlation a read-only lane has no write reservation, yet the first attempt is already reserved.
 	const second = read("R0");
 	expect(second.ok).toBe(false);
@@ -627,11 +641,11 @@ test("a reserved or running lane refuses a second independent dispatch even when
 	expect(batch.ok).toBe(false);
 	expect(read("R1").ok).toBe(true);
 	work.cancel("R1", work.placementOf("R1"));
-	work.admit({ spawnKey: "R0", agent: "storm-explorer", outcome: "routed" }, { plan: reads, config: team });
+	work.admit({ spawnKey: reader, agent: "storm-explorer", outcome: "routed" }, { plan: reads, config: team });
 	// Admitted: the agent's own state decides, including the moment before the host list shows it.
 	expect(read("R0", []).ok).toBe(false);
-	expect(read("R0", [agentEntry({ id: "R0", state: "running" })]).ok).toBe(false);
-	expect(read("R0", [agentEntry({ id: "R0", state: "idle" })]).ok).toBe(true);
+	expect(read("R0", [agentEntry({ id: reader, state: "running" })]).ok).toBe(false);
+	expect(read("R0", [agentEntry({ id: reader, state: "idle" })]).ok).toBe(true);
 });
 
 test("a placement that never reached a spawn stops holding its lane when cancelled or after the pending window", () => {
@@ -774,9 +788,12 @@ test("a progress-only note proven read-only meets no write-order gate and reserv
 	// A real bash-capable authority is one unknown shared scope: W0 owns the tree, so the work message collides.
 	const runId = "run-progress-writer";
 	const writing = new RunLanes(runId);
-	expect(writing.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, teamWithQuick, { policies: new Map([["W0", bash]]) }).ok).toBe(true);
-	writing.admit({ spawnKey: "W0", agent: "storm-quick", outcome: "routed" }, { plan: shared, config: teamWithQuick });
-	const runningW0 = [agentEntry({ id: "W0", state: "running" })];
+	const placedW0 = writing.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, teamWithQuick, { policies: new Map([["W0", bash]]) });
+	expect(placedW0.ok).toBe(true);
+	if (!placedW0.ok) return;
+	const w0Key = String(placedW0.input.name);
+	writing.admit({ spawnKey: w0Key, agent: "storm-quick", outcome: "routed" }, { plan: shared, config: teamWithQuick });
+	const runningW0 = [agentEntry({ id: w0Key, state: "running" })];
 	const denied = follow(writing, shared.lanes[0]!, { runId, agents: runningW0 });
 	expect(denied.ok).toBe(false);
 	if (!denied.ok) expect(denied.code).toBe("lane-write");
@@ -940,10 +957,12 @@ test("a delayed host start cannot bypass a writer that reserved the expired scop
 	);
 	const work = new RunLanes("run-late");
 	const at = 1_000_000;
-	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team, { now: at }).ok).toBe(true);
+	const first = work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team, { now: at });
+	expect(first.ok).toBe(true);
+	if (!first.ok) return;
 	// The pending window expires and a new writer takes the same scope.
 	expect(work.place({ agent: "storm-quick", name: "X0", task: "Write" }, shared, team, { now: at + 31_000 }).ok).toBe(true);
-	const late = work.admitChecked({ spawnKey: "W0", agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
+	const late = work.admitChecked({ spawnKey: String(first.input.name), agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
 	expect(late.ok).toBe(false);
 	if (!late.ok) expect(late.code).toBe("lane-write");
 });
@@ -969,7 +988,7 @@ test("the late recheck keeps the scope the lane was placed with: a shell writer 
 		expect(first.ok).toBe(true);
 		// E0's pending window runs out before the host allocates its spawn key; a path-only writer takes its turn meanwhile.
 		expect(place("P0", at + 31_000).ok).toBe(true);
-		const key = auto && first.ok ? String(first.input.name) : "E0";
+		const key = first.ok ? String(first.input.name) : "E0";
 		// Recomputed from declared files alone E0 would look like a disjoint path writer and slip in. It was placed as an
 		// unbounded writer (it has a shell), and the recheck keeps that.
 		const late = work.admitChecked({ spawnKey: key, agent: "storm-quick", outcome: "routed" }, { plan: shared, config: team });
@@ -1043,11 +1062,13 @@ test("approved capability policies drive read-only, path and blocked scopes; a l
 	const paths = plan(lateLane, nextLane);
 	const late = work.place({ agent: "storm-implementer", name: "late", task: "Late" }, paths, scheduling, { now: 0 });
 	expect(late.ok).toBe(true);
+	if (!late.ok) return;
 	const next = work.place({ agent: "storm-quick", name: "next", task: "Next" }, paths, scheduling, { now: PENDING_WRITE_MS + 1 });
 	expect(next.ok).toBe(true);
-	const nextAdmit = work.admitChecked({ spawnKey: "next", agent: "storm-quick", outcome: "routed" }, { plan: paths, config: scheduling });
-	expect(nextAdmit).toEqual({ ok: true, lane: "next" });
-	const lateAdmit = work.admitChecked({ spawnKey: "late", agent: "storm-implementer", outcome: "routed" }, { plan: paths, config: scheduling });
+	if (!next.ok) return;
+	const nextAdmit = work.admitChecked({ spawnKey: String(next.input.name), agent: "storm-quick", outcome: "routed" }, { plan: paths, config: scheduling });
+	expect(nextAdmit).toMatchObject({ ok: true, lane: "next" });
+	const lateAdmit = work.admitChecked({ spawnKey: String(late.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: paths, config: scheduling });
 	expect(lateAdmit.ok).toBe(false);
 	if (!lateAdmit.ok) expect(lateAdmit.code).toBe("lane-write");
 });

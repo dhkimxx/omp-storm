@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { LanePolicy } from "../src/policy/capability.ts";
-import { PLACEMENT_CHANGED_REASON, resolveTaskLanes, RunLanes, spawnKeyMismatchReason, UNPLANNED_NOTE_TAG } from "../src/runtime/lanes.ts";
+import { PLACEMENT_CHANGED_REASON, resolveTaskLanes, RunLanes, spawnKeyMismatchReason, UNPLANNED_NOTE_TAG, type HostJobRow } from "../src/runtime/lanes.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
 import { agentEntry, teamOf } from "./fixtures.ts";
 
@@ -140,43 +140,45 @@ test("a name that matches no lane takes its role's only lane; ambiguity is unpla
 	if (planned.ok) expect(planned.input.name).toBe("run-r5-lane-1");
 });
 
-test("a manual planned lane re-attempted in one run gets a run-unique handle, and the lane stays the same", () => {
+test("every manual planned placement gets a run-unique handle, and the lane stays the same", () => {
 	const work = new RunLanes("run-reattempt");
 	const p = plan(lane("api"));
 	const first = work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { agentTools });
 	expect(first.ok).toBe(true);
 	if (!first.ok) return;
-	expect(first.input.name).toBe("api");
-	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
-	// The first attempt ends before a re-attempt is placed.
-	work.releaseAgent("api");
-	// omp would dedupe a second placement under the lane name to `api-2`; R4 refuses that. The re-attempt gets a handle.
+	// A1-5: the lane's name is the table and ledger key, never the child's name; the host gets a handle it has not seen.
+	expect(String(first.input.name)).toMatch(/^run-reattempt-lane-\d+$/);
+	expect(work.admitChecked({ spawnKey: String(first.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
+	// The first attempt ends before a re-attempt is placed. The re-attempt must not reuse the first handle either.
+	work.releaseAgent(String(first.input.name));
 	const second = work.place({ agent: "storm-implementer", name: "api", task: "A again" }, p, team, { agentTools });
 	expect(second.ok).toBe(true);
 	if (!second.ok) return;
 	expect(String(second.input.name)).toMatch(/^run-reattempt-lane-\d+$/);
+	expect(second.input.name).not.toBe(first.input.name);
 	expect(work.admitChecked({ spawnKey: String(second.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
 });
 
-test("a resumed run's planned lanes get handles on their first attempt, because the session has seen their names", () => {
-	const work = new RunLanes("run-resumed", undefined, true);
+test("a planned lane's first attempt in a resumed session gets a handle, not the lane's seen name", () => {
+	const work = new RunLanes("run-resumed");
 	const placed = work.place({ agent: "storm-implementer", name: "api", task: "A" }, plan(lane("api")), team, { agentTools });
 	expect(placed.ok).toBe(true);
 	if (placed.ok) expect(String(placed.input.name)).toMatch(/^run-resumed-lane-\d+$/);
 });
 
-test("a blocked spawn still names its lane, so the lane's retry in the same run gets a handle", () => {
+test("a blocked spawn consumes its handle, so the lane's retry in the same run gets a new one", () => {
 	const work = new RunLanes("run-blocked-retry");
 	const p = plan(lane("api"));
 	const first = work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { agentTools });
 	expect(first.ok).toBe(true);
-	// The host named the spawn, then the hook's blocked path released the placement; the hook also records the name.
-	work.noteSpawnName("api");
-	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "blocked" }, { plan: p, config: team })).toMatchObject({ ok: true });
+	if (!first.ok) return;
+	const firstKey = String(first.input.name);
+	expect(work.admitChecked({ spawnKey: firstKey, agent: "storm-implementer", outcome: "blocked" }, { plan: p, config: team })).toMatchObject({ ok: true });
 	const retry = work.place({ agent: "storm-implementer", name: "api", task: "A again" }, p, team, { agentTools });
 	expect(retry.ok).toBe(true);
 	if (!retry.ok) return;
 	expect(String(retry.input.name)).toMatch(/^run-blocked-retry-lane-\d+$/);
+	expect(retry.input.name).not.toBe(firstKey);
 	expect(work.admitChecked({ spawnKey: String(retry.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team })).toMatchObject({ ok: true, lane: "api" });
 });
 
@@ -263,12 +265,14 @@ test("an isolated unplanned item is private and runs beside a shared writer (D10
 test("the admission returns the reservation key bound to the child (R7)", () => {
 	const work = new RunLanes("run-hold");
 	const p = plan(lane("api"));
-	expect(work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team).ok).toBe(true);
-	// A manual planned item is matched by its lane key and holds the lane's reservation. The hook derives the policy
-	// from the frozen placement; the result carries both the hold and the proven policy it must persist.
+	const manual = work.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team);
+	expect(manual.ok).toBe(true);
+	if (!manual.ok) return;
+	// A planned item is matched by the exact handle its placement gave the host and holds the lane's reservation. The
+	// hook derives the policy from the frozen placement; the result carries both the hold and the proven policy.
 	const frozenLanes: Array<string | undefined> = [];
 	expect(
-		work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, {
+		work.admitChecked({ spawnKey: String(manual.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, {
 			directorTask: {
 				policy: frozen => {
 					frozenLanes.push(frozen.lane);
@@ -395,8 +399,10 @@ test("a policy wider than the frozen placement is refused; a narrower one is adm
 	const p = plan(lane("api"));
 	const paths = pathsPolicy(["api.ts"]);
 	const broad = new RunLanes("run-r3-broad");
-	expect(broad.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) }).ok).toBe(true);
-	const wider = broad.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => pathsPolicy(["api.ts", "other.ts"]) } });
+	const broadPlaced = broad.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) });
+	expect(broadPlaced.ok).toBe(true);
+	if (!broadPlaced.ok) return;
+	const wider = broad.admitChecked({ spawnKey: String(broadPlaced.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => pathsPolicy(["api.ts", "other.ts"]) } });
 	expect(wider).toMatchObject({ ok: false, code: "internal" });
 	if (!wider.ok) expect(wider.reason).toBe(PLACEMENT_CHANGED_REASON);
 	// The refused admission released the placement. The lane is attempted again in the same run; the host already
@@ -412,8 +418,10 @@ test("a policy wider than the frozen placement is refused; a narrower one is adm
 
 	// A shared placement read as private would write the parent root: refused.
 	const privateRead = new RunLanes("run-r3-private-read");
-	expect(privateRead.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) }).ok).toBe(true);
-	expect(privateRead.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => privatePolicy } })).toMatchObject({
+	const privatePlaced = privateRead.place({ agent: "storm-implementer", name: "api", task: "A" }, p, team, { policies: new Map([["api", paths]]) });
+	expect(privatePlaced.ok).toBe(true);
+	if (!privatePlaced.ok) return;
+	expect(privateRead.admitChecked({ spawnKey: String(privatePlaced.input.name), agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }, { directorTask: { policy: () => privatePolicy } })).toMatchObject({
 		ok: false,
 		code: "internal",
 	});
@@ -435,4 +443,62 @@ test("a policy wider than the frozen placement is refused; a narrower one is adm
 		ok: true,
 		placed: true,
 	});
+});
+
+test("an unplanned shared writer is rechecked at admission against a host job that appeared after its placement (A1-2)", () => {
+	const rows: { current: readonly HostJobRow[] | undefined } = { current: [] };
+	const work = new RunLanes("run-host-recheck", () => rows.current);
+	const placed = work.place({ agent: "storm-implementer", name: "w", task: "write" }, undefined, team, { agentTools });
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const key = String(placed.input.name);
+	// The placement is live and was gated against an empty table; a command the director sent to the background now runs.
+	rows.current = [{ id: "bg-1", type: "bash", status: "running" }];
+	const admitted = work.admitChecked({ spawnKey: key, agent: "storm-implementer", outcome: "routed" }, undefined, DIRECT);
+	expect(admitted).toMatchObject({ ok: false, code: "lane-write" });
+});
+
+test("a planned reader that carries its own eval tools is reserved as a shared writer and the fact reaches the hook (D7/A1-7)", () => {
+	const work = new RunLanes("run-carried-tools");
+	const p = plan(lane("look", { kind: "explore", role: "explorer", files: [] }));
+	const placed = work.place(
+		{ agent: "storm-explorer", name: "look", task: "read", tools: ["my_lookup"] },
+		p,
+		team,
+		{ policies: new Map([["look", readPolicy]]), agentTools },
+	);
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const key = String(placed.input.name);
+	const frozen: boolean[] = [];
+	const admitted = work.admitChecked(
+		{ spawnKey: key, agent: "storm-explorer", outcome: "routed" },
+		{ plan: p, config: team },
+		{
+			directorTask: {
+				policy: placement => {
+					frozen.push(placement.toolsCarried);
+					return readPolicy;
+				},
+			},
+		},
+	);
+	// The placement reserved the whole shared tree, and the hook is told why; a read policy is narrower, so it is admitted.
+	expect(frozen).toEqual([true]);
+	expect(admitted).toMatchObject({ ok: true, hold: "lane:look" });
+	if (admitted.ok) expect(admitted.authority).toEqual({ kind: "unknown" });
+});
+
+test("mismatch notes are counted by cause with a bounded number of examples, never one line per item (B9)", () => {
+	const p = plan({ name: "api", kind: "code", role: "implementer", files: ["api.ts"] });
+	const items = Array.from({ length: 64 }, (_, index) => ({ agent: "storm-explorer", name: "api", task: `read ${index}` }));
+	const placed = new RunLanes("run-notes").place({ tasks: items }, p, team, { agentTools });
+	expect(placed.ok).toBe(true);
+	if (!placed.ok) return;
+	const notes = placed.notes ?? [];
+	// Two examples and one line that counts the rest, all under one cause.
+	expect(notes).toHaveLength(3);
+	expect(notes.every(note => note.includes(UNPLANNED_NOTE_TAG))).toBe(true);
+	expect(notes.at(-1)).toContain("62개 더");
+	expect(notes.join("\n").length).toBeLessThan(1_200);
 });

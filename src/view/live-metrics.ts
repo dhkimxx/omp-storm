@@ -3,7 +3,7 @@
  * description read the same chips; only the layout decides which whole chips fit. Animation never reaches this file.
  */
 import { formatUsd } from "../policy/spawn.ts";
-import { NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
+import { NO_DECLARED_RESULTS, OUT_OF_PLAN_LABEL, TREE_CHANGE_LABEL, WORKER_CHANGE_LABEL, WORKER_LABEL, resultFacts, type ResultFactOptions, type ResultFacts } from "../runtime/result-facts.ts";
 import type { InfoTone, RunRecord } from "../types.ts";
 import { RUN_APPEARANCE, type RunPhase } from "./appearance.ts";
 import { RETAINED_ACCEPTED, RETAINED_LABEL } from "./results.ts";
@@ -70,8 +70,8 @@ function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
 			facts.changedPaths === undefined
 				? facts.activity.changed === 0
 					? undefined
-					: `변경한 워커 ${facts.activity.changed}`
-				: `변경 ${facts.changedPaths}`;
+					: `${WORKER_CHANGE_LABEL} ${facts.activity.changed}`
+				: `${TREE_CHANGE_LABEL} ${facts.changedPaths}`;
 		const out = facts.outOfPlan === 0 ? undefined : `${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
 		const tail = [workers, changed, out].filter((part): part is string => part !== undefined).join(" · ");
 		const forms: LiveMetricForm[] =
@@ -97,18 +97,28 @@ function resultChip(facts: ResultFacts): LiveMetricChip | undefined {
 	const excluded = counts.excluded === 0 ? "" : ` · 제외 ${counts.excluded}`;
 	const mixed = facts.outOfPlan === 0 ? "" : ` · ${OUT_OF_PLAN_LABEL} ${facts.outOfPlan}`;
 	// Row 1: retained artifact acceptance is not tree work; the count carries that word instead of a bare `이행`.
+	// Every narrower form keeps the word too: a compact `1/1` would read as integrated work (B7).
 	const retainedOnly = facts.retained.count > 0 && facts.retained.count === counts.accepted;
-	const progressText = retainedOnly
-		? `${RETAINED_ACCEPTED} ${counts.accepted}/${counts.inScope}`
-		: `이행 ${counts.accepted}/${counts.inScope}${facts.retained.count > 0 ? ` · ${RETAINED_LABEL} ${facts.retained.count}` : ""}`;
+	const retainedPart = facts.retained.count > 0 && !retainedOnly ? ` · ${RETAINED_LABEL} ${facts.retained.count}` : "";
+	const retainedCount = `${RETAINED_ACCEPTED} ${counts.accepted}/${counts.inScope}`;
+	const plainCount = `${counts.accepted}/${counts.inScope}`;
+	const progressText = retainedOnly ? retainedCount : `이행 ${plainCount}${retainedPart}`;
 	const full = (focusState === "accepted" ? ` ${progressText}${excluded}` : ` ${state} · ${progressText}${excluded}`) + mixed;
 	const forms: LiveMetricForm[] =
 		counts.inScope > 0
-			? [
-					{ value: label, suffix: full },
-					{ value: `${counts.accepted}/${counts.inScope}`, suffix: ` ${state}${excluded}${mixed}` },
-					{ value: `${counts.accepted}/${counts.inScope}` },
-				]
+			? retainedOnly
+				? [
+						{ value: label, suffix: full },
+						{ value: retainedCount, suffix: `${excluded}${mixed}` },
+						{ value: retainedCount },
+					]
+				: [
+						{ value: label, suffix: full },
+						{ value: plainCount, suffix: ` ${state}${retainedPart}${excluded}${mixed}` },
+						facts.retained.count > 0
+							? { value: plainCount, suffix: `${RETAINED_LABEL} ${facts.retained.count}` }
+							: { value: plainCount },
+					]
 			: [
 					{ value: label, suffix: ` 사용자 제외 ${counts.excluded}${mixed}` },
 					{ value: `제외 ${counts.excluded}` },
