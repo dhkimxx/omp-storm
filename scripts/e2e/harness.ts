@@ -680,6 +680,18 @@ export class Rpc {
 		return this.frames.slice(from);
 	}
 
+	/** Hard-kills one running subagent through the host's public RPC command; `false` means the host did not confirm. */
+	async cancelSubagent(subagentId: string): Promise<boolean> {
+		const from = this.frames.length;
+		const id = this.send({ type: "cancel_subagent", subagentId });
+		const frame = await until(
+			() => this.frames.slice(from).find(candidate => candidate.type === "response" && candidate.id === id && candidate.command === "cancel_subagent"),
+			20_000,
+			`cancel_subagent ${subagentId}`,
+		);
+		return frame.success === true && frame.data?.cancelled === true;
+	}
+
 	/** Sends a prompt and waits until omp reports the session settled: the turn and what it started asynchronously are over. */
 	async turn(message: string, timeoutMs = 90_000): Promise<Frame[]> {
 		const from = this.frames.length;

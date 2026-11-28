@@ -52,6 +52,8 @@ export const E2E_SUITES: readonly E2eSuite[] = [
 	{ name: "session-scope", script: "session-scope.ts", group: "qa", note: "native session ownership and per-session stores" },
 	{ name: "decisions", script: "decisions.ts", group: "qa", note: "routine decisions without a dialog" },
 	{ name: "isolation", script: "isolation.ts", group: "qa", note: "selective lane isolation and host settings" },
+	{ name: "integration-pin", script: "integration-pin.ts", env: { INTEGRATION_REQUIRE_GATES: "1" }, group: "qa", note: "0.30.0 pin, profile and host source proof; prints release gates without a model" },
+	{ name: "integration", script: "integration.ts", env: { INTEGRATION_REQUIRE_GATES: "1" }, group: "qa", note: "0.30.0 isolated capture, candidates, write and judgment release gates" },
 	{ name: "hardening-pins", script: "hardening-pins.ts", group: "e2e-guarantees", note: "the approved model and effort are what runs" },
 	{ name: "read-shell", script: "read-shell.ts", group: "e2e-guarantees", note: "a read lane with a shell runs like a writer" },
 	{ name: "wait-evidence", script: "wait-evidence.ts", group: "qa", note: "native wait delivery and the result channel" },

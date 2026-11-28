@@ -663,6 +663,50 @@ function stepCall(step: Step, tools: Tool[] | undefined): Decision {
 	return { kind: "text", text: "waiting", awaitChild: true };
 }
 
+/**
+ * Exact integration candidate IDs named by the newest `storm` tool result in the conversation. The script cannot know a
+ * run ID before the run, so a `$candidates` selector reads what the director itself just read; it never invents an ID.
+ */
+function candidateIdsFrom(messages: Message[]): string[] {
+	for (let at = messages.length - 1; at >= 0; at--) {
+		const message = messages[at];
+		if (message?.role !== "tool") continue;
+		const found = [...textOf(message.content).matchAll(/\bc1_[0-9a-f]{64}\b/g)].map(match => match[0]);
+		if (found.length > 0) return [...new Set(found)];
+	}
+	return [];
+}
+
+/**
+ * Resolve `candidateIds: "$candidates"` and `candidateId: "$candidates:<index>"` against the newest candidates result.
+ * `$candidates` is every ID in printed order; `$candidates:2` is one by position, `$candidates:0,2` a subset. An empty
+ * selector result is passed as an empty list so the tool refuses it, rather than silently selecting something else.
+ */
+function dynamicStormCall(step: Step, later: Message[], tools: Tool[] | undefined): Decision | undefined {
+	if (!("storm" in step)) return undefined;
+	const args = step.storm;
+	const ids = candidateIdsFrom(later);
+	const resolve = (value: unknown): unknown => {
+		if (typeof value !== "string" || !value.startsWith("$candidates")) return value;
+		const suffix = value.slice("$candidates".length);
+		if (suffix === "") return ids;
+		if (!/^:\d+(?:,\d+)*$/.test(suffix)) throw new Error(`bad $candidates selector ${value}`);
+		return suffix
+			.slice(1)
+			.split(",")
+			.map(index => ids[Number(index)])
+			.filter((id): id is string => id !== undefined);
+	};
+	const candidateIds = resolve(args.candidateIds);
+	const candidateId = resolve(args.candidateId);
+	if (candidateIds === args.candidateIds && candidateId === args.candidateId) return undefined;
+	return extensionCall(tools, "storm", {
+		...args,
+		...(candidateIds === args.candidateIds ? {} : { candidateIds }),
+		...(candidateId === args.candidateId ? {} : { candidateId }),
+	});
+}
+
 /** The decision for `step`, or a text reply that ends the turn while its `after` condition is not met yet. */
 function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | undefined): Decision {
 	if (!step) return { kind: "text", text: "done" };
@@ -692,7 +736,7 @@ function gatedStep(step: Step | undefined, later: Message[], tools: Tool[] | und
 		if (forwarded === undefined) return { kind: "text", text: "waiting" };
 		return stepCall({ ...step, say: `${step.say ?? ""}\n${forwarded}` }, tools);
 	}
-	const call = stepCall(step, tools);
+	const call = dynamicStormCall(step, later, tools) ?? stepCall(step, tools);
 	const paused = step.pauseMs === undefined ? call : { ...call, pauseMs: step.pauseMs };
 	return step.holdUntilFile === undefined ? paused : { ...paused, waitFile: step.holdUntilFile };
 }
