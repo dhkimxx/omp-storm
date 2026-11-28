@@ -26,9 +26,13 @@ interface AgentRecord {
 	entry: AgentEntry;
 	/** Attested owner session directory. Always present: no unowned entries exist. */
 	scope: string;
+	order: number;
 }
 
 const agents = sharedMap<string, AgentRecord>("storm.agents.byKey");
+const agentsByScope = sharedMap<string, Set<AgentRecord>>("storm.agents.byScope");
+const agentsByRun = sharedMap<string, Set<AgentRecord>>("storm.agents.byRun");
+const sequence = sharedMap<"next", number>("storm.agents.order");
 /** Entries this thread created from the host registry because no child-session event reached it. */
 const registryEntries = sharedMap<string, true>("storm.agents.registryEntries");
 
@@ -44,11 +48,43 @@ function recordOf(id: string, scope: string): AgentRecord | undefined {
 	return agents.get(agentKey(id, scope));
 }
 
+function include(index: Map<string, Set<AgentRecord>>, key: string, record: AgentRecord): void {
+	let records = index.get(key);
+	if (records === undefined) index.set(key, (records = new Set()));
+	records.add(record);
+}
+
+function exclude(index: Map<string, Set<AgentRecord>>, key: string, record: AgentRecord): void {
+	const records = index.get(key);
+	if (records?.delete(record) && records.size === 0) index.delete(key);
+}
+
+function remember(key: string, entry: AgentEntry, scope: string): void {
+	const order = sequence.get("next") ?? 0;
+	sequence.set("next", order + 1);
+	const record = { entry, scope, order };
+	agents.set(key, record);
+	include(agentsByScope, scope, record);
+	if (entry.runId !== undefined) include(agentsByRun, entry.runId, record);
+}
+
+function forget(key: string, record: AgentRecord): void {
+	agents.delete(key);
+	registryEntries.delete(key);
+	exclude(agentsByScope, record.scope, record);
+	if (record.entry.runId !== undefined) exclude(agentsByRun, record.entry.runId, record);
+}
+
+function moveToRun(record: AgentRecord, runId: string): void {
+	if (record.entry.runId !== undefined) exclude(agentsByRun, record.entry.runId, record);
+	record.entry.runId = runId;
+	include(agentsByRun, runId, record);
+}
+
 function prune(now: number): void {
 	for (const [key, record] of agents) {
 		if (record.entry.state === "parked" && now - record.entry.lastActivityAt > PARKED_KEEP_MS) {
-			agents.delete(key);
-			registryEntries.delete(key);
+			forget(key, record);
 		}
 	}
 }
@@ -71,7 +107,7 @@ export function noteAgentRun(id: string, runId: string, scope: string): void {
 	delete e.review;
 	delete (e as ReviewEvidenceEntry).reviewLog;
 	delete (e as ReviewEvidenceEntry).reviewLogOverflow;
-	e.runId = runId;
+	moveToRun(record, runId);
 }
 
 export function noteAgentStart(input: {
@@ -111,7 +147,7 @@ export function noteAgentStart(input: {
 	if (input.parentId !== undefined) entry.parentId = input.parentId;
 	if (input.role !== undefined) entry.role = input.role;
 	if (input.runId !== undefined) entry.runId = input.runId;
-	agents.set(key, { entry, scope: input.scope });
+	remember(key, entry, input.scope);
 }
 
 export function noteAgentUsage(input: {
@@ -306,14 +342,14 @@ export function noteRegistryAgent(facts: RegistryAgentFacts): void {
 		if (role !== undefined) entry.role = role;
 		if (facts.model !== undefined) entry.model = facts.model;
 		if (facts.status === "aborted" || facts.lastWorkFailed === true) entry.lastWorkFailed = true;
-		agents.set(key, { entry, scope: facts.scope });
+		remember(key, entry, facts.scope);
 		registryEntries.set(key, true);
 		return;
 	}
 	const e = existingRecord.entry;
 	// A synthetic entry has no run-scoped evidence to carry into another run; only its usage is cumulative.
 	if (e.runId !== facts.runId) {
-		e.runId = facts.runId;
+		moveToRun(existingRecord, facts.runId);
 		e.startedAt = facts.startedAt;
 		delete e.lastWorkFailed;
 	}
@@ -408,15 +444,18 @@ export function registryAgentIds(): string[] | undefined {
  */
 export function listAgents(filter?: { runId?: string; ancestorId?: string; scope?: string }): AgentEntry[] {
 	syncRegistryAgents();
-	const out: AgentEntry[] = [];
-	for (const record of agents.values()) {
-		const e = record.entry;
-		if (filter?.scope !== undefined && record.scope !== filter.scope) continue;
-		if (filter?.runId !== undefined && e.runId !== filter.runId) continue;
+	const scope = filter?.scope;
+	const runId = filter?.runId;
+	const records = runId !== undefined ? agentsByRun.get(runId) : scope !== undefined ? agentsByScope.get(scope) : agents.values();
+	if (records === undefined) return [];
+	const out: AgentRecord[] = [];
+	for (const record of records) {
+		if (scope !== undefined && record.scope !== scope) continue;
 		if (filter?.ancestorId !== undefined && !descends(record, filter.ancestorId)) continue;
-		out.push({ ...e });
+		out.push(record);
 	}
-	return out.sort((a, b) => a.startedAt - b.startedAt);
+	out.sort((a, b) => a.entry.startedAt - b.entry.startedAt || a.order - b.order);
+	return out.map(record => ({ ...record.entry }));
 }
 
 /** The run-end janitor removed these agents' omp records; their ledger entries say so from now on. */
@@ -431,16 +470,16 @@ export function markAgentsCleaned(ids: readonly string[], now: number, scope: st
 /** Every live row of one session store leaves the shared ledger at that session's real shutdown, whatever run last touched it. */
 export function forgetScopeAgents(scope: string): void {
 	if (!validScope(scope)) return;
-	for (const [key, record] of agents) {
-		if (record.scope === scope) {
-			agents.delete(key);
-			registryEntries.delete(key);
-		}
-	}
+	const records = agentsByScope.get(scope);
+	if (records === undefined) return;
+	for (const record of records) forget(agentKey(record.entry.id, scope), record);
 }
 
 /** Tests only. */
 export function resetAgents(): void {
 	agents.clear();
 	registryEntries.clear();
+	agentsByScope.clear();
+	agentsByRun.clear();
+	sequence.clear();
 }

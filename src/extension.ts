@@ -2762,12 +2762,14 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	const OBSERVED_DELIVERIES_MAX = 128;
 	// A message without its own timestamp has no identity that tells two identical answers apart (the same worker may
 	// answer the same words again): it is never joined to an earlier evaluation, only evaluated when `message_end` says so.
-	const deliveryKey = (message: unknown): string | undefined =>
-		isRecord(message) && message.customType === "async-result" && typeof message.timestamp === "number"
-			? JSON.stringify([message.timestamp, message.content, message.details])
-			: undefined;
+	const isPushedDelivery = (message: unknown): message is Record<string, unknown> =>
+		isRecord(message) && message.customType === "async-result";
 	const observeDelivery = (ctx: ExtensionContext, runId: string, message: unknown): Promise<void> => {
-		const key = deliveryKey(message);
+		// Keep one fixed-size key, not the serialized output of up to a full batch. Include the exact run so a
+		// retained key can never coalesce a delivery for a later owner. Native payloads are JSON-compatible.
+		const key = isPushedDelivery(message) && typeof message.timestamp === "number"
+			? sha256Hex(JSON.stringify([runId, message.timestamp, message.content, message.details]))
+			: undefined;
 		const known = key === undefined ? undefined : observedDeliveries.get(key);
 		if (known !== undefined) return known;
 		const observedAt = Date.now();
@@ -2827,7 +2829,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		if (ctx.agent.kind === "main") {
 			capturePush(ctx, event.message);
 			const runId = runs.runId();
-			if (runId !== undefined) await observeDelivery(ctx, runId, event.message);
+			if (runId !== undefined && isPushedDelivery(event.message)) await observeDelivery(ctx, runId, event.message);
 		}
 		const usage = assistantUsage(event.message);
 		if (!usage) return;
@@ -4558,7 +4560,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			const message = event.messages[at];
 			if (message === undefined || message.role === "assistant") break;
 			capturePush(ctx, message);
-			if (runId !== undefined && deliveryKey(message) !== undefined) arrived.push(observeDelivery(ctx, runId, message));
+			if (runId !== undefined && isPushedDelivery(message) && typeof message.timestamp === "number") {
+				arrived.push(observeDelivery(ctx, runId, message));
+			}
 		}
 		if (runId === undefined) return undefined;
 		if (arrived.length > 0) {

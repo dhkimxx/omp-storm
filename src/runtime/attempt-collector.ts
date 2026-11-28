@@ -554,49 +554,78 @@ function deliveredOf(output: NativeJobOutput | undefined, data: unknown): Delive
 	};
 }
 
-/**
- * The result of `jobs[index]` isolated from an `async-result` notice by re-deriving the `async-result.md` frame from
- * the host's own `details.jobs[]`. Returns undefined when the frame does not match or the job's segment is ambiguous.
- */
-function asyncJobResult(content: string, jobs: readonly unknown[], index: number): string | undefined {
-	const job = jobs[index];
-	if (!record(job) || typeof job.jobId !== "string") return undefined;
-	const text = content.trim();
-	// An unframed single delivery (older host or adapter) is the result itself; a batch cannot be attributed.
-	if (!text.startsWith("<system-notice>")) return jobs.length === 1 ? text : undefined;
-	const framed = text.startsWith("<system-notice>\n") && text.endsWith("\n</system-notice>");
-	if (!framed) return undefined;
-	const body = text.slice("<system-notice>\n".length, text.length - "\n</system-notice>".length);
-	let segment: string;
+const JOB_HEADER_PREFIX = "── Job ";
+
+function batchedJobHeader(candidate: unknown): string | undefined {
+	if (!record(candidate) || typeof candidate.jobId !== "string") return undefined;
+	const label = typeof candidate.label === "string" && candidate.label !== "" ? candidate.label.replace(HARNESS_TAG_START, "&lt;") : undefined;
+	return `${JOB_HEADER_PREFIX}${candidate.jobId}${label === undefined ? "" : ` (${label})`} ──\n`;
+}
+
+/** One pass over the native frame. Missing or duplicate headings have no trustworthy offset. */
+function putHeaderOffsets(body: string, offsets: Map<string, number | undefined>): void {
+	let lineEnd = -1;
+	for (let at = body.indexOf(JOB_HEADER_PREFIX); at !== -1; at = body.indexOf(JOB_HEADER_PREFIX, at + JOB_HEADER_PREFIX.length)) {
+		if (at > lineEnd) lineEnd = body.indexOf("\n", at);
+		if (lineEnd === -1) break;
+		const header = body.slice(at, lineEnd + 1);
+		if (offsets.has(header)) offsets.set(header, offsets.get(header) === undefined ? at : -1);
+	}
+}
+
+type JobResultReader = (index: number) => string | undefined;
+
+/** Derives boundaries from native job facts, never from a similarly shaped heading in worker output. */
+function asyncJobResultReader(content: unknown, jobs: readonly unknown[]): JobResultReader | undefined {
+	const text = rawContentText(content)?.trim();
+	if (text === undefined) return undefined;
+	if (!text.startsWith("<system-notice>")) {
+		return jobs.length === 1 && record(jobs[0]) && typeof jobs[0].jobId === "string" ? () => text : undefined;
+	}
+	const opening = "<system-notice>\n";
+	const closing = "\n</system-notice>";
+	if (!text.startsWith(opening) || !text.endsWith(closing)) return undefined;
+	const body = text.slice(opening.length, text.length - closing.length);
 	if (jobs.length === 1) {
+		const job = jobs[0];
+		if (!record(job) || typeof job.jobId !== "string") return undefined;
 		const header = `Background job ${job.jobId} has completed.\nResume your work using the result below.\n`;
 		if (!body.startsWith(header)) return undefined;
-		segment = body.slice(header.length);
-	} else {
-		const intro = `${jobs.length} background jobs have completed. Resume your work using the results below.\n\n`;
-		if (!body.startsWith(intro)) return undefined;
-		const headerOf = (candidate: unknown): string | undefined => {
-			if (!record(candidate) || typeof candidate.jobId !== "string") return undefined;
-			const label = typeof candidate.label === "string" && candidate.label !== "" ? candidate.label.replace(HARNESS_TAG_START, "&lt;") : undefined;
-			return `── Job ${candidate.jobId}${label === undefined ? "" : ` (${label})`} ──\n`;
-		};
-		const header = headerOf(job);
-		if (header === undefined || countOf(body, header) !== 1) return undefined;
-		const start = body.indexOf(header);
-		if (index === 0 ? start !== intro.length : body[start - 1] !== "\n") return undefined;
+		const result = stripJobSuffix(body.slice(header.length), job, job.jobId);
+		return () => result;
+	}
+	const intro = `${jobs.length} background jobs have completed. Resume your work using the results below.\n\n`;
+	if (!body.startsWith(intro)) return undefined;
+	const headers = jobs.map(batchedJobHeader);
+	const offsets = new Map<string, number | undefined>();
+	for (const header of headers) {
+		if (header === undefined) continue;
+		// A multiline label is uncommon, but it still needs the same exact uniqueness proof as a single line.
+		offsets.set(header, header.indexOf("\n") === header.length - 1
+			? undefined : countOf(body, header) === 1 ? body.indexOf(header) : -1);
+	}
+	putHeaderOffsets(body, offsets);
+	return index => {
+		const header = headers[index];
+		const job = jobs[index];
+		if (header === undefined || !record(job) || typeof job.jobId !== "string") return undefined;
+		const start = offsets.get(header);
+		if (start === undefined || start < 0 || (index === 0 ? start !== intro.length : body[start - 1] !== "\n")) return undefined;
 		let end = body.length;
 		if (index < jobs.length - 1) {
-			const next = headerOf(jobs[index + 1]);
-			if (next === undefined || countOf(body, next) !== 1) return undefined;
-			const nextAt = body.indexOf(next);
-			if (nextAt <= start || body[nextAt - 1] !== "\n") return undefined;
+			const next = headers[index + 1];
+			const nextAt = next === undefined ? undefined : offsets.get(next);
+			if (nextAt === undefined || nextAt <= start || body[nextAt - 1] !== "\n") return undefined;
 			end = nextAt - 1;
 		}
-		segment = body.slice(start + header.length, end);
-	}
+		return stripJobSuffix(body.slice(start + header.length, end), job, job.jobId);
+	};
+}
+
+function stripJobSuffix(segment: string, job: Record<string, unknown>, jobId: string): string | undefined {
 	// Host suffixes after `{{this.result}}`: the structured-output block (only when the job row carries a schema) and
 	// the `Agent:` handles line.
-	const agentUrlId = typeof job.agentId === "string" ? job.agentId : job.jobId;
+	const agentUrlId = typeof job.agentId === "string" ? job.agentId : jobId;
 	if (record(job.schema) && job.schema.status !== undefined) {
 		const marker = "\n\nStructured output: ";
 		if (countOf(segment, marker) !== 1) return undefined;
@@ -611,12 +640,19 @@ function asyncJobResult(content: string, jobs: readonly unknown[], index: number
 	return segment;
 }
 
-/** Worker output for one correlated async job, or undefined when the host shape cannot be attributed. */
-function asyncJobOutput(content: unknown, jobs: readonly unknown[], index: number, agentId: string): NativeJobOutput | undefined {
-	const raw = rawContentText(content);
-	if (raw === undefined) return undefined;
-	const result = asyncJobResult(raw, jobs, index);
-	return result === undefined ? undefined : nativeJobOutput(result, agentId);
+function hostJobKey(id: string, agentId: string): string {
+	return `${id.length}:${id}${agentId}`;
+}
+
+/** Use the first exact row just like a snapshot lookup, including synthetic host snapshots with repeated job ids. */
+function indexHostJobs(jobs: readonly AttemptHostJob[] | undefined): Map<string, AttemptHostJob> {
+	const out = new Map<string, AttemptHostJob>();
+	for (const row of jobs ?? []) {
+		if (typeof row.id !== "string" || typeof row.agentId !== "string") continue;
+		const key = hostJobKey(row.id, row.agentId);
+		if (!out.has(key)) out.set(key, row);
+	}
+	return out;
 }
 
 /** An absolute host path within the adapter's own declared-path bound. */
@@ -1211,12 +1247,16 @@ export class AttemptCollector {
 		if (envelope === undefined) return;
 		const jobs = envelope.jobs;
 		if (!Array.isArray(jobs)) return;
+		const indexed = jobs.length > 1 && input.jobs !== undefined ? indexHostJobs(input.jobs) : undefined;
+		let readResult: JobResultReader | undefined | null = null;
 		for (const [index, job] of jobs.entries()) {
 			if (!record(job)) continue;
 			const agentId = typeof job.agentId === "string" ? job.agentId : undefined;
 			if (agentId === undefined) continue;
 			const tracked = this.#tracked.get(agentId);
-			const row = input.jobs?.find(candidate => candidate.id === job.jobId && candidate.agentId === agentId);
+			const row = indexed === undefined
+				? input.jobs?.find(candidate => candidate.id === job.jobId && candidate.agentId === agentId)
+				: typeof job.jobId === "string" ? indexed.get(hostJobKey(job.jobId, agentId)) : undefined;
 			// A delivered job is never running: when omp reused the job id, a running row is the *next* turn's, and its
 			// start says nothing about the turn being delivered.
 			const start = row?.status !== "running" && typeof row?.startTime === "number" && Number.isFinite(row.startTime) ? row.startTime : undefined;
@@ -1238,7 +1278,9 @@ export class AttemptCollector {
 			}
 			this.#lastDelivery.set(agentId, input.observedAt);
 			// Only this job's own output, never the notice frame or a sibling job's answer.
-			await this.#observeAsyncJob(tracked, job, input.observedAt, asyncJobOutput(envelope.content, jobs, index, agentId), start);
+			if (readResult === null) readResult = asyncJobResultReader(envelope.content, jobs);
+			const result = readResult?.(index);
+			await this.#observeAsyncJob(tracked, job, input.observedAt, result === undefined ? undefined : nativeJobOutput(result, agentId), start);
 		}
 	}
 
