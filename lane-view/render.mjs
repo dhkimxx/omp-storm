@@ -7,14 +7,16 @@
 // Needs `@napi-rs/canvas` (installed in the folder you run from, not in the repository) and `img2webp` on the PATH.
 // Nothing here knows what the lane view is: it only knows cells. Braille cells are drawn as dots (a 2 x 4 grid of
 // circles, like a terminal font draws them, but a little larger so they read when the picture is scaled down); every
-// other glyph is typeset in one monospace grid, two cells wide for Hangul and emoji.
+// other glyph is typeset in one monospace grid, two cells wide for Hangul and emoji. A frame with a `stage` (an inline
+// image the terminal shows: a PNG and the cell box it covers) gets the PNG scaled into that box, smoothed the way a
+// terminal scales an image to its cells, and the text cells under the box are not drawn.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 
 // Resolved from the folder you run in, so the package can live in a work folder instead of next to this file.
-const { createCanvas } = createRequire(join(process.cwd(), "noop.js"))("@napi-rs/canvas");
+const { createCanvas, loadImage } = createRequire(join(process.cwd(), "noop.js"))("@napi-rs/canvas");
 
 const args = process.argv.slice(2);
 const flag = name => {
@@ -90,7 +92,8 @@ const DOT_X = [0.29, 0.71];
 const DOT_Y = [0.14, 0.38, 0.62, 0.86];
 const DOT_R = CELL_W * 0.145;
 
-function drawFrame(ctx, rows) {
+function drawFrame(ctx, frame, picture) {
+	const { rows, stage } = frame;
 	ctx.fillStyle = BACKGROUND;
 	ctx.fillRect(0, 0, WIDTH, HEIGHT);
 	// Window: a title bar with three dots and a quiet title, so the picture reads as a terminal.
@@ -113,9 +116,14 @@ function drawFrame(ctx, rows) {
 	const top = BAR_H + PAD_Y;
 	rows.forEach((row, r) => {
 		let column = 0;
+		const boxed = stage !== undefined && r >= stage.row && r < stage.row + stage.rows;
 		for (const cell of parseRow(row)) {
 			const w = cellsOf(cell.ch);
 			if (w === 0) continue;
+			if (boxed && column >= stage.column && column < stage.column + stage.columns) {
+				column += w;
+				continue;
+			}
 			const x = PAD_X + column * CELL_W;
 			const y = top + r * CELL_H;
 			const code = cell.ch.codePointAt(0);
@@ -143,15 +151,21 @@ function drawFrame(ctx, rows) {
 			column += w;
 		}
 	});
+	if (stage !== undefined) {
+		ctx.imageSmoothingEnabled = true;
+		ctx.imageSmoothingQuality = "high";
+		ctx.drawImage(picture, PAD_X + stage.column * CELL_W, top + stage.row * CELL_H, stage.columns * CELL_W, stage.rows * CELL_H);
+	}
 }
 
 const canvas = createCanvas(WIDTH, HEIGHT);
 const ctx = canvas.getContext("2d");
+const pictureOf = frame => (frame.stage === undefined ? undefined : loadImage(Buffer.from(frame.stage.png, "base64")));
 
 if (has("--still")) {
 	const at = Number(flag("--still"));
 	const frame = clip.frames.reduce((best, f) => (Math.abs(f.t - at) < Math.abs(best.t - at) ? f : best));
-	drawFrame(ctx, frame.rows);
+	drawFrame(ctx, frame, await pictureOf(frame));
 	const target = Number(flag("--width") ?? WIDTH);
 	if (target === WIDTH) writeFileSync(out, canvas.toBuffer("image/png"));
 	else {
@@ -173,8 +187,9 @@ mkdirSync(work, { recursive: true });
 const FADE_OUT = Number(flag("--fade") ?? 6);
 const FADE_IN = Math.ceil(FADE_OUT / 2);
 const files = [];
+const pictures = await Promise.all(clip.frames.map(pictureOf));
 clip.frames.forEach((frame, i) => {
-	drawFrame(ctx, frame.rows);
+	drawFrame(ctx, frame, pictures[i]);
 	const left = clip.frames.length - 1 - i;
 	const veil = left < FADE_OUT ? (FADE_OUT - left) / (FADE_OUT + 1) : i < FADE_IN ? (FADE_IN - i) / (FADE_IN + 1) : 0;
 	if (veil > 0) {
