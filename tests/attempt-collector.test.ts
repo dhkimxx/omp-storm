@@ -1507,6 +1507,8 @@ describe("citation candidates", () => {
 		for (const text of [
 			"src/a.ts:12",
 			"src/a.ts:12-20",
+			"src/a.ts:12:5",
+			"src/a.ts:12:limit: 42",
 			"src/a.ts#L12",
 			"src/a.ts#L12-L20",
 			"src/a.ts#L12-20",
@@ -1538,6 +1540,7 @@ describe("citation candidates", () => {
 			"src/a.ts#L2-L3.5",
 			"src/a.ts:2x",
 			"src/a.ts:2-",
+			"src/a.ts:2-3:4",
 		]) {
 			expect(answerCitations(undefined, `see ${text}`)).toEqual([]);
 		}
@@ -1553,6 +1556,8 @@ describe("citation candidates", () => {
 		expect(normalizeAnswerText("see src/a.ts:12 and src/b.ts:3-4")).toBe("see src/a.ts:12 and src/b.ts:3");
 		const root = "/tmp/storm-citation-root";
 		expect(normalizeAnswerText(`see ${root}/src/a.ts#L2`, { root })).toBe("see src/a.ts:2");
+		expect(normalizeAnswerText(`42 (${root}/src/a.ts:2:5)`, { root })).toBe("42 (src/a.ts:2)");
+		expect(normalizeAnswerText(`${root}/src/a.ts:2:limit: 42`, { root })).toBe("src/a.ts:2:limit: 42");
 		// Nothing the parser does not read is rewritten into a citation.
 		for (const text of ["bad src/a.ts#L0", "bad src/a.ts#L9-L3", "bad /etc/passwd:12", "local://doc.md#L3", "https://example.test/x.ts#L9"]) {
 			expect(normalizeAnswerText(text, { root })).toBe(text);
@@ -1564,11 +1569,15 @@ describe("citation candidates", () => {
 		expect(answerCitations(undefined, `see ${root}/src/a.ts#L12`)).toEqual([]);
 		expect(answerCitations(undefined, `see ${root}/src/a.ts:12`, { root })).toEqual([{ path: "src/a.ts", line: 12 }]);
 		expect(answerCitations(undefined, `see ${root}/src/a.ts#L12-L20`, { root })).toEqual([{ path: "src/a.ts", line: 12 }]);
+		expect(answerCitations(undefined, `see ${root}/src/a.ts:12:5`, { root })).toEqual([{ path: "src/a.ts", line: 12 }]);
 		expect(answerCitations({ citations: [{ path: `${root}/src/a.ts`, line: 12 }] }, undefined, { root })).toEqual([
 			{ path: "src/a.ts", line: 12 },
 		]);
 		// Outside the root, and every non-project scheme, is not a citation.
-		for (const text of [`/etc/passwd:12`, `${root}/../secret.ts:12`, "local://doc.md:3", "agent://worker:3", "https://example.test/x.ts:9"]) {
+		for (const text of [
+			"/etc/passwd:12", `${root}/../secret.ts:12`, `${root}/src/a.ts#L2:1`,
+			"local://doc.md:3", "agent://worker:3", "https://example.test/x.ts:9",
+		]) {
 			expect(answerCitations(undefined, `see ${text}`, { root })).toEqual([]);
 		}
 	});

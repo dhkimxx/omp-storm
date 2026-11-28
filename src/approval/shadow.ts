@@ -99,14 +99,10 @@ async function scan(dir: string, scope: ShadowInfo["scope"], pluginReal: string)
 			continue;
 		}
 		if (real === pluginReal || real.startsWith(pluginReal + path.sep)) continue;
-		const front = frontmatterName(new TextDecoder().decode(bytes));
-		// The host may name the definition by its frontmatter or by its file; either routed name needs approval.
-		const names = new Set<string>();
-		if (typeof front === "string" && isRoutedAgentName(front)) names.add(front);
-		if (isRoutedAgentName(stem)) names.add(stem);
-		if (names.size === 0) continue;
-		const sha256 = sha256Hex(bytes);
-		for (const agent of names) out.push({ agent, path: file, scope, sha256 });
+		const agent = frontmatterName(new TextDecoder().decode(bytes));
+		// omp picks a readable definition by its declared name, not the file's basename.
+		if (typeof agent !== "string" || !isRoutedAgentName(agent)) continue;
+		out.push({ agent, path: file, scope, sha256: sha256Hex(bytes) });
 	}
 	return out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0));
 }

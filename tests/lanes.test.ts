@@ -98,7 +98,8 @@ test("shared placement flags only planned isolation lanes and strips an unplanne
 	expect(tasks[1]).toMatchObject({ isolated: true });
 	expect(String(tasks[1]!.name)).toMatch(/^run-placement-lane-\d+$/);
 	// The batch placement holds 'probe' until its spawn is correlated; the host never started it here.
-	work.cancel("probe", work.placementOf("probe"));
+	const probe = String(tasks[1]!.name);
+	work.cancel(probe, work.placementOf(probe));
 	// A manual placement of the selected lane gets its own handle too; only its isolation placement is decided here.
 	const flat = work.place({ agent: "storm-implementer", name: "probe", task: "Probe" }, p, team, { host: { enabled: true, apply: false } });
 	expect(flat.ok).toBe(true);
@@ -121,7 +122,8 @@ test("a batch-wide isolated shorthand cannot leak into shared items", () => {
 	expect(plain.input).not.toHaveProperty("isolated");
 	expect((plain.input.tasks as Array<Record<string, unknown>>)[0]).not.toHaveProperty("isolated");
 	// The first placement never became a worker; release its write scope before placing the same lane again.
-	work.cancel("api", work.placementOf("api"));
+	const api = String((plain.input.tasks as Array<Record<string, unknown>>)[0]!.name);
+	work.cancel(api, work.placementOf(api));
 
 	const selected = plan(lane("api", "Implement API"), { ...lane("probe", "Run experiment"), kind: "run", isolationReason: "independent" });
 	const placed = work.place(
@@ -460,7 +462,10 @@ test("a consumer starts before its prerequisite holds and is told so; only facts
 	const place = (readiness?: ReturnType<typeof readinessOf>, p = consumerPlan) => {
 		const placed = work.place(consumerCall, p, team, readiness === undefined ? {} : { readiness });
 		// A started placement holds its lane until the host correlates it; none is started here.
-		work.cancel("consumer", work.placementOf("consumer"));
+		if (placed.ok) {
+			const handle = String(placed.input.name);
+			work.cancel(handle, work.placementOf(handle));
+		}
 		return placed;
 	};
 	// No readiness view of the prerequisite: nothing is known, so the start is refused (fails closed).
@@ -603,8 +608,11 @@ test("a cancelled placement releases its write and a work follow-up passes the s
 		{ name: "R0", kind: "explore", role: "explorer", goal: "Read" },
 	);
 	const work = new RunLanes("run-follow");
-	expect(work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team).ok).toBe(true);
-	work.cancel("W0", work.placementOf("W0"));
+	const reserved = work.place({ agent: "storm-quick", name: "W0", task: "Write" }, shared, team);
+	expect(reserved.ok).toBe(true);
+	if (!reserved.ok) return;
+	const handle = String(reserved.input.name);
+	work.cancel(handle, work.placementOf(handle));
 	const placed = work.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, team);
 	expect(placed.ok).toBe(true);
 	if (!placed.ok) return;
@@ -639,8 +647,11 @@ test("a reserved or running lane refuses a second independent dispatch even when
 	// A batch with one busy lane refuses whole and leaves nothing held for its other item.
 	const batch = work.place({ tasks: [{ agent: "storm-explorer", name: "R0", task: "Read" }, { agent: "storm-explorer", name: "R1", task: "Read" }] }, reads, team);
 	expect(batch.ok).toBe(false);
-	expect(read("R1").ok).toBe(true);
-	work.cancel("R1", work.placementOf("R1"));
+	const placedR1 = read("R1");
+	expect(placedR1.ok).toBe(true);
+	if (!placedR1.ok) return;
+	const handleR1 = String(placedR1.input.name);
+	work.cancel(handleR1, work.placementOf(handleR1));
 	work.admit({ spawnKey: reader, agent: "storm-explorer", outcome: "routed" }, { plan: reads, config: team });
 	// Admitted: the agent's own state decides, including the moment before the host list shows it.
 	expect(read("R0", []).ok).toBe(false);
@@ -653,7 +664,8 @@ test("a placement that never reached a spawn stops holding its lane when cancell
 	const work = new RunLanes("run-stale");
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: 0 }).ok).toBe(true);
 	expect(work.laneBusy("R0", [], 1)).toBe(true);
-	work.cancel("R0", work.placementOf("R0"));
+	const handle = work.pendingHandle("R0")!;
+	work.cancel(handle, work.placementOf(handle));
 	expect(work.laneBusy("R0", [], 2)).toBe(false);
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: 3 }).ok).toBe(true);
 	expect(work.place({ agent: "storm-explorer", name: "R0", task: "Read" }, reads, team, { now: PENDING_WRITE_MS + 4 }).ok).toBe(true);
@@ -838,7 +850,8 @@ test("a progress-only note proven read-only meets no write-order gate and reserv
 	const duplicate = pending.place({ agent: "storm-implementer", name: "H0", task: "Write" }, shared, teamWithQuick, { policies: new Map([["H0", bash]]) });
 	expect(duplicate.ok).toBe(false);
 	if (!duplicate.ok) expect(duplicate.code).toBe("lane-busy");
-	pending.cancel("H0", pending.placementOf("H0"));
+	const handle = pending.pendingHandle("H0")!;
+	pending.cancel(handle, pending.placementOf(handle));
 	expect(pending.laneBusy("H0")).toBe(false);
 });
 
@@ -1079,21 +1092,25 @@ test("a late cancel of an older spawn leaves a newer call's placement of the sam
 	const work = new RunLanes("run-late-cancel");
 	const place = (now: number) => work.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team, { now });
 	expect(place(0).ok).toBe(true);
-	const older = work.placementOf("api");
+	const oldHandle = work.pendingHandle("api")!;
+	const older = work.placementOf(oldHandle);
 	expect(older).toBeDefined();
 	// The older call never reached a worker and its pending window expired, so the same name is placed again.
 	const later = PENDING_WRITE_MS + 1;
 	expect(place(later).ok).toBe(true);
-	const newer = work.placementOf("api");
+	const newHandle = work.pendingHandle("api")!;
+	const newer = work.placementOf(newHandle);
 	expect(newer).not.toBe(older);
 	// The older spawn's refusal lands now: the newer hold and its write reservation must both survive.
-	work.cancel("api", older);
+	work.cancel(oldHandle, older);
 	expect(work.laneBusy("api", [], later + 1)).toBe(true);
 	const conflict = work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team, { now: later + 2 });
 	expect(conflict.ok).toBe(false);
 	if (!conflict.ok) expect(conflict.code).toBe("lane-write");
 	// The newer call's own refusal releases everything it placed.
 	work.cancel("api", newer);
+	expect(work.laneBusy("api", [], later + 3)).toBe(true);
+	work.cancel(newHandle, newer);
 	expect(work.laneBusy("api", [], later + 3)).toBe(false);
 	expect(work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team, { now: later + 4 }).ok).toBe(true);
 });
@@ -1117,9 +1134,10 @@ test("a refused spawn releases the write reservation its admission bound, so the
 	const work = new RunLanes("run-bound-cancel");
 	expect(work.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
 	// Read before the decision awaits; admission later binds the spawn id to the reservation.
-	const stamp = work.placementOf("api");
-	expect(work.admitChecked({ spawnKey: "api", agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }).ok).toBe(true);
-	work.cancel("api", stamp);
+	const handle = work.pendingHandle("api")!;
+	const stamp = work.placementOf(handle);
+	expect(work.admitChecked({ spawnKey: handle, agent: "storm-implementer", outcome: "routed" }, { plan: p, config: team }).ok).toBe(true);
+	work.cancel(handle, stamp);
 	expect(work.place({ agent: "storm-implementer", name: "view", task: "Render" }, p, team).ok).toBe(true);
 });
 
@@ -1129,7 +1147,8 @@ test("a cancel for one run's lanes never touches the placement of another run's 
 	const current = new RunLanes("run-current");
 	expect(older.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
 	expect(current.place({ agent: "storm-implementer", name: "api", task: "Implement" }, p, team).ok).toBe(true);
-	older.cancel("api", older.placementOf("api"));
+	const handle = older.pendingHandle("api")!;
+	older.cancel(handle, older.placementOf(handle));
 	expect(older.laneBusy("api")).toBe(false);
 	expect(current.laneBusy("api")).toBe(true);
 });

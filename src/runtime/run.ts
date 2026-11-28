@@ -1,4 +1,5 @@
 import { constants as fsConstants } from "node:fs";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
@@ -43,12 +44,12 @@ export function runsDir(sessionDir: string): string {
 
 const pad = (n: number): string => String(n).padStart(2, "0");
 
-/** "run-YYYYMMDD-HHMMSS-xxxx" in UTC: sorts by start time, random tail keeps same-second runs apart. */
+/** Timestamp in UTC for ordering, with a profile-wide collision-resistant 128-bit suffix. */
 export function newRunId(now: number): string {
 	const d = new Date(now);
 	const date = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
 	const time = `${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
-	const tail = Array.from(crypto.getRandomValues(new Uint8Array(2)), b => b.toString(16).padStart(2, "0")).join("");
+	const tail = randomBytes(16).toString("hex");
 	return `run-${date}-${time}-${tail}`;
 }
 

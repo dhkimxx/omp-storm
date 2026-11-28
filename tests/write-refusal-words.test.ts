@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { lanePolicy, type LanePolicy, shellReader, WHY_AUTO_WRITER, WHY_EXEC_WRITER, WHY_SHELL_REVIEWER } from "../src/policy/capability.ts";
-import { RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
+import { batchWriteNeed, RunLanes, WRITE_ORDER_CHECK } from "../src/runtime/lanes.ts";
 import type { PlanLane, RunPlan } from "../src/types.ts";
 import { teamOf } from "./fixtures.ts";
 
@@ -142,6 +142,13 @@ describe("a single writer refused beside the one already running", () => {
 		const placed = refusal(new RunLanes("run-h").place(call("A", "B"), plan, team, { policies: policiesOf(plan, BASH_TOOLS, false) }));
 		expect(placed.reason).not.toContain("파일 목록을 선언했지만");
 	});
+});
+
+test("an overlapping batch is refused before the director takes the write claim", () => {
+	const plan: RunPlan = { ...directorPlan(), lanes: [implementer("A", ["src/a.ts"]), implementer("B", ["src/a.ts"])] };
+	const policies = policiesOf(plan, PATH_TOOLS, false);
+	expect(batchWriteNeed(call("A", "B"), plan, team, { policies })).toMatchObject({ ok: false, code: "lane-write" });
+	expect(batchWriteNeed(call("A"), plan, team, { policies })).toMatchObject({ ok: true, writers: ["storm-implementer"] });
 });
 
 describe("grammar around an inserted lane name", () => {

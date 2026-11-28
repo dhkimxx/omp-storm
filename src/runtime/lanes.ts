@@ -126,7 +126,7 @@ export interface HostJobRow {
 
 /**
  * What the run reads of the director session's own async jobs, synchronously. `undefined` means the host cannot show them
- * now: nothing is then assumed finished, and a director command is not admitted.
+ * now: nothing is assumed finished, and no new shared writer is admitted.
  */
 export type HostJobSource = () => readonly HostJobRow[] | undefined;
 
@@ -1311,10 +1311,29 @@ type DescribedPlacement =
 	| { ok: true; batch: boolean; items: unknown[]; placed: PlacedEntry[] }
 	| { ok: false; code?: LaneBlockCode | "lane" | "isolation"; reason: string };
 
+/** A refusal inherent to this batch, checked before the caller takes a target write claim. */
+function batchWriteConflict(placed: readonly PlacedEntry[]): { ok: false; code: "lane-write"; reason: string; retry: false } | undefined {
+	const shared = placed.filter(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown");
+	for (let i = 0; i < shared.length; i++) {
+		const a = shared[i]!;
+		for (let j = i + 1; j < shared.length; j++) {
+			const b = shared[j]!;
+			if (!scopesConflict(a.scope, b.scope)) continue;
+			return {
+				ok: false,
+				code: "lane-write",
+				retry: false,
+				reason: conflictText(a.lane, a.agent, a.scope, b.lane === undefined ? `같은 호출의 ${b.agent} 직접 작업` : `같은 호출의 '${b.lane.name}' 레인`, b.scope, true),
+			};
+		}
+	}
+	return undefined;
+}
+
 /**
  * Resolves and classifies one `task` call without side effects. The placement and the caller's pre-open/pre-lease check
- * both use it, so what the caller proved is what the placement decides: a batch that needs the target's write claim
- * here is exactly a batch that will reserve a shared writer below (A2-1, D11: one pass over the items).
+ * both use it, so the caller can reject an invalid batch before taking a write claim (A2-1). Only shared writers are
+ * paired; a batch of readers or isolated workers costs no pair work (D11).
  */
 function describePlacement(
 	input: unknown,
@@ -1397,7 +1416,7 @@ function describePlacement(
 					: teamIsolationApplyReason(merged.agent, options.host?.apply),
 		};
 	}
-	return { ok: true, batch, items, placed };
+	return batchWriteConflict(placed) ?? { ok: true, batch, items, placed };
 }
 
 /**
@@ -1492,12 +1511,13 @@ export class RunLanes {
 	/**
 	 * Brings the table in line with the host's job rows, in the same synchronous step as the conflict check that follows:
 	 * every running `bash` or `eval` job of the director is a holder (so a command started before this run, or sent to the
-	 * background by omp on its own, is seen), and a holder whose job is no longer running is gone. A host that cannot show its
-	 * jobs changes nothing.
+	 * background by omp on its own, is seen), and a holder whose job is no longer running is gone. If a supplied source
+	 * cannot show its jobs, keep the existing holds and report that the snapshot is unavailable.
 	 */
-	#syncHost(): void {
-		const rows = this.hostJobs?.();
-		if (rows === undefined) return;
+	#syncHost(): boolean {
+		if (this.hostJobs === undefined) return true;
+		const rows = this.hostJobs();
+		if (rows === undefined) return false;
 		const running = new Set<string>();
 		for (const row of rows) if (row.status === "running" && row.type !== "task") running.add(row.id);
 		for (const [key, reservation] of this.#writes) {
@@ -1509,6 +1529,7 @@ export class RunLanes {
 			const key = `director-bg:${id}`;
 			if (!this.#writes.has(key)) this.#writes.set(key, { scope: holderScope("director-bg"), kind: "director-bg", jobId: id, at: Date.now() });
 		}
+		return true;
 	}
 
 	/** Whether the host has finished what it does for a worker after the worker's turn: its parent's call and its task job. */
@@ -1742,7 +1763,7 @@ export class RunLanes {
 		manual: { plan: RunPlan; config: StormConfig } | undefined,
 		recheck: boolean,
 	): { ok: true; hold?: string; authority?: WriteAuthority } | { ok: false; code: LaneBlockCode; reason: string } {
-		this.#syncHost();
+		const hostKnown = this.#syncHost();
 		const laneName = assignment?.lane;
 		const lane = laneName === undefined ? undefined : manual?.plan.lanes.find(candidate => candidate.name === laneName);
 		const bound = this.#bindWrite(spawnKey, laneName, assignment?.placement);
@@ -1773,6 +1794,10 @@ export class RunLanes {
 			// is the placement's handle and ends with the admission's revoke. A planned private lane is bounded by its
 			// lane, so it needs none.
 			return laneName === undefined ? { ok: true, hold: `private:${spawnKey}`, authority } : { ok: true, authority };
+		}
+		if (recheck && !hostKnown) {
+			this.#releaseSpawn(spawnKey, laneName, "refused");
+			return { ok: false, code: "lane-write", reason: "omp가 이 세션의 백그라운드 작업 목록을 주지 않아 공유 쓰기 워커를 시작하지 않았습니다. 작업 목록을 확인할 수 있게 되면 다시 시도하세요." };
 		}
 		// A1-2: at admission every shared writer is checked again against everything that holds the tree now, its own
 		// reservation excepted. A host job or another call's writer can become visible between placement and this hook,
@@ -1866,22 +1891,6 @@ export class RunLanes {
 				retry: false,
 				reason: `레인 '${entry.lane.name}'에 이미 예약됐거나 진행 중인 작업이 있어 같은 레인에 독립 작업을 또 시작하지 않았습니다. 아무것도 시작하지 않았습니다. 그 작업이 끝난 뒤 다시 보내거나, 이어 가려면 ${handle === undefined ? "그 워커에게" : `\`write agent://${handle}\` 명령으로`} 후속 지시를 보내세요. 다른 관점의 병렬 작업이 필요하면 계획에 그 작업을 위한 별도 레인을 두세요.`,
 			};
-		}
-		// D11: only shared writers are paired. A batch of readers or isolated workers costs no pair work, whatever the
-		// number of workers.
-		const shared = scopes.filter(entry => entry.scope.kind === "paths" || entry.scope.kind === "unknown");
-		for (let i = 0; i < shared.length; i++) {
-			const a = shared[i]!;
-			for (let j = i + 1; j < shared.length; j++) {
-				const b = shared[j]!;
-				if (!scopesConflict(a.scope, b.scope)) continue;
-				return {
-					ok: false,
-					code: "lane-write",
-					retry: false,
-					reason: conflictText(a.lane, a.agent, a.scope, b.lane === undefined ? `같은 호출의 ${b.agent} 직접 작업` : `같은 호출의 '${b.lane.name}' 레인`, b.scope, true),
-				};
-			}
 		}
 		for (const entry of scopes) {
 			const scope = entry.scope;
@@ -2162,18 +2171,7 @@ export class RunLanes {
 	 * of that newer call.
 	 */
 	placementOf(spawnKey: string): number | undefined {
-		const assigned = this.#assigned.get(spawnKey)?.placement;
-		if (assigned !== undefined) return assigned;
-		// A planned lane's placement can also be named by the lane's own name: the table key, never the host's handle.
-		const lanePending = this.#held.get(spawnKey)?.placement;
-		if (lanePending !== undefined) return lanePending;
-		for (const hold of this.#held.values()) {
-			if (hold.agentId === undefined && hold.name === spawnKey && hold.placement !== undefined) return hold.placement;
-		}
-		for (const [key, reservation] of this.#writes) {
-			if (reservation.placement !== undefined && (reservation.name === spawnKey || key === `lane:${spawnKey}`)) return reservation.placement;
-		}
-		return undefined;
+		return this.#assigned.get(spawnKey)?.placement;
 	}
 
 	/**
@@ -2183,39 +2181,32 @@ export class RunLanes {
 	 * belongs to the decision that reserved it, not to the placement.
 	 */
 	cancel(spawnKey: string, placement: number | undefined): void {
-		const assignment = this.#assigned.get(spawnKey);
+		const pending = this.#assigned.get(spawnKey);
+		const assignment = pending ?? this.#admitted.get(spawnKey);
+		// A logical lane name or a stale stamp is not the identity of this host placement.
+		if (assignment === undefined || assignment.placement !== placement) return;
+		if (pending !== undefined) this.#assigned.delete(spawnKey);
+		const lane = assignment.lane;
+		if (lane !== undefined) {
+			const held = this.#held.get(lane);
+			if (held?.name === spawnKey && held.agentId === undefined && held.placement === placement) this.#held.delete(lane);
+		}
 		let reported = false;
-		// The placement identity is what the caller holds: a cancelled placement is removed whichever handle named it.
-		if (placement !== undefined) {
-			for (const [key, entry] of this.#assigned) {
-				if (entry.placement === placement) {
-					this.#assigned.delete(key);
-					break;
-				}
-			}
-		}
-		if (placement !== undefined) {
-			for (const [lane, hold] of this.#held) if (hold.agentId === undefined && hold.placement === placement) this.#held.delete(lane);
-		}
 		for (const [key, reservation] of this.#writes) {
 			// A follow-up's reservation belongs to its agent and ends with that agent's started turn.
 			if (reservation.awaiting === true) continue;
-			// With a stamp the placement identity decides, even after admission bound this spawn's id to it; without one
-			// only a reservation bound to this very spawn is its own.
-			const own = placement === undefined ? reservation.agentId === spawnKey : reservation.placement === placement;
-			if (own) {
+			if (reservation.name === spawnKey && reservation.placement === placement) {
 				this.#writes.delete(key);
 				if (reservation.agentId === spawnKey) reported = true;
 				this.#ended(reservation.agentId, reservation.lane, "cancelled");
 			}
 		}
 		for (const [key, reservation] of this.#lapsed) {
-			const own = placement === undefined ? reservation.name === spawnKey : reservation.placement === placement;
-			if (own) this.#lapsed.delete(key);
+			if (reservation.name === spawnKey && reservation.placement === placement) this.#lapsed.delete(key);
 		}
 		// The spawn was refused after its authority may already have been written (the hook persists it before its last
 		// guards): that authority ends with the refusal, whether or not a reservation stood behind it.
-		if (!reported) this.#ended(spawnKey, assignment?.lane, "cancelled");
+		if (!reported) this.#ended(spawnKey, assignment.lane, "cancelled");
 	}
 
 	/** The worker's turn settled: its lane is free for the next planned writer. */

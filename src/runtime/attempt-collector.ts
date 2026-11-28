@@ -721,16 +721,15 @@ function waitablePatch(error: string | undefined): boolean {
 /** The largest line coordinate the evaluator accepts; a larger or non-positive one is not a citation. */
 const MAX_CITED_LINE = 10_000_000;
 /**
- * One citation in answer text: `path:12`, `path:12-20`, `path#L12`, `path#L12-L20`, `path#L12-20`, or the target of a
- * Markdown link (the `(` or `<` before it is the boundary). The greedy absolute form backtracks to leave the
- * coordinate in its own group; `safeRelativePath` and the root check decide whether the path is usable at all. A path
- * needs a directory segment or a file extension, so a clock time like `12:30` stays text.
+ * One citation in answer text: colon or `#L` coordinates (including ranges), also in Markdown link targets.
+ * A colon-form single line can carry a numeric column or a search-tool excerpt. Normalize away the column but
+ * keep the excerpt as answer text. `#L` forms don't take those suffixes.
  *
- * The coordinate must be the whole token: the trailing lookahead rejects another coordinate character. Without it the
- * pattern backs off a malformed suffix (`#L2-Lx`, `#L2:0`, `#L2.5`, `#L2-L99999999`) and the valid prefix becomes a
- * citation for a position the answer never named (B6).
+ * The coordinate must be the whole token; don't backtrack into a malformed range, decimal, or numeric prefix.
+ * The absolute path excludes coordinate delimiters so the column can't be mistaken for the line (drive prefixes
+ * are matched separately). Path and root checks then decide whether the citation can be read.
  */
-const CITED = /(?:^|[\s(`"'<])((?:(?:[A-Za-z]:[\\/]|\/)[^\s`"'()\[\]{}<>]*|(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)))(?:#L(\d{1,7})(?:-L?(\d{1,7}))?|:(\d{1,7})(?:-(\d{1,7}))?)(?![0-9A-Za-z_:-]|\.\d)/g;
+const CITED = /(?:^|[\s(`"'<])((?:(?:[A-Za-z]:[\\/]|\/)[^:#\s`"'()\[\]{}<>]+|(?:(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.[A-Za-z0-9]+)))(?:#L(\d{1,7})(?:-L?(\d{1,7}))?(?![0-9A-Za-z_:-]|\.\d)|:(\d{1,7})(?:-(\d{1,7})(?![0-9A-Za-z_:-]|\.\d)|:\d+(?![0-9A-Za-z_:-]|\.\d)|(?=:[^\r\n])|(?![0-9A-Za-z_:-]|\.\d)))/g;
 
 /** What the caller can establish about a model-supplied citation path. */
 export interface AnswerCitationOptions {

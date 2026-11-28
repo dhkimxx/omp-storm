@@ -146,6 +146,21 @@ describe("a worker that settled keeps its place until the host has finished with
 	]);
 	const config: StormConfig = SESSION_TEAM;
 
+	test("a shared spawn is refused if omp loses the job snapshot after placement", () => {
+		const rows = { current: [] as readonly HostJobRow[] | undefined };
+		const lanes = table(rows);
+		const placed = lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, now: T0 });
+		expect(placed.ok).toBe(true);
+		if (!placed.ok) return;
+		rows.current = undefined;
+		const spawnKey = String(placed.input.name);
+		expect(lanes.admitChecked({ spawnKey, agent: "storm-implementer", outcome: "routed" })).toMatchObject({
+			ok: false, code: "lane-write", reason: expect.stringContaining("백그라운드 작업 목록"),
+		});
+		rows.current = [];
+		expect(lanes.place({ agent: "storm-implementer", name: "B", task: "x" }, plan, config, { policies, now: T0 + 1 }).ok).toBe(true);
+	});
+
 	test("its parent's call is the receipt: the place is free at the call's end, not at the settled turn", () => {
 		const lanes = table({ current: [] });
 		const placed = lanes.place({ agent: "storm-implementer", name: "A", task: "x" }, plan, config, { policies, callId: "sync-1", now: T0 });

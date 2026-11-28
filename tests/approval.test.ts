@@ -427,10 +427,9 @@ describe("findShadows", () => {
 		await writeFile(file, agent("task"));
 		const shadows = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
 		expect(shadows.map(s => [s.agent, s.path])).toEqual([["task", file]]);
-		// The file's basename is routed even when its frontmatter names something else: the host may load it by the file.
+		// Renaming the declared agent removes the shadow even if the file is still named task.md.
 		await writeFile(file, agent("something-else"));
-		const byFile = await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin });
-		expect(byFile.map(s => s.agent)).toEqual(["task"]);
+		expect(await findShadows({ cwd, userAgentsDir: user, pluginAgentsDir: plugin })).toEqual([]);
 	});
 
 	test("a routed definition that cannot be read is an unapproved shadow, never assumed absent (B1)", async () => {
