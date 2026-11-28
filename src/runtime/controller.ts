@@ -6052,11 +6052,15 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 				ownerSessionId: sessionId,
 				spentUsd: 0,
 				...(excludeAttemptIds.length === 0 ? {} : { excludeAttemptIds }),
-				// block-spawns lets already-active turns and the director finish/report at the limit; its own spawn and
-				// message gates refuse new work. Only a stop owns the provider-layer next-send refusal.
+				// block-spawns lets the leader's own continuation and an exactly-granted worker continuation finish;
+				// its spawn and message gates refuse new work. Only a stop owns the provider-layer next-send refusal.
 				...(config.budget === undefined
 					? {}
-					: { limitUsd: config.budget.perRunUsd, enforceLimit: config.budget.onExceed === "stop" }),
+					: {
+							limitUsd: config.budget.perRunUsd,
+							continuationPolicy:
+								config.budget.onExceed === "block-spawns" ? ("leader-and-exact-worker" as const) : ("refuse" as const),
+						}),
 			});
 		} catch (error) {
 			return { ok: false, reason: `${PAID_ATTEMPT_REFUSAL_TAG} host-invalid: ${errorText(error)}` };

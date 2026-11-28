@@ -7,11 +7,9 @@
  * window after Storm's hook:
  *
  *   - `identity`: only record scoped/global/session Settings identity and the isolation values.
- *   - `aba`:      set `task.isolation.apply` true then false, then record both reads. The host captured apply before
- *                 the hook; only an epoch listener can tell the caller that the captured decision is no longer current.
- *   - `late-auto`: set `isolation.backend` to `auto` and `ovnfs.path` to a fake executable *after* Storm's hook. The host
- *                 reads the backend later in `openIsolatedWorkspace`; a child must not run from that late switch, and
- *                 the parent must not be changed.
+ *   - `aba`:      set `task.isolation.apply` true then false; record the intervening read as proof it changed.
+ *   - `late-auto`: set `isolation.backend` to `auto` and `ovnfs.path` to a fake executable after the grant.
+ *                  A compatible host must use the native factory it already froze for this dispatch.
  *
  * The log is JSONL at `INTEGRATION_POLICY_LOG`; no path is read from the model.
  */
@@ -51,8 +49,10 @@ export default function probe(pi: ExtensionAPI): void {
 			backend: cfgIsolationBackend.get(scoped),
 			ovnfsPath: cfgOvnfsPath.get(scoped) ?? null,
 		};
+		let duringApply: boolean | undefined;
 		if (MODE === "aba") {
 			cfgTaskIsolationApply.set(scoped, true);
+			duringApply = cfgTaskIsolationApply.get(scoped);
 			cfgTaskIsolationApply.set(scoped, false);
 		}
 		if (MODE === "late-auto") {
@@ -73,6 +73,7 @@ export default function probe(pi: ExtensionAPI): void {
 			scopedIsGlobal: scoped === globalIdentity(),
 			directorSettingsSame: directorSettings === undefined ? "no-local-session-settings" : directorSettings === scoped,
 			before,
+			duringApply,
 			after,
 		});
 		return undefined;

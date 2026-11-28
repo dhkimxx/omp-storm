@@ -734,16 +734,39 @@ describe("baseline and accounting-source discipline", () => {
 		expect(delta.receiptToken).toBe(`${adapter.metadata.bindingToken}#2`);
 	});
 
-	test("caller-owned dispatch gating keeps active turns alive at the limit while pending stays nonzero", () => {
+	test("block-spawns grants only the leader's loop after the threshold and exact worker continuations", () => {
 		const fake = fakeHost({ owner: "owner-dispatch-gated" });
-		const adapter = bind(fake, { limitUsd: 0.5, enforceLimit: false });
+		bind(fake, { limitUsd: 0.5, continuationPolicy: "leader-and-exact-worker" });
 		fake.add({ costTotal: 0.6 });
-		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0.6 });
+		expect(fake.invoke({ actorSessionId: fake.api.ownerSessionId, purpose: "loop" }).send).toBe(true);
+		const noGrant = fake.invoke({ actorSessionId: "worker-no-grant", purpose: "loop" });
+		expect(noGrant.send).toBe(false);
+		if (noGrant.send === false) expect(noGrant.reason).toContain("limit-exceeded");
+		const leaderTaskLabel = fake.invoke({ actorSessionId: fake.api.ownerSessionId, purpose: "task-label" });
+		expect(leaderTaskLabel.send).toBe(false);
+		if (leaderTaskLabel.send === false) expect(leaderTaskLabel.reason).toContain("limit-exceeded");
 
-		fake.pend("pending-after-limit");
-		expect(refusal(adapter.check()).code).toBe("unresolved-pending");
-		fake.settlePending("pending-after-limit", { costTotal: 0.1 });
-		expect(adapter.check()).toMatchObject({ send: true, knownCostUsd: 0.7 });
+		fake.pend("pending-other");
+		// The leader continuation and an exact grant are provenance; an unrelated pending attempt stays visible but does
+		// not turn either into a new dispatch.
+		expect(fake.invoke({ actorSessionId: fake.api.ownerSessionId, purpose: "loop" }).send).toBe(true);
+		const pendingNoGrant = fake.invoke({ actorSessionId: "worker-no-grant", purpose: "loop" });
+		expect(pendingNoGrant.send).toBe(false);
+		if (pendingNoGrant.send === false) expect(pendingNoGrant.reason).toContain("unresolved-pending");
+
+		fake.add({ actorSessionId: "worker-exact", costTotal: 0.1 });
+		expect(fake.invoke({ actorSessionId: "worker-exact", purpose: "loop" }).send).toBe(true);
+	});
+
+	test("an unknown-cost worker receipt proves no grant and stays a terminal refusal", () => {
+		const fake = fakeHost({ owner: "owner-grant" });
+		bind(fake, { limitUsd: 0.5, continuationPolicy: "leader-and-exact-worker" });
+		fake.addWithoutCost({ actorSessionId: "worker-unknown" });
+		fake.add({ costTotal: 0.5 });
+		expect(fake.invoke({ actorSessionId: fake.api.ownerSessionId, purpose: "loop" }).send).toBe(true);
+		const refused = fake.invoke({ actorSessionId: "worker-unknown", purpose: "loop" });
+		expect(refused.send).toBe(false);
+		if (refused.send === false) expect(refused.reason).toContain("unresolved-receipt");
 	});
 
 	test("a retired pending attempt settling after this binding never charges this run", () => {

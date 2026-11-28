@@ -222,7 +222,7 @@ describe("coordinator paid-attempt wiring", () => {
 		expect(final?.spend).toEqual({ lowerBound: true, paidUnresolved: 1 });
 	});
 
-	test("block-spawns keeps exact overrun accounting; its dispatch gates, not the provider gate, refuse new work", async () => {
+	test("block-spawns keeps exact overrun accounting and permits the leader continuation; dispatch gates refuse new work", async () => {
 		const owner = "native-owner-budget";
 		const paid = fakePaid(owner);
 		const h = fakeSession({ root, sessionId: owner, config: CONFIG });

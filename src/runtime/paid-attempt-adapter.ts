@@ -11,10 +11,12 @@
  * strictly increasing receipt sequence the host publishes. Its known cost is the caller-supplied start cost plus the
  * observed `costTotal` of in-scope receipts; pending attempts are unknown, never zero. In finite-budget mode it refuses
  * every further paid attempt while an attempt is pending, an in-scope receipt is unresolved, or the exact authorized
- * cost exceeds the approved limit. Earlier-run receipts stay visible with `inScope: false` but cannot spend this run's
- * budget. A caller may also name attempt ids left pending by an earlier binding of the same owner: they are excluded even
- * when their late receipt's sequence follows this baseline, so a durable late receipt never charges the next run. The
- * host's refusal is terminal, so there is no resend path.
+ * cost exceeds the approved limit. A caller that opts into `leader-and-exact-worker` may still send the director's own
+ * `loop` continuation at or past the known threshold, or a continuation from an actor with an in-scope admitted receipt
+ * whose observed cost is exact; every attempt without that provenance stays refused. Earlier-run receipts stay visible
+ * with `inScope: false` but cannot spend this run's budget. A caller may also name attempt ids left pending by an earlier
+ * binding of the same owner: they are excluded even when their late receipt's sequence follows this baseline, so a
+ * durable late receipt never charges the next run. The host's refusal is terminal, so there is no resend path.
  *
  * The adapter never reads assistant `message_end` usage or `model_usage` journal rows. When it is effective the wiring
  * metadata says the native receipts are the only spend source; adding those legacy carriers as well would double count.
@@ -157,6 +159,8 @@ export interface PaidAttemptRefusal {
 
 export type PaidAttemptAccounting = "effective" | "faulted" | "unavailable";
 export type PaidAttemptLegacyPolicy = "native-only" | "legacy-allowed";
+export type PaidAttemptContinuationPolicy = "refuse" | "leader-and-exact-worker";
+
 export type PaidAttemptLimit =
 	| { readonly mode: "finite"; readonly usd: number }
 	| { readonly mode: "unbounded" };
@@ -294,12 +298,13 @@ export interface PaidAttemptBindOptions {
 	/** Rechecked for every decision. Throwing is an unknown revocation state and refuses. */
 	readonly isRevoked?: () => boolean;
 	/**
-	 * Whether the installed decision itself refuses a send once exact in-scope cost exceeds `limitUsd`. Default true.
-	 * A caller whose policy keeps already-active turns alive at the limit (`block-spawns`) passes false: the adapter still
-	 * reports the exact overrun, while the caller's dispatch boundary refuses new spawns, work-bearing messages and wakes.
-	 * A policy that stops the next send (`stop`) keeps the adapter gate.
+	 * Which over-limit provider attempts may still send. Default `refuse` refuses every send once exact in-scope cost
+	 * exceeds `limitUsd`. `leader-and-exact-worker` (Storm's `block-spawns`) additionally permits the director's own
+	 * `loop` continuation at or past the known threshold, and a continuation from an actor with an in-scope admitted
+	 * receipt whose observed cost is exact. An actor with no such grant, or an attempt whose provenance is missing or
+	 * unknown, is still refused; new spawns/work messages are the caller's dispatch gates' business.
 	 */
-	readonly enforceLimit?: boolean;
+	readonly continuationPolicy?: PaidAttemptContinuationPolicy;
 	/**
 	 * Attempt ids retired by an earlier binding of the same owner but not yet settled when it closed. They remain visible
 	 * to the host's contiguous receipt sequence yet never count toward this run: a durable late receipt that arrives
@@ -625,8 +630,8 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const limitValid = rawLimit === undefined || finiteNonNegative(rawLimit);
 	const spentValid = rawSpent === undefined || finiteNonNegative(rawSpent);
 	const revokedValid = options.isRevoked === undefined || typeof options.isRevoked === "function";
-	const enforceLimit = options.enforceLimit ?? true;
-	const enforceLimitValid = typeof enforceLimit === "boolean";
+	const continuationPolicy = options.continuationPolicy ?? "refuse";
+	const continuationPolicyValid = continuationPolicy === "refuse" || continuationPolicy === "leader-and-exact-worker";
 	const excludedRaw = options.excludeAttemptIds;
 	const excludedValid =
 		excludedRaw === undefined ||
@@ -636,8 +641,8 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 	const startCostUsd = finiteNonNegative(rawSpent) ? rawSpent : 0;
 	const limit = limitOf(finite ? "finite" : "unbounded", finite ? rawLimit : undefined);
 
-	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid || !enforceLimitValid) {
-		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, enforceLimit boolean, and excluded attempt ids unique non-empty strings", {
+	if (runId === "" || expectedOwnerSessionId === "" || !limitValid || !spentValid || !revokedValid || !excludedValid || !continuationPolicyValid) {
+		return unavailable("invalid-options", "runId/ownerSessionId must be non-empty, limit/spent finite nonnegative, continuationPolicy valid, and excluded attempt ids unique non-empty strings", {
 			runId: runId || "(missing run id)",
 			expectedOwnerSessionId: expectedOwnerSessionId || "(missing owner session id)",
 			startCostUsd,
@@ -701,7 +706,7 @@ export function bindPaidAttemptAdapter(options: PaidAttemptBindOptions): PaidAtt
 		startCostUsd,
 		bindingToken,
 		isRevoked: options.isRevoked,
-		enforceLimit,
+		continuationPolicy,
 		excludeAttemptIds,
 	});
 	let failure: { readonly code: PaidAttemptUnavailableCode; readonly detail: string } | undefined;
@@ -849,7 +854,7 @@ interface PaidAttemptAdapterInput {
 	readonly startCostUsd: number;
 	readonly bindingToken: string;
 	readonly isRevoked: (() => boolean) | undefined;
-	readonly enforceLimit: boolean;
+	readonly continuationPolicy: PaidAttemptContinuationPolicy;
 	readonly excludeAttemptIds: ReadonlySet<string>;
 }
 
@@ -863,8 +868,10 @@ export class PaidAttemptAdapter {
 	readonly #api: PaidAttemptsSurface;
 	readonly #startCostUsd: number;
 	readonly #isRevoked: (() => boolean) | undefined;
-	readonly #enforceLimit: boolean;
+	readonly #continuationPolicy: PaidAttemptContinuationPolicy;
 	readonly #excludeAttemptIds: ReadonlySet<string>;
+	/** In-scope worker actors with an admitted receipt whose observed cost is exact; their continuations are granted. */
+	#grantedActors = new Set<string>();
 	readonly #decider: PaidAttemptDecider = (attempt, state) => this.#decide(attempt, state);
 	#baselineKnown = false;
 	#baselineSeq = 0;
@@ -909,7 +916,7 @@ export class PaidAttemptAdapter {
 		this.#knownCostUsd = input.startCostUsd;
 		this.bindingToken = input.bindingToken;
 		this.#isRevoked = input.isRevoked;
-		this.#enforceLimit = input.enforceLimit;
+		this.#continuationPolicy = input.continuationPolicy;
 		this.#excludeAttemptIds = input.excludeAttemptIds;
 	}
 
@@ -1105,7 +1112,7 @@ export class PaidAttemptAdapter {
 			const gate = this.#refuse(parsed.code, parsed.detail);
 			return { send: false, reason: gate.reason };
 		}
-		const gate = this.#currentGate();
+		const gate = this.#currentGate(parsed.attempt);
 		if (!gate.send) return { send: false, reason: gate.reason };
 		const passed = parseState(stateRaw, this.ownerSessionId);
 		if (!passed.ok) {
@@ -1133,7 +1140,7 @@ export class PaidAttemptAdapter {
 		return passedPending === currentPending;
 	}
 
-	#currentGate(): PaidAttemptGate {
+	#currentGate(attempt?: PaidAttemptRequestView): PaidAttemptGate {
 		if (this.#disposed) return this.#refuse("adapter-disposed", "the adapter was disposed");
 		this.#checkHostIdentity();
 		this.#reconcileSafely();
@@ -1141,8 +1148,9 @@ export class PaidAttemptAdapter {
 		const revoked = this.#revocation();
 		if (revoked !== undefined) return revoked;
 		if (fault !== undefined) return this.#refuse(fault.code, fault.detail);
+		const continuation = attempt !== undefined && this.#continuationAllowed(attempt);
 		if (this.mode === "finite") {
-			if (this.#pending.length > 0) {
+			if (this.#pending.length > 0 && !continuation) {
 				// No exact upper bound for an unsettled provider attempt exists at this boundary, so a finite budget
 				// that cannot bound it refuses the next dispatch rather than treating pending as zero.
 				const ids = this.#pending
@@ -1155,7 +1163,7 @@ export class PaidAttemptAdapter {
 				);
 			}
 			const relevant = this.#unresolved.filter(fact => fact.inScope);
-			if (relevant.length > 0) {
+			if (relevant.length > 0 && !continuation) {
 				const facts = relevant
 					.slice(0, 3)
 					.map(item => `${item.attemptId}[${item.reasons.join(",")}]`)
@@ -1165,7 +1173,7 @@ export class PaidAttemptAdapter {
 					`${relevant.length} in-scope settled receipt(s) lack exact native proof: ${facts}${relevant.length > 3 ? ",..." : ""}`,
 				);
 			}
-			if (this.#enforceLimit && this.limitUsd !== undefined && this.#knownCostUsd > this.limitUsd) {
+			if (!continuation && this.limitUsd !== undefined && this.#knownCostUsd > this.limitUsd) {
 				return this.#refuse(
 					"limit-exceeded",
 					`exact authorized cost ${this.#knownCostUsd} exceeds the approved limit ${this.limitUsd}`,
@@ -1179,6 +1187,20 @@ export class PaidAttemptAdapter {
 			pendingCount: this.#pending.length,
 			unresolvedCount: this.#unresolved.length,
 		};
+	}
+
+	/** Whether this exact attempt is a continuation the caller's block-spawns policy proved, not a new dispatch. */
+	#continuationAllowed(attempt: PaidAttemptRequestView): boolean {
+		if (this.#continuationPolicy !== "leader-and-exact-worker") return false;
+		if (attempt.actorSessionId === this.ownerSessionId) {
+			// The leader's own loop is the active turn finishing/reporting after the known threshold. A leader title,
+			// label or probe is not that continuation and keeps the ordinary refusal.
+			return attempt.purpose === "loop" && this.limitUsd !== undefined && this.#knownCostUsd >= this.limitUsd;
+		}
+		// A worker actor is granted only after an in-scope admitted receipt with observed exact cost. The receipt's own
+		// append ack is a separate durability flag (the persisted row is written before the flush ack); cost exactness is
+		// what this grant proves. A pending or unknown attempt has no grant and a never-admitted worker stays terminal.
+		return this.#grantedActors.has(attempt.actorSessionId);
 	}
 
 	#revocation(): PaidAttemptGate | undefined {
@@ -1412,6 +1434,7 @@ export class PaidAttemptAdapter {
 		let knownReceipts = 0;
 		let settledReceipts = 0;
 		const classifications = new Map<string, Classification>();
+		const grantedActors = new Set<string>();
 		for (const entry of entries) {
 			const receipt = entry.receipt;
 			const inScope = receipt.seq > this.#baselineSeq && !this.#excludeAttemptIds.has(receipt.attemptId);
@@ -1425,6 +1448,9 @@ export class PaidAttemptAdapter {
 					const model = modelOf(receipt.model);
 					model.knownUsd += classification.spendUsd;
 					model.observedReceipts++;
+					if (receipt.gate === "admitted" && receipt.sent === true && receipt.actorSessionId !== this.ownerSessionId) {
+						grantedActors.add(receipt.actorSessionId);
+					}
 				}
 			}
 			if (classification.reasons.length > 0 && !this.#excludeAttemptIds.has(receipt.attemptId)) {
@@ -1485,6 +1511,7 @@ export class PaidAttemptAdapter {
 			reasons: UNRESOLVED_ORDER.filter(reason => fact.reasons.has(reason)),
 		}));
 		this.#byModel = byModel;
+		this.#grantedActors = grantedActors;
 		this.#knownCostUsd = knownCostUsd;
 		this.#knownReceipts = knownReceipts;
 		this.#settledReceipts = settledReceipts;

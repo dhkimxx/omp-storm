@@ -590,7 +590,8 @@ async function policyLateAuto(): Promise<void> {
 	const plugin = join(import.meta.dir, "integration-policy-plugin.ts");
 	const log = join(env.work, "logs", "policy-late-auto.jsonl");
 	const fake = join(env.work, "fake-ovnfs");
-	writeFileSync(fake, "#!/bin/sh\nexit 1\n");
+	const invoked = `${fake}.invoked`;
+	writeFileSync(fake, `#!/bin/sh\n: > '${invoked.replaceAll("'", "'\\''")}'\nexit 1\n`);
 	Bun.spawnSync(["chmod", "755", fake]);
 	env.childEnv.INTEGRATION_POLICY_LOG = log;
 	env.childEnv.INTEGRATION_POLICY_MODE = "late-auto";
@@ -601,14 +602,16 @@ async function policyLateAuto(): Promise<void> {
 			const lane = "policy-late-auto";
 			const file = "e2e-integration-late-auto.txt";
 			const llm = new LlmCursor(env);
-			const { frames } = await plannedRun(rpc, files, [laneFor(lane, file, "policy-late-auto-change")], [
+			const { run } = await plannedRun(rpc, files, [laneFor(lane, file, "policy-late-auto-change")], [
 				{ tasks: [{ name: lane, agent: "storm-implementer", task: "Write one file", say: childWrite(file) }] },
 				{ wait: true },
 			], { implementer: 1 });
-			check("late auto: no child ran from the late backend switch", llm.of("child").length === 0, `children=${llm.of("child").length}`);
+			check("late auto: the guarded child did run", llm.of("child").length > 0, `children=${llm.of("child").length}`);
 			check("late auto: the parent did not receive the file", !existsSync(join(env.project, file)), file);
-			const said = stormTexts(frames).join("\n");
-			check("late auto: the failure names ovnfs or the isolation boundary", said.includes("ovnfs") || said.includes("격리") || said.includes("isolation"), said.slice(0, 900));
+			const manifest = manifestOf(files, run.runId);
+			const policy = property(property(manifest, "admission"), "policy");
+			check("late auto: the exact frozen native backend ran, not the fallback", property(policy, "backendSetting") === nativeBackend() &&
+				property(property(manifest, "childClaim"), "kind") === "known" && !existsSync(invoked), JSON.stringify(policy));
 		}, ["-e", plugin]);
 	} finally {
 		delete env.childEnv.INTEGRATION_POLICY_LOG;
@@ -617,14 +620,15 @@ async function policyLateAuto(): Promise<void> {
 	}
 	const lines = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
 	const hook = lines.find(line => line.event === "before_subagent_spawn");
-	if (hook === undefined) console.log(`GATE policy-late-auto: the spawn was refused before the probe ran (expected on the blocked stock profile, log=${log})`);
+	check("late auto: the later native hook executed", hook !== undefined, log);
 	if (hook !== undefined) {
 		const before = property(hook, "before");
 		const after = property(hook, "after");
 		check("late auto: the hook saw the explicit native backend", property(before, "backend") !== "auto", String(property(before, "backend")));
 		check("late auto: the probe changed the backend after Storm's hook", property(after, "backend") === "auto", String(property(after, "backend")));
 		check("late auto: the probe changed ovnfs.path after the same hook", property(after, "ovnfsPath") === fake, String(property(after, "ovnfsPath")));
-		check("late auto: the scoped Settings identity is the director's live session scope", property(hook, "directorSettingsSame") === true && property(hook, "scopedIsGlobal") === false, JSON.stringify({ same: property(hook, "directorSettingsSame"), global: property(hook, "scopedIsGlobal") }));
+		check("late auto: the mutated instance is the exact live director Settings", property(hook, "directorSettingsSame") === true,
+			JSON.stringify({ same: property(hook, "directorSettingsSame"), global: property(hook, "scopedIsGlobal") }));
 	}
 }
 
@@ -639,12 +643,16 @@ async function policyAba(): Promise<void> {
 			const lane = "policy-aba";
 			const file = "e2e-integration-aba.txt";
 			const llm = new LlmCursor(env);
-			await plannedRun(rpc, files, [laneFor(lane, file, "policy-aba-change")], [
+			const { run } = await plannedRun(rpc, files, [laneFor(lane, file, "policy-aba-change")], [
 				{ tasks: [{ name: lane, agent: "storm-implementer", task: "Write one file", say: childWrite(file) }] },
 				{ wait: true },
 			], { implementer: 1 });
 			check("apply ABA: the parent was not changed", !existsSync(join(env.project, file)), file);
-			check("apply ABA: the live change was observed before the child was authorized", llm.of("child").length === 0, `children=${llm.of("child").length}`);
+			const manifest = manifestOf(files, run.runId);
+			const policy = property(property(manifest, "admission"), "policy");
+			check("apply ABA: the child entered only with the frozen apply-off policy", llm.of("child").length > 0 &&
+				property(policy, "apply") === false && property(policy, "merge") === "patch" &&
+				property(property(manifest, "childClaim"), "kind") === "known", JSON.stringify(policy));
 		}, ["-e", plugin]);
 	} finally {
 		delete env.childEnv.INTEGRATION_POLICY_LOG;
@@ -652,9 +660,11 @@ async function policyAba(): Promise<void> {
 	}
 	const lines = existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
 	const hook = lines.find(line => line.event === "before_subagent_spawn");
-	if (hook === undefined) console.log(`GATE policy-aba: the spawn was refused before the probe ran (log=${log})`);
+	check("apply ABA: the later native hook executed", hook !== undefined, log);
 	if (hook !== undefined) {
-		check("apply ABA: the hook read apply off before and after the ABA", property(property(hook, "before"), "apply") === false && property(property(hook, "after"), "apply") === false, JSON.stringify({ before: property(property(hook, "before"), "apply"), after: property(property(hook, "after"), "apply") }));
+		check("apply ABA: the live setting did change off → on → off", property(property(hook, "before"), "apply") === false &&
+			property(hook, "duringApply") === true && property(property(hook, "after"), "apply") === false,
+			JSON.stringify({ before: property(hook, "before"), during: property(hook, "duringApply"), after: property(hook, "after") }));
 	}
 }
 
@@ -1053,8 +1063,8 @@ async function main(): Promise<void> {
 	if (include("carrier", "carrier: capture failure")) await suite.step("carrier: capture failure keeps recovery only", carrierCaptureFailure, 360_000);
 	if (include("carrier", "carrier: tamper")) await suite.step("carrier: native and Storm-copy tamper controls", carrierTamper, 300_000);
 	if (include("policy", "policy: apply on")) await suite.step("policy: apply-on refusal and the unmanaged host control", policyApplyOn, 360_000);
-	if (include("policy", "policy: late auto")) await suite.step("policy: backend read after the hook", policyLateAuto, 300_000);
-	if (include("policy", "policy: aba")) await suite.step("policy: a relevant setting ABA is observed", policyAba, 300_000);
+	if (include("policy", "policy: late auto")) await suite.step("policy: frozen backend survives a later live switch", policyLateAuto, 300_000);
+	if (include("policy", "policy: aba")) await suite.step("policy: frozen apply off survives a later live ABA", policyAba, 300_000);
 	if (include("write", "write: dirty preimage")) await suite.step("write: dirty touched preimage and preserved index", writeDirtyPreimage, 300_000);
 	if (include("write", "write: dirty delete")) await suite.step("write: dirty and untracked delete refusal", writeDirtyDeleteRefusal, 300_000);
 	if (include("write", "write: clean delete")) await suite.step("write: clean delete succeeds without staging", writeCleanDelete, 300_000);
