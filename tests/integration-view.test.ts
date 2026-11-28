@@ -270,13 +270,14 @@ describe("detail separates capture, bundles, checkout and recovery", () => {
 	});
 
 	test("a cancelled attempt with a real patch keeps it as recovery; a history-only capture says unknown", () => {
+		const nativePatch = `/tmp/${"session-segment/".repeat(12)}w1.patch`;
 		const cancelled = texts({
 			outcome: known("cancel"),
 			cancelRequested: true,
-			recovery: { ...detail().recovery, nativePatch: known("patch/w1.diff"), nativeBranch: known({ ref: "refs/heads/storm/w1", base: known("b".repeat(40)), tip: known("c".repeat(40)) }) },
+			recovery: { ...detail().recovery, nativePatch: known(nativePatch), nativeBranch: known({ ref: "refs/heads/storm/w1", base: known("b".repeat(40)), tip: known("c".repeat(40)) }) },
 		});
 		expect(cancelled).toContain("취소");
-		expect(cancelled).toContain("patch/w1.diff");
+		expect(cancelled).toContain(nativePatch);
 		expect(cancelled).toContain("refs/heads/storm/w1");
 		expect(cancelled).not.toContain("결과: 성공");
 		const historyOnly = texts({ outcome: known("failure"), recovery: { ...detail().recovery, stormCopy: unknown("no-copy", "사본 없음"), nativePatch: unknown("no-patch", "패치 없음") } });

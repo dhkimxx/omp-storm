@@ -109,6 +109,9 @@ E2E_KEEP=1 ./node_modules/.bin/bun scripts/e2e/integration-pin.ts
 INTEGRATION_MANAGED_LAUNCH=1 E2E_ONLY="carrier: sync root-only" ./node_modules/.bin/bun scripts/e2e/integration.ts
 INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP=write ./node_modules/.bin/bun scripts/e2e/integration.ts
 # 릴리스 게이트를 실제로 실패시키려면 INTEGRATION_REQUIRE_GATES=1을 더한다.
+
+# 격리·쓰기 경계가 있는 비공개 테스트 바이너리에서 실제 동시 실행과 기본 풀 정지 확인
+OMP_BIN=/path/to/private/omp E2E_SCALE=1 E2E_SCALE_HOST=1 ./node_modules/.bin/bun scripts/e2e/integration-scale.ts
 ```
 
 `integration-pin.ts`는 고정 커밋·패키지·락·호스트 19.2.1·OS/Git·프로필을 확인한다. 호스트 소스 검토는
@@ -129,7 +132,9 @@ INTEGRATION_MANAGED_LAUNCH=1 INTEGRATION_GROUP=write ./node_modules/.bin/bun scr
 | 인터페이스 다이제스트 | `17dcefb550063cbbad538b937ace1d86e8a20a2b727c15efc9237883107827e9` |
 | 호스트 `dist/cli.js` | SHA-256 `60215f805c4bfe0eb9dab0de2edd54a6c38f57dca7abe0916dc62ddacc52fc1c` |
 
-소스 검토에서 `task-isolation-payload`와 `apply-before-hook`의 실행 순서를 확인했다. `backend-late-read`는
-**BLOCKED**다. `settings-scope`·`native-slot-stability`·`carrier-sync-wait-push`·`installer-and-receipt`·
-`pooled-default-stop`·`scale-16-and-100`은 `NOT-RUN`이다. `INTEGRATION_REQUIRE_GATES=1`이면 이 호스트에서는
-종료 코드 2를 반환한다. 고정·프로필 확인이 성공해도 통합 출시가 가능하다는 뜻은 아니다.
+배포본 소스에서는 `task-isolation-payload`와 `apply-before-hook`의 실행 순서를 확인했다. `backend-late-read`는
+여전히 **BLOCKED**다. `INTEGRATION_REQUIRE_GATES=1`이면 이 배포본에서 종료 코드 2를 반환한다.
+
+별도로 빌드한 비공개 `omp/19.2.1`에서는 동기·`wait`·푸시와 혼합 배치, 빈 `wait` 중복 방지, 정확한 후보 상세,
+사용자의 기존 변경·인덱스를 보존하는 설치, 삭제 거부, 설치 영수증에 따른 수용과 `need: integrated`를 실제 세션에서 확인했다.
+이 검증은 배포본의 호스트 경계를 바꾸지 않으며, 기본 작업자 풀에서의 100개 동시 실행을 증명하지 않는다.

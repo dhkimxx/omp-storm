@@ -379,7 +379,7 @@ function nativeExecution(input: { jobId: string; handle?: string; index?: number
 		executionToken: input.token ?? randomUUID(),
 		itemIndex: input.index ?? 0,
 		agentId: input.handle ?? "W1",
-		ownerSessionId: input.owner ?? "Main",
+		ownerSessionId: input.owner ?? "session-1",
 	};
 }
 
@@ -846,6 +846,32 @@ describe("async carrier join", () => {
 		if (manifests[0]?.terminal.kind === "known" && manifests[0].terminal.value.carrier !== "sync") {
 			expect(manifests[0].terminal.value.job.jobId).toBe("W1-7");
 		}
+	});
+
+	test("an exact native ack before admission joins detached metadata using the guarded host path", async () => {
+		const f = await fixture();
+		const rig = captureRig(f);
+		const built = await admissionFor(f, { startedAt: f.clock.now + 1 });
+		const path = await patch(f, "W1", "diff --git a/a b/a\n+A\n");
+		const execution = nativeExecution({ jobId: "W1-before-spawn" });
+		observeExecutionAck(rig, built, execution);
+		f.clock.now += 1;
+		rig.capture.track(built.admission);
+		const hostSessionFile = `${f.childSessionFile}.native-alias`;
+		const entry = { ...entryFor(f), hostSessionFile };
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { registryInstance: "", childSessionFile: hostSessionFile, event: "registered" }));
+		rig.capture.observeClaim(entry, { ...claimFor(f, built.admission), entry });
+		rig.capture.observeRegistry(registrySnapshot(f, built.admission, {
+			registryInstance: "", childSessionFile: hostSessionFile, history: { patchPath: path, nestedPatchPaths: [] },
+		}));
+		rig.capture.observeAsync({
+			director: built.admission.director,
+			carrier: "wait",
+			details: { op: "wait", jobs: [waitJob({ jobId: execution.jobId, settledAtMs: f.clock.now + 1, durationMs: 2, execution })] },
+			observedAt: f.clock.now + 1,
+		});
+		const [manifest] = await sealed(rig);
+		expect(manifest?.bundle.kind).toBe("root-only");
 	});
 
 	test("prefix, label-only and same-id terminals never replace the ack's resolved job", async () => {
@@ -1489,7 +1515,7 @@ describe("async carrier join", () => {
 		rig.capture.track(built.admission);
 		rig.capture.observeClaim(entryFor(f), claimFor(f, built.admission));
 		rig.capture.observeRegistry(registrySnapshot(f, built.admission, { history: { patchPath: path, nestedPatchPaths: [] } }));
-		const execution = nativeExecution({ jobId: "W1", owner: "Other" });
+		const execution = nativeExecution({ jobId: "W1", owner: built.admission.director.parentId });
 		observeExecutionAck(rig, built, execution);
 		vi.advanceTimersByTime(30);
 		const manifests = await sealed(rig);

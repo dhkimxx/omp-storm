@@ -59,6 +59,7 @@ export const CAPTURE_MAX_PATCH_BYTES = 64 * 1024 * 1024;
 /** At most eight typed parts are sealed in one manifest. */
 export const CAPTURE_MAX_PARTS = 8;
 const MAX_TRACKED = 512;
+const EARLY_ACK_MS = 30_000;
 const MAX_LATE_RECOVERIES = 64;
 const MAX_DIAGNOSTICS = 64;
 /** The host mints an opaque UUID per job registration; a label, timestamp or path is never this token. */
@@ -305,7 +306,8 @@ export class IsolationCapture implements IntegrationCapturePort {
 	readonly #onNativeEnded: ((admission: FrozenIntegrationAdmission) => void | Promise<void>) | undefined;
 	readonly #tracked = new Map<IntegrationCandidateId, TrackedCapture>();
 	readonly #byHandle = new Map<string, Set<IntegrationCandidateId>>();
-	readonly #jobs = new Set<Promise<void>>();
+	readonly #earlyAcks = new Map<string, { row: AsyncRow; observedAt: number; conflict?: AsyncRow }>();
+	readonly #jobs = new Map<Promise<void>, string>();
 	readonly #unmatched = new Map<string, number>();
 	#unsubscribe: (() => void) | undefined;
 	#stopped = false;
@@ -380,12 +382,39 @@ export class IsolationCapture implements IntegrationCapturePort {
 		}
 		this.#tracked.clear();
 		this.#byHandle.clear();
+		this.#earlyAcks.clear();
 		this.#jobs.clear();
 	}
 
-	/** Test/measurement seam: await every scheduled copy, seal and late recovery. */
-	async drain(): Promise<void> {
-		while (this.#jobs.size > 0) await Promise.allSettled([...this.#jobs]);
+	/** Join scheduled work only; an absent future native event never holds a read open. */
+	async drain(runId?: string, window?: ByteWindow): Promise<void> {
+		let signal: AbortSignal | undefined;
+		let cancel: (() => void) | undefined;
+		let aborted: Promise<void> | undefined;
+		try {
+			while (this.#jobs.size > 0) {
+				const jobs: Promise<void>[] = [];
+				for (const [job, owner] of this.#jobs) if (runId === undefined || runId === owner) jobs.push(job);
+				if (jobs.length === 0) return;
+				if (window === undefined) {
+					await Promise.allSettled(jobs);
+					continue;
+				}
+				const remaining = window.deadline - this.#now();
+				if (window.signal.aborted || remaining <= 0) return;
+				if (signal === undefined) {
+					signal = AbortSignal.any([window.signal, AbortSignal.timeout(Math.ceil(Math.min(remaining, 2 ** 31 - 1)))]);
+					const deferred = Promise.withResolvers<void>();
+					cancel = () => deferred.resolve();
+					aborted = deferred.promise;
+					signal.addEventListener("abort", cancel, { once: true });
+				}
+				if (signal.aborted) return;
+				await Promise.race([Promise.allSettled(jobs), aborted]);
+			}
+		} finally {
+			if (cancel !== undefined) signal?.removeEventListener("abort", cancel);
+		}
 	}
 
 	/** Bounded counters for unbound native observations; never candidate evidence. */
@@ -428,6 +457,15 @@ export class IsolationCapture implements IntegrationCapturePort {
 		const set = this.#byHandle.get(tracked.handle) ?? new Set<IntegrationCandidateId>();
 		set.add(candidateId);
 		this.#byHandle.set(tracked.handle, set);
+		const pendingKey = earlyAckKey(value.director, tracked.toolCallId, tracked.itemIndex, tracked.handle);
+		const pending = this.#earlyAcks.get(pendingKey);
+		if (pending !== undefined) {
+			this.#earlyAcks.delete(pendingKey);
+			if (Math.abs(value.startedAt - pending.observedAt) <= EARLY_ACK_MS) {
+				this.#acknowledge(tracked, pending.row, tracked.toolCallId, pending.observedAt);
+				if (pending.conflict !== undefined) this.#acknowledge(tracked, pending.conflict, tracked.toolCallId, pending.observedAt);
+			}
+		}
 		return { ok: true };
 	}
 
@@ -550,8 +588,9 @@ export class IsolationCapture implements IntegrationCapturePort {
 			patchPath !== undefined &&
 			nestedList === "explicit" &&
 			snapshot.parentSessionKey !== null &&
-			typeof snapshot.registryInstance === "string" &&
-			snapshot.registryInstance !== "" &&
+			(snapshot.registryInstance !== "" ||
+				(tracked.claim !== undefined && snapshot.parentId === tracked.admission.director.parentId &&
+					snapshot.generation === tracked.claim.entry.generation)) &&
 			typeof snapshot.generation === "number" &&
 			snapshot.generation >= 0 &&
 			typeof snapshot.childSessionFile === "string" &&
@@ -684,6 +723,14 @@ export class IsolationCapture implements IntegrationCapturePort {
 			return;
 		}
 		const observedAt = Number.isSafeInteger(input.observedAt) ? input.observedAt : this.#now();
+		const ackCounts = input.carrier === "ack" ? new Map<string, number>() : undefined;
+		if (ackCounts !== undefined) {
+			for (const row of rows) {
+				if (row.agentId === undefined || row.index === undefined) continue;
+				const item = JSON.stringify([row.index, row.agentId]);
+				ackCounts.set(item, (ackCounts.get(item) ?? 0) + 1);
+			}
+		}
 		for (const row of rows) {
 			if (row.type !== "task") {
 				this.#bump("async-not-task");
@@ -693,18 +740,36 @@ export class IsolationCapture implements IntegrationCapturePort {
 				this.#bump("async-agent-missing");
 				continue;
 			}
-			const candidates = [...this.#tracked.values()].filter(
-				tracked =>
-					!tracked.abandoned &&
-					tracked.sync === undefined &&
-					tracked.handle === row.agentId &&
-					sameDirector(tracked.admission.director, input.director),
-			);
+			const candidates: TrackedCapture[] = [];
+			for (const id of this.#byHandle.get(row.agentId) ?? []) {
+				const tracked = this.#tracked.get(id);
+				if (tracked !== undefined && !tracked.abandoned && tracked.sync === undefined &&
+					sameDirector(tracked.admission.director, input.director)) candidates.push(tracked);
+			}
+			if (ackCounts !== undefined && row.index !== undefined && ackCounts.get(JSON.stringify([row.index, row.agentId])) !== 1) {
+				this.#bump("async-ack-duplicate");
+				continue;
+			}
 			if (candidates.length === 0) {
+				const proof = row.execution;
+				if (input.carrier === "ack" && input.toolCallId !== undefined && proof !== undefined &&
+					proof.ownerSessionId === input.director.sessionId && proof.itemIndex === row.index &&
+					proof.agentId === row.agentId && proof.jobId === row.jobId) {
+					// The host can acknowledge registration while the queued spawn is still in approval.
+					const key = earlyAckKey(input.director, input.toolCallId, proof.itemIndex, row.agentId);
+					const previous = this.#earlyAcks.get(key);
+					if (previous === undefined || observedAt - previous.observedAt > EARLY_ACK_MS) {
+						this.#earlyAcks.set(key, { row, observedAt });
+						if (this.#earlyAcks.size > MAX_TRACKED) this.#earlyAcks.delete(this.#earlyAcks.keys().next().value!);
+					} else if (previous.row.execution?.executionToken !== proof.executionToken || previous.row.jobId !== row.jobId) {
+						previous.conflict = row;
+					}
+					continue;
+				}
 				this.#bump("async-unbound");
 				continue;
 			}
-			if (observedAt < Math.min(...candidates.map(tracked => tracked.admission.startedAt))) {
+			if (candidates.every(tracked => observedAt < tracked.admission.startedAt - (input.carrier === "ack" ? EARLY_ACK_MS : 0))) {
 				this.#bump("async-stale");
 				continue;
 			}
@@ -737,12 +802,9 @@ export class IsolationCapture implements IntegrationCapturePort {
 					this.#bump(matched.length === 0 ? "async-ack-unbound" : "async-ack-ambiguous");
 					continue;
 				}
-				if (rows.filter(other => other.index === row.index && other.agentId === row.agentId).length !== 1) {
-					this.#bump("async-ack-duplicate");
-					continue;
-				}
+				// Duplicate indices were refused above, so this is a single exact call/item proof.
 				const tracked = matched[0] as TrackedCapture;
-				this.#acknowledge(tracked, row, input, observedAt);
+				if (observedAt >= tracked.admission.startedAt - EARLY_ACK_MS) this.#acknowledge(tracked, row, input.toolCallId, observedAt);
 				continue;
 			}
 			if (input.carrier === "registration") {
@@ -772,17 +834,16 @@ export class IsolationCapture implements IntegrationCapturePort {
 		}
 	}
 
-	#acknowledge(tracked: TrackedCapture, row: AsyncRow, input: AsyncObservationInput, observedAt: number): void {
+	#acknowledge(tracked: TrackedCapture, row: AsyncRow, toolCallId: string | undefined, observedAt: number): void {
 		const state: AsyncFacts = tracked.async ?? {};
 		tracked.async = state;
 		const proof = row.execution;
 		const exact =
 			proof !== undefined &&
-			input.toolCallId !== undefined &&
-			input.toolCallId === tracked.toolCallId &&
+			toolCallId === tracked.toolCallId &&
 			proof.itemIndex === tracked.itemIndex &&
 			proof.agentId === tracked.handle &&
-			proof.ownerSessionId === tracked.admission.director.parentId &&
+			proof.ownerSessionId === tracked.admission.director.sessionId &&
 			proof.jobId === row.jobId;
 		if (!exact) {
 			const before = state.ackProblem?.code;
@@ -841,7 +902,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			proof.agentId !== row.agentId ||
 			proof.itemIndex !== tracked.itemIndex ||
 			proof.agentId !== tracked.handle ||
-			proof.ownerSessionId !== tracked.admission.director.parentId
+			proof.ownerSessionId !== tracked.admission.director.sessionId
 		) {
 			this.#bump("async-job-conflict");
 			return;
@@ -1053,7 +1114,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 				}
 			});
 		tracked.job = job;
-		this.#jobs.add(job);
+		this.#jobs.set(job, tracked.admission.key.runId);
 	}
 
 	async #work(tracked: TrackedCapture): Promise<void> {
@@ -1662,7 +1723,9 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (prior.generation !== null && snapshot.generation !== null && snapshot.generation < prior.generation) {
 				return problem("registry-generation-regressed", "레지스트리 세대가 뒤로 갔습니다");
 			}
-			if (prior.childSessionFile !== null && snapshot.childSessionFile !== null && prior.childSessionFile !== snapshot.childSessionFile) {
+			if (prior.childSessionFile !== null && snapshot.childSessionFile !== null && prior.childSessionFile !== snapshot.childSessionFile &&
+				!(tracked.claim !== undefined && claimSessionMatches(tracked.claim.entry, prior.childSessionFile) &&
+					claimSessionMatches(tracked.claim.entry, snapshot.childSessionFile))) {
 				return problem("registry-session-changed", "같은 후보에 다른 자식 세션 파일이 관측되었습니다");
 			}
 		}
@@ -1677,7 +1740,7 @@ export class IsolationCapture implements IntegrationCapturePort {
 			if (snapshot.generation !== null && claim.generation !== snapshot.generation) {
 				return problem("registry-claim-mismatch", "자식 진입 주장과 레지스트리 세대가 다릅니다");
 			}
-			if (snapshot.childSessionFile !== null && claim.childSessionFile.canonicalPath !== snapshot.childSessionFile) {
+			if (snapshot.childSessionFile !== null && !claimSessionMatches(claim, snapshot.childSessionFile)) {
 				return problem("registry-claim-mismatch", "자식 진입 주장과 세션 파일이 다릅니다");
 			}
 		}
@@ -1885,6 +1948,10 @@ function asyncRows(input: AsyncObservationInput): AsyncRow[] {
 	});
 }
 
+function earlyAckKey(director: DirectorIdentity, callId: string, index: number, handle: string): string {
+	return JSON.stringify([director.sessionId, director.sessionInstance, director.sessionDir, director.parentId, callId, index, handle]);
+}
+
 function jobExecution(tracked: TrackedCapture, jobId: string, executionToken: string): string {
 	const director = tracked.admission.director;
 	return sha256Hex(
@@ -1922,10 +1989,14 @@ function readKey(read: IntegrationRead<unknown> | undefined): string | null {
 
 function registryMatchesClaim(registry: RegistryEvidence, claim: ChildEntryClaim): boolean {
 	const entry = claim.entry;
-	if (entry.registryInstance !== registry.registryInstance) return false;
+	if (registry.registryInstance !== "" && entry.registryInstance !== registry.registryInstance) return false;
 	if (registry.generation !== null && entry.generation !== registry.generation) return false;
-	if (registry.childSessionFile !== null && entry.childSessionFile.canonicalPath !== registry.childSessionFile) return false;
+	if (registry.childSessionFile !== null && !claimSessionMatches(entry, registry.childSessionFile)) return false;
 	return true;
+}
+
+function claimSessionMatches(entry: ObservationIdentity, registryFile: string): boolean {
+	return entry.childSessionFile.canonicalPath === registryFile || entry.hostSessionFile === registryFile;
 }
 
 function terminalStatus(terminal: BoundTerminal): string {

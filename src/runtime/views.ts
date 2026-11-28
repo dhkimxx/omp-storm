@@ -246,7 +246,7 @@ function detailText(value: CandidateProjection & { readonly kind: "detail" }): s
 	const stop = readText(detail.stopCause, cause => clean(cause, 80));
 	const recovery = detail.recovery;
 	const copy = readText(recovery.stormCopy, copy => `${clean(copy.reference, 80)} (${whole(copy.bytes)}B, sha256:${clean(copy.sha256, 16)})`);
-	const patch = readText(recovery.nativePatch, patch => clean(patch, CANDIDATE_FIELD_MAX));
+	const patch = readText(recovery.nativePatch, patch => clean(patch, 1024));
 	const branch = readText(
 		recovery.nativeBranch,
 		branch => `${clean(branch.ref, 80)} · base ${readText(branch.base, base => clean(base, 40))} · tip ${readText(branch.tip, tip => clean(tip, 40))}`,

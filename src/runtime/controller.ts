@@ -1186,6 +1186,8 @@ export interface IntegrationPorts {
 	readonly journal: IntegrationJournalPort;
 	readonly delta: IntegrationDeltaPort;
 	readonly writer: IntegrationWriterPort;
+	/** Bound read-side join for capture work already scheduled by this native conversation. */
+	readonly settleCapture?: (runId: string, window: ByteWindow) => Promise<void>;
 }
 
 /**
@@ -6447,7 +6449,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 	 */
 	async observe(update: CaptureUpdate): Promise<void> {
 		const own = this.#own;
-		if (own === undefined || own.finalizing === true || this.deps.integration?.(own.sessionDir) === undefined) return;
+		if (own === undefined || this.deps.integration?.(own.sessionDir) === undefined) return;
 		this.#lastProjection = undefined;
 		const state = this.#integrationStateFor(own);
 		if (update.kind === "sealed") {
@@ -6655,6 +6657,8 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			(query.runId === undefined || query.runId === this.#recentIntegration.runId)) {
 			state = this.#recentIntegration.state;
 			rows = this.#recentIntegration.rows ?? [];
+			// After close, late durable seals/recovery no longer publish to the live run.
+			state.replayDone = false;
 			runId = this.#recentIntegration.runId;
 		} else if (query.runId !== undefined) {
 			state = emptyIntegrationState();
@@ -6664,6 +6668,7 @@ export class RunController implements IntegrationAttemptPort, IntegrationControl
 			return { kind: "not-recorded" };
 		}
 		if (runId === undefined) return { kind: "not-recorded" };
+		await ports.settleCapture?.(runId, window);
 		const replay = await this.#replayIntegration(ports, state, runId);
 		if (replay.kind !== "known") return { kind: "unknown", problem: replay.problem };
 		if (replay.value === null && state.candidates.size === 0) return { kind: "not-recorded" };

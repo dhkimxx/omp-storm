@@ -97,6 +97,8 @@ export interface ObservationIdentity {
 	readonly registryInstance: string;
 	readonly generation: number;
 	readonly childSessionFile: SpaceIdentity;
+	/** Native registry spelling when it differs from the verified physical path. */
+	readonly hostSessionFile?: string;
 }
 export interface NativeSlotLease {
 	readonly key: AdmissionKey;

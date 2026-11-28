@@ -1012,7 +1012,6 @@ function slotOwnedBy(owner: SlotOwnerRecord, slot: NativeSlotLease, key: Admissi
 	);
 }
 
-
 async function readJsonFile(path: string): Promise<unknown> {
 	try {
 		const text = await fs.readFile(path, "utf8");
@@ -1452,7 +1451,7 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		if (sameSpace(gitDir, admission.target.authorizedRoot) || sameSpace(gitDir, admission.target.gitRoot)) {
 			return unknown("entry-admin-parent", "자식 Git 관리 디렉터리가 부모 체크아웃입니다", gitDir.canonicalPath);
 		}
-		const odb = await this.#checkObjectStore(gitDir.canonicalPath, admission.target);
+		const odb = await this.#checkObjectStore(gitDir.canonicalPath, checkout.canonicalPath, admission.target);
 		if (!odb.ok) return { kind: "unknown", problem: odb.problem };
 		const entryFile = await this.#entryFileIdentity(input.entry);
 		if (entryFile.kind === "unknown") return entryFile;
@@ -1646,8 +1645,21 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		};
 	}
 
-	async #checkObjectStore(gitDir: string, target: IntegrationTarget): Promise<IntegrationCheck> {
-		const common = await commonDirOf(gitDir);
+	async #checkObjectStore(gitDir: string, checkoutRoot: string, target: IntegrationTarget): Promise<IntegrationCheck> {
+		const privateDir = (path: string): boolean => {
+			const rel = relative(checkoutRoot, path);
+			return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+		};
+		const common = await fs.realpath(await commonDirOf(gitDir)).catch(() => undefined);
+		if (common === undefined || !privateDir(gitDir) || !privateDir(common)) {
+			return refused("entry-admin-shared", "자식의 Git common 디렉터리가 실제 격리 체크아웃에 속하지 않습니다", gitDir);
+		}
+		const objectsPath = join(common, "objects");
+		const objects = await statOf(objectsPath).catch(() => undefined);
+		if (objects === undefined || !objects.isDirectory || objects.isSymbolicLink ||
+			(objects.dev.toString() === target.sourceOdb.objects.device && objects.ino.toString() === target.sourceOdb.objects.inode)) {
+			return refused("entry-object-source", "자식의 Git 객체 디렉터리가 별도의 실제 디렉터리가 아닙니다", objectsPath);
+		}
 		const configPath = join(common, "config");
 		let format: "sha1" | "sha256" = "sha1";
 		try {
@@ -1662,30 +1674,35 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 		if (format !== target.sourceOdb.objectFormat) {
 			return refused("entry-object-format", "자식 객체 형식이 소스 ODB와 다릅니다", configPath);
 		}
-		const alternatesPath = join(common, "objects", "info", "alternates");
-		let alternates: string[] = [];
+		const alternatesPath = join(objectsPath, "info", "alternates");
 		try {
-			alternates = (await fs.readFile(alternatesPath, "utf8"))
-				.split("\n")
-				.map(line => line.trim())
-				.filter(line => line !== "");
-		} catch {
-			alternates = [];
+			const stat = await statOf(alternatesPath);
+			if (!stat.isFile || stat.isSymbolicLink || stat.size > 256n * 1024n) {
+				return refused("entry-object-source", "자식 객체 저장소의 alternates가 안전한 파일이 아닙니다", alternatesPath);
+			}
+			const alternates = (await fs.readFile(alternatesPath, "utf8")).split("\n").map(line => line.trim()).filter(Boolean);
+			const sourceObjects = target.sourceOdb.objects.canonicalPath;
+			for (const alternate of alternates) {
+				const canonical = await fs.realpath(resolve(objectsPath, alternate)).catch(() => undefined);
+				if (canonical === sourceObjects) return { ok: true };
+			}
+			return refused("entry-object-source", "자식의 detached 객체 저장소가 승인된 소스 ODB를 가리키지 않습니다", alternatesPath);
+		} catch (error) {
+			// Native copy / APFS clones keep a private object store without alternates. At terminal capture the host
+			// builds synthetic root trees in the original, attested worktree ODB, not this private copy.
+			if (!record(error) || error.code !== "ENOENT") {
+				return refused("entry-object-source", "자식 객체 저장소의 alternates를 확인할 수 없습니다", alternatesPath);
+			}
 		}
-		const sourceObjects = await fs.realpath(target.sourceOdb.objects.canonicalPath).catch(() => target.sourceOdb.objects.canonicalPath);
-		let borrowed = false;
-		for (const alternate of alternates) {
-			const resolved = resolve(common, "objects", alternate);
-			const canonical = await fs.realpath(resolved).catch(() => resolved);
-			if (canonical === sourceObjects) borrowed = true;
-		}
-		if (!borrowed) return refused("entry-object-source", "자식 체크아웃이 승인된 소스 객체 저장소를 사용하지 않습니다", alternatesPath);
 		return { ok: true };
 	}
 
 	async #entryFileIdentity(entry: ObservationIdentity): Promise<IntegrationRead<SpaceIdentity>> {
 		if (!isSpaceIdentity(entry.childSessionFile)) return unknown("entry-session-invalid", "자식 세션 파일 신원이 올바르지 않습니다");
 		try {
+			if (entry.hostSessionFile !== undefined && await fs.realpath(entry.hostSessionFile) !== entry.childSessionFile.canonicalPath) {
+				return unknown("entry-session-invalid", "호스트 세션 경로와 물리 파일이 다릅니다", entry.hostSessionFile);
+			}
 			const stat = await statOf(entry.childSessionFile.canonicalPath);
 			if (!stat.isFile || stat.isSymbolicLink) return unknown("entry-session-unsafe", "자식 세션 파일이 안전한 파일이 아닙니다");
 			const identity = spaceOf(entry.childSessionFile.canonicalPath, stat);
@@ -1710,7 +1727,8 @@ function isObservation(value: unknown): value is ObservationIdentity {
 		typeof value.generation === "number" &&
 		Number.isSafeInteger(value.generation) &&
 		value.generation >= 0 &&
-		isSpaceIdentity(value.childSessionFile)
+		isSpaceIdentity(value.childSessionFile) &&
+		(value.hostSessionFile === undefined || boundedPath(value.hostSessionFile))
 	);
 }
 

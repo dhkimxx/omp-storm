@@ -218,6 +218,7 @@ export interface IntegrationRuntimePorts {
 	readonly delta: IntegrationDeltaPort;
 	readonly journal: IntegrationJournalPort;
 	readonly writer: IntegrationWriterPort;
+	readonly settleCapture?: (runId: string, window: ByteWindow) => Promise<void>;
 	readonly attempt: IntegrationAttemptPort;
 	readonly view: IntegrationViewPort;
 }
@@ -1003,7 +1004,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 */
 	interface AutoEntry extends AutoStatus {
 		task: string | undefined;
-		/** When the user's message that is `task` began its turn; set and cleared with it. */
+		/** Start of the live user ask, including an explicit /storm request without an automatic task. */
 		turnStartedAt?: number;
 		/**
 		 * Identity of the live user request of this entry: every prompt and every terminal end replaces it. A handler
@@ -1262,18 +1263,32 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	 */
 	const integrationChildEntry = async (event: unknown, ctx: ExtensionContext): Promise<{ block: true; reason: string } | { dispatchId: string; guard: string }> => {
 		const refuse = (reason: string) => ({ block: true as const, reason: `[storm:integration] ${reason}` });
-		const dispatch = guardedDispatch(event);
-		if (dispatch.kind === "unknown") return refuse(dispatch.problem.reason);
 		if (!isRecord(event) || event.guard !== INTEGRATION_GUARD_BUILD || !isRecord(event.parent) || !isRecord(event.agent) ||
 			!isRecord(event.checkout) || !isRecord(event.sessionFileIdentity) || ctx.agent.kind !== "sub") {
 			return refuse("호스트의 정확한 자식 진입 신원을 확인하지 못했습니다.");
 		}
+		const agentDir = workerAdmissionAgentDir();
+		const read = await readWorkerAdmission({
+			agentDir, artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id,
+		});
+		if (!threadPolicy.onHostMainThread()) {
+			// This guard runs before the usual provider hook that reports D5. Publish the exact stopped attempt
+			// before returning, so task/wait can distinguish it from an unexplained withdrawn admission.
+			if (read.kind === "record" && read.record.policy.kind === "private" &&
+				event.parent.agentId === ctx.agent.parentId && event.agent.id === ctx.agent.id) {
+				await recordWorkerStop(agentDir, {
+					key: read.key, runId: read.record.runId, childId: ctx.agent.id, attempt: read.record.attempt, reason: "pooled-thread",
+				});
+			}
+			return refuse(threadPolicy.workerStopNotice(ctx.agent.name, "pooled-thread"));
+		}
+		// Structured cloning across the worker service does not preserve Object.freeze. D5 denies pooled entry before
+		// consulting the proof used to allow a same-thread entry; it never loosens that positive test.
+		const dispatch = guardedDispatch(event);
+		if (dispatch.kind === "unknown") return refuse(dispatch.problem.reason);
 		const ledger = childLedger(ctx);
 		const ports = boundIntegrationRuntime(ledger?.sessionDir);
 		if (ledger === undefined || ports === undefined) return refuse("격리 디스패치의 감독 실행과 가드를 결속하지 못했습니다.");
-		const read = await readWorkerAdmission({
-			agentDir: workerAdmissionAgentDir(), artifactRoot: artifactsOf(ctx), parentId: ctx.agent.parentId, childId: ctx.agent.id,
-		});
 		if (read.kind !== "record" || read.record.runId !== ledger.runId || read.record.policy.kind !== "private") {
 			return refuse("이 자식의 격리 권한 기록을 찾을 수 없습니다.");
 		}
@@ -1298,7 +1313,10 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			dispatch.value.definition.digest !== admission.approvedDefinitionDigest || admission.item.handle !== ctx.agent.id) {
 			return refuse("격리 디스패치, 정의, 레지스트리 세대 또는 물리 체크아웃이 감독이 승인한 기록과 다릅니다.");
 		}
-		const entry: ObservationIdentity = { registryInstance, generation: ref.generation, childSessionFile: fileIdentity };
+		const entry: ObservationIdentity = {
+			registryInstance, generation: ref.generation, childSessionFile: fileIdentity,
+			...(sessionFile === fileIdentity.canonicalPath ? {} : { hostSessionFile: sessionFile }),
+		};
 		const claim = await ports.admission.claimAtEntry({
 			admission, worker: read.record, entry, childCwd: ctx.cwd, guardBuild: INTEGRATION_GUARD_BUILD,
 			live: () => {
@@ -1591,6 +1609,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 		});
 		const ports = {
 			admission, capture, journal, delta, writer,
+			settleCapture: (runId, window) => capture.drain(runId, window),
 			controller: {
 				project: (query, window) => runs.project(query, window, sessionDir),
 				select: input => input.live.audit.director.sessionDir === sessionDir
@@ -1998,12 +2017,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					if (spend.kind !== "open") {
 						return { outcome: "rejected", text: spend.kind === "unknown" ? `${SPEND_UNKNOWN_TAG} ${SPEND_UNKNOWN_REASON}` : `${SPEND_TAG} ${SPEND_SEND_REASON}` };
 					}
-					const owner = autoOf(ctx);
-					const request = owner?.request;
+					// Use the request captured when this tool call was created, not a subsequent user turn.
 					const askId = owner !== undefined && request !== undefined && owner.turnStartedAt !== undefined
 						? `${sessionId}:${request}:${owner.turnStartedAt}`
 						: undefined;
-					if (askId === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_NO_ASK };
+					if (askId === undefined || owner?.request !== request) return { outcome: "rejected", text: INTEGRATION_TOOL_NO_ASK };
 					const director = directorIdentityFor({ sessionId, sessionDir: ledger.sessionDir, parentId: ctx.agent.id });
 					if (director.kind === "unknown") return { outcome: "rejected", text: director.problem.reason };
 					if (toolCallId === undefined) return { outcome: "rejected", text: INTEGRATION_TOOL_NO_CALL };
@@ -2944,7 +2962,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 					// director later are not prompts and continue the request they belong to (see `agent_end`).
 					const wasPaused = auto.paused === true;
 					auto.paused = false;
-					if (wasPaused && runs.runId() === undefined) resetAutoRequest(auto);
+					if (wasPaused && (runs.runId() === undefined || integrationCapable)) resetAutoRequest(auto);
 					if (text === "") {
 						// A photo-only or empty prompt cannot become a text run task; a later plan refuses it explicitly.
 						if (runs.runId() === undefined) resetAutoRequest(auto);
@@ -2958,6 +2976,9 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 						auto.request = ++autoRequestSerial;
 						// The first prompt of a user turn starts its request; decisions never inherit from the last one.
 						decisions.nextRequest(sessionId, sessionGeneration);
+					} else if (integrationCapable && runs.runId() !== undefined) {
+						auto.turnStartedAt = Date.now();
+						auto.request = ++autoRequestSerial;
 					}
 					await refreshAuto(ctx, () => stateCache.get(projectEnv(ctx)));
 				}
@@ -4608,7 +4629,7 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 			return;
 		}
 		const eventSessionId = mainSessionId(ctx);
-		const auto = !event.willContinue && eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
+		const auto = !event.willContinue && !event.awaitingAsyncWork && eventSessionId !== undefined ? autos.get(eventSessionId) : undefined;
 		// Clear the ending request before yielding; a detached old handler must never clear a newer prompt's task.
 		if (auto !== undefined) {
 			resetAutoRequest(auto);
@@ -4787,15 +4808,33 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 	const startUserRun = async (ctx: ExtensionContext, spec: RunSpec): Promise<RunRequestResult> => {
 		const reason = runs.refusal();
 		if (reason !== undefined) return { ok: false, reason };
+		const sessionId = mainSessionId(ctx);
+		const generation = sessionGeneration;
 		await activateTool();
-		const result = await runs.start(ctx, spec);
-		if (result.ok) markRunStarted(ctx, result.runId);
-		// A user-started run is a new user request even when the previous run already settled.
-		if (result.ok) {
-			const sessionId = mainSessionId(ctx);
-			if (sessionId !== undefined) decisions.nextRequest(sessionId, sessionGeneration);
+		if (generation !== sessionGeneration || mainSessionId(ctx) !== sessionId) {
+			return { ok: false, reason: "대화가 바뀌어 이전 세션의 작업을 시작하지 않았습니다." };
 		}
-		return result;
+		const busy = runs.refusal();
+		if (busy !== undefined) return { ok: false, reason: busy };
+		// The explicit command is the ask; the initial handoff is synthetic and cannot open one itself.
+		const owner = integrationCapable && sessionId !== undefined ? autoFor(sessionId) : undefined;
+		const request = owner === undefined ? undefined : ++autoRequestSerial;
+		if (owner !== undefined && request !== undefined) {
+			owner.request = request;
+			owner.turnStartedAt = Date.now();
+		}
+		let started = false;
+		try {
+			const result = await runs.start(ctx, spec);
+			started = result.ok;
+			if (result.ok) {
+				markRunStarted(ctx, result.runId);
+				if (sessionId !== undefined && generation === sessionGeneration) decisions.nextRequest(sessionId, generation);
+			}
+			return result;
+		} finally {
+			if (!started && owner !== undefined && owner.request === request) resetAutoRequest(owner);
+		}
 	};
 
 	/**

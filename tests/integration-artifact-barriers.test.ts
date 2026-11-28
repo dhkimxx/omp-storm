@@ -240,6 +240,25 @@ describe("artifact root replacement", () => {
 });
 
 describe("child entry after async verification", () => {
+	test("an independent native clone does not borrow objects, but shared Git administration is refused", async () => {
+		const f = await fixture();
+		const built = await admissionFor(f);
+		expect(await f.store.persistPrepared(built.admission)).toEqual({ ok: true });
+		const { checkout, entry } = await childReady(f, built);
+		const gitDir = join(checkout, ".git");
+		await rm(join(gitDir, "objects", "info", "alternates"));
+		const input = {
+			admission: built.admission, worker: built.worker, entry, childCwd: checkout,
+			guardBuild: "guard-1", live: () => ({ ok: true } as const), verifyInputs: async () => ({ ok: true } as const),
+		};
+		await writeFile(join(gitDir, "commondir"), `${f.gitDir}\n`);
+		expect(await f.store.claimAtEntry(input)).toMatchObject({ kind: "unknown", problem: { code: "entry-admin-shared" } });
+		await rm(join(gitDir, "commondir"));
+		expect(await f.store.claimAtEntry(input)).toMatchObject({
+			kind: "known", value: { sourceOdb: built.admission.target.sourceOdb },
+		});
+	});
+
 	test("a stale admission object with the same candidate id cannot seed a claim", async () => {
 		const f = await fixture();
 		const built = await admissionFor(f);
