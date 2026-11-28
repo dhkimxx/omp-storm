@@ -1089,9 +1089,10 @@ Bun.serve({
 			writeFileSync(finalPause[2], String(Date.now()));
 			await Bun.sleep(Math.min(Number(finalPause[1]), HOLD_MAX_MS));
 		}
-		const scaleLane = who === "child" && !request.messages.some(message => message.role === "assistant")
-			? /\bE2E-SCALE-PROVIDER (scale-guarded-[0-9]+-[0-9]+)\b/u.exec(userText(request.messages))?.[1]
-			: undefined;
+		const scale = who === "child" && !request.messages.some(message => message.role === "assistant")
+			? /\bE2E-SCALE-PROVIDER (scale-guarded-[0-9]+-([0-9]+))\b/u.exec(userText(request.messages))
+			: null;
+		const scaleLane = scale?.[1];
 		if (scaleLane !== undefined) {
 			const dir = join(dirname(LOG), "scale-provider");
 			const start = Date.now();
@@ -1100,6 +1101,9 @@ Bun.serve({
 			if (existsSync(arrival)) return gateError(`Repeated first scale provider request: ${scaleLane}`);
 			writeFileSync(arrival, `${start}\n`);
 			if (!(await hold(() => existsSync(join(dir, "release"))))) return gateError(`Scale provider window was never released: ${scaleLane}`);
+			// All model requests have overlapped here. Avoid a synthetic microburst of identical replies; the separate
+			// shell barrier still requires all real effects to arrive and overlap in their private checkouts.
+			await Bun.sleep((Number(scale?.[2]) % 32) * 120);
 			writeFileSync(join(dir, `window-${scaleLane}.json`), JSON.stringify({ start, end: Date.now() }));
 		}
 		const delay = childDelayMs(who, request.messages);
