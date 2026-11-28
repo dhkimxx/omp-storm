@@ -192,7 +192,7 @@ import {
 	type WorkerStopReading,
 } from "./worker-admission.ts";
 
-import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationRead, NativeTaskItem, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
+import type { ApplyPolicyPort, FrozenIntegrationAdmission, IntegrationAdmissionPort, IntegrationCandidateId, IntegrationRead, ObservationIdentity, SpaceIdentity } from "./runtime/integration-admission.ts";
 import type { ByteWindow, IntegrationDeltaPort } from "./runtime/integration-delta.ts";
 import type { CandidateQuery, IntegrationAttemptPort, IntegrationControllerPort, IntegrationSelectionReply, IntegrationViewPort } from "./runtime/integration-controller-port.ts";
 import type { IntegrationCapturePort, RegistrySnapshotInput } from "./runtime/integration-capture.ts";
@@ -2435,10 +2435,11 @@ export default function storm(pi: ExtensionAPI, options: StormOptions = {}): voi
 				if (!observationCheck.ok) return ledgerBlock(observationCheck.problem.reason, current, Date.now());
 				const director = directorIdentityFor({ sessionId: current.sessionId, sessionDir: current.sessionDir, parentId: ctx.agent.id });
 				if (director.kind === "unknown") return ledgerBlock(director.problem.reason, current, Date.now());
+				const item = capturedLanes?.nativeTaskItem(spawnKey);
+				if (item === undefined) return ledgerBlock("격리 스폰의 정확한 task 호출과 항목 순번을 확인하지 못했습니다.", current, Date.now());
 				const policy = integration.policy ?? integrationApplyPolicy;
-				const proof = policy.arm({ director: director.value, toolCallId: spawnKey });
+				const proof = policy.arm({ director: director.value, toolCallId: item.toolCallId });
 				if (proof.kind === "unknown") return ledgerBlock(proof.problem.reason, current, Date.now());
-				const item: NativeTaskItem = { toolCallId: spawnKey, itemIndex: 0, handle: spawnKey };
 				const grantCheck = policy.checkBeforeGrant(proof.value, item);
 				if (!grantCheck.ok) return ledgerBlock(grantCheck.problem.reason, current, Date.now());
 				// A host seam with a captured backend/factory also publishes A's prepared admission, candidate id

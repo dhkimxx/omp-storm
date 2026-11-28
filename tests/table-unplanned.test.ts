@@ -67,6 +67,24 @@ test("a reader cannot take a writer's place, even with the same name in one plan
 	});
 });
 
+test("native task receives the authorized names and each exact call item stays bound after admission", () => {
+	const work = new RunLanes("run-native-items");
+	const placed = work.place({ tasks: [
+		{ agent: " storm-explorer ", name: "look", task: "read" },
+		{ agent: " ", name: "fix", task: "write", isolated: true },
+	] }, undefined, team, { agentTools, host, callId: "call-native" });
+	if (!placed.ok) throw new Error(placed.reason);
+	const [look, fix] = placed.input.tasks as { name: string; agent: string }[];
+	expect(look?.agent).toBe("storm-explorer");
+	if (fix === undefined) throw new Error("expected second native item");
+	expect(fix.agent).toBe("task");
+	expect(work.admitChecked({ spawnKey: fix.name, agent: fix.agent, outcome: "routed" }, undefined, {
+		directorTask: { policy: () => privatePolicy },
+	})).toMatchObject({ ok: true });
+	expect(work.nativeTaskItem(fix.name)).toEqual({ toolCallId: "call-native", itemIndex: 1, handle: fix.name });
+	expect(work.nativeTaskItem("fix")).toBeUndefined();
+});
+
 test("a deduped spawn key is refused and its sibling placement is unaffected", () => {
 	const work = new RunLanes("run-dedupe");
 	const placed = work.place(

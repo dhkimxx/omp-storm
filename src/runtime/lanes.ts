@@ -38,6 +38,7 @@ import {
 	directorWriteConflict,
 	type HolderView,
 } from "./arbiter.ts";
+import type { NativeTaskItem } from "./integration-admission.ts";
 import { requirementConflictFromPlan } from "./requirements.ts";
 import { sharedMap } from "./thread-state.ts";
 
@@ -49,6 +50,8 @@ interface Assignment {
 	agent: string;
 	/** The host tool call that placed it, so that call's failure releases exactly its own placement. */
 	callId?: string;
+	/** The original native call item's index, not the run-wide placement ordinal. */
+	itemIndex?: number;
 	/** Identity of the placed item: a late cancel of an older spawn never removes a newer placement of the same name. */
 	placement?: number;
 	/** The shared-tree scope the placement froze (R3, R6); absent only for a legacy caller that passed no policy. */
@@ -1704,7 +1707,7 @@ export class RunLanes {
 			// A caller's effort or model would outrank what the spawn hook answers with: the approved values stand.
 			let next = withoutPinnedFields(withIsolation(entry.item, entry.desired), pinned);
 			const placement = ++this.#placementSerial;
-			const call = options.callId === undefined ? {} : { callId: options.callId };
+			const call = options.callId === undefined ? {} : { callId: options.callId, itemIndex: index };
 			let handle: string;
 			if (entry.lane === undefined) {
 				// R4/D6: every unplanned item, auto or manual, gets a handle omp keeps as the spawn key. It carries the run
@@ -1718,7 +1721,7 @@ export class RunLanes {
 					toolsCarried: entry.toolsCarried,
 					...call,
 				});
-				next = { ...next, name: handle };
+				next = { ...next, name: handle, agent: entry.agent };
 			} else {
 				// A1-5/R4: every planned placement, manual or automatic, gives the host a handle it has never issued. The
 				// run id makes it unique across processes; the lane's name stays the table, ledger and director's key.
@@ -1732,7 +1735,7 @@ export class RunLanes {
 					toolsCarried: entry.toolsCarried,
 					...call,
 				});
-				next = { ...next, name: handle };
+				next = { ...next, name: handle, agent: entry.agent };
 			}
 			// Only a consumer with declared prerequisites receives a reference: no extra text on a legacy plan.
 			const refs = entry.lane === undefined ? undefined : dependencyRefs(entry.lane, options.readiness);
@@ -2291,6 +2294,14 @@ export class RunLanes {
 	 */
 	placementOf(spawnKey: string): number | undefined {
 		return this.#assigned.get(spawnKey)?.placement;
+	}
+
+	/** Exact argument as sent to native task, retained through admission; lane labels are never handles. */
+	nativeTaskItem(handle: string): NativeTaskItem | undefined {
+		const assignment = this.#assigned.get(handle) ?? this.#admitted.get(handle);
+		return assignment?.callId !== undefined && assignment.itemIndex !== undefined
+			? { toolCallId: assignment.callId, itemIndex: assignment.itemIndex, handle }
+			: undefined;
 	}
 
 	/**
