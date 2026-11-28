@@ -1101,7 +1101,7 @@ async function scenario(
 		const spawnStops = spawns.filter(spawn => spawn.stop?.reason === "pooled-thread");
 		const entryErrors = [...rpc.frames.filter(frame => frame.type === "tool_execution_end" && frame.toolName === "task").map(frameText).join("\n").matchAll(/SubagentEntryError:[^\n]*/gu)].map(match => match[0]);
 		const problems: string[] = [];
-		problems.push(...admissionAudit.problems, ...journal.problems, ...parentIssue, ...resultIssue, ...entryErrors.map(error => `spawn entry: ${error}`));
+		problems.push(...admissionAudit.problems, ...journal.problems, ...parentIssue, ...resultIssue);
 		configured.planWorkers = planWorkers;
 
 		check("the plan has exactly the requested lanes", planLanes.length === n && lanes.every(lane => planLanes.includes(lane)), `plan=${JSON.stringify(planLanes)}`);

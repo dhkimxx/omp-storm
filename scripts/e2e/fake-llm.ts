@@ -677,6 +677,21 @@ function candidateIdsFrom(messages: Message[]): string[] {
 	return [];
 }
 
+function candidatePagesFrom(messages: Message[]): { ids: string[]; next: string | undefined } {
+	const ids: string[] = [];
+	let next: string | undefined;
+	for (const message of messages) {
+		if (message.role !== "tool") continue;
+		const text = textOf(message.content);
+		if (!text.startsWith("통합 후보 — 실행 ")) continue;
+		const page = /^- 페이지\(\d+\): (.+)$/mu.exec(text)?.[1];
+		if (page === undefined) continue;
+		ids.push(...(page.match(/\bc1_[0-9a-f]{64}\b/gu) ?? []));
+		next = /^- 다음 페이지: candidateAfter=(c1_[0-9a-f]{64})$/mu.exec(text)?.[1];
+	}
+	return { ids, next };
+}
+
 /**
  * Resolve `candidateIds: "$candidates"` and `candidateId: "$candidates:<index>"` against the newest candidates result.
  * `$candidates` is every ID in printed order; `$candidates:2` is one by position, `$candidates:0,2` a subset. An empty
@@ -685,6 +700,13 @@ function candidateIdsFrom(messages: Message[]): string[] {
 function dynamicStormCall(step: Step, later: Message[], tools: Tool[] | undefined): Decision | undefined {
 	if (!("storm" in step)) return undefined;
 	const args = step.storm;
+	if (args.candidateAfter === "$candidateNext" || args.candidateIds === "$candidatePages") {
+		const pages = candidatePagesFrom(later);
+		if (args.candidateAfter === "$candidateNext") {
+			return extensionCall(tools, "storm", { ...args, candidateAfter: pages.next ?? "" });
+		}
+		return extensionCall(tools, "storm", { ...args, candidateIds: pages.next === undefined ? pages.ids : [] });
+	}
 	const ids = candidateIdsFrom(later);
 	const resolve = (value: unknown): unknown => {
 		if (typeof value !== "string" || !value.startsWith("$candidates")) return value;

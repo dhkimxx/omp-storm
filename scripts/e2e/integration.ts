@@ -961,6 +961,69 @@ async function judgmentOutside(): Promise<void> {
 	});
 }
 
+/** A hundred real captures in bounded waves are a selection-volume gate, not a simultaneous-worker measurement. */
+async function judgmentCandidateVolume(): Promise<void> {
+	const count = Number(process.env.E2E_CANDIDATE_COUNT ?? 100);
+	if (!Number.isSafeInteger(count) || count < 1 || count > 100) throw new Error("E2E_CANDIDATE_COUNT must be 1–100");
+	writeIsolationProfile(env, { enabled: true, apply: false, merge: "patch", backend: nativeBackend(), async: false, workerThreads: 0 });
+	const staged = "e2e-volume-staged.txt";
+	const untracked = "e2e-volume-untracked.txt";
+	seedCommitted(env.project, staged, "base\n");
+	writeFileSync(join(env.project, staged), "staged WIP\n");
+	gitAt(env.project, ["add", "--", staged]);
+	writeFileSync(join(env.project, untracked), "untracked WIP\n");
+	const rows = Array.from({ length: count }, (_, i) => {
+		const lane = `volume-${String(i).padStart(3, "0")}`;
+		return { lane, file: `e2e-${lane}.txt`, result: `${lane}-change` };
+	});
+	const before = parentState(env.project, [staged, untracked]);
+	await sessions.open(cancelAll, async (rpc, files) => {
+		const steps: Step[] = [];
+		for (let at = 0; at < count; at += 16) {
+			steps.push({ tasks: rows.slice(at, at + 16).map(({ lane: name, file }) => ({
+				name, agent: "storm-implementer", task: `Write ${file} in the private checkout`, say: childWrite(file),
+			})) });
+		}
+		steps.push({ storm: { action: "candidates" } });
+		for (let at = 20; at < count; at += 20) steps.push({ storm: { action: "candidates", candidateAfter: "$candidateNext" } });
+		steps.push({ storm: { action: "integrate", candidateIds: "$candidatePages" } });
+		const { run, frames } = await plannedRun(rpc, files, rows.map(({ lane, file, result }) => laneFor(lane, file, result)), steps, { implementer: 4 }, 1, 180_000);
+		const journal = journalAt(files.sessionDir, run.runId);
+		const payloads = (kind: string, key: string) => journal.filter(row => row.kind === kind).map(row => property(row.payload, key));
+		const manifests = payloads("manifest", "manifest");
+		const receipts = payloads("receipt", "receipt");
+		const selections = payloads("selection", "selection");
+		const chosen = property(selections[0], "chosen");
+		const installed = property(selections[0], "ordered");
+		const copies = manifests.filter(manifest => {
+			const bundle = property(manifest, "bundle");
+			const hash = property(property(bundle, "root"), "sha256");
+			return property(bundle, "kind") === "root-only" && typeof hash === "string" && ownedCopyOf(hash) !== undefined;
+		});
+		const reported = stormTexts(frames).flatMap(text => {
+			const page = /^- 페이지\(\d+\): (.+)$/mu.exec(text)?.[1];
+			return page?.match(/\bc1_[0-9a-f]{64}\b/gu) ?? [];
+		});
+		check("volume: each real capture has its own root-only manifest and exact owned copy", manifests.length === count && copies.length === count, `${copies.length}/${count}`);
+		check("volume: the pages name every exact candidate once", reported.length === count && new Set(reported).size === count, `${new Set(reported).size}/${count}`);
+		check("volume: one live selection names precisely the paged candidates", selections.length === 1 && Array.isArray(chosen) && JSON.stringify(chosen) === JSON.stringify(reported), `selections=${selections.length} listed=${reported.length}`);
+		const earliestSelection = journal.findIndex(row => row.kind === "selection");
+		check("volume: no installation ran before explicit selection", earliestSelection >= 0 && journal.slice(0, earliestSelection).filter(row => row.kind === "manifest").length === count &&
+			!journal.slice(0, earliestSelection).some(row => row.kind === "intent"), `selectionRow=${earliestSelection}`);
+		check("volume: each receipt commits one selection item in exact order", Array.isArray(installed) && receipts.length === count &&
+			JSON.stringify(receipts.map(receipt => property(property(receipt, "ref"), "candidateId"))) === JSON.stringify(installed), `receipts=${receipts.length}/${count}`);
+		const outcomes = new Map(run.results?.map(row => [row.id, row.state]));
+		const expectedHash = sha256("storm child change\n");
+		const present = rows.filter(({ file }) => imageAt(join(env.project, file)).sha256 === expectedHash).length;
+		const accepted = rows.filter(({ result }) => outcomes.get(result) === "accepted").length;
+		check("volume: all planned target bytes are independently read back", present === count, `${present}/${count}`);
+		check("volume: receipts reach existing result judgments", accepted === count, `${accepted}/${count}`);
+		const after = parentState(env.project, [staged, untracked]);
+		check("volume: HEAD and exact index bytes are preserved", before.head === after.head && before.index === after.index, `${before.head} ${before.index}`);
+		check("volume: unrelated staged and untracked bytes are preserved", JSON.stringify(before.images) === JSON.stringify(after.images), JSON.stringify(after.images));
+	});
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -1004,6 +1067,7 @@ async function main(): Promise<void> {
 	if (include("judgment", "judgment: accepted")) await suite.step("judgment: an integrated change can be accepted", judgmentAccepted, 300_000);
 	if (include("judgment", "judgment: need integrated")) await suite.step("judgment: a strict integrated consumer waits for the receipt", judgmentNeedIntegrated, 420_000);
 	if (include("judgment", "judgment: outside")) await suite.step("judgment: an outside equal postimage is unattributed", judgmentOutside, 300_000);
+	if (GROUP === "judgment: candidate volume") await suite.step("judgment: candidate volume", judgmentCandidateVolume, 200_000);
 	} else {
 		console.log("GATE carrier/write/judgment: BLOCKED — stock 19.2.1 lacks the guarded native dispatch capability; use INTEGRATION_MANAGED_LAUNCH=1 only with a compatible host.");
 	}
