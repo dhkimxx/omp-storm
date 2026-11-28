@@ -133,6 +133,11 @@ function normalizeItem(value: unknown, bounds: Readonly<ResultEvidenceLimits>): 
 	if (value.digest !== undefined && digest === undefined) return undefined;
 	const previousDigest = value.previousDigest === undefined ? undefined : digestValue(value.previousDigest);
 	if (value.previousDigest !== undefined && previousDigest === undefined) return undefined;
+	let absent: true | undefined;
+	if (value.absent !== undefined) {
+		if (value.absent !== true || value.kind !== "change") return undefined;
+		absent = true;
+	}
 
 	let observations: NonNullable<ResultEvidenceItem["observations"]> | undefined;
 	if (value.observations !== undefined) {
@@ -148,11 +153,13 @@ function normalizeItem(value: unknown, bounds: Readonly<ResultEvidenceLimits>): 
 			if (raw.digest !== undefined && observedDigest === undefined) return undefined;
 			const observedPrevious = raw.previousDigest === undefined ? undefined : digestValue(raw.previousDigest);
 			if (raw.previousDigest !== undefined && observedPrevious === undefined) return undefined;
+			if (raw.absent !== undefined && (raw.absent !== true || observedDigest !== undefined || observedPrevious === undefined)) return undefined;
 			observations.push({
 				path: observedPath,
 				changed: raw.changed,
 				...(observedDigest === undefined ? {} : { digest: observedDigest }),
 				...(observedPrevious === undefined ? {} : { previousDigest: observedPrevious }),
+				...(raw.absent === true ? { absent: true as const } : {}),
 			});
 		}
 	}
@@ -189,6 +196,7 @@ function normalizeItem(value: unknown, bounds: Readonly<ResultEvidenceLimits>): 
 		...(resultPath === undefined ? {} : { path: resultPath }),
 		...(digest === undefined ? {} : { digest }),
 		...(previousDigest === undefined ? {} : { previousDigest }),
+		...(absent === undefined ? {} : { absent }),
 		...(observations === undefined ? {} : { observations }),
 		contentVersion,
 		...(artifact === undefined ? {} : { artifact }),
@@ -221,6 +229,9 @@ function normalizeArtifact(value: unknown): ArtifactEvidenceSource | undefined {
 
 /** Whether a normalized item carries enough content facts to be re-proven at all. */
 function selfConsistent(item: ResultEvidenceItem): boolean {
+	if (item.kind === "change" && item.absent === true) {
+		return item.path !== undefined && item.previousDigest !== undefined;
+	}
 	if (item.digest === undefined) return false;
 	if (item.kind === "answer") return item.citation !== undefined && item.citation.digest !== undefined;
 	if (item.kind === "artifact" && item.artifact !== undefined) {
@@ -228,7 +239,9 @@ function selfConsistent(item: ResultEvidenceItem): boolean {
 		return true;
 	}
 	if (item.kind === "change" && item.path === undefined) {
-		return (item.observations ?? []).some(observation => observation.changed && observation.digest !== undefined);
+		return (item.observations ?? []).some(observation =>
+			observation.changed && (observation.digest !== undefined ||
+				(observation.absent === true && observation.previousDigest !== undefined)));
 	}
 	return true;
 }

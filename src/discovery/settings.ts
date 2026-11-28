@@ -269,6 +269,7 @@ export interface DirectorIsolationObservation {
 	readonly settings: Settings;
 	readonly settingsInstance: string;
 	readonly sessionInstance: string;
+	readonly toolCallId: string;
 	readonly relevantEpoch: number;
 	readonly snapshot: IsolationPolicySnapshot;
 	/** True once a relevant effective change was seen after this observation was armed. */
@@ -363,6 +364,7 @@ export function observeDirectorIsolation(input: {
 		settings,
 		settingsInstance: `${live.instanceKey}#${director.sessionId}`,
 		sessionInstance: live.instanceKey,
+		toolCallId: input.toolCallId,
 		get relevantEpoch(): number {
 			return epoch;
 		},

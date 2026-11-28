@@ -447,12 +447,74 @@ async function fsyncDir(dir: string): Promise<void> {
 	}
 }
 
+/**
+ * Open the admitted artifact root itself and prove the admitted device/inode on that handle. Every native byte read
+ * below stays anchored to this handle: a whole-directory replacement at the same spelling is not the admitted root
+ * even when its child file has the expected name, size and mode.
+ */
+async function openRootAnchor(root: string, expected: SpaceIdentity): Promise<FileHandle> {
+	let handle: FileHandle | undefined;
+	try {
+		handle = await fs.open(
+			root,
+			fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_DIRECTORY ?? 0),
+		);
+		const anchored = await handle.stat({ bigint: true });
+		if (
+			!anchored.isDirectory() ||
+			anchored.dev.toString() !== expected.device ||
+			anchored.ino.toString() !== expected.inode
+		) {
+			throw problem("artifact-root-replaced", "아티팩트 루트 신원이 승인 뒤 바뀌었습니다", root);
+		}
+		return handle;
+	} catch (error) {
+		await handle?.close().catch(() => undefined);
+		if (record(error) && typeof error.code === "string") throw error;
+		throw problem("artifact-root-open-failed", "아티팩트 루트를 안전하게 열지 못했습니다", root);
+	}
+}
+
+/** The path must still name exactly the admitted directory held by the open anchor. */
+async function proveRootIdentity(root: string, anchor: FileHandle, expected: SpaceIdentity): Promise<void> {
+	let anchored;
+	try {
+		anchored = await anchor.stat({ bigint: true });
+	} catch {
+		throw problem("artifact-root-replaced", "아티팩트 루트 핸들을 다시 확인하지 못했습니다", root);
+	}
+	if (
+		!anchored.isDirectory() ||
+		anchored.dev.toString() !== expected.device ||
+		anchored.ino.toString() !== expected.inode
+	) {
+		throw problem("artifact-root-replaced", "아티팩트 루트 신원이 승인 뒤 바뀌었습니다", root);
+	}
+	let current;
+	try {
+		current = await statOf(root);
+	} catch {
+		throw problem("artifact-root-missing", "아티팩트 루트를 읽지 못했습니다", root);
+	}
+	if (
+		!current.isDirectory ||
+		current.isSymbolicLink ||
+		current.dev.toString() !== expected.device ||
+		current.ino.toString() !== expected.inode
+	) {
+		throw problem("artifact-root-replaced", "아티팩트 루트 신원이 승인 뒤 바뀌었습니다", root);
+	}
+}
+
 /** Open one owner-bound regular file without following a replaced link, then prove its exact identity. */
 async function openVerified(
 	root: string,
 	path: string,
 	maxBytes: number,
+	anchor: FileHandle,
+	expectedRoot: SpaceIdentity,
 ): Promise<{ handle: FileHandle; stat: StatIdentity; realPath: string }> {
+	await proveRootIdentity(root, anchor, expectedRoot);
 	const realPath = await proveAncestors(root, path);
 	try {
 		const parent = await fs.realpath(resolve(realPath, ".."));
@@ -488,6 +550,8 @@ async function openVerified(
 		if (!opened.isFile() || !sameIdentity(before, afterStat) || opened.size !== before.size) {
 			throw problem("path-replaced", "네이티브 파일이 확인 중 교체되었습니다", path);
 		}
+		// The handle is the file; the path root must still be the admitted directory the handle was opened under.
+		await proveRootIdentity(root, anchor, expectedRoot);
 		return { handle, stat: afterStat, realPath };
 	} catch (error) {
 		await handle?.close().catch(() => undefined);
@@ -496,7 +560,14 @@ async function openVerified(
 	}
 }
 
-async function proveUnchangedAfter(path: string, opened: StatIdentity, root: string): Promise<void> {
+async function proveUnchangedAfter(
+	root: string,
+	path: string,
+	opened: StatIdentity,
+	anchor: FileHandle,
+	expectedRoot: SpaceIdentity,
+): Promise<void> {
+	await proveRootIdentity(root, anchor, expectedRoot);
 	let after;
 	try {
 		after = await statOf(await proveAncestors(root, path));
@@ -606,53 +677,70 @@ export class IntegrationArtifactStore implements IntegrationBytePort {
 		) {
 			return unknown("artifact-root-replaced", "아티팩트 루트 신원이 승인 뒤 바뀌었습니다", artifactRoot);
 		}
-		// The host may spell the artifact root through an alias (e.g. /tmp on macOS while the canonical root is
-		// /private/tmp). Resolve only the parent to the already bound canonical root; the final component is still opened
-		// with O_NOFOLLOW and its exact inode/length/digest is compared.
-		const canonicalParent = await fs.realpath(dirname(input.nativePath)).catch(() => undefined);
-		if (canonicalParent === undefined || canonicalParent !== artifactRoot) {
-			return unknown("path-outside-root", "네이티브 경로의 상위 디렉터리가 소유 아티팩트 루트가 아닙니다", input.nativePath);
-		}
-		const canonicalPath = join(canonicalParent, basename(input.nativePath));
-		let opened;
+		// The preflight lstat gives a diagnostic before any bytes move; the opened directory handle below is the
+		// authority every later read and commit is checked against.
+		let anchor: FileHandle;
 		try {
-			opened = await openVerified(artifactRoot, canonicalPath, this.#maxObjectBytes);
+			anchor = await openRootAnchor(artifactRoot, admission.artifactRoot);
 		} catch (error) {
 			const detail = record(error) && typeof error.reason === "string" ? error : undefined;
 			return unknown(
-				detail?.code === undefined ? "patch-read-failed" : String(detail.code),
-				detail?.reason === undefined ? "네이티브 패치를 안전하게 읽지 못했습니다" : String(detail.reason),
-				input.nativePath,
+				detail?.code === undefined ? "artifact-root-open-failed" : String(detail.code),
+				detail?.reason === undefined ? "아티팩트 루트를 안전하게 열지 못했습니다" : String(detail.reason),
+				artifactRoot,
 			);
 		}
 		try {
-			const size = Number(opened.stat.size);
-			if (!Number.isSafeInteger(size) || size > this.#maxObjectBytes) {
-				return unknown("patch-too-large", "네이티브 패치가 상한을 넘습니다", input.nativePath);
+			// The host may spell the artifact root through an alias (e.g. /tmp on macOS while the canonical root is
+			// /private/tmp). Resolve only the parent to the already bound canonical root; the final component is still
+			// opened with O_NOFOLLOW and its exact inode/length/digest is compared.
+			const canonicalParent = await fs.realpath(dirname(input.nativePath)).catch(() => undefined);
+			if (canonicalParent === undefined || canonicalParent !== artifactRoot) {
+				return unknown("path-outside-root", "네이티브 경로의 상위 디렉터리가 소유 아티팩트 루트가 아닙니다", input.nativePath);
 			}
-			const charged = this.#charge(admission.key.runId, size, await this.#ownedBytes());
-			if (charged !== undefined) return charged;
-			const release = await this.#acquire(input.deadline, input.signal).catch(() => undefined);
-			if (release === undefined) {
-				this.#refund(admission.key.runId, size);
-				return unknown("copy-deadline", "복사 대기 제한 시간이 지났습니다", input.nativePath);
+			const canonicalPath = join(canonicalParent, basename(input.nativePath));
+			let opened;
+			try {
+				opened = await openVerified(artifactRoot, canonicalPath, this.#maxObjectBytes, anchor, admission.artifactRoot);
+			} catch (error) {
+				const detail = record(error) && typeof error.reason === "string" ? error : undefined;
+				return unknown(
+					detail?.code === undefined ? "patch-read-failed" : String(detail.code),
+					detail?.reason === undefined ? "네이티브 패치를 안전하게 읽지 못했습니다" : String(detail.reason),
+					input.nativePath,
+				);
 			}
 			try {
-				const copied = await this.#streamObject(admission, input, opened, size);
-				if (copied.kind === "unknown") this.#refund(admission.key.runId, size);
-				else {
-					this.#reservedStoreBytes = Math.max(0, this.#reservedStoreBytes - size);
-					this.#knownBytes = undefined;
+				const size = Number(opened.stat.size);
+				if (!Number.isSafeInteger(size) || size > this.#maxObjectBytes) {
+					return unknown("patch-too-large", "네이티브 패치가 상한을 넘습니다", input.nativePath);
 				}
-				return copied;
-			} catch {
-				this.#refund(admission.key.runId, size);
-				return unknown("patch-copy-failed", "네이티브 패치를 소유 저장소로 복사하지 못했습니다", input.nativePath);
+				const charged = this.#charge(admission.key.runId, size, await this.#ownedBytes());
+				if (charged !== undefined) return charged;
+				const release = await this.#acquire(input.deadline, input.signal).catch(() => undefined);
+				if (release === undefined) {
+					this.#refund(admission.key.runId, size);
+					return unknown("copy-deadline", "복사 대기 제한 시간이 지났습니다", input.nativePath);
+				}
+				try {
+					const copied = await this.#streamObject(admission, input, opened, size, anchor);
+					if (copied.kind === "unknown") this.#refund(admission.key.runId, size);
+					else {
+						this.#reservedStoreBytes = Math.max(0, this.#reservedStoreBytes - size);
+						this.#knownBytes = undefined;
+					}
+					return copied;
+				} catch {
+					this.#refund(admission.key.runId, size);
+					return unknown("patch-copy-failed", "네이티브 패치를 소유 저장소로 복사하지 못했습니다", input.nativePath);
+				} finally {
+					release();
+				}
 			} finally {
-				release();
+				await opened.handle.close().catch(() => undefined);
 			}
 		} finally {
-			await opened.handle.close().catch(() => undefined);
+			await anchor.close().catch(() => undefined);
 		}
 	}
 
@@ -693,6 +781,7 @@ export class IntegrationArtifactStore implements IntegrationBytePort {
 		input: CopyPatchInput,
 		opened: { handle: FileHandle; stat: StatIdentity; realPath: string },
 		size: number,
+		anchor: FileHandle,
 	): Promise<IntegrationRead<StoredPatchRef>> {
 		await fs.mkdir(join(this.root, "v1", "tmp"), { recursive: true });
 		await fs.mkdir(this.objectsDir, { recursive: true });
@@ -734,7 +823,13 @@ export class IntegrationArtifactStore implements IntegrationBytePort {
 			})) {
 				throw new Error("file changed during copy");
 			}
-			await proveUnchangedAfter(opened.realPath, opened.stat, admission.artifactRoot.canonicalPath);
+			await proveUnchangedAfter(
+				admission.artifactRoot.canonicalPath,
+				opened.realPath,
+				opened.stat,
+				anchor,
+				admission.artifactRoot,
+			);
 			const digest = hash.digest("hex");
 			const objectPath = join(this.objectsDir, digest);
 			let existing: PathStat | undefined;
@@ -1286,33 +1381,38 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 	}): Promise<IntegrationRead<ChildEntryClaim>> {
 		const checked = validateFrozenAdmission(input.admission);
 		if (checked.kind === "unknown") return checked;
-		const admission = checked.value;
+		const claimed = checked.value;
 		if (
-			input.worker.key !== admission.workerAdmission.key ||
-			input.worker.attempt !== admission.workerAdmission.attempt
+			input.worker.key !== claimed.workerAdmission.key ||
+			input.worker.attempt !== claimed.workerAdmission.attempt
 		) {
 			return unknown("entry-worker-mismatch", "자식 작업자 시도가 승인과 다릅니다");
 		}
-		if (canonicalJson(input.worker.approved ?? null) !== canonicalJson(admission.workerAdmission.approved ?? null)) {
+		if (canonicalJson(input.worker.approved ?? null) !== canonicalJson(claimed.workerAdmission.approved ?? null)) {
 			return unknown("entry-approval-mismatch", "자식 승인 모델이 승인 시점과 다릅니다");
 		}
 		if (input.worker.revokedAt !== undefined) return unknown("entry-revoked", "철회된 작업자입니다");
 		if (input.worker.endedAt !== undefined) return unknown("entry-ended", "이미 끝난 작업자 시도입니다");
 		const workerArtifact = await fs.realpath(input.worker.artifactRoot).catch(() => undefined);
-		if (workerArtifact === undefined || workerArtifact !== admission.artifactRoot.canonicalPath) {
+		if (workerArtifact === undefined || workerArtifact !== claimed.artifactRoot.canonicalPath) {
 			return unknown("entry-artifact-root-mismatch", "작업자 아티팩트 루트가 승인과 다릅니다");
 		}
 		const workerTarget = await fs.realpath(input.worker.targetRoot).catch(() => undefined);
-		if (workerTarget === undefined || workerTarget !== admission.target.authorizedRoot.canonicalPath) {
+		if (workerTarget === undefined || workerTarget !== claimed.target.authorizedRoot.canonicalPath) {
 			return unknown("entry-target-root-mismatch", "작업자 대상 루트가 승인과 다릅니다");
 		}
-		if (input.guardBuild !== admission.policy.guardBuild) return unknown("entry-guard-mismatch", "자식 가드 빌드가 승인과 다릅니다");
+		if (input.guardBuild !== claimed.policy.guardBuild) return unknown("entry-guard-mismatch", "자식 가드 빌드가 승인과 다릅니다");
 		if (!boundedPath(input.childCwd)) return unknown("entry-cwd-invalid", "자식 작업 디렉터리가 올바르지 않습니다");
 		if (!isObservation(input.entry)) return unknown("entry-observation-invalid", "레지스트리 관측 신원이 올바르지 않습니다");
 
 		const prepared = await this.readPrepared(input.worker);
 		if (prepared.kind === "unknown") return prepared;
-		if (prepared.value.candidateId !== admission.candidateId) return unknown("entry-admission-mismatch", "준비된 승인과 전달된 승인이 다릅니다");
+		// The durable record, not the caller's object, seeds every later proof. Only the candidate id would let two
+		// different admissions with the same key seed different claim fields.
+		if (canonicalJson(prepared.value) !== canonicalJson(claimed)) {
+			return unknown("entry-admission-mismatch", "준비된 승인과 전달된 승인이 다릅니다");
+		}
+		const admission = prepared.value;
 
 		const target = await this.#matchTarget(admission);
 		if (!target.ok) return { kind: "unknown", problem: target.problem };
@@ -1395,6 +1495,24 @@ export class IntegrationAdmissionStore implements IntegrationAdmissionPort {
 			return unknown("entry-input-check-failed", "소비 입력 검증이 실패했습니다");
 		}
 		if (!verified.ok) return { kind: "unknown", problem: verified.problem };
+		// verifyInputs is caller code and may await arbitrarily long: the durable admission, its slot and the
+		// live/spend close can all change meanwhile. Re-authorize them immediately before the claim becomes durable;
+		// a stale child entry must not be granted first work under closed or withdrawn authority.
+		const settled = await this.readPrepared(input.worker);
+		if (settled.kind === "unknown") return settled;
+		if (canonicalJson(settled.value) !== canonicalJson(admission)) {
+			return unknown("entry-admission-mismatch", "입력 검증 중 준비된 승인이 바뀌었습니다");
+		}
+		const liveAfter = input.live();
+		if (!liveAfter.ok) return unknown("entry-live-refused", liveAfter.reason);
+		const ownerAfterVerify = await this.#slotOwner(admission.slot.slotPath);
+		if (ownerAfterVerify.kind === "unknown") return ownerAfterVerify;
+		if (
+			ownerAfterVerify.value === null ||
+			!slotOwnedBy(ownerAfterVerify.value, admission.slot, admission.key, admission.item.handle)
+		) {
+			return unknown("entry-slot-not-held", "입력 검증 중 자식 네이티브 슬롯 소유가 바뀌었습니다", admission.slot.slotPath);
+		}
 		const written = await writeExclusive(this.#claimPath(admission.candidateId), claim);
 		if (written === "failed") return unknown("entry-claim-write-failed", "자식 진입 주장을 내구성 있게 쓰지 못했습니다");
 		if (written === "exists") {

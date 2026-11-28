@@ -45,10 +45,12 @@ const UNSAFE_PATH = /[<>:"|?*]/u;
 /** One file the accepted evidence says the producer changed, with the exact post and (when known) pre digest. */
 export interface AcceptedFileFingerprint {
 	path: string;
-	/** sha256 of the accepted postimage observed by S1. */
+	/** sha256 of the accepted postimage observed by S1; empty for an exact deletion. */
 	digest: string;
 	/** sha256 before the attempt. Omitted means S1's baseline found the path absent, never "unknown". */
 	previousDigest?: string;
+	/** The accepted postimage is exact absence; there is no content digest to compare. */
+	deleted?: true;
 }
 
 /**
@@ -679,7 +681,10 @@ function filesProblem(files: unknown, limits: ReadEvidenceLimits): string | unde
 		if (safeRelative(file.path, limits.pathChars) !== file.path) return "변경 파일 경로가 안전한 상대 경로가 아닙니다.";
 		if (seen.has(file.path as string)) return "변경 파일 경로가 중복됩니다.";
 		seen.add(file.path as string);
-		if (digestValue(file.digest) !== file.digest) return "변경 파일의 post 다이제스트가 올바르지 않습니다.";
+		if (file.deleted !== undefined && file.deleted !== true) return "변경 파일의 삭제 표시가 올바르지 않습니다.";
+		if (file.deleted === true) {
+			if (file.digest !== "") return "삭제된 변경 파일에는 post 다이제스트가 없어야 합니다.";
+		} else if (digestValue(file.digest) !== file.digest) return "변경 파일의 post 다이제스트가 올바르지 않습니다.";
 		if (file.previousDigest !== undefined && digestValue(file.previousDigest) !== file.previousDigest) {
 			return "변경 파일의 pre 다이제스트가 올바르지 않습니다.";
 		}
@@ -732,7 +737,7 @@ export interface AcceptedEvidenceInput {
 	result: PlanLaneResult;
 	item: Pick<
 		ResultEvidenceItem,
-		"id" | "identity" | "kind" | "attemptId" | "state" | "path" | "digest" | "previousDigest" | "observations" | "artifact"
+		"id" | "identity" | "kind" | "attemptId" | "state" | "path" | "digest" | "previousDigest" | "absent" | "observations" | "artifact"
 	>;
 	/** The host-bound source kept with that settlement (`SettledAttempt.artifact`), for an isolated artifact. */
 	artifact?: ArtifactEvidenceSource;
@@ -745,6 +750,17 @@ function observedChangeFiles(
 	item: AcceptedEvidenceInput["item"],
 ): { ok: true; files: AcceptedFileFingerprint[] } | { ok: false; reason: string } {
 	if (result.path !== undefined) {
+		if (item.absent === true) {
+			return {
+				ok: true,
+				files: [{
+					path: result.path,
+					digest: "",
+					...(item.previousDigest === undefined ? {} : { previousDigest: item.previousDigest }),
+					deleted: true,
+				}],
+			};
+		}
 		if (item.digest === undefined) return { ok: false, reason: "S1 evidence has no observed digest for the declared path." };
 		return {
 			ok: true,
@@ -759,7 +775,17 @@ function observedChangeFiles(
 	}
 	const files: AcceptedFileFingerprint[] = [];
 	for (const observation of item.observations ?? []) {
-		if (!observation.changed || observation.digest === undefined) continue;
+		if (!observation.changed) continue;
+		if (observation.absent === true) {
+			files.push({
+				path: observation.path,
+				digest: "",
+				...(observation.previousDigest === undefined ? {} : { previousDigest: observation.previousDigest }),
+				deleted: true,
+			});
+			continue;
+		}
+		if (observation.digest === undefined) continue;
 		files.push({
 			path: observation.path,
 			digest: observation.digest,
@@ -948,6 +974,13 @@ async function locateIntegratedParent(
 	}
 	const verified: VerifiedResultFile[] = [];
 	for (const file of files) {
+		if (file.deleted === true) {
+			const gone = await readWorkspace(parent, file.path, limits, budget);
+			if (gone.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘어 부모 내용을 확인하지 못했습니다.");
+			if (gone.kind !== "absent") return fail("not-integrated", `${file.path} 파일이 삭제되지 않았습니다.`);
+			verified.push({ path: file.path, deleted: true });
+			continue;
+		}
 		const state = await readWorkspace(parent, file.path, limits, budget);
 		if (state.kind === "budget") return fail("unverifiable", "읽기 바이트 한도를 넘어 부모 내용을 확인하지 못했습니다.");
 		if (state.kind === "absent") return fail("not-integrated", `${file.path} 파일이 부모에 없습니다.`);

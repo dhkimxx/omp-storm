@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { captureSharedBaseline, evaluateSettledResults, resultContractIdentity } from "../src/runtime/result-evidence.ts";
+import { captureCheckpointProof } from "../src/runtime/checkpoint-import.ts";
 import {
 	type AcceptedResultProjection,
 	locateResult,
@@ -558,6 +559,46 @@ describe("S1 evidence projection", () => {
 
 		// A row from a newer attempt cannot reuse this item's evidence.
 		expect(projectAcceptedResult({ row: { ...row, attemptId: "job:W:W2" }, result, item }).ok).toBe(false);
+	});
+
+	test("an exact deletion is projected and located as absence, and reappearing bytes fail", async () => {
+		const root = await tempRoot("deleted-location");
+		await writeFiles(root, { "gone.txt": "before\n" });
+		const result: PlanLaneResult = { id: "gone-change", kind: "change", criterion: "the file is removed", path: "gone.txt" };
+		const captured = await captureSharedBaseline({ lane: "writer", root, results: [result] });
+		if (!captured.ok) throw new Error(captured.reason);
+		await fs.rm(path.join(root, "gone.txt"));
+		const evaluated = await evaluateSettledResults({
+			lane: "writer",
+			attemptId: "job:W:W",
+			results: [result],
+			shared: { root, baseline: captured.baseline },
+		});
+		if (!evaluated.ok) throw new Error(evaluated.reason);
+		const item = evaluated.report.results[0]!;
+		expect(item).toMatchObject({ state: "reviewable", absent: true, path: "gone.txt" });
+		const acceptedItem = { ...item, state: "accepted" as const };
+		const row = {
+			id: result.id,
+			state: "accepted" as const,
+			attemptId: "job:W:W",
+			identity: item.identity,
+			contentVersion: item.contentVersion!,
+		};
+		const projected = projectAcceptedResult({ row, result, item: acceptedItem });
+		if (!projected.ok) throw new Error(projected.reason);
+		expect(captureCheckpointProof(acceptedItem)).toBeDefined();
+		expect(projected.accepted.files).toEqual([
+			{ path: "gone.txt", digest: "", previousDigest: captured.baseline.entries[0]?.digest, deleted: true },
+		]);
+		const located = requireLocation(await locateResult({ mode: "integrated", parentRoot: root, accepted: projected.accepted }));
+		expect(located.kind).toBe("parent-file");
+		expect(located.path).toBe("gone.txt");
+		expect(located.digest).toBeUndefined();
+		expect(located.files).toEqual([{ path: "gone.txt", deleted: true }]);
+
+		await writeFiles(root, { "gone.txt": "back again\n" });
+		expectFailure(await locateResult({ mode: "integrated", parentRoot: root, accepted: projected.accepted }), "not-integrated");
 	});
 });
 

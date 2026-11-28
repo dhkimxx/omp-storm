@@ -165,6 +165,38 @@ describe("shared change evidence", () => {
 		expect(evaluated.report.results[0]?.state).toBe("unmet");
 		expect(evaluated.report.results[0]?.reason).toContain("레인 files");
 	});
+
+	test("a deleted declared path is absence evidence, not an empty file", async () => {
+		const root = await tempRoot("deleted-change");
+		await put(root, "gone.md", "before deletion\n");
+		const results = [change("gone", "gone.md")];
+		const baseline = await baselineOf(root, results);
+		await fs.rm(path.join(root, "gone.md"));
+		const evaluated = await evaluateSettledResults({ lane: "api", attemptId: "attempt-1", results, shared: { root, baseline } });
+		expect(evaluated.ok).toBe(true);
+		if (!evaluated.ok) return;
+		const item = evaluated.report.results[0]!;
+		expect(item).toMatchObject({ id: "gone", state: "reviewable", path: "gone.md", absent: true });
+		expect(item.digest).toBeUndefined();
+		expect(item.previousDigest).toBe(baseline.entries[0]?.digest);
+		expect(item.contentVersion).toBeDefined();
+	});
+
+	test("a pathless deletion is recorded as an absent observation", async () => {
+		const root = await tempRoot("pathless-delete");
+		await put(root, "one.md", "before\n");
+		await put(root, "two.md", "keep\n");
+		const results: PlanLaneResult[] = [{ id: "prose", kind: "change", criterion: "the prose response is improved" }];
+		const baseline = await baselineOf(root, results, "api", { laneFiles: ["one.md", "two.md"] });
+		await fs.rm(path.join(root, "one.md"));
+		const evaluated = await evaluateSettledResults({ lane: "api", attemptId: "attempt-1", results, shared: { root, baseline }, laneFiles: ["one.md", "two.md"] });
+		expect(evaluated.ok).toBe(true);
+		if (!evaluated.ok) return;
+		expect(evaluated.report.results[0]?.observations).toEqual(
+			expect.arrayContaining([expect.objectContaining({ path: "one.md", changed: true, absent: true })]),
+		);
+		expect(evaluated.report.results[0]?.contentVersion).toBeDefined();
+	});
 });
 
 describe("source-citing answers", () => {

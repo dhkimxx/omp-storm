@@ -191,8 +191,11 @@ export interface ResultCitationView {
 export interface ResultObservation {
 	path: string;
 	changed: boolean;
+	/** Present when the path is a regular file after the attempt; absent for a deletion. */
 	digest?: string;
 	previousDigest?: string;
+	/** `changed` with no digest and a previous file digest: the declared path was deleted. */
+	absent?: true;
 }
 
 /** Per-result evidence. `accepted` means only this declared result was met, never that the run is verified. */
@@ -209,6 +212,8 @@ export interface ResultEvidenceItem {
 	digest?: string;
 	/** The pre-attempt digest when a shared file was observed before and after. */
 	previousDigest?: string;
+	/** A declared path existed before the attempt and is absent after it; there is no postimage digest. */
+	absent?: true;
 	/** Present for a pathless change: every declared lane file's before/after fact. */
 	observations?: ResultObservation[];
 	/** Content-only version (path/digests/source excerpt digest) reused across attempts while the content is unchanged. */
@@ -256,6 +261,12 @@ export interface EvaluateResultsInput {
 	laneFiles?: readonly string[];
 	/** The approved config whose `requiredChecks` a declared `check` may name. Defaults to `checks.config` when valid. */
 	config?: StormConfig;
+	/**
+	 * The exact target-relative paths a current integration receipt attributes to an isolated change, keyed by result
+	 * id. Present only for the re-evaluation after its exact write; absent for the ordinary post-attempt read, where an
+	 * isolated change has no parent-tree judgment. A path not listed here can never satisfy that result.
+	 */
+	integratedChange?: Readonly<Record<string, readonly string[]>>;
 	/** Cancels between bounded reads; a cancelled evaluation never reports `complete`. */
 	signal?: AbortSignal;
 	limits?: Partial<ResultEvidenceLimits>;
@@ -422,10 +433,12 @@ export function resultEvidenceDigest(report: Omit<ResultEvidenceReport, "digest"
 function contentVersionOf(item: Omit<ResultEvidenceItem, "contentVersion">): string | undefined {
 	const observed =
 		item.observations !== undefined
-			? item.observations.map(observation => [observation.path, observation.digest ?? null])
-			: item.digest === undefined
-				? undefined
-				: [[item.path ?? "", item.digest]];
+			? item.observations.map(observation => [observation.path, observation.absent === true ? "absent" : observation.digest ?? null])
+			: item.absent === true
+				? [[item.path ?? "", "absent"]]
+				: item.digest === undefined
+					? undefined
+					: [[item.path ?? "", item.digest]];
 	if (observed === undefined) return undefined;
 	return sha256(
 		JSON.stringify([
@@ -721,6 +734,8 @@ interface ItemOutcome {
 	reason?: string;
 	digest?: string;
 	previousDigest?: string;
+	/** A declared pathful change whose postimage is exact absence. */
+	absent?: true;
 	observations?: ResultObservation[];
 	artifact?: "directory" | "patch" | "file";
 	check?: ResultCheckView;
@@ -737,6 +752,7 @@ async function evaluateChange(
 	budget: ReadBudget,
 	cache: Map<string, FileState>,
 	checks: ApprovedCheckEvidence | undefined,
+	attributable?: readonly string[],
 ): Promise<ItemOutcome> {
 	const pathless = result.path === undefined;
 	let targets: readonly ResultBaselineEntry[];
@@ -750,6 +766,15 @@ async function evaluateChange(
 		if (entry === undefined) return { state: "unmet", reason: "이 결과의 사전 기준선 항목이 없습니다." };
 		targets = [entry];
 	}
+	// A receipt-backed change is credited only for content changes the exact write attributed to this result's original
+	// evaluation scope. Mode-only or unrelated target bytes never enter the observation set.
+	if (attributable !== undefined) {
+		const allowed = new Set(attributable);
+		targets = targets.filter(entry => allowed.has(entry.path));
+		if (targets.length === 0) {
+			return { state: "unmet", reason: "통합 영수증이 이 결과 범위의 내용 변경을 포함하지 않습니다." };
+		}
+	}
 	for (const entry of targets) {
 		if (entry.identity !== resultContractIdentity(result)) {
 			return { state: "unmet", reason: "결과 계약이 사전 기준선과 달라졌습니다. 기준선을 다시 캡처해야 합니다." };
@@ -762,6 +787,7 @@ async function evaluateChange(
 	const observations: ResultObservation[] = [];
 	const changedFiles: Array<{ entry: ResultBaselineEntry; state: Extract<FileState, { kind: "file" }> }> = [];
 	let changedCount = 0;
+	let absent = false;
 	let firstFile: Extract<FileState, { kind: "file" }> | undefined;
 	let firstPrevious: string | undefined;
 	for (const entry of targets) {
@@ -780,11 +806,14 @@ async function evaluateChange(
 			entry.state === "absent"
 				? observed.kind === "file"
 				: observed.kind === "absent" || observed.bytes !== entry.bytes || observed.digest !== entry.digest;
+		const deleted = changed && observed.kind === "absent" && entry.state !== "absent";
+		if (deleted && !pathless) absent = true;
 		observations.push({
 			path: entry.path,
 			changed,
 			...(observed.kind === "file" ? { digest: observed.digest } : {}),
 			...(entry.digest === "" ? {} : { previousDigest: entry.digest }),
+			...(deleted ? { absent: true as const } : {}),
 		});
 		if (changed) changedCount += 1;
 		if (observed.kind === "file") {
@@ -839,6 +868,7 @@ async function evaluateChange(
 		state: "reviewable",
 		...(digest === undefined ? {} : { digest }),
 		...(previousDigest === undefined ? {} : { previousDigest }),
+		...(absent ? { absent: true as const } : {}),
 		...(pathless ? { observations } : {}),
 		...(checkView === undefined ? {} : { check: checkView }),
 	};
@@ -1528,11 +1558,11 @@ export async function evaluateSettledResults(input: EvaluateResultsInput): Promi
 	const items: ResultEvidenceItem[] = [];
 	for (const result of parsed.results) {
 		if (input.signal?.aborted === true) return { ok: false, reason: "결과 평가가 취소되었습니다." };
+		const attributable = input.integratedChange?.[result.id];
 		let outcome: ItemOutcome;
-		if (result.kind === "change" && input.artifactMode === "isolated") {
-			// Row 2 of the 0.29.0 table: an isolated worker's change is never judged on the parent tree in this version.
-			// The parent may hold another writer's bytes (ISO P7-B) and Storm has no managed integration; the reason
-			// names that missing capability, never "the worker changed nothing".
+		if (result.kind === "change" && input.artifactMode === "isolated" && attributable === undefined) {
+			// Row 2 of the 0.29.0 table: an isolated worker's change is never judged on the parent tree before its exact
+			// write. The parent may hold another writer's bytes (ISO P7-B) and no receipt attributes these paths yet.
 			outcome = { state: "unmet", reason: ISOLATED_CHANGE_REASON };
 		} else if (result.kind === "change") {
 			const entries = baselineEntries.get(result.id) ?? [];
@@ -1544,10 +1574,10 @@ export async function evaluateSettledResults(input: EvaluateResultsInput): Promi
 				} else if (JSON.stringify(actual) !== JSON.stringify(expected)) {
 					outcome = { state: "unmet", reason: "사전 기준선 파일 범위가 현재 레인 files와 다릅니다." };
 				} else {
-					outcome = await evaluateChange(result, entries, sharedRoot, limits, budget, changeCache, input.checks);
+					outcome = await evaluateChange(result, entries, sharedRoot, limits, budget, changeCache, input.checks, attributable);
 				}
 			} else {
-				outcome = await evaluateChange(result, entries, sharedRoot, limits, budget, changeCache, input.checks);
+				outcome = await evaluateChange(result, entries, sharedRoot, limits, budget, changeCache, input.checks, attributable);
 			}
 		} else if (result.kind === "artifact") {
 			if (input.artifactMode === "shared") {
@@ -1571,6 +1601,7 @@ export async function evaluateSettledResults(input: EvaluateResultsInput): Promi
 			...(result.path === undefined ? {} : { path: result.path }),
 			...(outcome.digest === undefined ? {} : { digest: outcome.digest }),
 			...(outcome.previousDigest === undefined ? {} : { previousDigest: outcome.previousDigest }),
+			...(outcome.absent === true ? { absent: true as const } : {}),
 			...(outcome.observations === undefined ? {} : { observations: outcome.observations }),
 			...(outcome.artifact === undefined ? {} : { artifact: outcome.artifact }),
 			...(outcome.check === undefined ? {} : { check: outcome.check }),

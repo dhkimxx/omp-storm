@@ -104,6 +104,7 @@ import {
 	type InputSatisfaction,
 	inputSnapshot,
 	ledgerInputSatisfaction,
+	MISSING_INPUT,
 	requirementConflict,
 	resultInputs,
 	staleRequirementIdsForPlan,
@@ -139,6 +140,21 @@ import {
 import { answerReviewAnchor, answerReviewPacket, answerReviewReceipt, answerReviewVerdict, type AnswerReviewSubject } from "./answer-review.ts";
 import { captureSharedBaseline, evaluateSettledResults, ISOLATED_CHANGE_REASON, resultContractIdentity, verifyAnswerReceipt, type AnswerCitation, type ApprovedCheckEvidence, type ArtifactEvidenceSource, type ResultBaseline, type ResultEvidenceItem } from "./result-evidence.ts";
 import { locateResult, projectAcceptedResult } from "./result-location.ts";
+import type {
+	AdmissionKey, AdmissionSubject, ConsumedInput, FrozenIntegrationAdmission, IntegrationCandidateId, IntegrationCheck,
+	IntegrationProblem, IntegrationRead, LocatedInputPath, PathImage, ReceiptRef,
+} from "./integration-admission.ts";
+import type { CaptureUpdate, LateRecoveryObservation, SealedCaptureManifest } from "./integration-capture.ts";
+import type { ByteWindow, IntegrationDeltaPort, Presence } from "./integration-delta.ts";
+import type {
+	CandidateRevision, CandidateWriteResult, FenceResolution, FenceResolutionRequest, IntegrationJournalPort,
+	IntegrationLiveGrant, IntegrationWriterPort, SelectionSnapshot, StoredCandidate, WriteReceipt,
+	WriteStepRecord,
+} from "./integration-record.ts";
+import type {
+	AttemptWriteWitness, CandidateDetail, CandidateLine, CandidateProjection, CandidateQuery, IntegratedInput,
+	IntegrationAttemptPort, IntegrationControllerPort, IntegrationSelectionReply, QueueReadiness, QueueWrite,
+} from "./integration-controller-port.ts";
 import { buildHandoff, discardStartRecord, newRunId, pruneRuns, publishRun, readRun, REQUEST_LIMIT, resumableRun, RUN_KEEP, writeRun } from "./run.ts";
 import { carryGoal } from "./goal.ts";
 import { appendRunIndex, summarizeForIndex } from "./run-index.ts";
@@ -511,6 +527,196 @@ interface SettledAttempt {
 	artifact?: ArtifactEvidenceSource;
 	/** The lane declared a check and no approved report existed at settlement; one re-evaluation is owed. */
 	checkDeferred?: boolean;
+	/** Current integration receipts this attempt's change rows were re-evaluated from; absent until a write. */
+	integrated?: {
+		readonly receipt: ReceiptRef;
+		readonly candidateId: IntegrationCandidateId;
+		readonly witnesses: ReadonlyMap<string, AttemptWriteWitness>;
+		readonly evaluatedAt: number;
+	};
+}
+
+/** One exact receipt-backed result location, kept only for this process's run. */
+interface IntegrationResultState {
+	readonly receipt: ReceiptRef;
+	readonly attemptId: string;
+	readonly candidateId: IntegrationCandidateId;
+	readonly manifestDigest: string;
+	readonly attributable: readonly LocatedInputPath[];
+	readonly observedAt: number;
+}
+
+/** A resultless producer's whole-footprint receipt version, never a fake result row. */
+interface IntegrationFootprintState {
+	readonly lane: string;
+	readonly receipt: ReceiptRef;
+	readonly version: string;
+	readonly paths: readonly LocatedInputPath[];
+	readonly observedAt: number;
+}
+
+/** One admission's in-memory integration state; the durable seal/receipt stays in B's journal. */
+interface IntegrationAdmissionState {
+	admission: FrozenIntegrationAdmission;
+	status: "prepared" | "committed" | "discarded";
+	seal?: SealedCaptureManifest;
+	sealSequence?: number;
+	recovery: LateRecoveryObservation[];
+	/** The exact native attempt this seal names; binding evidence only, never a second settlement. */
+	boundAttemptId?: string;
+	/** Integration-only epoch for resultless/unplanned admissions (planned resultful epochs live in the subject). */
+	epoch?: number;
+	lastWrite?: CandidateWriteResult;
+	lastWriteAt?: number;
+	/** A fail-closed active-run diagnostic or a bound contradiction; never a grant. */
+	problem?: IntegrationProblem;
+	observedAt: number;
+	/** The one synchronous final check published by revalidate, consumed by `checkCandidate`. */
+	liveCheck?: { revision: CandidateRevision; problem?: IntegrationProblem };
+}
+
+interface IntegrationRunState {
+	readonly admissions: Map<string, IntegrationAdmissionState>;
+	readonly candidates: Map<string, IntegrationAdmissionState>;
+	readonly receipts: Map<string, IntegrationResultState>;
+	readonly footprints: Map<string, IntegrationFootprintState>;
+	/** Latest integration-only epoch per planned resultless lane and per unplanned item. */
+	readonly laneEpoch: Map<string, number>;
+	readonly itemEpoch: Map<string, number>;
+	/** Rows awaiting an explicit selection for one exact candidate. */
+	readonly awaiting: Map<string, IntegrationCandidateId>;
+	replayDone: boolean;
+	lastSequence?: number;
+}
+
+function emptyIntegrationState(): IntegrationRunState {
+	return {
+		admissions: new Map(),
+		candidates: new Map(),
+		receipts: new Map(),
+		footprints: new Map(),
+		laneEpoch: new Map(),
+		itemEpoch: new Map(),
+		awaiting: new Map(),
+		replayDone: false,
+	};
+}
+
+const INTEGRATION_KEY_SCHEMA = "storm.integration-admission/v1";
+const INTEGRATION_CANDIDATE_RE = /^c1_[0-9a-f]{64}$/u;
+const INTEGRATION_DIGEST_RE = /^[0-9a-f]{64}$/u;
+const INTEGRATION_CANDIDATES_MAX = 128;
+const INTEGRATION_LIST_BYTES_MAX = 16 * 1024;
+const INTEGRATION_WINDOW_BYTES = 64 * 1024 * 1024;
+const INTEGRATION_WINDOW_MS = 120_000;
+const INTEGRATION_EXAMPLES = 3;
+const INTEGRATION_PAGE = 20;
+const INTEGRATION_RECOVERY_MAX = 8;
+const READINESS_KINDS: readonly QueueReadiness["kind"][] = [
+	"awaiting-native", "ready", "confirmed-empty", "kept-only", "unknown", "conflict", "stale",
+];
+const WRITE_KINDS: readonly QueueWrite["kind"][] = [
+	"not-written", "not-recorded", "present-unattributed", "no-effect", "recovery-required", "written",
+];
+
+/** A bounded machine problem; wording is D's, this is only the fail-closed fact. */
+function integrationProblem(code: string, reason: string, file?: string): IntegrationProblem {
+	return { code, reason: compactResultReason(reason), ...(file === undefined ? {} : { path: file }) };
+}
+
+function integrationUnknown<T>(code: string, reason: string): IntegrationRead<T> {
+	return { kind: "unknown", problem: integrationProblem(code, reason) };
+}
+
+function integrationKnown<T>(value: T): IntegrationRead<T> {
+	return { kind: "known", value };
+}
+
+function integrationOk(): IntegrationCheck {
+	return { ok: true };
+}
+
+function integrationFail(code: string, reason: string): IntegrationCheck {
+	return { ok: false, problem: integrationProblem(code, reason) };
+}
+
+/** The one runtime spelling of an admission's candidate id: `c1_` plus SHA-256 of the versioned key. */
+function candidateIdFor(key: AdmissionKey): IntegrationCandidateId {
+	const digest = createHash("sha256").update(JSON.stringify([key.schema, key.runId, key.dispatch]), "utf8").digest("hex");
+	return `c1_${digest}` as IntegrationCandidateId;
+}
+
+function isCandidateId(value: unknown): value is IntegrationCandidateId {
+	return typeof value === "string" && INTEGRATION_CANDIDATE_RE.test(value);
+}
+
+function sameKey(left: AdmissionKey, right: AdmissionKey): boolean {
+	return left.schema === right.schema && left.runId === right.runId && left.dispatch === right.dispatch;
+}
+
+function sameReceipt(left: ReceiptRef, right: ReceiptRef): boolean {
+	return sameKey(left.key, right.key) && left.candidateId === right.candidateId &&
+		left.manifestDigest === right.manifestDigest && left.intentSequence === right.intentSequence &&
+		left.receiptSequence === right.receiptSequence;
+}
+
+function itemIdentity(item: { readonly toolCallId: string; readonly itemIndex: number; readonly handle: string }): string {
+	return `${item.toolCallId}\u0000${item.itemIndex}\u0000${item.handle}`;
+}
+
+/** Whether two path images describe the same exact content, mode and absence. */
+function sameImage(left: PathImage, right: PathImage): boolean {
+	if (left.kind !== right.kind) return false;
+	if (left.kind === "absent" || right.kind === "absent") return true;
+	return left.mode === right.mode && left.bytes === right.bytes && left.sha256 === right.sha256;
+}
+
+/** A content change; a mode-only difference is deliberately not credit. */
+function contentChanged(before: PathImage, after: PathImage): boolean {
+	if (before.kind !== after.kind) return true;
+	if (before.kind === "absent" || after.kind === "absent") return false;
+	return before.bytes !== after.bytes || before.sha256 !== after.sha256;
+}
+
+/** The exact result contract digest an admission freezes; lane and epoch are separate fields. */
+function contractDigestOf(results: readonly PlanLaneResult[]): string {
+	const canonical = results
+		.map(result => persistedResultContract(result))
+		.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+	return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
+/** The content changes one receipt made inside a result's original evaluation scope. */
+function attributablePaths(
+	receipt: WriteReceipt,
+	result: PlanLaneResult,
+	laneFiles: readonly string[] | undefined,
+): LocatedInputPath[] {
+	const scope = result.path === undefined ? (laneFiles ?? []) : [result.path];
+	if (scope.length === 0) return [];
+	const allowed = new Set(scope);
+	const paths: LocatedInputPath[] = [];
+	for (const intent of receipt.intent.paths) {
+		if (!allowed.has(intent.path)) continue;
+		if (!contentChanged(intent.before, intent.after)) continue;
+		paths.push({ path: intent.path, image: intent.after });
+	}
+	return paths;
+}
+
+/** Every content change a receipt made; a resultless producer exports this whole footprint. */
+function receiptPaths(receipt: WriteReceipt): LocatedInputPath[] {
+	return receipt.intent.paths
+		.filter(intent => contentChanged(intent.before, intent.after))
+		.map(intent => ({ path: intent.path, image: intent.after }));
+}
+
+function emptyReadinessCounts(): Record<QueueReadiness["kind"], number> {
+	return Object.fromEntries(READINESS_KINDS.map(kind => [kind, 0])) as Record<QueueReadiness["kind"], number>;
+}
+
+function emptyWriteCounts(): Record<QueueWrite["kind"], number> {
+	return Object.fromEntries(WRITE_KINDS.map(kind => [kind, 0])) as Record<QueueWrite["kind"], number>;
 }
 
 /**
@@ -893,11 +1099,14 @@ interface OwnRun {
 	shownPhase?: RunPhase;
 	/** View-only: a required-check runner is inside `runRequiredChecks` now, not merely being prepared. */
 	checksRunning?: boolean;
-	/**
-	 * The director committed one of its own path edits in this run (R10's gate input): a run with one is never
+	/** The director committed one of its own path edits in this run (R10's gate input): a run with one is never
 	 * "quick-only". Memory only, never a record field; the extension raises it through `noteDirectorEdit`.
 	 */
 	directorEdit?: boolean;
+	/** Isolated-integration candidates/receipts for this run; absent until an admission is prepared. */
+	integration?: IntegrationRunState;
+	/** The final record is being built; no new settlement, capture update or selection may mutate the run. */
+	finalizing?: true;
 }
 
 type Refusal = Extract<RunRequestResult, { ok: false }>;
@@ -948,9 +1157,10 @@ export interface RunControllerDeps {
 	): Promise<AcquireRunLeaseResult>;
 	/**
 	 * The live status record: the run after it was first written, on every live rewrite and when a round is sent;
-	 * `undefined` when the run ends. A failing hook never breaks the run.
+	 * `undefined` when the run ends. `integration` is C's last exact candidate projection for that run, never a
+	 * fresh journal/fs read from the view side. A failing hook never breaks the run.
 	 */
-	live?(ctx: ExtensionContext, run: RunRecord | undefined): void;
+	live?(ctx: ExtensionContext, run: RunRecord | undefined, integration?: CandidateProjection): void;
 	/**
 	 * The approved write authority of each lane of `plan` (`lanePolicy` over the effective agent tools), for the one line
 	 * that says which writing lanes the write order now lets start. Absent, or `undefined` when the team cannot be read:
@@ -964,6 +1174,18 @@ export interface RunControllerDeps {
 	 * have no marker.
 	 */
 	closeSpend?(runId: string, onExceed: BudgetConfig["onExceed"]): void | Promise<void>;
+	/**
+	 * Isolated-integration ports (journal, exact delta, exclusive writer). Absent until the host boundary is proved:
+	 * every existing attempt/evaluation path then keeps its 0.29.0 behavior. E attaches the same ports once enabled.
+	 */
+	integration?: IntegrationPorts;
+}
+
+/** The three external seams C consumes; A/B/E own their implementations. */
+export interface IntegrationPorts {
+	readonly journal: IntegrationJournalPort;
+	readonly delta: IntegrationDeltaPort;
+	readonly writer: IntegrationWriterPort;
 }
 
 /**
@@ -977,7 +1199,7 @@ type StartMode = (
 	| (Pick<PlanlessStart, "turnStartedAt" | "deadline" | "lease"> & { kind: "planless" })
 ) & { authorize?: (() => string | undefined) | undefined };
 
-export class RunController {
+export class RunController implements IntegrationAttemptPort, IntegrationControllerPort {
 	#pending: { runId: string; spec: RunSpec } | undefined;
 	/** A start is between its checks and its handoff (it may be asking, compacting, or recording the run). */
 	#starting = false;
@@ -992,9 +1214,24 @@ export class RunController {
 	/** One finalization per run: a second stop during drain joins it instead of writing a second record. */
 	#finishing: Promise<RunRecord | undefined> | undefined;
 	readonly #timings: StormTimings;
+	/** Isolated-integration seams; absent keeps every existing behavior. */
+	#integration: IntegrationPorts | undefined;
+	/** Read-only projection of the run that just closed in this process, so its candidates remain inspectable. */
+	#recentIntegration: { runId: string; state: IntegrationRunState; rows?: readonly RunResult[] } | undefined;
+	/** The last exact projection C computed for the live run; views never read the journal themselves. */
+	#lastProjection: { runId: string; projection: CandidateProjection } | undefined;
 
 	constructor(private readonly deps: RunControllerDeps) {
 		this.#timings = deps.timings ?? DEFAULT_TIMINGS;
+		this.#integration = deps.integration;
+	}
+
+	/**
+	 * E attaches the journal/delta/writer once the host boundary is proved. Late attachment is the supported path: no
+	 * earlier attempt or evaluation gains integration state, and a repeated call replaces only the seams.
+	 */
+	attachIntegration(ports: IntegrationPorts | undefined): void {
+		this.#integration = ports;
 	}
 
 	/** Wake one consumer admission when a prerequisite's settlement finishes or times out. */
@@ -1497,7 +1734,15 @@ export class RunController {
 					// The earlier run's final facts are history for an explicit resume or a chosen follow-up only; an
 					// unrelated task carries none.
 					const earlier = continued ?? followUp;
-					const history = earlier === undefined ? undefined : closeoutHandoff(earlier);
+					const earlierProjection = earlier === undefined || this.#integration === undefined
+						? undefined
+						: await this.project({ kind: "overview", runId: earlier.runId }, this.#readWindow()).catch(() => undefined);
+					const history = earlier === undefined
+						? undefined
+						: (closeoutHandoff as unknown as (run: RunRecord, integration?: CandidateProjection) => string)(
+								earlier,
+								earlierProjection?.kind === "not-recorded" || earlierProjection === undefined ? undefined : earlierProjection,
+							);
 					handoff = buildHandoff({ runId, config, hash, task, ...(roundLimit === undefined ? {} : { maxRounds: roundLimit }),
 						...(resume === undefined ? {} : { resume: { ...resume, ...(checkpoint === undefined ? {} : { checkpoint }) } }),
 						...(history === undefined || history === "" ? {} : { history: { text: history, ...(followUp !== undefined ? { followUp: true } : {}) } }) });
@@ -1749,9 +1994,12 @@ export class RunController {
 					} else {
 						integrated = location.integrated;
 						retained = location.retained;
-						// Row 5: an isolated producer's result has no integrated location in this version. The reason is
-						// carried beside the result so the prerequisite refusal says why the condition cannot be met.
-						if (isolated && !integrated && result.kind !== "answer") retainedReason = ISOLATED_INTEGRATED_REASON;
+						// An isolated producer's retained artifact has no integrated location; an integrated change does, and
+						// then this reason is absent. The reason is carried beside the result for the consumer's refusal.
+						if (isolated && !integrated && result.kind !== "answer" &&
+							!(result.kind === "change" && own.integration?.receipts.get(result.id) !== undefined)) {
+							retainedReason = ISOLATED_INTEGRATED_REASON;
+						}
 					}
 				} else if (result.kind === "answer" && state === "reviewable" && row !== undefined) {
 					// A consumer that may start from a reviewable answer still starts only from the cited bytes S1 read.
@@ -1795,12 +2043,17 @@ export class RunController {
 				own.settling.has(name) ||
 				[...own.attempts.values()].some(prepared => prepared.lane === name) ||
 				(handle !== undefined && agents.some(agent => agent.id === handle && agent.state === "running"));
+			const resultlessIntegrated = sharedTeam && lane.isolationReason === undefined
+				? settled
+				: this.#integration !== undefined && isolated
+					? (await this.#currentFootprint(own, name, this.#readWindow())) !== undefined
+					: false;
 			view.set(name, {
 				results,
 				settled,
 				running,
-				// A legacy lane with no declared results has only the shared tree itself as integration proof.
-				integrated: sharedTeam && lane.isolationReason === undefined && (results.length === 0 ? settled : results.every(result => result.integrated)),
+				// A legacy/resultless lane is integrated by the shared tree, or by a current receipt of its whole footprint.
+				integrated: results.length === 0 ? resultlessIntegrated : results.every(result => result.integrated),
 				...(handle === undefined ? {} : { handle }),
 			});
 		}
@@ -1831,9 +2084,25 @@ export class RunController {
 		if (hasStaleInputs(row, own.record.results ?? [])) {
 			return { ok: false, reason: "선행 결과가 바뀌어 이전 근거를 다시 확인해야 합니다." };
 		}
-		// Row 2: an isolated change has no parent-tree location this version can judge. Even when someone else wrote
-		// the declared bytes, they are not this attempt's work (ISO P7-B); a restored or review-accepted row is reopened.
-		if (isolated === true && result.kind === "change") return { ok: false, reason: ISOLATED_CHANGE_REASON };
+		// An isolated change is judged only from the exact current integration receipt. With integration disabled the
+		// 0.29.0 refusal stands; with it enabled, a missing or drifted receipt is a named location failure, never credit
+		// from whatever bytes happen to be in the parent (ISO P7-B).
+		let receiptVerified = false;
+		if (result.kind === "change") {
+			const recorded = own.integration?.receipts.get(row.id);
+			if (this.#integration === undefined) {
+				if (isolated === true) return { ok: false, reason: ISOLATED_CHANGE_REASON };
+			} else if (isolated === true || recorded !== undefined) {
+				if (recorded === undefined || recorded.attemptId !== row.attemptId) {
+					return { ok: false, reason: "이 격리 변경에는 현재 통합 영수증이 없습니다. 통합을 선택해야 수용 근거가 됩니다." };
+				}
+				const verified = await this.#verifyReceiptState(own, result, row, recorded, this.#readWindow());
+				if (!verified.ok) {
+					return { ok: false, reason: `통합 영수증을 현재 확인하지 못했습니다(${verified.problem.code}).` };
+				}
+				receiptVerified = true;
+			}
+		}
 		if (restoredSubmission) {
 			const source = await revalidateCheckpointProof({ row, result, root: own.root, forReview: true });
 			if (!source.ok) return source;
@@ -1851,7 +2120,7 @@ export class RunController {
 			if (problem !== undefined) return { ok: false, reason: problem };
 			return { ok: true, integrated: false };
 		}
-		if (row.origin === "review") return { ok: true, integrated: false };
+		if (row.origin === "review" && !receiptVerified) return { ok: true, integrated: false };
 		const evidence = row.proof;
 		if (evidence === undefined || evidence.item.identity !== row.identity || evidence.item.attemptId !== row.attemptId) {
 			return { ok: false, reason: "수용 당시의 시도 근거를 확인하지 못했습니다." };
@@ -1902,7 +2171,7 @@ export class RunController {
 		if (own === undefined || own.record.runId !== input.runId) {
 			return { ok: false, reason: "이 실행은 더 이상 진행 중이 아닙니다." };
 		}
-		if (own.ending !== undefined || own.abort.signal.aborted) {
+		if (own.ending !== undefined || own.abort.signal.aborted || own.finalizing === true) {
 			return { ok: false, reason: "실행이 끝나는 중이라 새 작업의 기준선을 만들지 않았습니다." };
 		}
 		// No write-capable attempt starts under a read claim: a plan that can change the target is upgraded before its
@@ -2013,7 +2282,7 @@ export class RunController {
 	 */
 	async discardAttempt(input: { runId: string; dispatch: string }): Promise<void> {
 		const own = this.#own;
-		if (own === undefined || own.record.runId !== input.runId) return;
+		if (own === undefined || own.record.runId !== input.runId || own.finalizing === true) return;
 		const prepared = own.attempts.get(input.dispatch);
 		if (prepared === undefined) return;
 		own.attempts.delete(input.dispatch);
@@ -2044,7 +2313,7 @@ export class RunController {
 	 */
 	async settleAttempt(input: AttemptSettlement): Promise<void> {
 		const own = this.#own;
-		if (own === undefined || own.record.runId !== input.runId) return;
+		if (own === undefined || own.record.runId !== input.runId || own.finalizing === true) return;
 		const prepared = own.attempts.get(input.dispatch);
 		if (prepared === undefined) return;
 		own.attempts.delete(input.dispatch);
@@ -3169,33 +3438,106 @@ export class RunController {
 		this.#scheduleFlush(own);
 	}
 
+	/**
+	 * The exact capture disposition for an isolated attempt's change rows: awaiting capture, awaiting selection, or one
+	 * named unsupported/conflict/stale reason. It never evaluates parent bytes, adds a row, or accepts on its own.
+	 */
+	#applyIntegrationChanges(
+		own: OwnRun,
+		prepared: PreparedAttempt,
+		attemptId: string,
+		changes: readonly PlanLaneResult[],
+	): void {
+		const admitted = own.integration?.admissions.get(prepared.dispatch);
+		const rows = own.record.results ?? [];
+		let changed = false;
+		for (const result of changes) {
+			const row = rows.find(candidate => candidate.id === result.id);
+			if (row === undefined) continue;
+			const identity = resultContractIdentity(result);
+			if (row.identity !== undefined && row.identity !== identity) continue;
+			if (row.state === "accepted" || row.state === "reviewable") continue;
+			let state: RunResult["state"] = "pending";
+			let reason: string;
+			const readiness: QueueReadiness = admitted === undefined
+				? { kind: "unknown", problem: integrationProblem("admission-missing", "이 시도에는 통합 수락이 준비되지 않았습니다.") }
+				: this.#sealBaseReadiness(own, admitted);
+			if (admitted !== undefined && admitted.boundAttemptId !== undefined && admitted.boundAttemptId !== attemptId) {
+				state = "unmet";
+				reason = "같은 수락에 다른 네이티브 시도가 결속되어 있어 이 캡처를 이 시도에 쓸 수 없습니다.";
+			} else if (readiness.kind === "ready") {
+				reason = `통합 선택을 기다립니다(후보 ${admitted?.admission.candidateId ?? "unknown"}).`;
+				own.integration?.awaiting.set(result.id, admitted!.admission.candidateId);
+			} else if (readiness.kind === "awaiting-native") {
+				reason = "네이티브 캡처를 기다립니다.";
+			} else if (readiness.kind === "confirmed-empty") {
+				state = "unmet";
+				reason = EMPTY_CAPTURE_REASON;
+				own.integration?.awaiting.delete(result.id);
+			} else {
+				state = "unmet";
+				reason = "problem" in readiness ? readiness.problem.reason : "통합 후보를 사용할 수 없습니다.";
+				own.integration?.awaiting.delete(result.id);
+			}
+			row.state = state;
+			row.reason = compactResultReason(reason);
+			row.identity = identity;
+			row.origin = "attempt";
+			row.attemptId = attemptId;
+			this.#bindConsumed(row, prepared);
+			delete row.contentVersion;
+			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			changed = true;
+		}
+		if (changed) {
+			this.#invalidateConsumers(own);
+			this.#scheduleFlush(own);
+		}
+	}
+
 	/** Evaluates one settled attempt against its stored before state and writes the run-scoped rows. */
 	async #evaluateAttempt(own: OwnRun, settled: SettledAttempt): Promise<void> {
 		const prepared = settled.prepared;
-		const checkNames = prepared.results.filter(result => result.check !== undefined).map(result => result.id);
+		const integrationChanges = this.#integration !== undefined && prepared.isolated === true
+			? prepared.results.filter(result => result.kind === "change")
+			: [];
+		const judgeable = integrationChanges.length === 0 ? prepared.results : prepared.results.filter(result => result.kind !== "change");
+		const checkedResults = settled.integrated === undefined ? judgeable : [...judgeable, ...integrationChanges];
+		const checkNames = checkedResults.filter(result => result.check !== undefined).map(result => result.id);
 		const checks = checkNames.length === 0 ? undefined : await this.#approvedCheckEvidence(own);
 		const deferred = new Set(checkNames.length > 0 && checks === undefined ? checkNames : []);
-		// An isolated change is judged on the retained candidate, never on the parent tree in this version: it never
-		// becomes accepted or reviewable, and a declared check cannot turn it into a deferred review.
-		if (prepared.isolated === true) {
-			for (const result of prepared.results) if (result.kind === "change") deferred.delete(result.id);
+		if (integrationChanges.length === 0) {
+			// An isolated change is judged on the retained candidate, never on the parent tree in this version: it never
+			// becomes accepted or reviewable, and a declared check cannot turn it into a deferred review.
+			if (prepared.isolated === true) {
+				for (const result of prepared.results) if (result.kind === "change") deferred.delete(result.id);
+			}
+		} else if (settled.integrated === undefined) {
+			for (const result of integrationChanges) deferred.delete(result.id);
 		}
 		settled.checkDeferred = deferred.size > 0;
-		const wantsAnswer = prepared.results.some(result => result.kind === "answer");
-		const evaluation = await evaluateSettledResults({
-			lane: prepared.lane,
-			attemptId: settled.attemptId,
-			results: prepared.results,
-			shared: { root: own.root, ...(prepared.baseline === undefined ? {} : { baseline: prepared.baseline }) },
-			artifactMode: prepared.artifactMode,
-			config: own.config,
-			...(prepared.laneFiles === undefined ? {} : { laneFiles: prepared.laneFiles }),
-			...(checks === undefined ? {} : { checks }),
-			...(settled.artifact === undefined ? {} : { artifact: settled.artifact }),
-			...(wantsAnswer
-				? { answer: { text: settled.reportText ?? "", citations: [...settled.citations], ...(settled.reportPartial === true ? { partial: true } : {}) } }
-				: {}),
-		});
+		const wantsAnswer = judgeable.some(result => result.kind === "answer");
+		const evaluation = judgeable.length === 0
+			? { ok: true as const, report: { results: [] as ResultEvidenceItem[] } }
+			: await evaluateSettledResults({
+				lane: prepared.lane,
+				attemptId: settled.attemptId,
+				results: judgeable,
+				shared: { root: own.root, ...(prepared.baseline === undefined ? {} : { baseline: prepared.baseline }) },
+				artifactMode: prepared.artifactMode,
+				config: own.config,
+				...(prepared.laneFiles === undefined ? {} : { laneFiles: prepared.laneFiles }),
+				...(checks === undefined ? {} : { checks }),
+				...(settled.artifact === undefined ? {} : { artifact: settled.artifact }),
+				...(wantsAnswer
+					? { answer: { text: settled.reportText ?? "", citations: [...settled.citations], ...(settled.reportPartial === true ? { partial: true } : {}) } }
+					: {}),
+			});
 		// What the producers satisfy now is read after the evidence, so no await separates it from the fences below.
 		const satisfied = this.#own === own ? await this.#settledInputSatisfaction(own, prepared) : undefined;
 		// The run was finalized while the evidence was being read: this settlement is detached and must not mutate the
@@ -3217,7 +3559,7 @@ export class RunController {
 		}
 		if (!evaluation.ok) {
 			const rows = own.record.results ?? [];
-			for (const result of prepared.results) {
+			for (const result of judgeable) {
 				const row = rows.find(candidate => candidate.id === result.id);
 				if (row === undefined) continue;
 				const identity = resultContractIdentity(result);
@@ -3237,10 +3579,13 @@ export class RunController {
 				delete row.proof;
 				delete row.restoredFrom;
 			}
+			if (integrationChanges.length > 0) this.#applyIntegrationChanges(own, prepared, settled.attemptId, integrationChanges);
 			this.#invalidateConsumers(own);
 			return;
 		}
-		const items = isolatedChangeItems(evaluation.report.results, prepared.isolated === true);
+		const items = integrationChanges.length === 0
+			? isolatedChangeItems(evaluation.report.results, prepared.isolated === true)
+			: evaluation.report.results;
 		this.#applyEvaluated(own, prepared, settled.attemptId, items, deferred);
 		for (const item of items) {
 			const row = own.record.results?.find(candidate => candidate.id === item.id);
@@ -3253,6 +3598,7 @@ export class RunController {
 			delete row.restoredFrom;
 			if (item.kind === "answer") this.#noteAnswerSubject(own, row, item, settled);
 		}
+		if (integrationChanges.length > 0) this.#applyIntegrationChanges(own, prepared, settled.attemptId, integrationChanges);
 	}
 
 	/**
@@ -3322,6 +3668,10 @@ export class RunController {
 			});
 			if (!open) continue;
 			if ((await this.#approvedCheckEvidence(own)) === undefined) continue;
+			if (settled.integrated !== undefined) {
+				await this.#refreshIntegrated(own, settled, this.#readWindow());
+				if (this.#own !== own) return;
+			}
 			await this.#evaluateAttempt(own, settled);
 		}
 	}
@@ -3348,9 +3698,10 @@ export class RunController {
 			// An answer is never bound to, settled by or reopened from a tree: its verdict scopes its exact submission
 			// (`#refreshAnswerReviews`) and its cited bytes are re-read by `#revokeUnlocatedAccepted`.
 			if ((planned ?? row.contract)?.kind === "answer") continue;
-			// Row 2: an isolated change never becomes review-accepted on parent-tree bytes, including an older record's
-			// reviewable row; no check or review refresh may credit it.
-			if ((planned ?? row.contract)?.kind === "change" && this.#rowIsolated(own, row)) continue;
+			// Row 2: an isolated change never becomes review-accepted on parent-tree bytes. Once its exact write has a
+			// current receipt it is in the parent for the reviewer, and `#acceptedLocation` rechecks that receipt.
+			if ((planned ?? row.contract)?.kind === "change" && this.#rowIsolated(own, row) &&
+				own.integration?.receipts.get(row.id) === undefined) continue;
 			// A review state was bound to an older tree: the submission itself is still there, so reopen it for judgement.
 			if (row.origin === "review" && row.reviewTree !== treeNow) {
 				row.state = "reviewable";
@@ -3850,6 +4201,12 @@ export class RunController {
 		if (conflict !== undefined) return { ok: false, reason: conflict };
 		const revision = own.planRevision;
 		const previousPlan = own.record.plan;
+		if (own.integration !== undefined && this.#integration !== undefined) {
+			await this.#revokeStaleIntegratedReceipts(own);
+			if (this.#own !== own || own.record.plan !== previousPlan) {
+				return { ok: false, reason: "실행이나 계획이 바뀌어 계획을 적용하지 않았습니다." };
+			}
+		}
 		if (planNeedsWrite(plan)) {
 			const upgraded = await this.#upgradeLease(own);
 			if (!upgraded.ok) return upgraded;
@@ -5083,6 +5440,51 @@ export class RunController {
 	}
 
 	/**
+	 * Rechecks every receipt-backed result before a replan or a later evidence read. A vanished receipt, drifted target
+	 * bytes or changed consumed inputs reopen that row and, transitively, its consumers; an unrelated proof stays.
+	 */
+	async #revokeStaleIntegratedReceipts(own: OwnRun): Promise<boolean> {
+		const receipts = own.integration?.receipts;
+		if (receipts === undefined || receipts.size === 0) return false;
+		const window = this.#readWindow();
+		let changed = false;
+		for (const [id, recorded] of [...receipts]) {
+			const row = own.record.results?.find(candidate => candidate.id === id);
+			if (row === undefined || (row.state !== "accepted" && row.state !== "reviewable")) {
+				receipts.delete(id);
+				continue;
+			}
+			const result = this.#plannedResult(own, id) ?? row.contract;
+			if (result === undefined) {
+				receipts.delete(id);
+				continue;
+			}
+			const verified = await this.#verifyReceiptState(own, result, row, recorded, window);
+			if (verified.ok) continue;
+			if (row.attemptId !== recorded.attemptId) {
+				receipts.delete(id);
+				continue;
+			}
+			row.state = "unmet";
+			row.origin = "attempt";
+			row.reason = compactResultReason(`통합 영수증을 현재 확인하지 못했습니다(${verified.problem.code}).`);
+			delete row.contentVersion;
+			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			receipts.delete(id);
+			changed = true;
+		}
+		if (!changed) return false;
+		this.#invalidateConsumers(own);
+		this.#scheduleFlush(own);
+		return true;
+	}
+
+	/**
 	 * Re-reads every accepted row at its current source before the final record is written. A reverted shared change or
 	 * a vanished retained artifact reopens that row and, transitively, the rows that consumed its version; an
 	 * independent accepted row stays. The contract comes from the plan in force, else from the bounded copy the row
@@ -5173,6 +5575,46 @@ export class RunController {
 	}
 
 	/**
+	 * A sealed candidate the director never selected cannot land after the run closes: its exact rows become unmet with
+	 * a finalization marker, so a late capture or delivery cannot make them reviewable. Durable records stay readable.
+	 */
+	#closeUnintegrated(own: OwnRun): boolean {
+		const awaiting = own.integration?.awaiting;
+		const rows = own.record.results ?? [];
+		let changed = false;
+		if (awaiting !== undefined && awaiting.size > 0) {
+			for (const [id] of [...awaiting]) {
+				const row = rows.find(candidate => candidate.id === id);
+				awaiting.delete(id);
+				if (row === undefined || row.state !== "pending") continue;
+				row.state = "unmet";
+				row.reason = compactResultReason("실행이 끝날 때까지 통합 후보를 선택하지 않아 결과를 수용하지 않았습니다.");
+				row.origin = "attempt";
+				row.finalized = "unsettled";
+				delete row.contentVersion;
+				delete row.reviewTree;
+				delete row.proof;
+				delete row.restoredFrom;
+				changed = true;
+			}
+		}
+		for (const row of rows) {
+			if (row.state !== "pending" || row.attemptId === undefined) continue;
+			row.state = "unmet";
+			row.reason = compactResultReason("실행이 끝날 때까지 네이티브 캡처를 받지 못해 결과를 수용하지 않았습니다.");
+			row.origin = "attempt";
+			row.finalized = "unsettled";
+			delete row.contentVersion;
+			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
+			changed = true;
+		}
+		if (changed) this.#invalidateConsumers(own);
+		return changed;
+	}
+
+	/**
 	 * A run may close between a dispatch's admission and its terminal settlement. That attempt's requirement is not
 	 * accepted: the row becomes unmet with a compact reason, so a late async delivery cannot resurrect it after the
 	 * final record was written. No file or answer is read here.
@@ -5230,6 +5672,12 @@ export class RunController {
 			this.#deferFinalize(own);
 			return undefined;
 		}
+		let integrationProjection: CandidateProjection | undefined;
+		if (own.integration !== undefined && this.#integration !== undefined) {
+			own.finalizing = true;
+			integrationProjection = await this.project({ kind: "overview" }, this.#readWindow()).catch(() => undefined);
+		}
+		const integrationState = own.integration;
 		this.#own = undefined;
 		clearWorkerSlots(own.record.runId);
 		// A late child event or dialog answer now finds no watcher for this run, so it cannot mark the next one.
@@ -5275,6 +5723,7 @@ export class RunController {
 		// No verified close can race an attempt whose terminal metadata never arrived: the row is unmet, and the run
 		// records the honest no-progress end instead of a stale verification label.
 		this.#closePendingAttempts(own);
+		this.#closeUnintegrated(own);
 		this.#syncConfigRefusals(own);
 		this.#syncResults(own);
 		// Every final record carries current evidence, not the row's last accepted state: a later write may have
@@ -5383,7 +5832,12 @@ export class RunController {
 		const showingSession = ctx === undefined ? undefined : closeoutSessionId(ctx);
 		const sameSession = own.sessionId === showingSession;
 		if (ctx !== undefined && finalReason !== "shutdown" && sameSession && !quietAuto) {
-			const brief = closeoutBrief(record, { resumable });
+			const brief = closeoutBrief(record, {
+				resumable,
+				...(integrationProjection === undefined || integrationProjection.kind === "not-recorded"
+					? {}
+					: { integration: integrationProjection }),
+			} as unknown as Parameters<typeof closeoutBrief>[1]);
 			if (brief.tier !== "none") {
 				// Numbers are offered only where this host can actually take a typed pick from this session's owner.
 				const interactive = ctx.mode === "tui" && ctx.hasUI;
@@ -5401,6 +5855,13 @@ export class RunController {
 		}
 		// What the run's shared entries described has ended with its record: they must not outlive it in a long-lived host.
 		// Agent rows are process state a later run may still write to, so only the session shutdown removes them.
+		if (this.#integration !== undefined && integrationState !== undefined) {
+			this.#recentIntegration = {
+				runId: record.runId,
+				state: integrationState,
+				...(record.results === undefined ? {} : { rows: record.results }),
+			};
+		}
 		forgetRunLanes(own.record.runId);
 		return record;
 	}
@@ -5477,13 +5938,18 @@ export class RunController {
 	/** The status line's live record; a hook that throws must not keep the run from ending. */
 	#liveStatus(ctx: ExtensionContext, run: RunRecord | undefined): void {
 		try {
-			this.deps.live?.(ctx, run);
+			const integration = run === undefined || this.#lastProjection?.runId !== run.runId
+				? undefined
+				: this.#lastProjection.projection;
+			this.deps.live?.(ctx, run, integration);
 		} catch {
 			// A convenience of the screen: no run decision reads what it shows.
 		}
 	}
 
 	#scheduleFlush(own: OwnRun): void {
+		// Any record mutation can change what a candidate projection means; the view hook never reuses a stale one.
+		this.#lastProjection = undefined;
 		// A finalized run owns no live record: the final write already happened (or is happening) and no late mutation
 		// may schedule a rewrite on top of it.
 		if (this.#own !== own) return;
@@ -5549,6 +6015,1753 @@ export class RunController {
 		}
 		// The aborted turn's end finishes the run.
 		ctx.abort();
+	}
+
+	// ── Isolated integration: C's admission freeze, queue, selection and receipt evaluation ─────────────────────
+
+	#integrationStateFor(own: OwnRun): IntegrationRunState {
+		return (own.integration ??= emptyIntegrationState());
+	}
+
+	#windowFor(signal: AbortSignal, deadline = this.deps.now() + INTEGRATION_WINDOW_MS): ByteWindow {
+		return { maxBytes: INTEGRATION_WINDOW_BYTES, deadline: Math.min(deadline, this.deps.now() + INTEGRATION_WINDOW_MS), signal };
+	}
+
+	/** Read-only checks use their own never-aborted signal; a stopping run still records what its bytes prove. */
+	#readWindow(): ByteWindow {
+		return this.#windowFor(new AbortController().signal);
+	}
+
+	#producerLaneForResult(own: OwnRun, id: string): string | undefined {
+		return own.record.plan?.lanes.find(lane => (lane.results ?? []).some(result => result.id === id))?.name;
+	}
+
+	/**
+	 * The exact producer versions the attempt started from, with a current same-run receipt only when it still proves
+	 * the same version and location. A missing version stays missing: selecting its producer later cannot repair it.
+	 */
+	async #freezeConsumed(own: OwnRun, prepared: PreparedAttempt): Promise<IntegrationRead<ConsumedInput[]>> {
+		const started = new Map((prepared.consumed ?? []).map(input => [input.id, input.version]));
+		const consumed: ConsumedInput[] = [];
+		for (const input of prepared.declaredInputs) {
+			const producerLane = this.#producerLaneForResult(own, input.id);
+			if (producerLane === undefined) {
+				return integrationUnknown("producer-lane-unknown", `선행 결과 '${input.id}'의 레인을 현재 계획에서 확인하지 못했습니다.`);
+			}
+			const version = started.get(input.id) ?? MISSING_INPUT;
+			const subject = { kind: "result" as const, id: input.id };
+			if (version === MISSING_INPUT) {
+				consumed.push({ producerLane, need: input.need, subject, state: "missing" });
+				continue;
+			}
+			if (input.need === "integrated") {
+				const current = await this.#currentIntegratedResult(own, input.id, this.#readWindow());
+				if (current !== undefined && current.version === version) {
+					consumed.push({
+						producerLane, need: input.need, subject, state: "integrated",
+						version, receipt: current.receipt, paths: current.paths,
+					});
+					continue;
+				}
+			}
+			consumed.push({ producerLane, need: input.need, subject, state: "version", version });
+		}
+		return integrationKnown(consumed);
+	}
+
+	/** One accepted result's current receipt-backed integration, or nothing; a tree guess is never a receipt. */
+	async #currentIntegratedResult(
+		own: OwnRun,
+		id: string,
+		window: ByteWindow,
+	): Promise<{ readonly version: string; readonly receipt: ReceiptRef; readonly paths: readonly LocatedInputPath[] } | undefined> {
+		const row = own.record.results?.find(candidate => candidate.id === id);
+		if (row === undefined || row.state !== "accepted" || row.contentVersion === undefined) return undefined;
+		const result = this.#plannedResult(own, id) ?? row.contract;
+		if (result === undefined) return undefined;
+		const state = own.integration?.receipts.get(id);
+		if (state === undefined || state.attemptId !== row.attemptId) return undefined;
+		const verified = await this.#verifyReceiptState(own, result, row, state, window);
+		if (!verified.ok) return undefined;
+		return { version: row.contentVersion, receipt: state.receipt, paths: state.attributable };
+	}
+
+	/**
+	 * E calls this before A persists its prepared admission. The frozen subject names the exact planned attempt epoch,
+	 * result contract and consumed versions, or the explicit unplanned identity; the original evaluator baseline stays
+	 * in the prepared attempt, never in a second copy. A planned lane with declared results must already have passed
+	 * `prepareAttempt`, so the frozen epoch is the one its settlement will carry.
+	 */
+	async prepareAdmission(input: {
+		readonly admission: Omit<FrozenIntegrationAdmission, "subject">;
+		readonly placement: { readonly kind: "planned"; readonly lane: string } | { readonly kind: "unplanned" };
+	}): Promise<IntegrationRead<FrozenIntegrationAdmission>> {
+		const ports = this.#integration;
+		const own = this.#own;
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트 경계에서는 격리 통합이 아직 켜지지 않았습니다.");
+		if (own === undefined) return integrationUnknown("run-not-active", "진행 중인 실행이 없어 통합 수락을 준비하지 못했습니다.");
+		const { admission } = input;
+		const key = admission.key;
+		if (key === null || typeof key !== "object" || key.schema !== INTEGRATION_KEY_SCHEMA ||
+			key.runId !== own.record.runId || typeof key.dispatch !== "string" || key.dispatch.length === 0 || key.dispatch.length > 512) {
+			return integrationUnknown("admission-key-invalid", "통합 수락 키가 이 실행의 형식과 다릅니다.");
+		}
+		if (!isCandidateId(admission.candidateId) || admission.candidateId !== candidateIdFor(key)) {
+			return integrationUnknown("candidate-id-invalid", "통합 후보 id가 정확한 키에서 계산된 값과 다릅니다.");
+		}
+		if (admission.director.sessionId !== own.sessionId || admission.director.sessionDir !== own.sessionDir ||
+			admission.director.sessionInstance.trim() === "" ||
+			typeof admission.director.parentId !== "string" || admission.director.parentId.length > 512) {
+			return integrationUnknown("director-mismatch", "통합 수락의 소유 세션·인스턴스가 이 실행과 다릅니다.");
+		}
+		const target = admission.target;
+		const canonicalRoot = own.lease?.root ?? own.root;
+		if (path.resolve(target.authorizedRoot.canonicalPath) !== path.resolve(canonicalRoot) ||
+			own.lease === undefined || target.leaseKey !== own.lease.record.key) {
+			return integrationUnknown("target-mismatch", "통합 대상이 이 실행의 실제 쓰기 잠금 대상과 다릅니다.");
+		}
+		if (target.gitRoot.canonicalPath === "" || target.gitDir.canonicalPath === "" ||
+			target.sourceOdb.commonDir.canonicalPath === "" || target.sourceOdb.objects.canonicalPath === "" ||
+			(target.sourceOdb.objectFormat !== "sha1" && target.sourceOdb.objectFormat !== "sha256")) {
+			return integrationUnknown("target-identity-invalid", "통합 대상의 Git 객체 저장소 신원이 올바르지 않습니다.");
+		}
+		if (admission.artifactRoot.canonicalPath === "" || admission.item.handle === "" ||
+			admission.item.toolCallId === "" || !Number.isSafeInteger(admission.item.itemIndex) || admission.item.itemIndex < 0 ||
+			!Number.isSafeInteger(admission.placementOrdinal) || admission.placementOrdinal < 0 ||
+			!Number.isFinite(admission.startedAt)) {
+			return integrationUnknown("placement-invalid", "통합 수락의 배치·항목·시각이 올바르지 않습니다.");
+		}
+		if (admission.workerAdmission.key === "" || admission.workerAdmission.attempt === "") {
+			return integrationUnknown("worker-admission-invalid", "통합 수락의 워커 수락 기록이 없습니다.");
+		}
+		if (admission.policy.enabled !== true || admission.policy.apply !== false || admission.policy.merge !== "patch" ||
+			admission.policy.id === "" || admission.policy.toolCallId !== admission.item.toolCallId) {
+			return integrationUnknown("policy-proof-invalid", "통합 수락의 적용 끔 증명이 이 호출과 맞지 않습니다.");
+		}
+		if (!sameKey(admission.slot.key, key) || admission.slot.ownerToken === "" || admission.slot.slotPath === "") {
+			return integrationUnknown("slot-invalid", "통합 수락의 네이티브 슬롯 소유가 이 키와 다릅니다.");
+		}
+		if (own.ending !== undefined || own.abort.signal.aborted || own.finalizing === true) {
+			return integrationUnknown("run-stopping", "실행이 끝나는 중이라 통합 수락을 준비하지 않았습니다.");
+		}
+
+		const state = this.#integrationStateFor(own);
+		const existing = state.admissions.get(key.dispatch);
+		if (existing !== undefined) {
+			if (existing.admission.candidateId === admission.candidateId && existing.status !== "discarded") return integrationKnown(existing.admission);
+			return integrationUnknown("admission-duplicate", "같은 디스패치에 다른 통합 수락이 이미 있습니다.");
+		}
+		const prior = state.candidates.get(admission.candidateId);
+		if (prior !== undefined) return integrationUnknown("candidate-duplicate", "같은 통합 후보 id가 이미 다른 수락에 쓰였습니다.");
+
+		let subject: AdmissionSubject;
+		let integrationEpoch: number | undefined;
+		if (input.placement.kind === "planned") {
+			const placementLane = input.placement.lane;
+			const lane = own.record.plan?.lanes.find(candidate => candidate.name === placementLane);
+			if (lane === undefined) return integrationUnknown("lane-not-planned", "이 레인은 현재 계획에 없어 통합 수락을 준비하지 못했습니다.");
+			const declared = lane.results ?? [];
+			if (declared.length === 0) {
+				const epoch = ++own.attemptSerial;
+				state.laneEpoch.set(lane.name, epoch);
+				subject = { kind: "planned", lane: lane.name, epoch, contractDigest: contractDigestOf([]), results: [], consumed: [] };
+			} else {
+				const prepared = own.attempts.get(key.dispatch);
+				if (prepared === undefined) {
+					return integrationUnknown("attempt-not-prepared", "시도 기준선이 준비되기 전에는 통합 수락을 고정하지 않았습니다.");
+				}
+				if (prepared.lane !== lane.name || prepared.epoch !== (own.laneAttempt.get(lane.name) ?? 0)) {
+					return integrationUnknown("attempt-superseded", "이 시도는 이미 최신 시도가 아니어서 통합 수락을 고정하지 않았습니다.");
+				}
+				const consumed = await this.#freezeConsumed(own, prepared);
+				if (consumed.kind !== "known") return consumed;
+				subject = {
+					kind: "planned", lane: lane.name, epoch: prepared.epoch,
+					contractDigest: contractDigestOf(prepared.results),
+					results: prepared.results.map(result => persistedResultContract(result)),
+					consumed: consumed.value,
+				};
+			}
+		} else {
+			const epoch = ++own.attemptSerial;
+			state.itemEpoch.set(itemIdentity(admission.item), epoch);
+			subject = { kind: "unplanned" };
+			integrationEpoch = epoch;
+		}
+
+		const frozen: FrozenIntegrationAdmission = { ...admission, subject };
+		const admitted: IntegrationAdmissionState = {
+			admission: frozen,
+			status: "prepared",
+			recovery: [],
+			observedAt: this.deps.now(),
+			...(integrationEpoch === undefined ? {} : { epoch: integrationEpoch }),
+		};
+		state.admissions.set(key.dispatch, admitted);
+		state.candidates.set(frozen.candidateId, admitted);
+		return integrationKnown(frozen);
+	}
+
+	/** Whether this admission's frozen attempt is still the one that will run/settle; synchronous by contract. */
+	#admissionCurrent(own: OwnRun, state: IntegrationAdmissionState): boolean {
+		const subject = state.admission.subject;
+		if (subject.kind === "unplanned") {
+			return state.epoch !== undefined && this.#integrationStateFor(own).itemEpoch.get(itemIdentity(state.admission.item)) === state.epoch;
+		}
+		const lane = own.record.plan?.lanes.find(candidate => candidate.name === subject.lane);
+		if (lane === undefined) return false;
+		if (subject.results.length === 0) return this.#integrationStateFor(own).laneEpoch.get(subject.lane) === subject.epoch;
+		const prepared = own.attempts.get(state.admission.key.dispatch);
+		return prepared !== undefined && prepared.epoch === subject.epoch &&
+			(own.laneAttempt.get(subject.lane) ?? 0) === subject.epoch;
+	}
+
+	/** E's final synchronous step: only a committed admission may appear in the candidate queue. */
+	commitAdmission(key: AdmissionKey): IntegrationCheck {
+		const own = this.#own;
+		if (this.#integration === undefined) return integrationFail("integration-disabled", "이 호스트에서는 격리 통합이 켜지지 않았습니다.");
+		if (own === undefined || key.runId !== own.record.runId) return integrationFail("run-not-active", "이 실행의 통합 수락이 아닙니다.");
+		const state = own.integration?.admissions.get(key.dispatch);
+		if (state === undefined || state.admission.candidateId !== candidateIdFor(key)) {
+			return integrationFail("admission-not-prepared", "준비되지 않은 통합 수락은 게시할 수 없습니다.");
+		}
+		if (state.status === "discarded") return integrationFail("admission-discarded", "폐기된 통합 수락은 게시할 수 없습니다.");
+		if (state.status === "committed") return integrationOk();
+		if (own.ending !== undefined || own.abort.signal.aborted || own.finalizing === true) {
+			return integrationFail("run-stopping", "실행이 끝나는 중이라 통합 수락을 게시하지 않았습니다.");
+		}
+		if (!this.#admissionCurrent(own, state)) return integrationFail("admission-superseded", "이 시도가 더 이상 현재 시도가 아니어서 통합 수락을 게시하지 않았습니다.");
+		state.status = "committed";
+		state.observedAt = this.deps.now();
+		return integrationOk();
+	}
+
+	/** Revokes only the exact prepared admission; a durable seal already observed is never deleted by this. */
+	discardAdmission(key: AdmissionKey): void {
+		const own = this.#own;
+		if (own === undefined || key.runId !== own.record.runId) return;
+		const state = this.#integrationStateFor(own);
+		const admitted = state.admissions.get(key.dispatch);
+		if (admitted === undefined) return;
+		if (admitted.seal !== undefined) {
+			admitted.status = "discarded";
+			return;
+		}
+		state.admissions.delete(key.dispatch);
+		if (state.candidates.get(admitted.admission.candidateId) === admitted) state.candidates.delete(admitted.admission.candidateId);
+		const subject = admitted.admission.subject;
+		if (subject.kind === "planned") {
+			if (state.laneEpoch.get(subject.lane) === subject.epoch) state.laneEpoch.delete(subject.lane);
+		} else if (admitted.epoch !== undefined) {
+			if (state.itemEpoch.get(itemIdentity(admitted.admission.item)) === admitted.epoch) {
+				state.itemEpoch.delete(itemIdentity(admitted.admission.item));
+			}
+		}
+	}
+
+	/** Durable stored state from B's journal, merged into one admission without overwriting a first seal. */
+	#mergeStored(state: IntegrationRunState, stored: StoredCandidate): IntegrationProblem | undefined {
+		const manifest = stored.manifest;
+		const key = manifest.admission.key;
+		if (manifest.schema !== "storm.integration-capture/v1" || key.schema !== INTEGRATION_KEY_SCHEMA ||
+			!INTEGRATION_DIGEST_RE.test(manifest.digest) || !isCandidateId(manifest.admission.candidateId) ||
+			manifest.admission.candidateId !== candidateIdFor(key)) {
+			return integrationProblem("manifest-invalid", "저장된 통합 캡처의 스키마·키·후보 id가 올바르지 않습니다.");
+		}
+		const existing = state.candidates.get(manifest.admission.candidateId);
+		if (existing !== undefined) {
+			if (existing.seal !== undefined && existing.seal.digest !== manifest.digest) {
+				existing.problem ??= integrationProblem("manifest-contradiction", "같은 수락에 다른 캡처 매니페스트가 저장되어 있습니다.");
+				return existing.problem;
+			}
+			existing.seal ??= manifest;
+			if (existing.status !== "discarded") existing.status = "committed";
+			if (stored.lastWrite !== null) {
+				existing.lastWrite = stored.lastWrite;
+				existing.lastWriteAt = this.deps.now();
+			}
+			for (const recovery of stored.recovery) {
+				if (!existing.recovery.some(seen => seen.observationKey === recovery.observationKey)) existing.recovery.push(recovery);
+			}
+			if (existing.recovery.length > INTEGRATION_RECOVERY_MAX) existing.recovery.splice(0, existing.recovery.length - INTEGRATION_RECOVERY_MAX);
+			return undefined;
+		}
+		const other = state.admissions.get(key.dispatch);
+		if (other !== undefined && other.admission.candidateId !== manifest.admission.candidateId) {
+			other.problem ??= integrationProblem("dispatch-contradiction", "같은 디스패치에 다른 통합 후보가 저장되어 있습니다.");
+			return other.problem;
+		}
+		const admitted: IntegrationAdmissionState = {
+			admission: manifest.admission,
+			status: "committed",
+			seal: manifest,
+			recovery: [...stored.recovery].slice(-INTEGRATION_RECOVERY_MAX),
+			observedAt: this.deps.now(),
+			...(stored.lastWrite === null ? {} : { lastWrite: stored.lastWrite, lastWriteAt: this.deps.now() }),
+		};
+		state.admissions.set(key.dispatch, admitted);
+		state.candidates.set(manifest.admission.candidateId, admitted);
+		return undefined;
+	}
+
+	/** The bounded readiness this admission's own facts prove, before a target-fence lookup. */
+	#sealBaseReadiness(own: OwnRun | undefined, state: IntegrationAdmissionState): QueueReadiness {
+		if (state.status !== "committed") {
+			return { kind: "unknown", problem: integrationProblem("admission-not-committed", "게시되지 않은 통합 수락은 후보가 아닙니다.") };
+		}
+		const seal = state.seal;
+		if (seal === undefined) {
+			return state.problem === undefined
+				? { kind: "awaiting-native" }
+				: { kind: "unknown", problem: state.problem };
+		}
+		const bundle = seal.bundle;
+		if (bundle.kind === "kept-only") return { kind: "kept-only", problem: bundle.problem };
+		if (bundle.kind === "unknown") return { kind: "unknown", problem: bundle.problem };
+		if (bundle.kind === "confirmed-empty") return { kind: "confirmed-empty" };
+		if (!sameKey(bundle.root.key, seal.admission.key) ||
+			!INTEGRATION_DIGEST_RE.test(bundle.root.sha256) || !Number.isSafeInteger(bundle.root.bytes) || bundle.root.bytes < 0) {
+			return { kind: "unknown", problem: integrationProblem("root-part-invalid", "루트 패치 참조가 이 수락과 맞지 않습니다.") };
+		}
+		if (seal.terminal.kind !== "known") return { kind: "unknown", problem: seal.terminal.problem };
+		const terminal = seal.terminal.value;
+		if (terminal.outcome.kind !== "known") return { kind: "unknown", problem: terminal.outcome.problem };
+		if (terminal.outcome.value !== "success" || terminal.cancelRequested) {
+			return {
+				kind: "kept-only",
+				problem: integrationProblem(
+					terminal.outcome.value === "cancel" ? "attempt-cancelled" : "attempt-failed",
+					terminal.outcome.value === "cancel"
+						? "취소로 끝난 시도의 캡처는 복구용이며 통합 후보가 아닙니다."
+						: "실패로 끝난 시도의 캡처는 복구용이며 통합 후보가 아닙니다.",
+				),
+			};
+		}
+		if (terminal.stopCause.kind === "known") {
+			return {
+				kind: "kept-only",
+				problem: integrationProblem("attempt-stopped", `시도가 ${terminal.stopCause.value} 사유로 끝나 캡처는 복구용입니다.`),
+			};
+		}
+		if (seal.childClaim.kind !== "known") {
+			// Every carrier needs the bound child-entry claim: the terminal identifies the item, not the claimed
+			// checkout with its verified input images. An unknown claim is recovery/awaiting proof, never selectable,
+			// and a later observation cannot retroactively promote an immutable seal.
+			return { kind: "unknown", problem: seal.childClaim.problem };
+		}
+		const claim = seal.childClaim.value;
+		if (claim.key.dispatch !== seal.admission.key.dispatch || claim.candidateId !== seal.admission.candidateId ||
+			claim.childHandle !== seal.admission.item.handle) {
+			return { kind: "unknown", problem: integrationProblem("child-claim-mismatch", "자식 진입 증명이 이 수락과 맞지 않습니다.") };
+		}
+		if (seal.delta.kind !== "known") return { kind: "unknown", problem: seal.delta.problem };
+		const delta = seal.delta.value;
+		if (delta.schema !== "storm.integration-delta/v1" || !sameKey(delta.key, seal.admission.key) ||
+			delta.candidateId !== seal.admission.candidateId || !INTEGRATION_DIGEST_RE.test(delta.digest) ||
+			delta.root.objectKey !== bundle.root.objectKey || delta.root.sha256 !== bundle.root.sha256) {
+			return { kind: "unknown", problem: integrationProblem("delta-invalid", "정확 델타 증명이 캡처와 맞지 않습니다.") };
+		}
+		const conflict = this.#sealConflict(state);
+		if (conflict !== undefined) return { kind: "conflict", problem: conflict };
+		if (own !== undefined && this.#sealStale(own, state)) {
+			return { kind: "stale", problem: integrationProblem("candidate-stale", "이 후보는 최신 시도나 현재 계약이 아니어서 선택할 수 없습니다.") };
+		}
+		return { kind: "ready" };
+	}
+
+	/** A proven target fence or a bound contradiction revokes unused readiness; it never rewrites the manifest. */
+	#sealConflict(state: IntegrationAdmissionState): IntegrationProblem | undefined {
+		if (state.problem !== undefined) return state.problem;
+		const write = state.lastWrite;
+		if (write?.kind === "recovery-required" || write?.kind === "present-unattributed") return write.problem;
+		return undefined;
+	}
+
+	/** Whether a newer attempt, plan contract or consumed version replaced this admission's frozen subject. */
+	#sealStale(own: OwnRun, state: IntegrationAdmissionState): boolean {
+		const subject = state.admission.subject;
+		if (subject.kind === "unplanned") {
+			if (state.epoch === undefined) return false;
+			const latest = own.integration?.itemEpoch.get(itemIdentity(state.admission.item));
+			return latest !== undefined && latest !== state.epoch;
+		}
+		const lane = own.record.plan?.lanes.find(candidate => candidate.name === subject.lane);
+		if (lane === undefined) return true;
+		if (subject.results.length === 0) return own.integration?.laneEpoch.get(subject.lane) !== subject.epoch;
+		const newest = Math.max(own.laneAttempt.get(subject.lane) ?? 0, own.settledEpoch.get(subject.lane) ?? 0);
+		if (newest > subject.epoch) return true;
+		for (const frozen of subject.results) {
+			const current = this.#plannedResult(own, frozen.id);
+			if (current === undefined || resultContractIdentity(current) !== resultContractIdentity(frozen)) return true;
+		}
+		const rows = own.record.results ?? [];
+		for (const consumed of subject.consumed) {
+			if (consumed.subject.kind !== "result") continue;
+			const resultId = consumed.subject.id;
+			const row = rows.find(candidate => candidate.id === resultId);
+			const expected = consumed.state === "missing" ? MISSING_INPUT : consumed.version;
+			if (currentInputVersion(row) !== expected) return true;
+		}
+		return false;
+	}
+
+	/** Records a seal's exact disposition on the change rows it can satisfy, without a second settlement or a new row. */
+	#noteSealOnRows(own: OwnRun, state: IntegrationAdmissionState): void {
+		const subject = state.admission.subject;
+		if (subject.kind !== "planned" || subject.results.length === 0 || state.boundAttemptId === undefined) return;
+		const readiness = this.#sealBaseReadiness(own, state);
+		const rows = own.record.results ?? [];
+		let changed = false;
+		for (const frozen of subject.results) {
+			if (frozen.kind !== "change") continue;
+			const row = rows.find(candidate => candidate.id === frozen.id);
+			if (row === undefined || row.attemptId !== state.boundAttemptId) continue;
+			if (row.identity !== undefined && row.identity !== resultContractIdentity(frozen)) continue;
+			if (row.state === "accepted" || row.state === "reviewable") continue;
+			if (readiness.kind === "ready") {
+				row.state = "pending";
+				row.reason = compactResultReason(`통합 선택을 기다립니다(후보 ${state.admission.candidateId}).`);
+				this.#integrationStateFor(own).awaiting.set(row.id, state.admission.candidateId);
+				changed = true;
+				continue;
+			}
+			if (readiness.kind === "awaiting-native") continue;
+			const reason = readiness.kind === "confirmed-empty"
+				? EMPTY_CAPTURE_REASON
+				: "problem" in readiness
+					? readiness.problem.reason
+					: "통합 후보를 사용할 수 없습니다.";
+			row.state = "unmet";
+			row.reason = compactResultReason(reason);
+			row.origin = "attempt";
+			row.identity = resultContractIdentity(frozen);
+			this.#integrationStateFor(own).awaiting.delete(row.id);
+			delete row.contentVersion;
+			delete row.reviewTree;
+			delete row.proof;
+			delete row.restoredFrom;
+			delete row.remedy;
+			delete row.retryRoute;
+			delete row.unblock;
+			changed = true;
+		}
+		if (changed) {
+			this.#invalidateConsumers(own);
+			this.#scheduleFlush(own);
+		}
+	}
+
+	/**
+	 * A's durable update. A seal, a late recovery fact and a fail-closed diagnostic are separate observations; none
+	 * starts work, adds a result row, writes the target or issues a receipt. Replays are idempotent by admission key.
+	 */
+	async observe(update: CaptureUpdate): Promise<void> {
+		const ports = this.#integration;
+		const own = this.#own;
+		if (ports === undefined || own === undefined || own.finalizing === true) return;
+		this.#lastProjection = undefined;
+		const state = this.#integrationStateFor(own);
+		if (update.kind === "sealed") {
+			const manifest = update.manifest;
+			const key = manifest.admission.key;
+			if (key.runId !== own.record.runId || key.schema !== INTEGRATION_KEY_SCHEMA) return;
+			if (!Number.isSafeInteger(update.journalSequence) || update.journalSequence <= 0) return;
+			const admitted = state.admissions.get(key.dispatch);
+			if (admitted !== undefined && admitted.seal !== undefined) {
+				if (admitted.seal.digest !== manifest.digest) {
+					admitted.problem ??= integrationProblem("manifest-contradiction", "같은 수락에 다른 캡처가 관측되었습니다.");
+					return;
+				}
+				// A re-delivers the same durable seal with the existing attempt settlement: equal sequence is not a
+				// replay when it carries the binding C has not seen. An older sequence is always stale.
+				if ((admitted.sealSequence ?? 0) > update.journalSequence) return;
+				if ((admitted.sealSequence ?? 0) === update.journalSequence && update.settlement === undefined &&
+					admitted.boundAttemptId !== undefined) return;
+			}
+			const problem = this.#mergeStored(state, {
+				manifest,
+				recovery: [],
+				lastWrite: admitted?.lastWrite ?? null,
+			});
+			const merged = state.candidates.get(manifest.admission.candidateId);
+			if (merged === undefined) return;
+			if (problem !== undefined) merged.problem ??= problem;
+			merged.sealSequence = Math.max(merged.sealSequence ?? 0, update.journalSequence);
+			if (update.settlement !== undefined) {
+				const settlement = update.settlement;
+				const attemptId = settlement.report.attemptId;
+				const subject = merged.admission.subject;
+				const prepared = own.attempts.get(key.dispatch) ??
+					[...own.settled.values()].find(candidate => candidate.prepared.dispatch === key.dispatch)?.prepared;
+				const exact =
+					settlement.runId === own.record.runId && settlement.dispatch === key.dispatch &&
+					(prepared === undefined || settlement.parentId === prepared.parentId) &&
+					settlement.spawnKey === merged.admission.item.handle &&
+					(subject.kind === "unplanned" || settlement.lane === subject.lane) &&
+					attemptId !== undefined;
+				if (!exact) {
+					merged.problem ??= integrationProblem("settlement-binding-mismatch", "캡처의 정산 결속이 이 수락과 다릅니다.");
+				} else if (merged.boundAttemptId !== undefined && merged.boundAttemptId !== attemptId) {
+					merged.problem ??= integrationProblem("settlement-contradiction", "같은 수락에 다른 네이티브 시도가 결속되었습니다.");
+				} else {
+					merged.boundAttemptId = attemptId;
+				}
+			}
+			this.#noteSealOnRows(own, merged);
+			return;
+		}
+		if (update.kind === "recovery") {
+			const observation = update.observation;
+			if (observation.schema !== "storm.integration-recovery/v1" || observation.key.runId !== own.record.runId) return;
+			const admitted = state.candidates.get(observation.candidateId) ?? state.admissions.get(observation.key.dispatch);
+			if (admitted === undefined) return;
+			if (admitted.recovery.some(seen => seen.observationKey === observation.observationKey)) return;
+			admitted.recovery.push(observation);
+			if (admitted.recovery.length > INTEGRATION_RECOVERY_MAX) {
+				admitted.recovery.splice(0, admitted.recovery.length - INTEGRATION_RECOVERY_MAX);
+			}
+			if (observation.contradiction.kind === "known") {
+				admitted.problem ??= observation.contradiction.value;
+				this.#noteSealOnRows(own, admitted);
+			}
+			return;
+		}
+		const admitted = state.candidates.get(update.candidateId) ?? state.admissions.get(update.key.dispatch);
+		if (admitted === undefined || admitted.seal !== undefined) return;
+		admitted.problem ??= update.problem;
+		this.#noteSealOnRows(own, admitted);
+	}
+
+	/** One bounded keyed replay per run; null is the journal's own "no record", never an empty candidate list. */
+	async #replayIntegration(state: IntegrationRunState, runId: string): Promise<IntegrationRead<{ readonly lastSequence: number } | null>> {
+		const ports = this.#integration;
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 기록을 읽지 않습니다.");
+		if (state.replayDone) {
+			return integrationKnown(state.lastSequence === undefined ? null : { lastSequence: state.lastSequence });
+		}
+		const replay = await ports.journal.replay(runId, entry => {
+			this.#mergeStored(state, entry);
+		});
+		if (replay.kind !== "known") return replay;
+		state.replayDone = true;
+		if (replay.value !== null) state.lastSequence = replay.value.lastSequence;
+		return replay;
+	}
+
+	/** Stored candidate from B, merged into the active projection; unknown store content is never an empty record. */
+	async #storedCandidate(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState): Promise<IntegrationRead<StoredCandidate>> {
+		const ports = this.#integration;
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 기록을 읽지 않습니다.");
+		const runId = own?.record.runId ?? admitted.admission.key.runId;
+		const read = await ports.journal.readCandidate(runId, admitted.admission.candidateId);
+		if (read.kind !== "known") return read;
+		if (read.value === null) {
+			return admitted.seal === undefined
+				? integrationUnknown("candidate-missing", "저장된 통합 후보를 찾지 못했습니다.")
+				: integrationKnown({ manifest: admitted.seal, recovery: admitted.recovery, lastWrite: admitted.lastWrite ?? null });
+		}
+		const problem = this.#mergeStored(state, read.value);
+		if (problem !== undefined && admitted.seal === undefined) return integrationUnknown(problem.code, problem.reason);
+		return integrationKnown(read.value);
+	}
+
+	async #writeFor(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState): Promise<QueueWrite> {
+		const stored = await this.#storedCandidate(own, state, admitted);
+		const write = admitted.lastWrite ?? (stored.kind === "known" ? stored.value.lastWrite : null);
+		if (write === null || write === undefined) return { kind: "not-written" };
+		switch (write.kind) {
+			case "written":
+			case "already-written":
+				return { kind: "written", receipt: write.receipt.ref, at: write.receipt.readBackAt };
+			case "conflict":
+			case "refused":
+				return { kind: "not-recorded", problem: write.problem };
+			case "no-effect":
+				return { kind: "no-effect", problem: write.problem };
+			case "present-unattributed":
+				return { kind: "present-unattributed", problem: write.problem };
+			case "recovery-required":
+				return { kind: "recovery-required", problem: write.problem };
+		}
+	}
+
+	/** The one candidate's postimage presence; exact paths only, never a worktree scan. */
+	async #presenceFor(admitted: IntegrationAdmissionState, window: ByteWindow): Promise<Presence> {
+		const ports = this.#integration;
+		if (ports === undefined) return { kind: "unknown", problem: integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 확인하지 않습니다.") };
+		const seal = admitted.seal;
+		if (seal === undefined) return { kind: "unknown", problem: integrationProblem("awaiting-native", "네이티브 캡처를 기다립니다.") };
+		if (seal.delta.kind !== "known") return { kind: "unknown", problem: seal.delta.problem };
+		const paths = seal.delta.value.entries.map(entry => ({ path: entry.targetPath, image: entry.after.state }));
+		if (paths.length === 0) return { kind: "unknown", problem: integrationProblem("empty-proof", "정확 델타에 경로가 없습니다.") };
+		return ports.delta.observePresence(seal.admission.target, paths, window);
+	}
+
+	async #readinessFor(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState, window: ByteWindow): Promise<QueueReadiness> {
+		const base = this.#sealBaseReadiness(own, admitted);
+		if (base.kind !== "ready") return base;
+		const ports = this.#integration;
+		if (ports === undefined) return { kind: "unknown", problem: integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 선택하지 않습니다.") };
+		if (own !== undefined) {
+			const consumed = await this.#consumedProblem(own, admitted, window);
+			if (consumed !== undefined) return { kind: "stale", problem: consumed };
+		}
+		const stored = await this.#storedCandidate(own, state, admitted);
+		if (stored.kind !== "known") return { kind: "unknown", problem: stored.problem };
+		const write = admitted.lastWrite ?? stored.value.lastWrite;
+		if (write?.kind === "recovery-required" || write?.kind === "present-unattributed") {
+			return { kind: "conflict", problem: write.problem };
+		}
+		const target = admitted.admission.target;
+		const fence = await ports.journal.findFence({ canonicalRoot: target.authorizedRoot.canonicalPath, leaseKey: target.leaseKey });
+		if (fence.kind === "fenced") {
+			return { kind: "conflict", problem: integrationProblem("target-fenced", "대상에 해결되지 않은 통합 펜스가 있습니다.") };
+		}
+		if (fence.kind === "unknown") return { kind: "unknown", problem: fence.problem };
+		return { kind: "ready" };
+	}
+
+	async #lineFor(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState, window: ByteWindow): Promise<CandidateLine> {
+		const readiness = await this.#readinessFor(own, state, admitted, window);
+		const write = await this.#writeFor(own, state, admitted);
+		const presence = await this.#presenceFor(admitted, window);
+		return {
+			candidateId: admitted.admission.candidateId,
+			childHandle: admitted.admission.item.handle,
+			subject: admitted.admission.subject.kind === "planned"
+				? { kind: "planned", lane: admitted.admission.subject.lane }
+				: { kind: "unplanned" },
+			readiness,
+			write,
+			presence,
+		};
+	}
+
+	#orderedCandidates(state: IntegrationRunState): IntegrationAdmissionState[] {
+		return [...state.candidates.values()]
+			.filter(candidate => candidate.status === "committed" && candidate.seal !== undefined)
+			.sort((left, right) => {
+				const ordinal = left.admission.placementOrdinal - right.admission.placementOrdinal;
+				if (ordinal !== 0) return ordinal;
+				return left.admission.candidateId < right.admission.candidateId ? -1 : left.admission.candidateId > right.admission.candidateId ? 1 : 0;
+			});
+	}
+
+	/** Read-only candidate projection; it never starts a target effect, wake, check or reviewer. */
+	async project(query: CandidateQuery, window: ByteWindow): Promise<CandidateProjection> {
+		if (query.kind !== "overview" && query.kind !== "detail") {
+			return { kind: "unknown", problem: integrationProblem("query-invalid", "후보 조회의 종류가 올바르지 않습니다.") };
+		}
+		const ports = this.#integration;
+		if (ports === undefined) return { kind: "not-recorded" };
+		let own: OwnRun | undefined;
+		let state: IntegrationRunState;
+		let rows: readonly RunResult[] = [];
+		let runId: string | undefined;
+		const active = this.#own;
+		if (active !== undefined && (query.runId === undefined || query.runId === active.record.runId)) {
+			own = active;
+			state = this.#integrationStateFor(active);
+			rows = active.record.results ?? [];
+			runId = active.record.runId;
+		} else if (this.#recentIntegration !== undefined && (query.runId === undefined || query.runId === this.#recentIntegration.runId)) {
+			state = this.#recentIntegration.state;
+			rows = this.#recentIntegration.rows ?? [];
+			runId = this.#recentIntegration.runId;
+		} else if (query.runId !== undefined) {
+			state = emptyIntegrationState();
+			own = undefined;
+			runId = query.runId;
+		} else {
+			return { kind: "not-recorded" };
+		}
+		if (runId === undefined) return { kind: "not-recorded" };
+		const replay = await this.#replayIntegration(state, runId);
+		if (replay.kind !== "known") return { kind: "unknown", problem: replay.problem };
+		if (replay.value === null && state.candidates.size === 0) return { kind: "not-recorded" };
+
+		if (query.kind === "detail") {
+			if (!isCandidateId(query.candidateId)) {
+				return { kind: "unknown", problem: integrationProblem("candidate-id-invalid", "후보 id의 형식이 올바르지 않습니다.") };
+			}
+			const admitted = state.candidates.get(query.candidateId);
+			if (admitted === undefined) {
+				return { kind: "unknown", problem: integrationProblem("candidate-unknown", "이 실행의 통합 후보가 아닙니다.") };
+			}
+			if (admitted.status !== "committed" && admitted.seal === undefined) {
+				return { kind: "unknown", problem: integrationProblem("candidate-unknown", "게시되지 않은 통합 수락은 조회할 수 없습니다.") };
+			}
+			const line = await this.#lineFor(own, state, admitted, window);
+			const seal = admitted.seal;
+			const revision: CandidateRevision | null = seal === undefined
+				? null
+				: { key: seal.admission.key, candidateId: seal.admission.candidateId, manifestDigest: seal.digest };
+			const terminal = seal?.terminal;
+			const child = seal?.childClaim;
+			const carrier: IntegrationRead<"sync" | "wait" | "push"> = terminal?.kind === "known"
+				? integrationKnown(terminal.value.carrier)
+				: integrationUnknown("terminal-unknown", terminal !== undefined && terminal.kind === "unknown" ? terminal.problem.reason : "네이티브 종결을 확인하지 못했습니다.");
+			const checkoutClaim: IntegrationRead<{ readonly reference: string; readonly checkedAt: number }> = child?.kind === "known"
+				? integrationKnown({ reference: child.value.checkout.canonicalPath, checkedAt: child.value.checkedAt })
+				: integrationUnknown("claim-unknown", child !== undefined && child.kind === "unknown" ? child.problem.reason : "자식 진입 증명이 없습니다.");
+			const outcome: IntegrationRead<"success" | "failure" | "cancel"> = terminal?.kind === "known" && terminal.value.outcome.kind === "known"
+				? integrationKnown(terminal.value.outcome.value)
+				: integrationUnknown("outcome-unknown", "네이티브 결과를 확인하지 못했습니다.");
+			const stopCause: IntegrationRead<string> = terminal?.kind === "known"
+				? terminal.value.stopCause.kind === "known"
+					? integrationKnown(terminal.value.stopCause.value)
+					: integrationUnknown("stop-unknown", "중단 사유를 확인하지 못했습니다.")
+				: integrationUnknown("stop-unknown", "네이티브 종결을 확인하지 못했습니다.");
+			const recovery = seal?.recovery;
+			const latestRecovery = admitted.recovery.at(-1)?.facts;
+			const root = recovery?.root.kind === "known" ? recovery.root : latestRecovery?.root;
+			const copy = root?.kind === "known" ? root.value.copy : undefined;
+			const stormCopy: IntegrationRead<{ readonly reference: string; readonly bytes: number; readonly sha256: string }> =
+				copy?.kind === "known"
+					? integrationKnown({ reference: copy.value.objectKey, bytes: copy.value.bytes, sha256: copy.value.sha256 })
+					: integrationUnknown("copy-unknown", "Storm이 보존한 바이트를 확인하지 못했습니다.");
+			const branch = recovery?.branch.kind === "known" ? recovery.branch : latestRecovery?.branch;
+			const nativeBranch: IntegrationRead<{ readonly ref: string; readonly base: IntegrationRead<string>; readonly tip: IntegrationRead<string> }> =
+				branch?.kind === "known"
+					? integrationKnown({ ref: branch.value.ref, base: branch.value.typedBaseOid, tip: branch.value.observedTipOid })
+					: integrationUnknown("branch-unknown", "네이티브 브랜치를 확인하지 못했습니다.");
+			const nested = recovery?.nested.kind === "known" ? recovery.nested : latestRecovery?.nested;
+			const nativeLink = recovery?.nativeLink.kind === "known" ? recovery.nativeLink : latestRecovery?.nativeLink;
+			const checkout = latestRecovery !== undefined && latestRecovery.checkout.kind !== "unknown"
+				? latestRecovery.checkout
+				: recovery?.checkout;
+			const dirtyPaths: IntegrationRead<{ readonly total: number; readonly examples: readonly string[]; readonly dirtyDeletes: readonly string[] }> =
+				seal?.delta.kind === "known"
+					? await ports.delta.observeDirtyPaths(seal.delta.value, window)
+					: integrationUnknown("delta-unknown", "정확 델타 증명이 없습니다.");
+			const detail: CandidateDetail = {
+				line,
+				revision,
+				provenance: {
+					key: admitted.admission.key,
+					placementOrdinal: admitted.admission.placementOrdinal,
+					carrier,
+					checkoutClaim,
+				},
+				outcome,
+				stopCause,
+				cancelRequested: terminal?.kind === "known" ? terminal.value.cancelRequested : false,
+				bundle: seal?.bundle.kind ?? "unknown",
+				recovery: {
+					stormCopy,
+					nativePatch: root?.kind === "known" ? integrationKnown(root.value.nativePath) : integrationUnknown("patch-unknown", "네이티브 패치 경로를 확인하지 못했습니다."),
+					nativeBranch,
+					nestedCount: nested?.kind === "known" ? integrationKnown(nested.value.length) : integrationUnknown("nested-unknown", "중첩 캡처 목록을 확인하지 못했습니다."),
+					nestedExamples: nested?.kind === "known"
+						? nested.value.slice(0, INTEGRATION_EXAMPLES).map(part => ({ reference: part.nativePath, relativeRepo: part.relativeRepo }))
+						: [],
+					checkout: checkout ?? { kind: "unknown", problem: integrationProblem("checkout-unknown", "정확 체크아웃을 확인하지 못했습니다.") },
+					nativeLink: nativeLink ?? integrationUnknown("link-unknown", "네이티브 기록 링크가 없습니다."),
+				},
+				dirtyPaths,
+				resultStates: admitted.admission.subject.kind === "planned"
+					? admitted.admission.subject.results.map(result => ({
+							id: result.id,
+							state: rows.find(row => row.id === result.id)?.state ?? "pending",
+						}))
+					: [],
+			};
+			const projection: CandidateProjection = { kind: "detail", value: detail };
+			if (own !== undefined && this.#own === own) this.#lastProjection = { runId, projection };
+			return projection;
+		}
+
+		if (query.after !== undefined && !isCandidateId(query.after)) {
+			return { kind: "unknown", problem: integrationProblem("candidate-cursor-invalid", "후보 커서의 형식이 올바르지 않습니다.") };
+		}
+		const ordered = this.#orderedCandidates(state);
+		let start = 0;
+		if (query.after !== undefined) {
+			const at = ordered.findIndex(candidate => candidate.admission.candidateId === query.after);
+			if (at < 0) return { kind: "unknown", problem: integrationProblem("candidate-cursor-unknown", "커서가 이 실행의 후보가 아닙니다.") };
+			start = at + 1;
+		}
+		const readiness = emptyReadinessCounts();
+		const writes = emptyWriteCounts();
+		const lines: CandidateLine[] = [];
+		let present = 0;
+		let changed = 0;
+		let unknownPresence = 0;
+		for (const admitted of ordered) {
+			const line = await this.#lineFor(own, state, admitted, window);
+			readiness[line.readiness.kind] += 1;
+			writes[line.write.kind] += 1;
+			if (line.presence.kind === "present") present += 1;
+			else if (line.presence.kind === "changed") changed += 1;
+			else unknownPresence += 1;
+			lines.push(line);
+		}
+		const page = lines.slice(start, start + INTEGRATION_PAGE);
+		const nextAfter = start + page.length < lines.length ? page[page.length - 1]!.candidateId : null;
+		const projection: CandidateProjection = {
+			kind: "overview",
+			value: {
+				runId,
+				observedAt: this.deps.now(),
+				readiness,
+				writes,
+				present,
+				changed,
+				unknownPresence,
+				examples: page.slice(0, INTEGRATION_EXAMPLES),
+				page: page.map(line => line.candidateId),
+				nextAfter,
+			},
+		};
+		if (own !== undefined && this.#own === own) this.#lastProjection = { runId, projection };
+		return projection;
+	}
+
+	#laneFilesFor(own: OwnRun, admitted: IntegrationAdmissionState): readonly string[] | undefined {
+		const dispatch = admitted.admission.key.dispatch;
+		for (const settled of own.settled.values()) if (settled.prepared.dispatch === dispatch) return settled.prepared.laneFiles;
+		const prepared = own.attempts.get(dispatch);
+		if (prepared !== undefined) return prepared.laneFiles;
+		const subject = admitted.admission.subject;
+		if (subject.kind !== "planned") return undefined;
+		return own.record.plan?.lanes.find(lane => lane.name === subject.lane)?.files;
+	}
+
+	#targetProblem(own: OwnRun, admitted: IntegrationAdmissionState): IntegrationProblem | undefined {
+		if (own.lease === undefined) return integrationProblem("lease-missing", "실행 쓰기 잠금이 없어 통합 대상을 확인하지 못했습니다.");
+		const target = admitted.admission.target;
+		if (target.leaseKey !== own.lease.record.key ||
+			path.resolve(target.authorizedRoot.canonicalPath) !== path.resolve(own.lease.root)) {
+			return integrationProblem("target-mismatch", "통합 대상이 이 실행의 현재 쓰기 잠금 대상과 다릅니다.");
+		}
+		return undefined;
+	}
+
+	/** The current plan contract for the exact result ids the admission froze. */
+	#contractProblem(own: OwnRun, admitted: IntegrationAdmissionState): IntegrationProblem | undefined {
+		const subject = admitted.admission.subject;
+		if (subject.kind === "unplanned") return undefined;
+		if (own.record.plan?.lanes.some(lane => lane.name === subject.lane) !== true) {
+			return integrationProblem("lane-not-planned", "이 후보의 레인이 현재 계획에 없습니다.");
+		}
+		if (subject.results.length === 0) {
+			return own.integration?.laneEpoch.get(subject.lane) === subject.epoch
+				? undefined
+				: integrationProblem("candidate-stale", "더 새로운 결과 없는 후보가 이 레인에 있습니다.");
+		}
+		for (const frozen of subject.results) {
+			const current = this.#plannedResult(own, frozen.id);
+			if (current === undefined || resultContractIdentity(current) !== resultContractIdentity(frozen)) {
+				return integrationProblem("contract-changed", "이 후보가 고정한 결과 계약이 현재 계획과 다릅니다.");
+			}
+		}
+		return undefined;
+	}
+
+	/** Rechecks the exact producer versions and locations a frozen subject consumed. */
+	async #consumedProblem(
+		own: OwnRun,
+		admitted: IntegrationAdmissionState,
+		window: ByteWindow,
+	): Promise<IntegrationProblem | undefined> {
+		const subject = admitted.admission.subject;
+		if (subject.kind === "unplanned") return undefined;
+		const rows = own.record.results ?? [];
+		for (const consumed of subject.consumed) {
+			const label = consumed.subject.kind === "result" ? consumed.subject.id : `${consumed.subject.lane} 전체`;
+			if (consumed.subject.kind === "resultless-footprint") {
+				const footprint = await this.#currentFootprint(own, consumed.subject.lane, window);
+				if (consumed.state === "missing" || footprint === undefined) {
+					return integrationProblem("consumed-footprint-missing", `선행 '${label}'의 현재 통합 영수증이 없습니다.`);
+				}
+				if (footprint.version !== consumed.version ||
+					(consumed.state === "integrated" && !sameReceipt(footprint.receipt, consumed.receipt))) {
+					return integrationProblem("consumed-footprint-changed", `선행 '${label}'의 통합 영수증이 이 시도가 시작한 것과 다릅니다.`);
+				}
+				continue;
+			}
+			const resultId = consumed.subject.id;
+			const row = rows.find(candidate => candidate.id === resultId);
+			if (consumed.state === "missing") {
+				return integrationProblem("consumed-missing", `선행 결과 '${label}' 없이 시작한 시도는 나중에 보완할 수 없습니다.`);
+			}
+			if (currentInputVersion(row) !== consumed.version) {
+				return integrationProblem("consumed-changed", `선행 결과 '${label}'의 현재 버전이 이 시도가 시작한 버전과 다릅니다.`);
+			}
+			if (consumed.state === "integrated") {
+				const current = await this.#currentIntegratedResult(own, resultId, window);
+				if (current === undefined || current.version !== consumed.version || !sameReceipt(current.receipt, consumed.receipt)) {
+					return integrationProblem("consumed-receipt-changed", `선행 결과 '${label}'의 통합 영수증이 더 이상 현재 것이 아닙니다.`);
+				}
+				if (current.paths.length !== consumed.paths.length ||
+					current.paths.some((path, index) => path.path !== consumed.paths[index]?.path ||
+						consumed.paths[index] === undefined || !sameImage(path.image, consumed.paths[index]!.image))) {
+					return integrationProblem("consumed-location-changed", `선행 결과 '${label}'의 통합 위치가 이 시도가 시작한 위치와 다릅니다.`);
+				}
+				continue;
+			}
+			if (consumed.need === "result" && row?.state !== "accepted") {
+				return integrationProblem("consumed-result-missing", `선행 결과 '${label}'가 더 이상 수용 상태가 아닙니다.`);
+			}
+			if (consumed.need === "reviewable" && row?.state !== "accepted" && row?.state !== "reviewable") {
+				return integrationProblem("consumed-reviewable-missing", `선행 결과 '${label}'가 더 이상 검토 가능 상태가 아닙니다.`);
+			}
+			if (consumed.need === "integrated" && row !== undefined) {
+				const result = this.#plannedResult(own, resultId) ?? row.contract;
+				if (result === undefined) return integrationProblem("consumed-contract-missing", `선행 결과 '${label}'의 현재 계약이 없습니다.`);
+				const lane = own.record.plan?.lanes.find(candidate => (candidate.results ?? []).some(item => item.id === resultId));
+				const isolated = lane !== undefined && (lane.isolationReason !== undefined || own.config.isolation === "isolated");
+				const location = await this.#acceptedLocation(own, result, isolated, row);
+				if (!location.ok) {
+					return integrationProblem("consumed-not-integrated", `선행 결과 '${label}'가 현재 부모에 통합되어 있지 않습니다.`);
+				}
+				if (!location.integrated) {
+					return integrationProblem("consumed-not-integrated", `선행 결과 '${label}'의 통합 위치를 현재 확인하지 못했습니다.`);
+				}
+			}
+		}
+		return undefined;
+	}
+
+	/** B's durable receipt for one candidate, only in the written/already-written states. */
+	async #latestReceipt(own: OwnRun | undefined, state: IntegrationRunState, admitted: IntegrationAdmissionState): Promise<IntegrationRead<WriteReceipt>> {
+		const stored = await this.#storedCandidate(own, state, admitted);
+		if (stored.kind !== "known") return stored;
+		const write = admitted.lastWrite ?? stored.value.lastWrite;
+		if (write === undefined || write === null) return integrationUnknown("receipt-missing", "아직 이 후보의 통합 영수증이 없습니다.");
+		if (write.kind === "written" || write.kind === "already-written") return integrationKnown(write.receipt);
+		return integrationUnknown(`write-${write.kind}`, write.problem.reason);
+	}
+
+	/** Freshly proves one recorded result state against its current receipt, target presence and consumed inputs. */
+	async #verifyReceiptState(
+		own: OwnRun,
+		result: PlanLaneResult,
+		row: RunResult,
+		recorded: IntegrationResultState,
+		window: ByteWindow,
+	): Promise<IntegrationCheck> {
+		const ports = this.#integration;
+		if (ports === undefined) return integrationFail("integration-disabled", "이 호스트에서는 격리 통합 영수증을 확인하지 않습니다.");
+		const admitted = own.integration?.candidates.get(recorded.candidateId);
+		if (admitted === undefined || admitted.seal === undefined) {
+			return integrationFail("receipt-candidate-missing", "이 영수증의 후보 기록을 찾지 못했습니다.");
+		}
+		if (admitted.status !== "committed" || admitted.seal.digest !== recorded.manifestDigest) {
+			return integrationFail("receipt-candidate-stale", "영수증의 후보가 현재 게시 상태가 아닙니다.");
+		}
+		const receipt = await this.#latestReceipt(own, this.#integrationStateFor(own), admitted);
+		if (receipt.kind !== "known") return integrationFail(receipt.problem.code, receipt.problem.reason);
+		if (!sameReceipt(receipt.value.ref, recorded.receipt) || receipt.value.ref.manifestDigest !== admitted.seal.digest) {
+			return integrationFail("receipt-mismatch", "현재 저장된 영수증이 이 결과가 근거로 삼은 영수증과 다릅니다.");
+		}
+		if (row.attemptId !== recorded.attemptId) return integrationFail("receipt-attempt-mismatch", "영수증의 시도가 행의 시도와 다릅니다.");
+		const seal = admitted.seal;
+		if (admitted.problem !== undefined) return integrationFail(admitted.problem.code, admitted.problem.reason);
+		if (seal.bundle.kind !== "root-only") {
+			return integrationFail("candidate-not-written", "영수증은 루트 전용 캡처의 정확 쓰기에서만 나옵니다.");
+		}
+		if (seal.terminal.kind !== "known" || seal.terminal.value.outcome.kind !== "known" ||
+			seal.terminal.value.outcome.value !== "success" || seal.terminal.value.cancelRequested ||
+			seal.terminal.value.stopCause.kind === "known") {
+			return integrationFail("candidate-not-success", "성공으로 끝난 시도의 영수증이 아닙니다.");
+		}
+		if (seal.childClaim.kind !== "known") {
+			return integrationFail("candidate-unproved", "영수증의 자식 진입·정확 델타 증명이 없습니다.");
+		}
+		const claim = seal.childClaim.value;
+		if (claim.key.dispatch !== seal.admission.key.dispatch || claim.candidateId !== seal.admission.candidateId ||
+			claim.childHandle !== seal.admission.item.handle) {
+			return integrationFail("child-claim-mismatch", "영수증의 자식 진입 증명이 이 수락과 맞지 않습니다.");
+		}
+		if (seal.delta.kind !== "known") {
+			return integrationFail("candidate-unproved", "영수증의 자식 진입·정확 델타 증명이 없습니다.");
+		}
+		if (!sameKey(seal.delta.value.key, seal.admission.key) ||
+			seal.delta.value.candidateId !== seal.admission.candidateId) {
+			return integrationFail("delta-mismatch", "영수증의 정확 델타가 이 수락과 맞지 않습니다.");
+		}
+		const targetProblem = this.#targetProblem(own, admitted);
+		if (targetProblem !== undefined) return integrationFail(targetProblem.code, targetProblem.reason);
+		const fence = await ports.journal.findFence({
+			canonicalRoot: admitted.admission.target.authorizedRoot.canonicalPath,
+			leaseKey: admitted.admission.target.leaseKey,
+		});
+		if (fence.kind === "fenced") return integrationFail("target-fenced", "대상에 해결되지 않은 통합 펜스가 있습니다.");
+		if (fence.kind === "unknown") return integrationFail(fence.problem.code, fence.problem.reason);
+		const contractProblem = this.#contractProblem(own, admitted);
+		if (contractProblem !== undefined) return integrationFail(contractProblem.code, contractProblem.reason);
+		const consumedProblem = await this.#consumedProblem(own, admitted, window);
+		if (consumedProblem !== undefined) return integrationFail(consumedProblem.code, consumedProblem.reason);
+		const expected = attributablePaths(receipt.value, result, this.#laneFilesFor(own, admitted));
+		if (expected.length === 0 || expected.length !== recorded.attributable.length ||
+			expected.some((path, index) => path.path !== recorded.attributable[index]?.path ||
+				recorded.attributable[index] === undefined || !sameImage(path.image, recorded.attributable[index]!.image))) {
+			return integrationFail("attribution-mismatch", "영수증의 내용 변경과 결과 범위의 교집합이 기록과 다릅니다.");
+		}
+		const presence = await ports.delta.observePresence(
+			admitted.admission.target,
+			recorded.attributable,
+			window,
+		);
+		if (presence.kind === "unknown") return integrationFail("presence-unknown", presence.problem.reason);
+		if (presence.kind !== "present") {
+			return integrationFail("presence-changed", `통합 이후 대상 바이트가 영수증과 다릅니다(${presence.firstPath}).`);
+		}
+		return integrationOk();
+	}
+
+	async #witnessFromReceipt(
+		admitted: IntegrationAdmissionState,
+		receipt: WriteReceipt,
+		prepared: PreparedAttempt,
+		result: PlanLaneResult,
+		attemptId: string,
+		window: ByteWindow,
+	): Promise<IntegrationRead<AttemptWriteWitness>> {
+		const ports = this.#integration;
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 근거를 읽지 않습니다.");
+		if (admitted.status !== "committed" || admitted.problem !== undefined) {
+			return integrationUnknown("candidate-not-current", "현재 게시 상태가 아닌 후보는 통합 근거가 되지 않습니다.");
+		}
+		const subject = admitted.admission.subject;
+		if (subject.kind !== "planned") return integrationUnknown("unplanned", "계획 없는 후보는 결과 근거가 없습니다.");
+		if (result.kind !== "change") return integrationUnknown("not-change", "통합 영수증은 change 결과에만 근거가 됩니다.");
+		const deltaDigest = admitted.seal?.delta.kind === "known" ? admitted.seal.delta.value.digest : undefined;
+		if (!sameKey(receipt.ref.key, admitted.admission.key) || receipt.ref.candidateId !== admitted.admission.candidateId ||
+			admitted.seal === undefined || receipt.ref.manifestDigest !== admitted.seal.digest ||
+			receipt.intent.candidate.candidateId !== admitted.admission.candidateId ||
+			deltaDigest === undefined || receipt.intent.deltaDigest !== deltaDigest) {
+			return integrationUnknown("receipt-binding-mismatch", "영수증이 이 후보·매니페스트·델타에 결속되지 않았습니다.");
+		}
+		if (receipt.end.basis !== "installer-exit-proved") {
+			return integrationUnknown("effect-end-unproved", "설치 효과의 끝이 증명되지 않아 영수증을 근거로 쓰지 않습니다.");
+		}
+		const attributable = attributablePaths(receipt, result, prepared.laneFiles);
+		if (attributable.length === 0) {
+			return integrationUnknown("outside-scope", "영수증의 내용 변경이 이 결과의 원래 평가 범위에 없습니다.");
+		}
+		const presence = await ports.delta.observePresence(
+			admitted.admission.target,
+			attributable,
+			window,
+		);
+		if (presence.kind === "unknown") return integrationUnknown("presence-unknown", presence.problem.reason);
+		if (presence.kind !== "present") {
+			return integrationUnknown("presence-changed", `통합 이후 대상 바이트가 영수증과 다릅니다(${presence.firstPath}).`);
+		}
+		return integrationKnown({
+			attemptId: attemptId as AttemptWriteWitness["attemptId"],
+			dispatch: admitted.admission.key.dispatch,
+			lane: subject.lane,
+			epoch: subject.epoch,
+			contractDigest: subject.contractDigest,
+			consumed: subject.consumed,
+			receipt: receipt.ref,
+			attributable,
+			observedAt: this.deps.now(),
+		});
+	}
+
+	/** Internal C adapter to the original evaluator; unknown/stale/outside-scope bytes yield no witness. */
+	async readWitness(settlement: AttemptSettlement, resultId: string, window: ByteWindow): Promise<IntegrationRead<AttemptWriteWitness>> {
+		const ports = this.#integration;
+		const own = this.#own;
+		if (ports === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 근거를 읽지 않습니다.");
+		if (own === undefined || settlement.runId !== own.record.runId) return integrationUnknown("run-not-active", "이 실행의 정산이 아닙니다.");
+		const admitted = own.integration?.admissions.get(settlement.dispatch);
+		if (admitted === undefined || admitted.status !== "committed" || admitted.seal === undefined) {
+			return integrationUnknown("candidate-missing", "이 시도에 결속된 통합 후보가 없습니다.");
+		}
+		const subject = admitted.admission.subject;
+		if (subject.kind !== "planned" || settlement.lane !== subject.lane ||
+			settlement.spawnKey !== admitted.admission.item.handle ||
+			settlement.report.attemptId === undefined) {
+			return integrationUnknown("settlement-mismatch", "정산이 이 통합 수락의 시도와 맞지 않습니다.");
+		}
+		if (admitted.boundAttemptId !== undefined && admitted.boundAttemptId !== settlement.report.attemptId) {
+			return integrationUnknown("settlement-contradiction", "캡처와 정산의 네이티브 시도가 다릅니다.");
+		}
+		const result = subject.results.find(candidate => candidate.id === resultId);
+		if (result === undefined) return integrationUnknown("result-not-declared", "이 결과는 이 시도의 계약에 없습니다.");
+		const settled = [...own.settled.values()].find(candidate => candidate.prepared.dispatch === settlement.dispatch);
+		if (settled === undefined) return integrationUnknown("attempt-not-settled", "이 시도의 정산 근거를 아직 읽지 못했습니다.");
+		if (settled.attemptId !== settlement.report.attemptId || settled.prepared.parentId !== settlement.parentId) {
+			return integrationUnknown("attempt-mismatch", "정산의 시도 id·부모가 저장된 정산과 다릅니다.");
+		}
+		const receipt = await this.#latestReceipt(own, this.#integrationStateFor(own), admitted);
+		if (receipt.kind !== "known") return receipt;
+		return this.#witnessFromReceipt(admitted, receipt.value, settled.prepared, result, settled.attemptId, window);
+	}
+
+	/** Re-enters only the exact attempt's change rows, for receipt-attributed bytes on the parent tree. */
+	async #evaluateIntegrated(
+		own: OwnRun,
+		settled: SettledAttempt,
+		witnesses: ReadonlyMap<string, AttemptWriteWitness>,
+		window: ByteWindow,
+	): Promise<void> {
+		const prepared = settled.prepared;
+		const changes = prepared.results.filter(result => result.kind === "change" && witnesses.has(result.id));
+		if (changes.length === 0) return;
+		const checkNames = changes.filter(result => result.check !== undefined).map(result => result.id);
+		const checks = checkNames.length === 0 ? undefined : await this.#approvedCheckEvidence(own);
+		const deferred = new Set(checkNames.length > 0 && checks === undefined ? checkNames : []);
+		const integratedChange: Record<string, readonly string[]> = {};
+		for (const result of changes) integratedChange[result.id] = witnesses.get(result.id)!.attributable.map(path => path.path);
+		const evaluation = await evaluateSettledResults({
+			lane: prepared.lane,
+			attemptId: settled.attemptId,
+			results: changes,
+			shared: { root: own.root, ...(prepared.baseline === undefined ? {} : { baseline: prepared.baseline }) },
+			artifactMode: "isolated",
+			config: own.config,
+			...(prepared.laneFiles === undefined ? {} : { laneFiles: prepared.laneFiles }),
+			...(checks === undefined ? {} : { checks }),
+			integratedChange,
+			signal: window.signal,
+		});
+		if (this.#own !== own || own.settled.get(prepared.lane) !== settled ||
+			prepared.epoch < (own.laneAttempt.get(prepared.lane) ?? 0)) return;
+		if (!evaluation.ok) {
+			for (const result of changes) {
+				const row = own.record.results?.find(candidate => candidate.id === result.id);
+				if (row === undefined || row.attemptId !== settled.attemptId) continue;
+				row.state = "unmet";
+				row.reason = compactResultReason(`통합된 결과를 다시 평가하지 못했습니다: ${evaluation.reason}`);
+				row.origin = "attempt";
+				delete row.contentVersion;
+				delete row.proof;
+				delete row.remedy;
+				delete row.retryRoute;
+				delete row.unblock;
+				own.integration?.awaiting.delete(row.id);
+			}
+			this.#invalidateConsumers(own);
+			this.#scheduleFlush(own);
+			return;
+		}
+		this.#bindConsumedForRows(own, prepared, settled.attemptId);
+		this.#applyEvaluated(own, prepared, settled.attemptId, evaluation.report.results, deferred);
+		for (const item of evaluation.report.results) {
+			const row = own.record.results?.find(candidate => candidate.id === item.id);
+			if (row === undefined || row.attemptId !== settled.attemptId) continue;
+			if (row.state === "accepted" || row.state === "reviewable") {
+				// The row's state carries the check/review gate; the persisted item describes the content this exact receipt
+				// proved. A deferred check or a pending reviewer still needs a locatable content proof at acceptance.
+				const proofItem = item.state === "accepted" ? item : { ...item, state: "accepted" as const };
+				const proof = captureCheckpointProof(proofItem);
+				if (proof !== undefined) row.proof = proof;
+				own.integration?.awaiting.delete(row.id);
+			} else {
+				delete row.proof;
+				own.integration?.awaiting.delete(row.id);
+			}
+			delete row.restoredFrom;
+			const witness = witnesses.get(item.id);
+			if (witness !== undefined) {
+				this.#integrationStateFor(own).receipts.set(item.id, {
+					receipt: witness.receipt,
+					attemptId: settled.attemptId,
+					candidateId: witness.receipt.candidateId,
+					manifestDigest: witness.receipt.manifestDigest,
+					attributable: witness.attributable,
+					observedAt: witness.observedAt,
+				});
+			}
+		}
+		settled.integrated = {
+			receipt: [...witnesses.values()][0]!.receipt,
+			candidateId: [...witnesses.values()][0]!.receipt.candidateId,
+			witnesses,
+			evaluatedAt: this.deps.now(),
+		};
+		settled.checkDeferred = deferred.size > 0;
+		this.#scheduleFlush(own);
+	}
+
+	/** Bind every row of the attempt to the producer versions the attempt started from. */
+	#bindConsumedForRows(own: OwnRun, prepared: PreparedAttempt, attemptId: string): void {
+		for (const row of own.record.results ?? []) {
+			if (row.attemptId === attemptId && prepared.results.some(result => result.id === row.id)) this.#bindConsumed(row, prepared);
+		}
+	}
+
+	/** B's durable receipt re-enters the evaluator once, only for the exact attempt and attributable paths. */
+	async #onIntegrationReceipt(receipt: WriteReceipt): Promise<void> {
+		const ports = this.#integration;
+		const own = this.#own;
+		if (ports === undefined || own === undefined || receipt.ref.key.runId !== own.record.runId) return;
+		const admitted = own.integration?.candidates.get(receipt.ref.candidateId);
+		if (admitted === undefined || admitted.seal === undefined) return;
+		if (receipt.ref.manifestDigest !== admitted.seal.digest || !sameKey(receipt.ref.key, admitted.admission.key)) return;
+		admitted.lastWrite = { kind: "written", receipt };
+		admitted.lastWriteAt = this.deps.now();
+		const subject = admitted.admission.subject;
+		if (subject.kind === "unplanned") return;
+		const window = this.#readWindow();
+		if (subject.results.length === 0) {
+			const presence = await ports.delta.observePresence(admitted.admission.target, receiptPaths(receipt), window);
+			if (presence.kind === "present") {
+				this.#integrationStateFor(own).footprints.set(subject.lane, {
+					lane: subject.lane,
+					receipt: receipt.ref,
+					version: receipt.ref.manifestDigest,
+					paths: receiptPaths(receipt),
+					observedAt: this.deps.now(),
+				});
+			}
+			return;
+		}
+		const settled = own.settled.get(subject.lane);
+		if (settled === undefined || settled.prepared.epoch !== subject.epoch ||
+			(admitted.boundAttemptId !== undefined && admitted.boundAttemptId !== settled.attemptId)) return;
+		const witnesses = new Map<string, AttemptWriteWitness>();
+		for (const result of subject.results) {
+			if (result.kind !== "change") continue;
+			const witness = await this.#witnessFromReceipt(admitted, receipt, settled.prepared, result, settled.attemptId, window);
+			if (witness.kind === "known") witnesses.set(result.id, witness.value);
+		}
+		await this.#evaluateIntegrated(own, settled, witnesses, window);
+	}
+
+	/** Re-runs the same receipt-backed change evaluation once approved check evidence exists. */
+	async #refreshIntegrated(own: OwnRun, settled: SettledAttempt, window: ByteWindow): Promise<void> {
+		const integrated = settled.integrated;
+		if (integrated === undefined) return;
+		const admitted = own.integration?.candidates.get(integrated.candidateId);
+		if (admitted === undefined || admitted.seal === undefined) return;
+		const receipt = await this.#latestReceipt(own, this.#integrationStateFor(own), admitted);
+		if (receipt.kind !== "known") return;
+		const witnesses = new Map<string, AttemptWriteWitness>();
+		for (const result of settled.prepared.results) {
+			if (result.kind !== "change") continue;
+			const witness = await this.#witnessFromReceipt(admitted, receipt.value, settled.prepared, result, settled.attemptId, window);
+			if (witness.kind === "known") witnesses.set(result.id, witness.value);
+		}
+		await this.#evaluateIntegrated(own, settled, witnesses, window);
+	}
+
+	/** The synchronous revalidation B's segment publishes before an effect. */
+	async #revalidateCandidate(own: OwnRun, revision: CandidateRevision, window: ByteWindow): Promise<LiveCheck> {
+		const ports = this.#integration;
+		if (ports === undefined) return { ok: false, reason: "이 호스트에서는 격리 통합을 적용하지 않습니다." };
+		const admitted = own.integration?.candidates.get(revision.candidateId);
+		if (admitted === undefined || admitted.seal === undefined || admitted.status !== "committed") {
+			return { ok: false, reason: "게시된 통합 후보가 아닙니다." };
+		}
+		if (!sameKey(revision.key, admitted.admission.key) || admitted.seal.digest !== revision.manifestDigest) {
+			return { ok: false, reason: "후보 개정이 저장된 매니페스트와 다릅니다." };
+		}
+		const fail = (problem: IntegrationProblem): LiveCheck => {
+			admitted.liveCheck = { revision, problem };
+			return { ok: false, reason: problem.reason };
+		};
+		if (own.ending !== undefined || own.abort.signal.aborted || window.signal.aborted) {
+			return fail(integrationProblem("authority-lost", "실행 권한이 끝나 통합을 시작하지 않습니다."));
+		}
+		const readiness = this.#sealBaseReadiness(own, admitted);
+		if (readiness.kind !== "ready") {
+			return fail(readiness.kind === "confirmed-empty"
+				? integrationProblem("candidate-empty", "빈 캡처는 통합할 수 없습니다.")
+				: "problem" in readiness ? readiness.problem : integrationProblem("candidate-not-ready", "통합 후보가 준비 상태가 아닙니다."));
+		}
+		const targetProblem = this.#targetProblem(own, admitted);
+		if (targetProblem !== undefined) return fail(targetProblem);
+		const contractProblem = this.#contractProblem(own, admitted);
+		if (contractProblem !== undefined) return fail(contractProblem);
+		const consumedProblem = await this.#consumedProblem(own, admitted, window);
+		if (consumedProblem !== undefined) return fail(consumedProblem);
+		const fence = await ports.journal.findFence({
+			canonicalRoot: admitted.admission.target.authorizedRoot.canonicalPath,
+			leaseKey: admitted.admission.target.leaseKey,
+		});
+		if (fence.kind === "fenced") return fail(integrationProblem("target-fenced", "대상에 해결되지 않은 통합 펜스가 있습니다."));
+		if (fence.kind === "unknown") return fail(fence.problem);
+		const stored = await this.#storedCandidate(own, this.#integrationStateFor(own), admitted);
+		if (stored.kind !== "known") return fail(stored.problem);
+		const write = admitted.lastWrite ?? stored.value.lastWrite;
+		if (write?.kind === "recovery-required" || write?.kind === "present-unattributed") return fail(write.problem);
+		if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted || window.signal.aborted) {
+			return fail(integrationProblem("authority-lost", "대기 중 실행 권한이 끝났습니다."));
+		}
+		admitted.liveCheck = { revision };
+		return { ok: true };
+	}
+
+	/** The final synchronous check after refreshed file/image preflight; never permission to start a check. */
+	#checkCandidate(own: OwnRun, revision: CandidateRevision): LiveCheck {
+		const admitted = own.integration?.candidates.get(revision.candidateId);
+		if (admitted === undefined) return { ok: false, reason: "통합 후보가 사라졌습니다." };
+		const checked = admitted.liveCheck;
+		if (checked === undefined || checked.revision.manifestDigest !== revision.manifestDigest ||
+			!sameKey(checked.revision.key, revision.key)) {
+			return { ok: false, reason: "재검증 없이 통합 후보를 쓰지 않습니다." };
+		}
+		if (checked.problem !== undefined) return { ok: false, reason: checked.problem.reason };
+		return own.ending === undefined && !own.abort.signal.aborted ? { ok: true } : { ok: false, reason: "실행 권한이 끝났습니다." };
+	}
+
+	/**
+	 * The director's explicit selection under the live owning ask. The whole list is validated before any write, then
+	 * ordered by consumed receipt, placement ordinal and id. No selection is resumed automatically.
+	 */
+	async select(input: {
+		readonly candidateIds: readonly string[];
+		readonly live: Omit<IntegrationLiveGrant, "revalidateCandidate" | "checkCandidate">;
+	}): Promise<IntegrationSelectionReply> {
+		const ports = this.#integration;
+		const own = this.#own;
+		const refused = (problem: IntegrationProblem): IntegrationSelectionReply => ({ kind: "refused", problem });
+		if (ports === undefined) return refused(integrationProblem("integration-disabled", "이 호스트에서는 격리 통합을 선택하지 않습니다."));
+		if (own === undefined) return refused(integrationProblem("run-not-active", "진행 중인 실행이 없어 통합을 선택하지 않았습니다."));
+		if (own.ending !== undefined || own.abort.signal.aborted || own.finalizing === true) {
+			return refused(integrationProblem("run-stopping", "실행이 끝나는 중이라 통합을 선택하지 않았습니다."));
+		}
+		const ids = input.candidateIds;
+		if (!Array.isArray(ids) || ids.length < 1 || ids.length > INTEGRATION_CANDIDATES_MAX ||
+			Buffer.byteLength(JSON.stringify(ids), "utf8") > INTEGRATION_LIST_BYTES_MAX) {
+			return refused(integrationProblem("candidate-list-invalid", "통합 후보 목록은 1~128개의 정확한 id여야 합니다."));
+		}
+		const requested: IntegrationCandidateId[] = [];
+		const seen = new Set<string>();
+		for (const id of ids) {
+			if (!isCandidateId(id) || seen.has(id)) return refused(integrationProblem("candidate-id-invalid", "통합 후보 id가 형식과 다르거나 중복되었습니다."));
+			seen.add(id);
+			requested.push(id);
+		}
+		const audit = input.live.audit;
+		if (audit.director.sessionId !== own.sessionId || audit.director.sessionDir !== own.sessionDir ||
+			audit.director.sessionInstance.trim() === "" || typeof audit.director.parentId !== "string" ||
+			audit.director.parentId.length > 512 || audit.conversationId.trim() === "" || audit.askId.trim() === "" ||
+			!Number.isFinite(audit.deadline) || audit.deadline <= this.deps.now() ||
+			audit.selection.runId !== own.record.runId || audit.selection.callId.trim() === "" ||
+			audit.selection.callId.length > 512) {
+			return refused(integrationProblem("authority-invalid", "통합을 선택한 소유 ask·대화·기한을 확인하지 못했습니다."));
+		}
+		const liveNow = input.live.check();
+		if (!liveNow.ok) return refused(integrationProblem("authority-live", liveNow.reason));
+		if (input.live.signal.aborted) return refused(integrationProblem("authority-signal", "선택 권한이 취소되었습니다."));
+		this.#lastProjection = undefined;
+
+		const state = this.#integrationStateFor(own);
+		const replay = await this.#replayIntegration(state, own.record.runId);
+		if (replay.kind !== "known") return refused(replay.problem);
+		const selectionSignal = AbortSignal.any([own.abort.signal, input.live.signal]);
+		const window = this.#windowFor(selectionSignal, audit.deadline);
+		const steps = new Map<string, WriteStepRecord>();
+		const ready: IntegrationAdmissionState[] = [];
+		let skipped = 0;
+		for (const id of requested) {
+			const admitted = state.candidates.get(id);
+			if (admitted === undefined || admitted.status !== "committed" || admitted.admission.key.runId !== own.record.runId) {
+				return refused(integrationProblem("candidate-foreign", "이 실행의 게시된 통합 후보가 아닌 id가 있습니다."));
+			}
+			const readiness = await this.#readinessFor(own, state, admitted, window);
+			if (readiness.kind !== "ready") {
+				steps.set(id, {
+					candidateId: id,
+					state: "not-ready",
+					problem: readiness.kind === "confirmed-empty"
+						? integrationProblem("candidate-empty", "빈 캡처는 통합할 수 없습니다.")
+						: "problem" in readiness ? readiness.problem : integrationProblem("candidate-not-ready", "후보가 준비 상태가 아닙니다."),
+				});
+				skipped += 1;
+				continue;
+			}
+			const consumed = await this.#consumedProblem(own, admitted, window);
+			if (consumed !== undefined) {
+				steps.set(id, { candidateId: id, state: "not-ready", problem: consumed });
+				skipped += 1;
+				continue;
+			}
+			ready.push(admitted);
+		}
+
+		// Prerequisite order: only a selected producer's receipt that the consumer actually consumed is an edge.
+		const edges = new Map<string, Set<string>>();
+		const indegree = new Map<string, number>();
+		for (const candidate of ready) {
+			edges.set(candidate.admission.candidateId, new Set());
+			indegree.set(candidate.admission.candidateId, 0);
+		}
+		const byCandidate = new Map<string, IntegrationAdmissionState>();
+		for (const candidate of ready) byCandidate.set(candidate.admission.candidateId, candidate);
+		for (const consumer of ready) {
+			const subject = consumer.admission.subject;
+			if (subject.kind !== "planned") continue;
+			for (const consumed of subject.consumed) {
+				if (consumed.state !== "integrated") continue;
+				const consumedResultId = consumed.subject.kind === "result" ? consumed.subject.id : undefined;
+				// The consumed receipt names the exact producer write. Selecting a different/newer candidate for the
+				// same result is not that write and creates no edge; a missing producer in this list is not repaired.
+				const producer = byCandidate.get(consumed.receipt.candidateId);
+				if (producer === undefined || producer === consumer) continue;
+				const producerSubject = producer.admission.subject;
+				if (producerSubject.kind !== "planned") continue;
+				if (consumedResultId === undefined) {
+					if (producerSubject.results.length !== 0 || producerSubject.lane !== consumed.producerLane) continue;
+				} else if (!producerSubject.results.some(result => result.id === consumedResultId)) {
+					continue;
+				}
+				const out = edges.get(producer.admission.candidateId);
+				if (out === undefined || out.has(consumer.admission.candidateId)) continue;
+				out.add(consumer.admission.candidateId);
+				indegree.set(consumer.admission.candidateId, (indegree.get(consumer.admission.candidateId) ?? 0) + 1);
+			}
+		}
+		const ordered: IntegrationAdmissionState[] = [];
+		const pending = [...ready];
+		while (pending.length > 0) {
+			let best = -1;
+			for (let index = 0; index < pending.length; index += 1) {
+				const candidate = pending[index]!;
+				if ((indegree.get(candidate.admission.candidateId) ?? 0) !== 0) continue;
+				if (best < 0) {
+					best = index;
+					continue;
+				}
+				const incumbent = pending[best]!;
+				const ordinal = candidate.admission.placementOrdinal - incumbent.admission.placementOrdinal;
+				if (ordinal < 0 || (ordinal === 0 && candidate.admission.candidateId < incumbent.admission.candidateId)) best = index;
+			}
+			if (best < 0) return refused(integrationProblem("prerequisite-cycle", "선택한 후보들의 선행 관계가 순환합니다."));
+			const [next] = pending.splice(best, 1);
+			if (next === undefined) break;
+			ordered.push(next);
+			for (const dependent of edges.get(next.admission.candidateId) ?? []) {
+				indegree.set(dependent, (indegree.get(dependent) ?? 1) - 1);
+			}
+		}
+
+		const callId = audit.selection.callId;
+		const orderedIds = ordered.map(candidate => candidate.admission.candidateId);
+		const orderedSet = new Set<string>(orderedIds);
+		const chosen = requested.filter(id => orderedSet.has(id));
+		const selection: SelectionSnapshot = { key: { runId: own.record.runId, callId }, chosen, ordered: orderedIds };
+		if (ordered.length === 0) {
+			return {
+				kind: "selection", selection, started: 0, written: 0, skipped, notStarted: 0,
+				examples: requested.map(id => steps.get(id)).filter((step): step is WriteStepRecord => step !== undefined).slice(0, INTEGRATION_EXAMPLES),
+				firstNotStarted: null, stop: null,
+			};
+		}
+		const begun = await ports.journal.beginSelection(selection);
+		if (!begun.ok) return refused(begun.problem);
+		for (const id of requested) {
+			const step = steps.get(id);
+			if (step === undefined) continue;
+			const recorded = await ports.journal.recordStep(selection.key, step);
+			if (!recorded.ok) return refused(recorded.problem);
+		}
+		const upgraded = await this.#upgradeLease(own);
+		if (!upgraded.ok) return refused(integrationProblem("lease-unavailable", upgraded.reason));
+		if (this.#own !== own || own.lease === undefined) return refused(integrationProblem("authority-lost", "통합 쓰기 권한이 준비 중에 끝났습니다."));
+		const target = ordered[0]!.admission.target;
+		for (const candidate of ordered) {
+			const other = candidate.admission.target;
+			if (other.leaseKey !== target.leaseKey ||
+				path.resolve(other.authorizedRoot.canonicalPath) !== path.resolve(target.authorizedRoot.canonicalPath) ||
+				other.gitRoot.canonicalPath !== target.gitRoot.canonicalPath ||
+				other.gitDir.canonicalPath !== target.gitDir.canonicalPath ||
+				other.targetPrefix !== target.targetPrefix) {
+				return refused(integrationProblem("mixed-targets", "선택한 후보들이 같은 통합 대상을 쓰지 않습니다."));
+			}
+		}
+		if (target.leaseKey !== own.lease.record.key) return refused(integrationProblem("target-mismatch", "통합 대상이 현재 쓰기 잠금과 다릅니다."));
+		const grant: IntegrationLiveGrant = {
+			audit,
+			signal: input.live.signal,
+			check: input.live.check,
+			revalidateCandidate: (revision, effectWindow) => this.#revalidateCandidate(own, revision, effectWindow),
+			checkCandidate: revision => this.#checkCandidate(own, revision),
+		};
+		const reserved = await ports.writer.reserveSegment({ lease: own.lease, target, selection, live: grant, window });
+		if (reserved.kind !== "known") return refused(reserved.problem);
+		const holder = reserved.value;
+		let stop: IntegrationProblem | null = null;
+		let started = 0;
+		let written = 0;
+		let notStarted = 0;
+		try {
+			for (let index = 0; index < ordered.length; index += 1) {
+				const admitted = ordered[index]!;
+				const id = admitted.admission.candidateId;
+				if (stop !== null) {
+					steps.set(id, { candidateId: id, state: "not-started" });
+					notStarted += 1;
+					continue;
+				}
+				const authority = input.live.check();
+				if (!authority.ok) {
+					stop = integrationProblem("authority-live", authority.reason);
+					steps.set(id, { candidateId: id, state: "not-started" });
+					notStarted += 1;
+					continue;
+				}
+				if (this.#own !== own || own.ending !== undefined || own.abort.signal.aborted || input.live.signal.aborted) {
+					stop = integrationProblem("authority-lost", "통합 중 실행 권한이 끝났습니다.");
+					steps.set(id, { candidateId: id, state: "not-started" });
+					notStarted += 1;
+					continue;
+				}
+				const revision: CandidateRevision = {
+					key: admitted.admission.key,
+					candidateId: id,
+					manifestDigest: admitted.seal?.digest ?? "",
+				};
+				const effectWindow = this.#windowFor(selectionSignal, audit.deadline);
+				const revalidated = await this.#revalidateCandidate(own, revision, effectWindow);
+				if (!revalidated.ok) {
+					const problem = admitted.liveCheck?.problem ?? integrationProblem("revalidate-failed", revalidated.reason);
+					steps.set(id, { candidateId: id, state: "not-ready", problem });
+					skipped += 1;
+					if (problem.code === "target-fenced" || problem.code === "authority-lost" ||
+						problem.code === "target-mismatch" || problem.code === "lease-missing") {
+						stop = problem;
+					}
+					continue;
+				}
+				const finalCheck = this.#checkCandidate(own, revision);
+				if (!finalCheck.ok) {
+					const problem = admitted.liveCheck?.problem ?? integrationProblem("final-check-failed", finalCheck.reason);
+					steps.set(id, { candidateId: id, state: "not-ready", problem });
+					skipped += 1;
+					if (own.ending !== undefined || own.abort.signal.aborted || input.live.signal.aborted ||
+						problem.code === "target-fenced" || problem.code === "authority-lost") {
+						stop = problem;
+					}
+					continue;
+				}
+				const seal = admitted.seal;
+				if (seal === undefined || seal.delta.kind !== "known") {
+					steps.set(id, { candidateId: id, state: "not-ready", problem: integrationProblem("delta-missing", "정확 델타 증명이 없습니다.") });
+					skipped += 1;
+					continue;
+				}
+				started += 1;
+				let result: CandidateWriteResult;
+				try {
+					result = await ports.writer.applyCandidate({
+						holder,
+						candidate: revision,
+						proof: seal.delta.value,
+						window: effectWindow,
+					});
+				} catch (error) {
+					const problem = integrationProblem("writer-error", errorText(error));
+					await ports.journal.recordStep(selection.key, { candidateId: id, state: "recovery-required", problem }).catch(() => undefined);
+					stop = problem;
+					skipped += 1;
+					continue;
+				}
+				let step: WriteStepRecord;
+				switch (result.kind) {
+					case "written":
+					case "already-written":
+						step = { candidateId: id, state: result.kind };
+						written += 1;
+						break;
+					case "conflict":
+					case "refused":
+					case "no-effect":
+						step = { candidateId: id, state: result.kind, problem: result.problem };
+						skipped += 1;
+						break;
+					case "present-unattributed":
+					case "recovery-required":
+						step = { candidateId: id, state: result.kind, problem: result.problem };
+						stop = result.problem;
+						skipped += 1;
+						break;
+				}
+				steps.set(id, step);
+				const recorded = await ports.journal.recordStep(selection.key, step);
+				if (!recorded.ok) {
+					stop ??= integrationProblem("step-record-failed", recorded.problem.reason);
+					continue;
+				}
+				if (result.kind === "written" || result.kind === "already-written") {
+					delete admitted.liveCheck;
+					await this.#onIntegrationReceipt(result.receipt).catch(() => undefined);
+				}
+			}
+		} finally {
+			const finished = await ports.writer.finishSegment(holder).catch((error: unknown) => integrationFail("segment-finish-failed", errorText(error)));
+			if (!finished.ok) stop ??= finished.problem;
+		}
+		// Record outcomes that happened after an authority loss too; a journal write is not a target effect.
+		for (const id of orderedIds) {
+			const step = steps.get(id);
+			if (step === undefined) continue;
+			const recorded = await ports.journal.recordStep(selection.key, step).catch((error: unknown) =>
+				integrationFail("step-record-failed", errorText(error)));
+			if (!recorded.ok) stop ??= integrationProblem("step-record-failed", recorded.problem.reason);
+		}
+		const firstNotStarted = ordered.find(candidate => steps.get(candidate.admission.candidateId)?.state === "not-started")?.admission.candidateId ?? null;
+		const examples = requested
+			.map(id => steps.get(id))
+			.filter((step): step is WriteStepRecord => step !== undefined)
+			.slice(0, INTEGRATION_EXAMPLES);
+		return {
+			kind: "selection",
+			selection,
+			started,
+			written,
+			skipped,
+			notStarted,
+			examples,
+			firstNotStarted,
+			stop,
+		};
+	}
+
+	/** Operator fence reconciliation; only the directly confirmed user flow reaches this, never the model tool. */
+	async reconcile(input: FenceResolutionRequest, window: ByteWindow): Promise<FenceResolution> {
+		const ports = this.#integration;
+		const own = this.#own;
+		if (ports === undefined || own === undefined) {
+			return { kind: "kept", problem: integrationProblem("integration-disabled", "이 호스트에서는 통합 펜스를 해결하지 않습니다.") };
+		}
+		if (input.audit.sessionId !== own.sessionId || input.audit.userActionId.trim() === "" ||
+			!Number.isFinite(input.audit.acknowledgedAt) ||
+			path.resolve(input.fence.root) !== path.resolve(own.lease?.root ?? own.root) ||
+			input.fence.runId !== own.record.runId ||
+			(own.lease !== undefined && input.fence.leaseKey !== own.lease.record.key)) {
+			return { kind: "kept", problem: integrationProblem("fence-foreign", "이 세션·대상의 통합 펜스가 아닙니다.") };
+		}
+		let confirmed: LiveCheck;
+		try {
+			confirmed = input.checkOperator();
+		} catch {
+			confirmed = { ok: false, reason: "운영자 확인을 읽지 못했습니다." };
+		}
+		if (!confirmed.ok) return { kind: "kept", problem: integrationProblem("operator-not-confirmed", confirmed.reason) };
+		try {
+			return await ports.journal.resolveFence(input, window);
+		} catch (error) {
+			return { kind: "kept", problem: integrationProblem("fence-unresolved", errorText(error)) };
+		}
+	}
+
+	/** Same-run integrated inputs for B's dependency gate; only a current receipt and located verdict count. */
+	readIntegratedProducer(query: { readonly runId: string; readonly lane: string }): IntegrationRead<readonly IntegratedInput[]> {
+		const own = this.#own;
+		if (this.#integration === undefined) return integrationUnknown("integration-disabled", "이 호스트에서는 격리 통합 의존성을 읽지 않습니다.");
+		if (own === undefined || query.runId !== own.record.runId) return integrationUnknown("run-not-active", "이 실행의 통합 의존성이 아닙니다.");
+		const state = own.integration;
+		if (state === undefined) return integrationUnknown("producer-not-integrated", "이 실행에는 아직 통합 기록이 없습니다.");
+		const lane = own.record.plan?.lanes.find(candidate => candidate.name === query.lane);
+		const results = lane?.results ?? [];
+		if (results.length === 0) {
+			const footprint = state.footprints.get(query.lane);
+			if (footprint === undefined) return integrationUnknown("producer-not-integrated", "이 결과 없는 레인의 통합 영수증이 없습니다.");
+			return integrationKnown([{
+				producerLane: query.lane,
+				need: "integrated",
+				subject: { kind: "resultless-footprint", lane: query.lane },
+				state: "integrated",
+				version: footprint.version,
+				receipt: footprint.receipt,
+				paths: footprint.paths,
+			}]);
+		}
+		const integrated: IntegratedInput[] = [];
+		for (const result of results) {
+			const row = own.record.results?.find(candidate => candidate.id === result.id);
+			const recorded = state.receipts.get(result.id);
+			if (row === undefined || row.state !== "accepted" || row.contentVersion === undefined ||
+				recorded === undefined || recorded.attemptId !== row.attemptId ||
+				recorded.manifestDigest !== own.integration?.candidates.get(recorded.candidateId)?.seal?.digest) {
+				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}'가 현재 통합 영수증과 함께 수용되어 있지 않습니다.`);
+			}
+			integrated.push({
+				producerLane: query.lane,
+				need: "integrated",
+				subject: { kind: "result", id: result.id },
+				state: "integrated",
+				version: row.contentVersion,
+				receipt: recorded.receipt,
+				paths: recorded.attributable,
+			});
+		}
+		return integrationKnown(integrated);
+	}
+
+	/** Async refresh for a caller that can read the target now; the sync port returns only the last verified cache. */
+	async readIntegratedProducerNow(query: { readonly runId: string; readonly lane: string }, window: ByteWindow): Promise<IntegrationRead<readonly IntegratedInput[]>> {
+		const own = this.#own;
+		if (own === undefined || query.runId !== own.record.runId) return integrationUnknown("run-not-active", "이 실행의 통합 의존성이 아닙니다.");
+		const state = own.integration;
+		if (state === undefined) return integrationUnknown("producer-not-integrated", "이 실행에는 아직 통합 기록이 없습니다.");
+		const lane = own.record.plan?.lanes.find(candidate => candidate.name === query.lane);
+		const results = lane?.results ?? [];
+		if (results.length === 0) {
+			const footprint = await this.#currentFootprint(own, query.lane, window);
+			if (footprint === undefined) return integrationUnknown("producer-not-integrated", "이 결과 없는 레인의 현재 통합 영수증이 없습니다.");
+			return integrationKnown([{
+				producerLane: query.lane,
+				need: "integrated",
+				subject: { kind: "resultless-footprint", lane: query.lane },
+				state: "integrated",
+				version: footprint.version,
+				receipt: footprint.receipt,
+				paths: footprint.paths,
+			}]);
+		}
+		const integrated: IntegratedInput[] = [];
+		for (const result of results) {
+			const row = own.record.results?.find(candidate => candidate.id === result.id);
+			if (row === undefined || row.state !== "accepted") {
+				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}'가 수용 상태가 아닙니다.`);
+			}
+			const current = await this.#currentIntegratedResult(own, result.id, window);
+			if (current === undefined) {
+				return integrationUnknown("producer-not-integrated", `선행 결과 '${result.id}'의 현재 통합 영수증을 확인하지 못했습니다.`);
+			}
+			integrated.push({
+				producerLane: query.lane,
+				need: "integrated",
+				subject: { kind: "result", id: result.id },
+				state: "integrated",
+				version: current.version,
+				receipt: current.receipt,
+				paths: current.paths,
+			});
+		}
+		return integrationKnown(integrated);
+	}
+
+	async #currentFootprint(own: OwnRun, lane: string, window: ByteWindow): Promise<IntegrationFootprintState | undefined> {
+		const state = own.integration;
+		const ports = this.#integration;
+		if (state === undefined || ports === undefined) return undefined;
+		const candidates = [...state.candidates.values()].filter(candidate =>
+			candidate.status === "committed" &&
+			candidate.admission.subject.kind === "planned" &&
+			candidate.admission.subject.lane === lane &&
+			candidate.admission.subject.results.length === 0);
+		candidates.sort((left, right) =>
+			right.admission.startedAt - left.admission.startedAt ||
+			right.admission.placementOrdinal - left.admission.placementOrdinal);
+		for (const candidate of candidates) {
+			const receipt = await this.#latestReceipt(own, state, candidate);
+			if (receipt.kind !== "known") continue;
+			const paths = receiptPaths(receipt.value);
+			if (paths.length === 0) continue;
+			const presence = await ports.delta.observePresence(candidate.admission.target, paths, window);
+			if (presence.kind !== "present") continue;
+			const footprint: IntegrationFootprintState = {
+				lane,
+				receipt: receipt.value.ref,
+				version: receipt.value.ref.manifestDigest,
+				paths,
+				observedAt: this.deps.now(),
+			};
+			state.footprints.set(lane, footprint);
+			return footprint;
+		}
+		return undefined;
 	}
 }
 

@@ -21,6 +21,7 @@ import {
 	observeDirectorIsolation,
 	type DirectorIsolationObservation,
 } from "../src/discovery/settings.ts";
+import { bindGuardedIsolation, guardedDispatch, supportsGuardedIsolation } from "../src/discovery/integration-host.ts";
 import type { ApplyPolicyProofRef, IntegrationProblem, NativeTaskItem } from "../src/runtime/integration-admission.ts";
 import { fenceRefusal, INTEGRATION_FENCE_REFUSAL } from "../src/policy/toolcall.ts";
 import { integrationIdListProblem, type StormToolHost } from "../src/tool/host.ts";
@@ -128,6 +129,38 @@ describe("the exact director isolation observation", () => {
 		cfgTaskIsolationEnabled.override(settings, true);
 		expect(withActiveSettings(settings, () => observation.check()).ok).toBe(false);
 		observation.stop();
+	});
+});
+
+describe("the guarded host's dispatch proof", () => {
+	test("a capable host freezes one private dispatch to its exact task call", () => {
+		const capability = Object.freeze({ version: 1, spawnPolicy: true, childEntryGuard: true, entryGuard: true, agentDefinitionIdentity: true });
+		expect(supportsGuardedIsolation({ version: "19.2.1" })).toBe(false);
+		expect(supportsGuardedIsolation({ capabilities: Object.freeze({ version: 1, subagentIsolation: capability }) })).toBe(true);
+		const workspace = Object.freeze({ kind: "native", backend: "apfs" });
+		const policy = Object.freeze({ requested: true, enabled: true, merge: "patch", apply: false, commits: "generic", workspace });
+		const event = { dispatchId: "iso_41", isolation: policy, agentDefinition: Object.freeze({ source: "bundled", digest: `sha256:${"a".repeat(64)}` }) };
+		expect(guardedDispatch({ ...event, isolation: Object.freeze({ ...policy, apply: true }) }).kind).toBe("unknown");
+		expect(guardedDispatch({ ...event, isolation: Object.freeze({ ...policy, workspace: Object.freeze({ kind: "ovnfs", backend: "auto" }) }) }).kind).toBe("unknown");
+		const dispatch = guardedDispatch(event);
+		if (dispatch.kind !== "known") throw new Error(dispatch.problem.reason);
+		const settings = isolated();
+		const observation = observe(settings);
+		try {
+			const item = { toolCallId: "call-1", itemIndex: 1, handle: "worker" };
+			const input = { director: DIRECTOR, item, profile: "test", observation, dispatch: dispatch.value };
+			expect(withActiveSettings(settings, () => bindGuardedIsolation(input))).toMatchObject({
+				kind: "known", value: { backendProofId: event.dispatchId, toolCallId: item.toolCallId, apply: false },
+			});
+			expect(withActiveSettings(settings, () => bindGuardedIsolation({ ...input, item: { ...item, toolCallId: "call-2" } })).kind).toBe("unknown");
+			cfgTaskIsolationApply.override(settings, true);
+			cfgTaskIsolationApply.override(settings, false);
+			expect(withActiveSettings(settings, () => bindGuardedIsolation(input))).toMatchObject({
+				kind: "unknown", problem: { code: ISOLATION_POLICY_CHANGED },
+			});
+		} finally {
+			observation.stop();
+		}
 	});
 });
 
